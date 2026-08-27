@@ -139,6 +139,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -190,6 +191,7 @@ async fn mark_continued_as_new(
     let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: new_id,
         input: json!({"n": 2}),
+        new_workflow_type: None,
     }];
     store::append_events(conn, exec_id, &events, history.next_event_id)
         .await

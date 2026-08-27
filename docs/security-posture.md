@@ -259,6 +259,81 @@ convenience) and the offline `harvest token bootstrap`.
 
 ---
 
+## Data residency and shard placement (issue #697)
+
+`POST /workflows/{name}/start` accepts an optional `shard_id` or `residency_key`
+that pins the new workflow (and, by shard inheritance, its whole descendant
+tree) to a specific database. See [`sharding.md`](./sharding.md#explicit-shard-placement-and-data-residency-issue-697)
+for the mechanism. Security-relevant properties:
+
+- **`shard_id` is not a capability.** Any caller authorised to start a workflow
+  can pin it to any *placeable* shard. Placement selects a database within the
+  deployment; it does not grant access to data already there, and there is no
+  per-shard authorisation tier. If a caller must be confined to one region,
+  enforce that in your own auth layer before delegating to the start route —
+  Harvest validates that a requested shard exists and accepts writes, not that
+  *this* caller is entitled to it.
+- **Rejections do not enumerate the deployment.** A refused placement names only
+  what the caller asked for (`shard N is not a placeable shard for this
+  deployment`, `residency key 'K' is not declared for this deployment`). The
+  shard set, drain state, and declared key list are never returned to the
+  caller — they go to the server log via `tracing::warn!`. This keeps the start
+  route from being a topology-discovery oracle for a lower-trust caller.
+- **Residency keys are opaque labels, not secrets.** They are operator-declared
+  at boot and appear in caller requests, CLI invocations, and audit rows. Do not
+  encode tenant identifiers or anything sensitive in them; use region /
+  jurisdiction names.
+- **A pin failing closed is a `503`, not a silent redirect.** A shard the router
+  accepts but has no pool for is refused rather than written to the default
+  database, so a residency obligation cannot be violated by a configuration gap.
+
+---
+
+## Business-key targeting for signal/cancel (issue #751)
+
+`WorkflowContext::signal_external_workflow_by_id` and
+`request_cancel_external_workflow_by_id` let a running workflow address another
+by its stable `(workflow_name, workflow_id)` business key instead of its
+`ExecutionId`. Security-relevant properties:
+
+- **Same trust boundary as `ExecutionId`-targeted signal/cancel.** Neither
+  primitive is reachable from outside the engine — both are called from
+  already-running, already-trusted server-side workflow code, exactly like the
+  pre-existing `ExecutionId`-targeted methods (issue #244/#492). There is no
+  new HTTP or network-facing surface here; the HTTP business-id read surface
+  (issue #805) already exposes at least as much information to any
+  read-authenticated caller.
+- **A business key is easier to guess than an `ExecutionId`.** A `workflow_id`
+  is often predictable (`order-42`, `tenant-7`), unlike a random `ExecutionId`.
+  This does not widen what the *engine* allows — there is no ACL on either
+  addressing mode, matching Harvest's "no built-in RBAC engine" design — but it
+  does lower the practical guessing bar for embedder-supplied inputs. **Do not
+  build `workflow_name`/`workflow_id` targeting strings from
+  attacker-influenced data inside a workflow** without your own
+  authorization check; treat this exactly like the [shard-placement caveat
+  above](#data-residency-and-shard-placement-issue-697) — the string is an
+  address, not a secret, and reaching it should be gated by your embedding
+  application, not by Harvest.
+- **Shard resolution assumes the default (`Auto`) placement (issue #697
+  interaction).** Resolving which shard owns a `(workflow_name, workflow_id)`
+  target re-derives the same rendezvous hash a fresh start would use
+  (`shard::external_target_owning_shard`) — it does not, and cannot without a
+  directory lookup, see an explicit shard pin applied at start time
+  (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`). A workflow started
+  with an explicit pin can therefore be unreachable — or, in a genuinely
+  pathological multi-tenant layout, misresolved to a shard hosting an
+  unrelated `(workflow_name, workflow_id)` pair — via business-key targeting.
+  This is a correctness limitation, not a privilege-escalation vector (a
+  misresolution surfaces as `target_unknown`/`NoRunFound`, never as access to
+  a target the caller could not otherwise reach), but it means
+  business-key-addressed signal/cancel should be reserved for workflows known
+  to use the default placement; address an explicitly shard-pinned workflow
+  by `ExecutionId` instead. A shard-placement-aware directory lookup for
+  business-key targeting is a documented follow-up, out of scope for issue
+  #751.
+
+---
+
 ## CLI token semantics
 
 The Harvest CLI supports `--token <value>` and the `HARVEST_TOKEN` environment

@@ -40,6 +40,9 @@ type WfHandler = for<'a> fn(&'a WorkflowContext, Value) -> WfFuture<'a>;
 
 fn wf_info(name: &'static str, handler: WfHandler) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "child_timeout_tests",

@@ -10,8 +10,8 @@ agent a workflow as a correlated set of MCP tools so it can **start** durable
 work, **watch** it, and **steer** it — without the work being tied to the
 agent's fragile, short-lived session.
 
-Built on autumn-web 0.6's MCP layer (autumn#1117 tool exposure, autumn#1118
-streaming): tools are served at `AppBuilder::mount_mcp("/mcp")` over
+Built on autumn-web's MCP layer (introduced in 0.6: autumn#1117 tool
+exposure, autumn#1118 streaming): tools are served at `AppBuilder::mount_mcp("/mcp")` over
 Streamable-HTTP JSON-RPC, and `tools/call` replays an in-process HTTP request
 through the real, authenticated handler pipeline.
 
@@ -199,7 +199,7 @@ An already-terminal run yields the result frame immediately.
   (GET-only) by design and never picks up the mutating workflow tools.
 - **Annotations.** Read tools (`_status`) carry `readOnlyHint: true`; the
   mutating tools carry `readOnlyHint: false`. Known inherited gap: autumn-web
-  0.5 derives annotations from the HTTP verb and only emits
+  (still as of 0.7) derives annotations from the HTTP verb and only emits
   `destructiveHint: true` for DELETE routes, so the mutating workflow tools
   cannot yet carry a literal `destructiveHint` — flagged for an autumn-web
   follow-up.

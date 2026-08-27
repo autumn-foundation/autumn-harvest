@@ -3439,6 +3439,83 @@ async fn test_default_env_metadata_in_activity_input_replays_clean() {
     );
 }
 
+/// Records `ctx.queue_name()` into an activity input.
+///
+/// `queue_name` is supplied by the live worker from the claimed task row (the
+/// test env supplies it via `span_meta`) and lives in no `WorkflowEvent` — the same
+/// family as `workflow_name` / `workflow_id` above.
+fn queue_name_in_activity_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        let out = ctx
+            .execute_activity_raw("record_queue", json!({ "queue": queue }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": out }))
+    })
+}
+
+/// Issue #798: a `WorkflowTestEnv` configured via `with_queue_name` that records
+/// `ctx.queue_name()` into an **activity input** must self-check clean.
+///
+/// The live run receives the configured queue via `span_meta`, so without
+/// `replay_check` threading it onto the replay snapshot the self-check replays
+/// under `""`, the recorded activity input no longer matches, and the harness
+/// reports a FALSE non-determinism.
+#[tokio::test]
+async fn test_configured_queue_name_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .with_queue_name("priority-queue")
+        .mock_activity("record_queue", |input| {
+            // Sanity: the LIVE run recorded the CONFIGURED queue into the input.
+            assert_eq!(
+                input.get("queue").and_then(Value::as_str),
+                Some("priority-queue"),
+                "live run must record the configured queue into the activity input"
+            );
+            Ok(json!("ok"))
+        })
+        .run(queue_name_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(queue_name_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a WorkflowTestEnv configured with a queue that records ctx.queue_name() into an \
+         activity input must replay clean (issue #798):\n{report}"
+    );
+}
+
+/// Regression guard: a default `WorkflowTestEnv` (no `with_queue_name`) recording
+/// `ctx.queue_name()` still self-checks clean — the default `""` is used
+/// consistently on both the live and replay sides.
+#[tokio::test]
+async fn test_default_env_queue_name_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("record_queue", |input| {
+            assert_eq!(input.get("queue").and_then(Value::as_str), Some(""));
+            Ok(json!("ok"))
+        })
+        .run(queue_name_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(queue_name_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a default WorkflowTestEnv recording ctx.queue_name() into an activity input must \
+         replay clean:\n{report}"
+    );
+}
+
 // ── await_external_workflow coverage (issue #757) ────────────────────────────
 
 /// Awaits an external target and returns its output verbatim.
@@ -3835,4 +3912,224 @@ async fn windowed_fan_out_drives_to_completion() {
         .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
         .count();
     assert_eq!(completed, 10, "all 10 activities completed");
+}
+
+/// A workflow that records its worker's build id into an activity input.
+///
+/// `build_id` is supplied by the live worker from its **own** `WorkerConfig`
+/// (the test env supplies it via `span_meta`) and lives in no `WorkflowEvent`.
+fn build_id_in_activity_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let build = ctx.build_id().unwrap_or("<none>").to_string();
+        let out = ctx
+            .execute_activity_raw("record_build", json!({ "build": build }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": out }))
+    })
+}
+
+/// Issue #798: a `WorkflowTestEnv` configured via `with_build_id` that records
+/// `ctx.build_id()` into an **activity input** must self-check clean.
+///
+/// This locks the live/replay *symmetry* invariant. The env threads the build id
+/// into the live run via `span_meta`; `replay_check` must thread the same value
+/// onto the replayer (it rides the replayer rather than the snapshot, because
+/// `HistorySnapshot` deliberately carries no build id). Wiring only the live half
+/// would reproduce exactly the `queue_name` bug this family already produced once.
+#[tokio::test]
+async fn test_configured_build_id_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .with_build_id("v2")
+        .mock_activity("record_build", |input| {
+            // Sanity: the LIVE run recorded the CONFIGURED build into the input.
+            assert_eq!(
+                input.get("build").and_then(Value::as_str),
+                Some("v2"),
+                "live run must record the configured build id into the activity input"
+            );
+            Ok(json!("ok"))
+        })
+        .run(build_id_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(build_id_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a WorkflowTestEnv configured with a build id that records ctx.build_id() into \
+         an activity input must replay clean (issue #798):\n{report}"
+    );
+}
+
+/// Regression guard: a default `WorkflowTestEnv` (no `with_build_id`) recording
+/// `ctx.build_id()` still self-checks clean — `None` is used consistently on both
+/// the live and replay sides, so the default path is unchanged.
+#[tokio::test]
+async fn test_default_env_build_id_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("record_build", |input| {
+            assert_eq!(
+                input.get("build").and_then(Value::as_str),
+                Some("<none>"),
+                "default env must report no build id on the live side"
+            );
+            Ok(json!("ok"))
+        })
+        .run(build_id_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(build_id_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the default (unset) build id must be used consistently on both sides:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Business-day timers (issue #806)
+// ---------------------------------------------------------------------------
+
+/// Arms one business-day timer and returns the resolved deadline.
+fn business_day_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let deadline = ctx
+            .timer_business_days("sla", 2, "biz")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(deadline.to_rfc3339()))
+    })
+}
+
+fn biz_calendars() -> autumn_harvest::calendar::BusinessCalendars {
+    autumn_harvest::calendar::BusinessCalendars::new().with_calendar("biz", [])
+}
+
+/// `WorkflowTestEnv` fires a business-day timer deterministically, with **no
+/// real sleeping** — the harness auto-fires the durable timer.
+#[tokio::test]
+async fn test_business_day_timer_fires_without_real_sleeping() {
+    let start = std::time::Instant::now();
+    // Thursday 2026-07-02T09:00Z + 2 business days = Monday 2026-07-06T09:00Z
+    // (a 4-calendar-day wait that the harness must NOT actually sleep through).
+    let outcome = WorkflowTestEnv::new()
+        .with_frozen_anchor("2026-07-02T09:00:00Z".parse().expect("valid instant"))
+        .with_business_calendars(biz_calendars())
+        .run(business_day_workflow, json!(null))
+        .await;
+    let elapsed = start.elapsed();
+
+    let result = outcome.result.expect("workflow should complete");
+    assert_eq!(
+        result.as_str().expect("rfc3339 string"),
+        "2026-07-06T09:00:00+00:00",
+        "Sat 07-04 and Sun 07-05 must be stepped over"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a 4-day business timer must fire virtually, not by sleeping: took {elapsed:?}"
+    );
+}
+
+/// `replay_check` forwards the env's shared state (so this is a *round-trip*
+/// check, not a freeze proof), and separately: replaying the harness-produced
+/// history under a **hostile** calendar that excludes the frozen deadline's own
+/// date still yields the identical deadline.
+///
+/// The hostile-calendar half is the falsifiable one — if the deadline were
+/// recomputed on replay instead of read back from the frozen record, the
+/// excluded Monday would push it to Tuesday and the assertion fails.
+#[tokio::test]
+async fn test_business_day_run_replays_frozen_under_a_hostile_calendar() {
+    let outcome = WorkflowTestEnv::new()
+        .with_frozen_anchor("2026-07-02T09:00:00Z".parse().expect("valid instant"))
+        .with_business_calendars(biz_calendars())
+        .run(business_day_workflow, json!(null))
+        .await;
+    let live = outcome
+        .result
+        .clone()
+        .expect("workflow should complete")
+        .as_str()
+        .expect("rfc3339 string")
+        .to_owned();
+    assert_eq!(live, "2026-07-06T09:00:00+00:00");
+
+    // (a) Round-trip: the harness's own self-check forwards the same snapshot a
+    //     real worker would hold, so this asserts the history replays cleanly.
+    let report = outcome.replay_check(business_day_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the recorded history must replay cleanly:\n{report}"
+    );
+
+    // (b) The freeze proof: replay under a calendar that excludes 2026-07-06.
+    //     A recompute would land on Tue 07-07; the frozen record must win.
+    let hostile = autumn_harvest::calendar::BusinessCalendars::new().with_calendar(
+        "biz",
+        [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid date")],
+    );
+    let hostile_report = autumn_harvest::testing::WorkflowReplayer::new()
+        .with_state(hostile)
+        .register_fn("business_day_workflow", business_day_workflow as _)
+        .replay_from_events(outcome.events().to_vec())
+        .await;
+    assert!(
+        matches!(hostile_report.status, ReplayStatus::ReplaySucceeded),
+        "a calendar edit after arming must not move the frozen deadline:\n{hostile_report}"
+    );
+}
+
+/// Hermeticity: the resolution depends only on the frozen anchor, never on the
+/// weekday CI happens to run. Without `with_frozen_anchor` this test would give
+/// a different answer on five of seven days.
+#[tokio::test]
+async fn test_business_day_env_is_hermetic_across_all_seven_weekdays() {
+    // 2026-06-29 is a Monday, so this walks Mon..Sun.
+    let expected = [
+        // anchor            -> +2 business days
+        ("2026-06-29", "2026-07-01"), // Mon -> Wed
+        ("2026-06-30", "2026-07-02"), // Tue -> Thu
+        ("2026-07-01", "2026-07-03"), // Wed -> Fri
+        ("2026-07-02", "2026-07-06"), // Thu -> Mon (weekend stepped over)
+        ("2026-07-03", "2026-07-07"), // Fri -> Tue (weekend stepped over)
+        // A weekend anchor first rolls forward to Monday (the n = 0 position),
+        // then counts 2 more business days from there -> Wednesday.
+        ("2026-07-04", "2026-07-08"), // Sat -> Wed
+        ("2026-07-05", "2026-07-08"), // Sun -> Wed
+    ];
+    for (anchor, want) in expected {
+        let outcome = WorkflowTestEnv::new()
+            .with_frozen_anchor(
+                format!("{anchor}T09:00:00Z")
+                    .parse()
+                    .expect("valid instant"),
+            )
+            .with_business_calendars(biz_calendars())
+            .run(business_day_workflow, json!(null))
+            .await;
+        let got = outcome
+            .result
+            .clone()
+            .expect("workflow should complete")
+            .as_str()
+            .expect("rfc3339 string")
+            .to_string();
+        assert_eq!(
+            got,
+            format!("{want}T09:00:00+00:00"),
+            "anchor {anchor} must resolve identically on every CI weekday"
+        );
+    }
 }

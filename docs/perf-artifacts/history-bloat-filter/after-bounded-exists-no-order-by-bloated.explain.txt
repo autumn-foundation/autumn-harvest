@@ -1,0 +1,22 @@
+-- after-bounded-exists-no-order-by-bloated --
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=529.29..529.30 rows=1 width=1) (actual rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=93
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=529.23..529.29 rows=1 width=4) (actual rows=1 loops=1)
+           Output: 1
+           Buffers: shared hit=93
+           ->  Index Only Scan using idx_harvest_events_exec_last on public.harvest_events  (cost=0.56..23467.79 rows=443842 width=4) (actual rows=10000 loops=1)
+                 Output: 1
+                 Index Cond: (harvest_events.workflow_exec_id = '593fc354-f251-43a6-a124-baf0e3a2d121'::uuid)
+                 Heap Fetches: 0
+                 Buffers: shared hit=93
+ Query Identifier: 8824402302196676549
+ Planning:
+   Buffers: shared hit=231
+ Planning Time: 0.640 ms
+ Execution Time: 1.044 ms
+(17 rows)
+

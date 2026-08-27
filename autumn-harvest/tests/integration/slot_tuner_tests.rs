@@ -110,6 +110,9 @@ fn slow_activity<'a>(
 fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "slot_tuner_slow_workflow",
             module: "slot_tuner_tests",
@@ -183,6 +186,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
+        capability_miss_max_redeliveries: 5,
         workflow_task_timeout: Duration::from_secs(10),
         workflow_panic_max_attempts: 3,
         labels: std::collections::HashMap::new(),
@@ -222,6 +226,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

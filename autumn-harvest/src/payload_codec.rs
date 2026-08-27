@@ -39,9 +39,19 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult};
 
+/// Discriminator key marking a codec envelope (issue #608).
+///
+/// Public for the same reason as its offload sibling
+/// [`crate::payload_store::OFFLOAD_ENVELOPE_KEY`]: a consumer that must
+/// *detect* an undecoded payload without a codec registry — e.g. the
+/// replay-drift gate's fixture guard (issue #798), which refuses a bundle it
+/// cannot decode — can cheaply reject on the raw JSON without hardcoding the
+/// key and drifting from this definition.
+pub const CODEC_ENVELOPE_KEY: &str = "_harvest_codec_envelope";
+
 /// Marker key for a payload field the read path could not decode (issue #608).
 ///
-/// Sibling discriminator of `_harvest_codec_envelope`,
+/// Sibling discriminator of [`CODEC_ENVELOPE_KEY`],
 /// `_harvest_offload_envelope` (issue #524), and `_harvest_erased`
 /// (issue #495).
 pub const UNDECODABLE_MARKER_KEY: &str = "_harvest_undecodable";
@@ -113,7 +123,7 @@ impl LossyDecodeOutcome {
 /// a `codec_id` field, malformed near-envelopes).
 fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
     let obj = payload.as_object()?;
-    if obj.get("_harvest_codec_envelope").and_then(Value::as_i64) != Some(1) {
+    if obj.get(CODEC_ENVELOPE_KEY).and_then(Value::as_i64) != Some(1) {
         return None;
     }
     let codec_id = obj.get("codec_id").and_then(Value::as_str)?;
@@ -122,6 +132,26 @@ fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
         return None;
     }
     Some((codec_id, encoded_b64))
+}
+
+/// `true` when `payload` is a codec envelope written by
+/// [`PayloadCodecs::encode_event`] — i.e. an opaque stored value whose real
+/// contents this process cannot read without decoding it first.
+///
+/// Delegates to the single authoritative shape check
+/// ([`codec_envelope_parts`]) that the strict and lossy read paths already
+/// share, so a caller's "is this opaque?" question can never drift from what
+/// the decoder itself recognises.
+///
+/// Its sibling for the offload half is
+/// [`crate::payload_store::extract_offload_ref`]. A reader that derives
+/// anything from a payload-bearing field on a RAW (undecoded) history — for
+/// example the DAG run graph's issue #780 compensation-dispatch filter — uses
+/// these two to decide whether it must run an inflate/decode pass before its
+/// derivation is meaningful.
+#[must_use]
+pub fn is_codec_envelope(payload: &Value) -> bool {
+    codec_envelope_parts(payload).is_some()
 }
 
 /// A trait for intercepting and transforming raw payload bytes.

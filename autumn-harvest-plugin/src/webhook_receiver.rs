@@ -174,6 +174,9 @@ fn build_webhook_route(
         idempotency: autumn_web::RouteIdempotency::Direct,
         // Inherit the global request-timeout deadline (autumn-web 0.6).
         timeout: autumn_web::RouteTimeout::Inherit,
+        // An inbound webhook endpoint is machine-to-machine and is never
+        // rendered or indexed, so it carries no SEO meta (autumn-web 0.7).
+        seo: autumn_web::SeoRouteDefaults::EMPTY,
     }
 }
 

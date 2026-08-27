@@ -551,7 +551,7 @@ enum StashedSignalTerminal {
 #[derive(Debug, Clone)]
 struct StashedExternalSignal {
     signal_id: ExternalSignalId,
-    target: ExecutionId,
+    target: crate::types::ExternalTarget,
     signal_name: String,
     /// Durable payload from the recorded `ExternalSignalRequested` event.
     /// Carried through so that crash-recovery re-dispatch uses the same
@@ -576,7 +576,7 @@ enum StashedCancelTerminal {
 #[derive(Debug, Clone)]
 struct StashedExternalCancel {
     cancel_id: ExternalCancelId,
-    target: ExecutionId,
+    target: crate::types::ExternalTarget,
     terminal: Option<StashedCancelTerminal>,
 }
 
@@ -1019,7 +1019,7 @@ impl HistoryMatcher {
         &mut self,
         cursor: usize,
         signal_id: ExternalSignalId,
-        target: ExecutionId,
+        target: crate::types::ExternalTarget,
         signal_name: String,
         payload: Value,
         idempotency_key: Option<String>,
@@ -1105,11 +1105,29 @@ impl HistoryMatcher {
 
             match &self.events[scan_cursor] {
                 WorkflowEvent::ActivityCompleted {
-                    activity_id: id,
-                    output,
+                    activity_id: id, ..
                 } if *id == activity_id => {
+                    // Take rather than clone the recorded output. This is the
+                    // only production read of an already-matched
+                    // `ActivityCompleted`'s `output` anywhere in this matcher
+                    // -- `settle_terminal` below re-reads only `activity_id`
+                    // from this same event, never `output` -- so once matched,
+                    // the recorded payload is never observed again and cloning
+                    // it (a deep clone for an arbitrary-shape `Value`, e.g. a
+                    // `BTreeMap`-backed object) is pure waste. Re-indexed
+                    // mutably here (rather than converting the whole match's
+                    // scrutinee, which would force every other arm below to
+                    // separately satisfy the borrow checker for no benefit):
+                    // the shared borrow above ends at the guard check, since
+                    // `id` is the only field bound from it. See
+                    // `docs/performance-replay.md`.
+                    let WorkflowEvent::ActivityCompleted { output, .. } =
+                        &mut self.events[scan_cursor]
+                    else {
+                        unreachable!("just matched ActivityCompleted above")
+                    };
                     let result = HistoryMatch::Matched {
-                        output: output.clone(),
+                        output: std::mem::take(output),
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -1207,7 +1225,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1246,7 +1264,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -1470,7 +1488,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1509,7 +1527,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -1901,7 +1919,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         self.cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1943,7 +1961,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2414,7 +2432,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -2453,7 +2471,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2565,14 +2583,14 @@ impl HistoryMatcher {
     #[allow(clippy::too_many_lines)]
     pub fn match_external_signal(
         &mut self,
-        target: ExecutionId,
+        target: &crate::types::ExternalTarget,
         signal_name: &str,
     ) -> HistoryMatch {
         // Helper: drain a matching entry from the stash and return its result.
         let try_stash = |pending: &mut Vec<StashedExternalSignal>| {
             let pos = pending
                 .iter()
-                .position(|p| p.target == target && p.signal_name == signal_name)?;
+                .position(|p| p.target == *target && p.signal_name == signal_name)?;
             let stashed = pending.remove(pos);
             Some(match stashed.terminal {
                 Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
@@ -2648,7 +2666,7 @@ impl HistoryMatcher {
                 payload: recorded_payload,
                 idempotency_key: recorded_idempotency_key,
             } => {
-                if *recorded_target != target {
+                if *recorded_target != *target {
                     return HistoryMatch::Diverged {
                         expected: format!(
                             "ExternalSignalRequested(target={target}, signal={signal_name})"
@@ -2742,7 +2760,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2858,7 +2876,7 @@ impl HistoryMatcher {
     /// - `Diverged` when the history event mismatches the expected target.
     /// - `NoMatch` when there is no history at or beyond the cursor.
     #[allow(clippy::too_many_lines)]
-    pub fn match_external_cancel(&mut self, target: ExecutionId) -> HistoryMatch {
+    pub fn match_external_cancel(&mut self, target: &crate::types::ExternalTarget) -> HistoryMatch {
         // prepare_match calls drain_early_signals which eagerly stashes any
         // ExternalCancel events sitting at the current cursor. Call it first so
         // the stash check below sees freshly drained events, mirroring
@@ -2870,7 +2888,7 @@ impl HistoryMatcher {
         if let Some(pos) = self
             .pending_external_cancels
             .iter()
-            .position(|s| s.target == target)
+            .position(|s| s.target == *target)
         {
             let stashed = self.pending_external_cancels.remove(pos);
             return match stashed.terminal {
@@ -2915,7 +2933,7 @@ impl HistoryMatcher {
             };
         };
 
-        if *recorded_target != target {
+        if *recorded_target != *target {
             return HistoryMatch::Diverged {
                 expected: format!("ExternalCancelRequested(target={target})"),
                 actual: format!("ExternalCancelRequested(target={recorded_target})"),
@@ -2992,7 +3010,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *sig_target,
+                        sig_target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3026,7 +3044,7 @@ impl HistoryMatcher {
                 } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *other_id,
-                        target: *other_target,
+                        target: other_target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -3305,7 +3323,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *sig_target,
+                        sig_target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3339,7 +3357,7 @@ impl HistoryMatcher {
                 } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *other_id,
-                        target: *other_target,
+                        target: other_target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -3632,7 +3650,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3674,7 +3692,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -4108,7 +4126,7 @@ impl HistoryMatcher {
                 self.stash_external_signal_request(
                     scan,
                     *signal_id,
-                    *target,
+                    target.clone(),
                     signal_name.clone(),
                     payload.clone(),
                     idempotency_key.clone(),
@@ -4146,7 +4164,7 @@ impl HistoryMatcher {
             WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                 let stashed = StashedExternalCancel {
                     cancel_id: *cancel_id,
-                    target: *target,
+                    target: target.clone(),
                     terminal: None,
                 };
                 self.pending_external_cancels.push(stashed);
@@ -4462,7 +4480,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -4492,7 +4510,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -4982,7 +5000,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -5014,7 +5032,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -5106,14 +5124,27 @@ impl HistoryMatcher {
 
     /// Match a continue-as-new command against history.
     ///
-    /// Expects `WorkflowContinuedAsNew { input }` at the current cursor.
-    pub fn match_continue_as_new(&mut self, input: &Value) -> HistoryMatch {
+    /// Expects `WorkflowContinuedAsNew { input, new_workflow_type }` at the
+    /// current cursor.
+    ///
+    /// Both the input **and** the successor type are part of the recorded
+    /// command (issue #803): a code change that redirects a continuation to a
+    /// different workflow type — or that adds/removes the cross-type call
+    /// entirely — surfaces as non-determinism rather than silently forking the
+    /// chain into a different phase on replay. `None` (same type) and
+    /// `Some(t)` are distinct recorded intents and never compare equal.
+    pub fn match_continue_as_new(
+        &mut self,
+        input: &Value,
+        new_workflow_type: Option<&str>,
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let WorkflowEvent::WorkflowContinuedAsNew {
             input: recorded_input,
+            new_workflow_type: recorded_type,
             ..
         } = &self.events[self.cursor]
         else {
@@ -5124,6 +5155,21 @@ impl HistoryMatcher {
                 event_index: i32::try_from(self.cursor).ok(),
             };
         };
+
+        if recorded_type.as_deref() != new_workflow_type {
+            return HistoryMatch::Diverged {
+                expected: format!(
+                    "WorkflowContinuedAsNewType({})",
+                    new_workflow_type.unwrap_or("<same type>")
+                ),
+                actual: format!(
+                    "WorkflowContinuedAsNewType({})",
+                    recorded_type.as_deref().unwrap_or("<same type>")
+                ),
+
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
 
         if recorded_input != input {
             return HistoryMatch::Diverged {
@@ -5138,6 +5184,27 @@ impl HistoryMatcher {
         self.cursor += 1;
         self.advance_to_next_unconsumed_event();
         HistoryMatch::Matched { output }
+    }
+
+    /// Whether the recorded continue-as-new target type equals `expected`
+    /// (issue #803).
+    ///
+    /// Cursor-independent (it scans, rather than reading at the cursor) so it
+    /// can be consulted *after* [`Self::match_continue_as_new`] has advanced
+    /// past the event. Exists solely to back a `debug_assert!` on the
+    /// `Matched` arm, where the successor type is emitted from the live
+    /// argument rather than echoed from history; a history with no recorded
+    /// continuation reports `true` (there is nothing to contradict).
+    pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
+        self.events
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::WorkflowContinuedAsNew {
+                    new_workflow_type, ..
+                } => Some(new_workflow_type.as_deref() == expected),
+                _ => None,
+            })
+            .unwrap_or(true)
     }
 
     /// Match a child workflow command against history.
@@ -5299,6 +5366,67 @@ impl HistoryMatcher {
             scan += 1;
         }
         false
+    }
+
+    /// After a `ctx.race()` (issue #600) records its winner on the first
+    /// resolving cycle (the else branch of `WorkflowContext::settle_race`),
+    /// consume the still in-flight LOSER branches' progress-frontier events so
+    /// the matcher cursor advances past them, letting a follow-on positional
+    /// command in the SAME decision cycle land cleanly (issue #1126).
+    ///
+    /// The winner's terminal (and its own `ActivityStarted`) are already
+    /// consumed by its own `match_activity`. The loser branches, however,
+    /// resolved as `ActivityInProgress` this cycle — their synthetic
+    /// `ActivityFailed` (from the pending `CancelRaceLosers` command) is
+    /// appended only at *persist* time and is invisible to this cycle's
+    /// matcher, so their in-flight `ActivityStarted` / `ActivityHeartbeat`
+    /// (and, defensively, a losing child's `ChildWorkflowStarted`) are left
+    /// unconsumed straddling the cursor. Without consuming them, the next
+    /// positional `match_*` call diverges on the leftover event -> nd-block.
+    ///
+    /// Consumes ONLY events belonging to the given loser ids, so it is safe
+    /// under `futures::join!(race1, race2)` interleaving (a sibling race's
+    /// events are left untouched). Called ONLY on the first winner-recording
+    /// cycle; later replays take `settle_race`'s `peek_u64_marker` branch,
+    /// where each loser resolves via its recorded terminal and everything is
+    /// already positioned correctly (so this is never invoked then).
+    pub(crate) fn consume_race_loser_frontier(
+        &mut self,
+        loser_activity_ids: &[ActivityExecId],
+        loser_child_ids: &[ExecutionId],
+    ) {
+        if loser_activity_ids.is_empty() && loser_child_ids.is_empty() {
+            return;
+        }
+        let mut scan = self.cursor;
+        while scan < self.events.len() {
+            if !self.is_consumed(scan) {
+                match &self.events[scan] {
+                    WorkflowEvent::ActivityStarted { activity_id, .. }
+                    | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                        if loser_activity_ids.contains(activity_id) =>
+                    {
+                        self.consumed_out_of_order_events.insert(scan);
+                    }
+                    // Defensive: a losing CHILD branch resolves as
+                    // `ChildInProgress`, whose `match_child_workflow` already
+                    // advances the cursor PAST the child's own
+                    // `ChildWorkflowStarted` (a child has no separate started
+                    // event to strand the way an activity does), so in practice
+                    // this arm is unreachable today. Kept so a future child-race
+                    // shape that leaves a child's start unconsumed is handled
+                    // by the same in-cycle consume rather than nd-blocking.
+                    WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                        if loser_child_ids.contains(child_id) =>
+                    {
+                        self.consumed_out_of_order_events.insert(scan);
+                    }
+                    _ => {}
+                }
+            }
+            scan += 1;
+        }
+        self.advance_to_next_unconsumed_event();
     }
 
     /// Read-only peek: does a recorded `ChildWorkflowStarted` already sit at the
@@ -5617,7 +5745,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -5648,7 +5776,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -7350,10 +7478,11 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: ExecutionId::new(),
             input: payload.clone(),
+            new_workflow_type: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&payload);
+        let result = matcher.match_continue_as_new(&payload, None);
         assert_eq!(result, HistoryMatch::Matched { output: payload });
         assert_eq!(matcher.position(), 1);
         assert!(!matcher.is_replaying());
@@ -7364,10 +7493,11 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: ExecutionId::new(),
             input: serde_json::json!({"phase": "next"}),
+            new_workflow_type: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}));
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}), None);
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
         assert_eq!(matcher.position(), 0);
     }
@@ -7380,9 +7510,106 @@ mod tests {
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}));
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}), None);
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
         assert_eq!(matcher.position(), 0);
+    }
+
+    // ── Cross-type continue-as-new matching (issue #803) ────────────────
+
+    /// AC6: a recorded cross-type continuation replays to the same successor
+    /// type it was recorded with.
+    #[test]
+    fn matcher_replays_cross_type_continue_as_new() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("paid_subscription"));
+        assert_eq!(result, HistoryMatch::Matched { output: payload });
+        assert_eq!(matcher.position(), 1);
+    }
+
+    /// AC6: redirecting a continuation to a *different* type is a code change
+    /// the recorded history cannot satisfy — it must surface as divergence,
+    /// not silently fork the chain into another phase.
+    #[test]
+    fn matcher_continue_as_new_type_mismatch_diverges() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("churned"));
+        match result {
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
+                assert!(expected.contains("churned"), "got {expected}");
+                assert!(actual.contains("paid_subscription"), "got {actual}");
+            }
+            other => panic!("expected divergence, got {other:?}"),
+        }
+        assert_eq!(matcher.position(), 0, "a divergence must not advance");
+    }
+
+    /// `None` (same type) and `Some(t)` are distinct recorded intents:
+    /// *adding* a cross-type call over a same-type history diverges…
+    #[test]
+    fn matcher_same_type_history_diverges_against_a_cross_type_call() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: None,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("paid_subscription"));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    /// …and *removing* it over a cross-type history diverges too.
+    #[test]
+    fn matcher_cross_type_history_diverges_against_a_same_type_call() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, None);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    /// The type is compared **before** the input, so a run that changed both
+    /// reports the type divergence — the actionable one for a phase redirect.
+    #[test]
+    fn matcher_continue_as_new_reports_type_divergence_before_input() {
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"a": 1}),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        match matcher.match_continue_as_new(&serde_json::json!({"b": 2}), Some("churned")) {
+            HistoryMatch::Diverged { expected, .. } => {
+                assert!(expected.contains("Type"), "got {expected}");
+            }
+            other => panic!("expected divergence, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10181,7 +10408,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "poke".into(),
                 payload: serde_json::json!({"n": 1}),
                 idempotency_key: None,
@@ -10197,7 +10424,8 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
 
         assert_eq!(
-            matcher.match_external_signal(target, "poke"),
+            matcher
+                .match_external_signal(&crate::types::ExternalTarget::ExecutionId(target), "poke"),
             HistoryMatch::Matched {
                 output: Value::Null
             }

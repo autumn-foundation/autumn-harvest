@@ -124,6 +124,9 @@ pub struct WorkerConfigView {
     /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
     /// `null` when no builder-default timeout floor is configured.
     pub default_activity_start_to_close_ms: Option<u64>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
+    /// (issue #744). Always present (not opt-in); default 15 minutes.
+    pub retry_after_ceiling_ms: u64,
     /// Worker liveness heartbeat interval, milliseconds.
     pub worker_heartbeat_interval_ms: u64,
     /// Immutable build identifier (may be empty; not a secret).
@@ -142,6 +145,19 @@ pub struct WorkerConfigView {
     pub poison_pill_threshold: i32,
     /// Whether poison-pill quarantine is enabled (`poison_pill_threshold > 0`).
     pub poison_pill_quarantine_enabled: bool,
+    /// Consecutive capability misses (claims by a worker with no handler
+    /// registered for the task's type) before a task escalates to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    /// `0` escalates on the first miss.
+    ///
+    /// **No dead-letter row is written.** The escalation routes through
+    /// `fail_task_and_execution_with_history`, which fails the task and the
+    /// execution without inserting into `harvest_dead_letters` — the reason
+    /// lives on the failed execution row, so an operator diagnosing an
+    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
+    /// this path would also be indistinguishable from a poison-pill
+    /// quarantine, #367, which a capability miss deliberately is not.)
+    pub capability_miss_max_redeliveries: u32,
     /// Wall-clock budget for a single workflow-task dispatch, milliseconds (0 = disabled).
     pub workflow_task_timeout_ms: u64,
     /// Bounded-pause auto-resume ceiling, milliseconds.
@@ -185,6 +201,39 @@ pub struct WorkerConfigView {
     /// REDACTED: number of shards in the resolved runtime sharded pool (0 if not
     /// sharded). See [`sharded_pool_configured`](Self::sharded_pool_configured).
     pub sharded_pool_shard_count: usize,
+}
+
+/// Shard ids of the pool the runtime actually uses (issue #961).
+///
+/// A resolved-runtime override wins over the raw [`WorkerConfig::sharded_pool`]
+/// knob, because a runner can supply a sharded pool the `WorkerConfig` never
+/// saw. This is what makes `GET /admin/config` report the *effective*
+/// `shard_assignments` an auto-configured worker resolves to.
+fn resolved_pool_shards(
+    worker: &WorkerConfig,
+    resolved: Option<&ShardedInfo>,
+) -> Vec<crate::types::ShardId> {
+    if let Some(info) = resolved {
+        return info
+            .shard_ids
+            .iter()
+            .copied()
+            .map(crate::types::ShardId::new)
+            .collect();
+    }
+    #[cfg(feature = "db")]
+    {
+        worker
+            .sharded_pool
+            .as_ref()
+            .map(crate::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "db"))]
+    {
+        let _ = worker;
+        Vec::new()
+    }
 }
 
 impl WorkerConfigView {
@@ -235,6 +284,7 @@ impl WorkerConfigView {
             .map_or((false, 0), |p| (true, p.iter_shards().count()));
         #[cfg(not(feature = "db"))]
         let wc_sharding = (false, 0usize);
+        let pool_shards = resolved_pool_shards(worker, resolved.as_ref());
         let (sharded_pool_configured, sharded_pool_shard_count) =
             resolved.map_or(wc_sharding, |info| (info.configured, info.shard_count));
 
@@ -256,6 +306,7 @@ impl WorkerConfigView {
             max_local_activity_start_to_close,
             default_activity_retry_policy,
             default_activity_start_to_close,
+            retry_after_ceiling,
             worker_heartbeat_interval,
             build_id,
             deployment_name,
@@ -264,6 +315,7 @@ impl WorkerConfigView {
             max_workflow_start_delay,
             unknown_target_grace_window,
             poison_pill_threshold,
+            capability_miss_max_redeliveries,
             workflow_task_timeout,
             max_workflow_pause_duration,
             labels,
@@ -289,12 +341,24 @@ impl WorkerConfigView {
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
-            shard_assignments: shard_assignments.iter().map(|s| s.as_i32()).collect(),
+            // The **effective** assignments, not the raw knob: an empty
+            // `shard_assignments` means "auto: cover every pool shard"
+            // (issue #961). `GET /admin/config` must report what the worker
+            // actually polls, because the add-a-shard runbook's coverage
+            // verification reads exactly this field (AC8).
+            shard_assignments: crate::builder::resolve_shard_assignments(
+                shard_assignments.clone(),
+                &pool_shards,
+            )
+            .into_iter()
+            .map(crate::types::ShardId::as_i32)
+            .collect(),
             max_local_activity_start_to_close_ms: dur_ms(*max_local_activity_start_to_close),
             default_activity_retry_max_attempts: default_activity_retry_policy
                 .as_ref()
                 .map(|p| p.max_attempts),
             default_activity_start_to_close_ms: default_activity_start_to_close.map(dur_ms),
+            retry_after_ceiling_ms: dur_ms(*retry_after_ceiling),
             worker_heartbeat_interval_ms: dur_ms(*worker_heartbeat_interval),
             build_id: build_id.clone(),
             deployment_name: deployment_name.clone(),
@@ -304,6 +368,7 @@ impl WorkerConfigView {
             unknown_target_grace_window_ms: dur_ms(*unknown_target_grace_window),
             poison_pill_threshold: *poison_pill_threshold,
             poison_pill_quarantine_enabled: *poison_pill_threshold > 0,
+            capability_miss_max_redeliveries: *capability_miss_max_redeliveries,
             workflow_task_timeout_ms: dur_ms(*workflow_task_timeout),
             max_workflow_pause_duration_ms: dur_ms(*max_workflow_pause_duration),
             labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -409,24 +474,47 @@ pub struct ShardTopologyView {
     pub writable_shards: Vec<i32>,
     /// The default shard used to resolve unencoded execution IDs.
     pub default_shard: i32,
+    /// The declared residency key → shard mapping (issue #697).
+    ///
+    /// Empty unless the deployment declared one. This is **placement-affecting
+    /// configuration**, not a secret: the keys are operator-declared
+    /// jurisdiction labels (`"eu"`, `"us"`), never caller input or credentials,
+    /// and this endpoint is admin-gated.
+    ///
+    /// Surfacing it is what lets an operator detect the failure mode a
+    /// topology-only snapshot hides: two replicas deployed with **different**
+    /// key → shard maps report identical `readable`/`writable`/`default` sets
+    /// while placing the same `residency_key` in **different jurisdictions**
+    /// depending on which replica serves the request. Diff this field across
+    /// replicas before accepting pinned starts. `BTreeMap` ordering makes the
+    /// projection stable, so a byte comparison of two snapshots is meaningful.
+    pub residency_map: BTreeMap<String, i32>,
 }
 
 impl ShardTopologyView {
     /// Project a [`ShardRouter`](crate::shard::ShardRouter) into its view.
     #[must_use]
     pub fn from_router(router: &crate::shard::ShardRouter) -> Self {
+        // Coverage guard (issue #695 pattern, extended to the router by the
+        // issue #697 review): destructure EXHAUSTIVELY so adding a
+        // placement-affecting accessor to `ShardRouter` without surfacing it
+        // here is a compile error rather than a silent snapshot gap -- which is
+        // exactly how `residency_map` slipped through when it was introduced.
+        // Do NOT add `..`.
+        let crate::shard::ShardRouterParts {
+            readable_shards,
+            writable_shards,
+            default_shard,
+            residency_map,
+        } = router.parts();
         Self {
-            readable_shards: router
-                .readable_shards()
+            readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
+            writable_shards: writable_shards.iter().map(|s| s.as_i32()).collect(),
+            default_shard: default_shard.as_i32(),
+            residency_map: residency_map
                 .iter()
-                .map(|s| s.as_i32())
+                .map(|(key, shard)| (key.clone(), shard.as_i32()))
                 .collect(),
-            writable_shards: router
-                .writable_shards()
-                .iter()
-                .map(|s| s.as_i32())
-                .collect(),
-            default_shard: router.default_shard().as_i32(),
         }
     }
 }
@@ -492,12 +580,23 @@ pub struct PoolSizing {
 /// hands the result here, so the reported values describe the resolved runtime
 /// pool rather than solely the `WorkerConfig` knob — and the pure decision stays
 /// testable without ever constructing a real pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardedInfo {
     /// Whether the resolved runtime storage pool is a sharded pool.
     pub configured: bool,
     /// Number of shards in the resolved sharded pool (0 when not sharded).
     pub shard_count: usize,
+    /// Shard ids present in the **resolved runtime pool**, ascending.
+    ///
+    /// Carried so the snapshot can report the worker's *effective* shard
+    /// assignments (issue #961, AC1/AC8): an empty
+    /// [`WorkerConfig::shard_assignments`] means "auto: cover every pool
+    /// shard", and only the resolved runtime pool knows which shards those
+    /// are. This is always populated from the resolved pool — including the
+    /// single-shard fallback wrapper — so `GET /admin/config` reports the same
+    /// list the worker actually polls, which is what the add-a-shard runbook's
+    /// coverage check reads.
+    pub shard_ids: Vec<i32>,
 }
 
 /// Resolve the reported [`PoolConfigView`], mirroring the pool-selection
@@ -619,6 +718,25 @@ mod tests {
         assert_eq!(json["poll_interval_ms"], 500);
     }
 
+    #[test]
+    fn retry_after_ceiling_ms_surfaces_the_configured_value_issue_744() {
+        // The ceiling is not opt-in (always present, unlike the sibling
+        // default_activity_* floors) -- confirm the default AND a configured
+        // override both surface through the introspection snapshot.
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            default_view.retry_after_ceiling_ms,
+            u64::try_from(crate::builder::DEFAULT_RETRY_AFTER_CEILING.as_millis()).unwrap(),
+        );
+
+        let configured = WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
+        let view = WorkerConfigView::from_worker_config(&configured, Duration::from_millis(500));
+        assert_eq!(view.retry_after_ceiling_ms, 90_000);
+    }
+
     #[cfg(feature = "db")]
     #[test]
     fn poll_interval_ms_matches_the_side_effect_free_constant() {
@@ -727,6 +845,60 @@ mod tests {
         let view = ShardTopologyView::from_router(&multi);
         assert_eq!(view.readable_shards, vec![0, 1, 2]);
         assert_eq!(view.writable_shards, vec![0, 1]);
+        assert!(
+            view.residency_map.is_empty(),
+            "a router with no declared map must report an empty projection"
+        );
+    }
+
+    /// Issue #697 review (Codex P2): two replicas deployed with DIFFERENT
+    /// residency maps place the same key in different jurisdictions while
+    /// reporting identical readable/writable/default sets. The snapshot must
+    /// surface the map so an operator can diff it across the fleet.
+    #[test]
+    fn shard_topology_surfaces_the_residency_map_so_replica_drift_is_visible() {
+        let shards = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        let replica_a = crate::shard::ShardRouter::new(
+            shards.clone(),
+            shards.clone(),
+            crate::types::ShardId::new(0),
+        )
+        .with_residency_map([
+            ("eu".to_string(), crate::types::ShardId::new(0)),
+            ("us".to_string(), crate::types::ShardId::new(1)),
+        ]);
+        // Same topology, MIRRORED map -- the misconfiguration this exists to catch.
+        let replica_b =
+            crate::shard::ShardRouter::new(shards.clone(), shards, crate::types::ShardId::new(0))
+                .with_residency_map([
+                    ("eu".to_string(), crate::types::ShardId::new(1)),
+                    ("us".to_string(), crate::types::ShardId::new(0)),
+                ]);
+
+        let view_a = ShardTopologyView::from_router(&replica_a);
+        let view_b = ShardTopologyView::from_router(&replica_b);
+
+        assert_eq!(view_a.residency_map.get("eu"), Some(&0));
+        assert_eq!(view_a.residency_map.get("us"), Some(&1));
+
+        // Topology alone is identical -- exactly why the map is load-bearing.
+        assert_eq!(view_a.readable_shards, view_b.readable_shards);
+        assert_eq!(view_a.writable_shards, view_b.writable_shards);
+        assert_eq!(view_a.default_shard, view_b.default_shard);
+        assert_ne!(
+            view_a.residency_map, view_b.residency_map,
+            "a mirrored residency map MUST be visible in the snapshot; without \
+             this field two conflicting replicas serialize identically"
+        );
+
+        // Stable ordering, so a byte comparison across replicas is meaningful.
+        let json_a = serde_json::to_string(&view_a).expect("serialize");
+        assert_eq!(
+            json_a,
+            serde_json::to_string(&ShardTopologyView::from_router(&replica_a)).expect("serialize"),
+            "the projection must be byte-stable across calls"
+        );
+        assert!(json_a.contains("residency_map"), "{json_a}");
     }
 
     #[test]
@@ -845,6 +1017,7 @@ mod tests {
             Some(ShardedInfo {
                 configured: true,
                 shard_count: 3,
+                shard_ids: vec![0, 1, 2],
             }),
         );
         assert!(overridden.sharded_pool_configured);
@@ -857,6 +1030,7 @@ mod tests {
             Some(ShardedInfo {
                 configured: false,
                 shard_count: 0,
+                shard_ids: vec![0],
             }),
         );
         assert!(!single.sharded_pool_configured);
@@ -867,6 +1041,59 @@ mod tests {
         let fallback = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
         assert!(!fallback.sharded_pool_configured);
         assert_eq!(fallback.sharded_pool_shard_count, 0);
+    }
+
+    #[test]
+    fn worker_view_reports_effective_shard_assignments_not_the_auto_sentinel() {
+        // AC8: `docs/sharding.md` step 4 tells an operator to verify coverage
+        // with `GET /admin/config` -> `worker.shard_assignments`. That check is
+        // only meaningful if the view reports the *resolved* list, so a worker
+        // left on auto (empty `shard_assignments`) shows the concrete shards it
+        // will poll rather than an empty array the operator cannot act on.
+        let auto = WorkerConfig::default();
+        assert!(
+            auto.shard_assignments.is_empty(),
+            "the default must be the auto sentinel, else this test is vacuous"
+        );
+
+        let view = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &auto,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: true,
+                shard_count: 3,
+                shard_ids: vec![0, 1, 2],
+            }),
+        );
+        assert_eq!(
+            view.shard_assignments,
+            vec![0, 1, 2],
+            "auto must resolve to every shard of the pool the runtime actually uses"
+        );
+    }
+
+    #[test]
+    fn worker_view_never_widens_an_explicit_shard_assignment() {
+        // The mirror of the test above: a deliberately narrowed worker (the
+        // one-worker-process-per-shard shape) must be reported as narrowed, so
+        // an operator flipping a shard writable can *see* the missing id.
+        let explicit =
+            WorkerConfig::default().with_shard_assignments([crate::types::ShardId::new(1)]);
+
+        let view = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &explicit,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: true,
+                shard_count: 3,
+                shard_ids: vec![0, 1, 2],
+            }),
+        );
+        assert_eq!(
+            view.shard_assignments,
+            vec![1],
+            "an explicit assignment must never be widened to the pool"
+        );
     }
 
     #[test]

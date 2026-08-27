@@ -6,13 +6,33 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use autumn_harvest::{DetCheckReport, DetSeverity, check_paths};
+use autumn_harvest::backup_verify::{
+    Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
+    dsn_targets_same_database, redact_dsn, verify_restore,
+};
+use autumn_harvest::testing::WorkflowReplayer;
+use autumn_harvest::{
+    AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
+    SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
+    dropped_acknowledgements, unacknowledged_breaking,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+/// Characters percent-encoded when a caller-supplied value becomes one URL path
+/// segment.
+///
+/// `/` and `\` are both here because the URL parser reqwest uses treats **both**
+/// as path separators for special (http/https) URLs, so either one would split a
+/// single value into extra segments and silently retarget the request at a
+/// different route — and `\` additionally re-enables `..` traversal inside what
+/// should be one opaque segment (`payments\..\admin` resolved to
+/// `/admin/queues/admin/pause`). `%` is here so a caller-supplied `%2e` cannot
+/// become a dot-segment; the LITERAL `.`/`..` forms cannot be encoded away at
+/// all and are rejected instead — see `is_url_dot_segment`.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -24,7 +44,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'`')
     .add(b'{')
     .add(b'}')
-    .add(b'/');
+    .add(b'/')
+    .add(b'\\');
 
 /// Top-level CLI arguments for the `harvest` binary.
 #[derive(Debug, Parser)]
@@ -74,6 +95,66 @@ pub enum OutputFormat {
     Json,
 }
 
+/// `harvest backup` subcommands (issue #943).
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    /// Verify a restored (scratch) snapshot is resumable.
+    Verify {
+        /// A scratch-database DSN to inspect. Repeat once per shard. Accepts a
+        /// bare DSN or an explicit `<shard_id>=<dsn>` pair. An unprefixed DSN
+        /// takes its POSITIONAL index as its shard id (first `--shard` is
+        /// shard `0`, second is shard `1`, ...) — so prefix explicitly
+        /// whenever your shard ids are not `0..n`.
+        ///
+        /// Supply EVERY shard: a cross-shard reference into a shard that was
+        /// not supplied is reported as an advisory, never silently passed.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// A live (production) DSN to guard against. When a `--shard` target
+        /// resolves to the same `(host, port, database)`, the run is refused
+        /// unless `--i-know-this-is-scratch` is passed.
+        ///
+        /// Repeat once per live shard: a fleet whose other shards are not
+        /// named here is NOT guarded against, and the run warns saying so.
+        #[arg(
+            long = "live-dsn",
+            value_name = "DSN",
+            env = "HARVEST_DATABASE_URL",
+            hide_env_values = true
+        )]
+        live_dsn: Vec<String>,
+
+        /// Acknowledge that every `--shard` target is a throwaway scratch copy,
+        /// overriding the live-DSN guard.
+        #[arg(long, default_value_t = false)]
+        i_know_this_is_scratch: bool,
+
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: BackupVerifyFormat,
+
+        /// How many non-terminal histories to sample and replay per shard.
+        #[arg(long, default_value_t = 50)]
+        replay_sample: usize,
+
+        /// Worker-heartbeat staleness threshold, in seconds, for the
+        /// dead-worker and broken-session probes.
+        #[arg(long, default_value_t = 60)]
+        worker_stale_secs: i64,
+
+        /// Rows read per coherence probe.
+        ///
+        /// For the cross-shard reference scan this is a *page* size, not a
+        /// ceiling: that scan pages through complete owner groups until the
+        /// shard is exhausted. Raise it only if the report says a single
+        /// execution carries more reference events than one page.
+        #[arg(long, default_value_t = 1000)]
+        probe_limit: i64,
+    },
+}
+
 /// Output format for the `det-check` subcommand (issue #778).
 ///
 /// This is a **local** flag (`--format`); it is deliberately distinct from the
@@ -84,6 +165,20 @@ pub enum DetCheckFormat {
     #[default]
     Text,
     /// Machine-readable `DetCheckReport` JSON for CI consumption.
+    Json,
+}
+
+/// Output format for the `schema check` subcommand (issue #794).
+///
+/// This is a **local** flag (`--format`); it is deliberately distinct from the
+/// global `--output` used for API responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum SchemaCheckFormat {
+    /// Human-readable `workflow.role: <field_path> — <verdict> — <reason>`
+    /// lines (default).
+    #[default]
+    Text,
+    /// Machine-readable diff JSON for CI consumption.
     Json,
 }
 
@@ -290,6 +385,42 @@ pub enum CliError {
         verdict: String,
     },
 
+    /// A queue pause/resume was only partially applied across the fleet.
+    #[error("queue mutation was only partially applied: {detail}")]
+    QueuePartialMutation {
+        /// Per-shard failure summary reported by the API.
+        detail: String,
+    },
+
+    /// An activity pause/resume was only partially applied across the fleet.
+    #[error("activity mutation was only partially applied: {detail}")]
+    ActivityPartialMutation {
+        /// Per-shard failure summary reported by the API.
+        detail: String,
+    },
+
+    /// A queue name would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid queue name '{value}': '.' and '..' are removed as dot-segments \
+         when the request URL is parsed, which would silently retarget the \
+         request at a different route"
+    )]
+    QueueNameDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
+    /// An activity name would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid activity name '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    ActivityNameDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
     /// Version-gate guard found active usage or incomplete shard inspection.
     #[error("version usage guard failed")]
     VersionUsageGate,
@@ -305,6 +436,17 @@ pub enum CliError {
     /// from an unsafe-handler-removal verdict.
     #[error("workflow-type reachability gate failed: {context}")]
     WorkflowReachabilityGate {
+        /// Human-readable cause: transport error string or verdict summary.
+        context: String,
+    },
+
+    /// Queue coverage found an uncovered task queue or an incomplete report.
+    ///
+    /// `context` carries either the original transport error (connection
+    /// failure, auth error, server 5xx) so operators can distinguish infra
+    /// misconfiguration from an unsafe-deploy verdict (issue #774).
+    #[error("queue coverage gate failed: {context}")]
+    QueueCoverageGate {
         /// Human-readable cause: transport error string or verdict summary.
         context: String,
     },
@@ -340,6 +482,155 @@ pub enum CliError {
         /// Number of `Warning`-severity findings.
         warnings: usize,
     },
+
+    /// `backup verify` found a broken invariant in the restored snapshot
+    /// (issue #943). Exit code is `1`.
+    ///
+    /// The report itself is already printed; this only carries the count so
+    /// `main` can exit with the right code.
+    #[error(
+        "backup verify: {findings} incoherent finding(s) — DO NOT START WORKERS on this \
+         restore. See the report above and docs/runbooks/backup-restore.md."
+    )]
+    RestoreIncoherent {
+        /// Number of `Incoherent`-severity findings.
+        findings: usize,
+    },
+
+    /// `backup verify` could not complete every check, so the restore's
+    /// coherence could not be determined (issue #943). Exit code is `2`,
+    /// distinct from a determined failure, so CI can tell "broken" apart from
+    /// "unknown".
+    ///
+    /// Two causes: a shard that could not be connected to, and a probe that
+    /// could not run (canonically a missing table — an unmigrated database).
+    #[error(
+        "backup verify: UNDETERMINED — {unreachable_shards} shard(s) unreachable, \
+         {failed_probes} probe(s) could not run. Do not start workers on the strength \
+         of this report."
+    )]
+    RestoreUndetermined {
+        /// Number of shards that could not be reached.
+        unreachable_shards: usize,
+        /// Number of `Undetermined`-severity findings (probes that never ran).
+        failed_probes: usize,
+    },
+
+    /// `schema check` found a backward-incompatible payload-schema change
+    /// (issue #794).
+    ///
+    /// The diff itself is already printed to stdout; this only carries the
+    /// count so `main` can exit with the right code. Exit code is `1`, per the
+    /// issue's exit-code contract.
+    #[error(
+        "schema check: {breaking} breaking schema change(s) would break replay of in-flight \
+         executions. Acknowledge a deliberate migration with `harvest schema update \
+         --acknowledge \"<why this is safe>\"`."
+    )]
+    SchemaContractBreaking {
+        /// Number of breaking deltas.
+        breaking: usize,
+    },
+
+    /// `schema check --acknowledged-in` found a breaking change the artifact
+    /// does not record (issue #794).
+    ///
+    /// The escape hatch is auditable by construction: absorbing a break writes
+    /// a justification into the artifact. This fires when the artifact moved
+    /// over a break with no such record — the shape a hand-edited baseline
+    /// takes, which the ordinary check cannot see because the artifact and the
+    /// generated contract already agree. Exit code is `1`.
+    #[error(
+        "schema check: {missing} breaking schema change(s) since the previous revision of the \
+         artifact carry no acknowledgement:\n{detail}\nThe artifact appears to have absorbed a \
+         break without recording why. Regenerate it with `harvest schema update --acknowledge \
+         \"<why this is safe>\"` instead of editing it by hand."
+    )]
+    SchemaContractUnacknowledged {
+        /// Number of breaking deltas with no covering record.
+        missing: usize,
+        /// One line per unrecorded break.
+        detail: String,
+    },
+
+    /// The acknowledgement log lost a record it previously carried.
+    ///
+    /// The log is append-only, and the coverage check above leans on that: it
+    /// subtracts the records the previous revision already had, so a stale one
+    /// cannot cover a fresh break. Retargeting an existing record — editing the
+    /// break it names rather than appending — defeats that subtraction, and is
+    /// invisible to both the ordinary diff and the coverage check. A vanished
+    /// record is its one observable signature. Exit code is `1`.
+    #[error(
+        "schema check: {dropped} acknowledgement record(s) present in the previous revision of \
+         the artifact are missing now:\n{detail}\nThe acknowledgement log is append-only. Restore \
+         the record(s) and append a new one with `harvest schema update --acknowledge \
+         \"<why this is safe>\"` instead of editing an existing entry."
+    )]
+    SchemaContractAuditLogRewritten {
+        /// Number of records the previous revision carried that are now gone.
+        dropped: usize,
+        /// One line per vanished record.
+        detail: String,
+    },
+
+    /// `debug replay` was given a breakpoint that never matched (issue #949).
+    ///
+    /// The trace overview is already printed to stdout; this only signals the
+    /// exit code. Exit code is `1`.
+    #[error("debug replay: breakpoint never hit")]
+    DebugBreakpointMissed,
+
+    /// `debug replay --step N` was given an index past the end of the trace
+    /// (issue #949). Exit code is `1`.
+    #[error("debug replay: step {index} is out of range (trace has {len} steps)")]
+    DebugStepOutOfRange {
+        /// The requested step index.
+        index: usize,
+        /// How many steps the trace actually has.
+        len: usize,
+    },
+
+    /// `debug diff` found a divergence (issue #949).
+    ///
+    /// The report itself is already printed to stdout; this only signals the
+    /// exit code. Mirrors `diff(1)`: exit `1` means "differences found", not
+    /// "the tool failed". Exit code is `1`.
+    #[error("debug diff: traces diverge at step {step_index}")]
+    DebugDivergence {
+        /// The step index at which the two traces first differ.
+        step_index: usize,
+    },
+
+    /// `debug diff` compared only a **prefix** of the two traces because at
+    /// least one was capped by `max_steps`, and found no difference in it
+    /// (issue #949).
+    ///
+    /// This is deliberately *not* exit `0`. "No difference in the part we
+    /// looked at" is not "these agree", and a CI gate that treats it as a pass
+    /// is silently trusting an unexamined suffix. Exit code is `2`, joining
+    /// the other "could not determine" gates (`WorkflowReachabilityGate`,
+    /// `QueueCoverageGate`, `RestoreUndetermined`) so a script can tell it
+    /// apart from `1` = "differences found".
+    #[error("debug diff: inconclusive — {reason} (compared {examined} steps)")]
+    DebugDiffInconclusive {
+        /// How many steps were actually compared.
+        examined: usize,
+        /// Why the comparison could not reach a verdict. Distinguishes an
+        /// unexamined suffix (a `--max-steps` cap) from two builds that both
+        /// failed to replay, which agree only because neither answered.
+        reason: &'static str,
+    },
+
+    /// A terminal operation failed while running the interactive stepper
+    /// (issue #949). Exit code is `1`.
+    #[error("debug replay: terminal {op} failed: {reason}")]
+    DebugTerminal {
+        /// The terminal operation that failed.
+        op: &'static str,
+        /// The underlying error, rendered.
+        reason: String,
+    },
 }
 
 impl CliError {
@@ -348,13 +639,80 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::PreflightGate { status } if status == "warn" => 2,
-            // Issue #520: the reachability gate uses exit code 2 specifically so
-            // CI can distinguish "an orphaned/partial deploy hazard" from a
-            // generic transport/usage failure (exit 1).
-            Self::WorkflowReachabilityGate { .. } => 2,
+            // Issue #520 / #774: both the workflow-reachability gate and the
+            // queue-coverage gate use exit code 2 specifically so CI can
+            // distinguish "an orphaned/partial/uncovered deploy hazard" from
+            // a generic transport/usage failure (exit 1).
+            //
+            // Issue #943 joins them for the same reason: "could not determine"
+            // (a shard was unreachable) must be distinguishable from
+            // "determined broken" (exit 1), so an operator drill script can
+            // retry a transient shard outage rather than declare the restore
+            // unusable.
+            //
+            // Issue #949's `debug diff` joins them on the same reasoning: a
+            // capped comparison examined only a prefix, so "inconclusive" must
+            // be distinguishable from `1` = "differences found" and from
+            // `0` = "compared in full and agree".
+            Self::WorkflowReachabilityGate { .. }
+            | Self::QueueCoverageGate { .. }
+            | Self::RestoreUndetermined { .. }
+            | Self::DebugDiffInconclusive { .. } => 2,
             _ => 1,
         }
     }
+}
+
+/// `harvest debug` subcommands (issue #949).
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Step through a recorded history, with optional breakpoints.
+    Replay {
+        /// Path to an exported `HistorySnapshot` JSON file.
+        #[arg(value_name = "HISTORY")]
+        history: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (the full `ReplayTrace`).
+        #[arg(long, value_enum, default_value_t)]
+        format: crate::debug::DebugFormat,
+        /// Jump straight to this step index and inspect it.
+        #[arg(long, value_name = "N", conflicts_with_all = ["break_at_event_type", "break_at_index", "break_at_activity", "break_at_signal"])]
+        step: Option<usize>,
+        /// Run to the first step whose event type matches.
+        #[arg(long, value_name = "TYPE", conflicts_with_all = ["break_at_index", "break_at_activity", "break_at_signal"])]
+        break_at_event_type: Option<String>,
+        /// Run to this exact event index.
+        #[arg(long, value_name = "N", conflicts_with_all = ["break_at_activity", "break_at_signal"])]
+        break_at_index: Option<usize>,
+        /// Run to the first step that schedules this activity.
+        #[arg(long, value_name = "NAME", conflicts_with = "break_at_signal")]
+        break_at_activity: Option<String>,
+        /// Run to the first step that receives (or waits for) this signal.
+        #[arg(long, value_name = "NAME")]
+        break_at_signal: Option<String>,
+        /// Cap the number of steps materialised (guards a pathological history).
+        #[arg(long, value_name = "N")]
+        max_steps: Option<usize>,
+        /// Open the interactive stepper instead of printing.
+        #[arg(long, default_value_t = false, conflicts_with = "format")]
+        tui: bool,
+    },
+    /// Diff two recorded histories and report the first divergence.
+    ///
+    /// Exits `1` when a divergence is found, mirroring `diff(1)`, so this is
+    /// usable directly as a CI gate.
+    Diff {
+        /// The baseline history (the "old build" recording).
+        #[arg(value_name = "LEFT")]
+        left: PathBuf,
+        /// The candidate history (the "new build" recording).
+        #[arg(value_name = "RIGHT")]
+        right: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (the full `TraceDiff`).
+        #[arg(long, value_enum, default_value_t)]
+        format: crate::debug::DebugFormat,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -423,6 +781,18 @@ enum Commands {
         #[command(subcommand)]
         command: RetentionCommand,
     },
+    /// Hold or release dispatch on a named task queue (issue #619).
+    #[command(alias = "queues")]
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+    /// Hold or release dispatch for a single activity type (issue #807).
+    #[command(alias = "activities")]
+    Activity {
+        #[command(subcommand)]
+        command: ActivityCommand,
+    },
     /// Inspect cluster-wide per-activity concurrency caps.
     Concurrency {
         #[command(subcommand)]
@@ -433,6 +803,13 @@ enum Commands {
     RateLimit {
         #[command(subcommand)]
         command: RateLimitCommand,
+    },
+    /// Manage workflow-start throttles (issue #607, TTL'd overrides added
+    /// in issue #945).
+    #[command(alias = "throttles")]
+    Throttle {
+        #[command(subcommand)]
+        command: ThrottleCommand,
     },
     /// Manage batch operations.
     Batch {
@@ -593,6 +970,21 @@ enum Commands {
         #[command(subcommand)]
         command: BuildRoutingCommand,
     },
+    /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
+    ///
+    /// Read-only against every supplied scratch database: each connection is
+    /// pinned `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`, so
+    /// Postgres itself rejects any write. Never mutates the production
+    /// database, never starts a worker, and never applies a reclaim -- the
+    /// scanners' work is *reported*, not performed.
+    ///
+    /// Exit codes: `0` clean or resumable-with-reclaim; `1` incoherent (do not
+    /// start workers); `2` undetermined (a shard was unreachable).
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+
     /// Statically check source for non-determinism reachable from `#[workflow]`
     /// bodies, including one first-party helper hop (issue #778).
     ///
@@ -620,6 +1012,32 @@ enum Commands {
         list_suppressions: bool,
     },
 
+    /// Time-travel replay debugger for a recorded workflow history (issue #949).
+    ///
+    /// Read-only and entirely local: no HTTP, no database, no activity
+    /// execution. Operates on the `HistorySnapshot` JSON written by
+    /// `harvest history export`, so a production history is debugged offline.
+    ///
+    /// The shipped binary cannot link your `#[workflow]` handlers, so this
+    /// command covers the handler-free surface: stepping, breakpoints,
+    /// inspection, and diffing two fixture histories. For per-step pending
+    /// commands and for diffing two workflow-code registrations, use
+    /// `autumn_harvest::debugger::ReplayDebugger` from a test or binary in your
+    /// own crate.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+
+    /// Gate backward-incompatible workflow payload-schema changes (issue #794).
+    ///
+    /// Read-only file comparison: no database, no network.
+    Schema {
+        /// `check` (gate) or `update` (regenerate the baseline).
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+
     /// Scaffold a new, runnable autumn-harvest project (issue #692).
     ///
     /// Emits a complete crate — a `Cargo.toml` with crates.io deps and the `db`
@@ -644,6 +1062,81 @@ enum Commands {
         /// Template to emit. Currently only `minimal` ships.
         #[arg(long, value_enum, default_value_t)]
         template: ScaffoldTemplate,
+    },
+}
+
+/// Workflow payload-schema contract subcommands (issue #794).
+///
+/// Both are pure local file comparison — no database, no network. `--current`
+/// is the schema set your app publishes *right now*; generate it with a
+/// three-line binary in your own crate (the only place the registry is in
+/// scope), or pipe `GET /workflows/registered` straight in.
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Compare the current published schemas against the checked-in baseline
+    /// and fail on any backward-incompatible change.
+    ///
+    /// Exits `0` when every delta is compatible, `1` when any delta is
+    /// breaking from the replay-read perspective.
+    Check {
+        /// Checked-in baseline artifact.
+        #[arg(long, value_name = "PATH", default_value = autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)]
+        baseline: PathBuf,
+        /// Currently published schemas: a generated contract, or a raw
+        /// `GET /workflows/registered` response body.
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (per-type, per-field verdict and reason).
+        #[arg(long, value_enum, default_value_t)]
+        format: SchemaCheckFormat,
+        /// Fail on ANY unabsorbed delta, not only a breaking one.
+        ///
+        /// Without this the artifact is allowed to lag: a compatible change
+        /// passes and nobody regenerates it, so the baseline records what was
+        /// deployed *some time ago* while the gate reads it as what was deployed
+        /// *last*. That gap round-trips — add an enum variant (compatible, so
+        /// nothing is absorbed), deploy and record payloads carrying it, then
+        /// remove it again, and the generated contract equals the stale baseline
+        /// while replay of the intermediate release's data fails. Use it in CI;
+        /// the fix is always `harvest schema update`.
+        #[arg(long, default_value_t = false, conflicts_with = "acknowledged_in")]
+        require_current: bool,
+        /// Verify the ESCAPE HATCH instead of the artifact's freshness.
+        ///
+        /// Pass the artifact as it stands now, with `--baseline` pointing at the
+        /// PREVIOUS revision of it (e.g. `git show <base>:<path>`). Every
+        /// breaking delta must then be covered by an acknowledgement that is new
+        /// in this artifact — which catches a baseline hand-edited to absorb a
+        /// break silently, something the ordinary check cannot see because the
+        /// artifact and the generated contract already agree. Also enforces that
+        /// the acknowledgement log is append-only: a record the previous
+        /// revision carried and this one does not is reported, since retargeting
+        /// an existing record would otherwise read as fresh coverage.
+        #[arg(long, value_name = "PATH")]
+        acknowledged_in: Option<PathBuf>,
+    },
+
+    /// Regenerate the checked-in baseline from the current schemas.
+    ///
+    /// A breaking delta is **refused** unless `--acknowledge` records why it is
+    /// safe; the justification is written into the artifact, so the
+    /// acknowledgement is visible in the checked-in diff and never silent.
+    Update {
+        /// Baseline artifact to rewrite in place.
+        #[arg(long, value_name = "PATH", default_value = autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)]
+        baseline: PathBuf,
+        /// Currently published schemas (see `check --current`).
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        /// Why each breaking change is safe (e.g. "in-flight runs drained;
+        /// pinned by build routing #171"). Required when any delta is breaking.
+        #[arg(long, value_name = "REASON")]
+        acknowledge: Option<String>,
+        /// Where the migration is written up — a changelog fragment, PR, or
+        /// runbook. Recorded alongside the justification.
+        #[arg(long, value_name = "REF")]
+        recorded_in: Option<String>,
     },
 }
 
@@ -750,6 +1243,61 @@ enum HistoryCommand {
         #[arg(long, value_name = "PATH")]
         output_file: Option<PathBuf>,
     },
+    /// Export a stratified sample of IN-FLIGHT histories as a replay bundle.
+    ///
+    /// Takes at most `--per-workflow` non-terminal executions per registered
+    /// workflow type across every shard and writes one JSON fixture per
+    /// execution into `--output-dir`, alongside a
+    /// `harvest-sample-manifest.json` reporting how many were sampled versus
+    /// how many are actually in flight. Feed the directory to
+    /// `WorkflowReplayer::replay_bundle` in CI to block promotion of a build
+    /// that would diverge on in-flight work (issue #798).
+    ExportSample {
+        /// Directory to write the replay bundle into. Created if absent.
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        /// Maximum executions to sample per workflow type (clamped to 500).
+        #[arg(long, default_value_t = autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE)]
+        per_workflow: usize,
+        /// Non-terminal states to sample. Repeatable or comma-separated.
+        /// Defaults to RUNNING,PAUSED. A terminal state is rejected.
+        #[arg(long, value_name = "STATE")]
+        states: Vec<String>,
+        /// Restrict the sample to a single registered workflow type.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Which end of each type's in-flight population to sample.
+        #[arg(long, value_enum, default_value = "oldest")]
+        order: HistorySampleOrder,
+        /// Restrict inspection to one shard.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Payload policy. `full` emits sensitive replay fixtures; `redacted` is safer for sharing.
+        #[arg(long, value_enum, default_value = "redacted")]
+        payload_policy: HistoryExportPayloadPolicy,
+        /// Maximum serialized size per exported history in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+}
+
+/// Which end of each workflow type's in-flight population to sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HistorySampleOrder {
+    /// The longest-running in-flight executions — the ones most likely to span
+    /// a code change, and therefore the highest-signal drift sample.
+    Oldest,
+    /// The most recently started in-flight executions.
+    Newest,
+}
+
+impl HistorySampleOrder {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Oldest => "oldest",
+            Self::Newest => "newest",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -927,6 +1475,15 @@ enum WorkflowCommand {
         /// stalled-workflow results. Only meaningful with --no-progress-minutes.
         #[arg(long)]
         include_sleeping: bool,
+        /// Operator early-warning discovery for workflow history bloat (issue
+        /// #704): return only live (non-terminal) executions whose current
+        /// recorded event count is at least this many, sorted by history size
+        /// descending. Distinct from the server's general-purpose
+        /// `min_history_events` filter (issue #493, not currently CLI-exposed),
+        /// which composes with `--state`/pagination and does not restrict to
+        /// live executions or force this sort order.
+        #[arg(long = "history-bloat-min-events")]
+        history_bloat_min_events: Option<u64>,
         /// Filter by workflow-start provenance (issue #740): one of api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
         /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
@@ -991,6 +1548,71 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Read the durable per-execution author log lines a workflow emitted via
+    /// `ctx.logger()` / `ctx.log_info` / `log_warn` / `log_error`.
+    ///
+    /// Requires the opt-in durable sink
+    /// (`HarvestBuilder::workflow_log_persistence`); with it disabled every
+    /// execution returns an empty list. Lines are observational only: they are
+    /// not part of the event history and are never replayed.
+    Logs {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Only show lines at this level. Repeat, or comma-separate, to allow
+        /// several. One of: info, warn, error.
+        #[arg(long = "level")]
+        level: Vec<String>,
+        /// Page size (default 200, max 1000).
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Exclusive keyset cursor: the previous page's last `seq`.
+        #[arg(long)]
+        cursor: Option<i64>,
+        /// RFC 3339 exclusive lower bound on `occurred_at`.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Show the open awaitables an execution is parked on (pending activities,
+    /// unfired timers, awaited-but-unsent signals, pending children,
+    /// `await_condition` parks, pending updates), replay-derived.
+    Awaitables {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
+    /// Diagnose why one execution is stuck: a one-word health verdict plus the
+    /// discriminated root cause (no live worker on the queue, circuit open,
+    /// retry backoff, rate-limited, concurrency-deferred, queue paused,
+    /// awaiting a signal, sleeping on a timer, ...), in a single call.
+    ///
+    /// For a determinism verdict on a code change instead, see
+    /// `workflow replay-diagnosis`.
+    Diagnose {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Print the raw JSON body instead of the rendered verdict.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render the recursive descendant lineage tree for an execution across all
+    /// shards — the spawn topology of a saga or fan-out, annotated with each
+    /// descendant's state.
+    Tree {
+        /// Root workflow execution ID (may be any node in the tree; the
+        /// response is the subtree below it).
+        execution_id: String,
+        /// Print the per-state descendant roll-up instead of the tree.
+        #[arg(long)]
+        summary: bool,
+        /// Recursion depth cap below the root (1-50, default 20).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=50))]
+        max_depth: Option<u32>,
+        /// Total node cap including the root (1-10000, default 1000).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        max_nodes: Option<u32>,
+        /// Emit raw JSON instead of the default rendering.
+        #[arg(long)]
+        json: bool,
+    },
     /// Reconstruct the ordered continue-as-new run chain a workflow execution
     /// belongs to, resolvable from any member (origin, middle, or tail).
     RunChain {
@@ -1003,8 +1625,10 @@ enum WorkflowCommand {
     /// Replay a single execution's recorded history against the currently
     /// registered workflow handler and report a structured determinism verdict
     /// (clean, diverged, failed, not-registered, or not-replayable).
+    ///
+    /// For a stall root cause instead, see `workflow diagnose`.
     ReplayDiagnosis {
-        /// Workflow execution ID to diagnose.
+        /// Workflow execution ID to replay.
         execution_id: String,
     },
     /// List child workflow executions for a parent execution.
@@ -1079,6 +1703,16 @@ enum WorkflowCommand {
         /// Delay duration before starting the workflow (e.g. "10s", "5m").
         #[arg(long)]
         delay: Option<String>,
+        /// Pin this workflow to a concrete shard (issue #697). Mutually
+        /// exclusive with `--residency-key`. An unknown or drained shard is
+        /// rejected with `400`, never silently re-hashed.
+        #[arg(long, value_name = "SHARD", conflicts_with = "residency_key")]
+        shard_id: Option<i32>,
+        /// Pin this workflow via an operator-declared residency key (issue
+        /// #697), e.g. `eu`. Mutually exclusive with `--shard-id`. An
+        /// undeclared key is rejected with `400`.
+        #[arg(long, value_name = "KEY")]
+        residency_key: Option<String>,
     },
     /// Cancel a workflow execution.
     Cancel {
@@ -1105,6 +1739,38 @@ enum WorkflowCommand {
     Resume {
         /// Workflow execution ID.
         execution_id: String,
+    },
+    /// Set, update, or clear an execution's operator-mutable triage tags:
+    /// owner, severity, and a free-text note (issue #759).
+    ///
+    /// A plain metadata update on the execution row -- appends no workflow
+    /// event, is never read by the workflow function, and has zero
+    /// replay-determinism impact; distinct from author-controlled
+    /// `search_attrs`. `owner`/`severity` set this way are immediately
+    /// reflected in `harvest workflow list --owner ... --severity ...`.
+    /// Works on any lifecycle state (RUNNING, PAUSED, FAILED, COMPLETED,
+    /// ...). Idempotent: re-running with the same flags is a no-op.
+    Annotate {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// New owner (e.g. a team or on-call handle).
+        #[arg(long, conflicts_with = "clear_owner")]
+        owner: Option<String>,
+        /// Clear the owner (sends an explicit JSON null).
+        #[arg(long)]
+        clear_owner: bool,
+        /// New severity/priority label (freeform, e.g. "P1").
+        #[arg(long, conflicts_with = "clear_severity")]
+        severity: Option<String>,
+        /// Clear the severity (sends an explicit JSON null).
+        #[arg(long)]
+        clear_severity: bool,
+        /// New free-text triage note.
+        #[arg(long, conflicts_with = "clear_note")]
+        note: Option<String>,
+        /// Clear the note (sends an explicit JSON null).
+        #[arg(long)]
+        clear_note: bool,
     },
     /// Erase PII payload fields from a completed workflow execution (GDPR Art. 17).
     ///
@@ -1164,6 +1830,35 @@ enum WorkflowCommand {
         /// Validate and print the reset plan without committing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Re-run a terminal workflow execution as a brand-new run.
+    ///
+    /// The complement to `reset`: reset forks an execution mid-history so the
+    /// surviving prefix is replayed, whereas a re-run replays nothing — it
+    /// starts the whole workflow over from the source run's recorded start
+    /// parameters (input, queue, memo, search attributes, timeouts, SLA,
+    /// owner/severity, context headers, retry policy, completion callbacks).
+    /// The source must be terminal (`COMPLETED`, `FAILED`, `CANCELLED`,
+    /// `TIMED_OUT`, `TERMINATED`); a `RUNNING`/`PAUSED` or already-sealed
+    /// `CONTINUED_AS_NEW` source is rejected. Admin-only, and NOT idempotent —
+    /// re-running the default way seals the source to `CONTINUED_AS_NEW` to
+    /// free its business key, so a second identical call returns `409`.
+    Rerun {
+        /// Workflow execution ID of the terminal source run.
+        execution_id: String,
+        /// Inline JSON input override for the new run. Omit to clone the
+        /// source's stored input verbatim; required when the source's input
+        /// has been erased.
+        #[arg(long, conflicts_with = "input_file")]
+        input_json: Option<String>,
+        /// File containing the JSON input override. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "input_json")]
+        input_file: Option<PathBuf>,
+        /// Business-key override for the new run. Omit to reuse the source's
+        /// workflow ID, which seals the source to `CONTINUED_AS_NEW`; supplying
+        /// one starts under a different key and leaves the source untouched.
+        #[arg(long)]
+        workflow_id: Option<String>,
     },
     /// Send a signal to a workflow execution.
     Signal {
@@ -1597,6 +2292,113 @@ enum ConcurrencyCommand {
     Status,
 }
 
+/// Task-queue pause/resume (issue #619): hold dispatch on a whole queue while a
+/// downstream dependency is down, then thaw it.
+///
+/// A pause never fails, retries, or dead-letters work — held tasks stay
+/// `PENDING` and become claimable again the instant the queue is resumed, with
+/// the time they spent held credited back so the thaw does not retroactively
+/// schedule-to-start-time-out the backlog.
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Hold dispatch on a task queue.
+    Pause {
+        /// Task queue name.
+        queue_name: String,
+        /// Why the queue is being held (recorded on the pause row, surfaced by
+        /// `harvest queue list-paused` and the Vantage Workers page).
+        #[arg(long)]
+        reason: String,
+        /// Restrict the hold to one shard. Omit for a fleet-wide pause (the
+        /// default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// Release a held task queue; held tasks become immediately claimable.
+    Resume {
+        /// Task queue name.
+        queue_name: String,
+        /// Restrict the release to one shard. Omit for fleet-wide (the default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// List every currently-paused queue with its reason and held-task count.
+    #[command(alias = "list", alias = "status")]
+    ListPaused,
+    /// Report task queues with pending work but zero live workers polling
+    /// them (issue #774).
+    ///
+    /// Exits `2` when any queue is uncovered, or when the report is
+    /// incomplete (a shard was unreachable), so it can gate a deploy or
+    /// migration in CI.
+    Coverage {
+        /// Narrow the report to a single queue name.
+        #[arg(long = "queue")]
+        queue_name: Option<String>,
+        /// Output raw JSON instead of the summary table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Per-activity-type pause/resume (issue #807): the surgical sibling of the
+/// queue pause above.
+///
+/// Hold dispatch for ONE activity type while a scoped downstream dependency is
+/// down, leaving every other activity type on the same queue flowing. Held
+/// tasks stay `PENDING` — never failed, retried, or dead-lettered — and an
+/// already-running attempt finishes naturally. On resume the time each task
+/// spent held is credited back to its `scheduled_at`, so the thaw does not
+/// retroactively schedule-to-start-time-out the backlog.
+///
+/// Reach for `harvest queue pause` instead when the WHOLE queue must stop; for
+/// many affected activity types on one queue, one queue hold is easier to
+/// remember to release than N activity holds.
+#[derive(Debug, Subcommand)]
+enum ActivityCommand {
+    /// Hold dispatch for one activity type, fleet-wide.
+    Pause {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+        /// Why the activity is being held. Recorded on the pause row, surfaced
+        /// by `harvest activity list`, and carried into the audit trail — which
+        /// is the reason's only permanent home, since resume deletes the row.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Operator identity to record as `paused_by`. A LABEL for attribution,
+        /// not authentication: the audit row always carries the authenticated
+        /// actor, so this can never rewrite the security trail.
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Release a held activity type; held tasks become immediately claimable.
+    Resume {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+    },
+    /// List registered activity types with their pause state and held backlog.
+    ///
+    /// Driven by the registered catalogue, not the pause table, so a healthy
+    /// activity is listed with `paused: false` — this is the surface used to
+    /// answer "is `charge_card` held?" during an incident. A paused-but-
+    /// unregistered activity is listed too, flagged `registered: false`, so a
+    /// mistyped hold can never become invisible here.
+    #[command(alias = "list-paused", alias = "status")]
+    List {
+        /// Print the raw JSON body instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one activity type's pause state.
+    ///
+    /// Exits non-zero when the name is neither registered nor paused anywhere
+    /// the read could reach (HTTP 404).
+    Get {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+    },
+}
+
 /// Per-execution legal hold (issue #747): exempt an execution's history from
 /// retention deletion and PII erasure until released or auto-expired.
 #[derive(Debug, Subcommand)]
@@ -1635,6 +2437,80 @@ enum RateLimitCommand {
         /// Maximum capacity of the token bucket.
         #[arg(long)]
         burst: f64,
+    },
+    /// Set (or replace) a TTL'd runtime pacing override on top of a
+    /// declared per-activity rate limit (issue #945).
+    ///
+    /// Takes effect on the existing token-consumption path immediately,
+    /// with no worker restart; self-expires and reverts to the declared
+    /// baseline at the TTL with no further operator action. Each call
+    /// fully replaces the whole override.
+    Override {
+        /// Name of a registered activity that declares a static
+        /// (non-dynamic) rate limit.
+        activity_name: String,
+        /// Overridden token refill rate per second. At least one of
+        /// --refill-rate/--burst must be set.
+        #[arg(long)]
+        refill_rate: Option<f64>,
+        /// Overridden token bucket burst capacity. At least one of
+        /// --refill-rate/--burst must be set.
+        #[arg(long)]
+        burst: Option<f64>,
+        /// Seconds until the override self-expires and the declared
+        /// baseline resumes. Must be greater than zero and not exceed the
+        /// server-side cap (24h).
+        #[arg(long)]
+        ttl_secs: u64,
+    },
+    /// Clear a TTL'd runtime pacing override before its TTL elapses,
+    /// immediately reverting to the declared baseline with no worker
+    /// restart (issue #945).
+    Clear {
+        /// Name of a registered activity whose pacing override should be
+        /// cleared.
+        activity_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThrottleCommand {
+    /// Show the per-(`workflow_name`, `throttle_key`) deferred-start
+    /// backlog across all shards, including any active TTL'd pacing
+    /// override (issue #607, issue #945).
+    Status,
+    /// Set (or replace) a TTL'd runtime pacing override on top of a
+    /// declared workflow-start throttle (issue #945, extends issue #607).
+    ///
+    /// Takes effect on the existing token-consumption path immediately,
+    /// with no worker restart; self-expires and reverts to the declared
+    /// baseline at the TTL with no further operator action. Each call
+    /// fully replaces the whole override.
+    Override {
+        /// Name of a registered workflow that declares a static
+        /// (non-dynamic) start throttle.
+        workflow_name: String,
+        /// Overridden token refill rate per second. At least one of
+        /// --refill-per-sec/--burst must be set.
+        #[arg(long)]
+        refill_per_sec: Option<f64>,
+        /// Overridden token bucket burst capacity. At least one of
+        /// --refill-per-sec/--burst must be set.
+        #[arg(long)]
+        burst: Option<f64>,
+        /// Seconds until the override self-expires and the declared
+        /// baseline resumes. Must be greater than zero and not exceed the
+        /// server-side cap (24h).
+        #[arg(long)]
+        ttl_secs: u64,
+    },
+    /// Clear a TTL'd runtime pacing override before its TTL elapses,
+    /// immediately reverting to the declared baseline with no worker
+    /// restart (issue #945).
+    Clear {
+        /// Name of a registered workflow whose pacing override should be
+        /// cleared.
+        workflow_name: String,
     },
 }
 
@@ -1995,8 +2871,11 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::CompletionDelivery { command } => Ok(completion_delivery_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
+            Commands::Queue { command } => queue_request(command),
+            Commands::Activity { command } => activity_request(command),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
+            Commands::Throttle { command } => Ok(throttle_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
@@ -2056,8 +2935,17 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
+            Commands::Backup { .. } => {
+                unreachable!("Backup handles its own execution locally")
+            }
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
+            }
+            Commands::Debug { .. } => {
+                unreachable!("Debug handles its own execution locally")
+            }
+            Commands::Schema { .. } => {
+                unreachable!("Schema handles its own execution locally")
             }
             Commands::New { .. } => {
                 unreachable!("New handles its own execution locally")
@@ -2117,6 +3005,8 @@ impl ApiRequest {
     }
 }
 
+pub mod debug;
+pub mod debug_tui;
 pub mod tui;
 
 /// Run the CLI, print successful response data to stdout, and return errors.
@@ -2126,10 +3016,38 @@ pub mod tui;
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
 // A dispatcher: a sequence of `if let ... return` guards for locally-handled
-// commands (det-check, tui, events, worker-drain-wait, token bootstrap) followed
+// commands (det-check, schema, new, tui, debug, events, worker-drain-wait,
+// backup verify, token bootstrap) followed
 // by the shared execute/render path. Splitting it would only scatter the guards.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
+    // `backup verify` talks to scratch databases directly (read-only), not to
+    // the management API: no HTTP, handled in-process (mirrors DetCheck).
+    if let Commands::Backup {
+        command:
+            BackupCommand::Verify {
+                shards,
+                live_dsn,
+                i_know_this_is_scratch,
+                format,
+                replay_sample,
+                worker_stale_secs,
+                probe_limit,
+            },
+    } = &cli.command
+    {
+        return run_backup_verify(
+            shards,
+            live_dsn,
+            *i_know_this_is_scratch,
+            *format,
+            *replay_sample,
+            *worker_stale_secs,
+            *probe_limit,
+        )
+        .await;
+    }
+
     // det-check is read-only local source analysis: no HTTP, handled entirely
     // in-process before the API execute path (mirrors the Tui early-return).
     if let Commands::DetCheck {
@@ -2140,6 +3058,70 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
+    // `debug` is a read-only local history analysis: no HTTP, no DB, no
+    // activity execution (mirrors DetCheck).
+    if let Commands::Debug { command } = &cli.command {
+        return match command {
+            DebugCommand::Replay {
+                history,
+                format,
+                step,
+                break_at_event_type,
+                break_at_index,
+                break_at_activity,
+                break_at_signal,
+                max_steps,
+                tui,
+            } => crate::debug::run_replay(
+                history,
+                *format,
+                *step,
+                break_at_event_type.as_deref(),
+                *break_at_index,
+                break_at_activity.as_deref(),
+                break_at_signal.as_deref(),
+                *max_steps,
+                *tui,
+            ),
+            DebugCommand::Diff {
+                left,
+                right,
+                format,
+            } => crate::debug::run_diff(left, right, *format),
+        };
+    }
+
+    // `schema` is read-only local file comparison: no HTTP, no DB (mirrors
+    // DetCheck).
+    if let Commands::Schema { command } = &cli.command {
+        return match command {
+            SchemaCommand::Check {
+                baseline,
+                current,
+                format,
+                require_current,
+                acknowledged_in,
+            } => run_schema_check(
+                baseline,
+                current,
+                *format,
+                *require_current,
+                acknowledged_in.as_deref(),
+            ),
+            SchemaCommand::Update {
+                baseline,
+                current,
+                acknowledge,
+                recorded_in,
+            } => run_schema_update(
+                baseline,
+                current,
+                acknowledge.as_deref(),
+                recorded_in.as_deref(),
+            ),
+        };
     }
 
     // `new` is pure local file generation: no HTTP, no DB (mirrors DetCheck).
@@ -2210,23 +3192,48 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                     context: err.to_string(),
                 });
             }
+            // Issue #774: same fail-closed convention as the reachability gate
+            // above -- a transport error on a queue-coverage deploy gate must
+            // also read as "deploy hazard" (exit 2), not a generic error (exit 1).
+            if queue_coverage_should_gate(&cli) {
+                return Err(CliError::QueueCoverageGate {
+                    context: err.to_string(),
+                });
+            }
             return Err(err);
         }
     };
-    let rendered = render_response(&cli, &response)?;
     // Issue #756: a degraded cross-shard read carries its partial-availability
     // warning on STDERR, keeping STDOUT a clean/parseable body (`-o json | jq`)
     // on both the happy and degraded paths. The operator still sees the warning.
     if let Some(notice) = fanout_partial_notice(&response) {
         eprintln!("{notice}");
     }
-    if let Some(path) = history_output_file(&cli) {
+    // `render_response` is deliberately called inside each arm rather than once
+    // up front: for a bundle export it produces a full pretty-printed copy of
+    // every sampled payload, which the default (non-JSON) arm then discards in
+    // favour of `summary`. `write_history_sample_bundle` is already serializing
+    // every fixture, so holding a second whole-response copy alongside it is
+    // what pushes a large export toward an OOM on a CI runner.
+    if let Some(dir) = history_sample_output_dir(&cli) {
+        // Issue #798: the sample export writes a replay BUNDLE (one fixture per
+        // sampled execution plus the coverage manifest), not a single blob, so
+        // the directory can be fed straight to `WorkflowReplayer::replay_bundle`.
+        // `-o json` still prints the raw response for scripting.
+        let summary = write_history_sample_bundle(&response, dir)?;
+        if cli.output == OutputFormat::Json {
+            println!("{}", render_response(&cli, &response)?);
+        } else {
+            print!("{summary}");
+        }
+    } else if let Some(path) = history_output_file(&cli) {
+        let rendered = render_response(&cli, &response)?;
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
             path: path.display().to_string(),
             source,
         })?;
     } else {
-        println!("{rendered}");
+        println!("{}", render_response(&cli, &response)?);
     }
     if matches!(cli.command, Commands::Preflight) {
         let exit_code = preflight_exit_code(&response);
@@ -2254,6 +3261,30 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 .to_string(),
         });
     }
+    if queue_coverage_should_gate(&cli) && queue_coverage_exit_code(&response) != 0 {
+        return Err(CliError::QueueCoverageGate {
+            context: "uncovered queue or incomplete shard report".to_string(),
+        });
+    }
+    if queue_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
+        let detail = response
+            .get("partial_failures")
+            .and_then(Value::as_str)
+            .unwrap_or("see response body")
+            .to_string();
+        return Err(CliError::QueuePartialMutation { detail });
+    }
+    // Same 207-is-2xx hazard as the queue mutation above, and the response
+    // carries the identical `ok`/`status` contract, so the same body-level gate
+    // applies: a hold that missed a shard must never look like success.
+    if activity_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
+        let detail = response
+            .get("partial_failures")
+            .and_then(Value::as_str)
+            .unwrap_or("see response body")
+            .to_string();
+        return Err(CliError::ActivityPartialMutation { detail });
+    }
     if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
         let verdict = response
             .get("verdict")
@@ -2274,6 +3305,380 @@ fn history_output_file(cli: &Cli) -> Option<&Path> {
         } => output_file.as_deref(),
         _ => None,
     }
+}
+
+// ── replay-drift sample bundle (issue #798) ─────────────────────────────────
+
+fn history_sample_output_dir(cli: &Cli) -> Option<&Path> {
+    match &cli.command {
+        Commands::History {
+            command: HistoryCommand::ExportSample { output_dir, .. },
+        } => Some(output_dir.as_path()),
+        _ => None,
+    }
+}
+
+/// One file to write into the replay bundle.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BundleFile {
+    /// File name, relative to the bundle directory.
+    pub name: String,
+    /// Serialized JSON contents.
+    pub contents: String,
+}
+
+/// Split a sample-export response into the files that make up a replay bundle.
+///
+/// Pure: no filesystem access, so the naming, manifest placement, and
+/// collision handling are unit-testable without a temp directory.
+///
+/// The manifest is written under the reserved
+/// [`SampleManifest::FILE_NAME`](autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+/// so `replay_bundle` reads it as coverage instead of trying to replay it as a
+/// fixture.
+///
+/// # Errors
+/// Returns [`CliError::InvalidInput`] when the response is not a sample-export
+/// body (missing `exports` array or `manifest` object) — better than writing a
+/// silently-empty bundle that a CI gate would then pass or fail for the wrong
+/// reason.
+pub fn history_sample_bundle_files(response: &Value) -> Result<Vec<BundleFile>, CliError> {
+    let exports = response
+        .get("exports")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::InvalidInput(
+                "sample export response is missing an `exports` array".to_string(),
+            )
+        })?;
+    let manifest = response.get("manifest").filter(|value| value.is_object());
+    let Some(manifest) = manifest else {
+        return Err(CliError::InvalidInput(
+            "sample export response is missing a `manifest` object".to_string(),
+        ));
+    };
+
+    let mut files = Vec::with_capacity(exports.len() + 1);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, export) in exports.iter().enumerate() {
+        let workflow_name = export
+            .get("workflow_name")
+            .and_then(Value::as_str)
+            .unwrap_or("workflow");
+        let execution_id = export
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut name =
+            autumn_harvest::replay_sample::fixture_file_name(workflow_name, execution_id);
+        // Sanitization can, in principle, map two distinct names onto one file.
+        // Overwriting would silently shrink the bundle and make the gate verify
+        // fewer fixtures than the manifest claims, so disambiguate instead.
+        if !seen.insert(name.clone()) {
+            name = format!("{index}-{name}");
+            seen.insert(name.clone());
+        }
+        files.push(BundleFile {
+            name,
+            contents: serde_json::to_string_pretty(export).map_err(|error| {
+                CliError::InvalidInput(format!("failed to serialize sample fixture: {error}"))
+            })?,
+        });
+    }
+
+    files.push(BundleFile {
+        name: autumn_harvest::replay_sample::SampleManifest::FILE_NAME.to_string(),
+        contents: serde_json::to_string_pretty(manifest).map_err(|error| {
+            CliError::InvalidInput(format!("failed to serialize sample manifest: {error}"))
+        })?,
+    });
+    Ok(files)
+}
+
+/// Render the operator-facing coverage table for a sample export.
+///
+/// Pure and separate from the write so the "how much of the fleet did this
+/// verify?" answer (AC2) is testable without touching disk.
+#[must_use]
+pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
+    let manifest = response.get("manifest");
+    let status = manifest
+        .and_then(|manifest| manifest.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let sampled_total = manifest
+        .and_then(|manifest| manifest.get("sampled_total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let in_flight_total = manifest
+        .and_then(|manifest| manifest.get("in_flight_total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "wrote {sampled_total} fixture(s) to {} (coverage: {status})",
+        dir.display()
+    );
+    let _ = writeln!(
+        out,
+        "sampled {sampled_total} of {in_flight_total} in-flight execution(s)"
+    );
+
+    if let Some(rows) = manifest
+        .and_then(|manifest| manifest.get("per_workflow"))
+        .and_then(Value::as_array)
+        && !rows.is_empty()
+    {
+        out.push_str("\nWORKFLOW                                 SAMPLED  IN FLIGHT  TRUNCATED\n");
+        for row in rows {
+            let name = row
+                .get("workflow_name")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let sampled = row.get("sampled").and_then(Value::as_u64).unwrap_or(0);
+            let total = row
+                .get("in_flight_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let truncated = if sampled < total { "yes" } else { "no" };
+            let _ = writeln!(out, "{name:<40} {sampled:>7}  {total:>9}  {truncated}");
+        }
+    }
+
+    // A partial sample is a lower bound: an operator must not read a green gate
+    // over it as "the whole fleet replays clean".
+    if status != "complete" {
+        out.push_str("\nWARNING: shard coverage is ");
+        out.push_str(status);
+        out.push_str("; this bundle is a LOWER BOUND on the in-flight fleet.\n");
+        if let Some(unavailable) = manifest
+            .and_then(|manifest| manifest.get("unavailable_shards"))
+            .and_then(Value::as_array)
+        {
+            for shard in unavailable {
+                if let Some(reason) = shard.as_str() {
+                    let _ = writeln!(out, "  unavailable: {reason}");
+                }
+            }
+        }
+    }
+    if sampled_total < in_flight_total {
+        out.push_str(
+            "NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.\n",
+        );
+    }
+    // Distinct from the NOTE above, and the distinction is what an operator acts
+    // on: that one reports the *intended* truncation of sampling `per_workflow`
+    // out of a larger population, this one an *unplanned* resource limit. Raising
+    // `--per-workflow` would make this strictly worse.
+    if manifest
+        .and_then(|manifest| manifest.get("truncated_by_size"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.push_str(
+            "\nWARNING: the export stopped early on the response byte budget, so this bundle \
+             is SMALLER than the sample you asked for. Narrow the export (fewer states, a \
+             single --shard-id, a lower --max-bytes) rather than raising --per-workflow.\n",
+        );
+    }
+
+    // A candidate the sample SELECTED but the export could not fetch. Reported
+    // separately from the byte-budget cut above because the fix differs: this
+    // one is per-document (`--max-bytes`), that one is request-wide. Both make
+    // the bundle a subset of the chosen slice, and both make the gate exit 2.
+    let dropped = manifest
+        .and_then(|manifest| manifest.get("export_failures"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if dropped > 0 {
+        let _ = write!(
+            out,
+            "\nWARNING: the export could not fetch {dropped} candidate(s) the sample \
+             selected (over --max-bytes, or an unreadable shard), so this bundle is a \
+             BIASED subset — biased against the largest histories, which are the \
+             longest-running and the most likely to span your change. The replay gate \
+             will refuse it (exit 2). Raise --max-bytes, or narrow the sample until \
+             every selected candidate fits.\n",
+        );
+    }
+
+    // A redacted bundle is refused by the replay gate (it rewrites the very
+    // activity inputs replay compares against, so every fixture would report a
+    // false divergence). The CLI default is `redacted`, so an operator who omits
+    // the flag writes an unusable bundle. Say so here, at write time, rather than
+    // letting them discover it as an exit-2 wall of BLOCKED lines later.
+    if bundle_is_redacted(response) {
+        out.push_str(
+            "\nWARNING: this bundle was exported with --payload-policy redacted, which the \
+             replay-drift gate REFUSES (redaction rewrites the activity inputs replay compares \
+             against). Re-export with `--payload-policy full`, and treat the result as \
+             production data.\n",
+        );
+    }
+    out
+}
+
+/// Whether `response` declares a redacted payload policy.
+///
+/// Reads the response's own top-level `payload_policy`, which the sample-export
+/// route echoes back from the request. That is authoritative and present even
+/// when `exports` is empty, so it beats sniffing the individual fixtures.
+///
+/// Absent or unrecognized reads as *not* redacted: a legacy response, or a
+/// future policy value, must never produce a spurious warning about a bundle the
+/// gate would happily replay.
+fn bundle_is_redacted(response: &Value) -> bool {
+    response.get("payload_policy").and_then(Value::as_str) == Some("redacted")
+}
+
+/// Write a replay bundle to `dir`, returning the operator summary.
+///
+/// # Errors
+/// Returns [`CliError::WriteOutput`] when the directory or a fixture cannot be
+/// written, or [`CliError::InvalidInput`] when the response is not a
+/// sample-export body.
+fn write_history_sample_bundle(response: &Value, dir: &Path) -> Result<String, CliError> {
+    let files = history_sample_bundle_files(response)?;
+    fs::create_dir_all(dir).map_err(|source| CliError::WriteOutput {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    clear_stale_bundle(dir)?;
+    for file in &files {
+        let path = dir.join(&file.name);
+        fs::write(&path, &file.contents).map_err(|source| CliError::WriteOutput {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(render_history_sample_summary(response, dir))
+}
+
+/// Remove a previous bundle's fixtures from `dir` so a re-export replaces it.
+///
+/// A fixture's file name embeds its execution id, so re-exporting does not
+/// overwrite the previous run's fixtures — it accumulates on top of them. The
+/// manifest has a fixed name and *is* overwritten, so the two end up describing
+/// different things: the manifest counts this run's sample while the directory
+/// holds every run's, and `replay_bundle` walks every `*.json` it finds. The
+/// gate would then verify executions that finished hours ago and report coverage
+/// numbers that never described them.
+///
+/// Scoped narrowly, because this deletes files in a path the caller chose:
+/// * A top-level manifest **that is a regular file** must be present — that is
+///   the marker identifying a directory this CLI wrote. A directory holding
+///   `*.json` with no such manifest is somebody else's and is **refused**, not
+///   cleaned; `--output-dir .` must never eat a user's files because they
+///   mistyped a path.
+/// * Every `*.json` entry the gate would replay is removed — at **any depth**,
+///   and whether it is a regular file or a **symlink** (the link is removed,
+///   never the file it points at). The predicate deliberately mirrors
+///   `testing::collect_json_files`: if the two walks disagree about what counts
+///   as a fixture, a leftover entry is replayed against the fresh manifest and
+///   reported as drift the candidate never caused.
+/// * Directories and every non-`.json` file are left alone.
+///
+/// # Errors
+/// [`CliError::InvalidInput`] when `dir` holds JSON that is not a Harvest
+/// bundle; [`CliError::WriteOutput`] when an entry cannot be read or removed.
+fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
+    let manifest_name = autumn_harvest::replay_sample::SampleManifest::FILE_NAME;
+    let mut json_entries = Vec::new();
+    let mut has_manifest = false;
+
+    // Walk exactly what the gate replays. `testing::collect_json_files`
+    // DESCENDS SUBDIRECTORIES, so a top-level-only clean would leave a nested
+    // fixture in place while the gate still replayed it — the new manifest
+    // would describe only the fresh top-level fixtures, and the stale nested
+    // one would surface as unrelated drift. That is precisely the false verdict
+    // this function exists to prevent, so the two walks must agree on depth as
+    // well as on the extension predicate.
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        let at_top_level = current == dir;
+        let entries = fs::read_dir(&current).map_err(|source| CliError::WriteOutput {
+            path: current.display().to_string(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| CliError::WriteOutput {
+                path: current.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            // `file_type` does not follow symlinks, so a symlinked directory is
+            // neither descended nor mistaken for a file.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                dirs_to_visit.push(path);
+                continue;
+            }
+            // Deliberately NOT `is_file()`. `testing::collect_json_files`
+            // decides what the GATE replays with the predicate "not a directory
+            // and ends in `.json`" — which a SYMLINK satisfies. Requiring a
+            // regular file here would leave a linked fixture behind for the
+            // replay walk to pick up, and the disagreement is a false verdict:
+            // the fresh manifest describes this run's sample while the
+            // directory still holds a previous run's, and the stale fixture
+            // surfaces as unrelated drift on an unchanged candidate.
+            //
+            // Containment depends on it too. `fs::write` FOLLOWS a symlink, so
+            // a leftover link whose name collides with a fixture about to be
+            // written sends that write outside the directory the operator
+            // named. Clearing the link first is what keeps the replace inside
+            // `--output-dir`; `fs::remove_file` removes the LINK, never the file
+            // it points at.
+            let is_manifest = entry.file_name().to_string_lossy() == manifest_name;
+            if is_manifest && kind.is_file() {
+                // Only a TOP-LEVEL manifest marks this directory as our bundle;
+                // a nested one is just a file we happen to skip (the replay walk
+                // excludes the reserved name at any depth, so it is never
+                // replayed and never needs deleting).
+                //
+                // The MARKER is held to a stricter rule than the fixtures it
+                // guards — a regular file, not merely a `.json` entry — because
+                // it is what AUTHORIZES deleting this directory's contents. A
+                // *linked* manifest is not evidence we wrote the directory, so
+                // it falls through to the `.json` branch below and blocks the
+                // replace instead of licensing it. That also keeps the manifest
+                // write itself contained, since it is a name we are about to
+                // `fs::write`.
+                if at_top_level {
+                    has_manifest = true;
+                }
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                json_entries.push(path);
+            }
+        }
+    }
+
+    if json_entries.is_empty() {
+        return Ok(());
+    }
+    if !has_manifest {
+        return Err(CliError::InvalidInput(format!(
+            "{} already contains {} .json file(s) but no {manifest_name}, so it is \
+             not a bundle written by this command. Refusing to overwrite it — \
+             point --output-dir at an empty or previously-exported directory.",
+            dir.display(),
+            json_entries.len(),
+        )));
+    }
+
+    for path in json_entries {
+        fs::remove_file(&path).map_err(|source| CliError::WriteOutput {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 // ── det-check (issue #778) ──────────────────────────────────────────────────
@@ -2478,6 +3883,723 @@ pub fn run_det_check(
     if let Some(err) = det_check_gate(&report, deny_warnings) {
         return Err(err);
     }
+    Ok(())
+}
+
+// ── harvest backup verify: post-restore resumability drill (issue #943) ─────
+
+/// Output format for `harvest backup verify`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BackupVerifyFormat {
+    /// Human-readable operator report (default).
+    #[default]
+    Text,
+    /// Machine-readable `RestoreVerifyReport` JSON for CI consumption.
+    Json,
+}
+
+/// Parse `--shard` values into [`ShardTarget`]s.
+///
+/// Accepts either a bare DSN (implicitly shard `0`, the single-shard default)
+/// or an explicit `<shard_id>=<dsn>` pair. Rejects an empty list and duplicate
+/// shard ids, since either would make the cross-shard verdict meaningless.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an empty list, a malformed shard id, an empty
+/// DSN, or a duplicated shard id.
+pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError> {
+    if raw.is_empty() {
+        return Err(CliError::InvalidInput(
+            "at least one --shard <DSN> (or --shard <ID>=<DSN>) is required".to_string(),
+        ));
+    }
+    let mut seen: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for (idx, spec) in raw.iter().enumerate() {
+        let spec = spec.trim();
+        // Only split on a `<digits>=` prefix: a DSN can legitimately contain
+        // `=` in its query string (`?sslmode=require`), so an unconditional
+        // `split_once('=')` would mangle a bare DSN.
+        let (shard_id, dsn) = match spec.split_once('=') {
+            Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+                let id = head.parse::<i32>().map_err(|_| {
+                    CliError::InvalidInput(format!("--shard: shard id `{head}` is out of range"))
+                })?;
+                (id, tail)
+            }
+            _ => (i32::try_from(idx).unwrap_or(0), spec),
+        };
+        // An `ExecutionId` carries its shard as `shard & 0xFFFF`, and `0xFFFF`
+        // is the reserved `ShardId::UNENCODED` sentinel -- so a value outside
+        // `0..=0xFFFE` does not survive the round trip. `65536` truncates to
+        // `0`, which would make every target id read out of THIS database
+        // decode as shard 0, miss the supplied map, and be written off as
+        // "on an uninspected shard": an advisory, exit 0, and the shard the
+        // operator supplied never actually checked. Validate with the same
+        // rule the shard router uses so the two cannot drift.
+        if !autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(shard_id)) {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard id `{shard_id}` cannot be encoded into an execution id \
+                 (valid range is 0..={})",
+                autumn_harvest::shard::MAX_ENCODABLE_SHARD
+            )));
+        }
+        if dsn.trim().is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard {shard_id} has an empty DSN"
+            )));
+        }
+        if !seen.insert(shard_id) {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard {shard_id} was supplied more than once"
+            )));
+        }
+        out.push(ShardTarget::new(shard_id, dsn.trim()));
+    }
+    Ok(out)
+}
+
+/// AC4: refuse to run against a DSN that resolves to the same database as the
+/// live configuration, unless the operator explicitly acknowledges otherwise.
+///
+/// Comparison is on `(host, port, database)` only, so a different user or
+/// password against the same database is still caught. The guard **fails
+/// closed**: a DSN that cannot be parsed is treated as a match.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when a target matches `live` and `ack` is false.
+/// The message names the override flag and never echoes a password.
+pub fn scratch_guard(dsns: &[String], live: &[String], ack: bool) -> Result<(), CliError> {
+    if ack || live.is_empty() {
+        return Ok(());
+    }
+    for dsn in dsns {
+        let candidate = strip_shard_prefix(dsn);
+        for l in live {
+            if dsn_targets_same_database(candidate, l) {
+                return Err(CliError::InvalidInput(format!(
+                    "refusing to verify `{}`: it resolves to the same database as the live \
+                     configuration. Restore into a scratch database first, or pass \
+                     --i-know-this-is-scratch if this really is a throwaway copy.",
+                    redact_dsn(candidate)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strip an optional `<shard_id>=` prefix from a `--shard` value.
+fn strip_shard_prefix(dsn: &str) -> &str {
+    match dsn.split_once('=') {
+        Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => tail,
+        _ => dsn,
+    }
+}
+
+/// The stderr notice to print when the live-DSN guard could not actually
+/// protect anything.
+///
+/// The guard is silent by design in two cases, and silence is the dangerous
+/// part: an operator who believes a safety net is engaged will point the
+/// command at whatever DSN is to hand. Say so out loud instead.
+///
+/// * No `--live-dsn` was supplied at all — nothing was compared.
+/// * `--i-know-this-is-scratch` was passed — the comparison was skipped.
+///
+/// Returns `None` when the guard genuinely ran against at least one live DSN.
+#[must_use]
+pub fn scratch_guard_warning(live: &[String], ack: bool) -> Option<String> {
+    if ack {
+        return Some(
+            "WARNING: --i-know-this-is-scratch was passed, so the live-database guard did \
+             NOT run. Nothing checked that these DSNs are scratch copies."
+                .to_string(),
+        );
+    }
+    if live.is_empty() {
+        return Some(
+            "WARNING: no --live-dsn was supplied (and HARVEST_DATABASE_URL is unset), so the \
+             live-database guard did NOT run. Pass --live-dsn once per live shard to be \
+             refused if a --shard target resolves to production."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Serialise a restore-verification report as pretty JSON.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] if serialisation fails (not reachable for the
+/// report's own types; guarded rather than unwrapped).
+pub fn backup_verify_json(report: &RestoreVerifyReport) -> Result<String, CliError> {
+    serde_json::to_string_pretty(report)
+        .map_err(|e| CliError::InvalidInput(format!("failed to serialise report: {e}")))
+}
+
+/// Render a restore-verification report for a human operator.
+#[must_use]
+pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "restore verification: {}", report.status);
+    let _ = writeln!(out, "  generated at: {}", report.generated_at);
+    if let Some(skew) = report.restore_point_skew_secs {
+        let _ = writeln!(out, "  restore-point skew: {skew}s across shards");
+    }
+
+    let replay = &report.replay;
+    if replay.verified() {
+        let _ = writeln!(
+            out,
+            "  replay: {} sampled, {} clean, {} divergent, {} workflow-failed, \
+             {} skipped (no handler), {} unreadable",
+            replay.sampled,
+            replay.clean,
+            replay.divergent,
+            replay.failed,
+            replay.skipped_no_handler,
+            replay.unreadable
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} skipped (no handler), {} unreadable. \
+             Register the workflow handlers to make this drill meaningful.",
+            replay.sampled, replay.skipped_no_handler, replay.unreadable
+        );
+    }
+
+    for shard in &report.shards {
+        if shard.reachable {
+            let _ = writeln!(
+                out,
+                "\nshard {} ({}) — {} non-terminal execution(s)",
+                shard.shard_id,
+                shard.dsn,
+                shard
+                    .non_terminal_executions
+                    .map_or_else(|| "unknown".to_string(), |n| n.to_string())
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "\nshard {} ({}) — UNREACHABLE: {}",
+                shard.shard_id,
+                shard.dsn,
+                shard.unreachable_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        write_findings(&mut out, &shard.findings);
+    }
+
+    if !report.cross_shard.is_empty() {
+        let _ = writeln!(out, "\ncross-shard");
+        write_findings(&mut out, &report.cross_shard);
+    }
+
+    if report.all_findings().next().is_none() {
+        let _ = writeln!(out, "\nno findings.");
+    }
+
+    let _ = write!(out, "\nverdict: {}", verdict_advice(report.status));
+    out
+}
+
+fn write_findings(out: &mut String, findings: &[Finding]) {
+    for f in findings {
+        let more = if f.truncated { ", truncated" } else { "" };
+        let _ = writeln!(
+            out,
+            "  [{}] {} x{}{} — {}",
+            f.severity, f.class, f.count, more, f.explanation
+        );
+        for sample in &f.samples {
+            let _ = writeln!(out, "        {sample}");
+        }
+        if let Some(detail) = &f.detail {
+            let _ = writeln!(out, "        note: {detail}");
+        }
+    }
+}
+
+const fn verdict_advice(status: VerifyStatus) -> &'static str {
+    match status {
+        VerifyStatus::Clean => "nothing in flight; safe to start workers.",
+        VerifyStatus::ResumableWithReclaim => {
+            "resumable — the reclaimable findings above heal themselves once workers start."
+        }
+        VerifyStatus::Incoherent => {
+            "DO NOT START WORKERS — the incoherent findings above are broken invariants."
+        }
+        VerifyStatus::Unavailable => {
+            "UNDETERMINED — a shard was unreachable or a probe could not run, so coherence \
+             was not actually checked. Do not start workers on the strength of this report."
+        }
+    }
+}
+
+/// Map a report's verdict onto the CLI's exit-code contract.
+///
+/// `None` means "pass" (exit `0`) for both `Clean` and `ResumableWithReclaim` —
+/// a normal restore always carries reclaimable artifacts and must not fail a
+/// drill. `Incoherent` exits `1`; `Unavailable` exits `2` so CI can tell
+/// "determined broken" apart from "could not determine".
+#[must_use]
+pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
+    match report.status {
+        VerifyStatus::Clean | VerifyStatus::ResumableWithReclaim => None,
+        VerifyStatus::Incoherent => Some(CliError::RestoreIncoherent {
+            findings: report
+                .all_findings()
+                .filter(|f| f.severity == FindingSeverity::Incoherent)
+                .count(),
+        }),
+        VerifyStatus::Unavailable => Some(CliError::RestoreUndetermined {
+            unreachable_shards: report.shards.iter().filter(|s| !s.reachable).count(),
+            // Sum each finding's `count`, not the number of findings: one
+            // `ProbeFailed` finding aggregates every probe that could not run
+            // on that shard, so counting findings would under-report by an
+            // order of magnitude and make the message read far less alarming
+            // than the truth.
+            failed_probes: report
+                .all_findings()
+                .filter(|f| f.severity == FindingSeverity::Undetermined)
+                .map(|f| usize::try_from(f.count).unwrap_or(usize::MAX))
+                .sum(),
+        }),
+    }
+}
+
+/// Run `harvest backup verify` end to end.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on bad arguments or a refused live DSN;
+/// [`CliError::RestoreIncoherent`] / [`CliError::RestoreUndetermined`] when the
+/// report fails the gate. The report itself is always printed first.
+pub async fn run_backup_verify(
+    shards: &[String],
+    live_dsn: &[String],
+    ack: bool,
+    format: BackupVerifyFormat,
+    replay_sample: usize,
+    worker_stale_secs: i64,
+    probe_limit: i64,
+) -> Result<(), CliError> {
+    scratch_guard(shards, live_dsn, ack)?;
+    // Say out loud when the guard could not protect anything -- an operator
+    // who believes a safety net is engaged is the one who points this at
+    // production. On stderr so `-o json` stdout stays parseable.
+    if let Some(w) = scratch_guard_warning(live_dsn, ack) {
+        eprintln!("{w}");
+    }
+    let targets = parse_shard_targets(shards)?;
+
+    let options = VerifyOptions::default()
+        .with_replay_sample(replay_sample)
+        .with_worker_stale_secs(worker_stale_secs)
+        .with_probe_limit(probe_limit)
+        .with_scratch_ack(ack);
+
+    // The CLI ships no application workflow handlers, so replay coverage is
+    // reported as NOT VERIFIED rather than silently claimed. An embedder that
+    // wants replay coverage calls `verify_restore` from its own binary with a
+    // populated `WorkflowReplayer` (see docs/runbooks/backup-restore.md).
+    let replayer = WorkflowReplayer::new();
+    let report = verify_restore(&targets, &options, &replayer).await;
+
+    match format {
+        BackupVerifyFormat::Text => println!("{}", format_backup_verify_text(&report)),
+        BackupVerifyFormat::Json => println!("{}", backup_verify_json(&report)?),
+    }
+
+    backup_verify_gate(&report).map_or(Ok(()), Err)
+}
+
+// ── harvest schema: payload-schema contract gate (issue #794) ───────────────
+
+/// Reads and parses a schema-contract document, naming the path on failure.
+fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        CliError::InvalidInput(format!(
+            "failed to read schema contract `{}`: {e}",
+            path.display()
+        ))
+    })?;
+    WorkflowSchemaContract::parse(&raw)
+        .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
+}
+
+/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// lines, one per delta, plus a summary line.
+#[must_use]
+pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for d in &diff.deltas {
+        let role = d.role.map_or("*", SchemaRole::as_str);
+        let field = if d.field_path.is_empty() {
+            "(root)"
+        } else {
+            d.field_path.as_str()
+        };
+        // Writing into a String is infallible.
+        let _ = writeln!(
+            out,
+            "{}.{}: {} — {} — {}",
+            d.workflow,
+            role,
+            field,
+            d.verdict.as_str(),
+            d.reason
+        );
+    }
+
+    // `breaking_count` rather than a count of the stored deltas: the tally
+    // keeps counting past the storage cap, so a truncated report still states
+    // the true number.
+    let breaking = diff.breaking_count;
+    let total = diff.breaking_count + diff.compatible_count;
+    if breaking == 0 {
+        let _ = write!(
+            out,
+            "schema check: no breaking changes ({} compatible delta(s))",
+            diff.compatible_count
+        );
+    } else {
+        let _ = write!(
+            out,
+            "schema check: {breaking} breaking change(s) of {total} delta(s)"
+        );
+    }
+    if diff.truncated {
+        let _ = write!(
+            out,
+            "\nschema check: report TRUNCATED at {} delta(s) — the listing above is incomplete",
+            diff.deltas.len()
+        );
+    }
+    out
+}
+
+/// Serialises a schema diff as machine-readable JSON for CI.
+///
+/// # Errors
+/// Returns [`CliError::SerializeResponse`] if serialisation fails. The input
+/// parsed fine — nothing about it was invalid — so this is an output failure,
+/// matching `det_check_json`.
+pub fn schema_diff_json(diff: &SchemaContractDiff) -> Result<String, CliError> {
+    serde_json::to_string_pretty(diff).map_err(CliError::SerializeResponse)
+}
+
+/// Runs `harvest schema check`: diffs `current` against `baseline`, prints the
+/// result, and gates the exit code.
+///
+/// # Errors
+/// Returns [`CliError::SchemaContractBreaking`] when any delta is breaking (the
+/// diff is already on stdout), or an [`CliError::InvalidInput`] read/parse
+/// error naming the offending path.
+///
+/// A **truncated** diff also fails: once the delta cap is hit the report no
+/// longer enumerates every difference, so passing it would be a claim the tool
+/// cannot support. Failing closed keeps "exit `0`" meaning "nothing breaking",
+/// never "nothing breaking *that fit*".
+pub fn run_schema_check(
+    baseline: &Path,
+    current: &Path,
+    format: SchemaCheckFormat,
+    require_current: bool,
+    acknowledged_in: Option<&Path>,
+) -> Result<(), CliError> {
+    let base = read_schema_contract(baseline)?;
+    let cur = read_schema_contract(current)?;
+    guard_empty_current(&base, &cur, current)?;
+    let diff = diff_schema_contracts(&base, &cur);
+
+    match format {
+        SchemaCheckFormat::Text => println!("{}", format_schema_diff_text(&diff)),
+        SchemaCheckFormat::Json => println!("{}", schema_diff_json(&diff)?),
+    }
+
+    if diff.truncated {
+        return Err(CliError::InvalidInput(format!(
+            "schema diff truncated at {} delta(s): the report is incomplete, so it \
+             cannot certify that nothing is breaking. Split the change into smaller \
+             steps, or regenerate the baseline with `harvest schema update`.",
+            diff.deltas.len()
+        )));
+    }
+
+    // Escape-hatch mode: a breaking delta is allowed, but only when THIS
+    // revision of the artifact records why. Without it the tool's refusal to
+    // absorb a break can be sidestepped by hand-editing the artifact, which
+    // leaves the ordinary check clean and the change unrecorded.
+    if let Some(ack_path) = acknowledged_in {
+        let head = read_schema_contract(ack_path)?;
+        // An INDEPENDENT check, not a precondition of the coverage one: a
+        // retargeted record covers the delta, so coverage passes and only this
+        // notices the rewrite. Reported first because it is the root cause when
+        // both fire, and because the remedy differs — restore the record and
+        // append, rather than record this break — hence its own error type.
+        // The head artifact is loaded here, so `diff_schema_contracts` — which
+        // only ever saw `base` and `current` — never inspected its reasons. The
+        // coverage check below already refuses to let a blank record cover
+        // anything; reporting it here names the root cause instead of leaving
+        // the operator with "nothing acknowledges this" beside a record that
+        // plainly exists.
+        let blank: Vec<&AcknowledgedBreakingChange> = head
+            .acknowledged_breaking_changes
+            .iter()
+            .filter(|a| a.reason.trim().is_empty())
+            .collect();
+        if !blank.is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "{} acknowledgement record(s) in {} record no justification; an \
+                 acknowledgement without a reason is a rubber stamp:\n{}",
+                blank.len(),
+                ack_path.display(),
+                format_dropped(&blank)
+            )));
+        }
+        let dropped = dropped_acknowledgements(&base, &head);
+        if !dropped.is_empty() {
+            return Err(CliError::SchemaContractAuditLogRewritten {
+                dropped: dropped.len(),
+                detail: format_dropped(&dropped),
+            });
+        }
+        let missing = unacknowledged_breaking(&diff, &base, &head);
+        if !missing.is_empty() {
+            return Err(CliError::SchemaContractUnacknowledged {
+                missing: missing.len(),
+                detail: format_unacknowledged(&missing),
+            });
+        }
+        return Ok(());
+    }
+
+    // `breaking_count` is the authoritative tally kept by the differ, not a
+    // count of the *stored* deltas: it stays correct even where storage is
+    // capped, so a breaking change can never be dropped on the floor.
+    if diff.has_breaking() {
+        return Err(CliError::SchemaContractBreaking {
+            breaking: diff.breaking_count,
+        });
+    }
+
+    // Regenerated METADATA is not compared by the differ, which only ever looks
+    // at `workflows` — so a hand-edit to it survives every check above. That
+    // matters because `compatibility` is the machine-readable claim about WHICH
+    // rules this gate implements: an artifact advertising `pattern` as analysed
+    // would promise a guarantee no code provides, and `description` is the same
+    // claim in prose. `schema update` regenerates both, so requiring them to
+    // match the freshly generated contract costs nothing legitimate.
+    //
+    // Two siblings are deliberately NOT compared here. `version` records which
+    // BUILD produced the artifact rather than what the gate checks, so tying
+    // currency to it would force a regeneration on every crate version bump for
+    // no safety gain. `contract_version` needs no check at all — `parse` already
+    // hard-refuses a value this build does not implement — and `workflows` and
+    // `coverage` are rebuilt from the entries on parse.
+    //
+    // Reported before the delta staleness below because it is the stronger
+    // claim: a stale schema means the artifact is behind, while a doctored
+    // ruleset means it is lying.
+    if require_current {
+        let stale: Vec<&str> = [
+            ("description", base.description != cur.description),
+            ("compatibility", base.compatibility != cur.compatibility),
+        ]
+        .into_iter()
+        .filter_map(|(name, differs)| differs.then_some(name))
+        .collect();
+        if !stale.is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "the checked-in baseline's regenerated metadata does not match this build: {}. \
+                 That metadata is the artifact's own description of WHICH rules this gate \
+                 implements, so a stale or hand-edited value advertises a guarantee the checker \
+                 does not provide. Regenerate it with `harvest schema update`.",
+                stale.join(", ")
+            )));
+        }
+    }
+
+    // Checked AFTER the breaking verdict so a break is always reported as a
+    // break: staleness is the milder finding, and reporting it first would bury
+    // the severe one behind "run schema update".
+    if require_current && !diff.deltas.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "the checked-in baseline is not current: {} unabsorbed compatible delta(s). \
+             A baseline allowed to lag records what was deployed some time ago while \
+             this gate reads it as what was deployed last — so a field added in one \
+             release and removed in the next is invisible, even though replay of data \
+             written in between fails. Regenerate it with `harvest schema update`.",
+            diff.deltas.len()
+        )));
+    }
+    Ok(())
+}
+
+/// One line per unrecorded break, in the same shape as the ordinary report.
+fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for d in missing {
+        let role = d
+            .role
+            .map_or_else(String::new, |r| format!(".{}", r.as_str()));
+        let _ = writeln!(
+            out,
+            "  {}{role}{}: {} — {}",
+            d.workflow,
+            d.field_path,
+            d.change.as_str(),
+            d.reason
+        );
+    }
+    out
+}
+
+/// One line per vanished record, naming what it used to cover.
+fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for a in dropped {
+        let role = a
+            .role
+            .map_or_else(String::new, |r| format!(".{}", r.as_str()));
+        let _ = writeln!(
+            out,
+            "  {}{role}{}: {} — recorded as {:?}",
+            a.workflow,
+            a.field_path,
+            a.change.as_str(),
+            a.reason
+        );
+    }
+    out
+}
+
+/// Refuses a `--current` that publishes nothing against a non-empty baseline.
+///
+/// An empty contract is almost always a broken *producer*, not a deliberate
+/// mass deletion: a `dump-schema-contract` binary that forgot `.workflows(…)`,
+/// a `curl` that captured an error body, or a truncated redirect. Diffed
+/// literally it is technically correct — every workflow "removed", every schema
+/// "unpublished" — but it buries the real cause under N breaking deltas and
+/// invites the author to reach for `--acknowledge`, which would overwrite the
+/// baseline with nothing and disarm the gate permanently.
+///
+/// Deleting every workflow at once is legitimate but vanishingly rare, so this
+/// trades that case (regenerate the baseline directly) for a clear diagnosis of
+/// the common one.
+fn guard_empty_current(
+    base: &WorkflowSchemaContract,
+    cur: &WorkflowSchemaContract,
+    current: &Path,
+) -> Result<(), CliError> {
+    if cur.workflows.is_empty() && !base.workflows.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "`{}` publishes no workflows at all, but the baseline has {}. This is almost always \
+             a broken schema dump (a producer that registered no workflows, or a captured error \
+             body) rather than a deliberate deletion of every workflow — refusing to diff it so \
+             the real cause is not buried under {} `removed` verdicts. Check the producer, or \
+             regenerate the baseline directly if the emptiness is intended.",
+            current.display(),
+            base.workflows.len(),
+            base.workflows.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes the regenerated baseline without ever leaving a truncated file behind.
+///
+/// `fs::write` truncates the target *before* writing, so an interrupted run (a
+/// full disk, a killed CI step, a `^C`) can destroy a checked-in baseline and
+/// leave a half-written one in the working tree — and the next `schema check`
+/// would then diff against garbage. Writing a sibling temp file and `rename`ing
+/// it over the target makes the replacement atomic on POSIX: the baseline is
+/// either the old bytes or the new bytes, never a prefix of the new ones.
+///
+/// The temp file is a sibling (not `/tmp`) so the rename stays within one
+/// filesystem, and is removed on any failure path.
+fn write_baseline_atomically(baseline: &Path, contents: &str) -> Result<(), CliError> {
+    let wrap = |e: std::io::Error| {
+        CliError::InvalidInput(format!(
+            "failed to write schema contract `{}`: {e}",
+            baseline.display()
+        ))
+    };
+
+    let dir = baseline.parent().unwrap_or_else(|| Path::new("."));
+    let stem = baseline
+        .file_name()
+        .map_or_else(|| "schema-contract".into(), |n| n.to_string_lossy());
+    let tmp = dir.join(format!(".{stem}.tmp-{}", std::process::id()));
+
+    if let Err(e) = fs::write(&tmp, contents) {
+        drop(fs::remove_file(&tmp));
+        return Err(wrap(e));
+    }
+    if let Err(e) = fs::rename(&tmp, baseline) {
+        drop(fs::remove_file(&tmp));
+        return Err(wrap(e));
+    }
+    Ok(())
+}
+
+/// Runs `harvest schema update`: rewrites `baseline` from `current`.
+///
+/// A breaking delta is refused unless `acknowledge` records why it is safe; the
+/// justification is written into the artifact so it is visible in the
+/// checked-in diff and never silent.
+///
+/// # Errors
+/// Returns [`CliError::InvalidInput`] when a read, parse, refusal or write
+/// fails. Refusal messages name `--acknowledge` explicitly.
+pub fn run_schema_update(
+    baseline: &Path,
+    current: &Path,
+    acknowledge: Option<&str>,
+    recorded_in: Option<&str>,
+) -> Result<(), CliError> {
+    let base = read_schema_contract(baseline)?;
+    let cur = read_schema_contract(current)?;
+    // Refuse here too: `update` is the path that would OVERWRITE the baseline
+    // with the empty document and disarm the gate for every later run.
+    guard_empty_current(&base, &cur, current)?;
+    let diff = diff_schema_contracts(&base, &cur);
+
+    // The core recomputes the diff internally rather than accepting ours: it is
+    // a pure function of the same two inputs, so it cannot disagree, and the
+    // API cannot be fed a diff computed from *different* contracts — which
+    // would write acknowledgement records for deltas that were never inspected.
+    let updated = acknowledge
+        .map_or_else(
+            || base.compatible_update(&cur),
+            |reason| base.acknowledged_update(&cur, reason, recorded_in),
+        )
+        .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+    let json = updated
+        .to_json_pretty()
+        .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+    write_baseline_atomically(baseline, &json)?;
+
+    // The true tallies, not `deltas.len()`: the stored listing is capped at
+    // `MAX_DELTAS` but the counts keep counting, so a large update still
+    // reports honestly.
+    let breaking = diff.breaking_count;
+    let total = diff.breaking_count + diff.compatible_count;
+    println!(
+        "schema baseline updated: {total} delta(s) recorded, {breaking} acknowledged as breaking"
+    );
     Ok(())
 }
 
@@ -3026,6 +5148,13 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_summaries_wants_table(cli) {
         return Ok(format_workflow_summaries_table(value));
     }
+    if lineage_tree_wants_render(cli) {
+        return Ok(if lineage_tree_wants_summary(cli) {
+            format_lineage_summary(value)
+        } else {
+            format_lineage_tree(value)
+        });
+    }
     if run_chain_wants_table(cli) {
         return Ok(format_run_chain_table(value));
     }
@@ -3050,6 +5179,12 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_reachability_wants_table(cli) {
         return Ok(format_workflow_reachability_table(value));
     }
+    if queue_coverage_wants_table(cli) {
+        return Ok(format_queue_coverage_table(value));
+    }
+    if activity_list_wants_table(cli) {
+        return Ok(format_activity_list_table(value));
+    }
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
@@ -3059,16 +5194,23 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if usage_wants_table(cli) {
         return Ok(format_usage_table(value));
     }
+    if diagnose_wants_table(cli) {
+        return Ok(format_diagnose_verdict(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli)
         || workflow_summaries_wants_raw_json(cli)
         || run_chain_wants_raw_json(cli)
+        || lineage_tree_wants_raw_json(cli)
         || batch_preview_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
         || workflow_reachability_wants_raw_json(cli)
+        || queue_coverage_wants_raw_json(cli)
+        || activity_list_wants_raw_json(cli)
         || usage_wants_raw_json(cli)
+        || diagnose_wants_raw_json(cli)
     {
         OutputFormat::Json
     } else {
@@ -3115,6 +5257,97 @@ fn fanout_partial_notice(value: &Value) -> Option<String> {
         unavailable.len(),
         detail.join(", ")
     ))
+}
+
+fn diagnose_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Diagnose { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn diagnose_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Diagnose { json: true, .. }
+        }
+    )
+}
+
+/// Render `GET /workflows/{id}/diagnose` as a human-readable verdict
+/// (issue #809).
+///
+/// Leads with the two things an operator reads first — the one-word `health`
+/// and the one-sentence `summary` — then the discriminated `blocked_on`
+/// members, so the actionable field (the uncovered queue, the open circuit's
+/// cooldown, the awaited signal's name) is on screen without a `jq` pipeline.
+fn format_diagnose_verdict(value: &Value) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "execution: {}  workflow: {}  state: {}",
+        cell_str(value.get("execution_id")),
+        cell_str(value.get("workflow_name")),
+        cell_str(value.get("state")),
+    );
+    let _ = writeln!(out, "health:    {}", cell_str(value.get("health")));
+    let _ = writeln!(out, "summary:   {}", cell_str(value.get("summary")));
+
+    if let Some(blocked) = value.get("blocked_on").and_then(Value::as_object) {
+        let _ = writeln!(
+            out,
+            "blocked on: {}",
+            blocked
+                .get("type")
+                .map_or("-", |v| v.as_str().unwrap_or("-"))
+        );
+        // Every member except the discriminator, in the response's own order.
+        for (key, member) in blocked.iter().filter(|(k, _)| k.as_str() != "type") {
+            let _ = writeln!(out, "  {key}: {}", cell_str(Some(member)));
+        }
+    }
+
+    if let Some(outcome) = value.get("terminal_outcome").and_then(Value::as_object) {
+        let _ = writeln!(out, "terminal outcome:");
+        for (key, member) in outcome {
+            let _ = writeln!(out, "  {key}: {}", cell_str(Some(member)));
+        }
+    }
+
+    let reasons = value
+        .get("contributing_reason_codes")
+        .and_then(Value::as_array)
+        .map(|codes| {
+            codes
+                .iter()
+                .map(|c| cell_str(Some(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if !reasons.is_empty() {
+        let _ = writeln!(out, "contributing reasons: {reasons}");
+    }
+
+    let _ = writeln!(
+        out,
+        "last event: {} ({}s ago)",
+        cell_str(value.get("last_event_at")),
+        format_f64(value.get("last_event_age_seconds")),
+    );
+    let wait_set = cell_str(value.get("wait_set"));
+    match value.get("wait_set_reason").and_then(Value::as_str) {
+        Some(reason) => {
+            let _ = writeln!(out, "wait set:   {wait_set} ({reason})");
+        }
+        None => {
+            let _ = writeln!(out, "wait set:   {wait_set}");
+        }
+    }
+    out
 }
 
 fn usage_wants_table(cli: &Cli) -> bool {
@@ -3785,7 +6018,63 @@ fn format_preflight_table(value: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
+    let findings = format_preflight_findings(checks);
+    if findings.is_empty() {
+        format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
+    } else {
+        format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}\n\n{findings}")
+    }
+}
+
+/// Render the per-check detail block the summary table cannot show.
+///
+/// The table's `SUMMARY` column carries only a check's one-line verdict, so the
+/// payload an operator actually needs in order to act — the specific unresolved
+/// references in `details.failures`, and the check's `remediation` — is
+/// invisible in table mode. Surfacing them beneath the table makes a failing
+/// `harvest preflight` (and its non-zero exit in CI) actionable without
+/// re-running the command through `--output json | jq`.
+///
+/// Only non-`pass` checks contribute, and only when they carry at least one
+/// failure or a remediation, so a healthy fleet's output is unchanged.
+fn format_preflight_findings(checks: &[Value]) -> String {
+    let mut blocks = Vec::new();
+    for check in checks {
+        let status = check.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "pass" {
+            continue;
+        }
+        let name = check
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed)");
+        let mut lines = vec![format!("{name} ({status})")];
+        if let Some(failures) = check
+            .get("details")
+            .and_then(|details| details.get("failures"))
+            .and_then(Value::as_array)
+        {
+            for failure in failures {
+                lines.push(format!("  - {}", preflight_failure_text(failure)));
+            }
+        }
+        if let Some(remediation) = check.get("remediation").and_then(Value::as_str) {
+            lines.push(format!("  remediation: {remediation}"));
+        }
+        if lines.len() > 1 {
+            blocks.push(lines.join("\n"));
+        }
+    }
+    blocks.join("\n\n")
+}
+
+/// A `details.failures` entry is a plain string for some checks (catalog
+/// consistency, worker coverage) and a structured object for others (schedule
+/// resolvability); render both without dropping information.
+fn preflight_failure_text(failure: &Value) -> String {
+    failure
+        .as_str()
+        .map_or_else(|| failure.to_string(), ToString::to_string)
 }
 
 fn format_shard_health_table(value: &Value) -> String {
@@ -4165,6 +6454,309 @@ fn format_workflow_reachability_table(value: &Value) -> String {
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}{footer}")
 }
 
+// ─── Per-activity-type pause helpers (issue #807) ─────────────────────────────
+
+/// `harvest activity list` renders the table by default; `--json` opts out.
+///
+/// Mirrors the `--json`-flag idiom the other list reads use (dlq aggregate,
+/// workflow-types reachability, queue coverage) rather than the queue-pause
+/// sibling, which ships no renderer at all: `queue list-paused` returns only
+/// held queues, whereas this read returns the whole registered catalogue and is
+/// long enough that raw JSON is unreadable mid-incident.
+fn activity_list_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::List { json: false }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn activity_list_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::List { json: true }
+        }
+    )
+}
+
+/// Render `GET /activities` (issue #807) as an operator-readable table.
+///
+/// `status` is a header line rather than a column because it qualifies every
+/// row at once: on a partial read `PAUSED: no` means only "not held on the
+/// shards that answered", so an operator reading a negative during an incident
+/// has to see the degradation before trusting it. The per-shard detail is not
+/// repeated here — `run_cli` already emits it on STDERR via
+/// `fanout_partial_notice`, keeping STDOUT a single clean table.
+///
+/// `LOCAL` earns a column despite being niche: a local activity runs inline on
+/// the workflow worker and never takes a task-queue row, so a hold on one holds
+/// nothing. A `PAUSED: yes` / `LOCAL: yes` row is a no-op hold, and that is
+/// invisible without the column. `REGISTERED` is the mistyped-hold signal — a
+/// held name this process has no catalogue entry for is still listed, flagged
+/// `no`.
+///
+/// `SCOPE` earns one for the same reason (issue #807 review): it is the second
+/// way `PAUSED: yes` can be a lie. A fleet-wide pause that only reached some
+/// shards writes rows byte-identical to a complete hold and *no* row on the
+/// shards it missed, so `partial_fleet` is the only signal that part of the
+/// fleet is still dispatching. Leaving it to `--json` would put the one field
+/// that contradicts the headline answer behind a flag nobody reaches for
+/// mid-incident. The remaining fields (`scope_shard_id`, `provenance_uniform`,
+/// the per-shard `shards` array) stay `--json` territory: they matter when
+/// reconciling a disagreeing hold, not when answering "is this held?".
+fn format_activity_list_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let Some(items) = value.get("activities").and_then(Value::as_array) else {
+        return format!("status: {status}\nNo activities returned.");
+    };
+    if items.is_empty() {
+        return format!("status: {status}\nNo activities found.");
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "ACTIVITY".to_string(),
+        "QUEUE".to_string(),
+        "REGISTERED".to_string(),
+        "LOCAL".to_string(),
+        "PAUSED".to_string(),
+        "SCOPE".to_string(),
+        "HELD".to_string(),
+        "REASON".to_string(),
+        "PAUSED_BY".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("activity_name")),
+            cell_str(item.get("queue_name")),
+            bool_cell(item.get("registered")),
+            bool_cell(item.get("is_local")),
+            bool_cell(item.get("paused")),
+            cell_str(item.get("effective_scope")),
+            cell_number(item.get("held_task_count")),
+            cell_str(item.get("paused_reason")),
+            cell_str(item.get("paused_actor")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("status: {status}\n\n{table}")
+}
+
+// ─── Queue coverage helpers (issue #774) ───────────────────────────────────
+
+fn queue_coverage_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn queue_coverage_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { json: true, .. }
+        }
+    )
+}
+
+const fn queue_coverage_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { .. }
+        }
+    )
+}
+
+/// Exit `2` when the report is unsafe to deploy against:
+///
+/// - `partial`/`unavailable` cross-shard status: an incomplete answer must
+///   never be mistaken for "fully covered".
+/// - Any queue reported `uncovered: true`: pending work with zero live
+///   pollers, the exact deploy hazard this gate exists to catch.
+///
+/// Exit `0` otherwise.
+fn queue_coverage_exit_code(value: &Value) -> i32 {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if matches!(status, "partial" | "unavailable") {
+        return 2;
+    }
+    let uncovered = value
+        .get("uncovered")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if uncovered { 2 } else { 0 }
+}
+
+/// "WARNING: unavailable shards [..]" footer, or empty when every shard was
+/// reached. Extracted so [`format_queue_coverage_table`] stays under the
+/// line-count lint.
+fn queue_coverage_unavailable_footer(value: &Value) -> String {
+    let unavailable = value
+        .get("shards")
+        .and_then(Value::as_array)
+        .map(|shards| {
+            shards
+                .iter()
+                .filter(|shard| shard.get("status").and_then(Value::as_str) == Some("unavailable"))
+                .filter_map(|shard| shard.get("shard_id").and_then(Value::as_i64))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nWARNING: unavailable shards [{}] — coverage is provisional, not fully verified.",
+            unavailable.join(", ")
+        )
+    }
+}
+
+/// "NOTE: paused queues .." footer, or empty when nothing was excluded.
+/// Extracted so [`format_queue_coverage_table`] stays under the line-count
+/// lint.
+fn queue_coverage_paused_note(value: &Value) -> String {
+    let paused_uncovered = value
+        .get("excluded_paused_queues")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if paused_uncovered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nNOTE: paused queues with pending work and no live poller (excluded from the count above; unpausing without adding a worker would make them uncovered immediately): {}",
+            paused_uncovered.join(", ")
+        )
+    }
+}
+
+fn format_queue_coverage_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let total_uncovered = value
+        .get("total_uncovered_queues")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // Computed up front so an unavailable shard is warned about on EVERY
+    // return path below, even the friendly "fully covered" shortcuts — a
+    // partial/unavailable report's "nothing uncovered" claim is unverified
+    // for the shards it never reached, and must never read as clean.
+    let footer = queue_coverage_unavailable_footer(value);
+
+    // A paused, pollerless queue with real pending work is deliberately
+    // excluded from `items`/`uncovered` (see the endpoint's docs), but must
+    // still surface here — unpausing it without adding a worker would
+    // immediately make it uncovered, and `--json` is the only other way to
+    // see this list.
+    let paused_note = queue_coverage_paused_note(value);
+
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\nNo uncovered queues.{footer}{paused_note}"
+        );
+    };
+    if items.is_empty() {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: 0\nAll queues with pending work are covered.{footer}{paused_note}"
+        );
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "QUEUE_NAME".to_string(),
+        "PENDING".to_string(),
+        "SAMPLE_TASK_IDS".to_string(),
+        "SAMPLE_EXECUTION_IDS".to_string(),
+    ]);
+    for item in items {
+        let sample_tasks = item
+            .get("sample_task_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let sample_execs = item
+            .get("sample_execution_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        rows.push(vec![
+            cell_str(item.get("queue_name")),
+            cell_number(item.get("pending_count")),
+            sample_tasks,
+            sample_execs,
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
+    )
+}
+
 fn audit_list_wants_table(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -4206,6 +6798,34 @@ const fn workflow_summaries_wants_raw_json(cli: &Cli) -> bool {
         &cli.command,
         Commands::Workflow {
             command: WorkflowCommand::Summaries { json: true, .. }
+        }
+    )
+}
+
+/// `workflow tree` renders an indented outline by default; `--json` opts out.
+fn lineage_tree_wants_render(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn lineage_tree_wants_summary(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { summary: true, .. }
+        }
+    )
+}
+
+const fn lineage_tree_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { json: true, .. }
         }
     )
 }
@@ -4473,6 +7093,186 @@ fn format_workflow_summaries_table(value: &Value) -> String {
         rendered.push_str(cursor);
     }
     rendered
+}
+
+// ── Lineage tree rendering (issue #621) ──────────────────────────────────────
+
+/// Render the recursive lineage tree as an indented outline.
+///
+/// Indentation *is* the topology here — a flat table would lose the parent →
+/// child relationship that is the whole point of the endpoint — so each node is
+/// printed one level deeper than its parent with its state and identity inline.
+fn format_lineage_tree(value: &Value) -> String {
+    let Some(root) = value.get("root") else {
+        return "No lineage tree found.".to_string();
+    };
+
+    let mut out = String::new();
+    render_lineage_node(root, 0, &mut out);
+
+    let _ = write!(
+        out,
+        "\n{} node(s), max depth {}\n",
+        cell_number(value.get("node_count")),
+        cell_number(value.get("max_depth_reached"))
+    );
+    out.push_str(&format_lineage_footer(value));
+    out.trim_end().to_string()
+}
+
+/// One node line plus its subtree. Depth is bounded by the server's
+/// `max_depth` ceiling, so this recursion cannot blow the stack.
+fn render_lineage_node(node: &Value, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    let branch = if indent == 0 { "" } else { "└─ " };
+    let detached = if node.get("await_mode").and_then(Value::as_str) == Some("detached") {
+        let policy = node
+            .get("parent_close_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        format!(" [detached:{policy}]")
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        out,
+        "{pad}{branch}{state:<12} {exec}  {name} ({wf_id}){detached}",
+        state = cell_str(node.get("state")),
+        exec = cell_str(node.get("execution_id")),
+        name = cell_str(node.get("workflow_name")),
+        wf_id = cell_str(node.get("workflow_id")),
+    );
+
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            render_lineage_node(child, indent + 1, out);
+        }
+    }
+}
+
+/// Render the `?summary=true` per-state descendant roll-up.
+fn format_lineage_summary(value: &Value) -> String {
+    let mut out = String::new();
+    if let Some(root) = value.get("root") {
+        let _ = write!(
+            out,
+            "root {} {} ({}) state={}\n\n",
+            cell_str(root.get("execution_id")),
+            cell_str(root.get("workflow_name")),
+            cell_str(root.get("workflow_id")),
+            cell_str(root.get("state")),
+        );
+    }
+
+    match value.get("counts").and_then(Value::as_object) {
+        Some(counts) if !counts.is_empty() => {
+            let width = counts.keys().map(String::len).max().unwrap_or(0);
+            for (state, count) in counts {
+                let _ = writeln!(
+                    out,
+                    "{state:<width$}  {}",
+                    cell_number(Some(count)),
+                    width = width
+                );
+            }
+        }
+        _ => out.push_str("(no descendant counts)\n"),
+    }
+
+    let _ = write!(
+        out,
+        "\n{} descendant(s), max depth {}\n",
+        cell_number(value.get("total_descendants")),
+        cell_number(value.get("max_depth_reached"))
+    );
+    out.push_str(&format_lineage_footer(value));
+    out.trim_end().to_string()
+}
+
+/// Shared truncation / partial-shard footer.
+///
+/// A truncated or partial tree must never look complete on the terminal, so
+/// both conditions are called out explicitly rather than left to the operator
+/// to notice a missing subtree.
+fn format_lineage_footer(value: &Value) -> String {
+    let mut out = String::new();
+
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        let reason = value
+            .get("truncation_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let _ = write!(out, "\nTRUNCATED ({reason}) — the tree is incomplete.");
+        if let Some(parents) = value
+            .get("truncated_parent_ids")
+            .and_then(Value::as_array)
+            .filter(|p| !p.is_empty())
+        {
+            out.push_str("\n  dropped subtrees under (re-root the call here to continue):");
+            for parent in parents {
+                let _ = write!(out, "\n    {}", cell_str(Some(parent)));
+            }
+            if value
+                .get("truncated_parents_capped")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                out.push_str("\n    ... (list capped)");
+            }
+        }
+        out.push('\n');
+    }
+
+    if value
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != "complete")
+    {
+        let _ = write!(
+            out,
+            "\nPARTIAL ({}) — some shards could not be read:",
+            cell_str(value.get("status"))
+        );
+        if let Some(shards) = value.get("unavailable_shards").and_then(Value::as_array) {
+            for shard in shards {
+                let _ = write!(
+                    out,
+                    "\n  shard {}: {}",
+                    cell_number(shard.get("shard_id")),
+                    cell_str(shard.get("reason"))
+                );
+            }
+        }
+        out.push('\n');
+    }
+
+    // The third incompleteness signal (issue #752). Unlike the other two it
+    // can fire on a tree that is otherwise entirely clean — `truncated:
+    // false`, `status: complete`, `failed: 0` — because a terminal descendant
+    // was collected by retention rather than dropped by a bound or an
+    // unreachable shard. Printing it is what keeps the documented
+    // `harvest workflow tree [--summary]` triage flow from showing an
+    // apparently-healthy family that is missing a failed child.
+    //
+    // It is deliberately NOT phrased as a truncation: re-rooting here would
+    // not surface the omitted rows, because they are no longer in
+    // `harvest_workflow_executions` at all.
+    if let Some(parents) = value
+        .get("retained_summary_parent_ids")
+        .and_then(Value::as_array)
+        .filter(|p| !p.is_empty())
+    {
+        out.push_str(
+            "\nRETENTION — descendants were collected by retention and are absent from this tree.",
+        );
+        out.push_str("\n  omitted under (read them with `harvest workflow summaries`):");
+        for parent in parents {
+            let _ = write!(out, "\n    {}", cell_str(Some(parent)));
+        }
+        out.push('\n');
+    }
+
+    out
 }
 
 fn format_run_chain_table(value: &Value) -> String {
@@ -4762,6 +7562,50 @@ fn canary_request(
     )
 }
 
+/// Build `GET /workflows/{id}/logs` (issue #790).
+///
+/// `--level` is repeatable AND comma-separable; each value is sent as its own
+/// `level=` param (the server accepts both forms). Values are passed through
+/// verbatim so an invalid level is rejected by the server with a clear 400
+/// rather than being silently dropped here — a typo must never look like
+/// "this run logged nothing".
+fn workflow_logs_request(
+    execution_id: &str,
+    levels: &[String],
+    limit: Option<i64>,
+    cursor: Option<i64>,
+    since: Option<&str>,
+) -> ApiRequest {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    for raw in levels {
+        for part in raw.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                params.push(("level", part.to_string()));
+            }
+        }
+    }
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+    if let Some(value) = cursor {
+        params.push(("cursor", value.to_string()));
+    }
+    if let Some(value) = since {
+        params.push(("since", value.to_string()));
+    }
+    let path = format!("/workflows/{}/logs", path_segment(execution_id));
+    if params.is_empty() {
+        return ApiRequest::get(path);
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    ApiRequest::get(format!("{path}?{encoded}"))
+}
+
 fn usage_request(from: &str, to: &str, group_by: Option<&str>) -> ApiRequest {
     let mut params: Vec<(&'static str, String)> =
         vec![("from", from.to_string()), ("to", to.to_string())];
@@ -4829,6 +7673,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner,
             no_progress_minutes,
             include_sleeping,
+            history_bloat_min_events,
             start_source,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
@@ -4839,6 +7684,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner.as_deref(),
             *no_progress_minutes,
             *include_sleeping,
+            *history_bloat_min_events,
             start_source.as_deref(),
         )?)),
         WorkflowCommand::Summaries {
@@ -4875,6 +7721,54 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/timeline",
             path_segment(execution_id)
         ))),
+        WorkflowCommand::Logs {
+            execution_id,
+            level,
+            limit,
+            cursor,
+            since,
+        } => Ok(workflow_logs_request(
+            execution_id,
+            level,
+            *limit,
+            *cursor,
+            since.as_deref(),
+        )),
+        WorkflowCommand::Awaitables { execution_id } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/awaitables",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Diagnose {
+            execution_id,
+            json: _,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/diagnose",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Tree {
+            execution_id,
+            summary,
+            max_depth,
+            max_nodes,
+            json: _,
+        } => {
+            let mut path = format!("/workflows/{}/tree", path_segment(execution_id));
+            let mut params: Vec<String> = Vec::new();
+            if *summary {
+                params.push("summary=true".to_string());
+            }
+            if let Some(depth) = max_depth {
+                params.push(format!("max_depth={depth}"));
+            }
+            if let Some(nodes) = max_nodes {
+                params.push(format!("max_nodes={nodes}"));
+            }
+            if !params.is_empty() {
+                path.push('?');
+                path.push_str(&params.join("&"));
+            }
+            Ok(ApiRequest::get(path))
+        }
         WorkflowCommand::RunChain {
             execution_id,
             json: _,
@@ -4917,6 +7811,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             conflict_policy,
             start_at,
             delay,
+            shard_id,
+            residency_key,
         } => {
             let mut body = Map::new();
             insert_string(&mut body, "workflow_id", workflow_id.as_deref());
@@ -4951,6 +7847,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             insert_string(&mut body, "conflict_policy", conflict_policy.as_deref());
             insert_string(&mut body, "start_at", start_at.as_deref());
             insert_string(&mut body, "delay", delay.as_deref());
+            // issue #697: explicit shard placement. Omitting a flag omits the
+            // key entirely, so an unpinned start's body is byte-identical to a
+            // pre-#697 CLI. Clap enforces the mutual exclusion.
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), json!(shard));
+            }
+            insert_string(&mut body, "residency_key", residency_key.as_deref());
 
             Ok(ApiRequest::post(
                 format!("/workflows/{}/start", path_segment(workflow_name)),
@@ -4983,6 +7886,39 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             format!("/workflows/{}/resume", path_segment(execution_id)),
             None,
         )),
+        WorkflowCommand::Annotate {
+            execution_id,
+            owner,
+            clear_owner,
+            severity,
+            clear_severity,
+            note,
+            clear_note,
+        } => {
+            let mut body = Map::new();
+            // Tri-state nullable fields: --clear-* sends an explicit JSON
+            // null; clap's `conflicts_with` prevents setting and clearing
+            // the same field in one call.
+            if let Some(v) = owner {
+                body.insert("owner".to_string(), Value::String(v.clone()));
+            } else if *clear_owner {
+                body.insert("owner".to_string(), Value::Null);
+            }
+            if let Some(v) = severity {
+                body.insert("severity".to_string(), Value::String(v.clone()));
+            } else if *clear_severity {
+                body.insert("severity".to_string(), Value::Null);
+            }
+            if let Some(v) = note {
+                body.insert("note".to_string(), Value::String(v.clone()));
+            } else if *clear_note {
+                body.insert("note".to_string(), Value::Null);
+            }
+            Ok(ApiRequest::patch(
+                format!("/workflows/{}/triage", path_segment(execution_id)),
+                Value::Object(body),
+            ))
+        }
         WorkflowCommand::ErasePayloads {
             execution_id,
             reason,
@@ -5043,6 +7979,28 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             let suffix = if *dry_run { "?dry_run=true" } else { "" };
             Ok(ApiRequest::post(
                 format!("/workflows/{}/reset{suffix}", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::Rerun {
+            execution_id,
+            input_json,
+            input_file,
+            workflow_id,
+        } => {
+            let mut body = Map::new();
+            // `input` is TRI-STATE server-side: absent = clone the source's
+            // stored input verbatim, explicit JSON null = override with null.
+            // So the key is inserted ONLY when the operator actually supplied
+            // one — never defaulted to null to mean "unset".
+            if let Some(input) =
+                parse_json_source(input_json.as_deref(), input_file.as_deref(), "rerun input")?
+            {
+                body.insert("input".to_string(), input);
+            }
+            insert_string(&mut body, "workflow_id", workflow_id.as_deref());
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/rerun", path_segment(execution_id)),
                 Some(Value::Object(body)),
             ))
         }
@@ -5235,6 +8193,52 @@ fn history_request(command: &HistoryCommand) -> ApiRequest {
 
             ApiRequest::get(format!(
                 "/admin/history/exports?{}",
+                encode_query_params(&params)
+            ))
+        }
+        HistoryCommand::ExportSample {
+            output_dir: _,
+            per_workflow,
+            states,
+            workflow_name,
+            order,
+            shard_id,
+            payload_policy,
+            max_bytes,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(value) = workflow_name {
+                params.push(("workflow_name", value.clone()));
+            }
+            // Repeatable AND comma-separated: `--states RUNNING --states PAUSED`
+            // and `--states RUNNING,PAUSED` must mean the same thing, so a CI
+            // recipe copied from either idiom samples the same population.
+            let joined = states
+                .iter()
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !joined.is_empty() {
+                params.push(("states", joined));
+            }
+            // Always sent: the effective per-type cap and payload policy are the
+            // two knobs that decide what the gate actually verified, so they are
+            // explicit on the wire rather than left to a server-side default the
+            // operator cannot see in the request log.
+            params.push(("per_workflow", per_workflow.to_string()));
+            params.push(("order", order.as_wire().to_string()));
+            if let Some(value) = shard_id {
+                params.push(("shard_id", value.to_string()));
+            }
+            params.push(("payload_policy", payload_policy.as_wire().to_string()));
+            if let Some(value) = max_bytes {
+                params.push(("max_bytes", value.to_string()));
+            }
+
+            ApiRequest::get(format!(
+                "/admin/history/export-sample?{}",
                 encode_query_params(&params)
             ))
         }
@@ -5688,6 +8692,191 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
     }
 }
 
+/// True when the command is a queue pause/resume, whose response carries a
+/// partial-application contract worth gating the exit code on.
+///
+/// `list-paused` is a read with no such contract, so it is deliberately excluded.
+const fn queue_mutation_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+        }
+    )
+}
+
+/// Exit code for a queue pause/resume response.
+///
+/// A `207` partial fleet-wide hold is NOT in effect on the shards it missed --
+/// those keep dispatching into exactly the outage the operator is riding out --
+/// so it must never look like success to a script or a runbook step. `execute`
+/// only rejects non-2xx statuses, and `207` IS 2xx, hence this body-level gate
+/// (the same shape as `preflight_exit_code` and friends).
+///
+/// Fails closed: a body carrying neither signal is not a queue-mutation response
+/// we can vouch for, so it is reported as a failure rather than as a hold that
+/// may not hold.
+fn queue_mutation_exit_code(value: &Value) -> i32 {
+    let ok = value.get("ok").and_then(Value::as_bool);
+    let complete = value.get("status").and_then(Value::as_str) == Some("complete");
+    i32::from(!(ok == Some(true) && complete))
+}
+
+/// True when `raw` names a WHATWG URL dot-segment.
+///
+/// The URL parser reqwest uses strips single-dot (`.`, `%2e`) and double-dot
+/// (`..`, `.%2e`, `%2e.`, `%2e%2e`) segments, all ASCII-case-insensitively,
+/// when the request URL is parsed -- which happens *after* `ApiRequest.path` is
+/// assembled, so `path_segment` cannot encode its way out of the LITERAL forms:
+/// `.` on `/admin/queues/{q}/pause` silently resolves to `/admin/queues/pause`
+/// and `..` to `/admin/pause`, retargeting the request at a different route.
+/// They are therefore rejected up front.
+///
+/// The percent-encoded forms are, today, already neutralized a layer down --
+/// `PATH_SEGMENT_ENCODE_SET` encodes `%`, so a queue literally named `%2e`
+/// reaches the URL as `%252e` and survives intact. They are matched here anyway
+/// so this guard stays correct on its own terms rather than silently depending
+/// on that encode set keeping `%`.
+fn is_url_dot_segment(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "." | "%2e" | ".." | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
+/// Reject a queue name that cannot survive URL path parsing intact.
+fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
+    if is_url_dot_segment(queue_name) {
+        return Err(CliError::QueueNameDotSegment {
+            value: queue_name.to_string(),
+        });
+    }
+    Ok(path_segment(queue_name))
+}
+
+/// Map `harvest queue …` onto the three management routes (issue #619).
+///
+/// `--shard-id` is omitted from the body entirely when unset, so the default is
+/// a fleet-wide hold rather than a shard-scoped one.
+fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        QueueCommand::Pause {
+            queue_name,
+            reason,
+            shard_id,
+        } => {
+            let segment = checked_queue_segment(queue_name)?;
+            let mut body = Map::new();
+            body.insert("reason".to_string(), Value::String(reason.clone()));
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{segment}/pause"),
+                Some(Value::Object(body)),
+            ))
+        }
+        QueueCommand::Resume {
+            queue_name,
+            shard_id,
+        } => {
+            let segment = checked_queue_segment(queue_name)?;
+            let mut body = Map::new();
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{segment}/resume"),
+                Some(Value::Object(body)),
+            ))
+        }
+        QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
+            || ApiRequest::get("/admin/queue-coverage"),
+            |value| {
+                ApiRequest::get(format!(
+                    "/admin/queue-coverage?queue_name={}",
+                    query_encode(value)
+                ))
+            },
+        )),
+    }
+}
+
+/// True when the command is an activity pause/resume, whose response carries
+/// the same partial-application contract as the queue mutations.
+///
+/// `list`/`get` are reads with no such contract, so they are excluded — the
+/// same split `queue_mutation_should_gate` makes for `list-paused`.
+const fn activity_mutation_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::Pause { .. } | ActivityCommand::Resume { .. }
+        }
+    )
+}
+
+/// Map `harvest activity …` onto the four management routes (issue #807).
+///
+/// The activity name is checked for URL dot-segments for exactly the reason
+/// `checked_queue_segment` documents: the WHATWG URL parser strips `.` and `..`
+/// segments AFTER `ApiRequest.path` is assembled, so an activity literally named
+/// `.` would silently retarget `/activities/./pause` at `/activities/pause`.
+///
+/// `--reason`/`--actor` are omitted from the body entirely when unset, so the
+/// server applies its own defaults rather than receiving an empty string — and
+/// a bare `harvest activity pause charge_card` is a valid, complete containment
+/// action. Containment must not wait on paperwork.
+fn activity_request(command: &ActivityCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        ActivityCommand::Pause {
+            activity_name,
+            reason,
+            actor,
+        } => {
+            let segment = checked_activity_segment(activity_name)?;
+            let mut body = Map::new();
+            if let Some(value) = reason {
+                body.insert("reason".to_string(), Value::String(value.clone()));
+            }
+            if let Some(value) = actor {
+                body.insert("actor".to_string(), Value::String(value.clone()));
+            }
+            Ok(ApiRequest::post(
+                format!("/activities/{segment}/pause"),
+                Some(Value::Object(body)),
+            ))
+        }
+        ActivityCommand::Resume { activity_name } => {
+            let segment = checked_activity_segment(activity_name)?;
+            Ok(ApiRequest::post(
+                format!("/activities/{segment}/resume"),
+                Some(Value::Object(Map::new())),
+            ))
+        }
+        ActivityCommand::List { .. } => Ok(ApiRequest::get("/activities")),
+        ActivityCommand::Get { activity_name } => {
+            let segment = checked_activity_segment(activity_name)?;
+            Ok(ApiRequest::get(format!("/activities/{segment}")))
+        }
+    }
+}
+
+/// Reject an activity name that cannot survive URL path parsing intact.
+///
+/// Shares `is_url_dot_segment` with the queue path — the hazard is a property
+/// of URL parsing, not of what the segment names.
+fn checked_activity_segment(activity_name: &str) -> Result<String, CliError> {
+    if is_url_dot_segment(activity_name) {
+        return Err(CliError::ActivityNameDotSegment {
+            value: activity_name.to_string(),
+        });
+    }
+    Ok(path_segment(activity_name))
+}
+
 fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
     match command {
         RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
@@ -5702,6 +8891,60 @@ fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
                 "burst": burst,
             })),
         ),
+        RateLimitCommand::Override {
+            activity_name,
+            refill_rate,
+            burst,
+            ttl_secs,
+        } => ApiRequest::post(
+            format!(
+                "/admin/rate-limits/{}/override",
+                path_segment(activity_name)
+            ),
+            Some(json!({
+                "refill_rate": refill_rate,
+                "burst": burst,
+                "ttl_secs": ttl_secs,
+            })),
+        ),
+        RateLimitCommand::Clear { activity_name } => ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!(
+                "/admin/rate-limits/{}/override",
+                path_segment(activity_name)
+            ),
+            body: None,
+        },
+    }
+}
+
+fn throttle_request(command: &ThrottleCommand) -> ApiRequest {
+    match command {
+        ThrottleCommand::Status => ApiRequest::get("/admin/start-throttle"),
+        ThrottleCommand::Override {
+            workflow_name,
+            refill_per_sec,
+            burst,
+            ttl_secs,
+        } => ApiRequest::post(
+            format!(
+                "/admin/start-throttle/{}/override",
+                path_segment(workflow_name)
+            ),
+            Some(json!({
+                "refill_per_sec": refill_per_sec,
+                "burst": burst,
+                "ttl_secs": ttl_secs,
+            })),
+        ),
+        ThrottleCommand::Clear { workflow_name } => ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!(
+                "/admin/start-throttle/{}/override",
+                path_segment(workflow_name)
+            ),
+            body: None,
+        },
     }
 }
 
@@ -6574,6 +9817,7 @@ fn build_workflow_list_path(
     owner: Option<&str>,
     no_progress_minutes: Option<i64>,
     include_sleeping: bool,
+    history_bloat_min_events: Option<u64>,
     start_source: Option<&str>,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -6608,6 +9852,17 @@ fn build_workflow_list_path(
     }
     if include_sleeping {
         params.push(("include_sleeping", "true".to_string()));
+    }
+    // Issue #704: operator early-warning discovery for workflow history bloat.
+    // A query param DISTINCT from the server's general-purpose
+    // `min_history_events` filter (issue #493, not exposed via this CLI
+    // command) — see `WorkflowFilters::history_bloat_min_events` in the
+    // plugin for why the two must never share a name. The server owns
+    // validation (non-numeric/negative → 400) and the restricted-to-non-
+    // terminal + sorted-by-size-descending behavior — the CLI is a thin
+    // passthrough.
+    if let Some(value) = history_bloat_min_events {
+        params.push(("history_bloat_min_events", value.to_string()));
     }
     // Issue #740: bounded provenance filter. The server owns validation (a value
     // outside the known `StartSource` set / "unknown" returns a 400), so the CLI
@@ -7534,6 +10789,620 @@ mod reuse_policy_tests {
         assert_eq!(workflow_reachability_exit_code(&unavailable), 2);
     }
 
+    // ─── Queue coverage CLI tests (issue #774) ────────────────────────────────
+
+    #[test]
+    fn queue_coverage_builds_unfiltered_request() {
+        let cli = parse(&["queue", "coverage"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/queue-coverage");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn queue_coverage_threads_queue_name_filter() {
+        let cli = parse(&["queue", "coverage", "--queue", "email-workers"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.path, "/admin/queue-coverage?queue_name=email-workers");
+    }
+
+    #[test]
+    fn queue_coverage_query_encodes_the_filter() {
+        let cli = parse(&["queue", "coverage", "--queue", "weird queue&name"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(
+            req.path,
+            "/admin/queue-coverage?queue_name=weird%20queue%26name"
+        );
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_zero_when_fully_covered() {
+        let value = json!({
+            "status": "complete",
+            "uncovered": false,
+            "items": []
+        });
+        assert_eq!(queue_coverage_exit_code(&value), 0);
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_two_on_uncovered_queue() {
+        let value = json!({
+            "status": "complete",
+            "uncovered": true,
+            "items": [{ "queue_name": "typo_queue", "pending_count": 5 }]
+        });
+        assert_eq!(queue_coverage_exit_code(&value), 2);
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_two_on_partial_report() {
+        // A partial answer must never be mistaken for fully covered: fail closed.
+        let value = json!({ "status": "partial", "uncovered": false, "items": [] });
+        assert_eq!(queue_coverage_exit_code(&value), 2);
+        let unavailable = json!({ "status": "unavailable", "uncovered": false, "items": [] });
+        assert_eq!(queue_coverage_exit_code(&unavailable), 2);
+    }
+
+    #[test]
+    fn queue_coverage_should_gate_only_matches_coverage_subcommand() {
+        assert!(queue_coverage_should_gate(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_should_gate(&parse(&[
+            "queue",
+            "list-paused"
+        ])));
+        assert!(!queue_coverage_should_gate(&parse(&["shard", "health"])));
+    }
+
+    #[test]
+    fn queue_coverage_table_lists_uncovered_queues_with_samples() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 1,
+            "uncovered": true,
+            "items": [
+                {
+                    "queue_name": "typo_queue",
+                    "pending_count": 42,
+                    "sample_task_ids": ["11111111-1111-1111-1111-111111111111"],
+                    "sample_execution_ids": ["22222222-2222-2222-2222-222222222222"],
+                    "shard_breakdown": [{ "shard_id": 0, "pending_count": 42 }]
+                }
+            ],
+            "shards": [{ "shard_id": 0, "status": "inspected" }]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("typo_queue"));
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains("11111111-1111-1111-1111-111111111111"));
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(!rendered.contains("WARNING"));
+    }
+
+    #[test]
+    fn queue_coverage_table_reports_fully_covered_with_no_items() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("All queues with pending work are covered."));
+    }
+
+    #[test]
+    fn queue_coverage_table_warns_on_unavailable_shard() {
+        let value = json!({
+            "status": "partial",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [
+                { "shard_id": 0, "status": "inspected" },
+                { "shard_id": 1, "status": "unavailable", "error": "connection refused" }
+            ]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("WARNING: unavailable shards [1]"));
+    }
+
+    #[test]
+    fn queue_coverage_table_surfaces_excluded_paused_queues() {
+        // The paused-but-pollerless exclusion (module docs on
+        // `queue_coverage.rs`) must not be invisible outside `--json` --
+        // an operator using the default table view needs to see it too.
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("All queues with pending work are covered."));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_with_uncovered_items_also_surfaces_paused_note() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 1,
+            "uncovered": true,
+            "items": [
+                {
+                    "queue_name": "typo_queue",
+                    "pending_count": 1,
+                    "sample_task_ids": [],
+                    "sample_execution_ids": [],
+                    "shard_breakdown": [{ "shard_id": 0, "pending_count": 1 }]
+                }
+            ],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("typo_queue"));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_omits_paused_note_when_nothing_excluded() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": []
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(!rendered.contains("NOTE: paused queues"));
+    }
+
+    #[test]
+    fn queue_coverage_wants_raw_json_only_with_the_json_flag() {
+        assert!(queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&["shard", "health"])));
+    }
+
+    #[test]
+    fn queue_coverage_wants_table_only_without_the_json_flag_in_pretty_mode() {
+        assert!(queue_coverage_wants_table(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_wants_table(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
+    }
+
+    #[test]
+    fn queue_coverage_gate_maps_to_exit_code_two() {
+        let error = CliError::QueueCoverageGate {
+            context: "uncovered queue".to_string(),
+        };
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn path_segment_encodes_both_path_separators() {
+        // The URL parser treats `\` as a path separator for http/https, so an
+        // unencoded backslash splits one value into extra segments and the
+        // request silently lands on a different route. Route-wide: every caller
+        // of `path_segment` (queue names, workflow ids, keys, ...) depends on
+        // this, not just queue pause/resume.
+        assert_eq!(path_segment(r"payments\eu"), "payments%5Ceu");
+        assert_eq!(path_segment(r"a\b\c"), "a%5Cb%5Cc");
+        assert_eq!(path_segment("payments/eu"), "payments%2Feu");
+        // Worse than a missed route: a backslash re-enables `..` traversal
+        // inside what should be one opaque segment, past the whole-segment
+        // dot-segment guard.
+        assert_eq!(path_segment(r"payments\..\admin"), "payments%5C..%5Cadmin");
+        // An ordinary name is untouched.
+        assert_eq!(path_segment("orders-eu"), "orders-eu");
+    }
+
+    /// Exhaustive guard for the whole path-separator / normalization class.
+    ///
+    /// Every printable ASCII byte, embedded in a value that becomes one path
+    /// segment, must survive `path_segment` + URL parsing as **exactly one**
+    /// segment that decodes back to the original. This is the test that would
+    /// have caught the missing `\` (the URL parser treats it as a path
+    /// separator for http/https), and it fails if any separator-class character
+    /// is ever dropped from `PATH_SEGMENT_ENCODE_SET`.
+    ///
+    /// Scope: *embedded* bytes. A whole-segment `.`/`..` cannot be encoded away
+    /// at all and is rejected instead (`is_url_dot_segment`); control
+    /// characters are covered by `CONTROLS`.
+    #[test]
+    fn every_printable_ascii_byte_survives_as_exactly_one_path_segment() {
+        let mut offenders = Vec::new();
+        for byte in 0x20u8..=0x7e {
+            let raw = format!("q{}z", byte as char);
+            let encoded = path_segment(&raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("byte {byte:#04x} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            let intact = segments.len() == 4 && percent_decode(segments[2]) == raw;
+            if !intact {
+                offenders.push(format!(
+                    "byte {byte:#04x} ({:?}) encoded to {encoded:?} but parsed as {:?}",
+                    byte as char,
+                    parsed.path()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these bytes did not survive as one intact path segment:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn non_ascii_queue_names_survive_as_exactly_one_path_segment() {
+        // The exhaustive sweep above can only walk printable ASCII, because a
+        // lone byte >= 0x80 is not valid UTF-8 and so is not expressible as a
+        // `&str` queue name at all. The reachable non-ASCII case is a real
+        // multi-byte character, and it is worth pinning rather than assuming:
+        // `utf8_percent_encode` percent-encodes every non-ASCII byte regardless
+        // of the `AsciiSet`, so such a name has no separator hazard -- but that
+        // is a property of the encoding crate, and this asserts we actually get
+        // it instead of trusting it.
+        for raw in [
+            "paiements-europe-é",
+            "支払い",
+            "очередь",
+            "emoji-🚀-queue",
+            // A combining sequence, so normalization differences would show up.
+            "e\u{0301}-queue",
+        ] {
+            let encoded = path_segment(raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("{raw:?} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            assert_eq!(
+                segments.len(),
+                4,
+                "{raw:?} encoded to {encoded:?} but split into {:?}",
+                parsed.path()
+            );
+            assert_eq!(
+                percent_decode(segments[2]),
+                raw,
+                "{raw:?} encoded to {encoded:?} but did not decode back intact"
+            );
+        }
+    }
+
+    fn percent_decode(value: &str) -> String {
+        percent_encoding::percent_decode_str(value)
+            .decode_utf8_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn queue_mutation_exit_code_fails_on_a_partial_hold() {
+        // Issue #619: a 207 partial fleet-wide hold is NOT in effect on the
+        // shards it missed -- those keep dispatching into the outage. It must
+        // never look like success to a script or a runbook step.
+        assert_eq!(
+            queue_mutation_exit_code(&json!({ "ok": false, "status": "partial" })),
+            1
+        );
+        assert_eq!(
+            queue_mutation_exit_code(&json!({ "ok": true, "status": "complete" })),
+            0
+        );
+    }
+
+    #[test]
+    fn queue_mutation_exit_code_gates_on_either_signal_independently() {
+        // `ok` and `status` are belt-and-braces: either one reporting a
+        // non-complete application is enough to fail the command.
+        assert_eq!(queue_mutation_exit_code(&json!({ "ok": false })), 1);
+        assert_eq!(queue_mutation_exit_code(&json!({ "status": "partial" })), 1);
+        // A body missing both signals is not a queue-mutation response we can
+        // vouch for -- fail closed rather than reporting a hold that may not hold.
+        assert_eq!(queue_mutation_exit_code(&json!({})), 1);
+    }
+
+    #[test]
+    fn queue_mutation_gate_applies_only_to_the_mutating_subcommands() {
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "pause", "q", "--reason", "x"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "resume", "q"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "list-paused"])),
+            "the read route has no partial-application contract to gate on"
+        );
+        assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_partial_mutation_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::QueuePartialMutation {
+                detail: "shard 1 unreachable".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    // ─── Per-activity-type pause/resume (issue #807) ─────────────────────────
+
+    #[test]
+    fn activity_mutation_gate_applies_only_to_the_mutating_subcommands() {
+        assert!(activity_mutation_should_gate(&parse(&[
+            "activity",
+            "pause",
+            "charge_card"
+        ])));
+        assert!(activity_mutation_should_gate(&parse(&[
+            "activity",
+            "resume",
+            "charge_card"
+        ])));
+        assert!(
+            !activity_mutation_should_gate(&parse(&["activity", "list"])),
+            "the read route has no partial-application contract to gate on"
+        );
+        assert!(!activity_mutation_should_gate(&parse(&[
+            "activity",
+            "get",
+            "charge_card"
+        ])));
+        assert!(!activity_mutation_should_gate(&parse(&["health"])));
+        assert!(
+            !activity_mutation_should_gate(&parse(&["queue", "pause", "q", "--reason", "x"])),
+            "the queue gate and the activity gate must not fire for each other"
+        );
+    }
+
+    #[test]
+    fn activity_partial_mutation_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::ActivityPartialMutation {
+                detail: "shard 1 unreachable".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn activity_name_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::ActivityNameDotSegment {
+                value: "..".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn activity_list_renders_a_table_by_default_and_raw_json_on_demand() {
+        assert!(
+            activity_list_wants_table(&parse(&["activity", "list"])),
+            "the table is the default rendering, not an opt-in"
+        );
+        assert!(!activity_list_wants_raw_json(&parse(&["activity", "list"])));
+
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity", "list", "--json"
+        ])));
+        assert!(activity_list_wants_raw_json(&parse(&[
+            "activity", "list", "--json"
+        ])));
+
+        // `--output json` is the global format flag and must keep suppressing
+        // the table on its own, exactly as it does for every other list read.
+        assert!(!activity_list_wants_table(&parse(&[
+            "--output", "json", "activity", "list"
+        ])));
+
+        // The table gate is scoped to `list`: the mutations and the single-name
+        // read still fall through to the shared JSON rendering.
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity",
+            "get",
+            "charge_card"
+        ])));
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity",
+            "pause",
+            "charge_card"
+        ])));
+    }
+
+    #[test]
+    fn activity_list_table_gate_survives_the_documented_aliases() {
+        // The aliases are the muscle-memory spellings an operator reaches for
+        // mid-incident; they must land on the table, not raw JSON.
+        for alias in ["list", "list-paused", "status"] {
+            assert!(
+                activity_list_wants_table(&parse(&["activity", alias])),
+                "`activity {alias}` should render the table"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_list_table_surfaces_the_hold_and_its_provenance() {
+        let value = json!({
+            "status": "complete",
+            "activities": [
+                {
+                    "activity_name": "charge_card",
+                    "registered": true,
+                    "queue_name": "payments",
+                    "is_local": false,
+                    "paused": true,
+                    "paused_reason": "stripe outage",
+                    "paused_actor": "alice",
+                    "paused_at": "2026-08-17T00:00:00Z",
+                    "scope_shard_id": null,
+                    "held_task_count": 42,
+                    "provenance_uniform": true,
+                    "shards": []
+                },
+                {
+                    "activity_name": "send_email",
+                    "registered": true,
+                    "queue_name": "email",
+                    "is_local": false,
+                    "paused": false,
+                    "paused_reason": null,
+                    "paused_actor": null,
+                    "paused_at": null,
+                    "scope_shard_id": null,
+                    "held_task_count": 0,
+                    "provenance_uniform": true,
+                    "shards": []
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+
+        assert!(rendered.starts_with("status: complete"));
+        assert!(rendered.contains("ACTIVITY"));
+        assert!(rendered.contains("charge_card"));
+        assert!(rendered.contains("payments"));
+        assert!(rendered.contains("42"), "held backlog must be visible");
+        assert!(rendered.contains("stripe outage"), "why it is held");
+        assert!(rendered.contains("alice"), "who held it");
+        // The healthy row is listed too — this read answers "is it held?", so a
+        // flowing activity has to appear rather than be absent-by-omission.
+        assert!(rendered.contains("send_email"));
+    }
+
+    #[test]
+    fn activity_list_table_flags_a_no_op_hold_on_a_local_activity() {
+        // A local activity runs inline and never takes a task-queue row, so a
+        // hold on one holds nothing. Without the LOCAL column that row reads as
+        // a successful containment action when it did nothing at all.
+        let value = json!({
+            "status": "complete",
+            "activities": [{
+                "activity_name": "compute_checksum",
+                "registered": true,
+                "queue_name": null,
+                "is_local": true,
+                "paused": true,
+                "paused_reason": "held by mistake",
+                "paused_actor": "bob",
+                "held_task_count": 0
+            }],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(rendered.contains("LOCAL"));
+        assert!(rendered.contains("compute_checksum"));
+    }
+
+    /// Issue #807 review: a partially-applied fleet-wide hold must not render
+    /// as a clean containment action.
+    ///
+    /// `PAUSED: yes` on its own is exactly the misleading signal: the shards a
+    /// fleet-wide pause reached hold rows byte-identical to a complete hold, and
+    /// the ones it missed hold no row at all, so an operator reading the table
+    /// during an incident would believe `charge_card` is stopped while part of
+    /// the fleet keeps dispatching it. `SCOPE` is the column that says otherwise.
+    #[test]
+    fn activity_list_table_flags_a_partially_applied_fleet_hold() {
+        let value = json!({
+            "status": "complete",
+            "activities": [{
+                "activity_name": "charge_card",
+                "registered": true,
+                "queue_name": "payments",
+                "is_local": false,
+                "paused": true,
+                "effective_scope": "partial_fleet",
+                "paused_reason": "stripe outage",
+                "paused_actor": "alice",
+                "scope_shard_id": null,
+                "held_task_count": 4,
+                "provenance_uniform": true,
+                "shards": []
+            }],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(rendered.contains("SCOPE"), "the coverage column must exist");
+        assert!(
+            rendered.contains("partial_fleet"),
+            "an incomplete hold must say so on the surface an operator reads \
+             during the incident, not only in --json: {rendered}"
+        );
+    }
+
+    #[test]
+    fn activity_list_table_keeps_status_visible_on_a_partial_read() {
+        // The contract warns that on a partial read `paused: false` means only
+        // "not held on the shards that answered". The status line is what stops
+        // an operator trusting that negative, so it must render even though the
+        // per-shard detail goes to STDERR via `fanout_partial_notice`.
+        let value = json!({
+            "status": "partial",
+            "activities": [{
+                "activity_name": "charge_card",
+                "registered": true,
+                "queue_name": "payments",
+                "is_local": false,
+                "paused": false,
+                "held_task_count": 0
+            }],
+            "unavailable_shards": [{ "shard_id": 1, "reason": "connect timeout" }]
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(
+            rendered.starts_with("status: partial"),
+            "a degraded read must not present a clean negative: {rendered}"
+        );
+    }
+
+    #[test]
+    fn activity_list_table_handles_empty_and_malformed_bodies() {
+        let empty = format_activity_list_table(&json!({
+            "status": "complete",
+            "activities": [],
+            "unavailable_shards": []
+        }));
+        assert!(empty.contains("status: complete"));
+        assert!(empty.contains("No activities found."));
+
+        // Defensive: never panic on a body missing the list entirely, and still
+        // report the status the operator needs.
+        let malformed = format_activity_list_table(&json!({ "status": "unavailable" }));
+        assert!(malformed.contains("status: unavailable"));
+        assert!(malformed.contains("No activities returned."));
+    }
+
     #[test]
     fn workflow_reachability_gate_error_uses_exit_code_two() {
         assert_eq!(
@@ -8003,6 +11872,144 @@ mod reuse_policy_tests {
         assert!(rendered.contains("10.00"));
         assert!(rendered.contains("8.50"));
         assert!(rendered.contains("2026-05-22T22:00:00Z"));
+    }
+
+    // ── TTL'd runtime pacing overrides (issue #945) ─────────────────────
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn rate_limit_override_builds_post_request_with_both_fields() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "send_email",
+            "--refill-rate",
+            "50",
+            "--burst",
+            "100",
+            "--ttl-secs",
+            "300",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/rate-limits/send_email/override");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_rate"].as_f64().unwrap(), 50.0);
+        assert_eq!(body["burst"].as_f64().unwrap(), 100.0);
+        assert_eq!(body["ttl_secs"].as_u64().unwrap(), 300);
+    }
+
+    #[test]
+    fn rate_limit_override_omits_unset_optional_fields() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "send_email",
+            "--burst",
+            "100",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(body["refill_rate"].is_null());
+        assert!(!body["burst"].is_null());
+    }
+
+    #[test]
+    fn rate_limit_override_url_escapes_activity_name() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "weird name",
+            "--refill-rate",
+            "1",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        assert!(!req.path.contains(' '));
+        assert!(req.path.starts_with("/admin/rate-limits/"));
+        assert!(req.path.ends_with("/override"));
+    }
+
+    #[test]
+    fn rate_limit_clear_builds_delete_request_with_no_body() {
+        let req = parse(&["rate-limit", "clear", "send_email"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Delete);
+        assert_eq!(req.path, "/admin/rate-limits/send_email/override");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn throttle_status_builds_get_request() {
+        let req = parse(&["throttle", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/start-throttle");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn throttle_override_builds_post_request_with_both_fields() {
+        let req = parse(&[
+            "throttle",
+            "override",
+            "onboard_user",
+            "--refill-per-sec",
+            "2.5",
+            "--burst",
+            "5",
+            "--ttl-secs",
+            "600",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/start-throttle/onboard_user/override");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_per_sec"].as_f64().unwrap(), 2.5);
+        assert_eq!(body["burst"].as_f64().unwrap(), 5.0);
+        assert_eq!(body["ttl_secs"].as_u64().unwrap(), 600);
+    }
+
+    #[test]
+    fn throttle_override_omits_unset_optional_fields() {
+        let req = parse(&[
+            "throttle",
+            "override",
+            "onboard_user",
+            "--refill-per-sec",
+            "2.5",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(!body["refill_per_sec"].is_null());
+        assert!(body["burst"].is_null());
+    }
+
+    #[test]
+    fn throttle_clear_builds_delete_request_with_no_body() {
+        let req = parse(&["throttle", "clear", "onboard_user"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Delete);
+        assert_eq!(req.path, "/admin/start-throttle/onboard_user/override");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn throttle_alias_throttles_resolves_to_the_same_command() {
+        let req = parse(&["throttles", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/start-throttle");
     }
 }
 
@@ -8481,6 +12488,98 @@ mod fail_activity_cli_tests {
 }
 
 #[cfg(test)]
+mod rerun_cli_tests {
+    use super::*;
+
+    fn request(args: &[&str]) -> ApiRequest {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn rerun_builds_post_request_with_correct_path() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/exec-123/rerun");
+    }
+
+    #[test]
+    fn rerun_bare_sends_empty_object_body() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        assert_eq!(
+            req.body,
+            Some(Value::Object(Map::new())),
+            "the body is optional server-side but the CLI sends an empty object"
+        );
+    }
+
+    #[test]
+    fn rerun_without_input_flags_sends_no_input_key() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        let body = req.body.as_ref().expect("should have a body");
+        // The server's `input` field is TRI-STATE: absent = clone the source's
+        // stored input verbatim, explicit null = override with null.  Injecting
+        // a null for "the operator did not pass --input-*" would silently wipe
+        // the cloned input, so the key must be ABSENT (not present-and-null).
+        assert!(
+            body.get("input").is_none(),
+            "omitting --input-json/--input-file must send no `input` key at all"
+        );
+    }
+
+    #[test]
+    fn rerun_with_workflow_id_sends_workflow_id_body() {
+        let req = request(&["workflow", "rerun", "exec-123", "--workflow-id", "order-9"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["workflow_id"], "order-9");
+        assert!(
+            body.get("input").is_none(),
+            "--workflow-id alone must not add an `input` key"
+        );
+    }
+
+    #[test]
+    fn rerun_with_inline_input_json_sends_input_body() {
+        let req = request(&[
+            "workflow",
+            "rerun",
+            "exec-123",
+            "--input-json",
+            r#"{"k":1}"#,
+        ]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["input"], serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn rerun_with_explicit_null_input_sends_null_input() {
+        let req = request(&["workflow", "rerun", "exec-123", "--input-json", "null"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert!(
+            body.get("input").is_some(),
+            "an operator-supplied JSON null IS a legitimate override and must be sent"
+        );
+        assert_eq!(body["input"], Value::Null);
+    }
+
+    #[test]
+    fn rerun_path_encodes_the_execution_id() {
+        let req = request(&["workflow", "rerun", "exec 123/../x"]);
+        assert!(
+            !req.path.contains("../"),
+            "execution id must be path-encoded, got {}",
+            req.path
+        );
+        assert_eq!(
+            req.path,
+            format!("/workflows/{}/rerun", path_segment("exec 123/../x"))
+        );
+    }
+}
+
+#[cfg(test)]
 mod completion_delivery_cli_tests {
     use super::*;
 
@@ -8565,6 +12664,288 @@ mod completion_delivery_cli_tests {
         let value = json!({ "ok": true });
         let filtered = filter_completion_deliveries_by_state(&value, "failed");
         assert_eq!(filtered, value);
+    }
+
+    // ── Lineage tree rendering (issue #621) ──────────────────────────────
+
+    fn lineage_tree_fixture() -> Value {
+        serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING",
+                "depth": 0,
+                "await_mode": "awaited",
+                "parent_close_policy": null,
+                "children": [{
+                    "execution_id": "22222222-2222-2222-2222-222222222222",
+                    "workflow_name": "charge_card",
+                    "workflow_id": "charge-42",
+                    "state": "FAILED",
+                    "depth": 1,
+                    "await_mode": "detached",
+                    "parent_close_policy": "request_cancel",
+                    "children": [{
+                        "execution_id": "33333333-3333-3333-3333-333333333333",
+                        "workflow_name": "refund_card",
+                        "workflow_id": "refund-42",
+                        "state": "COMPLETED",
+                        "depth": 2,
+                        "await_mode": "awaited",
+                        "parent_close_policy": null,
+                        "children": []
+                    }]
+                }]
+            },
+            "node_count": 3,
+            "max_depth_reached": 2,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": []
+        })
+    }
+
+    #[test]
+    fn lineage_tree_renders_children_indented_below_their_parent() {
+        // Indentation IS the topology for this endpoint — a child must not
+        // render at the same level as its parent.
+        let rendered = format_lineage_tree(&lineage_tree_fixture());
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[0].starts_with("RUNNING"), "root is not indented");
+        assert!(
+            lines[1].starts_with("  "),
+            "the child must be indented below the root, got {:?}",
+            lines[1]
+        );
+        assert!(lines[1].contains("FAILED"));
+        assert!(lines[1].contains("22222222-2222-2222-2222-222222222222"));
+        assert!(
+            lines[1].contains("[detached:request_cancel]"),
+            "a detached child must surface its parent-close policy"
+        );
+        // Depth 2 is what proves the indent GROWS per level rather than being
+        // a constant applied to every non-root node.
+        assert!(
+            lines[2].starts_with("    "),
+            "the grandchild must be indented one level deeper again, got {:?}",
+            lines[2]
+        );
+        assert!(lines[2].contains("33333333-3333-3333-3333-333333333333"));
+        assert!(rendered.contains("3 node(s), max depth 2"));
+    }
+
+    #[test]
+    fn lineage_tree_bounds_are_rejected_locally_when_out_of_range() {
+        // The server rejects these too, but a local rejection saves a
+        // pointless round-trip — matching the adjacent `workflow children`.
+        for args in [
+            vec!["harvest", "workflow", "tree", "abc", "--max-depth", "0"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-depth", "51"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-nodes", "0"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-nodes", "10001"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} should be rejected at parse time"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "tree",
+                "abc",
+                "--max-depth",
+                "50",
+                "--max-nodes",
+                "10000",
+            ])
+            .is_ok(),
+            "the ceilings themselves are inclusive"
+        );
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_truncation_and_names_dropped_parents() {
+        // A truncated tree must never look complete on a terminal.
+        let mut value = lineage_tree_fixture();
+        value["truncated"] = Value::Bool(true);
+        value["truncation_reason"] = Value::String("max_nodes".to_string());
+        value["truncated_parent_ids"] = serde_json::json!(["22222222-2222-2222-2222-222222222222"]);
+        let rendered = format_lineage_tree(&value);
+        assert!(rendered.contains("TRUNCATED (max_nodes)"));
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(rendered.contains("re-root the call here"));
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_an_unavailable_shard() {
+        let mut value = lineage_tree_fixture();
+        value["status"] = Value::String("partial".to_string());
+        value["unavailable_shards"] = serde_json::json!([
+            { "shard_id": 1, "reason": "connection refused" }
+        ]);
+        let rendered = format_lineage_tree(&value);
+        assert!(rendered.contains("PARTIAL (partial)"));
+        assert!(rendered.contains("shard 1"));
+        assert!(rendered.contains("connection refused"));
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_retention_collected_descendants() {
+        // The third incompleteness signal. Unlike the other two it can fire on
+        // a tree that is otherwise clean — `truncated: false`, `status:
+        // complete` — so if the terminal does not print it, the documented
+        // triage flow shows an apparently-healthy family that is missing a
+        // descendant.
+        let mut value = lineage_tree_fixture();
+        value["retained_summary_parent_ids"] =
+            serde_json::json!(["22222222-2222-2222-2222-222222222222"]);
+        let rendered = format_lineage_tree(&value);
+        assert!(
+            rendered.contains("RETENTION"),
+            "an otherwise-clean tree must still be called out as incomplete:\n{rendered}"
+        );
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(
+            rendered.contains("workflow summaries"),
+            "name the command that reads the omitted rows"
+        );
+    }
+
+    #[test]
+    fn lineage_render_stays_quiet_when_nothing_was_retention_collected() {
+        // The complement: the signal must not cry wolf on a genuinely
+        // complete tree, or operators will learn to ignore it.
+        let value = lineage_tree_fixture();
+        let rendered = format_lineage_tree(&value);
+        assert!(!rendered.contains("RETENTION"), "{rendered}");
+    }
+
+    #[test]
+    fn lineage_summary_render_calls_out_retention_collected_descendants() {
+        // `--summary` is the *first* command in the runbook's triage flow, and
+        // the one that reports `failed: 0`. It shares the footer, so this pins
+        // that the sharing is real.
+        let value = serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING"
+            },
+            // The trap this guards: a clean-looking roll-up.
+            "counts": { "running": 1, "failed": 0, "completed": 2 },
+            "total_descendants": 3,
+            "max_depth_reached": 1,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": [],
+            "retained_summary_parent_ids": ["33333333-3333-3333-3333-333333333333"]
+        });
+        let rendered = format_lineage_summary(&value);
+        assert!(rendered.contains("RETENTION"), "{rendered}");
+        assert!(rendered.contains("33333333-3333-3333-3333-333333333333"));
+    }
+
+    #[test]
+    fn lineage_summary_renders_per_state_counts() {
+        let value = serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING"
+            },
+            "counts": { "running": 3, "failed": 1, "completed": 12 },
+            "total_descendants": 16,
+            "max_depth_reached": 3,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": []
+        });
+        let rendered = format_lineage_summary(&value);
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("16 descendant(s)"));
+        assert!(rendered.contains("order-42"));
+    }
+
+    #[test]
+    fn lineage_tree_flag_dispatch_picks_the_right_renderer() {
+        let tree = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_render(&tree));
+        assert!(!lineage_tree_wants_summary(&tree));
+        assert!(!lineage_tree_wants_raw_json(&tree));
+
+        let summary = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+            "--summary",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_summary(&summary));
+
+        let raw = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_raw_json(&raw));
+        assert!(
+            !lineage_tree_wants_render(&raw),
+            "--json must bypass the outline renderer"
+        );
+    }
+
+    #[test]
+    fn render_response_renders_the_diagnose_verdict_as_a_table() {
+        // Pins the WIRING, not just the formatter: deleting the dispatch arm in
+        // `render_response` would leave the formatter and predicate tests green
+        // while `harvest workflow diagnose` silently reverted to raw JSON.
+        let cli = parse(&["workflow", "diagnose", "exec-1"]);
+        let value = json!({
+            "execution_id": "exec-1",
+            "health": "stalled",
+            "summary": "no live worker is polling queue 'email'",
+            "blocked_on": { "type": "activity_no_worker", "queue": "email" },
+            "contributing_reason_codes": ["no_live_worker"],
+        });
+        let rendered = render_response(&cli, &value).expect("should render");
+        assert!(
+            rendered.contains("stalled"),
+            "expected the rendered verdict, got: {rendered}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&rendered).is_err(),
+            "the table renderer must not emit raw JSON, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_response_diagnose_json_flag_emits_the_raw_body() {
+        let cli = parse(&["workflow", "diagnose", "exec-1", "--json"]);
+        let value = json!({ "execution_id": "exec-1", "health": "stalled" });
+        let rendered = render_response(&cli, &value).expect("should render");
+        let parsed: Value = serde_json::from_str(&rendered).expect("--json must emit valid JSON");
+        assert_eq!(parsed["health"], "stalled");
     }
 
     #[test]
@@ -8690,6 +13071,120 @@ mod usage_cli_tests {
     }
 
     #[test]
+    fn diagnose_flag_selects_table_vs_raw_json() {
+        let table_cli = parse(&["workflow", "diagnose", "exec-1"]);
+        assert!(diagnose_wants_table(&table_cli));
+        assert!(!diagnose_wants_raw_json(&table_cli));
+
+        let json_cli = parse(&["workflow", "diagnose", "exec-1", "--json"]);
+        assert!(!diagnose_wants_table(&json_cli));
+        assert!(diagnose_wants_raw_json(&json_cli));
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_the_replay_derived_wait_kinds() {
+        // The renderer walks `blocked_on`'s members generically, so a newly
+        // added variant must surface with no CLI change. This pins that: a
+        // mutex park has to name the contended key an operator needs to find
+        // the holder.
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "blocked_external",
+            "summary": "parked on a durable mutex wait (ledger:42)",
+            "blocked_on": {
+                "type": "awaiting_replay_wait",
+                "wait_kind": "mutex",
+                "name": "ledger:42"
+            },
+            "wait_set": "replayed",
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("awaiting_replay_wait"),
+            "expected the verdict type, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("mutex") && rendered.contains("ledger:42"),
+            "expected the wait kind and contended key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_the_workflow_task_verdicts() {
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "stalled",
+            "summary": "no live worker is polling workflow task queue 'orphan'",
+            "blocked_on": { "type": "workflow_no_worker", "queue": "orphan" },
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("workflow_no_worker") && rendered.contains("orphan"),
+            "expected the uncovered workflow queue, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_diagnose_verdict_surfaces_the_actionable_root_cause() {
+        // The headline case (#809 AC3): the operator must read the uncovered
+        // queue name off the rendered verdict without a `jq` pipeline.
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "workflow_id": "order-42",
+            "workflow_name": "order_flow",
+            "state": "RUNNING",
+            "health": "stalled",
+            "blocked_on": {
+                "type": "activity_no_worker",
+                "queue": "typo-queue",
+                "activity_name": "charge_card"
+            },
+            "summary": "no live worker is polling queue 'typo-queue', so activity 'charge_card' will never be claimed",
+            "last_event_age_seconds": 903.5,
+            "last_event_at": "2026-01-01T00:00:00Z",
+            "contributing_reason_codes": ["no_live_worker"],
+            "wait_set": "not_consulted"
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(rendered.contains("health:    stalled"), "{rendered}");
+        assert!(
+            rendered.contains("blocked on: activity_no_worker"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("queue: typo-queue"), "{rendered}");
+        assert!(
+            rendered.contains("activity_name: charge_card"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no_live_worker"), "{rendered}");
+        assert!(rendered.contains("order_flow"), "{rendered}");
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_a_terminal_outcome_without_blocked_on() {
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000002",
+            "workflow_id": "order-43",
+            "workflow_name": "order_flow",
+            "state": "FAILED",
+            "health": "terminal",
+            "summary": "execution reached terminal state FAILED — nothing to diagnose",
+            "last_event_age_seconds": 12.0,
+            "terminal_outcome": {"state": "FAILED", "error": "boom"},
+            "contributing_reason_codes": [],
+            "wait_set": "not_consulted"
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(rendered.contains("health:    terminal"), "{rendered}");
+        assert!(rendered.contains("terminal outcome:"), "{rendered}");
+        assert!(rendered.contains("error: boom"), "{rendered}");
+        assert!(
+            !rendered.contains("blocked on:"),
+            "a terminal verdict has no blocked_on to render: {rendered}"
+        );
+    }
+
+    #[test]
     fn format_usage_table_renders_header_and_rows() {
         let value = serde_json::json!({
             "status": "complete",
@@ -8772,6 +13267,88 @@ mod det_check_cli_tests {
     const WF_WARN: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::process::id();\n    Ok(())\n}\n";
 
     const WF_SUPPRESSED: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
+
+    // ── backup verify (issue #943) ─────────────────────────────────────────
+
+    #[test]
+    fn backup_verify_parses_repeated_shards_and_flags() {
+        let cli = parse(&[
+            "backup",
+            "verify",
+            "--shard",
+            "0=postgres://scratch/a",
+            "--shard",
+            "1=postgres://scratch/b",
+            "--format",
+            "json",
+            "--replay-sample",
+            "7",
+            "--worker-stale-secs",
+            "120",
+            "--probe-limit",
+            "250",
+            "--i-know-this-is-scratch",
+        ]);
+        match cli.command {
+            Commands::Backup {
+                command:
+                    BackupCommand::Verify {
+                        shards,
+                        i_know_this_is_scratch,
+                        format,
+                        replay_sample,
+                        worker_stale_secs,
+                        probe_limit,
+                        ..
+                    },
+            } => {
+                assert_eq!(shards.len(), 2);
+                assert_eq!(shards[1], "1=postgres://scratch/b");
+                assert!(i_know_this_is_scratch);
+                assert_eq!(format, BackupVerifyFormat::Json);
+                assert_eq!(replay_sample, 7);
+                assert_eq!(worker_stale_secs, 120);
+                assert_eq!(probe_limit, 250);
+            }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_defaults_are_text_and_guarded() {
+        let cli = parse(&["backup", "verify", "--shard", "postgres://scratch/a"]);
+        match cli.command {
+            Commands::Backup {
+                command:
+                    BackupCommand::Verify {
+                        i_know_this_is_scratch,
+                        format,
+                        replay_sample,
+                        probe_limit,
+                        ..
+                    },
+            } => {
+                assert!(
+                    !i_know_this_is_scratch,
+                    "the scratch guard must be opt-OUT, never the default"
+                );
+                assert_eq!(format, BackupVerifyFormat::Text);
+                assert_eq!(replay_sample, 50);
+                assert_eq!(
+                    probe_limit,
+                    autumn_harvest::backup_verify::DEFAULT_PROBE_LIMIT,
+                    "the CLI default must track the library default"
+                );
+            }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_requires_at_least_one_shard() {
+        Cli::try_parse_from(["harvest", "backup", "verify"])
+            .expect_err("--shard is required; a verify with no target is meaningless");
+    }
 
     #[test]
     fn det_check_parses_paths_and_flags() {
@@ -8986,6 +13563,179 @@ fn bad_helper() -> i64 {
             result.is_ok(),
             "--list-suppressions --format json must exit Ok, got: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    //    // These live inline rather than in `tests/integration/schema_check_cli.rs`
+    // because `Commands` and `SchemaCommand` are private: an external test can
+    // only assert that parsing *succeeded*, which would pass just as happily
+    // with a wrong default baked in. Destructuring is what actually pins the
+    // defaults. Mirrors the det-check tests directly above.
+
+    #[test]
+    fn schema_check_parses_paths_and_format() {
+        let cli = parse(&[
+            "schema",
+            "check",
+            "--baseline",
+            "base.json",
+            "--current",
+            "cur.json",
+            "--format",
+            "json",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        baseline,
+                        current,
+                        format,
+                        require_current,
+                        acknowledged_in,
+                    },
+            } => {
+                assert_eq!(baseline, PathBuf::from("base.json"));
+                assert_eq!(current, PathBuf::from("cur.json"));
+                assert_eq!(format, SchemaCheckFormat::Json);
+                assert!(!require_current, "the currency check is opt-in");
+                assert_eq!(acknowledged_in, None, "the escape-hatch mode is opt-in");
+            }
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_check_require_current_and_acknowledged_in_are_mutually_exclusive() {
+        let cli = parse(&[
+            "schema",
+            "check",
+            "--current",
+            "cur.json",
+            "--require-current",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        require_current, ..
+                    },
+            } => assert!(require_current, "--require-current must set the flag"),
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+
+        // The escape-hatch mode diffs the BASE revision against the generated
+        // contract, where deltas are the whole point — demanding currency there
+        // would fail every legitimate acknowledged change.
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "schema",
+                "check",
+                "--current",
+                "cur.json",
+                "--require-current",
+                "--acknowledged-in",
+                "head.json",
+            ])
+            .is_err(),
+            "combining the two modes is a contradiction and must not parse"
+        );
+    }
+
+    #[test]
+    fn schema_check_baseline_defaults_to_the_documented_path() {
+        let cli = parse(&["schema", "check", "--current", "cur.json"]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        baseline, format, ..
+                    },
+            } => {
+                // The default is what makes the documented one-liner short; if
+                // it drifts from the constant the guide and CI recipe rot.
+                assert_eq!(
+                    baseline,
+                    PathBuf::from(autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)
+                );
+                assert_eq!(format, SchemaCheckFormat::Text);
+            }
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_update_parses_acknowledge_and_recorded_in() {
+        let cli = parse(&[
+            "schema",
+            "update",
+            "--current",
+            "cur.json",
+            "--acknowledge",
+            "drained via reset",
+            "--recorded-in",
+            "docs/changelog.d/pr-794-schema-contract-gate.md",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Update {
+                        baseline,
+                        current,
+                        acknowledge,
+                        recorded_in,
+                    },
+            } => {
+                assert_eq!(
+                    baseline,
+                    PathBuf::from(autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)
+                );
+                assert_eq!(current, PathBuf::from("cur.json"));
+                assert_eq!(acknowledge.as_deref(), Some("drained via reset"));
+                assert_eq!(
+                    recorded_in.as_deref(),
+                    Some("docs/changelog.d/pr-794-schema-contract-gate.md")
+                );
+            }
+            other => panic!("expected Schema::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_update_acknowledge_is_optional_at_parse_time() {
+        // The refusal is a *runtime* decision made only when a delta is
+        // breaking, not a clap requirement — a purely compatible regeneration
+        // must not need a justification.
+        let cli = parse(&["schema", "update", "--current", "cur.json"]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Update {
+                        acknowledge,
+                        recorded_in,
+                        ..
+                    },
+            } => {
+                assert!(acknowledge.is_none());
+                assert!(recorded_in.is_none());
+            }
+            other => panic!("expected Schema::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_check_format_default_is_text() {
+        assert_eq!(SchemaCheckFormat::default(), SchemaCheckFormat::Text);
     }
 }
 
@@ -9356,5 +14106,970 @@ mod scaffold_new_tests {
         assert_eq!(derive_crate_ident("trail-"), "trail");
         assert_eq!(derive_crate_ident("my--app"), "my_app");
         assert_eq!(derive_crate_ident("A_B-c"), "a_b_c");
+    }
+}
+
+#[cfg(test)]
+mod shard_placement_tests {
+    //! CLI mapping tests for `--shard-id` / `--residency-key` on
+    //! `workflow start` (issue #697). Mirror `mod conflict_policy_tests`:
+    //! omitting a flag must omit the key entirely so an unpinned start's body
+    //! stays byte-identical to a pre-#697 CLI.
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn start_request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn start_omitting_placement_sends_neither_field() {
+        let req = start_request(&["workflow", "start", "my_wf"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert!(
+            body.get("shard_id").is_none(),
+            "omitting --shard-id must not send the field"
+        );
+        assert!(
+            body.get("residency_key").is_none(),
+            "omitting --residency-key must not send the field"
+        );
+    }
+
+    #[test]
+    fn start_with_shard_id_sends_a_numeric_field() {
+        let req = start_request(&["workflow", "start", "my_wf", "--shard-id", "2"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(body.get("shard_id"), Some(&serde_json::json!(2)));
+        assert!(body.get("residency_key").is_none());
+    }
+
+    #[test]
+    fn start_with_residency_key_sends_a_string_field() {
+        let req = start_request(&["workflow", "start", "my_wf", "--residency-key", "eu"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(body.get("residency_key"), Some(&serde_json::json!("eu")));
+        assert!(body.get("shard_id").is_none());
+    }
+
+    #[test]
+    fn start_rejects_both_placement_flags_at_parse_time() {
+        // Two placement sources are ambiguous; clap must reject them before a
+        // request is ever built.
+        let parsed = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "start",
+            "my_wf",
+            "--shard-id",
+            "1",
+            "--residency-key",
+            "eu",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--shard-id and --residency-key must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn placement_preserves_other_start_fields() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--workflow-id",
+            "order-42",
+            "--residency-key",
+            "eu",
+        ]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(
+            body.get("workflow_id"),
+            Some(&serde_json::json!("order-42"))
+        );
+        assert_eq!(body.get("residency_key"), Some(&serde_json::json!("eu")));
+    }
+}
+
+#[cfg(test)]
+mod replay_sample_bundle_tests {
+    //! Bundle-writer tests for `harvest history export-sample` (issue #798).
+    //!
+    //! The split into `history_sample_bundle_files` (which files, named how) and
+    //! `render_history_sample_summary` (the coverage table) keeps both pure, so
+    //! the two things a CI operator depends on — that every sampled fixture is
+    //! written under a name `replay_bundle` will read, and that truncation is
+    //! stated out loud — are testable without touching a filesystem.
+    use super::*;
+    use serde_json::json;
+
+    fn sample_response() -> Value {
+        json!({
+            "status": "complete",
+            "payload_policy": "redacted",
+            "manifest": {
+                "generated_at": "2026-01-01T00:00:00Z",
+                "status": "complete",
+                "states": ["PAUSED", "RUNNING"],
+                "per_workflow": [
+                    { "workflow_name": "noisy", "sampled": 3, "in_flight_total": 700 },
+                    { "workflow_name": "quiet", "sampled": 2, "in_flight_total": 2 }
+                ],
+                "sampled_total": 5,
+                "in_flight_total": 702,
+                "unavailable_shards": [],
+                "inspected_shards": [0]
+            },
+            "exports": [
+                { "workflow_name": "noisy", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] },
+                { "workflow_name": "quiet", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+            ],
+            "failures": []
+        })
+    }
+
+    #[test]
+    fn bundle_writes_one_fixture_per_export_plus_the_manifest() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        assert_eq!(files.len(), 3, "2 fixtures + 1 manifest");
+
+        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+        assert!(names.contains(&"noisy--11111111-1111-4111-8111-111111111111.json"));
+        assert!(names.contains(&"quiet--22222222-2222-4222-8222-222222222222.json"));
+        assert!(
+            names.contains(&autumn_harvest::replay_sample::SampleManifest::FILE_NAME),
+            "the manifest must use the reserved name so replay_bundle reads it as \
+             coverage rather than replaying it as a fixture: {names:?}"
+        );
+    }
+
+    /// Every written fixture must be exactly what the replay harness reads, or
+    /// the gate blocks on a harness error instead of verifying anything.
+    #[test]
+    fn each_fixture_deserializes_as_a_replay_snapshot_shape() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        for file in files
+            .iter()
+            .filter(|file| file.name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+        {
+            let parsed: Value = serde_json::from_str(&file.contents).expect("valid JSON");
+            assert!(parsed.get("workflow_name").is_some(), "{}", file.name);
+            assert!(parsed.get("events").is_some(), "{}", file.name);
+        }
+    }
+
+    #[test]
+    fn manifest_round_trips_into_the_core_type() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        let manifest = files
+            .iter()
+            .find(|file| file.name == autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .expect("manifest present");
+        let parsed: autumn_harvest::replay_sample::SampleManifest =
+            serde_json::from_str(&manifest.contents)
+                .expect("the written manifest must deserialize as the core SampleManifest");
+        assert_eq!(parsed.sampled_total, 5);
+        assert_eq!(parsed.in_flight_total, 702);
+        assert!(parsed.is_truncated());
+    }
+
+    /// Two workflow names that sanitize to the same file name must not silently
+    /// overwrite each other — that would make the bundle smaller than the
+    /// manifest claims, so the gate would verify fewer fixtures than reported.
+    #[test]
+    fn colliding_fixture_names_are_disambiguated_never_overwritten() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 2, "in_flight_total": 2,
+                          "per_workflow": [], "states": [], "unavailable_shards": [],
+                          "inspected_shards": [0], "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": [
+                { "workflow_name": "a/b", "execution_id": "same-id", "events": [] },
+                { "workflow_name": "a:b", "execution_id": "same-id", "events": [] }
+            ]
+        });
+        let files = history_sample_bundle_files(&response).expect("bundle files");
+        let fixture_names: Vec<&str> = files
+            .iter()
+            .map(|file| file.name.as_str())
+            .filter(|name| *name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .collect();
+        assert_eq!(fixture_names.len(), 2);
+        assert_ne!(
+            fixture_names[0], fixture_names[1],
+            "a sanitization collision must be disambiguated: {fixture_names:?}"
+        );
+    }
+
+    /// A non-sample body must fail loudly rather than write an empty bundle a
+    /// gate would then evaluate for the wrong reason.
+    #[test]
+    fn a_non_sample_response_is_rejected_not_written_as_an_empty_bundle() {
+        assert!(history_sample_bundle_files(&json!({ "error": "nope" })).is_err());
+        assert!(history_sample_bundle_files(&json!({ "exports": [] })).is_err());
+        assert!(
+            history_sample_bundle_files(&json!({ "manifest": { "status": "complete" } })).is_err()
+        );
+    }
+
+    #[test]
+    fn summary_reports_per_type_coverage_and_names_truncation() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("/tmp/fixtures"));
+        assert!(summary.contains("/tmp/fixtures"), "{summary}");
+        assert!(summary.contains("sampled 5 of 702"), "{summary}");
+        assert!(summary.contains("noisy"), "{summary}");
+        assert!(summary.contains("700"), "{summary}");
+        assert!(
+            summary.contains("NOTE: the sample is truncated"),
+            "AC2: truncation must be stated, never implied: {summary}"
+        );
+    }
+
+    /// A partial shard read makes the bundle a LOWER BOUND. A green gate over
+    /// it must not read as "the fleet replays clean", so the warning is loud.
+    #[test]
+    fn summary_warns_loudly_on_partial_shard_coverage() {
+        let mut response = sample_response();
+        response["manifest"]["status"] = json!("partial");
+        response["manifest"]["unavailable_shards"] = json!(["shard 1: connection refused"]);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(summary.contains("WARNING"), "{summary}");
+        assert!(summary.contains("LOWER BOUND"), "{summary}");
+        assert!(summary.contains("shard 1: connection refused"), "{summary}");
+    }
+
+    #[test]
+    fn summary_of_a_complete_untruncated_sample_carries_no_warning() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 4, "in_flight_total": 4,
+                          "per_workflow": [{ "workflow_name": "wf", "sampled": 4, "in_flight_total": 4 }],
+                          "states": ["RUNNING"], "unavailable_shards": [], "inspected_shards": [0],
+                          "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": []
+        });
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(!summary.contains("WARNING"), "{summary}");
+        assert!(!summary.contains("NOTE:"), "{summary}");
+    }
+
+    /// An export stopped by the response byte budget must say so at write time.
+    ///
+    /// Distinct from the `NOTE: the sample is truncated` line, and the
+    /// distinction is what the operator acts on: that reports the *intended*
+    /// truncation of sampling `--per-workflow` out of a larger population, this
+    /// reports an *unplanned* resource limit. Reading the two as the same thing
+    /// leads to raising `--per-workflow`, which makes it strictly worse.
+    #[test]
+    fn summary_warns_that_the_export_was_cut_short_by_the_byte_budget() {
+        let mut response = sample_response();
+        response["manifest"]["truncated_by_size"] = json!(true);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            summary.contains("response byte budget"),
+            "the cause must be named: {summary}"
+        );
+        assert!(
+            summary.contains("SMALLER than the sample you asked for"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("rather than raising --per-workflow"),
+            "the fix must steer away from the one that makes it worse: {summary}"
+        );
+    }
+
+    /// Control: an export that was NOT size-truncated must not claim it was.
+    ///
+    /// `sample_response()` is already truncated by population, so this also pins
+    /// that the two truncation kinds are reported independently.
+    #[test]
+    fn summary_of_a_population_truncated_sample_does_not_claim_a_size_cut() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(
+            summary.contains("NOTE: the sample is truncated"),
+            "population truncation is still reported: {summary}"
+        );
+        assert!(
+            !summary.contains("response byte budget"),
+            "a population-truncated sample must not claim a size cut: {summary}"
+        );
+    }
+
+    /// A candidate the sample selected but the export could not fetch must be
+    /// reported at write time.
+    ///
+    /// The count is otherwise invisible: the failed candidate produces no
+    /// document, so `sampled_total` counts only survivors and matches the file
+    /// count exactly. An operator reading a summary that says "4 of 4 sampled"
+    /// would reasonably believe the bundle is whole.
+    #[test]
+    fn summary_warns_that_the_export_dropped_selected_candidates() {
+        let mut response = sample_response();
+        response["manifest"]["export_failures"] = json!(2);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            summary.contains("could not fetch 2 candidate(s)"),
+            "the count must be named: {summary}"
+        );
+        assert!(
+            summary.contains("BIASED subset"),
+            "the consequence must be named, not just the cause: {summary}"
+        );
+        assert!(
+            summary.contains("--max-bytes"),
+            "the fix must be named: {summary}"
+        );
+        // The two shortfall causes are reported independently.
+        assert!(
+            !summary.contains("response byte budget"),
+            "a dropped candidate is not a byte-budget cut: {summary}"
+        );
+    }
+
+    /// Control: a clean export must not claim it dropped anything.
+    #[test]
+    fn summary_of_a_clean_export_does_not_claim_dropped_candidates() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(!summary.contains("BIASED subset"), "{summary}");
+    }
+
+    /// A manifest written before `truncated_by_size` existed must not warn.
+    #[test]
+    fn summary_of_a_legacy_manifest_without_the_size_flag_does_not_warn() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 4, "in_flight_total": 4,
+                          "per_workflow": [{ "workflow_name": "wf", "sampled": 4, "in_flight_total": 4 }],
+                          "states": ["RUNNING"], "unavailable_shards": [], "inspected_shards": [0],
+                          "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": []
+        });
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(!summary.contains("response byte budget"), "{summary}");
+        assert!(
+            !summary.contains("BIASED subset"),
+            "a legacy manifest predates export_failures too, so it must not warn: {summary}"
+        );
+    }
+
+    /// The CLI default is `redacted`, and the replay gate REFUSES a redacted
+    /// bundle. An operator who omits `--payload-policy full` must find that out
+    /// here — at the moment they write the bundle — not later, as an exit-2 wall
+    /// of BLOCKED lines against a bundle they can no longer re-export (the fleet
+    /// has moved on).
+    #[test]
+    fn summary_warns_that_a_redacted_bundle_is_refused_by_the_gate() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(summary.contains("WARNING"), "{summary}");
+        assert!(summary.contains("redacted"), "{summary}");
+        assert!(
+            summary.contains("--payload-policy full"),
+            "the warning must name the fix, not just the problem: {summary}"
+        );
+    }
+
+    /// The complement: a `full` bundle is exactly what the gate wants, so it
+    /// must carry no policy warning at all. Without this, the warning above
+    /// could be unconditional and still pass.
+    #[test]
+    fn summary_of_a_full_bundle_carries_no_payload_policy_warning() {
+        let mut response = sample_response();
+        response["payload_policy"] = json!("full");
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            !summary.contains("--payload-policy full"),
+            "a full bundle must not be told to re-export as full: {summary}"
+        );
+    }
+
+    /// Re-exporting into a directory that already holds a bundle must replace
+    /// it, not accumulate on top of it.
+    ///
+    /// Fixture names embed the execution id, so a second export does not
+    /// overwrite the first — it *adds* to it. The manifest, however, has a fixed
+    /// name and IS overwritten. The two then disagree: the manifest says
+    /// "sampled 1", the directory holds two fixtures, and the gate replays both.
+    /// The stale one is an execution that may have completed hours ago, so the
+    /// gate silently verifies a population the coverage record never described.
+    #[test]
+    fn re_exporting_replaces_a_stale_bundle_rather_than_accumulating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut first = sample_response();
+        first["exports"] = json!([
+            { "workflow_name": "old", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] }
+        ]);
+        write_history_sample_bundle(&first, dir.path()).expect("first export");
+
+        let mut second = sample_response();
+        second["exports"] = json!([
+            { "workflow_name": "new", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+        ]);
+        write_history_sample_bundle(&second, dir.path()).expect("second export");
+
+        // Enumerated exactly the way `ReplayVerifier`'s bundle walk does, so
+        // this counts what the gate would actually replay.
+        let fixtures: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .filter(|name| name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .collect();
+
+        assert_eq!(
+            fixtures.len(),
+            1,
+            "a stale fixture must not survive a re-export — the gate would \
+             replay an execution the fresh manifest never counted: {fixtures:?}"
+        );
+        assert!(fixtures[0].starts_with("new--"), "{fixtures:?}");
+    }
+
+    /// A stale fixture in a SUBDIRECTORY must not survive a re-export either.
+    ///
+    /// `testing::collect_json_files` descends subdirectories, so a top-level-only
+    /// clean leaves a nested fixture that the gate still replays — against a
+    /// manifest that never counted it. The result is drift reported for an
+    /// execution the operator did not sample, i.e. a false red on a healthy
+    /// build, which is the exact verdict this whole feature exists to avoid.
+    #[test]
+    fn re_exporting_replaces_a_stale_fixture_nested_in_a_subdirectory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut first = sample_response();
+        first["exports"] = json!([
+            { "workflow_name": "old", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] }
+        ]);
+        write_history_sample_bundle(&first, dir.path()).expect("first export");
+
+        // Simulate a fixture that ended up one level down (a hand-copied file,
+        // or a bundle laid out by an older/other tool).
+        let nested = dir.path().join("shard-1");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(nested.join("stale--33333333.json"), "{}").expect("nested fixture");
+
+        let mut second = sample_response();
+        second["exports"] = json!([
+            { "workflow_name": "new", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+        ]);
+        write_history_sample_bundle(&second, dir.path()).expect("second export");
+
+        // Count what the gate would replay: recursive, `*.json`, manifest
+        // excluded at any depth — the `collect_json_files` predicate.
+        let mut found = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(&current).expect("read dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")
+                    && path.file_name().and_then(std::ffi::OsStr::to_str)
+                        != Some(autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+                {
+                    found.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert_eq!(
+            found.len(),
+            1,
+            "a nested stale fixture must not survive a re-export — the gate \
+             walks subdirectories and would replay it: {found:?}"
+        );
+        assert!(found[0].contains("new--"), "{found:?}");
+    }
+
+    /// The replace above must never reach a directory this CLI did not write.
+    /// Refusing beats guessing: `--output-dir .` should not delete a user's
+    /// JSON files because they happened to pick the wrong path.
+    #[test]
+    fn a_directory_of_foreign_json_is_refused_not_cleaned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("important.json"), "{}").expect("write");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a non-bundle directory must not be silently emptied");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not a bundle") || rendered.contains("--output-dir"),
+            "the error must tell the operator what to do: {rendered}"
+        );
+        assert!(
+            dir.path().join("important.json").exists(),
+            "a foreign file must survive"
+        );
+    }
+
+    // ── JSON symlinks: the cleaner and the replay walk must agree (#798) ──
+    //
+    // `testing::collect_json_files` decides what the GATE replays with the
+    // predicate "not a directory, extension `.json`" — a symlink satisfies it.
+    // The cleaner therefore has to use the same rule, or the two walks disagree
+    // about what a bundle contains and the disagreement is a false verdict.
+
+    /// A `*.json` symlink is a fixture to the replay walk, so a re-export has to
+    /// clear it like any other. Leaving it behind means the fresh manifest
+    /// describes this run's sample while the directory still holds a previous
+    /// one, and the gate replays the stale fixture and blocks an unchanged
+    /// candidate — the exact false red this replace exists to prevent.
+    ///
+    /// Removing the LINK must not touch what it points at: the operator pointed
+    /// `--output-dir` at the bundle, not at the target's directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_json_symlink_in_a_marked_bundle_is_cleared_like_a_regular_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+
+        // Mark the directory as ours so the replace is authorized at all.
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("first export");
+
+        let target = outside.path().join("someone-elses-history.json");
+        fs::write(&target, "{\"not\":\"ours\"}").expect("write target");
+        let link = dir.path().join("stale-linked-fixture.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("re-export");
+
+        assert!(
+            !link.exists() && link.symlink_metadata().is_err(),
+            "a .json symlink is replayed by the gate, so the replace must clear \
+             it; leaving it makes the next gate run replay a stale fixture"
+        );
+        assert!(
+            target.exists(),
+            "only the LINK may be removed — the file it points at is outside \
+             the bundle and is not ours to delete"
+        );
+    }
+
+    /// `fs::write` follows a symlink, so a stale link whose name collides with a
+    /// fixture about to be written would send that write OUTSIDE the bundle.
+    /// Clearing the link first is what keeps the replace contained to the
+    /// directory the operator named.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_export_never_writes_through_a_colliding_json_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("first export");
+
+        // Collide with a name this export really writes, rather than a guess.
+        let fixture_name = history_sample_bundle_files(&sample_response())
+            .expect("bundle files")
+            .into_iter()
+            .map(|file| file.name)
+            .find(|name| name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .expect("the sample response must produce at least one fixture");
+
+        let target = outside.path().join("untouchable.json");
+        fs::write(&target, "ORIGINAL").expect("write target");
+        let link = dir.path().join(&fixture_name);
+        fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("re-export");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "ORIGINAL",
+            "the replace must stay inside --output-dir: writing through a \
+             colliding symlink clobbers a file the operator never named"
+        );
+    }
+
+    /// The "is this our bundle?" evidence is the count of JSON entries, so a
+    /// symlink has to count toward it too. If it does not, a directory holding
+    /// only a linked JSON reads as empty, the refusal never fires, and this
+    /// command writes into a directory it did not create.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_whose_only_json_is_a_symlink_is_refused_not_written_into() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let target = outside.path().join("important.json");
+        fs::write(&target, "{}").expect("write target");
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.json")).expect("symlink");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a directory of foreign JSON must be refused, linked or not");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not a bundle") || rendered.contains("--output-dir"),
+            "the error must tell the operator what to do: {rendered}"
+        );
+        assert!(target.exists(), "a foreign file must survive");
+    }
+
+    /// The manifest is what AUTHORIZES deleting a directory's contents, so the
+    /// marker is held to a stricter rule than the fixtures it guards: only a
+    /// real file we wrote counts. A linked manifest is not evidence this bundle
+    /// is ours, and the safe answer to "not ours" is to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_manifest_does_not_authorize_clearing_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let manifest_target = outside.path().join("manifest-elsewhere.json");
+        fs::write(&manifest_target, "{}").expect("write target");
+        std::os::unix::fs::symlink(
+            &manifest_target,
+            dir.path()
+                .join(autumn_harvest::replay_sample::SampleManifest::FILE_NAME),
+        )
+        .expect("symlink");
+        fs::write(dir.path().join("keep-me.json"), "{}").expect("write");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a linked manifest must not authorize deleting real files");
+        assert!(
+            error.to_string().contains("not a bundle")
+                || error.to_string().contains("--output-dir"),
+            "{error}"
+        );
+        assert!(dir.path().join("keep-me.json").exists(), "must survive");
+        assert_eq!(
+            fs::read_to_string(&manifest_target).expect("read"),
+            "{}",
+            "the manifest write must not follow the link out of the bundle"
+        );
+    }
+
+    /// A response that predates the field (or uses a policy this CLI does not
+    /// know) must not be accused of being redacted — a spurious warning on a
+    /// perfectly replayable bundle trains operators to ignore the real one.
+    #[test]
+    fn an_absent_or_unknown_payload_policy_is_not_reported_as_redacted() {
+        let mut response = sample_response();
+        response
+            .as_object_mut()
+            .expect("object")
+            .remove("payload_policy");
+        assert!(!bundle_is_redacted(&response));
+
+        response["payload_policy"] = json!("some-future-policy");
+        assert!(!bundle_is_redacted(&response));
+
+        response["payload_policy"] = json!("redacted");
+        assert!(bundle_is_redacted(&response));
+    }
+}
+
+#[cfg(test)]
+mod preflight_findings_tests {
+    //! Rendering tests for the preflight detail block (issue #802 review).
+    //!
+    //! The summary table carries only each check's one-line verdict, so the
+    //! specific unresolved references live in `details.failures` and used to be
+    //! invisible in table mode — the exact payload the declared-dependency
+    //! check exists to produce. These pin that they are rendered, that a
+    //! healthy fleet's output is unchanged, and that both `failures` element
+    //! shapes (plain string, structured object) survive.
+    use super::*;
+
+    fn check(name: &str, status: &str, failures: &Value, remediation: Option<&str>) -> Value {
+        let mut value = serde_json::json!({
+            "name": name,
+            "status": status,
+            "summary": "…",
+            "details": { "failures": failures },
+        });
+        if let Some(text) = remediation {
+            value["remediation"] = serde_json::json!(text);
+        }
+        value
+    }
+
+    #[test]
+    fn a_failing_check_renders_each_failure_and_its_remediation() {
+        let checks = vec![check(
+            "catalog_consistency",
+            "fail",
+            &serde_json::json!([
+                "workflow 'onboarding' references unregistered activity 'send_emial'",
+                "workflow 'onboarding' references unregistered child workflow 'generate_reprot'",
+            ]),
+            Some("Register the named handler."),
+        )];
+
+        let rendered = format_preflight_findings(&checks);
+
+        assert!(
+            rendered.starts_with("catalog_consistency (fail)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - workflow 'onboarding' references unregistered activity 'send_emial'"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - workflow 'onboarding' references unregistered child workflow 'generate_reprot'"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  remediation: Register the named handler."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_passing_check_contributes_nothing() {
+        let checks = vec![check(
+            "catalog_consistency",
+            "pass",
+            &serde_json::json!([]),
+            None,
+        )];
+        assert_eq!(format_preflight_findings(&checks), "");
+    }
+
+    #[test]
+    fn a_healthy_fleet_leaves_the_table_output_unchanged() {
+        let value = serde_json::json!({
+            "overall_status": "pass",
+            "observed_at": "2026-08-14T09:12:00Z",
+            "checks": [check("catalog_consistency", "pass", &serde_json::json!([]), None)],
+        });
+        let rendered = format_preflight_table(&value);
+        assert!(
+            !rendered.contains("catalog_consistency (pass)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .ends_with("registered catalog contains unresolved workflow runtime references")
+                || rendered.contains("STATUS"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn structured_failure_objects_are_rendered_not_dropped() {
+        // `schedule_resolvability` pushes objects rather than strings; the
+        // renderer must not silently swallow them.
+        let checks = vec![check(
+            "schedule_resolvability",
+            "fail",
+            &serde_json::json!([{ "schedule": "nightly", "reason": "unregistered workflow" }]),
+            None,
+        )];
+        let rendered = format_preflight_findings(&checks);
+        assert!(rendered.contains("nightly"), "{rendered}");
+        assert!(rendered.contains("unregistered workflow"), "{rendered}");
+    }
+
+    #[test]
+    fn a_warn_check_with_no_failures_and_no_remediation_is_omitted() {
+        let mut value = serde_json::json!({ "name": "worker_health", "status": "warn" });
+        value["details"] = serde_json::json!({});
+        assert_eq!(format_preflight_findings(&[value]), "");
+    }
+
+    #[test]
+    fn the_detail_block_is_appended_beneath_the_table() {
+        let value = serde_json::json!({
+            "overall_status": "fail",
+            "observed_at": "2026-08-14T09:12:00Z",
+            "checks": [check(
+                "catalog_consistency",
+                "fail",
+                &serde_json::json!(["workflow 'onboarding' references unregistered activity 'send_emial'"]),
+                Some("Register the named handler."),
+            )],
+        });
+
+        let rendered = format_preflight_table(&value);
+        let table_at = rendered.find("STATUS").expect("table header");
+        let detail_at = rendered
+            .find("catalog_consistency (fail)")
+            .expect("detail block");
+        assert!(
+            table_at < detail_at,
+            "detail block must follow the table:\n{rendered}"
+        );
+        assert!(rendered.contains("send_emial"), "{rendered}");
+    }
+}
+
+// Issue #949: `harvest debug` clap-layer tests. The rendering / focus-resolution
+// / breakpoint behaviour lives in `tests/integration/debug_cli.rs`; these pin
+// only the argument surface (defaults, aliases, mutual exclusion), mirroring
+// `det_check_cli_tests`.
+#[cfg(test)]
+mod debug_cli_tests {
+    use super::*;
+    use crate::debug::DebugFormat;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn debug_replay_parses_with_defaults() {
+        let cli = parse(&["debug", "replay", "history.json"]);
+        let Commands::Debug {
+            command:
+                DebugCommand::Replay {
+                    history,
+                    format,
+                    step,
+                    break_at_event_type,
+                    break_at_index,
+                    break_at_activity,
+                    break_at_signal,
+                    max_steps,
+                    tui,
+                },
+        } = cli.command
+        else {
+            panic!("expected debug replay");
+        };
+        assert_eq!(history, PathBuf::from("history.json"));
+        assert_eq!(format, DebugFormat::Text, "text is the default format");
+        assert!(step.is_none());
+        assert!(break_at_event_type.is_none());
+        assert!(break_at_index.is_none());
+        assert!(break_at_activity.is_none());
+        assert!(break_at_signal.is_none());
+        assert!(max_steps.is_none());
+        assert!(!tui, "the stepper is opt-in");
+    }
+
+    #[test]
+    fn debug_replay_parses_every_flag() {
+        let cli = parse(&[
+            "debug",
+            "replay",
+            "h.json",
+            "--format",
+            "json",
+            "--max-steps",
+            "50",
+        ]);
+        let Commands::Debug {
+            command: DebugCommand::Replay {
+                format, max_steps, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected debug replay");
+        };
+        assert_eq!(format, DebugFormat::Json);
+        assert_eq!(max_steps, Some(50));
+    }
+
+    #[test]
+    fn debug_replay_accepts_each_breakpoint_flag_alone() {
+        for args in [
+            vec![
+                "debug",
+                "replay",
+                "h.json",
+                "--break-at-event-type",
+                "TimerStarted",
+            ],
+            vec!["debug", "replay", "h.json", "--break-at-index", "3"],
+            vec!["debug", "replay", "h.json", "--break-at-activity", "charge"],
+            vec!["debug", "replay", "h.json", "--break-at-signal", "approval"],
+        ] {
+            assert!(
+                try_parse(&args).is_ok(),
+                "a single breakpoint flag must parse: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_replay_rejects_two_breakpoint_flags() {
+        // AC2's breakpoints are alternatives, not a conjunction; clap enforces
+        // it so `resolve_breakpoint` never has to pick a silent winner.
+        assert!(
+            try_parse(&[
+                "debug",
+                "replay",
+                "h.json",
+                "--break-at-index",
+                "1",
+                "--break-at-activity",
+                "charge",
+            ])
+            .is_err(),
+            "two breakpoint flags must be rejected"
+        );
+    }
+
+    #[test]
+    fn debug_replay_rejects_step_with_a_breakpoint() {
+        assert!(
+            try_parse(&[
+                "debug",
+                "replay",
+                "h.json",
+                "--step",
+                "1",
+                "--break-at-index",
+                "2"
+            ])
+            .is_err(),
+            "--step and a breakpoint are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn debug_replay_rejects_tui_with_format() {
+        // `--tui` drives a terminal; a format flag alongside it would silently
+        // do nothing.
+        assert!(
+            try_parse(&["debug", "replay", "h.json", "--tui", "--format", "json"]).is_err(),
+            "--tui and --format are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn debug_diff_parses_both_sides() {
+        let cli = parse(&["debug", "diff", "old.json", "new.json", "--format", "json"]);
+        let Commands::Debug {
+            command:
+                DebugCommand::Diff {
+                    left,
+                    right,
+                    format,
+                },
+        } = cli.command
+        else {
+            panic!("expected debug diff");
+        };
+        assert_eq!(left, PathBuf::from("old.json"));
+        assert_eq!(right, PathBuf::from("new.json"));
+        assert_eq!(format, DebugFormat::Json);
+    }
+
+    #[test]
+    fn debug_diff_requires_two_paths() {
+        assert!(try_parse(&["debug", "diff", "only-one.json"]).is_err());
     }
 }

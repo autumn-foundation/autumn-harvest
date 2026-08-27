@@ -66,6 +66,9 @@ fn test_app_state() -> AppState {
 fn minimal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "deploy_workflow",
             module: "tests",
@@ -491,6 +494,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -799,6 +803,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,

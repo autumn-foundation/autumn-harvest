@@ -88,6 +88,93 @@ fn real_migrations_have_unique_version_prefixes() {
     );
 }
 
+/// Migration directory names in the **plugin's** harvest-database tree.
+///
+/// Read from disk rather than an env var because `build.rs` belongs to the
+/// core crate. A missing directory yields an empty list: the guard's job is to
+/// detect collisions, not to require the plugin to own any migrations.
+fn plugin_harvest_migration_names() -> Vec<String> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../autumn-harvest-plugin/migrations/harvest");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Plugin migration names whose version is already taken by a core migration.
+///
+/// Pure, so the guard below and its RED demonstration exercise the *same*
+/// predicate rather than two copies that can drift apart.
+fn versions_colliding_with_core<'a>(plugin: &'a [String], core_list: &str) -> Vec<&'a str> {
+    let core: BTreeSet<&str> = core_list
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter_map(|n| n.split('_').next())
+        .collect();
+    plugin
+        .iter()
+        .filter(|name| {
+            name.split('_')
+                .next()
+                .is_some_and(|version| core.contains(version))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn plugin_and_core_migrations_never_share_a_version() {
+    // Diesel identifies an applied migration by its **version alone** and
+    // records it in one `__diesel_schema_migrations` table. The plugin's
+    // migrations run against the SAME harvest database as the core ones, and
+    // `ensure_runtime_migrations` runs core first — so a plugin migration
+    // sharing a core version is silently considered already applied and its
+    // SQL NEVER EXECUTES. The table it was meant to create simply does not
+    // exist, and the failure surfaces far away at runtime.
+    //
+    // The sibling `real_migrations_have_unique_version_prefixes` cannot catch
+    // this: it only sees the core tree.
+    let plugin = plugin_harvest_migration_names();
+    if plugin.is_empty() {
+        return;
+    }
+    let collisions = versions_colliding_with_core(&plugin, MIGRATIONS_LIST);
+
+    assert!(
+        collisions.is_empty(),
+        "plugin migration(s) {collisions:?} reuse a version already taken by a core \
+         migration. Diesel keys on version alone and core runs first, so the plugin \
+         migration would be skipped entirely and its table never created. Rename it to a \
+         version unused anywhere in the repository."
+    );
+}
+
+#[test]
+fn version_collision_detection_covers_both_trees() {
+    // RED demonstration for the guard above, on the SAME predicate: a shared
+    // version must be reported even though the two directory names differ.
+    let core = "20260716000000_core_thing,20260101000000_other";
+    let plugin = ["20260716000000_plugin_thing".to_string()];
+    assert_eq!(
+        versions_colliding_with_core(&plugin, core),
+        vec!["20260716000000_plugin_thing"],
+        "a version shared with a core migration must be detected"
+    );
+
+    // A distinct version is not a collision, so the guard cannot be vacuously
+    // green by flagging everything.
+    let distinct = ["20260719000000_plugin_thing".to_string()];
+    assert!(versions_colliding_with_core(&distinct, core).is_empty());
+}
+
 #[test]
 fn full_migrations_sql_bundle_is_complete() {
     let bundle = autumn_harvest::full_migrations_sql();
@@ -175,6 +262,15 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
     // the core `migrations/` bundle that `full_migrations_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
+    // The three connector suites (issue #944) each build
+    // `full_migrations_sql()` and then append the plugin-owned
+    // `harvest_connector_dead_letters` migration, which likewise lives in
+    // `autumn-harvest-plugin/migrations/harvest/` rather than the core bundle.
+    // The paved path is used for everything it covers; only the one plugin
+    // table is hand-appended.
+    "autumn-harvest-plugin/tests/connector_integration.rs",
+    "autumn-harvest-plugin/tests/connector_kafka_broker.rs",
+    "autumn-harvest-plugin/tests/connector_sqs_broker.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a
@@ -302,7 +398,7 @@ fn line_detector_flags_a_handrolled_include_and_ignores_others() {
         r#"    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),"#
     ));
     assert!(line_is_handrolled_migration_include(
-        r#"    include_str!("../migrations/20260409010000_harvest_workflow_outbox/up.sql");"#
+        r#"    include_str!("../migrations/app/20260409010000_harvest_workflow_outbox/up.sql");"#
     ));
     // A non-migration `include_str!` (the paved-path helper's own CI includes)
     // must NOT be flagged — it lacks both `migrations` and `up.sql`.
@@ -420,5 +516,107 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
         "ALLOWED_HANDROLLED_MIGRATION_INCLUDES has stale entries — these no longer contain a \
          hand-rolled migration include (converted to full_migrations_sql()?). Remove them:\n  {}",
         stale.join("\n  ")
+    );
+}
+
+/// The release-upgrade guide whose migration inventory this guard keeps honest.
+///
+/// Root-relative so the failure message names the file an author must edit.
+const UPGRADE_GUIDE: &str = "docs/upgrading/0.5.0.md";
+
+/// Extract the migration directory names listed in the upgrade guide's
+/// inventory table, i.e. the leading `` `<dir>` `` cell of every row shaped
+/// `` | `<dir>` | … | ``.
+///
+/// Pure — takes the guide's text so it can be unit-tested with synthetic input.
+fn migrations_listed_in_guide(markdown: &str) -> BTreeSet<String> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let cell = line.trim().strip_prefix("| `")?;
+            let (name, _) = cell.split_once('`')?;
+            // Inventory rows only: a migration dir is `<timestamp>_<slug>`, so
+            // require a leading all-digit timestamp. This skips every other
+            // backtick-leading table in the guide (config keys, metric names).
+            let prefix = name.split('_').next()?;
+            (prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_digit()))
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn guide_row_extractor_reads_migration_rows_and_ignores_others() {
+    let synthetic = "\
+| Migration dir | Adds |\n\
+|---------------|------|\n\
+| `20260618000001_harvest_debounce` | `harvest_debounce` table (#499) |\n\
+| `20260715000000_harvest_queue_pause` | `harvest_queue_pauses` (#619) |\n\
+| `harvest.queue.paused` | a metric, not a migration |\n\
+plain prose mentioning `20260101000000_not_a_row`\n";
+    let found = migrations_listed_in_guide(synthetic);
+    assert_eq!(
+        found,
+        [
+            "20260618000001_harvest_debounce",
+            "20260715000000_harvest_queue_pause"
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<BTreeSet<String>>(),
+        "only timestamped migration rows must be extracted"
+    );
+}
+
+/// Every migration in this release must appear in the upgrade guide's inventory.
+///
+/// The guide states it lists the migrations `0.5.0` adds, and non-`dev` profiles
+/// **refuse to start** with a pending migration — so an omitted row means an
+/// operator following the guide applies an incomplete set and the deploy fails
+/// (or, if they bypass the plugin check, the new queries fail against a missing
+/// relation). Issue #619 shipped `20260715000000_harvest_queue_pause` without
+/// its row; nothing caught it, because this is the one inventory in the repo
+/// with no drift guard. This is that guard.
+///
+/// **Scope** is every migration at or after the guide's own earliest listed
+/// entry, so migrations from prior releases are correctly out of scope and a
+/// NEW migration — which always sorts later — is always in scope. That makes
+/// the boundary self-maintaining rather than a hardcoded date this guard would
+/// itself have to keep current.
+#[test]
+fn every_release_migration_is_in_the_upgrade_guide() {
+    let path = workspace_root().join(UPGRADE_GUIDE);
+    let markdown = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("upgrade guide '{}' must be readable: {e}", path.display()));
+
+    let listed = migrations_listed_in_guide(&markdown);
+    assert!(
+        !listed.is_empty(),
+        "no migration rows parsed from {UPGRADE_GUIDE} — the inventory table's shape changed, \
+         so this guard is silently vacuous. Fix the parser, do not delete the test."
+    );
+
+    // The guide's earliest listed migration is the release boundary.
+    let first = listed
+        .iter()
+        .next()
+        .expect("non-empty, checked above")
+        .clone();
+
+    let mut missing: Vec<&str> = MIGRATIONS_LIST
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name >= first.as_str())
+        .filter(|name| !listed.contains(*name))
+        .collect();
+    missing.sort_unstable();
+
+    assert!(
+        missing.is_empty(),
+        "these migrations are missing from the inventory table in {UPGRADE_GUIDE}:\n  {}\n\
+         An operator following that guide would apply an incomplete migration set, and a \
+         non-`dev` profile refuses to start with a migration pending. Add a row per migration \
+         (release boundary: the guide's earliest listed entry, `{first}`).",
+        missing.join("\n  ")
     );
 }

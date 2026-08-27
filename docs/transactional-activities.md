@@ -1,5 +1,9 @@
 # Transactional Activities
 
+> **Starting a workflow atomically with your own domain write?** See
+> [Transactional Workflow Start](transactional-start.md) — the same dual-write
+> problem, one step earlier in the pipeline (issue #763).
+
 ## The dual-write problem
 
 An activity that writes to a user table and then returns `Ok(output)` relies on

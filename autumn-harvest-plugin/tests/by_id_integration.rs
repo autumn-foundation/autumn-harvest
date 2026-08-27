@@ -147,6 +147,7 @@ async fn seed(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -224,6 +225,9 @@ fn progress_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "progress_wf",
         module: "tests",

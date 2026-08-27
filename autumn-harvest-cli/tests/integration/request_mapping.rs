@@ -143,6 +143,96 @@ fn workflow_start_maps_to_management_api_request() {
     );
 }
 
+/// issue #697: `--residency-key` maps to the `residency_key` body field, and an
+/// unpinned start's body stays byte-identical to a pre-#697 CLI.
+#[test]
+fn workflow_start_residency_key_maps_to_the_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "start",
+        "approval_workflow",
+        "--workflow-id",
+        "approval-42",
+        "--residency-key",
+        "eu",
+    ])
+    .expect("workflow start args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.path, "/workflows/approval_workflow/start");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "workflow_id": "approval-42",
+            "residency_key": "eu",
+        }))
+    );
+}
+
+/// issue #697: `--shard-id` maps to a numeric `shard_id` body field.
+#[test]
+fn workflow_start_shard_id_maps_to_a_numeric_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "start",
+        "approval_workflow",
+        "--shard-id",
+        "2",
+    ])
+    .expect("workflow start args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.body, Some(json!({ "shard_id": 2 })));
+}
+
+/// Lineage tree (issue #621) maps onto `GET /workflows/{id}/tree`, with every
+/// bound carried as a query param so an omitted flag inherits the *server's*
+/// documented default rather than a second copy of it in the CLI.
+#[test]
+fn workflow_tree_maps_bounds_onto_query_params() {
+    // Bare form sends no query string at all, so the server's documented
+    // defaults (max_depth 20 / max_nodes 1000) apply.
+    let tree = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "tree",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow tree args should parse");
+    let tree_request = tree.api_request().expect("tree request should build");
+    assert_eq!(tree_request.method, ApiMethod::Get);
+    assert_eq!(
+        tree_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/tree"
+    );
+    assert_eq!(tree_request.body, None);
+
+    let tree_summary = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "tree",
+        "00000000-0000-0000-0000-000000000001",
+        "--summary",
+        "--max-depth",
+        "3",
+        "--max-nodes",
+        "50",
+    ])
+    .expect("workflow tree flags should parse");
+    let tree_summary_request = tree_summary
+        .api_request()
+        .expect("tree summary request should build");
+    assert_eq!(tree_summary_request.method, ApiMethod::Get);
+    assert_eq!(
+        tree_summary_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/tree\
+         ?summary=true&max_depth=3&max_nodes=50"
+    );
+    assert_eq!(tree_summary_request.body, None);
+}
+
 #[test]
 fn workflow_list_and_query_use_get_requests() {
     let list = Cli::try_parse_from(["harvest", "workflow", "list", "--limit", "25"])
@@ -202,6 +292,23 @@ fn workflow_list_and_query_use_get_requests() {
     );
     assert_eq!(timeline_request.body, None);
 
+    let awaitables = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "awaitables",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow awaitables args should parse");
+    let awaitables_request = awaitables
+        .api_request()
+        .expect("awaitables request should build");
+    assert_eq!(awaitables_request.method, ApiMethod::Get);
+    assert_eq!(
+        awaitables_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/awaitables"
+    );
+    assert_eq!(awaitables_request.body, None);
+
     let run_chain = Cli::try_parse_from([
         "harvest",
         "workflow",
@@ -235,6 +342,78 @@ fn workflow_list_and_query_use_get_requests() {
         "/workflows/00000000-0000-0000-0000-000000000001/replay-diagnosis"
     );
     assert_eq!(replay_diagnosis_request.body, None);
+}
+
+/// Durable per-execution author logs (issue #790) — `harvest workflow logs`.
+///
+/// Its own test rather than more assertions on
+/// `workflow_list_and_query_use_get_requests`: that function is already at the
+/// `clippy::too_many_lines` ceiling, and the logs route has three distinct
+/// query-shaping behaviours worth naming (bare, fully-filtered, repeated
+/// `--level`).
+#[test]
+fn workflow_logs_maps_to_the_logs_route_with_query_filters() {
+    let logs = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow logs args should parse");
+    let logs_request = logs.api_request().expect("logs request should build");
+    assert_eq!(logs_request.method, ApiMethod::Get);
+    assert_eq!(
+        logs_request.path, "/workflows/00000000-0000-0000-0000-000000000001/logs",
+        "no flags must send no query string at all"
+    );
+    assert_eq!(logs_request.body, None);
+
+    // Every flag, including a comma-separated --level that must expand into
+    // one `level=` param per value.
+    let logs_filtered = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "warn,error",
+        "--limit",
+        "50",
+        "--cursor",
+        "17",
+        "--since",
+        "2026-05-06T00:00:00Z",
+    ])
+    .expect("workflow logs filter args should parse");
+    let logs_filtered_request = logs_filtered
+        .api_request()
+        .expect("filtered logs request should build");
+    assert_eq!(
+        logs_filtered_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/logs\
+         ?level=warn&level=error&limit=50&cursor=17&since=2026-05-06T00:00:00Z"
+    );
+    assert_eq!(logs_filtered_request.body, None);
+
+    // A repeated --level flag is equivalent to the comma-separated form.
+    let logs_repeated = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "warn",
+        "--level",
+        "error",
+    ])
+    .expect("repeated --level should parse");
+    assert_eq!(
+        logs_repeated
+            .api_request()
+            .expect("repeated-level request should build")
+            .path,
+        "/workflows/00000000-0000-0000-0000-000000000001/logs?level=warn&level=error"
+    );
 }
 
 #[test]
@@ -304,6 +483,39 @@ fn workflow_list_supports_repeated_and_comma_states() {
     let request = list.api_request().expect("list request should build");
 
     assert_eq!(request.path, "/workflows?state=RUNNING,FAILED,TIMED_OUT");
+}
+
+#[test]
+fn workflow_list_history_bloat_min_events_maps_to_query_string() {
+    // Issue #704: operator early-warning discovery for workflow history bloat.
+    // Distinct query param from the server's pre-existing, general-purpose
+    // `min_history_events` filter (issue #493) -- reusing that name broke
+    // callers combining it with state=/pagination (PR #1139 review). The CLI
+    // forwards the raw value verbatim -- the server owns validation
+    // (non-numeric/negative -> 400) and the non-terminal + sorted-by-size
+    // discovery behavior.
+    let list = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "list",
+        "--history-bloat-min-events",
+        "5000",
+    ])
+    .expect("history-bloat-min-events list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows?history_bloat_min_events=5000");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_list_omits_history_bloat_min_events_by_default() {
+    let list = Cli::try_parse_from(["harvest", "workflow", "list"])
+        .expect("default list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.path, "/workflows");
 }
 
 #[test]
@@ -497,6 +709,132 @@ fn history_export_batch_maps_filters_to_admin_route() {
          &shard_id=2&limit=1000&payload_policy=redacted"
     );
     assert_eq!(request.body, None);
+}
+
+/// Issue #798: the sample export maps onto the stratified admin route with the
+/// per-type cap, the caller-specified non-terminal states, and the payload
+/// policy — the three inputs a CI drift gate actually varies.
+#[test]
+fn history_export_sample_maps_to_the_stratified_admin_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--per-workflow",
+        "25",
+        "--states",
+        "RUNNING",
+        "--workflow-name",
+        "billing_checkout",
+        "--order",
+        "newest",
+        "--shard-id",
+        "2",
+        "--payload-policy",
+        "full",
+        "--max-bytes",
+        "1048576",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/history/export-sample?workflow_name=billing_checkout&states=RUNNING\
+         &per_workflow=25&order=newest&shard_id=2&payload_policy=full&max_bytes=1048576"
+    );
+    assert_eq!(request.body, None);
+}
+
+/// Omitting every optional flag must still send the two defaults the AC names
+/// (`per_workflow=50`, redacted payloads) — never an unbounded request.
+#[test]
+fn history_export_sample_defaults_are_explicit_on_the_wire() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    assert_eq!(
+        request.path,
+        "/admin/history/export-sample?per_workflow=50&order=oldest&payload_policy=redacted"
+    );
+}
+
+/// Repeating `--states` accumulates rather than overwriting, so
+/// `--states RUNNING --states PAUSED` is not silently narrowed to one state.
+#[test]
+fn history_export_sample_accumulates_repeated_states() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING",
+        "--states",
+        "PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    // `,` is deliberately left unencoded by `query_encode`, matching every other
+    // repeatable/comma-separated management-API param.
+    assert!(
+        request.path.contains("states=RUNNING,PAUSED"),
+        "repeated --states must accumulate: {}",
+        request.path
+    );
+}
+
+/// The comma-separated idiom must produce the identical wire shape as the
+/// repeated-flag idiom, so a CI recipe copied from either samples the same
+/// population.
+#[test]
+fn history_export_sample_comma_separated_states_match_repeated_flags() {
+    let repeated = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING",
+        "--states",
+        "PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("parse")
+    .api_request()
+    .expect("build");
+    let comma = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING,PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("parse")
+    .api_request()
+    .expect("build");
+
+    assert_eq!(repeated.path, comma.path);
 }
 
 #[test]
@@ -1958,6 +2296,241 @@ fn workflow_resume_maps_to_post_resume_route_with_no_body() {
     assert_eq!(request.body, None, "resume sends no body");
 }
 
+// ── rerun (operator re-run of a terminal execution, issue #777) ───────────────
+
+#[test]
+fn workflow_rerun_maps_to_post_rerun_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/rerun"
+    );
+}
+
+#[test]
+fn workflow_rerun_without_flags_sends_empty_object_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    // No `input` key at all: the server treats an absent `input` as "clone the
+    // source's stored input verbatim" and an explicit JSON null as an override,
+    // so the CLI must never inject a null to mean "the operator said nothing".
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn workflow_rerun_with_input_json_and_workflow_id() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-json",
+        r#"{"user_id": 7}"#,
+        "--workflow-id",
+        "order-42-retry",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.body,
+        Some(json!({ "input": { "user_id": 7 }, "workflow_id": "order-42-retry" }))
+    );
+}
+
+#[test]
+fn workflow_rerun_with_input_file_and_workflow_id() {
+    let mut tmp = tempfile::NamedTempFile::new().expect("tmp file");
+    std::io::Write::write_all(&mut tmp, br#"{"user_id": 7, "retry": true}"#).expect("write input");
+    let path = tmp.into_temp_path();
+    let path_str = path.to_str().expect("temp path is utf-8");
+
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-file",
+        path_str,
+        "--workflow-id",
+        "order-42-retry",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/rerun"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "input": { "user_id": 7, "retry": true },
+            "workflow_id": "order-42-retry",
+        }))
+    );
+}
+
+#[test]
+fn workflow_rerun_input_json_and_input_file_conflict() {
+    // Positive controls: each flag alone must parse, so the conflict assertion
+    // below cannot pass merely because the subcommand or flags are unknown.
+    for flag in ["--input-json", "--input-file"] {
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "rerun",
+                "00000000-0000-0000-0000-000000000001",
+                flag,
+                "{}",
+            ])
+            .is_ok(),
+            "{flag} alone should parse"
+        );
+    }
+
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "rerun",
+            "00000000-0000-0000-0000-000000000001",
+            "--input-json",
+            "{}",
+            "--input-file",
+            "input.json",
+        ])
+        .is_err(),
+        "--input-json and --input-file are mutually exclusive"
+    );
+}
+
+// ── annotate (operator-mutable triage tags, issue #759) ───────────────────────
+
+#[test]
+fn workflow_annotate_sets_owner_and_severity_maps_to_patch_triage_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+    ])
+    .expect("workflow annotate args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/triage"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({ "owner": "team-payments", "severity": "P1" }))
+    );
+}
+
+#[test]
+fn workflow_annotate_note_only_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--note",
+        "claimed, investigating stuck timer",
+    ])
+    .expect("workflow annotate note args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(
+        request.body,
+        Some(json!({ "note": "claimed, investigating stuck timer" }))
+    );
+}
+
+#[test]
+fn workflow_annotate_clear_flags_send_explicit_null() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--clear-owner",
+        "--clear-severity",
+        "--clear-note",
+    ])
+    .expect("workflow annotate clear args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    let body = request.body.expect("annotate request must have a body");
+    let obj = body.as_object().expect("body must be an object");
+    assert!(obj.contains_key("owner") && body["owner"].is_null());
+    assert!(obj.contains_key("severity") && body["severity"].is_null());
+    assert!(obj.contains_key("note") && body["note"].is_null());
+}
+
+#[test]
+fn workflow_annotate_no_flags_sends_empty_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow annotate args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn workflow_annotate_set_and_clear_flags_conflict() {
+    for (set_flag, set_value, clear_flag) in [
+        ("--owner", "team-payments", "--clear-owner"),
+        ("--severity", "P1", "--clear-severity"),
+        ("--note", "investigating", "--clear-note"),
+    ] {
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "annotate",
+                "00000000-0000-0000-0000-000000000001",
+                set_flag,
+                set_value,
+                clear_flag,
+            ])
+            .is_err(),
+            "{set_flag} and {clear_flag} must conflict"
+        );
+    }
+}
+
 // ── batch-reset subcommand (issue #538) ───────────────────────────────────────
 
 #[test]
@@ -2244,6 +2817,422 @@ fn legal_hold_release_maps_to_post_with_no_body() {
     assert_eq!(request.body, None);
 }
 
+// ── Task-queue pause/resume (issue #619) ──────────────────────────────────────
+
+#[test]
+fn queue_pause_maps_to_post_with_reason() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "SMTP provider outage",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "SMTP provider outage" })),
+        "omitting --shard-id must send NO shard_id field: the default is a \
+         fleet-wide hold, not shard 0"
+    );
+}
+
+#[test]
+fn queue_pause_with_shard_id_scopes_the_hold() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "one shard only",
+        "--shard-id",
+        "2",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "one shard only", "shard_id": 2 }))
+    );
+}
+
+#[test]
+fn queue_resume_maps_to_post_with_empty_body() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", "email-workers"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/resume");
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn queue_list_paused_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "list-paused"])
+        .expect("queue list-paused args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queues/paused");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_pause_percent_encodes_the_queue_name() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email workers/eu",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/email%20workers%2Feu/pause",
+        "a queue name with a space or slash must not break out of the path segment"
+    );
+}
+
+#[test]
+fn queue_pause_rejects_url_dot_segment_queue_names() {
+    // A literal `.` or `..` queue name is NOT percent-encodable out of the
+    // problem: the WHATWG URL parser that reqwest uses collapses dot-segments
+    // *after* `ApiRequest.path` is built, so a `.` name silently rewrites the
+    // request to `/admin/queues/pause` -- a DIFFERENT route. Rejection at
+    // request-construction time is the only correct handling.
+    //
+    // The `%2e` spellings are additionally rejected as defense in depth: they
+    // are already neutralized today by `PATH_SEGMENT_ENCODE_SET` encoding `%`
+    // (they reach the URL as `%252e`), and the guard should not silently depend
+    // on that staying true.
+    for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "pause", bad, "--reason", "x"])
+            .expect("queue pause args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_resume_rejects_url_dot_segment_queue_names() {
+    // Same hazard on the destructive direction: a `..` resume must never be
+    // allowed to silently target `/admin/pause`.
+    for bad in [".", "..", "%2e", "%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "resume", bad])
+            .expect("queue resume args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_pause_percent_encodes_a_backslash_in_the_queue_name() {
+    // The URL parser treats `\` as a path separator for http/https, so an
+    // unencoded backslash splits the segment and the request silently lands on
+    // a different route -- and it re-enables `..` traversal inside what should
+    // be one opaque segment, past the whole-segment dot-segment guard.
+    // Encoding IS the right fix here (unlike the literal `.`/`..` forms):
+    // `%5C` is not collapsed, so a queue whose name genuinely carries a
+    // backslash stays pausable.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        r"payments\..\admin",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/payments%5C..%5Cadmin/pause",
+        "a backslash must not split the path segment or enable traversal"
+    );
+}
+
+#[test]
+fn queue_resume_percent_encodes_a_backslash_in_the_queue_name() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", r"payments\eu"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/payments%5Ceu/resume");
+}
+
+#[test]
+fn queue_pause_still_accepts_names_that_merely_contain_dots() {
+    // Only a WHOLE-segment `.`/`..` is a dot-segment -- `a.b` is a perfectly
+    // ordinary queue name and must not be swept up by the rejection.
+    let cli = Cli::try_parse_from(["harvest", "queue", "pause", "orders.eu", "--reason", "x"])
+        .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/orders.eu/pause");
+}
+
+#[test]
+fn queue_pause_requires_a_reason() {
+    // A hold with no stated cause is unauditable -- clap must reject it.
+    assert!(
+        Cli::try_parse_from(["harvest", "queue", "pause", "email-workers"]).is_err(),
+        "queue pause must require --reason"
+    );
+}
+
+// ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
+
+#[test]
+fn activity_pause_maps_to_post_with_reason_and_actor() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "activity",
+        "pause",
+        "charge_card",
+        "--reason",
+        "payments provider outage",
+        "--actor",
+        "alice",
+    ])
+    .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "payments provider outage", "actor": "alice" }))
+    );
+}
+
+#[test]
+fn activity_pause_without_flags_sends_an_empty_body() {
+    // Unlike `queue pause`, `--reason` is OPTIONAL here: containment must not
+    // wait on paperwork. Omitted flags must be absent from the body entirely so
+    // the server applies its own documented defaults, rather than being
+    // overwritten with an empty string.
+    let cli = Cli::try_parse_from(["harvest", "activity", "pause", "charge_card"])
+        .expect("activity pause args should parse without --reason");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({})),
+        "omitted --reason/--actor must send NO field, not an empty string"
+    );
+}
+
+#[test]
+fn activity_pause_sends_only_the_flag_that_was_given() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "activity",
+        "pause",
+        "charge_card",
+        "--actor",
+        "pagerduty-bot",
+    ])
+    .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.body, Some(json!({ "actor": "pagerduty-bot" })));
+}
+
+#[test]
+fn activity_resume_maps_to_post_with_empty_body() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "resume", "charge_card"])
+        .expect("activity resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/resume");
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn activity_list_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "list"])
+        .expect("activity list args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/activities");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn activity_list_json_flag_is_render_only_and_never_reaches_the_request() {
+    // `--json` selects the OUTPUT rendering, so it must not leak into the wire
+    // request as a query param or body field. Pinned because the read route is
+    // shared with the default table path: a leak would send the server an
+    // unknown param that a strict handler could reject.
+    let plain = Cli::try_parse_from(["harvest", "activity", "list"])
+        .expect("activity list args should parse")
+        .api_request()
+        .expect("request should build");
+    let json = Cli::try_parse_from(["harvest", "activity", "list", "--json"])
+        .expect("activity list --json args should parse")
+        .api_request()
+        .expect("request should build");
+
+    assert_eq!(json.method, ApiMethod::Get);
+    assert_eq!(json.path, "/activities");
+    assert_eq!(json.body, None);
+    assert_eq!(
+        plain, json,
+        "--json must produce a byte-identical request to the default table path"
+    );
+}
+
+#[test]
+fn activity_get_maps_to_the_single_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "get", "charge_card"])
+        .expect("activity get args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/activities/charge_card");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn activity_list_accepts_the_documented_aliases() {
+    // `list-paused` mirrors the queue command an operator already knows, and
+    // `status` mirrors the other read subcommands. Both must reach the SAME
+    // route -- an alias that silently 404s is worse than no alias.
+    for alias in ["list", "list-paused", "status"] {
+        let cli = Cli::try_parse_from(["harvest", "activity", alias])
+            .unwrap_or_else(|e| panic!("activity {alias} should parse: {e}"));
+        let request = cli.api_request().expect("request should build");
+        assert_eq!(
+            request.path, "/activities",
+            "alias {alias} must map to the read route"
+        );
+    }
+
+    // The plural top-level alias, for parity with `harvest queues`.
+    let cli = Cli::try_parse_from(["harvest", "activities", "list"])
+        .expect("the `activities` top-level alias should parse");
+    assert_eq!(
+        cli.api_request().expect("request should build").path,
+        "/activities"
+    );
+}
+
+#[test]
+fn activity_pause_percent_encodes_the_activity_name() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "pause", "charge card/eu"])
+        .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/activities/charge%20card%2Feu/pause",
+        "an activity name with a space or slash must not break out of the path segment"
+    );
+}
+
+#[test]
+fn activity_routes_reject_url_dot_segment_names() {
+    // Identical hazard to the queue path: the WHATWG URL parser collapses
+    // dot-segments AFTER `ApiRequest.path` is assembled, so an activity named
+    // `.` would silently rewrite `/activities/./pause` to `/activities/pause`
+    // -- a different route. Every subcommand that interpolates the name must
+    // reject it, including the reads (a `..` on `get` would target `/`).
+    for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
+        for verb in ["pause", "resume", "get"] {
+            let cli = Cli::try_parse_from(["harvest", "activity", verb, bad])
+                .unwrap_or_else(|e| panic!("activity {verb} {bad:?} should parse: {e}"));
+
+            assert!(
+                cli.api_request().is_err(),
+                "activity {verb} name {bad:?} normalizes away in the URL path \
+                 and must be rejected"
+            );
+        }
+    }
+}
+
+// ── Queue coverage (issue #774) ────────────────────────────────────────────
+
+#[test]
+fn queue_coverage_maps_to_the_read_route_unfiltered() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "coverage"]).expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queue-coverage");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_coverage_threads_the_queue_filter_into_the_query_string() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "coverage", "--queue", "email-workers"])
+        .expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/queue-coverage?queue_name=email-workers"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_coverage_query_encodes_a_queue_name_with_special_characters() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "coverage",
+        "--queue",
+        "email workers/eu",
+    ])
+    .expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path,
+        "/admin/queue-coverage?queue_name=email%20workers%2Feu"
+    );
+}
+
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
 #[test]
@@ -2332,4 +3321,36 @@ fn token_rotate_maps_to_post_create_replacement() {
     let request = cli.api_request().expect("request should build");
     assert_eq!(request.method, ApiMethod::Post);
     assert_eq!(request.path, "/admin/tokens");
+}
+
+/// Issue #809: `workflow diagnose` maps onto the read-only diagnose route, and
+/// `--json` is a render-only flag that must not alter the wire request.
+#[test]
+fn workflow_diagnose_maps_to_the_diagnose_route() {
+    for args in [
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+        ],
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ],
+    ] {
+        let diagnose = Cli::try_parse_from(args).expect("workflow diagnose args should parse");
+        let diagnose_request = diagnose
+            .api_request()
+            .expect("diagnose request should build");
+        assert_eq!(diagnose_request.method, ApiMethod::Get);
+        assert_eq!(
+            diagnose_request.path,
+            "/workflows/00000000-0000-0000-0000-000000000001/diagnose"
+        );
+        assert_eq!(diagnose_request.body, None);
+    }
 }

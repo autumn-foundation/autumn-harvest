@@ -16,7 +16,7 @@ use diesel_async::RunQueryDsl;
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::{harvest_events, harvest_workflow_executions};
+use crate::schema::{harvest_events, harvest_execution_summaries, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -494,6 +494,36 @@ pub(crate) async fn next_event_id_for(
         .map_err(crate::error::database_error)?;
 
     Ok(max_id.map_or(0, |id| id.saturating_add(1)))
+}
+
+/// Count an execution's durably-persisted `harvest_events` rows.
+///
+/// Lock-free (no `FOR UPDATE`, no execution-row existence check) and
+/// autocommit-safe -- unlike [`next_event_id_for`], which is meant for
+/// in-transaction use and raises [`crate::error::HarvestError::NotFound`] on
+/// a missing execution. This is a best-effort read intended for post-commit
+/// telemetry decisions (issue #704's history-bloat soft-threshold warning):
+/// the caller must already know the execution exists (it just persisted a
+/// decision cycle for it), so a `NotFound` distinction is unnecessary here
+/// -- an execution with zero rows (impossible in practice) simply counts 0.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub(crate) async fn count_history_events(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    use diesel::dsl::count_star;
+
+    let count: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(count_star())
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// Durably admit an update into a workflow's event history.
@@ -1291,6 +1321,339 @@ fn workflow_child_row_from_parts(
     }
 }
 
+/// Load the direct children of every id in `parent_ids` from one shard, in
+/// one `parent_id = ANY($1)` query.
+///
+/// This is the batched sibling of `load_workflow_children`: a caller walking
+/// a traversal *frontier* (the accumulated set of parents discovered at one
+/// depth level) should call this once per shard per depth level rather than
+/// calling `load_workflow_children` once per *parent* per shard per depth
+/// level — the latter costs `O(nodes × shards)` round trips for a depth-`D`
+/// tree, this costs `O(D × shards)`. See the "Cross-shard lineage tree
+/// loaders" doc comment below for the same argument as applied to
+/// `load_workflow_children_batch`, which this mirrors exactly except for
+/// returning `WorkflowChildRow` (this endpoint's flat, non-parent-tagged
+/// projection) instead of `LineageChildRow` (the nested `/tree` endpoint's
+/// parent-tagged one) — the caller here doesn't need to know *which* parent
+/// in the frontier produced a given child, only the whole next frontier and
+/// the whole set of matching rows.
+///
+/// Returns an empty vec without querying when `parent_ids` is empty.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children_multi(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+    filters: &WorkflowChildFilters,
+    depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .order((
+            harvest_workflow_executions::started_at.desc(),
+            harvest_workflow_executions::id.desc(),
+        ));
+
+    if !filters.statuses.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(cursor) = &filters.cursor {
+        query = query.filter(
+            harvest_workflow_executions::started_at
+                .lt(cursor.started_at)
+                .or(harvest_workflow_executions::started_at
+                    .eq(cursor.started_at)
+                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
+        );
+    }
+    if let Some(limit) = filters.limit {
+        query = query.limit(limit);
+    }
+
+    query
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::error,
+            harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
+        ))
+        .load::<WorkflowChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        workflow_name,
+                        state,
+                        started_at,
+                        completed_at,
+                        error,
+                        shard_id,
+                        parent_close_policy,
+                    )| {
+                        workflow_child_row_from_parts(
+                            id,
+                            workflow_name,
+                            state,
+                            started_at,
+                            completed_at,
+                            error,
+                            shard_id,
+                            depth,
+                            parent_close_policy.as_deref(),
+                        )
+                    },
+                )
+                .collect()
+        })
+}
+
+// ── Cross-shard lineage tree loaders (issue #621) ────────────────────────────
+//
+// The recursive lineage walk expands a whole *frontier* of parents per level,
+// so these helpers take a batch of parent ids (`parent_id = ANY($1)`) rather
+// than a single parent. That turns a depth-`D` tree over `S` shards from
+// `O(nodes × S)` round trips (one query per parent per shard — what a naive
+// recursion over `load_workflow_children` costs) into `O(D × S)`, which is what
+// keeps a ~200-node/8-shard tree inside the issue's p95 < 500 ms budget.
+//
+// Both helpers are shard-local reads; the cross-shard fan-out and the bounded
+// walk itself live in the plugin (`autumn-harvest-plugin::lineage`).
+
+/// One execution row in a cross-shard lineage tree (issue #621).
+///
+/// Distinct from [`WorkflowChildRow`] (the `GET /workflows/{id}/children` read
+/// model): a lineage node additionally carries its own `parent_id` — needed to
+/// nest a flat, cross-shard row set back into a tree — and `workflow_id`, the
+/// business key an operator recognises. It deliberately does **not** carry an
+/// error summary: the tree is a topology/state map, and a node's failure detail
+/// is one `GET /workflows/{id}` away.
+#[derive(Debug, Clone)]
+pub struct LineageChildRow {
+    /// This execution's id.
+    pub exec_id: ExecutionId,
+    /// The parent this row was discovered through. `None` only for a row whose
+    /// `parent_id` column is NULL (a root), which the batch loader never
+    /// returns — it is populated for every discovered descendant.
+    pub parent_id: Option<ExecutionId>,
+    /// Registered workflow type name.
+    pub workflow_name: String,
+    /// Caller-supplied business workflow id.
+    pub workflow_id: String,
+    /// Raw persisted state (`RUNNING`, `FAILED`, …), matching the `state=`
+    /// filter vocabulary of `GET /workflows`.
+    pub state: String,
+    /// When this execution started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When this execution reached a terminal state, if it has.
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Shard this row was read from.
+    pub shard_id: i32,
+    /// How this child was spawned (awaited vs detached).
+    pub await_mode: AwaitMode,
+    /// For detached children, the policy applied when the parent closes.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
+}
+
+type LineageChildProjection = (
+    uuid::Uuid,
+    Option<uuid::Uuid>,
+    String,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i32,
+    Option<String>,
+);
+
+/// Load the direct children of **every** parent in `parent_ids` from one shard,
+/// in a single query (issue #621).
+///
+/// Rows are ordered `started_at ASC, id ASC` and capped at `limit`. The
+/// ordering is load-bearing, not cosmetic: when the walk's `max_nodes` budget
+/// truncates a level it keeps the first `N` rows of this order, so the tree an
+/// operator sees is stable across retries instead of varying with Postgres'
+/// physical row order.
+///
+/// Returns an empty vector without touching the database when `parent_ids` is
+/// empty or `limit <= 0` — the walk calls this once per shard per level and
+/// both cases occur naturally (an exhausted node budget, an empty frontier).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children_batch(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+    limit: i64,
+) -> HarvestResult<Vec<LineageChildRow>> {
+    if parent_ids.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .order((
+            harvest_workflow_executions::started_at.asc(),
+            harvest_workflow_executions::id.asc(),
+        ))
+        .limit(limit)
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::parent_id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
+        ))
+        .load::<LineageChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().map(lineage_child_row_from_parts).collect())
+}
+
+fn lineage_child_row_from_parts(parts: LineageChildProjection) -> LineageChildRow {
+    let (
+        id,
+        parent_id,
+        workflow_name,
+        workflow_id,
+        state,
+        started_at,
+        completed_at,
+        shard_id,
+        parent_close_policy_str,
+    ) = parts;
+    let parent_close_policy = parent_close_policy_str
+        .as_deref()
+        .and_then(|s| s.parse::<crate::types::ParentClosePolicy>().ok());
+    // A detached child is exactly one that carries a parent-close policy; an
+    // awaited child's column is NULL. Same derivation as
+    // `workflow_child_row_from_parts`, kept in lockstep with it.
+    let await_mode = if parent_close_policy.is_some() {
+        AwaitMode::Detached
+    } else {
+        AwaitMode::Awaited
+    };
+    LineageChildRow {
+        exec_id: ExecutionId::from_uuid(id),
+        parent_id: parent_id.map(ExecutionId::from_uuid),
+        workflow_name,
+        workflow_id,
+        state,
+        started_at,
+        completed_at,
+        shard_id,
+        await_mode,
+        parent_close_policy,
+    }
+}
+
+/// Bounded existence probe: of the given `parent_ids`, which ones have at least
+/// one child on this shard? (issue #621)
+///
+/// This is what lets a truncated lineage walk name **precisely** the nodes whose
+/// subtrees were dropped, instead of conservatively naming every unexpanded
+/// leaf. A false positive there would send an operator chasing a subtree that
+/// does not exist, so the walk pays one extra `SELECT DISTINCT` per shard to
+/// stay honest.
+///
+/// The result is `DISTINCT`, so a parent with 500 children contributes one id —
+/// the response's dropped-subtree list is bounded by frontier size, not by
+/// child count.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_parents_with_children(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .select(harvest_workflow_executions::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+/// Bounded existence probe against **retained summaries**: which of the given
+/// `parent_ids` have a demoted child on this shard? (issues #621, #752)
+///
+/// "Demoted" means the child now lives only in `harvest_execution_summaries`.
+/// Tiered summary retention is opt-in, but when it is on, a *terminal* child is
+/// independently retention-eligible: it can be demoted into a summary and have
+/// its `harvest_workflow_executions` row deleted while its long-running parent
+/// is still live. [`load_workflow_children_batch`] reads only the executions
+/// table, so such a child — and everything beneath it — is invisible to a
+/// lineage walk. Without this probe a `FAILED` demoted child would produce a
+/// tree that reports itself complete, which is precisely the silent omission
+/// the walk's bounds machinery exists to prevent.
+///
+/// Retention deliberately preserves `harvest_execution_summaries.parent_id` for
+/// exactly this case (it skips the terminal-child `parent_id` null-out when
+/// summary retention is enabled), and [`crate::erase`]'s cascade already unions
+/// both tables on it; this is the read-side counterpart.
+///
+/// Returns only the *nearest live ancestors* of omitted lineage. A summary
+/// child's own children are not enumerated — naming the live node an operator
+/// can actually act from is the useful signal, and it keeps the probe a single
+/// `DISTINCT` per shard.
+///
+/// When summary retention is disabled (the default) the table is empty and this
+/// returns nothing, so the walk is unaffected.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_parents_with_summary_children(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_execution_summaries::table
+        .filter(harvest_execution_summaries::parent_id.eq_any(parents))
+        .select(harvest_execution_summaries::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
 /// Merge-patch the `search_attrs` JSONB column for a workflow execution.
 ///
 /// `Some(value)` entries in `patch` overwrite the stored key; `None` entries
@@ -1370,6 +1733,300 @@ pub async fn update_current_details(
         .map_err(crate::error::database_error)?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Durable per-execution workflow logs (issue #790)
+// ---------------------------------------------------------------------------
+
+/// `seq` reserved for the per-execution truncation marker (issue #790).
+///
+/// `i64::MAX` sorts strictly after every real line — a real `seq` is a
+/// **call ordinal** (the Nth `ctx.log_*` call of this run), so a workflow would
+/// have to make ~2^63 log calls in one execution to reach it, and the
+/// per-execution line cap plus the in-memory enqueue bound stop storing long
+/// before that. Using the ordering key itself to pin the marker last means no
+/// extra column and no special-casing in the read path: the marker is just the
+/// final line.
+pub const WORKFLOW_LOG_TRUNCATION_SEQ: i64 = i64::MAX;
+
+/// Message stored on the truncation marker row.
+pub const WORKFLOW_LOG_TRUNCATION_MESSAGE: &str =
+    "[harvest] per-execution log cap reached; subsequent lines were dropped";
+
+/// One log line to persist, as resolved from the drained command list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowLogLine {
+    /// Deterministic logical-position identity; the dedup + ordering key.
+    pub seq: i64,
+    /// `"info"` / `"warn"` / `"error"`.
+    pub level: &'static str,
+    /// The author's message (already byte-capped by the context).
+    pub message: String,
+}
+
+/// Append durable workflow log lines, enforcing the per-execution cap.
+///
+/// **Exactly-once (issue #790 AC2).** Every row is inserted with
+/// `ON CONFLICT DO NOTHING` against the unique `(workflow_exec_id, seq)` index.
+/// Replay-suppression alone is not sufficient — a decision cycle that logs and
+/// then parks can be re-driven at an *unchanged* history position (a spurious
+/// wake, or a cycle whose persist rolled back), where `is_replaying()` is still
+/// false and the line is emitted again. Because `seq` is a deterministic
+/// function of that position, the re-emitted line collides and is collapsed.
+///
+/// **Bounded volume (AC4) — drop-newest.** Once the execution holds `max_lines`
+/// real lines, further lines are dropped and a single terminal truncation
+/// marker (`WORKFLOW_LOG_TRUNCATION_SEQ`) is recorded instead, so the loss is
+/// visible rather than silent. Drop-newest keeps the start of the run (where a
+/// workflow's setup and branch decisions are) and costs one bounded `COUNT`
+/// per decision cycle rather than a `DELETE` per line.
+///
+/// **The marker is terminal.** Once it exists the gate stays shut: a later
+/// batch is rejected even if `max_lines` has since been RAISED. This is not
+/// hypothetical — `max_lines` is per-worker-process config, so on a rolling
+/// deployment a run can truncate under an old worker's cap and have its next
+/// decision cycle handled by a new worker with a larger one. Re-deciding
+/// admission against the current policy would store a line *after* the one that
+/// was dropped, leaving a hole in the stored prefix and a marker whose
+/// "subsequent lines were dropped" claim is false. Latching keeps the stored
+/// rows a contiguous prefix of the run and keeps the marker honest; the
+/// already-dropped lines are unrecoverable either way, so re-opening the gate
+/// buys nothing.
+///
+/// Rejecting a post-marker batch wholesale loses nothing: every line in such a
+/// batch is either already stored (so `ON CONFLICT DO NOTHING` would have
+/// collapsed it) or was deliberately dropped.
+///
+/// Returns the number of real (non-marker) rows **actually inserted** — the
+/// affected-row count from the INSERT, not the number offered. A re-driven
+/// cycle whose rows are all collapsed by the conflict clause therefore returns
+/// `0`, which is the honest answer: nothing was written.
+pub async fn append_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    lines: &[WorkflowLogLine],
+    max_lines: u32,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    if lines.is_empty() {
+        return Ok(0);
+    }
+
+    // The marker latches the cap decision (see the doc comment): once it is
+    // present, no previously unseen line is admitted, whatever `max_lines`
+    // currently says. Checked BEFORE the count so a raised cap cannot re-open
+    // the gate on a rolling deployment.
+    let truncated: bool = diesel::select(diesel::dsl::exists(
+        dsl::harvest_workflow_logs
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::seq.eq(WORKFLOW_LOG_TRUNCATION_SEQ)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if truncated {
+        return Ok(0);
+    }
+
+    // Count only real lines that this batch is NOT about to re-insert.
+    //
+    // Two exclusions, each load-bearing:
+    //   * the marker, so its own presence can never push the count over the cap
+    //     and re-trigger truncation accounting; and
+    //   * this batch's own seqs (issue #790 review), because on the re-drive
+    //     path the design depends on -- the same position re-minting the same
+    //     seq -- those rows are ALREADY stored and `ON CONFLICT DO NOTHING`
+    //     will collapse them. Counting them would charge the cycle's lines to
+    //     the budget twice and fire the truncation marker on a run that
+    //     dropped nothing, which is exactly the false alarm the marker exists
+    //     to rule out.
+    let batch_seqs: Vec<i64> = lines.iter().map(|line| line.seq).collect();
+    let existing: i64 = dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::seq.ne(WORKFLOW_LOG_TRUNCATION_SEQ))
+        .filter(dsl::seq.ne_all(batch_seqs))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let remaining = i64::from(max_lines).saturating_sub(existing).max(0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let admit = (remaining as usize).min(lines.len());
+
+    // Keep the affected-row count (issue #790 review round 2): on the re-drive
+    // path the conflict clause collapses rows that are already stored, so
+    // `admit` counts what we OFFERED, not what landed.
+    let inserted = if admit > 0 {
+        let rows: Vec<crate::models::NewHarvestWorkflowLog> = lines[..admit]
+            .iter()
+            .map(|line| crate::models::NewHarvestWorkflowLog {
+                workflow_exec_id: exec_id.as_uuid(),
+                seq: line.seq,
+                level: line.level.to_string(),
+                message: line.message.clone(),
+            })
+            .collect();
+        diesel::insert_into(dsl::harvest_workflow_logs)
+            .values(&rows)
+            .on_conflict((dsl::workflow_exec_id, dsl::seq))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    } else {
+        0
+    };
+
+    // Anything we could not admit is dropped -- record the marker exactly once.
+    //
+    // This condition MUST stay on `admit`, never on `inserted`. A re-drive
+    // offers rows that are already stored, so `inserted` is 0 while nothing was
+    // dropped at all -- gating on it would stamp a truncation marker on every
+    // re-driven cycle and tell an operator a healthy run had lost lines.
+    if admit < lines.len() {
+        diesel::insert_into(dsl::harvest_workflow_logs)
+            .values(crate::models::NewHarvestWorkflowLog {
+                workflow_exec_id: exec_id.as_uuid(),
+                seq: WORKFLOW_LOG_TRUNCATION_SEQ,
+                level: "warn".to_string(),
+                message: WORKFLOW_LOG_TRUNCATION_MESSAGE.to_string(),
+            })
+            .on_conflict((dsl::workflow_exec_id, dsl::seq))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(inserted)
+}
+
+/// Read filters for one page of an execution's durable log lines (issue #790).
+///
+/// Mirrors the `ScheduleRunQuery` params-struct precedent so the HTTP layer has
+/// one thing to build and the signature stays extensible.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowLogQuery<'a> {
+    /// Exclusive keyset cursor: the previous page's last `seq`.
+    pub after_seq: Option<i64>,
+    /// Wall-clock lower bound on `occurred_at` (exclusive). Independent of
+    /// `after_seq`; both may be set and are `AND`ed.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Level allow-list. Empty means "all levels".
+    pub levels: &'a [&'a str],
+    /// Page size. The caller is responsible for clamping it.
+    pub limit: i64,
+}
+
+/// Load one page of an execution's durable log lines, in emission order.
+///
+/// Ordering is by `seq`, the deterministic emission order -- **not** by
+/// `occurred_at`, which is wall-clock and can be non-monotonic across workers.
+/// `since` is offered as a convenience bound only; pagination must use
+/// `after_seq`.
+pub async fn load_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    query: &WorkflowLogQuery<'_>,
+) -> HarvestResult<Vec<crate::models::HarvestWorkflowLog>> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    let mut q = dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .into_boxed();
+    if let Some(after) = query.after_seq {
+        q = q.filter(dsl::seq.gt(after));
+    }
+    if let Some(since) = query.since {
+        q = q.filter(dsl::occurred_at.gt(since));
+    }
+    if !query.levels.is_empty() {
+        // The truncation marker is a `warn` row, so a `?level=warn` filter
+        // naturally still surfaces it; other filters correctly hide it.
+        q = q.filter(dsl::level.eq_any(query.levels.to_vec()));
+    }
+    q.order(dsl::seq.asc())
+        .limit(query.limit)
+        .select(crate::models::HarvestWorkflowLog::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Count an execution's **real** durable log lines, across all levels.
+///
+/// The synthetic truncation marker is excluded, matching the accounting in
+/// [`append_workflow_logs`]: it is engine bookkeeping, not an author line, so
+/// counting it would make a capped execution report `max_lines + 1` and break
+/// the `total_lines <= max_lines` invariant exactly on the runs an operator is
+/// most likely inspecting. Whether a run was truncated is reported separately,
+/// by probing for the marker directly.
+pub async fn count_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<i64> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::seq.ne(WORKFLOW_LOG_TRUNCATION_SEQ))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Delete every durable log line for an execution (issue #790 × issue #495).
+///
+/// Called by the targeted PII-erasure path: an author's log messages are
+/// free-form text that can carry personal data, so erasing an execution's
+/// payloads must erase its logs too. Returns the number of rows removed.
+pub async fn delete_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    diesel::delete(dsl::harvest_workflow_logs.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Guarded exactly-once stamp for the operator early-warning soft threshold
+/// on workflow history bloat (issue #704).
+///
+/// Called by the worker, post-commit (in autocommit), when a still-RUNNING
+/// execution's recorded history event count has just crossed
+/// `history_bloat_warn_fraction * event_hard_cap` for the first time.
+///
+/// The `WHERE history_bloat_warned_at IS NULL` guard makes this exactly-once
+/// and race-safe: concurrent workers racing to persist the same execution's
+/// next cycle (or repeated re-dispatch of an already-warned execution) can
+/// never double-stamp the row. Returns `Ok(true)` iff THIS call performed the
+/// transition (the row was NULL and is now stamped) so the caller emits the
+/// counter exactly once; `Ok(false)` means it was already stamped (by an
+/// earlier cycle or a racing worker) and the caller must not emit again.
+pub async fn mark_history_bloat_warned(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> crate::error::HarvestResult<bool> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let rows = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::history_bloat_warned_at.is_null()),
+    )
+    .set(dsl::history_bloat_warned_at.eq(diesel::dsl::now))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows > 0)
 }
 
 fn summarize_error(error: Option<String>) -> Option<String> {

@@ -209,6 +209,9 @@ fn two_shard_router() -> ShardRouter {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "echo_workflow",
         module: "tests",
@@ -402,6 +405,25 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
             .expect("checks should be an array")
             .iter()
             .any(|check| check["name"] == "worker_coverage")
+    );
+
+    // Issue #797: the scanner-liveness check is part of the report, and an
+    // API-only process (this test runs no worker, so no control loops) passes
+    // with an empty registry rather than reporting seven phantom wedged
+    // scanners.
+    let scanner_check = body["checks"]
+        .as_array()
+        .expect("checks should be an array")
+        .iter()
+        .find(|check| check["name"] == "scanner_liveness")
+        .expect("scanner_liveness must be part of the preflight report");
+    assert_eq!(scanner_check["status"], "pass");
+    assert_eq!(scanner_check["details"]["scanners_registered"], 0);
+    assert!(
+        scanner_check["details"]["scanners"]
+            .as_array()
+            .expect("scanners must be an array")
+            .is_empty()
     );
 }
 

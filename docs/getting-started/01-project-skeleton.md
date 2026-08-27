@@ -23,9 +23,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-autumn-harvest = "0.4"
-autumn-harvest-plugin = "0.4"
-autumn-web = "0.5"
+autumn-harvest = "0.6"
+autumn-harvest-plugin = "0.6"
+autumn-web = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -69,9 +69,12 @@ docker compose up -d
 AUTUMN_PROFILE=dev cargo run
 ```
 
-`AUTUMN_PROFILE=dev` runs `diesel migration run` automatically on startup so
-you don't need `diesel-cli` for the dev loop. The app will start on
-`http://localhost:3000`. Hit the health endpoint to confirm the plugin
+`HarvestPlugin` registers its migrations with Autumn, which applies them
+before any startup hook runs. Under `AUTUMN_PROFILE=dev` pending migrations are
+applied automatically, so you don't need `diesel-cli` for the dev loop. (Outside
+`dev`, pending migrations are only *reported* — run `autumn migrate` in your
+deploy pipeline first. See [Chapter 10](10-operations.md).) The app will start
+on `http://localhost:3000`. Hit the health endpoint to confirm the plugin
 mounted:
 
 ```bash

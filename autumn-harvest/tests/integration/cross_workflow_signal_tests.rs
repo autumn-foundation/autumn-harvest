@@ -445,6 +445,9 @@ fn slow_act_info() -> ActivityInfo {
 // breaks every test together rather than silently diverging).
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "cross_workflow_signal_tests",
@@ -495,6 +498,7 @@ fn mk_start_params(
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -555,6 +559,9 @@ async fn test_same_shard_not_found_retry() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
@@ -579,6 +586,9 @@ async fn test_same_shard_not_found_retry() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
@@ -641,6 +651,7 @@ async fn test_same_shard_not_found_retry() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -696,6 +707,7 @@ async fn test_same_shard_not_found_retry() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -766,6 +778,9 @@ async fn test_cross_shard_outbox_delivery() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
@@ -790,6 +805,9 @@ async fn test_cross_shard_outbox_delivery() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
@@ -853,6 +871,7 @@ async fn test_cross_shard_outbox_delivery() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -901,6 +920,7 @@ async fn test_cross_shard_outbox_delivery() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -967,6 +987,9 @@ async fn test_grace_window_expiration() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "caller_workflow",
             module: "cross_workflow_signal_tests",
@@ -1029,6 +1052,7 @@ async fn test_grace_window_expiration() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -1111,6 +1135,9 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "mixed_suspension_workflow",
                 module: "cross_workflow_signal_tests",
@@ -1135,6 +1162,9 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
@@ -1197,6 +1227,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -1252,6 +1283,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,

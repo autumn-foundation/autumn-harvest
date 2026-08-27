@@ -191,6 +191,7 @@ async fn publish_progress_replays_with_zero_divergence() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 

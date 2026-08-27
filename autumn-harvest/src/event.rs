@@ -309,6 +309,24 @@ pub enum WorkflowEvent {
         new_exec_id: ExecutionId,
         /// The JSON payload passed to the next iteration of the workflow.
         input: serde_json::Value,
+        /// Registered workflow type the successor runs as (issue #803).
+        ///
+        /// `None` — the overwhelmingly common case, and what every event
+        /// written before #803 deserializes to — means **same type**: the
+        /// successor inherits the predecessor's `workflow_name` and carries
+        /// its lifecycle columns forward verbatim, exactly as before.
+        ///
+        /// `Some(type)` means the author called
+        /// [`continue_as_new_as_type`](crate::context::WorkflowContext::continue_as_new_as_type)
+        /// (or its typed sibling `continue_as_new_as`): the successor runs as
+        /// `type` and resolves its lifecycle defaults from *that* type's
+        /// [`WorkflowInfo`](crate::info::WorkflowInfo).
+        ///
+        /// Additive and `skip_serializing_if`-guarded, so a pre-#803 history
+        /// round-trips byte-identically and replays unchanged (no new event
+        /// variant, no migration).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_workflow_type: Option<String>,
     },
 
     // ── Local activities (issue #98) ─────────────────────────────────────
@@ -513,19 +531,26 @@ pub enum WorkflowEvent {
         attempt: u32,
     },
 
-    // ── External workflow signals (issue #330) ────────────────────────────
-    /// A workflow requested delivery of a named signal to another running
-    /// workflow by `ExecutionId`.
+    // ── External workflow signals (issue #330, by-id targeting #751) ─────────
+    /// A workflow requested delivery of a named signal to another workflow,
+    /// addressed either by a specific `ExecutionId` or by a stable
+    /// `(workflow_name, workflow_id)` business key resolved to the current
+    /// run at delivery time (issue #751).
     ///
     /// The `signal_id` correlates this request with its terminal outcome event
     /// (`ExternalSignalDelivered` or `ExternalSignalFailed`). On replay the
     /// caller's context returns the recorded outcome without re-issuing the
     /// side effect.
+    ///
+    /// `target`'s type widened from a bare `ExecutionId` to
+    /// [`crate::types::ExternalTarget`] in issue #751 — `#[serde(untagged)]`
+    /// makes every pre-#751 stored event (a bare UUID string) deserialize
+    /// unchanged into the `ExecutionId` variant.
     ExternalSignalRequested {
         /// Correlation ID linking this event to its terminal outcome.
         signal_id: ExternalSignalId,
-        /// The execution ID of the workflow that should receive the signal.
-        target: ExecutionId,
+        /// The workflow that should receive the signal.
+        target: crate::types::ExternalTarget,
         /// Name of the signal channel on the receiving workflow.
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
@@ -542,13 +567,19 @@ pub enum WorkflowEvent {
         signal_id: ExternalSignalId,
     },
     /// The signal could not be delivered. The `reason_code` is one of:
-    /// - `"target_terminal"` — the target workflow is already in a terminal state.
-    /// - `"target_unknown"` — no execution with the given ID was found after
-    ///   the configured grace window.
+    /// - `"target_terminal"` — the target execution is already in a terminal
+    ///   state (`ExecutionId`-targeted requests only).
+    /// - `"not_running"` — the resolved current run for a `workflow_id`
+    ///   target is definitively terminal (issue #751; no grace window needed,
+    ///   since a continue-as-new always leaves an active successor behind
+    ///   atomically, so this observation can never be a false negative).
+    /// - `"target_unknown"` — no execution with the given ID (or business key)
+    ///   was ever found, after the configured grace window.
     ExternalSignalFailed {
         /// Correlation ID matching the corresponding `ExternalSignalRequested`.
         signal_id: ExternalSignalId,
-        /// Machine-readable reason code (`"target_terminal"` or `"target_unknown"`).
+        /// Machine-readable reason code (`"target_terminal"`,
+        /// `"not_running"`, or `"target_unknown"`).
         reason_code: String,
     },
 
@@ -673,19 +704,27 @@ pub enum WorkflowEvent {
         actor: String,
     },
 
-    // ── External workflow cancellation (issue #492) ───────────────────────────
-    /// A workflow requested cancellation of another running workflow by `ExecutionId`.
+    // ── External workflow cancellation (issue #492, by-id targeting #751) ────
+    /// A workflow requested cancellation of another workflow, addressed
+    /// either by a specific `ExecutionId` or by a stable
+    /// `(workflow_name, workflow_id)` business key resolved to the current
+    /// run at delivery time (issue #751).
     ///
     /// The `cancel_id` correlates this request with its terminal outcome event
     /// (`ExternalCancelDelivered` or `ExternalCancelFailed`). On replay the
     /// caller's context returns the recorded outcome without re-issuing the
     /// side effect. Unlike signal, no payload is carried — the cancel is
     /// target-only.
+    ///
+    /// `target`'s type widened from a bare `ExecutionId` to
+    /// [`crate::types::ExternalTarget`] in issue #751 — see
+    /// `ExternalSignalRequested`'s doc comment for the backward-compatibility
+    /// argument (identical here).
     ExternalCancelRequested {
         /// Correlation ID linking this event to its terminal outcome.
         cancel_id: ExternalCancelId,
-        /// The execution ID of the workflow to cancel.
-        target: ExecutionId,
+        /// The workflow to cancel.
+        target: crate::types::ExternalTarget,
     },
     /// The cancel was successfully applied to the target workflow (or the
     /// target was already in a terminal state — no-op success).
@@ -694,8 +733,8 @@ pub enum WorkflowEvent {
         cancel_id: ExternalCancelId,
     },
     /// The cancel could not be delivered. The `reason_code` is one of:
-    /// - `"target_unknown"` — no execution with the given ID was found after
-    ///   the configured grace window.
+    /// - `"target_unknown"` — no execution with the given ID (or business
+    ///   key) was ever found, after the configured grace window.
     ExternalCancelFailed {
         /// Correlation ID matching the corresponding `ExternalCancelRequested`.
         cancel_id: ExternalCancelId,
@@ -1484,6 +1523,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::Value::Null,
+                new_workflow_type: None,
             },
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id: ActivityExecId::new(),
@@ -1557,7 +1597,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id: crate::types::ExternalSignalId::new(),
-                target: ExecutionId::new(),
+                target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
                 signal_name: "cancel".into(),
                 payload: serde_json::Value::Null,
                 idempotency_key: None,
@@ -1600,7 +1640,7 @@ mod tests {
             },
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id: crate::types::ExternalCancelId::new(),
-                target: ExecutionId::new(),
+                target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
             },
             WorkflowEvent::ExternalCancelDelivered {
                 cancel_id: crate::types::ExternalCancelId::new(),
@@ -1797,10 +1837,10 @@ mod tests {
     #[test]
     fn external_signal_requested_round_trips() -> Result<(), serde_json::Error> {
         let signal_id = crate::types::ExternalSignalId::new();
-        let target = ExecutionId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
         let event = WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: target.clone(),
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
             idempotency_key: Some("evt_123".into()),
@@ -1912,7 +1952,7 @@ mod tests {
     #[test]
     fn external_signal_events_are_not_terminal_lifecycle() {
         let signal_id = crate::types::ExternalSignalId::new();
-        let target = ExecutionId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
         assert!(
             !WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -1994,6 +2034,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: exec,
                 input: serde_json::Value::Null,
+                new_workflow_type: None,
             },
             WorkflowEvent::WorkflowResetTerminated {
                 reset_to_exec_id: exec,
@@ -2410,5 +2451,89 @@ mod tests {
             }
             .is_terminal_lifecycle()
         );
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ──────────────────────────
+
+    /// A same-type continue-as-new records `new_workflow_type: None`, and the
+    /// additive field must be **absent** from the serialized JSON so a
+    /// pre-#803 reader (and a byte-comparison against a pre-#803 history) sees
+    /// exactly today's shape.
+    #[test]
+    fn continued_as_new_same_type_omits_the_additive_field() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"cycle": 2}),
+            new_workflow_type: None,
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            !json.contains("new_workflow_type"),
+            "new_workflow_type must skip when None, got {json}"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_workflow_type, ..
+            } => assert!(new_workflow_type.is_none()),
+            other => panic!("wrong variant: {}", other.type_name()),
+        }
+        Ok(())
+    }
+
+    /// A cross-type continue-as-new round-trips the target type verbatim.
+    #[test]
+    fn continued_as_new_cross_type_round_trips() -> Result<(), serde_json::Error> {
+        let exec = ExecutionId::new();
+        let event = WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: exec,
+            input: serde_json::json!({"tier": "paid"}),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("paid_subscription"), "got {json}");
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id,
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(new_exec_id, exec);
+                assert_eq!(input, serde_json::json!({"tier": "paid"}));
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("wrong variant: {}", other.type_name()),
+        }
+        Ok(())
+    }
+
+    /// **Append-only invariant (AC3).** A history written by a pre-#803 build
+    /// carries no `new_workflow_type` key at all; it must deserialize to
+    /// `None` (same-type) rather than failing, so in-flight executions replay
+    /// identically across the upgrade.
+    #[test]
+    fn pre_803_continued_as_new_json_deserializes_to_none() -> Result<(), serde_json::Error> {
+        let exec = ExecutionId::new();
+        let legacy = format!(
+            r#"{{"type":"WorkflowContinuedAsNew","data":{{"new_exec_id":"{exec}","input":{{"cycle":7}}}}}}"#
+        );
+        let back: WorkflowEvent = serde_json::from_str(&legacy)?;
+        match back {
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id,
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(new_exec_id, exec);
+                assert_eq!(input, serde_json::json!({"cycle": 7}));
+                assert!(
+                    new_workflow_type.is_none(),
+                    "a pre-#803 event must read as same-type"
+                );
+            }
+            other => panic!("wrong variant: {}", other.type_name()),
+        }
+        Ok(())
     }
 }

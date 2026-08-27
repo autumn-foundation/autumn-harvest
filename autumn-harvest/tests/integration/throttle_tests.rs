@@ -241,6 +241,7 @@ async fn start(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str, input: serde
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Default::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -1856,6 +1857,9 @@ fn noop_scheduler_handler<'a>(
 fn make_throttled_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: workflow_name,
             module: "throttle_tests",

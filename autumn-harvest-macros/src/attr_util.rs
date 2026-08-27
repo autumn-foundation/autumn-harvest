@@ -1,6 +1,57 @@
 //! Small parsing helpers shared across the `#[workflow(...)]`, `#[update(...)]`,
 //! and sibling attribute-macro argument parsers.
 
+/// Compile-time validator for the runtime `task_duration()` string format
+/// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
+/// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
+/// trailing garbage. Mirrors (but does not call) the runtime parser in
+/// `autumn-harvest/src/lib.rs::task_duration` so an invalid duration string
+/// is rejected at compile time rather than silently accepted by the macro
+/// and failing only when the workflow/DAG actually starts.
+///
+/// Shared by every attribute-macro argument parser that accepts a duration
+/// string (`#[workflow(...)]`'s `start_to_close`/`heartbeat_timeout`/
+/// `schedule_to_start`/`execution_timeout`, `#[dag(...)]`'s
+/// `execution_timeout`/`sla`, ...) so the validation rule lives in exactly
+/// one place.
+pub fn is_valid_task_duration(s: &str) -> bool {
+    let mut total_secs = 0u64;
+    let mut current_num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            if current_num == "0" {
+                current_num.clear();
+            }
+            if current_num.len() > 20 {
+                return false;
+            }
+            current_num.push(ch);
+        } else if ch.is_ascii_alphabetic() {
+            let Ok(num) = current_num.parse::<u64>() else {
+                return false;
+            };
+            current_num.clear();
+            let mult = match ch {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
+                _ => return false,
+            };
+            match num
+                .checked_mul(mult)
+                .and_then(|v| total_secs.checked_add(v))
+            {
+                Some(v) => total_secs = v,
+                None => return false,
+            }
+        } else if ch != ' ' {
+            return false;
+        }
+    }
+    current_num.is_empty() && total_secs != 0
+}
+
 /// Parse a bare-flag-or-explicit-bool attribute value: `name` (bare, implies
 /// `true`) or `name = true`/`name = false`.
 ///

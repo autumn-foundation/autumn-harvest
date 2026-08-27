@@ -52,6 +52,12 @@ HarvestPlugin::new()
     .api("/api/harvest")
 ```
 
+Forgetting to add a handler here is the most common first bug, and it surfaces
+only at runtime — one dispatch, one retry cycle, one dead letter later. You can
+turn it into a deploy-time failure instead by declaring what the workflow
+dispatches; see [catching a forgotten registration before
+rollout](10-operations.md#catching-a-forgotten-registration-before-rollout).
+
 Restart, then start a workflow over HTTP:
 
 ```bash

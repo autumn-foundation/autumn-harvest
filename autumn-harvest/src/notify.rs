@@ -171,6 +171,13 @@ pub async fn notify_task_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
+    // Chaos: drop this LISTEN/NOTIFY wake (issue #940 AC1(c)). The task row is
+    // already committed; a dropped wake must still converge via the poll loop,
+    // which is the source of truth (NOTIFY is only a latency optimization).
+    if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
+        return Ok(());
+    }
+
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
         .bind::<Text, _>(&payload)

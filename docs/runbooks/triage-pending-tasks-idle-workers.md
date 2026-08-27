@@ -2,6 +2,64 @@
 
 Use this runbook when an alert fires indicating that tasks are sitting in `PENDING` state on a queue while connected workers appear idle.
 
+> **Start here for a single wedged run: `GET /workflows/{exec_id}/diagnose`.**
+> Issue #809 collapses the correlation this runbook otherwise walks you through
+> — the pending stack, per-queue worker liveness, the circuit registry,
+> rate-limit / concurrency saturation, queue pauses, and the task row's own
+> retry timing — into **one** admin-gated, read-only call that names the actual
+> root cause:
+>
+> ```bash
+> harvest workflow diagnose <exec-id>            # human-readable verdict
+> harvest workflow diagnose <exec-id> --json     # raw body
+> curl -s "$HARVEST/api/harvest/workflows/$EXEC/diagnose" | jq .
+> ```
+>
+> The response leads with a one-word `health` (`healthy` | `stalled` |
+> `blocked_external` | `terminal`) and a discriminated `blocked_on` object:
+>
+> | `blocked_on.type` | `health` | What to do |
+> |---|---|---|
+> | `activity_no_worker` | `stalled` | **No live worker can run this row.** For a *pending* row that means nothing `Active` can claim it — deploy/scale a worker for `queue`, or fix the queue name (a `Draining` worker claims nothing new, so a drain-only fleet reports this too). For an *already-held* row it means the recorded claimant itself is gone — a poison-pill orphan (#367) a peer cannot pick up. Coverage is not the whole claim predicate: the row's required build (#171/#604), required capabilities (#804) and session pin (#606) are each checked against the *same* worker, so a well-covered queue can still report this. If the row predates capability snapshotting (a legacy or manual enqueue with no `required_capabilities`), the **registered** activity's `requires` still gates it — compare the activity's `#[activity(requires = "...")]` against your workers' labels. Cross-check with `GET /admin/queue-coverage` (#774) and `GET /admin/queues/{queue}/eligibility` (#611). |
+> | `activity_circuit_open` | `stalled` when `phase` is `open`, `healthy` when `half_open` | The breaker for `activity_name` is open until `cooldown_until`. Read `phase` first: `half_open` means a probe is admitted **right now** and the breaker closes on success — no operator action, so the run is reported `healthy`. `open` with a `cooldown_until` self-heals at that instant; `open` with the field **absent** was operator-forced, admits no timed probe, and needs an explicit `force-close`. **Multi-replica caveat:** the breaker registry is in-process (one per worker process), so this verdict is only reported when the API replica's own co-located worker is the *sole* worker that could claim the task. In a multi-replica fleet a peer's breaker may be closed and still dispatch the work, so the endpoint deliberately declines to report a fleet-wide block — use `GET /admin/circuits` on each replica to see every breaker's real phase. See `docs/runbooks/activity-circuit-breaker.md`. |
+> | `workflow_no_worker` | `stalled` | **No live worker polls the queue the run's own decision cycle sits on.** Nothing individual is wedged — the workflow task itself can never be claimed. Also covers a claim left behind by a crashed worker (a poison-pill orphan, #367) and a task deferred to a future `scheduled_at` that nothing will claim when it arrives. Same remedy as `activity_no_worker`, applied to the workflow queue. |
+> | `no_pending_work` | `stalled` | A `RUNNING` run with nothing pending and a *parked* workflow task — executor loss / lost task. Consider a redrive. |
+> | `activity_retrying` | `healthy` | Backing off; `last_error` says why, `next_attempt_at` says when. |
+> | `activity_deferred` | `healthy` | Pushed forward by the dispatcher with **no failure recorded** — a dispatch-time rate-limit deferral (#699/#369), session capacity (#606), or a capability-miss redelivery (#804). Distinct from `activity_retrying`: nothing failed, so do not go hunting an error. |
+> | `activity_rate_limited` / `activity_concurrency_deferred` | `healthy` | Deliberately paced by `key`. Raise the limit or wait. |
+> | `activity_rate_limit_bucket_missing` | `stalled` | **The rate-limit bucket `key` has no row at all**, so the claim gate's `EXISTS(bucket >= 1.0)` refuses the task *forever* — nothing refills a row that does not exist. Distinct from `activity_rate_limited`, which self-heals. Reachable when the bucket's auto-registration failed, the row was deleted, or startup skipped it as an invalid config. Check `GET /admin/rate-limits` for `key`; re-register the bucket or remove the activity's rate limit. |
+> | `activity_queue_paused` | `blocked_external` | An operator paused `queue` (#619). Resume it. |
+> | `activity_paused` | `blocked_external` | An operator paused activity type `activity_name` (#807). It is held on every queue on this shard. Resume it. |
+> | `sleeping_timer` | `healthy` | A durable sleep until `fires_at` — **not** a stall, however old the last event is. Reported only when the run's own workflow task is actually claimable: a timer fires when a worker claims that task, so a paused or pollerless workflow queue reports `workflow_queue_paused` / `workflow_no_worker` instead. |
+> | `timer_overdue` | `stalled` | A timer was due at `fires_at` (`overdue_by_seconds` ago), nothing fired it, **and that timer owned the run's wake** (the workflow task is `PENDING` long past its own `scheduled_at`). Timers fire only when a worker claims the owning workflow task, so this is a lost-task wedge — same remedy as `no_pending_work`. A timer armed alongside another wait (an external handoff, a child, a signal) does *not* own the wake and is reported under that wait instead, so an overdue row there is expected, not a stall. |
+> | `pending_child` | `healthy` | Waiting on `child_exec_id`; diagnose *that* id next. |
+> | `awaiting_signal` / `awaiting_external_handoff` | `blocked_external` | Waiting on an external party. Nothing engine-side is wrong. |
+> | `workflow_queue_paused` | `blocked_external` | An operator paused the queue the run's own decision cycle sits on (#619). Resume it. Outranks every timer verdict, because a held queue stops the claim that would fire the timer. |
+> | `workflow_no_worker` | `stalled` | Nothing polls the queue the run's own decision cycle sits on. Start a worker for `queue`. Like the pause above, this outranks a timer verdict — an unclaimable task can never fire its timer. |
+> | `awaiting_replay_wait` | `blocked_external` | Parked on a durable wait that leaves no side-table row — `wait_kind` names which: `condition` (a `ctx.await_condition` park), `mutex` (#691 — `name` is the contended key; find the holder), `update`, or `external_workflow`. Only the replay-derived wait set can see these, so `wait_set` will read `replayed`. |
+> | `paused` | `blocked_external` | Operator-paused (#383); resume when ready. |
+> | `non_determinism_blocked` | `stalled` | **Replay diverged and the engine blocked the run (#603) rather than failing it.** `reason` is the recorded divergence, `since` when it was first blocked and `block_count` how many times it has re-fired. The run re-pends its workflow task on a capped-exponential backoff **indefinitely**, so by row shape alone it is identical to a healthy deferral. Roll the divergent build back (or forward-fix it) — see `docs/runbooks/nondeterminism-block.md`. Outranks every side-table cause, because the block re-fires on every decision cycle whatever those rows are doing; the activities' own impediments still appear in `contributing_reason_codes`. |
+> | `healthy_in_progress` | `healthy` | Genuinely running — an activity in flight, or the run's own decision cycle claimed by a live worker or awaiting dispatch on a covered queue. |
+>
+> `contributing_reason_codes` lists **every** claim-time impediment on the
+> diagnosed activity, not just the highest-precedence one — so a task that is
+> both rate-limited *and* on a paused queue shows both. In a fan-out the
+> **worst** slot wins, so one wedged slot among nineteen healthy ones is never
+> masked. `no_live_worker` is the one code that is not a claim-time gate, so it
+> also appears for a row a worker already **holds** — but it asks the same
+> question the verdict does: an in-flight row is judged on whether its own
+> recorded claimant is alive (a gracefully-draining worker still counts, since
+> it is finishing exactly that row), not on whether some *other* worker could
+> claim new work. So the codes never contradict `health`: a row held by a live
+> draining claimant reads `healthy` with no `no_live_worker`, and an orphan
+> whose claimant is gone reads `stalled` **with** it even when a healthy Active
+> peer covers the queue.
+>
+> The endpoint is read-only: it appends no events, mutates no task-queue row,
+> and never advances a circuit breaker's phase, so it is safe to poll. Reach for
+> the per-endpoint triage below when you need the raw underlying detail, or when
+> you are diagnosing a **queue** rather than a single execution.
+
 > **First check for a heartbeating activity.** Before assuming an activity is
 > stalled, confirm it is actually stuck rather than just slow. Call
 > `GET /workflows/{exec_id}/stack` and read the activity's
@@ -162,7 +220,199 @@ Common reason codes and their fixes:
 
 ---
 
-### 5. `healthy`
+### 5. `queue_paused` — an operator is deliberately holding this queue
+
+**What it means**: An operator has paused dispatch on the whole task queue
+(issue #619), typically to ride out a downstream outage without failing,
+retrying, or dead-lettering the affected work. **This is not an incident.** Held
+tasks stay `PENDING`, already-`RUNNING` tasks finish naturally, and the
+`schedule_to_start` timer is suspended for the duration of the hold.
+
+> **A pause does not stop the `schedule_to_close` clock.** Only the *relative*
+> `schedule_to_start` timer is suspended. An activity declaring an **absolute**
+> `schedule_to_close` deadline (issue #378) will still be timed out during a
+> long hold — a pause is not an SLA extension. Before holding a queue for longer
+> than the shortest `schedule_to_close` on it, check what the affected
+> activities declare; that work will fail on its own deadline even though the
+> queue is frozen. Crediting held time back to `schedule_to_close` is explicitly
+> out of scope for issue #619.
+
+It is listed **first** in the eligibility explainer's reason set precisely
+because it is the operator's own deliberate action — check it before chasing a
+capacity or routing cause.
+
+**How to verify**:
+
+```bash
+harvest queue list-paused
+# or: curl -s .../api/harvest/admin/queues/paused | jq
+```
+
+The response gives, per held queue: `reason` (why), `paused_by` (who),
+`paused_at` (since when), and `held_task_count` (how much work is waiting). The
+same information appears as a banner on the Vantage **Workers** page, and the
+`harvest.queue.paused` gauge reads `1` for held queues.
+
+**This is the single most common cause of a false capacity page.** A rising
+`harvest_queue_depth` while `harvest_queue_paused` is `1` is the hold working as
+designed — not a shortage of workers.
+
+**Corrective Actions**:
+- Confirm the downstream named in `reason` has actually recovered.
+- Release the hold:
+
+  ```bash
+  harvest queue resume email-workers
+  ```
+
+  Held tasks become claimable immediately. The time they spent held is credited
+  back to their `scheduled_at`, so a thaw does **not** retroactively
+  schedule-to-start-time-out the backlog, and the schedule-to-start histogram
+  does not spike on release.
+- If the outage is still ongoing, leave the hold in place. The
+  `harvest_queue_paused_too_long` alert exists to make sure a forgotten freeze
+  eventually gets attention — see
+  [that runbook section](harvest-alerts.md#harvest_queue_paused_too_long).
+
+---
+
+### 6. `activity_paused` — an operator is deliberately holding one activity type
+
+**What it means**: An operator has paused dispatch for a single **activity
+type**, fleet-wide (issue #807) — the surgical sibling of the queue pause above.
+It is the right tool when one downstream dependency is broken but the healthy
+work sharing its queue should keep flowing. **This is not an incident.** Held
+tasks stay `PENDING`, already-`RUNNING` tasks finish naturally, and the
+`schedule_to_start` timer is suspended for the duration of the hold.
+
+> **A pause does not stop the `schedule_to_close` clock.** Exactly as for the
+> queue pause above, only the *relative* `schedule_to_start` timer is suspended;
+> an activity declaring an **absolute** `schedule_to_close` deadline (issue #378)
+> will still be timed out during a long hold. Check what the held activity
+> declares before freezing it for longer than that deadline.
+
+Like `queue_paused`, it is listed **first** in the eligibility explainer's reason
+set because it is the operator's own deliberate action — check it before chasing
+a capacity or routing cause. A task can be held by **both** pauses at once; both
+codes are reported, so resuming the one you see first does not silently leave the
+task stuck behind the other.
+
+**Reported only for `task_type='activity'` rows.** A *workflow* task can
+legitimately carry a non-NULL `activity_name` (the engine stamps the
+`'mixed_signal_suspension'` sentinel there), and the claim gate is scoped by
+`task_type` so pausing an activity of that name cannot hold those workflow
+tasks. The explainer matches that scoping, so `activity_paused` never appears
+against a task the engine would happily dispatch.
+
+**A pause on a *local* activity is refused, not silently ineffective.** A
+`#[activity(local = true)]` activity (issue #98) runs **inline on the workflow
+worker** and never takes a `harvest_task_queue` row at all, so the claim-path
+gate a pause installs has nothing to hold — the invocations would keep running
+while the read endpoints reported a healthy-looking hold. `harvest activity
+pause` therefore rejects a name the management node has registered as local
+with a `400` naming the activity, rather than reporting containment it cannot
+deliver. To contain a local activity, hold the **queue** the calling workflows
+are dispatched on (§5, issue #619) — that stops the workflow tasks that would
+invoke it — or rely on the activity's circuit breaker if it declares one
+(issue #369). A name this node does *not* have registered is still accepted:
+a management node need not register every activity the fleet runs, and
+refusing an unregistered name would break holding a genuinely remote one.
+
+**Distinguish it from `circuit_open`.** Both name one activity type, but they
+answer different questions: `circuit_open` is the engine's *automatic, reactive*
+breaker fast-failing after failures accumulated (issue #369), while
+`activity_paused` is a human's *manual, proactive* hold that fails nothing. If
+you see `circuit_open`, something broke on its own; if you see
+`activity_paused`, someone decided.
+
+**How to verify**:
+
+```bash
+harvest activity list             # every registered type + its pause state
+harvest activity get charge_card  # just this one
+```
+
+`list` is driven by the registered **catalogue**, not the pause table, so a
+healthy activity is listed with `paused: false` — this is the surface that
+answers "is `charge_card` held?", and one that listed only the already-broken
+things could not. A paused-but-**unregistered** activity is listed too, flagged
+`registered: false`, so a mistyped hold can never become invisible on the one
+page used to find it. Each entry carries `reason` (why), `paused_by` (who),
+`paused_at` (since when), and `held_task_count` (how much work is waiting).
+
+**Check the `SCOPE` column before trusting `PAUSED: yes`.** It reports what the
+hold *actually* covers, derived from the shards that hold the activity versus
+the expected shard set — not the `scope_shard_id` intent recorded when the row
+was written:
+
+- `fleet` — every expected shard holds it.
+- `partial_fleet` — **some shards are still dispatching this activity.** A
+  fleet-wide pause that only reached part of the fleet writes
+  `scope_shard_id: null` on the shards it reached and *no row* on the ones it
+  missed, so intent alone cannot tell this apart from a complete hold. The
+  original request returned `207`, but a later read that reaches every shard
+  looks `complete` and its rows agree — this column is what still says
+  otherwise. Re-issue the pause; it is idempotent and preserves the original
+  provenance.
+- `shard` — every row is deliberately shard-scoped and they do not span the
+  fleet. Expected for a scoped hold; suspicious if you asked for fleet-wide.
+
+An unreachable shard counts as expected-but-not-holding — the safe direction,
+since it may still be dispatching — so a `partial` read also reports
+`partial_fleet`.
+
+**Corrective Actions**:
+- Confirm the downstream named in `reason` has actually recovered.
+- If `SCOPE` reads `partial_fleet`, re-issue the pause **before** triaging
+  anything else: part of the fleet never stopped.
+- Release the hold:
+  ```bash
+  harvest activity resume charge_card
+  ```
+  Held tasks become claimable immediately, and the time they spent held is
+  credited back to their `scheduled_at`, so a thaw does **not** retroactively
+  schedule-to-start-time-out the backlog. The command exits non-zero if the
+  release only partially applied (a shard was unreachable) — a `207` must never
+  look like success, because the shards it missed are still holding.
+- If the outage is still ongoing, leave the hold in place.
+- If the *whole* queue needs holding rather than one activity, prefer the queue
+  pause in §5; if many activity types on one queue are affected, holding the
+  queue once is easier to remember to release than N activity holds.
+
+**The full loop** — pause → triage → resume:
+
+```bash
+# 1. CONTAIN. Reason and actor are optional: containment must not wait on
+#    paperwork. Effective on every shard and worker within one poll interval.
+harvest activity pause charge_card --reason "payments provider 5xx" --actor alice
+
+# 2. TRIAGE. The backlog is visible and bounded, and it is not decaying:
+#    nothing is being failed, retried, or dead-lettered while held.
+harvest activity get charge_card       # held_task_count, reason, paused_by
+harvest workflow list --state RUNNING  # in-flight attempts finish naturally
+
+# 3. RELEASE, once the downstream is actually healthy.
+harvest activity resume charge_card
+```
+
+**Choosing between the three holds.** All three stop work; they differ in blast
+radius and in who decides:
+
+| | `harvest activity pause` (#807) | `harvest queue pause` (#619) | Circuit breaker (#369) |
+|---|---|---|---|
+| Scope | One **activity type**, fleet-wide | One **queue**, and everything on it | One activity type |
+| Who decides | A human, proactively | A human, proactively | The engine, reactively |
+| Effect on work | Held `PENDING`; nothing fails | Held `PENDING`; nothing fails | Fast-**fails** with `CircuitOpen` |
+| Reach for it when | One downstream is broken and healthy types share its queue | The whole queue's dependency is down, or many types on it are affected | You want automatic protection, configured ahead of time |
+
+An operator pause **wins over** a tripped breaker: the task is held before
+dispatch, so the breaker never gets to fast-fail it. Resuming the pause does
+**not** auto-close a tripped breaker — the breaker's own half-open probe still
+governs recovery, so a resume cannot accidentally re-arm a broken dependency.
+
+---
+
+### 7. `healthy`
 
 **What it means**: Eligible workers with available capacity are connected and polling.
 

@@ -29,7 +29,7 @@ use crate::replay::{
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
-    ExternalSignalId, IdempotencyKey, SessionId, TimerId, UpdateId,
+    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -56,6 +56,46 @@ pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 /// is advised to `continue_as_new` once it is within the final 20% of its
 /// deadline.
 pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
+
+/// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
+/// operator early-warning soft threshold fires (issue #704).
+///
+/// `0.75` means a still-running execution is warned once it has accumulated
+/// 75% of the configured hard-cap event count -- giving an operator a window
+/// to intervene (e.g. trigger a manual `continue_as_new`, or investigate a
+/// runaway loop) before the hard cap terminally fails the workflow.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
+
+/// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
+/// (issue #704, PR #1139 review, P2).
+///
+/// Deliberately **strictly below `1.0`**, unlike the structurally-similar
+/// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`] knob (which clamps to a full
+/// `[0.0, 1.0]`): `worker.rs`'s hard-cap force-fail check runs unconditionally
+/// *before* the warn-fraction crossing calculation on the same decision
+/// cycle, and returns early the instant `current_history_event_count >= cap`
+/// -- the exact condition a fraction of `1.0` would itself require to fire.
+/// A configured `1.0` would therefore always lose that race and the counter
+/// could never fire, silently and permanently disabling it exactly like
+/// `0.0` does, but with none of `0.0`'s documented "this disables it"
+/// contract.
+///
+/// This ceiling alone is **not** what guarantees the warn threshold stays
+/// below the hard cap, though: `ceil(cap * fraction)` can still equal `cap`
+/// itself at this exact ceiling for any `cap` below 1000 (e.g. cap=100:
+/// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
+/// fix -- would collapse the promised "warn before the hard cap" window into
+/// "warn on the same decision cycle as the hard cap" for small caps (PR
+/// #1139 review, a later round). The actual below-`cap` guarantee is
+/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
+/// its computed threshold to `cap - 1` unconditionally of what `fraction`
+/// resolves to -- that clamp is what keeps the signal functional for every
+/// `(cap, fraction)` combination the public builder API can produce. This
+/// constant's `< 1.0` ceiling remains as an independent, secondary safety
+/// margin (and a reasonable API choice on its own: a fraction of exactly
+/// `1.0` is a confusing "wait until literally the entire cap" configuration
+/// regardless of the below-cap clamp).
+pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
 
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
@@ -133,6 +173,14 @@ pub struct WorkflowHistoryPolicy {
     /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
     /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
     continue_as_new_deadline_fraction: f64,
+    /// Fraction of [`event_hard_cap`](Self::event_hard_cap) at which the
+    /// operator early-warning soft threshold fires (issue #704). Clamped
+    /// into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]` (see that constant's
+    /// doc comment); `0.0` disables the signal entirely (AC4); `NAN` is
+    /// normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`] -- all set only
+    /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
+    /// entry point, since this field is private.
+    history_bloat_warn_fraction: f64,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -141,6 +189,7 @@ impl Default for WorkflowHistoryPolicy {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
             event_hard_cap: None,
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
+            history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
         }
     }
 }
@@ -188,6 +237,41 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn with_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
         self.continue_as_new_deadline_fraction = fraction.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Fraction of [`event_hard_cap`](Self::event_hard_cap) at which the
+    /// operator early-warning soft threshold fires (issue #704). Defaults to
+    /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`].
+    #[must_use]
+    pub const fn history_bloat_warn_fraction(self) -> f64 {
+        self.history_bloat_warn_fraction
+    }
+
+    /// Override the history-bloat soft-warning fraction (issue #704). The
+    /// value is **clamped** into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]`
+    /// (strictly below `1.0` -- see that constant's doc comment for why).
+    /// `0.0` disables the signal entirely (AC4) -- a naive threshold of
+    /// `cap * 0.0 == 0` would instead fire on the very first recorded event,
+    /// which is never the intent.
+    ///
+    /// `f64::NAN` is normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`]
+    /// rather than silently passed through (PR #1139 review, P2): `f64::clamp`
+    /// leaves `NAN` untouched (both of its internal comparisons against `NAN`
+    /// are `false`, so neither bound is ever applied), and a stored `NAN`
+    /// would make every later `cap as f64 * NAN` compute `NAN`, which casts to
+    /// `0` -- tripping the soft threshold on the very first suspended cycle of
+    /// *every* execution regardless of its actual history size. Normalizing
+    /// to the documented default (rather than to `0.0`/disabled) is the safer
+    /// failure mode for a garbage/corrupted config value: it keeps the signal
+    /// behaving as if unconfigured instead of silently going dark forever.
+    #[must_use]
+    pub const fn with_history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
+        self.history_bloat_warn_fraction = if fraction.is_nan() {
+            DEFAULT_HISTORY_BLOAT_WARN_FRACTION
+        } else {
+            fraction.clamp(0.0, MAX_HISTORY_BLOAT_WARN_FRACTION)
+        };
         self
     }
 }
@@ -398,6 +482,9 @@ pub enum WorkflowCommand {
     ContinueAsNew {
         /// Input passed to the next iteration of the workflow.
         input: Value,
+        /// Registered workflow type the successor runs as (issue #803).
+        /// `None` = same type as the predecessor (today's behavior).
+        new_workflow_type: Option<String>,
     },
     /// Run a local activity inline on the workflow worker (never enqueued).
     ///
@@ -502,6 +589,33 @@ pub enum WorkflowCommand {
         /// marker).
         chunk: Value,
     },
+    /// Persist one author-emitted log line to the durable per-execution log
+    /// store (issue #790).
+    ///
+    /// Emitted by [`WorkflowLogger`] during live execution only (suppressed
+    /// during replay, exactly like the `tracing` sink it accompanies) and only
+    /// when a [`WorkflowLogPolicy`] is configured — the sink is opt-in, so with
+    /// it disabled this command is never pushed at all.
+    ///
+    /// Pure **bookkeeping**: no result channel, never drives a suspension
+    /// shape, and appends **nothing** to `harvest_events`. The worker writes it
+    /// to the separate `harvest_workflow_logs` table at persist time.
+    ///
+    /// Logs are **observational only**: they carry no determinism guarantee and
+    /// must never be read back into workflow logic.
+    RecordLog {
+        /// Deterministic logical-position identity (see
+        /// [`encode_progress_seq`]), doubling as the total emission order and
+        /// the exactly-once dedup key: a re-driven position re-mints the same
+        /// `seq`, which the durable INSERT resolves with `ON CONFLICT DO
+        /// NOTHING`.
+        seq: u64,
+        /// Severity, as emitted through the `ctx.log_*` entry point.
+        level: WorkflowLogLevel,
+        /// The author's message, already truncated to the policy's per-line
+        /// byte cap on a UTF-8 character boundary.
+        message: String,
+    },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
     /// immediately without suspending the parent.
     ///
@@ -538,8 +652,10 @@ pub enum WorkflowCommand {
     SignalExternalWorkflow {
         /// Correlation ID shared across all three history events.
         signal_id: ExternalSignalId,
-        /// Target workflow execution to signal.
-        target: ExecutionId,
+        /// Target workflow execution to signal — either a specific
+        /// [`ExecutionId`] or a `(workflow_name, workflow_id)` business key
+        /// resolved to the current run at delivery time (issue #751).
+        target: ExternalTarget,
         /// Signal channel name on the receiver.
         signal_name: String,
         /// JSON payload to deliver.
@@ -557,8 +673,10 @@ pub enum WorkflowCommand {
     RequestCancelExternalWorkflow {
         /// Correlation ID shared across all three history events.
         cancel_id: ExternalCancelId,
-        /// Target workflow execution to cancel.
-        target: ExecutionId,
+        /// Target workflow execution to cancel — either a specific
+        /// [`ExecutionId`] or a `(workflow_name, workflow_id)` business key
+        /// resolved to the current run at delivery time (issue #751).
+        target: ExternalTarget,
         /// Outcome channel: `Ok(())` on delivery (including already-terminal),
         /// `Err(reason_code)` on failure (target unknown after grace window).
         result_tx: oneshot::Sender<Result<(), String>>,
@@ -775,9 +893,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 f.debug_struct("Complete").field("output", output).finish()
             }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
-            Self::ContinueAsNew { input } => f
+            Self::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => f
                 .debug_struct("ContinueAsNew")
                 .field("input", input)
+                .field("new_workflow_type", new_workflow_type)
                 .finish(),
             Self::RunLocalActivity {
                 activity_id,
@@ -806,6 +928,16 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("PublishProgress")
                 .field("seq", seq)
                 .field("chunk", chunk)
+                .finish(),
+            Self::RecordLog {
+                seq,
+                level,
+                message,
+            } => f
+                .debug_struct("RecordLog")
+                .field("seq", seq)
+                .field("level", level)
+                .field("message", message)
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
@@ -1585,6 +1717,138 @@ fn validate_search_attr_value(value: &Value) -> HarvestResult<()> {
 // WorkflowLogger  (issue #379)
 // ---------------------------------------------------------------------------
 
+/// Severity of a workflow log line (issue #379 levels; issue #790 wire form).
+///
+/// Deliberately exactly the three levels the [`WorkflowLogger`] entry points
+/// already expose — #790 reuses them as-is and adds none.
+///
+/// [`as_str`](Self::as_str) is the **wire form**: it is what the durable sink
+/// stores in `harvest_workflow_logs.level` and what the read route's `?level=`
+/// filter matches, so it is a stability contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowLogLevel {
+    /// Informational progress.
+    Info,
+    /// A recoverable anomaly worth an operator's attention.
+    Warn,
+    /// A failure the author wants surfaced during triage.
+    Error,
+}
+
+impl WorkflowLogLevel {
+    /// The stored/wire representation (`"info"` / `"warn"` / `"error"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse a wire/query-parameter level, case-insensitively.
+    ///
+    /// Returns `None` for an unrecognized level so a caller can reject it
+    /// explicitly (a `400`) rather than silently coercing to a default and
+    /// returning the wrong rows.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Default per-execution durable log-line cap (issue #790).
+///
+/// Chosen to match the issue's own read-latency target ("≤ 1,000 lines"), so a
+/// run that stays inside the documented budget is never truncated.
+pub const DEFAULT_WORKFLOW_LOG_MAX_LINES: u32 = 1_000;
+
+/// Default per-line message byte cap (issue #790).
+pub const DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES: usize = 4_096;
+
+/// Opt-in durable-log-sink policy (issue #790).
+///
+/// Attach one with [`HarvestBuilder::workflow_log_persistence`] to persist the
+/// lines a workflow emits through [`WorkflowContext::logger`] /
+/// [`WorkflowContext::log_info`] & friends into the per-execution
+/// `harvest_workflow_logs` table, readable via
+/// `GET /api/harvest/workflows/{id}/logs`.
+///
+/// **The sink is off by default.** With no policy configured the logger is
+/// tracing-only and pushes no command at all, so existing workflows are
+/// byte-for-byte unaffected.
+///
+/// [`HarvestBuilder::workflow_log_persistence`]: crate::builder::HarvestBuilder::workflow_log_persistence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowLogPolicy {
+    max_lines: u32,
+    max_message_bytes: usize,
+}
+
+impl Default for WorkflowLogPolicy {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_WORKFLOW_LOG_MAX_LINES,
+            max_message_bytes: DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+impl WorkflowLogPolicy {
+    /// A policy with the documented defaults (1,000 lines, 4 KiB per line).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the per-execution line cap.
+    ///
+    /// Once an execution reaches this many stored lines, further lines are
+    /// **dropped (drop-newest)** and a single terminal truncation marker is
+    /// recorded so the loss is visible rather than silent. A cap of `0` is
+    /// clamped to `1` so the truncation marker itself always has room.
+    #[must_use]
+    pub const fn with_max_lines(mut self, max_lines: u32) -> Self {
+        self.max_lines = if max_lines == 0 { 1 } else { max_lines };
+        self
+    }
+
+    /// Override the per-line message byte cap (UTF-8-boundary truncation).
+    ///
+    /// A cap of `0` is clamped to `1`, mirroring [`Self::with_max_lines`]: it
+    /// would otherwise store every line as an empty string — silent loss that
+    /// still burns the per-execution budget — and it is a plausible spelling of
+    /// "unlimited". Disabling the sink is what *omitting*
+    /// `workflow_log_persistence` already means.
+    #[must_use]
+    pub const fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = if max_message_bytes == 0 {
+            1
+        } else {
+            max_message_bytes
+        };
+        self
+    }
+
+    /// The per-execution line cap.
+    #[must_use]
+    pub const fn max_lines(self) -> u32 {
+        self.max_lines
+    }
+
+    /// The per-line message byte cap.
+    #[must_use]
+    pub const fn max_message_bytes(self) -> usize {
+        self.max_message_bytes
+    }
+}
+
 /// Replay-aware logger scoped to a single workflow execution.
 ///
 /// Obtained via [`WorkflowContext::logger`]. Suppresses all `tracing` events
@@ -1604,45 +1868,142 @@ pub struct WorkflowLogger<'ctx> {
 impl WorkflowLogger<'_> {
     /// Emit an INFO-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn info(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::info!(
-                target: "autumn_harvest::context",
-                workflow_id = self.ctx.workflow_id(),
-                execution_id = %self.ctx.execution_id(),
-                workflow_type = self.ctx.workflow_type(),
-                replay = false,
-                "{message}"
-            );
-        }
+        self.emit(WorkflowLogLevel::Info, message);
     }
 
     /// Emit a WARN-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn warn(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::warn!(
-                target: "autumn_harvest::context",
-                workflow_id = self.ctx.workflow_id(),
-                execution_id = %self.ctx.execution_id(),
-                workflow_type = self.ctx.workflow_type(),
-                replay = false,
-                "{message}"
-            );
-        }
+        self.emit(WorkflowLogLevel::Warn, message);
     }
 
     /// Emit an ERROR-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn error(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::error!(
+        self.emit(WorkflowLogLevel::Error, message);
+    }
+
+    /// Shared emission path for all three levels.
+    ///
+    /// Two independent sinks, in order:
+    ///
+    /// 1. **`tracing`** (issue #379) — always, and byte-for-byte as before:
+    ///    same target, same four structured fields, same message rendering.
+    /// 2. **The durable per-execution sink** (issue #790) — *only* when a
+    ///    [`WorkflowLogPolicy`] is configured. It pushes a replay-suppressed
+    ///    bookkeeping [`WorkflowCommand::RecordLog`] that the worker writes to
+    ///    `harvest_workflow_logs` at persist time. With no policy, nothing is
+    ///    pushed and the command stream is unchanged from pre-#790.
+    ///
+    /// Replay suppression covers both sinks: the early return below is the
+    /// *only* emission gate, so the durable write inherits the #379 property
+    /// that a line reaches `tracing` at most once per execution.
+    ///
+    /// The durable `seq` is claimed *before* that gate, on every call including
+    /// a suppressed one — see [`log_call_ordinal`](WorkflowContext::log_call_ordinal)
+    /// for why the ordinal, not the history epoch, is what makes AC2's
+    /// exactly-once dedup an identity.
+    fn emit(&self, level: WorkflowLogLevel, message: &str) {
+        // Claim this call's ordinal FIRST, unconditionally. A replay-suppressed
+        // call must still consume its slot, or every later line in the cycle
+        // would shift down and collide with a different line's stored row.
+        let ordinal = self
+            .ctx
+            .log_call_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // We lock the matcher directly — NOT via `match_history` — so this read
+        // never triggers the `pump_signal_handlers` post-hook (mirroring
+        // `publish_progress` and `info()`; `is_replaying()` locks the same way,
+        // so this is behaviourally identical to the pre-#790 guard).
+        {
+            let matcher = self.ctx.matcher.lock().expect("matcher lock poisoned");
+            if matcher.is_replaying() {
+                return;
+            }
+        }
+
+        // Sink 1: tracing (unchanged from issue #379).
+        match level {
+            WorkflowLogLevel::Info => tracing::info!(
                 target: "autumn_harvest::context",
                 workflow_id = self.ctx.workflow_id(),
                 execution_id = %self.ctx.execution_id(),
                 workflow_type = self.ctx.workflow_type(),
                 replay = false,
                 "{message}"
-            );
+            ),
+            WorkflowLogLevel::Warn => tracing::warn!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            ),
+            WorkflowLogLevel::Error => tracing::error!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            ),
         }
+
+        // Sink 2: the durable per-execution store (issue #790) — opt-in.
+        let Some(policy) = self.ctx.log_policy else {
+            return;
+        };
+
+        // Bound the in-memory queue at `max_lines + 1` (issue #790 review
+        // round 2). `max_lines` is otherwise enforced only at the database
+        // write, so a workflow logging in a large loop without suspending would
+        // retain one capped `String` per call for the whole decision cycle —
+        // hundreds of thousands of them — despite advertising a 1,000-line cap.
+        // Checked BEFORE the truncate below so the allocation is genuinely
+        // avoided, not merely dropped later.
+        //
+        // The `+ 1` is load-bearing: see `log_commands_queued`. Queuing exactly
+        // `max_lines` would make the store's `admit == lines.len()` and the
+        // truncation marker would never fire, turning AC4's visible overflow
+        // into silent loss.
+        let queued = self
+            .ctx
+            .log_commands_queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if queued > u64::from(policy.max_lines()) {
+            return;
+        }
+
+        let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
+        // `seq` IS the call ordinal: a deterministic identity for this logical
+        // line. A re-drive (spurious wake, rolled-back cycle, pause/resume)
+        // re-executes the body from the top, so the same line claims the same
+        // ordinal and the durable INSERT dedups it on `(workflow_exec_id, seq)`
+        // instead of duplicating. This is what makes AC2 hold where
+        // replay-suppression alone cannot — a re-drive is not a replay.
+        self.ctx.push_command(WorkflowCommand::RecordLog {
+            seq: ordinal,
+            level,
+            message: capped,
+        });
     }
+}
+
+/// Truncate `input` to at most `max_bytes`, landing on a UTF-8 character
+/// boundary (never splitting a codepoint).
+///
+/// Shared by the durable log sink; mirrors the inline walk in
+/// [`WorkflowContext::set_current_details`] (`floor_char_boundary` is still
+/// unstable, tracking rust#93743).
+fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    input[..boundary].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +2094,146 @@ pub(crate) fn remaining_secs_until(deadline: DateTime<Utc>, now: DateTime<Utc>) 
     let secs = delta.num_seconds();
     let round_up = i64::from(delta.subsec_nanos() > 0);
     u64::try_from(secs.saturating_add(round_up)).unwrap_or(u64::MAX)
+}
+
+/// Reserved `side_effect` name prefix for business-day freezes (issue #806).
+///
+/// Follows the `__harvest_deadline_probe` convention (issue #772) so an author's
+/// own `ctx.side_effect("business_day:x", ..)` can never collide with an
+/// engine-recorded business-day resolution.
+pub(crate) const BUSINESS_DAY_SIDE_EFFECT_PREFIX: &str = "__harvest_business_day:";
+
+/// The frozen outcome of a business-day resolution (issue #806).
+///
+/// Serialized into a single `SideEffectRecorded { kind: Custom, name:
+/// "__harvest_business_day:{seq}:{id}" }` event. The `v` tag follows the
+/// `harvest_activity_failure_v1` precedent so the payload schema can evolve
+/// without breaking already-recorded histories.
+///
+/// **Every arm is a deterministic function of `(anchor, n, calendar snapshot)`**
+/// — including the rejections — so replaying the recorded value reproduces the
+/// caller's `Result` exactly, without ever re-reading the calendar.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct FrozenBusinessDay {
+    /// Payload schema version.
+    v: u8,
+    #[serde(flatten)]
+    outcome: FrozenBusinessDayOutcome,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum FrozenBusinessDayOutcome {
+    /// The resolution succeeded.
+    Resolved {
+        anchor: DateTime<Utc>,
+        deadline: DateTime<Utc>,
+        calendar: String,
+        /// Non-business dates stepped over — the audit trail that answers
+        /// "why did this land on Tuesday?" from history alone.
+        skipped: Vec<chrono::NaiveDate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coverage_end: Option<chrono::NaiveDate>,
+    },
+    /// The named calendar is not in the registered snapshot.
+    UnknownCalendar {
+        anchor: DateTime<Utc>,
+        calendar: String,
+    },
+    /// The calendar could not cover the requested span.
+    Rejected {
+        anchor: DateTime<Utc>,
+        calendar: String,
+        rejection: crate::calendar::BusinessDayRejection,
+    },
+}
+
+impl FrozenBusinessDay {
+    fn resolved(
+        anchor: DateTime<Utc>,
+        calendar: String,
+        res: &crate::calendar::BusinessDayResolution,
+        coverage_end: Option<chrono::NaiveDate>,
+    ) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::Resolved {
+                anchor,
+                deadline: res.deadline,
+                calendar,
+                skipped: res.skipped.clone(),
+                coverage_end,
+            },
+        }
+    }
+
+    const fn unknown_calendar(anchor: DateTime<Utc>, calendar: String) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::UnknownCalendar { anchor, calendar },
+        }
+    }
+
+    const fn rejected(
+        anchor: DateTime<Utc>,
+        calendar: String,
+        rejection: crate::calendar::BusinessDayRejection,
+    ) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::Rejected {
+                anchor,
+                calendar,
+                rejection,
+            },
+        }
+    }
+
+    /// The anchor captured at resolution time, whichever arm was frozen.
+    const fn anchor(&self) -> DateTime<Utc> {
+        match &self.outcome {
+            FrozenBusinessDayOutcome::Resolved { anchor, .. }
+            | FrozenBusinessDayOutcome::UnknownCalendar { anchor, .. }
+            | FrozenBusinessDayOutcome::Rejected { anchor, .. } => *anchor,
+        }
+    }
+
+    /// Map the frozen record back to the caller's `Result`.
+    ///
+    /// A rejection maps to a typed `HarvestError` — **never** to a zero-duration
+    /// "fire now", which would silently escalate immediately instead of at the
+    /// intended business deadline.
+    fn into_result(self) -> HarvestResult<ResolvedBusinessDay> {
+        let anchor = self.anchor();
+        match self.outcome {
+            FrozenBusinessDayOutcome::Resolved { deadline, .. } => {
+                Ok(ResolvedBusinessDay { anchor, deadline })
+            }
+            FrozenBusinessDayOutcome::UnknownCalendar { calendar, .. } => {
+                Err(HarvestError::NotFound(format!(
+                    "business calendar '{calendar}' is not in the registered BusinessCalendars \
+                     snapshot; this resolution is frozen in history, so fixing the name requires \
+                     a workflow reset"
+                )))
+            }
+            FrozenBusinessDayOutcome::Rejected {
+                calendar,
+                rejection,
+                ..
+            } => Err(HarvestError::Config(format!(
+                "business calendar '{calendar}': {rejection}; this resolution is frozen in \
+                 history, so extending the calendar requires a workflow reset"
+            ))),
+        }
+    }
+}
+
+/// A successfully frozen business-day resolution.
+pub(crate) struct ResolvedBusinessDay {
+    /// The instant the resolution was anchored on.
+    pub(crate) anchor: DateTime<Utc>,
+    /// The resolved fire instant.
+    pub(crate) deadline: DateTime<Utc>,
 }
 
 /// Options for [`WorkflowContext::create_session`] (issue #606).
@@ -2041,6 +2542,22 @@ pub struct WorkflowContext {
     /// so each session has a stable, unique `session:{seq}` marker name across
     /// replays, mirroring `fan_out_seq`/`race_seq`.
     session_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming business-day freeze
+    /// side-effects (issue #806). Each `timer_business_days` /
+    /// `business_days_from_now` call increments this once so each *invocation*
+    /// gets a distinct `__harvest_business_day:{seq}:{id}` name across replays,
+    /// mirroring `fan_out_seq`/`race_seq`/`session_seq`.
+    ///
+    /// This is load-bearing, not cosmetic: the prologue's "is this call already
+    /// frozen?" peek is a whole-history *name* scan, while `side_effect` matches
+    /// *positionally*. Keying the name on the caller-supplied `id` alone would
+    /// make those two questions diverge the moment an `id` is reused across
+    /// iterations of a loop — the second iteration is a genuinely fresh dispatch
+    /// but the peek would find the first iteration's freeze and skip the
+    /// prologue's snapshot guard, durably recording a rejection that can only be
+    /// undone by a workflow reset. The per-invocation seq makes the name unique,
+    /// so the name scan and the positional match answer the same question.
+    business_day_seq: Mutex<u32>,
     /// Per-cycle 0-based local index for progress `seq` generation (issue #791).
     /// Incremented once per live [`publish_progress`](Self::publish_progress)
     /// call; combined with the loaded-history-length epoch by
@@ -2049,6 +2566,49 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
+    /// the count of `ctx.log_*` calls made so far by *this run of the workflow
+    /// body*.
+    ///
+    /// Deliberately **not** the `progress_local_index` + epoch encoding its
+    /// sibling `publish_progress` uses. That encoding keys a line to the
+    /// loaded-history length at cycle start, which is only stable when a
+    /// re-drive happens at an unchanged history length — a cycle that appends
+    /// *any* event before a later log (a side effect, a marker, a version
+    /// gate), or a pause/resume that inserts replay-transparent events, moves
+    /// the epoch and re-mints a *different* `seq` for the same logical line,
+    /// duplicating it in the store. Progress is an ephemeral stream where a
+    /// repeated `seq` is harmless; a durable log row is not.
+    ///
+    /// The ordinal is incremented on **every** call, including
+    /// replay-suppressed ones, so the Nth `ctx.log_*` call of a deterministic
+    /// workflow body always carries `seq == N` no matter which cycle finally
+    /// emits it live. That is what makes the store's
+    /// `UNIQUE (workflow_exec_id, seq)` dedup a genuine identity rather than a
+    /// coincidence. The context is rebuilt per decision cycle, so this resets
+    /// to 0 each cycle — which is exactly right, because replay re-executes the
+    /// body from the top.
+    log_call_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of [`WorkflowCommand::RecordLog`] commands **queued** so far this
+    /// decision cycle (issue #790 review round 2).
+    ///
+    /// Deliberately a *second* counter rather than a reuse of
+    /// [`log_call_ordinal`](WorkflowContext::log_call_ordinal): the ordinal
+    /// counts every `ctx.log_*` call including replay-suppressed ones (that is
+    /// what makes it a stable identity), whereas this counts only the commands
+    /// actually retained in memory. Bounding on the ordinal would shrink the
+    /// queue by however many lines the cycle happened to replay.
+    ///
+    /// The bound is `max_lines + 1`, not `max_lines`: the store admits at most
+    /// `max_lines` rows from any one batch, so a batch of exactly `max_lines`
+    /// would satisfy `admit == lines.len()` and never trip the truncation
+    /// marker — converting AC4's *visible* overflow into silent loss. One extra
+    /// queued command guarantees `admit < lines.len()` so the marker fires.
+    log_commands_queued: std::sync::atomic::AtomicU64,
+    /// Opt-in durable-log-sink policy (issue #790). `None` (the default) means
+    /// the sink is disabled: [`WorkflowLogger`] stays tracing-only and pushes
+    /// no [`WorkflowCommand::RecordLog`] at all.
+    log_policy: Option<WorkflowLogPolicy>,
     /// Monotonically increasing counter for naming saga compensation dedup
     /// markers (issue #801). Each non-empty `Saga` unwind increments this
     /// once so each compensation sequence has stable, unique
@@ -2340,11 +2900,32 @@ impl WorkflowContext {
         )
     }
 
+    /// Is a `NoMatch` at this point a strict-replay divergence?
+    ///
+    /// `false` under the **canary frontier exception**: an in-flight fixture
+    /// (issue #798) has legitimately consumed all of its recorded history, so
+    /// emitting the next command there is the candidate build making forward
+    /// progress, not drift. Outside canary mode — a *completed*-history strict
+    /// replay (`verify_dir`, issue #251) — running past the end is a genuine
+    /// early-completion mismatch and stays an error.
+    ///
+    /// Shared by the returning form
+    /// ([`check_strict_replay_no_match`](Self::check_strict_replay_no_match))
+    /// and by the deferred form used in the built-in side-effect capture paths,
+    /// which record a deferred nd error instead of returning `Err` because their
+    /// callers (`system_now`, `new_uuid`, `random_range`, …) return a plain value
+    /// rather than a `Result`. Keeping one predicate means the exception can
+    /// never drift between the two spellings (issue #798, Codex round 25).
+    ///
+    /// The `&&` short-circuit preserves the original behaviour exactly: outside
+    /// strict replay the matcher is never locked, so no `pump_signal_handlers`
+    /// side effect is introduced on the non-strict path.
+    fn strict_replay_no_match_is_divergence(&self) -> bool {
+        self.strict_replay && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
+    }
+
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
-        if self.strict_replay {
-            if self.canary_mode && self.match_history(|m| m.position() >= m.len()) {
-                return Ok(());
-            }
+        if self.strict_replay_no_match_is_divergence() {
             return Err(self.nd_error(
                 format!("early completion mismatch: expected <end of history>, got {actual_event}"),
                 self.match_history(|m| i32::try_from(m.position()).ok()),
@@ -2451,6 +3032,14 @@ impl WorkflowContext {
         matcher.is_timer_started_next(timer_id)
     }
 
+    /// Backs the `debug_assert!` on `continue_as_new_impl`'s `Matched` arm
+    /// (issue #803): the successor type pushed there comes from the live
+    /// argument, and this pins that it still equals what history recorded.
+    pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.recorded_continue_as_new_type_matches(expected)
+    }
+
     // ── Constructors ──────────────────────────────────────────────────
 
     /// Create a context for replaying a workflow from its event history.
@@ -2539,7 +3128,11 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2686,7 +3279,11 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2748,7 +3345,11 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2862,6 +3463,18 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_offload_threshold = threshold;
+        self
+    }
+
+    /// Install the opt-in durable workflow-log policy (issue #790).
+    ///
+    /// `None` (the default) disables the durable sink entirely:
+    /// [`WorkflowLogger`] stays tracing-only and pushes no
+    /// [`WorkflowCommand::RecordLog`], so the drained command stream is
+    /// byte-for-byte identical to a pre-#790 build.
+    #[must_use]
+    pub const fn with_log_policy(mut self, policy: Option<WorkflowLogPolicy>) -> Self {
+        self.log_policy = policy;
         self
     }
 
@@ -3126,6 +3739,13 @@ impl WorkflowContext {
     /// [`deadline`](Self::deadline) check runs first, so `system_now` (which
     /// records a `SideEffectRecorded` event) is only consulted when a deadline
     /// actually exists.
+    ///
+    /// # Differs from the activity-side sibling
+    ///
+    /// [`ActivityContext::time_remaining`] returns a [`std::time::Duration`]
+    /// that **saturates at zero** past its deadline, and is measured against the
+    /// live-enforced *attempt* deadline rather than this replay-stable nominal
+    /// *run* deadline. They are not interchangeable.
     ///
     /// # Panics
     ///
@@ -4132,8 +4752,15 @@ impl WorkflowContext {
                 ));
                 f()
             }
+            // `NoMatch` here is *precisely* the frontier: `match_side_effect_event`
+            // returns it only when `prepare_match()` is false (the cursor is past
+            // the end of recorded history); any other event at the cursor resolves
+            // to `Diverged`, handled above in every mode. So under the canary
+            // frontier exception this is a fresh live capture by an in-flight
+            // execution, not drift (issue #798, Codex round 25) — while a
+            // completed-history strict replay still rejects it.
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
+                if self.strict_replay_no_match_is_divergence() {
                     self.record_deferred_nd(format!(
                         "side-effect drift mismatch: expected <end of history>, \
                          got SideEffectRecorded({})",
@@ -4308,8 +4935,12 @@ impl WorkflowContext {
                 ));
                 rand::Rng::gen_range(&mut rand::thread_rng(), range)
             }
+            // Frontier read — see the identical arm in `capture_builtin_validated`.
+            // `random_range` carries its own copy of the match because its generic
+            // range bounds do not fit that helper's signature (issue #798, Codex
+            // round 25).
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
+                if self.strict_replay_no_match_is_divergence() {
                     self.record_deferred_nd(
                         "side-effect drift mismatch: expected <end of history>, \
                          got SideEffectRecorded(random)"
@@ -4580,6 +5211,18 @@ impl WorkflowContext {
     /// never released once allocated.
     fn next_saga_seq(&self) -> u32 {
         let mut seq = self.saga_seq.lock().expect("saga_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Allocate the next business-day freeze sequence number (issue #806;
+    /// mirrors `next_fan_out_seq`/`next_race_seq`/`next_session_seq`). Numbers
+    /// are never released once allocated.
+    fn next_business_day_seq(&self) -> u32 {
+        let mut seq = self
+            .business_day_seq
+            .lock()
+            .expect("business_day_seq lock poisoned");
         *seq += 1;
         *seq
     }
@@ -5064,22 +5707,40 @@ impl WorkflowContext {
 
             // Worker crashed after appending `LocalActivityScheduled` (and
             // possibly one or more `LocalActivityFailed` events) but before
-            // recording a terminal event. Re-run with the original `activity_id`
-            // so the idempotency key is stable across the crash.
+            // recording a terminal event — or, for an in-flight fixture sampled
+            // by the #798 drift gate, the local activity is simply mid-retry.
+            // Re-run with the original `activity_id` so the idempotency key is
+            // stable across the crash.
+            //
+            // Issue #798 (Codex round 24): this arm deliberately makes NO inline
+            // non-determinism decision, mirroring the `InProgress` arms of the
+            // signal/child race twins (issue #1048). `replay_canary_snapshot`
+            // sets `strict_replay` as well as `canary_mode`, so an inline
+            // `strict_replay` error here false-reported drift on an ordinary
+            // in-flight shape and blocked promotion. Reaching this arm means the
+            // strict matcher already verified name+input against the recorded
+            // `LocalActivityScheduled` — a genuine divergence returns `Diverged`,
+            // which always errors — so the only thing "wrong" is an absent
+            // terminal, which is the defining property of a non-terminal run.
+            //
+            // Falling through re-parks (suspends), and the executor's
+            // end-of-cycle authority decides: `run_workflow_canary` maps a clean
+            // parked cycle to `Suspended` (→ `ReplaySucceeded`) but still fails
+            // when `history_has_unconsumed_events()`, and `outcome_to_report`
+            // maps `Suspended` to `NonDeterminismDetected` for non-canary strict
+            // replay — so `verify_dir`'s completed-history fixture check keeps
+            // rejecting an incomplete history.
+            //
+            // NOTE: the zero-failure shape never reaches here —
+            // `match_local_activity_strict` maps `failed_attempts: 0` to
+            // `NoMatch`, which `check_strict_replay_no_match` already grants the
+            // canary frontier exception. This arm is the `failed_attempts > 0`
+            // (mid-retry) case.
             HistoryMatch::LocalActivityInProgress {
                 activity_id,
                 failed_attempts,
                 last_error,
             } => {
-                if self.strict_replay {
-                    return Err(self.nd_error(
-                        format!("local activity '{name}' scheduled but terminal not in history"),
-                        self.match_history(|m| i32::try_from(m.position()).ok()),
-                        Some("LocalActivityCompleted".to_string()),
-                        Some("LocalActivityInProgress".to_string()),
-                    ));
-                }
-
                 // Issue #620 (AC8): the retry budget AND per-attempt timeout for
                 // an in-flight local activity must come from the values it was
                 // ORIGINALLY scheduled with — frozen into the
@@ -5394,6 +6055,290 @@ impl WorkflowContext {
         let now = self.system_now();
         let remaining_secs = remaining_secs_until(deadline, now);
         self.timer(timer_id, remaining_secs).await
+    }
+
+    // ── Business-day timers (issue #806) ──────────────────────────────────
+
+    /// The wall-clock instant a business-day resolution is anchored on.
+    ///
+    /// Production reads the real clock. Under the test harness (when the
+    /// advancing virtual clock is enabled) it reads that clock instead, so
+    /// business-day tests are hermetic across all seven weekdays rather than
+    /// resolving differently depending on the day CI happens to run.
+    ///
+    /// Mirrors [`Self::deadline_frontier_now_millis`]'s precedent (issue #772).
+    /// The value is captured **inside** the freeze closure and never escapes as
+    /// its own event, so a failed resolution leaves no orphaned anchor behind.
+    fn business_day_anchor(&self) -> DateTime<Utc> {
+        #[cfg(any(test, feature = "testing"))]
+        if self.timer_clock_elapsed_secs.is_some() {
+            return self.now();
+        }
+        Utc::now()
+    }
+
+    /// Resolve and **freeze** a business-day deadline, without arming a timer.
+    ///
+    /// Records exactly one `SideEffectRecorded` event named
+    /// `__harvest_business_day:{seq}:{id}` carrying the anchor, the resolved deadline,
+    /// the calendar name, and the dates stepped over. On replay the recorded
+    /// value is returned verbatim and the resolution is **never re-run**, so an
+    /// operator calendar edit can never move an already-resolved deadline.
+    ///
+    /// Business days are computed on **UTC dates** and the deadline preserves
+    /// the anchor's UTC time-of-day; Saturday and Sunday are always non-business
+    /// days. See [`Self::timer_business_days`] for the full semantics.
+    ///
+    /// `id` scopes the freeze to this call site. Reusing one `id` for two
+    /// distinct call sites still replays correctly (side effects match in
+    /// command order) but produces worse drift diagnostics — prefer a distinct
+    /// `id` per call site.
+    ///
+    /// # Errors
+    ///
+    /// **Prologue** errors record nothing. They are pure functions of the
+    /// arguments and this execution's own state, so they fire identically on
+    /// every worker and every replay — fixing the *call* and redeploying is
+    /// enough, with no per-execution reset:
+    ///
+    /// - [`HarvestError::Config`] when `n` exceeds
+    ///   [`MAX_BUSINESS_DAYS`](crate::MAX_BUSINESS_DAYS), or when `id` collides
+    ///   with a live cancellable [`Self::start_timer`] handle.
+    ///
+    /// **Frozen** errors are recorded into history and replay identically
+    /// forever; recover with a workflow reset:
+    ///
+    /// - [`HarvestError::NotFound`] when `calendar` is unavailable on this
+    ///   worker — either no [`BusinessCalendars`](crate::BusinessCalendars)
+    ///   snapshot is registered, or the name is not in the registered snapshot.
+    /// - [`HarvestError::Config`] when the calendar cannot cover the requested
+    ///   span (see [`BusinessCalendars::with_calendar_covering`](crate::BusinessCalendars::with_calendar_covering)).
+    ///
+    /// Calendar availability is **worker-local deployment state**, so it is
+    /// frozen rather than returned early. Returning early looks retryable but is
+    /// not: a workflow that propagates the error is sealed terminally, and one
+    /// that catches it and records anything afterwards diverges on replay once
+    /// the calendar is registered. Register calendars **before** deploying
+    /// workflows that name them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn business_days_from_now(
+        &self,
+        id: &str,
+        n: u32,
+        calendar: &str,
+    ) -> HarvestResult<DateTime<Utc>> {
+        Ok(self.freeze_business_day(id, n, calendar, false)?.deadline)
+    }
+
+    /// Arm a durable timer that fires `n` business days from now.
+    ///
+    /// The one-call answer to "escalate this ticket after 2 business days":
+    /// weekends and the named calendar's holidays are stepped over, and the
+    /// resolved instant is frozen so it survives replay, worker failover, and
+    /// any later operator edit to the calendar.
+    ///
+    /// Returns the resolved fire instant.
+    ///
+    /// # Semantics
+    ///
+    /// - **Weekends are always non-business days**, whatever the calendar is
+    ///   named — the named calendar contributes *holidays*. (This deliberately
+    ///   differs from the scheduler's `"weekends-off"` naming convention; see
+    ///   [`crate::is_business_day`].)
+    /// - **UTC dates, anchor time-of-day.** Business days are counted on UTC
+    ///   dates and the deadline preserves the anchor's UTC time-of-day. This
+    ///   matches the `DATE`-typed calendar exclusions and is DST-free.
+    ///   *Known limitation:* a deployment whose business hours straddle UTC
+    ///   midnight is off by one business day near that boundary; a per-call
+    ///   timezone is a named follow-up.
+    /// - **`n = 0` rolls forward**: fires at the anchor when the anchor's UTC
+    ///   date is a business day, otherwise at the next business date at the same
+    ///   time-of-day. It never fires "one business day later".
+    /// - **Coverage horizon.** A calendar registered with a *declared* horizon
+    ///   (`with_calendar_covering`, and the shipped built-ins) only answers for
+    ///   dates it covers; a resolution needing a later date is *rejected*, never
+    ///   silently answered weekends-only. The shipped built-ins declare
+    ///   [`BusinessCalendars::BUILTIN_COVERAGE_END`](crate::BusinessCalendars::BUILTIN_COVERAGE_END)
+    ///   (**2026-12-31**). A calendar registered with plain `with_calendar` has
+    ///   no declared horizon and is never rejected on coverage grounds.
+    ///
+    /// # Determinism
+    ///
+    /// The resolution runs **once**, on the first live execution, from an anchor
+    /// captured inside the freeze — never a fresh `Utc::now()` on replay. It is
+    /// recorded in the existing `SideEffectRecorded` event (issue #384) and the
+    /// wait is carried by the existing `TimerStarted` event: **no new
+    /// `WorkflowEvent` variant and no migration**.
+    ///
+    /// # Composition
+    ///
+    /// Sequential composition is supported (arm one, await it, arm the next).
+    /// Racing a business-day timer against `receive_signal_timeout` in a single
+    /// suspension is **not** supported — the engine allows exactly one
+    /// `StartTimer` per suspension batch and rejects the mixed batch loudly.
+    ///
+    /// Registration is one builder call:
+    /// `HarvestBuilder::state(BusinessCalendars::builtin())`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::business_days_from_now`], plus
+    /// [`HarvestError::NonDeterministic`] if the timer at this history position
+    /// does not match, and [`HarvestError::Cancelled`] if the oneshot sender was
+    /// dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Escalate an unacknowledged ticket after two business days:
+    /// ctx.timer_business_days("sla-escalation", 2, "us-federal-holidays").await?;
+    /// ```
+    pub async fn timer_business_days(
+        &self,
+        timer_id: &str,
+        n: u32,
+        calendar: &str,
+    ) -> HarvestResult<DateTime<Utc>> {
+        let frozen = self.freeze_business_day(timer_id, n, calendar, true)?;
+        let remaining_secs = remaining_secs_until(frozen.deadline, frozen.anchor);
+        self.timer(timer_id, remaining_secs).await?;
+        Ok(frozen.deadline)
+    }
+
+    /// Shared prologue + freeze for the two business-day entry points.
+    ///
+    /// **DO NOT REORDER.** Every validation that is *not* a deterministic
+    /// function of the frozen record must run BEFORE the `side_effect` call, so
+    /// a rejected call records **zero** commands. A validation that slipped
+    /// below the freeze would leave an orphaned `SideEffectRecorded` in history
+    /// with no matching consumer on the next replay cycle (issue #806 C1/C2).
+    fn freeze_business_day(
+        &self,
+        id: &str,
+        n: u32,
+        calendar: &str,
+        arms_timer: bool,
+    ) -> HarvestResult<ResolvedBusinessDay> {
+        // (1) Bound `n` before anything else: a typo'd `u32::MAX` must be a loud
+        //     rejection, not a multi-million-iteration stall inside the 100 ms
+        //     suspension budget.
+        if n > crate::calendar::MAX_BUSINESS_DAYS {
+            return Err(HarvestError::Config(format!(
+                "timer_business_days: n = {n} exceeds MAX_BUSINESS_DAYS ({})",
+                crate::calendar::MAX_BUSINESS_DAYS
+            )));
+        }
+        // (2) Claim the timer-id namespace before the freeze, so a collision with
+        //     the cancellable `start_timer` API cannot record an orphaned freeze.
+        //
+        //     Only for the timer-arming entry point. `business_days_from_now`
+        //     arms no timer — it records only `__harvest_business_day:{seq}:{id}`,
+        //     a namespace disjoint from `harvest_timers` — so rejecting it here
+        //     would force an author to rename an id for no reason, citing three
+        //     APIs the call never touches.
+        if arms_timer && self.timer_logically_armed(id).is_some() {
+            return Err(HarvestError::Config(format!(
+                "timer id '{id}' is used for both a cancellable start_timer/reset_timer \
+                 and a classic ctx.timer/sleep_until/timer_business_days in the same \
+                 workflow task — use distinct timer ids across the two APIs"
+            )));
+        }
+        // (3) Freeze. EVERY outcome that depends on worker-local deployment
+        //     state — including "no snapshot registered" and "calendar name not
+        //     in the snapshot" — is resolved INSIDE the closure and frozen.
+        //
+        //     This split is the load-bearing invariant, and it is not a stylistic
+        //     choice (issue #806, Codex P1 review). The rule is:
+        //
+        //       * A check that is a pure function of (code, history, arguments)
+        //         may be a PROLOGUE error — it records nothing, and because it is
+        //         deterministic it fires identically on every worker and every
+        //         replay. `n > MAX_BUSINESS_DAYS` and the timer-id collision above
+        //         qualify.
+        //       * A check that depends on WORKER-LOCAL deployment state must be
+        //         FROZEN. Returning early from it looks retryable but is not: the
+        //         two workers disagree, so the recording worker and the replaying
+        //         worker take different branches.
+        //
+        //     Concretely, an earlier cut returned early here on a missing snapshot
+        //     or an unknown calendar name, on the theory that recording nothing
+        //     made the call "retryable after a redeploy". It does not:
+        //
+        //       * If the workflow propagates the error, `process_workflow_task`
+        //         treats an author `Err` as a TERMINAL failure — the run is sealed
+        //         FAILED and a redeploy cannot revive it.
+        //       * If the workflow CATCHES the error and records anything after it
+        //         (an activity, a timer, a completion), the corrected deployment
+        //         replays down the other branch and emits this side effect where
+        //         history holds that recorded command — a replay divergence, which
+        //         issue #603 turns into a non-terminal block that clears only by
+        //         rolling BACK the fix.
+        //
+        //     Freezing instead makes both shapes replay-stable: the recorded
+        //     outcome answers on every later cycle, so a caught error keeps taking
+        //     the same branch forever. The cost is honest and documented — a
+        //     config error frozen into an in-flight run needs a workflow reset,
+        //     because the run has already committed to its fallback path. The
+        //     strictly better answer is a capability-miss release that re-pends
+        //     the task without recording (the issue #804 pattern); that needs a
+        //     new outcome channel through the executor and worker, and is tracked
+        //     as a follow-up rather than smuggled into this slice.
+        //
+        //     Freezing is also what makes replay and deploy-canary contexts safe
+        //     by construction: they carry empty shared state by design, and
+        //     `side_effect`'s matched arm never invokes the closure, so the
+        //     snapshot is never consulted on replay at all.
+        //
+        //     The name carries a per-invocation sequence number so a loop that
+        //     reuses one timer id freezes each iteration under its own name,
+        //     keeping drift diagnostics readable and preventing a different call
+        //     site that reuses the id from matching silently.
+        let freeze_name = format!(
+            "{BUSINESS_DAY_SIDE_EFFECT_PREFIX}{}:{id}",
+            self.next_business_day_seq()
+        );
+        let snapshot = self.state::<crate::calendar::BusinessCalendars>();
+        // The registered names are WORKER-LOCAL, so they are a diagnostic only —
+        // they are logged on the live path and deliberately never enter the frozen
+        // record or its replayed message, which must be identical on every worker.
+        let registered: Option<Vec<String>> = snapshot.map(|c| {
+            let mut names: Vec<String> = c.names().map(ToString::to_string).collect();
+            names.sort();
+            names
+        });
+        // The anchor is captured INSIDE the closure so no separate `Now` event can
+        // be orphaned by a later failure, and the closure is never invoked on
+        // replay — which is what makes an operator calendar edit structurally
+        // unable to move an armed deadline.
+        let holidays = snapshot.and_then(|c| c.get(calendar).cloned());
+        let coverage_end = snapshot.and_then(|c| c.coverage_end(calendar));
+        let calendar_owned = calendar.to_string();
+        let frozen: FrozenBusinessDay = self.side_effect(&freeze_name, move || {
+            let anchor = self.business_day_anchor();
+            let Some(holidays) = holidays else {
+                tracing::warn!(
+                    calendar = %calendar_owned,
+                    registered = ?registered,
+                    "business calendar is unavailable on this worker; freezing an \
+                     UnknownCalendar outcome. Register the calendar via \
+                     `HarvestBuilder::state(BusinessCalendars::..)` before deploying \
+                     workflows that name it — executions that already froze this \
+                     outcome need a workflow reset, a redeploy alone will not move them"
+                );
+                return FrozenBusinessDay::unknown_calendar(anchor, calendar_owned);
+            };
+            match crate::calendar::add_business_days_bounded(anchor, n, &holidays, coverage_end) {
+                Ok(res) => FrozenBusinessDay::resolved(anchor, calendar_owned, &res, coverage_end),
+                Err(rejection) => FrozenBusinessDay::rejected(anchor, calendar_owned, rejection),
+            }
+        })?;
+        frozen.into_result()
     }
 
     // ── Cancellable / renewable durable timers (issue #768) ───────────────
@@ -6093,22 +7038,31 @@ impl WorkflowContext {
             // state when the parent wakes because one of several parallel children
             // completed while this child is still running.
             //
-            // In strict-replay mode (WorkflowReplayer) an incomplete history is
-            // treated as a non-determinism error — callers always provide complete
-            // histories.  In the worker's non-strict replay mode we re-emit the
-            // command carrying the *existing* child_id so the worker can re-park
-            // the parent without creating a duplicate child execution.
+            // We re-emit the command carrying the *existing* child_id so the
+            // worker can re-park the parent without creating a duplicate child
+            // execution.
+            //
+            // Issue #798 (Codex round 24, sibling of the local-activity arm):
+            // this arm deliberately makes NO inline non-determinism decision,
+            // mirroring the `InProgress` arms of the signal/child race twins
+            // (issue #1048). `replay_canary_snapshot` sets `strict_replay` as
+            // well as `canary_mode`, so an inline `strict_replay` error here
+            // false-reported drift on *any* parent parked on a running child —
+            // one of the most common in-flight shapes the #798 gate samples —
+            // and blocked promotion. Reaching this arm means `match_child_workflow`
+            // already verified name+input against the recorded
+            // `ChildWorkflowStarted` (a changed child returns `Diverged`, which
+            // always errors), so the only thing "wrong" is an absent terminal,
+            // which is the defining property of a non-terminal run.
+            //
+            // Falling through re-parks (suspends), and the executor's
+            // end-of-cycle authority decides: `run_workflow_canary` maps a clean
+            // parked cycle to `Suspended` (→ `ReplaySucceeded`) but still fails
+            // when `history_has_unconsumed_events()`, and `outcome_to_report`
+            // maps `Suspended` to `NonDeterminismDetected` for non-canary strict
+            // replay — so `verify_dir`'s completed-history fixture check keeps
+            // rejecting an incomplete history.
             HistoryMatch::ChildInProgress { child_id } => {
-                if self.strict_replay {
-                    return Err(self.nd_error(
-                        format!(
-                            "child workflow '{workflow_name}' started but terminal not in history"
-                        ),
-                        self.match_history(|m| i32::try_from(m.position()).ok()),
-                        Some("ChildWorkflowCompleted".to_string()),
-                        Some("ChildWorkflowInProgress".to_string()),
-                    ));
-                }
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
                     child_id,
@@ -6152,7 +7106,12 @@ impl WorkflowContext {
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
-                    child_id: ExecutionId::new(),
+                    // Inherit the parent's shard so data residency is transitive
+                    // across the workflow tree (issue #697 AC4). The worker
+                    // already writes the child's row on the parent's shard; the
+                    // encoded shard is what makes every later id-based lookup
+                    // route there too, instead of the default shard.
+                    child_id: ExecutionId::new_for_shard(self.exec_id.shard()),
                     workflow_name: workflow_name.to_string(),
                     input,
                     result_tx: tx,
@@ -7441,10 +8400,142 @@ impl WorkflowContext {
         payload: P,
         idempotency_key: impl Into<Option<String>>,
     ) -> HarvestResult<()> {
+        self.signal_external_target(target.into(), signal_name, payload, idempotency_key.into())
+            .await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`signal_external_workflow`](Self::signal_external_workflow) (issue
+    /// #751): send a named signal to another workflow addressed by its
+    /// `(workflow_name, workflow_id)` business key rather than a specific
+    /// `ExecutionId`.
+    ///
+    /// # Resolution
+    ///
+    /// The target resolves to the **current run** of `(workflow_name,
+    /// workflow_id)` at delivery time — the latest non-terminal execution, or
+    /// (if none is running) `HarvestError::ExternalSignalFailed { reason_code:
+    /// "not_running" }`. Resolution happens fresh on every delivery attempt
+    /// (not just once, at the first live call), so a target that
+    /// continues-as-new between the request and delivery is followed to its
+    /// successor rather than misdelivering to — or failing against — the
+    /// sealed predecessor.
+    ///
+    /// # Known limitation — explicit shard placement (issue #697)
+    ///
+    /// Resolving which shard owns `(workflow_name, workflow_id)` is done by
+    /// re-deriving the SAME rendezvous hash a fresh start of that business
+    /// key would use ([`crate::shard::external_target_owning_shard`]). This
+    /// is correct for a target started under the default
+    /// [`crate::shard::ShardPlacement::Auto`] placement — the overwhelming
+    /// majority of workflows. It is **not** correct for a target started
+    /// with an *explicit* shard pin (`ShardPlacement::Shard`/
+    /// `ShardPlacement::ResidencyKey`, issue #697): the pin can place the
+    /// workflow on a shard the pure hash would never compute, and this
+    /// resolution has no way to discover that. A `workflow_id`-addressed
+    /// signal to such a target may resolve to the wrong shard and report
+    /// [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    /// "target_unknown"` even though the target is running (just not where
+    /// the hash predicts). If a workflow is started with explicit shard
+    /// placement, address it by [`ExecutionId`](Self::signal_external_workflow)
+    /// instead of by business key. A shard-placement-aware directory lookup
+    /// is a documented follow-up, out of scope for issue #751.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "self_signal"` when `(workflow_name, workflow_id)` matches this
+    ///   execution's own business key (compared by key, not `ExecutionId`, so
+    ///   this still catches self-targeting after a continue-as-new).
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "not_running"` when the current run for this business key is already
+    ///   terminal.
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "target_unknown"` if no run has ever existed for this business key
+    ///   within the grace window.
+    /// - Same as [`signal_external_workflow`](Self::signal_external_workflow)
+    ///   otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow_by_id<P: serde::Serialize>(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        signal_name: &str,
+        payload: P,
+    ) -> HarvestResult<()> {
+        self.signal_external_workflow_by_id_with_idempotency(
+            workflow_name,
+            workflow_id,
+            signal_name,
+            payload,
+            None,
+        )
+        .await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`signal_external_workflow_with_idempotency`](Self::signal_external_workflow_with_idempotency)
+    /// (issue #751). See [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id)
+    /// for the resolution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow_by_id_with_idempotency<P: serde::Serialize>(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        signal_name: &str,
+        payload: P,
+        idempotency_key: impl Into<Option<String>>,
+    ) -> HarvestResult<()> {
+        // Self-targeting is always an immediate, deterministic error (same
+        // rationale as `request_cancel_external_workflow`'s self-cancel
+        // check). This path records no history, so `signal_id` must be a
+        // stable sentinel (nil UUID) rather than a fresh v4, or a workflow
+        // that surfaces the error would diverge on replay. Compared by
+        // BUSINESS KEY (not `ExecutionId`) so a workflow that has since
+        // continued-as-new under the same `(workflow_name, workflow_id)`
+        // still recognises the target as itself.
+        if workflow_name == self.workflow_type() && workflow_id == self.workflow_id() {
+            return Err(HarvestError::ExternalSignalFailed {
+                signal_id: ExternalSignalId::from_uuid(uuid::Uuid::nil()),
+                target: ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+                signal_name: signal_name.to_string(),
+                reason_code: "self_signal".to_string(),
+            });
+        }
+        self.signal_external_target(
+            ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+            signal_name,
+            payload,
+            idempotency_key.into(),
+        )
+        .await
+    }
+
+    /// Shared implementation for `signal_external_workflow*` and
+    /// `signal_external_workflow_by_id*`, operating uniformly on the resolved
+    /// [`ExternalTarget`] so the matcher, dispatch, and error construction
+    /// exist in exactly one place regardless of how the caller addressed the
+    /// target (issue #751).
+    async fn signal_external_target<P: serde::Serialize>(
+        &self,
+        target: ExternalTarget,
+        signal_name: &str,
+        payload: P,
+        idempotency_key: Option<String>,
+    ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
-        let idempotency_key = idempotency_key.into();
-        let history_match = self.match_history(|m| m.match_external_signal(target, signal_name));
+        let history_match = self.match_history(|m| m.match_external_signal(&target, signal_name));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -7545,7 +8636,7 @@ impl WorkflowContext {
     /// (`already_requested = false`) dispatch paths.
     async fn dispatch_signal_command<P: serde::Serialize>(
         &self,
-        target: ExecutionId,
+        target: ExternalTarget,
         signal_name: &str,
         payload: P,
         signal_id: ExternalSignalId,
@@ -7556,7 +8647,7 @@ impl WorkflowContext {
         let (tx, rx) = oneshot::channel();
         self.push_command(WorkflowCommand::SignalExternalWorkflow {
             signal_id,
-            target,
+            target: target.clone(),
             signal_name: signal_name.to_string(),
             payload: payload_json,
             result_tx: tx,
@@ -7612,8 +8703,6 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn request_cancel_external_workflow(&self, target: ExecutionId) -> HarvestResult<()> {
-        use crate::replay::HistoryMatch;
-
         // Self-cancel is always an immediate deterministic error. This path records
         // no history, so the `cancel_id` must be a stable sentinel (nil UUID) rather
         // than a fresh v4 — otherwise a workflow that surfaces the error (e.g.
@@ -7621,12 +8710,98 @@ impl WorkflowContext {
         if target == self.exec_id {
             return Err(HarvestError::ExternalCancelFailed {
                 cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
-                target,
+                target: ExternalTarget::ExecutionId(target),
                 reason_code: "self_cancel".to_string(),
             });
         }
 
-        let history_match = self.match_history(|m| m.match_external_cancel(target));
+        self.request_cancel_external_target(target.into()).await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`request_cancel_external_workflow`](Self::request_cancel_external_workflow)
+    /// (issue #751): request cancellation of another workflow addressed by
+    /// its `(workflow_name, workflow_id)` business key rather than a specific
+    /// `ExecutionId`.
+    ///
+    /// # Resolution
+    ///
+    /// The target resolves to the **current run** of `(workflow_name,
+    /// workflow_id)` at delivery time — the latest non-terminal execution.
+    /// Resolution happens fresh on every delivery attempt (not just once, at
+    /// the first live call), so a target that continues-as-new between the
+    /// request and delivery is followed to its successor and *that* run is
+    /// cancelled, rather than misdelivering to — or reporting a spurious
+    /// success against — the already-sealed predecessor.
+    ///
+    /// # Known limitation — explicit shard placement (issue #697)
+    ///
+    /// See the identical limitation documented on
+    /// [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id):
+    /// shard resolution for a `WorkflowId` target re-derives the same
+    /// rendezvous hash a fresh start would use and cannot see an explicit
+    /// shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
+    /// issue #697). Address a pinned workflow by
+    /// [`ExecutionId`](Self::request_cancel_external_workflow) instead.
+    ///
+    /// # Cancel semantics vs signal
+    ///
+    /// As with [`request_cancel_external_workflow`](Self::request_cancel_external_workflow),
+    /// a current run that is already terminal is a **no-op success**
+    /// (`ExternalCancelDelivered`): the goal (nothing running under this
+    /// business key) is already met.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code =
+    ///   "self_cancel"` when `(workflow_name, workflow_id)` matches this
+    ///   execution's own business key (compared by key, not `ExecutionId`, so
+    ///   this still catches self-targeting after a continue-as-new).
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code =
+    ///   "target_unknown"` if no run has ever existed for this business key
+    ///   within the grace window.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position
+    ///   does not match the requested target.
+    /// - [`HarvestError::Cancelled`] if the result channel is dropped before
+    ///   the worker resolves this command.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn request_cancel_external_workflow_by_id(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> HarvestResult<()> {
+        // Self-cancel by business key -- see the identical rationale on
+        // `request_cancel_external_workflow`'s `ExecutionId` self-check.
+        // Compared by BUSINESS KEY (not `ExecutionId`) so a workflow that has
+        // since continued-as-new under the same `(workflow_name,
+        // workflow_id)` still recognises the target as itself.
+        if workflow_name == self.workflow_type() && workflow_id == self.workflow_id() {
+            return Err(HarvestError::ExternalCancelFailed {
+                cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
+                target: ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+                reason_code: "self_cancel".to_string(),
+            });
+        }
+
+        self.request_cancel_external_target(ExternalTarget::from_workflow_id(
+            workflow_name,
+            workflow_id,
+        ))
+        .await
+    }
+
+    /// Shared implementation for `request_cancel_external_workflow` and
+    /// `request_cancel_external_workflow_by_id`, operating uniformly on the
+    /// resolved [`ExternalTarget`] so the matcher, dispatch, and error
+    /// construction exist in exactly one place regardless of how the caller
+    /// addressed the target (issue #751).
+    async fn request_cancel_external_target(&self, target: ExternalTarget) -> HarvestResult<()> {
+        use crate::replay::HistoryMatch;
+
+        let history_match = self.match_history(|m| m.match_external_cancel(&target));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -7692,14 +8867,14 @@ impl WorkflowContext {
     /// (`already_requested = false`) dispatch paths.
     async fn dispatch_cancel_command(
         &self,
-        target: ExecutionId,
+        target: ExternalTarget,
         cancel_id: ExternalCancelId,
         already_requested: bool,
     ) -> HarvestResult<()> {
         let (tx, rx) = oneshot::channel();
         self.push_command(WorkflowCommand::RequestCancelExternalWorkflow {
             cancel_id,
-            target,
+            target: target.clone(),
             result_tx: tx,
             already_requested,
         });
@@ -9251,7 +10426,9 @@ impl WorkflowContext {
                             to_dispatch.push(RaceDispatch {
                                 index,
                                 activity_id: None,
-                                child_id: Some(ExecutionId::new()),
+                                // Inherit the parent's shard (issue #697 AC4) --
+                                // same rationale as the plain awaited-child path.
+                                child_id: Some(ExecutionId::new_for_shard(self.exec_id.shard())),
                                 is_new: true,
                             });
                         }
@@ -9468,6 +10645,11 @@ impl WorkflowContext {
             let mut activities = Vec::new();
             let mut children = Vec::new();
             for dispatch in to_dispatch {
+                // Skip the winner: its own progress-frontier events are consumed
+                // by the terminal-settling path (`settle_terminal` /
+                // `scan_activity_terminal`) that resolved it this cycle, so the
+                // winner never has an unconsumed `ActivityStarted` to strand. Only
+                // the still-open LOSER branches need `consume_race_loser_frontier`.
                 if dispatch.index == winner_index {
                     continue;
                 }
@@ -9478,6 +10660,16 @@ impl WorkflowContext {
                     children.push(id);
                 }
             }
+            // Issue #1126: the loser branches that resolved as `*InProgress`
+            // this cycle have their synthetic terminal appended only at persist
+            // time (via the `CancelRaceLosers` command below), so their
+            // in-flight progress-frontier events (`ActivityStarted` /
+            // `ActivityHeartbeat`, or a child's `ChildWorkflowStarted`) are left
+            // unconsumed straddling the matcher cursor. Consume them in-cycle so
+            // a follow-on positional durable command in the SAME decision cycle
+            // (a plain activity, `ctx.mutex(k).acquire()`, a timer, ...) lands
+            // cleanly instead of diverging on the leftover event -> nd-block.
+            self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
             if !activities.is_empty() || !children.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
                     activities,
@@ -9915,13 +11107,194 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
-        let history_match = self.match_history(|m| m.match_continue_as_new(&input));
+        self.continue_as_new_impl(None, input).await
+    }
+
+    /// Continue as a **different** registered workflow type, keeping the same
+    /// logical `WorkflowId` (issue #803).
+    ///
+    /// This is the entity / state-machine phase-transition primitive: an
+    /// entity whose behavior genuinely changes across lifecycle phases
+    /// (`trial_subscription → paid_subscription → churned`,
+    /// `cart → checkout → fulfillment`) gets one focused, replay-safe handler
+    /// per phase instead of a single ever-branching function, while its
+    /// stable `workflow_id`, shard, and queue carry across every transition.
+    ///
+    /// Everything [`continue_as_new`](Self::continue_as_new) does still
+    /// applies: the current execution is sealed `CONTINUED_AS_NEW`, a fresh
+    /// execution with an empty history is started in its place, unconsumed
+    /// signals are reassigned to it, and the returned future never resolves.
+    ///
+    /// # Successor defaults
+    ///
+    /// The successor's **lifecycle defaults are resolved from
+    /// `workflow_type`'s own [`WorkflowInfo`]** — not the predecessor's:
+    /// `execution_timeout` (#243), `sla` (#487, clamped to at most the
+    /// execution timeout exactly as at start), the `concurrency` key/limit
+    /// (#247), the workflow-level `retry_policy` (#523), and the
+    /// `owner`/`runbook_url`/`severity` ops metadata (#372). This mirrors how
+    /// a spawned child resolves its own type's defaults, and means an alert
+    /// on the new phase pages the team that owns *that* phase.
+    ///
+    /// Carried forward verbatim (identical to a same-type continuation):
+    /// `workflow_id`, shard, `queue_name`, `memo`, search attributes, context
+    /// headers, build id, schedule lineage (#488/#534), completion callbacks
+    /// (#605), the run-chain back-links (#701), and — deliberately — the
+    /// chain-scoped lifetime cap `chain_execution_timeout`/`chain_deadline_at`
+    /// (#617). The chain cap is anchored at the *first* run of the chain, so
+    /// changing type must not reset it: cross-type continuation is not an
+    /// escape hatch from a runaway-loop budget.
+    ///
+    /// The fleet-wide `max_workflow_execution_timeout` ceiling is applied to
+    /// the target's declared timeout exactly as at every other registry-aware
+    /// start path, so a type change is not an escape hatch from that either.
+    ///
+    /// **Not consulted on this path**: the target type's `throttle` (#607),
+    /// `debounce` (#499), `batch` (#518) and `max_input_bytes` (#252). Those
+    /// are *admission* policies, and continue-as-new is in-flight continuation
+    /// rather than a start — so a cross-type transition does not pass through
+    /// the target type's admission gates, and the payload cap enforced is the
+    /// predecessor's. If a phase must be paced or rate-limited on entry, gate
+    /// it at the caller instead.
+    ///
+    /// # Addressing consequence (read this)
+    ///
+    /// Harvest's active-run identity is `(workflow_name, workflow_id)`, so
+    /// after a cross-type transition an external `signal_with_start` /
+    /// `update_with_start` must name the **new** type to attach to the live
+    /// successor. Naming the old type instead starts a *fresh* run of the old
+    /// type — which can legitimately coexist with the live successor, since
+    /// the two occupy different uniqueness slots. Address the entity by its
+    /// current phase type, or keep a stable front-door type that transitions
+    /// only internally.
+    ///
+    /// The inverse is the hazard: because the successor must *take*
+    /// `(workflow_type, workflow_id)`, a **live** run someone already started
+    /// under that pair blocks the transition, and this execution is failed
+    /// terminally rather than displacing it (see *Errors*). Starting the next
+    /// phase out-of-band while the current phase is still running is therefore
+    /// not benign — let the entity transition itself.
+    ///
+    /// A cross-type successor also leaves its schedule's overlap controls
+    /// behind: `max_active_runs` counting and `OverlapPolicy::CancelOther` /
+    /// `TerminateOther` both select on the *schedule's* `workflow_name`, so
+    /// they no longer see the run even though `schedule_id`/`scheduled_for`
+    /// are carried.
+    ///
+    /// # Rollout ordering
+    ///
+    /// The target type must be registered on the worker that runs the
+    /// transition. Continuing into an unregistered type fails the execution
+    /// terminally (see *Errors*) rather than creating a successor no worker
+    /// can dispatch — so **deploy the new phase's handler to the whole fleet
+    /// before** deploying code that continues into it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`continue_as_new`](Self::continue_as_new). Additionally, the
+    /// worker fails the execution terminally (a `WorkflowFailed` event, no
+    /// successor created, no retry offered) in four cases:
+    ///
+    /// 1. `workflow_type` is empty or blank.
+    /// 2. `workflow_type` is not registered on the worker running the
+    ///    transition (see *Rollout ordering*).
+    /// 3. `workflow_type` names a registered **unified DAG** rather than a
+    ///    plain workflow type — a DAG successor would run the level walker
+    ///    while bypassing the admission gates `POST /dags/{name}/trigger`
+    ///    enforces, so it is rejected with a pointer to that route.
+    /// 4. A **live** (`RUNNING`/`PAUSED`) run already occupies
+    ///    `(workflow_type, workflow_id)`. Harvest admits exactly one active
+    ///    run per pair, and this path never displaces a bystander. Recovery is
+    ///    to resolve that run, then restart or reset (#148) the entity.
+    ///
+    /// Naming the *current* type is **not** an error — it is a supported
+    /// request for that type's declared defaults (which plain
+    /// [`continue_as_new`](Self::continue_as_new) deliberately does not
+    /// re-resolve), and the predecessor's own seal frees the slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as_type(
+        &self,
+        workflow_type: &str,
+        input: Value,
+    ) -> HarvestResult<()> {
+        self.continue_as_new_impl(Some(workflow_type.to_string()), input)
+            .await
+    }
+
+    /// Typed sibling of
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type): continue as
+    /// the workflow described by `info`, serializing `input` for you (issue
+    /// #803).
+    ///
+    /// Prefer this over the raw string form — the target type name comes from
+    /// the `#[workflow]`-generated companion function, so a renamed or deleted
+    /// phase handler is a compile error rather than a runtime failure:
+    ///
+    /// ```ignore
+    /// ctx.continue_as_new_as(&paid_subscription_info(), PaidInput { plan }).await?;
+    /// ```
+    ///
+    /// See [`continue_as_new_as_type`](Self::continue_as_new_as_type) for the
+    /// successor-default, addressing, and rollout-ordering semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be encoded to
+    /// JSON; otherwise as
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as<I: serde::Serialize>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+    ) -> HarvestResult<()> {
+        let payload = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
+        self.continue_as_new_as_type(info.name, payload).await
+    }
+
+    /// Shared implementation behind [`continue_as_new`](Self::continue_as_new)
+    /// and its cross-type siblings.
+    ///
+    /// `new_workflow_type` is `None` for a same-type continuation — the legacy
+    /// path, byte-identical to pre-#803 — and `Some(type)` for a cross-type
+    /// one. **Presence decides**: the field is never normalized away when the
+    /// named type happens to equal the current one, because naming a type is
+    /// an explicit request for *that type's* declared defaults.
+    async fn continue_as_new_impl(
+        &self,
+        new_workflow_type: Option<String>,
+        input: Value,
+    ) -> HarvestResult<()> {
+        let history_match =
+            self.match_history(|m| m.match_continue_as_new(&input, new_workflow_type.as_deref()));
 
         match history_match {
             HistoryMatch::Matched { output } => {
                 // Replay still emits the terminal command so the worker can
                 // observe the recorded intent while draining commands.
-                self.push_command(WorkflowCommand::ContinueAsNew { input: output });
+                //
+                // `input` echoes the recorded value (`output`) while
+                // `new_workflow_type` is the live argument — an asymmetry that
+                // is only sound because `match_continue_as_new` compares the
+                // recorded target type FIRST and returns `Diverged` on any
+                // mismatch, so reaching this arm proves the two are equal. The
+                // assert pins that coupling: if the guard is ever loosened,
+                // this fires in debug/test rather than silently forking the
+                // chain into a type history never recorded.
+                debug_assert!(
+                    self.recorded_continue_as_new_type_matches(new_workflow_type.as_deref()),
+                    "reaching Matched must imply the recorded target type equals the live one"
+                );
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input: output,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
             HistoryMatch::Diverged {
@@ -9966,11 +11339,21 @@ impl WorkflowContext {
                         kind: crate::error::PayloadKind::WorkflowInput,
                         observed_bytes: observed,
                         cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
+                        // Name the run this input is destined for: the target
+                        // type for a cross-type continuation (#803), else our
+                        // own. The cap value itself is still the *current*
+                        // type's — the context cannot see the target's
+                        // `max_input_bytes` override.
+                        workflow_type: new_workflow_type
+                            .clone()
+                            .unwrap_or_else(|| self.workflow_name.clone()),
                         activity_name: None,
                     });
                 }
-                self.push_command(WorkflowCommand::ContinueAsNew { input });
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
         }
@@ -11109,6 +12492,210 @@ impl std::future::Future for ChildOrTimerRaceFut {
 // ActivityContext
 // ---------------------------------------------------------------------------
 
+/// The subset of an activity attempt's metadata that is **stable across every
+/// retry attempt** of the same logical invocation (issue #783).
+///
+/// Returned by [`ActivityExecutionInfo::identity`]. Two attempts of the same
+/// logical activity compare equal here; only the attempt counter and the
+/// deadline advance between them. Asserting on this value — rather than on a
+/// hand-written list of fields — keeps a stability test honest as fields are
+/// added, since a new identity field automatically joins every existing
+/// comparison.
+///
+/// `is_local`, `attempt`, `max_attempts`, `queue_name`, and `task_id` are
+/// deliberately **not** here: the first is a property of the dispatch path
+/// rather than of the activity's identity, and the rest are per-attempt or
+/// per-dispatch.
+///
+/// `Hash` is derived (unlike on [`ActivityExecutionInfo`]) precisely because
+/// this is the retry-stable subset: it is the value you want as a `HashMap` key
+/// when de-duplicating work per logical invocation.
+///
+/// Because the struct is `#[non_exhaustive]`, downstream code cannot build one
+/// with a struct literal (nor with functional-update syntax). Use
+/// [`new`](Self::new) — or, in a test, [`for_test`](Self::for_test) — instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ActivityIdentity {
+    /// The owning workflow run's execution id.
+    pub execution_id: ExecutionId,
+    /// The owning run's business-level workflow identifier.
+    pub workflow_id: String,
+    /// The owning run's logical workflow type.
+    pub workflow_type: String,
+    /// This activity's registered name.
+    pub activity_type: String,
+    /// This logical invocation's activity execution id.
+    pub activity_id: ActivityExecId,
+}
+
+impl ActivityIdentity {
+    /// Assemble an identity from the values the worker resolves at dispatch.
+    #[must_use]
+    pub fn new(
+        execution_id: ExecutionId,
+        workflow_id: impl Into<String>,
+        workflow_type: impl Into<String>,
+        activity_type: impl Into<String>,
+        activity_id: ActivityExecId,
+    ) -> Self {
+        Self {
+            execution_id,
+            workflow_id: workflow_id.into(),
+            workflow_type: workflow_type.into(),
+            activity_type: activity_type.into(),
+            activity_id,
+        }
+    }
+
+    /// A synthetic, self-consistent identity for tests and for contexts that
+    /// were not built by the worker (issue #783).
+    ///
+    /// Every field is populated with a plausible value — never an empty string
+    /// or a nil UUID — so a test context reports a usable [`info`] out of the
+    /// box and an accidentally-unwired production path is visibly wrong rather
+    /// than plausibly blank.
+    ///
+    /// Gated behind the `testing` feature, matching its only public consumer
+    /// [`ActivityContext::new_test_with_identity`]. The worker builds real
+    /// identities with [`new`](Self::new), so nothing in a default build needs
+    /// this — and gating it keeps the synthetic `"test_workflow"` /
+    /// `"test-workflow-id"` values out of reach of production code.
+    ///
+    /// [`info`]: ActivityContext::info
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test() -> Self {
+        Self {
+            execution_id: ExecutionId::new(),
+            workflow_id: "test-workflow-id".to_string(),
+            workflow_type: "test_workflow".to_string(),
+            activity_type: "test_activity".to_string(),
+            activity_id: ActivityExecId::new(),
+        }
+    }
+}
+
+/// A read-only snapshot of the currently-executing activity attempt's
+/// owning-run and dispatch metadata (issue #783).
+///
+/// Returned by [`ActivityContext::info`]. Every field is a plain in-memory read
+/// — obtaining it performs **no** I/O, issues **no** query, and sends **no**
+/// heartbeat.
+///
+/// This is the activity-side counterpart of
+/// [`WorkflowExecutionInfo`]: the [`execution_id`](Self::execution_id) here is
+/// the exact identifier the management-API path
+/// (`/api/harvest/workflows/{execution_id}/...`), the dead-letter queue,
+/// reset/pause/cancel, and the ADR-0001 `execution.id` span attribute all key
+/// on — so an activity log line carrying it opens the owning run with zero
+/// directory lookups.
+///
+/// Unlike the workflow side there is **no replay-determinism contract to
+/// satisfy**: an activity handler is never re-run during replay (the recorded
+/// terminal event's value is used instead), so these fields carry no
+/// replay-safety obligation and may be branched on freely.
+///
+/// The attempt's wall-clock deadline is deliberately **not** a field. It is
+/// time-varying, so keeping it out makes this a pure snapshot whose
+/// [`PartialEq`] is a meaningful identity comparison and whose value cannot go
+/// stale while held across an `.await`. Read it live via
+/// [`ActivityContext::deadline`] / [`ActivityContext::time_remaining`].
+///
+/// ```rust,ignore
+/// // `heartbeat_timeout` above `start_to_close` on purpose: the heartbeat
+/// // clock is NOT folded into `ActivityContext::deadline`, so keeping it the
+/// // looser of the two means the reported deadline is the binding one.
+/// #[activity(start_to_close = "5m", heartbeat_timeout = "10m")]
+/// async fn import_rows(ctx: &ActivityContext, job: Job) -> Result<Done, String> {
+///     let info = ctx.info();
+///     tracing::info!(
+///         execution_id = %info.execution_id,   // pasteable into the management API
+///         workflow_type = %info.workflow_type,
+///         activity = %info.activity_type,
+///         attempt = info.attempt,
+///         "starting import"
+///     );
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActivityExecutionInfo {
+    /// The owning workflow run's system-generated execution id — the exact
+    /// `{exec_id}` segment of the management-API path. Render it with
+    /// `Display` (`%info.execution_id`), never `Debug`, or the logged string
+    /// is not pasteable.
+    pub execution_id: ExecutionId,
+    /// The owning run's business-level workflow identifier (e.g.
+    /// `"subscription-123"`).
+    pub workflow_id: String,
+    /// The owning run's logical workflow type — the `#[workflow]` function
+    /// name.
+    pub workflow_type: String,
+    /// This activity's registered name — the `#[activity]` function name.
+    pub activity_type: String,
+    /// This logical invocation's activity execution id: the id recorded in the
+    /// `ActivityScheduled` / `LocalActivityScheduled` event, stable across
+    /// every retry attempt, and the same id backing
+    /// [`ActivityContext::idempotency_key`].
+    ///
+    /// This is **not** the id the operator `retry-now` (issue #516) and
+    /// `fail-now` (issue #765) routes take — those address the task-queue row,
+    /// which is [`task_id`](Self::task_id).
+    pub activity_id: ActivityExecId,
+    /// 1-based attempt number for this logical invocation.
+    pub attempt: u32,
+    /// Configured maximum attempts (the retry policy's `max_attempts`, or `1`
+    /// when no policy is set).
+    pub max_attempts: u32,
+    /// `true` when this activity is running **inline** on the workflow worker
+    /// (an `#[activity(local = true)]` dispatch), `false` for a task-queue
+    /// dispatch.
+    pub is_local: bool,
+    /// The task queue this activity was dispatched on. For a local activity
+    /// this is the *owning workflow task's* queue, since a local activity has
+    /// no queue of its own. Empty for a bare [`ActivityContext::new_test`]
+    /// context that never went through the worker.
+    pub queue_name: String,
+    /// The `harvest_task_queue` row id.
+    ///
+    /// `None` for a local activity (which has no task-queue row), and also for
+    /// a bare [`ActivityContext::new_test`] context that never went through the
+    /// worker — so `None` does **not** imply local. Use
+    /// [`is_local`](Self::is_local) to distinguish the dispatch path.
+    ///
+    /// This is the id the operator routes
+    /// `POST /workflows/{id}/activities/{activity_exec_id}/retry-now` (issue
+    /// #516) and `.../fail-now` (issue #765) actually address — despite their
+    /// path segment's name, they look the row up by primary key. Log this
+    /// alongside [`activity_id`](Self::activity_id) if you want an operator to
+    /// be able to act on the activity, not merely find it.
+    ///
+    /// A raw [`uuid::Uuid`] (deliberately, unlike the newtyped
+    /// [`execution_id`](Self::execution_id) / [`activity_id`](Self::activity_id))
+    /// because the task-queue row PK is a bare `Uuid` throughout the storage
+    /// layer and no `TaskId` newtype exists to reach for. The `uuid` crate is
+    /// re-exported as `autumn_harvest::uuid`, so downstream code can always
+    /// name the exact type.
+    pub task_id: Option<uuid::Uuid>,
+}
+
+impl ActivityExecutionInfo {
+    /// The subset of these fields guaranteed stable across every retry attempt
+    /// (issue #783).
+    #[must_use]
+    pub fn identity(&self) -> ActivityIdentity {
+        ActivityIdentity {
+            execution_id: self.execution_id,
+            workflow_id: self.workflow_id.clone(),
+            workflow_type: self.workflow_type.clone(),
+            activity_type: self.activity_type.clone(),
+            activity_id: self.activity_id,
+        }
+    }
+}
+
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
@@ -11188,6 +12775,33 @@ pub struct ActivityContext {
     /// task row's `heartbeat_timeout`; `None` for test / local / no-flusher
     /// contexts unless [`Self::with_heartbeat_timeout`] is called.
     heartbeat_timeout: Option<std::time::Duration>,
+    /// Owning-run and dispatch identity for [`Self::info`] (issue #783).
+    ///
+    /// A **required** constructor argument rather than an optional builder: an
+    /// `Option` here would mean deleting a worker's wiring line still compiles
+    /// and still passes every test that only exercises a hand-built context.
+    /// Making it required turns an unwired dispatch path into a compile error.
+    identity: ActivityIdentity,
+    /// `true` when this activity runs inline on the workflow worker (issue
+    /// #783). Set by the constructor, not by the caller's identity, so it can
+    /// never disagree with the dispatch path that actually built the context.
+    is_local: bool,
+    /// The dispatch task queue (issue #783); the owning workflow task's queue
+    /// for a local activity.
+    queue_name: String,
+    /// The `harvest_task_queue` row id (issue #783). `None` for a local
+    /// activity, which has no task-queue row.
+    task_id: Option<uuid::Uuid>,
+    /// This attempt's absolute deadline (issue #783), or `None` when the
+    /// attempt is unbounded.
+    ///
+    /// Regular path: [`attempt_deadline`] of the task row's `started_at`,
+    /// `start_to_close`, and `schedule_to_close_at` — the earlier of the two
+    /// clocks the timeout scanners actually enforce. Local path:
+    /// `now + per_attempt_timeout`, recomputed on each retry (never `None` —
+    /// an unset local `start_to_close` resolves to
+    /// `WorkerConfig::max_local_activity_start_to_close`).
+    deadline: Option<DateTime<Utc>>,
     /// Shared last-heartbeat payload cell for the auto-heartbeat ticker
     /// (issue #682).
     ///
@@ -11261,6 +12875,7 @@ impl ActivityContext {
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
+        identity: ActivityIdentity,
     ) -> Self {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
@@ -11285,6 +12900,11 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            is_local: false,
+            queue_name: String::new(),
+            task_id: None,
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -11299,6 +12919,7 @@ impl ActivityContext {
         cancel: tokio_util::sync::CancellationToken,
         task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
+        identity: ActivityIdentity,
     ) -> Self {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
@@ -11330,6 +12951,13 @@ impl ActivityContext {
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            is_local: false,
+            queue_name: String::new(),
+            // The queue-row PK this attempt is running under — the id the
+            // operator `retry-now`/`fail-now` routes address (issue #783).
+            task_id: Some(task_id),
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload,
         }
@@ -11339,6 +12967,7 @@ impl ActivityContext {
     pub(crate) fn new_local_activity(
         state: SharedState,
         cancel: tokio_util::sync::CancellationToken,
+        identity: ActivityIdentity,
     ) -> Self {
         Self {
             state,
@@ -11359,6 +12988,13 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            // Set by the constructor, never by the caller's identity: this IS the
+            // inline dispatch path, so it can never disagree with reality.
+            is_local: true,
+            queue_name: String::new(),
+            task_id: None,
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -11515,6 +13151,123 @@ impl ActivityContext {
         self
     }
 
+    // ── Activity run metadata (issue #783) ────────────────────────────────
+    //
+    // The worker sets all of these at dispatch. They are `pub` (not
+    // `testing`-gated) because the worker itself is behind the `db` feature and
+    // could not otherwise call them — the same reason `with_attempt` /
+    // `with_max_attempts` are ungated. The *test constructor*
+    // ([`Self::new_test`]) is what carries the `testing` gate.
+
+    /// Override the owning workflow run's execution id (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub const fn with_execution_id(mut self, exec_id: ExecutionId) -> Self {
+        self.identity.execution_id = exec_id;
+        self
+    }
+
+    /// Override the owning run's business `workflow_id` (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.identity.workflow_id = workflow_id.into();
+        self
+    }
+
+    /// Override the owning run's logical workflow type (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_workflow_type(mut self, workflow_type: impl Into<String>) -> Self {
+        self.identity.workflow_type = workflow_type.into();
+        self
+    }
+
+    /// Override this activity's registered name (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_activity_type(mut self, activity_type: impl Into<String>) -> Self {
+        self.identity.activity_type = activity_type.into();
+        self
+    }
+
+    /// Override this logical invocation's activity execution id (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    ///
+    /// If a default idempotency key is already attached — as
+    /// [`new_test`](Self::new_test) attaches one — it is **re-derived from the
+    /// new id**, so [`info().activity_id`](Self::info) and
+    /// [`idempotency_key`](Self::idempotency_key) can never disagree. That is
+    /// the invariant production dispatch always upholds (both are built from
+    /// the same `activity_id`), and a test context that violated it would
+    /// exercise a shape the engine never produces. A context with no key
+    /// attached still has none — this never manufactures one.
+    ///
+    /// Call [`with_idempotency_key`](Self::with_idempotency_key) *after* this
+    /// if you need a key that is not derived from the id.
+    #[must_use]
+    pub fn with_activity_id(mut self, activity_id: ActivityExecId) -> Self {
+        self.identity.activity_id = activity_id;
+        if self.idempotency_key.is_some() {
+            self.idempotency_key = Some(IdempotencyKey::from_activity_exec_id(activity_id));
+        }
+        self
+    }
+
+    /// Set the dispatch task queue (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+        self.queue_name = queue_name.into();
+        self
+    }
+
+    /// Set the `harvest_task_queue` row id backing this dispatch (issue #783).
+    ///
+    /// `None` for a local activity, which has no task-queue row. Set
+    /// automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds only: panics on `Some(_)` for a local-activity context, a
+    /// state the worker never produces and which would make
+    /// [`task_id`](Self::task_id) advertise a queue row that does not exist.
+    #[must_use]
+    pub fn with_task_id(mut self, task_id: Option<uuid::Uuid>) -> Self {
+        debug_assert!(
+            !(self.is_local && task_id.is_some()),
+            "a local activity has no harvest_task_queue row; task_id must stay None"
+        );
+        self.task_id = task_id;
+        self
+    }
+
+    /// Set this attempt's absolute deadline (issue #783); `None` for an
+    /// unbounded attempt.
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests — for example to
+    /// exercise a deadline-aware checkpoint branch without waiting on a real
+    /// timeout.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// Attach the transactional state needed by [`Self::run_transactional`].
     ///
     /// Called by the worker after the `ActivityStarted` event is committed so
@@ -11638,6 +13391,226 @@ impl ActivityContext {
     #[must_use]
     pub const fn is_retrying(&self) -> bool {
         self.attempt() > 1
+    }
+
+    // ── Run metadata and deadline (issue #783) ─────────────────────────────
+
+    /// Snapshot of this activity attempt's run metadata.
+    ///
+    /// Bundles the owning workflow's identity (`execution_id`, `workflow_id`,
+    /// `workflow_type`), this activity's own identity (`activity_type`,
+    /// `activity_id`), and the per-attempt fields (`attempt`, `max_attempts`,
+    /// `is_local`, `queue_name`, `task_id`).
+    ///
+    /// The `execution_id` is exactly the `{exec_id}` path segment the
+    /// management API keys on, so a log line carrying it opens the owning run
+    /// with zero directory lookups:
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    ///
+    /// # fn example(ctx: &ActivityContext) {
+    /// let info = ctx.info();
+    /// tracing::info!(
+    ///     execution_id = %info.execution_id,
+    ///     workflow = %info.workflow_type,
+    ///     activity = %info.activity_type,
+    ///     attempt = info.attempt,
+    ///     "starting activity",
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// Every field is a plain copy of already-resolved dispatch state — reading
+    /// it performs no I/O, appends no event, and never blocks.
+    #[must_use]
+    pub fn info(&self) -> ActivityExecutionInfo {
+        ActivityExecutionInfo {
+            execution_id: self.identity.execution_id,
+            workflow_id: self.identity.workflow_id.clone(),
+            workflow_type: self.identity.workflow_type.clone(),
+            activity_type: self.identity.activity_type.clone(),
+            activity_id: self.identity.activity_id,
+            attempt: self.attempt(),
+            max_attempts: self.max_attempts(),
+            is_local: self.is_local,
+            queue_name: self.queue_name.clone(),
+            task_id: self.task_id,
+        }
+    }
+
+    /// The retry-stable subset of [`info`](Self::info) (issue #783).
+    ///
+    /// Identical on every attempt of the same logical invocation, so it is the
+    /// value to derive a downstream idempotency key from, to key a dedupe map
+    /// on, or to assert on in a retry-stability test. Cheaper than
+    /// `ctx.info().identity()`, which clones the shared strings twice.
+    #[must_use]
+    pub fn identity(&self) -> ActivityIdentity {
+        self.identity.clone()
+    }
+
+    /// Owning workflow execution id — the management-API `{exec_id}` path segment.
+    #[must_use]
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.identity.execution_id
+    }
+
+    /// Owning workflow's business id (the author-supplied `workflow_id`).
+    #[must_use]
+    pub fn workflow_id(&self) -> &str {
+        &self.identity.workflow_id
+    }
+
+    /// Owning workflow's registered type name.
+    #[must_use]
+    pub fn workflow_type(&self) -> &str {
+        &self.identity.workflow_type
+    }
+
+    /// This activity's registered type name.
+    #[must_use]
+    pub fn activity_type(&self) -> &str {
+        &self.identity.activity_type
+    }
+
+    /// This activity invocation's id (stable across retry attempts).
+    #[must_use]
+    pub const fn activity_id(&self) -> ActivityExecId {
+        self.identity.activity_id
+    }
+
+    /// `true` when this activity is running inline as a local activity.
+    ///
+    /// Local activities run on the workflow worker task and are never enqueued
+    /// to `harvest_task_queue`, so they have no [`task_id`](Self::task_id),
+    /// cannot heartbeat, and are bounded by
+    /// `WorkerConfig::max_local_activity_start_to_close`.
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        self.is_local
+    }
+
+    /// Task queue this activity was dispatched on.
+    ///
+    /// Local activities report the owning workflow's queue (they are never
+    /// dispatched to a queue of their own).
+    #[must_use]
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
+    }
+
+    /// `harvest_task_queue` row id for this attempt, when one exists.
+    ///
+    /// This is the id the operator routes address —
+    /// `POST /workflows/{exec_id}/activities/{task_id}/retry-now` and
+    /// `.../fail-now` — so logging it alongside
+    /// [`execution_id`](Self::execution_id) gives an operator a directly
+    /// actionable pair.
+    ///
+    /// `None` for a local activity (no queue row exists) *and* for a bare
+    /// [`new_test`](Self::new_test) context, so `None` does not imply local —
+    /// use [`is_local`](Self::is_local) for that.
+    #[must_use]
+    pub const fn task_id(&self) -> Option<uuid::Uuid> {
+        self.task_id
+    }
+
+    /// Wall-clock deadline for **this attempt**, when one is bounded.
+    ///
+    /// Resolves to the earliest of the attempt's `start_to_close` budget
+    /// (`started_at + start_to_close`) and the activity's cross-retry
+    /// `schedule_to_close` deadline, when either is set.  Returns `None` when
+    /// the attempt is genuinely unbounded.
+    ///
+    /// Taking the minimum matters: `schedule_to_close` enforcement (issue #378)
+    /// kills a `RUNNING` row, so reporting only the per-attempt budget would
+    /// over-report the time available and let an activity keep working right up
+    /// to a kill that discards everything.
+    ///
+    /// # Caveats
+    ///
+    /// * **The heartbeat clock is not included.** An activity configured with
+    ///   `heartbeat_timeout < start_to_close` can be killed by the heartbeat
+    ///   scanner before this instant; see [`attempt_deadline`] for why that
+    ///   clock cannot be frozen here, and
+    ///   [`heartbeat_timeout`](Self::heartbeat_timeout) to compute it yourself.
+    /// * **This is a claim-time snapshot.** Pausing and resuming the owning
+    ///   workflow shifts the stored `schedule_to_close` deadline *later* (the
+    ///   paused span is not charged), so a resumed attempt reports a value that
+    ///   is conservatively early rather than stale-late.
+    /// * **Local activities** take a minimum too, over a different pair: the
+    ///   clamped per-attempt budget (`now + ` the budget, bounded by
+    ///   `max_local_activity_start_to_close`) and the enclosing workflow-task
+    ///   budget (`WorkerConfig::workflow_task_timeout`, issue #494), whose
+    ///   absolute cut-off is threaded in from the dispatch that armed it. The
+    ///   enclosing clock starts at the top of the decision cycle, so time spent
+    ///   before the attempt — history load, an earlier command, a previous
+    ///   attempt of the same local activity — has already been consumed from
+    ///   it; clamping is what keeps a late attempt from claiming a budget that
+    ///   outlives the cycle.
+    ///
+    /// # Differs from the workflow-side sibling
+    ///
+    /// [`WorkflowContext::deadline`] reports the **nominal** run deadline
+    /// (`started_at + execution_timeout`), deliberately replay-stable and
+    /// therefore ignoring pause extensions. This one reports the **live
+    /// enforced** attempt deadline. They are not interchangeable.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.deadline
+    }
+
+    /// Time left before [`deadline`](Self::deadline), saturating at zero.
+    ///
+    /// Returns `None` when the attempt is unbounded.  Never returns a negative
+    /// duration — an already-elapsed deadline reports
+    /// `Some(Duration::ZERO)`, so callers can compare against a reserve
+    /// without special-casing overrun.
+    ///
+    /// For a queue-dispatched activity the deadline is anchored to a Postgres
+    /// `NOW()` (the claim timestamp) while `now` here is the worker host's
+    /// clock, so a host running behind the database over-reports by the skew.
+    /// Assumes NTP-synced hosts, as elsewhere in the engine; keep the reserve
+    /// passed to [`is_expiring_within`](Self::is_expiring_within) comfortably
+    /// above any skew you tolerate. Local activities read both sides from the
+    /// host clock and are unaffected.
+    ///
+    /// # Differs from the workflow-side sibling
+    ///
+    /// [`WorkflowContext::time_until_deadline`] returns a
+    /// [`chrono::Duration`] that goes **negative** past the deadline. This
+    /// returns a [`std::time::Duration`], which cannot be negative, so it
+    /// saturates instead — the right shape for a reserve comparison, but it
+    /// means `Some(Duration::ZERO)` cannot distinguish "exactly at the
+    /// deadline" from "ten minutes over". To measure overrun, subtract
+    /// directly: `ctx.deadline().map(|d| Utc::now() - d)`.
+    #[must_use]
+    pub fn time_remaining(&self) -> Option<std::time::Duration> {
+        time_remaining_from(self.deadline, Utc::now())
+    }
+
+    /// `true` when less than `reserve` remains before the attempt deadline.
+    ///
+    /// Always `false` for an unbounded attempt — the guard reads "we are close
+    /// to a deadline", and no deadline means we never are.  Prefer this over
+    /// comparing `time_remaining()` directly: `Option`'s ordering makes
+    /// `None < Some(_)`, so a naive `ctx.time_remaining() < Some(reserve)`
+    /// checkpoints *immediately* on an unbounded activity.
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example(ctx: &ActivityContext) {
+    /// if ctx.is_expiring_within(Duration::from_secs(10)) {
+    ///     // Flush a checkpoint and return early; the retry resumes from it.
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_expiring_within(&self, reserve: std::time::Duration) -> bool {
+        should_checkpoint(self.time_remaining(), reserve)
     }
 
     /// Access typed shared state.
@@ -11968,7 +13941,14 @@ impl ActivityContext {
     ///
     /// Returns [`HarvestError::ActivityCancelled`] when cancellation has been
     /// requested (regular activities only).  Returns [`Ok(())`] otherwise.
-    #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
+    // The `async` is load-bearing under `db` (it awaits the durable
+    // queue-row check below); without `db` the body has no `.await`, so both
+    // no-await lints fire. `unused_async_trait_impl` is clippy 1.98's new
+    // sibling of `unused_async` and needs its own name here.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub async fn check_cancellation(&self) -> crate::HarvestResult<()> {
         if self.cancel.is_cancelled() {
             return Err(HarvestError::ActivityCancelled(
@@ -12296,12 +14276,119 @@ impl ActivityContext {
     #[must_use]
     pub fn new_test() -> Self {
         let id = ActivityExecId::new();
+        // Reuse the same id for the identity so `info().activity_id` and the
+        // default idempotency key never disagree in an author's logs.
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
         Self::new(
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            identity,
         )
         .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but on the **local** dispatch path, so
+    /// a test can exercise the `is_local() == true` branch (issue #783).
+    ///
+    /// [`is_local`](Self::is_local) is constructor-set (never a builder), so
+    /// without this there is no way for downstream code to unit-test an
+    /// activity that branches on it — e.g. one that skips checkpointing because
+    /// a local activity cannot heartbeat. Reports `task_id() == None`, matching
+    /// the real inline dispatch.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_local() -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but wired to a heartbeat channel, so a
+    /// test can exercise an activity that checkpoints with
+    /// [`heartbeat`](Self::heartbeat) — the durable-progress half of the
+    /// deadline-aware pattern in `examples/activity_ctx_info.rs` (issue #783).
+    ///
+    /// Pair it with [`with_deadline`](Self::with_deadline) to drive
+    /// [`time_remaining`](Self::time_remaining) /
+    /// [`is_expiring_within`](Self::is_expiring_within) deterministically,
+    /// without a worker or a database.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_heartbeat(
+        heartbeat_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    ) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            empty_shared_state(),
+            Some(heartbeat_tx),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Seeds the resume snapshot a retry attempt would see, so a test can drive
+    /// the "resume from the last checkpoint" half of the deadline-aware pattern
+    /// without a worker or a database (issue #783).
+    ///
+    /// This is what the worker passes from `harvest_task_queue.heartbeat_details`
+    /// on a retry; [`heartbeat_details`](Self::heartbeat_details) reads it back.
+    /// It also seeds the auto-heartbeat re-send cell, exactly as the worker does
+    /// (issue #682), so a liveness ping preserves the resumed checkpoint rather
+    /// than clobbering it.
+    ///
+    /// This does **not** attach a flusher: reading the value back still requires
+    /// one, since a real retry attempt always has one. Build the context with
+    /// [`new_test_with_heartbeat`](Self::new_test_with_heartbeat) — a bare
+    /// [`new_test`](Self::new_test) context rejects every heartbeat call,
+    /// including [`heartbeat_details`](Self::heartbeat_details).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.heartbeat_details.clone_from(&details);
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
+        self
+    }
+
+    /// Like [`new_test`](Self::new_test) but with a caller-supplied identity, so
+    /// two contexts can share one logical invocation's identity while differing
+    /// in attempt number (issue #783).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_identity(identity: ActivityIdentity) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(key)
         .with_attempt(1)
         .with_max_attempts(1)
     }
@@ -12315,6 +14402,7 @@ impl ActivityContext {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
     }
 }
@@ -12327,7 +14415,7 @@ impl ActivityContext {
 mod tests {
     use super::*;
     use crate::error::TimeoutType;
-    use crate::types::ActivityExecId;
+    use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
 
@@ -13625,6 +15713,77 @@ mod tests {
         assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
     }
 
+    // ── Operator early-warning for history bloat (issue #704) ────────────────
+
+    #[test]
+    fn workflow_history_policy_bloat_warn_fraction_default_and_clamp() {
+        let default = WorkflowHistoryPolicy::default();
+        assert!(
+            (default.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON
+        );
+
+        // Clamped to [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION] -- deliberately
+        // NOT the full [0.0, 1.0] `continue_as_new_deadline_fraction` uses;
+        // see MAX_HISTORY_BLOAT_WARN_FRACTION's doc comment (PR #1139 P2).
+        let over = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.5);
+        assert!(
+            (over.history_bloat_warn_fraction() - MAX_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON
+        );
+        assert!(over.history_bloat_warn_fraction() < 1.0);
+        // Exactly 1.0 must ALSO clamp down -- it is the specific value that
+        // silently disables the signal if let through (see the constant's
+        // doc comment).
+        let exactly_one = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.0);
+        assert!(exactly_one.history_bloat_warn_fraction() < 1.0);
+        let under = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(-0.5);
+        assert!(under.history_bloat_warn_fraction().abs() < f64::EPSILON);
+        let mid = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(0.5);
+        assert!((mid.history_bloat_warn_fraction() - 0.5).abs() < f64::EPSILON);
+
+        // 0.0 is a valid, intentional value meaning "disabled" (AC4) — the
+        // crossing-detection logic (tested separately) must treat it as a
+        // no-op rather than a threshold of zero events.
+        let disabled = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(0.0);
+        assert!(disabled.history_bloat_warn_fraction().abs() < f64::EPSILON);
+    }
+
+    /// PR #1139 review, second pass, finding A: `f64::clamp` leaves `NAN`
+    /// untouched (both of its internal comparisons against `NAN` are
+    /// `false`), so a `NAN` input must be explicitly normalized rather than
+    /// relying on the clamp -- otherwise a stored `NAN` fraction makes
+    /// `history_bloat_threshold_crossed`'s `(cap as f64 * NAN) as u64` cast
+    /// to `0`, tripping the soft threshold on the very first suspended cycle
+    /// of every execution regardless of its actual history size.
+    #[test]
+    fn workflow_history_policy_bloat_warn_fraction_normalizes_nan() {
+        let nan_input = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(f64::NAN);
+        assert!(
+            !nan_input.history_bloat_warn_fraction().is_nan(),
+            "a NAN input must never be stored as NAN"
+        );
+        assert!(
+            (nan_input.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON,
+            "a NAN input must normalize to the documented default, not to 0.0 \
+             (which would silently and indistinguishably behave like the \
+             intentional \"disabled\" value)"
+        );
+
+        // The negative-NaN bit pattern must be treated identically -- IEEE
+        // 754 has multiple NaN bit patterns, and `is_nan()` must catch all of
+        // them, not just the canonical one.
+        let neg_nan_input =
+            WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(-f64::NAN);
+        assert!(!neg_nan_input.history_bloat_warn_fraction().is_nan());
+        assert!(
+            (neg_nan_input.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
     // ── Cross-version replay tolerance (issue #772 / #603, Finding 1) ────────
 
     /// Finding 1: an in-flight execution recorded under a pre-#772 binary has
@@ -13873,10 +16032,229 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
                 assert_eq!(input, &payload);
+                assert!(
+                    new_workflow_type.is_none(),
+                    "the legacy same-type call must record no target type (issue #803 AC1)"
+                );
             }
             other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ─────────────────────────
+
+    /// Drive a never-resolving continue-as-new future far enough to queue its
+    /// command, then hand back whatever was drained.
+    async fn drain_parked_continue_as_new(
+        ctx: &WorkflowContext,
+        fut: impl std::future::Future<Output = HarvestResult<()>>,
+    ) -> Vec<WorkflowCommand> {
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        ctx.drain_commands()
+    }
+
+    /// AC1/AC2: the untyped cross-type call records the named target type.
+    #[tokio::test]
+    async fn continue_as_new_as_type_records_the_target_type() {
+        let ctx = WorkflowContext::new_test();
+        let payload = serde_json::json!({"tier": "paid"});
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC1: the typed entry point takes the target name from the
+    /// `#[workflow]`-generated `WorkflowInfo` and serializes the input.
+    #[tokio::test]
+    async fn continue_as_new_as_takes_the_type_from_workflow_info() {
+        let ctx = WorkflowContext::new_test();
+        let info = crate::info::WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: "paid_subscription",
+            module: "app::phases",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        };
+
+        let drained =
+            drain_parked_continue_as_new(&ctx, ctx.continue_as_new_as(&info, vec![1_u8, 2])).await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &serde_json::json!([1, 2]));
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// **Presence decides** (documented rule): naming the *current* type is
+    /// still a cross-type request, so it is recorded rather than normalized
+    /// away — the author explicitly asked for that type's declared defaults.
+    #[tokio::test]
+    async fn continue_as_new_as_type_naming_the_current_type_is_still_recorded() {
+        let ctx = WorkflowContext::new_test();
+        let own = ctx.workflow_type().to_string();
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type(&own, serde_json::json!({})),
+        )
+        .await;
+
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                new_workflow_type, ..
+            } => assert_eq!(new_workflow_type.as_deref(), Some(own.as_str())),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: replaying a recorded cross-type history re-emits the same target
+    /// type, and the future still never resolves.
+    #[tokio::test]
+    async fn continue_as_new_as_type_replays_the_recorded_target_type() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: redirecting a recorded continuation to a different type is
+    /// non-determinism, not a silent re-route.
+    #[tokio::test]
+    async fn continue_as_new_target_type_change_is_nondeterministic() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        // Bounded deliberately: if the type guard ever regresses, the call
+        // resolves `Matched` and parks forever (`park_until_dropped`), which
+        // would turn a regression into a multi-hour CI timeout instead of a
+        // red test. The sibling `drain_parked_continue_as_new` helper exists
+        // for the same reason.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.continue_as_new_as_type("churned", payload),
+        )
+        .await
+        .expect("a redirected target must diverge, not park forever")
+        .expect_err("a redirected target type must be non-deterministic");
+        assert!(
+            matches!(err, HarvestError::NonDeterministic { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a divergence must queue no command"
+        );
+    }
+
+    /// The payload-cap rejection names the run the input is destined for —
+    /// the *target* type on a cross-type continuation.
+    #[tokio::test]
+    async fn continue_as_new_as_type_payload_cap_names_the_target_type() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
+        let big = serde_json::json!({"blob": "x".repeat(256)});
+
+        let err = ctx
+            .continue_as_new_as_type("paid_subscription", big)
+            .await
+            .expect_err("an oversized input must be rejected");
+        match err {
+            HarvestError::PayloadTooLarge { workflow_type, .. } => {
+                assert_eq!(workflow_type, "paid_subscription");
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
 
@@ -13894,6 +16272,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: payload.clone(),
+                new_workflow_type: None,
             },
         ];
 
@@ -13908,7 +16287,7 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => assert_eq!(input, &payload),
+            WorkflowCommand::ContinueAsNew { input, .. } => assert_eq!(input, &payload),
             other => panic!("expected ContinueAsNew, got {other:?}"),
         }
         assert!(!ctx.is_replaying());
@@ -13956,6 +16335,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::json!({"cycle": 3}),
+                new_workflow_type: None,
             },
         ];
 
@@ -14053,6 +16433,7 @@ mod tests {
         let ctx = ActivityContext::new_local_activity(
             empty_shared_state(),
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         );
 
         let result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
@@ -14068,6 +16449,7 @@ mod tests {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         );
 
         let heartbeat_result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
@@ -14085,7 +16467,12 @@ mod tests {
     async fn activity_context_heartbeat_sends_on_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         // Send a couple of heartbeats with different payloads.
         ctx.heartbeat(serde_json::json!({"progress": 50}))
@@ -14107,7 +16494,12 @@ mod tests {
     async fn activity_context_detects_cancellation() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
 
         // Before cancellation -- should not be cancelled.
         assert!(!ctx.is_cancelled());
@@ -14129,7 +16521,12 @@ mod tests {
     async fn activity_check_cancellation_returns_ok_when_not_cancelled() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
         assert!(ctx.check_cancellation().await.is_ok());
     }
 
@@ -14137,7 +16534,12 @@ mod tests {
     async fn activity_check_cancellation_returns_activity_cancelled_when_token_set() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
         cancel.cancel();
         let result = ctx.check_cancellation().await;
         assert!(
@@ -14159,8 +16561,13 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel.clone())
-            .with_heartbeat_timeout(timeout);
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        )
+        .with_heartbeat_timeout(timeout);
         (ctx, rx, cancel)
     }
 
@@ -14393,6 +16800,7 @@ mod tests {
             cancel,
             uuid::Uuid::new_v4(),
             pool,
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
 
@@ -14420,7 +16828,12 @@ mod tests {
         // rather than silently spawning a ticker whose pings are never checked.
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         assert!(
             matches!(
@@ -14445,6 +16858,7 @@ mod tests {
         let ctx = ActivityContext::new_local_activity(
             empty_shared_state(),
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
 
@@ -14468,6 +16882,7 @@ mod tests {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
         assert!(
@@ -14484,7 +16899,12 @@ mod tests {
         // Local activities have no heartbeat channel; check_cancellation must
         // still detect token cancellation correctly.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), None, cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            None,
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
         assert!(ctx.check_cancellation().await.is_ok());
         cancel.cancel();
         let result = ctx.check_cancellation().await;
@@ -14515,7 +16935,12 @@ mod tests {
     async fn activity_context_heartbeat_errors_when_channel_closed() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         // Drop the receiver -- channel is now closed.
         drop(rx);
@@ -16086,6 +18511,781 @@ mod tests {
         assert!(ctx.take_deferred_nd_error().is_none());
     }
 
+    // ── timer_business_days (issue #806) ──────────────────────────────────
+
+    /// A live context frozen at `anchor`, carrying `cals` in shared state.
+    ///
+    /// The `WorkflowStarted` timestamp seeds `start_time`, and
+    /// `with_advancing_timer_clock` makes `business_day_anchor()` read that
+    /// virtual clock instead of the real wall clock — so every business-day
+    /// test is hermetic across all seven weekdays (issue #806 R6).
+    #[cfg(test)]
+    fn bd_ctx(anchor: DateTime<Utc>, cals: crate::calendar::BusinessCalendars) -> WorkflowContext {
+        bd_ctx_with_events(anchor, cals, vec![])
+    }
+
+    #[cfg(test)]
+    fn bd_ctx_with_events(
+        anchor: DateTime<Utc>,
+        cals: crate::calendar::BusinessCalendars,
+        mut tail: Vec<WorkflowEvent>,
+    ) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: anchor,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.append(&mut tail);
+        let mut map: SharedStateMap = HashMap::new();
+        map.insert(
+            std::any::TypeId::of::<crate::calendar::BusinessCalendars>(),
+            Box::new(cals),
+        );
+        WorkflowContext::for_replay_with_state(ExecutionId::new(), events, std::sync::Arc::new(map))
+            .with_advancing_timer_clock()
+    }
+
+    #[cfg(test)]
+    fn bd_utc(s: &str) -> DateTime<Utc> {
+        s.parse::<DateTime<Utc>>().expect("valid RFC 3339 instant")
+    }
+
+    #[cfg(test)]
+    fn bd_poll_pending<T>(fut: impl std::future::Future<Output = HarvestResult<T>>) {
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "the call must suspend on its durable timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_reused_id_second_call_is_still_a_prologue_error() {
+        // REVIEW P2 (replay): the prologue's "is a snapshot registered?" guard
+        // was skipped whenever ANY freeze under this name already existed in
+        // history -- a GLOBAL name scan. But `side_effect` matches
+        // POSITIONALLY, so in the documented poll-loop idiom
+        //
+        //     loop { ctx.timer_business_days("poll", 1, cal).await?; ... }
+        //
+        // iteration 2+ is a FRESH dispatch that the scan nonetheless reported as
+        // already-frozen. On a worker without the snapshot it therefore fell
+        // through to the freeze with `holidays: None`, DURABLY recording an
+        // `UnknownCalendar` rejection that replays forever and needs a workflow
+        // reset -- precisely the permanent poisoning the guard exists to
+        // prevent, and the opposite of the retryable prologue error iteration 1
+        // would have produced.
+        //
+        // Build iteration 1's real recorded history WITH a snapshot, then
+        // re-drive it WITHOUT one.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let warm = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(warm.timer_business_days("poll", 1, "biz"));
+        let freeze_name = match &warm.drain_commands()[0] {
+            WorkflowCommand::RecordSideEffect { name: Some(n), .. } => n.clone(),
+            other => panic!("expected a freeze command, got {other:?}"),
+        };
+
+        // History as iteration 1 left it: freeze + armed timer + fired timer.
+        let recorded = vec![
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(freeze_name),
+                value: serde_json::to_value(FrozenBusinessDay::resolved(
+                    bd_utc("2026-07-02T09:00:00Z"),
+                    "biz".into(),
+                    &crate::calendar::BusinessDayResolution {
+                        deadline: bd_utc("2026-07-03T09:00:00Z"),
+                        skipped: vec![],
+                    },
+                    None,
+                ))
+                .expect("serializes"),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("poll"),
+                duration_secs: 86_400,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("poll"),
+            },
+        ];
+
+        // A worker that does NOT hold the snapshot (heterogeneous fleet
+        // mid-deploy, or the DB-loaded-snapshot path).
+        let ctx = WorkflowContext::for_replay_with_state(
+            ExecutionId::new(),
+            {
+                let mut ev = vec![WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: bd_utc("2026-07-02T09:00:00Z"),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                }];
+                ev.extend(recorded);
+                ev
+            },
+            std::sync::Arc::new(HashMap::new()),
+        )
+        .with_advancing_timer_clock();
+
+        // Iteration 1 replays from the frozen record -- no snapshot needed.
+        ctx.timer_business_days("poll", 1, "biz")
+            .await
+            .expect("iteration 1 must replay from its frozen record");
+
+        // Iteration 2 is a FRESH dispatch on a worker without the snapshot. It
+        // must FREEZE an UnknownCalendar outcome, because "is this calendar
+        // available here?" is worker-local deployment state: returning early
+        // would make the recording worker and a corrected worker take different
+        // branches, which is the divergence Codex's P1 identified.
+        let err = ctx
+            .timer_business_days("poll", 1, "biz")
+            .await
+            .expect_err("iteration 2 is a fresh dispatch with no snapshot");
+        assert!(
+            matches!(&err, HarvestError::NotFound(m) if m.contains("biz")),
+            "an unavailable calendar must surface as the frozen NotFound naming \
+             the calendar; got {err:?}"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect { name: Some(n), .. }
+                    if n == "__harvest_business_day:2:poll"
+            )),
+            "iteration 2 must FREEZE under its OWN sequence number (2) so the \
+             replayed outcome is stable on every worker; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_business_days_live_records_one_freeze_then_timer() {
+        // Thursday 2026-07-02T09:00Z + 2 business days = Monday 2026-07-06T09:00Z
+        // (Sat 07-04 / Sun 07-05 stepped over) = 4 calendar days = 345_600s.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            2,
+            "exactly ONE freeze + ONE timer -- no separate Now capture: {cmds:?}"
+        );
+        assert!(
+            matches!(
+                &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Custom,
+                    name: Some(n),
+                    ..
+                } if n == "__harvest_business_day:1:t1"
+            ),
+            "first command must be the single business-day freeze, got {cmds:?}"
+        );
+        let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = &cmds[1]
+        else {
+            panic!("second command must be StartTimer, got {cmds:?}");
+        };
+        assert_eq!(timer_id.as_str(), "t1");
+        assert_eq!(*duration_secs, 4 * 86_400, "Thu 09:00Z -> Mon 09:00Z");
+    }
+
+    #[tokio::test]
+    async fn timer_business_days_skips_a_holiday() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar(
+            "biz",
+            [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid")],
+        );
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs,
+            5 * 86_400,
+            "Mon 07-06 is a holiday -> Tue 07-07"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_days_from_now_records_only_the_freeze() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        let deadline = ctx
+            .business_days_from_now("d1", 2, "biz")
+            .expect("resolves");
+        assert_eq!(deadline, bd_utc("2026-07-06T09:00:00Z"));
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "no timer is armed: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::RecordSideEffect {
+                kind: SideEffectKind::Custom,
+                name: Some(n),
+                ..
+            } if n == "__harvest_business_day:1:d1"
+        ));
+    }
+
+    // ── Deployment-dependent outcomes are FROZEN (issue #806, Codex P1) ───
+
+    #[tokio::test]
+    async fn business_day_missing_calendars_freezes_unknown_calendar() {
+        // No BusinessCalendars in shared state. "Is this calendar available on
+        // this worker?" is worker-local deployment state, so the outcome MUST be
+        // frozen: an early return would let the recording worker and a corrected
+        // worker take different branches, diverging on replay.
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(&err, HarvestError::NotFound(m) if m.contains("biz")),
+            "expected the frozen NotFound naming the calendar, got {err:?}"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Custom,
+                    name: Some(n),
+                    ..
+                } if n == "__harvest_business_day:1:t1"
+            )),
+            "a deployment-dependent outcome must be FROZEN so every later replay \
+             reproduces it verbatim; got {cmds:?}"
+        );
+    }
+
+    /// The Codex P1 regression (issue #806): a workflow that CATCHES the
+    /// unavailable-calendar error and records something afterwards must still
+    /// replay cleanly once the operator registers the calendar.
+    ///
+    /// Falsifiable by construction. Deploy A records
+    /// `[WorkflowStarted, <freeze>, TimerStarted(fallback)]`. Deploy B replays
+    /// with the calendar now registered; if the outcome were NOT frozen, the
+    /// freeze would be emitted where history holds `TimerStarted` and this call
+    /// would return `NonDeterministic` instead of the caught error.
+    #[tokio::test]
+    async fn business_day_caught_unavailable_calendar_replays_after_the_fix() {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+
+        // ── Deploy A: the calendar is not registered. ──
+        let deploy_a = WorkflowContext::new_test();
+        let err = deploy_a
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("deploy A has no calendar");
+        assert!(matches!(&err, HarvestError::NotFound(_)));
+        // The workflow catches it and arms a fallback timer instead.
+        let mut recorded: Vec<WorkflowEvent> = deploy_a
+            .drain_commands()
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    Some(WorkflowEvent::SideEffectRecorded {
+                        kind: *kind,
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded.len(), 1, "deploy A must have frozen the outcome");
+        recorded.push(WorkflowEvent::TimerStarted {
+            timer_id: crate::types::TimerId::new("fallback"),
+            duration_secs: 3600,
+        });
+
+        // ── Deploy B: the operator registered the calendar. ──
+        let deploy_b = bd_ctx_with_events(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("biz", []),
+            recorded,
+        );
+        let replayed = deploy_b
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("the frozen outcome must replay verbatim");
+        assert!(
+            matches!(&replayed, HarvestError::NotFound(m) if m.contains("biz")),
+            "replay must reproduce the CAUGHT error, not diverge; got {replayed:?}"
+        );
+        assert!(
+            !matches!(&replayed, HarvestError::NonDeterministic { .. }),
+            "the whole point: a corrected deployment must not nd-block this run"
+        );
+        // And the fallback timer still matches at its recorded position.
+        bd_poll_pending(deploy_b.timer("fallback", 3600));
+    }
+
+    #[tokio::test]
+    async fn business_day_namespace_collision_records_no_command() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        // Arm a cancellable timer on the same id first (issue #768 namespace).
+        let _handle = ctx.start_timer("t1", 60);
+        let before = ctx.drain_commands().len();
+        assert_eq!(before, 1, "start_timer records its own arm command");
+
+        let err = ctx
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("must reject the cross-API id collision");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("distinct timer ids")),
+            "expected the cross-API collision Config error, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "the collision check must be HOISTED ABOVE the freeze -- otherwise a \
+             collision records an orphaned SideEffectRecorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_invalid_n_records_no_command() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let err = ctx
+            .timer_business_days("t1", u32::MAX, "biz")
+            .await
+            .expect_err("must reject an out-of-range n");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("MAX_BUSINESS_DAYS")),
+            "expected a Config error naming the bound, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "an out-of-range n must record nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_failure_path_pushes_zero_start_timer_commands() {
+        // The other half of the "never silently fire now" pair: a regression
+        // that mapped a rejection to Ok(0) would still pass
+        // `n_zero_on_business_day_yields_duration_zero`, but fails here.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar_covering(
+            "biz",
+            [],
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid"),
+        );
+        for (label, id, n, cal) in [
+            ("missing calendar name", "a", 2_u32, "typo"),
+            ("coverage exhausted", "b", 5, "biz"),
+            ("n out of range", "c", u32::MAX, "biz"),
+        ] {
+            let ctx = bd_ctx(
+                bd_utc("2026-07-02T09:00:00Z"),
+                crate::calendar::BusinessCalendars::clone(&cals),
+            );
+            let res = ctx.timer_business_days(id, n, cal).await;
+            assert!(res.is_err(), "{label} must be an Err, never Ok");
+            let start_timers = ctx
+                .drain_commands()
+                .into_iter()
+                .filter(|c| matches!(c, WorkflowCommand::StartTimer { .. }))
+                .count();
+            assert_eq!(
+                start_timers, 0,
+                "{label} must never arm a timer (a zero-duration timer would \
+                 escalate IMMEDIATELY instead of at the business deadline)"
+            );
+        }
+    }
+
+    // ── Frozen rejections replay identically (issue #806) ─────────────────
+
+    /// Drive once against `cals`, capture the recorded freeze, then re-drive the
+    /// recorded history against `corrected` and return both errors.
+    #[cfg(test)]
+    async fn bd_frozen_rejection_round_trip(
+        cals: crate::calendar::BusinessCalendars,
+        corrected: crate::calendar::BusinessCalendars,
+        n: u32,
+        calendar: &str,
+    ) -> (HarvestError, HarvestError) {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let ctx = bd_ctx(anchor, cals);
+        let first = ctx
+            .timer_business_days("t1", n, calendar)
+            .await
+            .expect_err("first drive must reject");
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::RecordSideEffect { kind, name, value } = &cmds[0] else {
+            panic!("expected the rejection to be FROZEN as a side effect, got {cmds:?}");
+        };
+        let recorded = WorkflowEvent::SideEffectRecorded {
+            kind: *kind,
+            name: name.clone(),
+            value: value.clone(),
+        };
+
+        // Re-drive with a calendar that WOULD resolve successfully.
+        let replay = bd_ctx_with_events(anchor, corrected, vec![recorded]);
+        let second = replay
+            .timer_business_days("t1", n, calendar)
+            .await
+            .expect_err("the frozen rejection must replay identically");
+        (first, second)
+    }
+
+    /// An unknown calendar NAME is a **prologue** error, not a frozen one: it is
+    /// the same class of deployment misconfiguration as registering no snapshot
+    /// at all (a typo, or a worker built from a partial registration), so it
+    /// records nothing and a redeploy that fixes the name lets the call succeed.
+    ///
+    /// Freezing it instead would durably poison every in-flight execution and
+    /// force a per-execution workflow reset even after the operator corrected
+    /// the registration (issue #806 review).
+    #[tokio::test]
+    async fn business_day_unknown_calendar_is_frozen_not_returned_early() {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let ctx = bd_ctx(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("biz", []),
+        );
+        let err = ctx
+            .timer_business_days("t1", 2, "typo")
+            .await
+            .expect_err("an unknown calendar must reject");
+        assert!(
+            matches!(&err, HarvestError::NotFound(m) if m.contains("typo")),
+            "unknown calendar must be a typed NotFound naming the requested \
+             calendar, got {err:?}"
+        );
+        // The message must NOT enumerate the worker's registered calendars: that
+        // set is worker-local, so baking it into a FROZEN outcome would make the
+        // replayed message differ between workers.
+        assert!(
+            !format!("{err}").contains("biz"),
+            "the frozen message must not carry worker-local registered names: {err}"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect { name: Some(n), .. }
+                    if n == "__harvest_business_day:1:t1"
+            )),
+            "a typo'd calendar name is worker-local deployment state, so it must \
+             be FROZEN rather than returned early; got {cmds:?}"
+        );
+
+        // A NEW execution started after the registration is fixed resolves
+        // normally — only runs that already froze the outcome need a reset.
+        let fixed = bd_ctx(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("typo", []),
+        );
+        bd_poll_pending(fixed.timer_business_days("t1", 2, "typo"));
+        let cmds = fixed.drain_commands();
+        assert!(
+            matches!(cmds.first(), Some(WorkflowCommand::RecordSideEffect { .. })),
+            "a fresh execution must freeze a real resolution, got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_coverage_exhausted_is_frozen_rejection() {
+        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let (first, second) = bd_frozen_rejection_round_trip(
+            crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon),
+            // The corrected snapshot extends coverage well past the deadline.
+            crate::calendar::BusinessCalendars::new().with_calendar_covering(
+                "biz",
+                [],
+                chrono::NaiveDate::from_ymd_opt(2027, 12, 31).expect("valid"),
+            ),
+            5,
+            "biz",
+        )
+        .await;
+        assert!(
+            matches!(&first, HarvestError::Config(m) if m.contains("2026-07-03")),
+            "coverage exhaustion must name the horizon, got {first:?}"
+        );
+        assert_eq!(
+            first.to_string(),
+            second.to_string(),
+            "extending the calendar must NOT retroactively resolve a frozen rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_error_variants_for_prologue_vs_frozen() {
+        // A future consolidation that collapsed these onto one variant would
+        // silently change which failures are frozen vs returned early.
+
+        // Prologue: `n` over the cap is a pure function of the ARGUMENT, so it
+        // fires identically everywhere -> Config, zero commands.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let prologue = ctx
+            .timer_business_days("t1", crate::calendar::MAX_BUSINESS_DAYS + 1, "biz")
+            .await
+            .expect_err("prologue");
+        assert!(
+            matches!(prologue, HarvestError::Config(_)),
+            "prologue (n over cap, deterministic) => Config"
+        );
+        assert!(ctx.drain_commands().is_empty(), "prologue records nothing");
+
+        // Frozen: no snapshot at all is WORKER-LOCAL state -> NotFound, recorded.
+        let ctx = WorkflowContext::new_test();
+        let absent = ctx
+            .timer_business_days("t2", 2, "biz")
+            .await
+            .expect_err("snapshot absent");
+        assert!(
+            matches!(absent, HarvestError::NotFound(_)),
+            "frozen (calendar unavailable) => NotFound"
+        );
+        assert!(
+            !ctx.drain_commands().is_empty(),
+            "an unavailable calendar MUST be frozen, not returned early"
+        );
+
+        // Frozen: snapshot present but the NAME is absent -> same class.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let unknown = ctx
+            .timer_business_days("t3", 2, "nope")
+            .await
+            .expect_err("unknown calendar name");
+        assert!(
+            matches!(unknown, HarvestError::NotFound(_)),
+            "frozen (unknown calendar NAME) => NotFound"
+        );
+        assert!(
+            !ctx.drain_commands().is_empty(),
+            "an unknown calendar name is worker-local state, so it MUST be frozen"
+        );
+
+        // Frozen: coverage exhausted -> Config, and it IS recorded.
+        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let cals =
+            crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let frozen = ctx
+            .timer_business_days("t3", 5, "biz")
+            .await
+            .expect_err("coverage exhausted");
+        assert!(
+            matches!(frozen, HarvestError::Config(_)),
+            "frozen (coverage exhausted, needs a reset) => Config"
+        );
+        assert!(
+            matches!(
+                ctx.drain_commands().first(),
+                Some(WorkflowCommand::RecordSideEffect { .. })
+            ),
+            "a coverage rejection MUST be frozen so a catching workflow replays \
+             the same branch"
+        );
+    }
+
+    // ── Semantics + boundary pins (issue #806) ────────────────────────────
+
+    #[tokio::test]
+    async fn n_zero_on_business_day_yields_duration_zero() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 0, "biz"));
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs, 0,
+            "n = 0 on a business instant fires at the anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn n_zero_on_a_weekend_rolls_forward_to_monday() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        // Saturday 2026-07-04.
+        let ctx = bd_ctx(bd_utc("2026-07-04T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 0, "biz"));
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs,
+            2 * 86_400,
+            "Sat -> Mon, never 'one day later'"
+        );
+    }
+
+    #[tokio::test]
+    async fn utc_midnight_boundary_anchor_shifts_a_business_day() {
+        // KNOWN LIMITATION pin (issue #806): business days are counted on UTC
+        // dates, so two anchors two seconds apart across UTC midnight resolve
+        // one business day apart. Documented, not fixed -- a per-call timezone
+        // is a named follow-up. This test exists so the limitation cannot
+        // silently change without someone noticing.
+        let mk = |anchor: &str| {
+            let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+            let ctx = bd_ctx(bd_utc(anchor), cals);
+            let deadline = ctx.business_days_from_now("d", 1, "biz").expect("resolves");
+            deadline.date_naive()
+        };
+        // Friday 23:59:59Z -> +1 business day = Monday.
+        assert_eq!(
+            mk("2026-07-03T23:59:59Z"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid"),
+        );
+        // Two seconds later it is Saturday in UTC -> +1 business day = Tuesday.
+        assert_eq!(
+            mk("2026-07-04T00:00:01Z"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 7).expect("valid"),
+        );
+
+        // The SHARPER form of the same limitation: `n = 0`'s roll-forward can be
+        // entirely SUPPRESSED for a deployment east of UTC. Sat 2026-07-04 08:00
+        // in UTC+10 is Fri 2026-07-03 22:00 UTC -- a UTC business day -- so
+        // `n = 0` fires immediately even though it is locally a Saturday, rather
+        // than rolling forward to the local Monday.
+        let mk0 = |anchor: &str| {
+            let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+            let ctx = bd_ctx(bd_utc(anchor), cals);
+            ctx.business_days_from_now("d", 0, "biz").expect("resolves")
+        };
+        let local_saturday_in_utc_plus_10 = bd_utc("2026-07-03T22:00:00Z");
+        assert_eq!(
+            mk0("2026-07-03T22:00:00Z"),
+            local_saturday_in_utc_plus_10,
+            "n = 0 fires at the anchor because the UTC date is Friday -- the \
+             local-Saturday roll-forward is suppressed (known limitation)"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_history_event_types_are_exact() {
+        // AC: no new WorkflowEvent variant. The live command sequence maps onto
+        // exactly the two EXISTING event types.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+        let kinds: Vec<&'static str> = ctx
+            .drain_commands()
+            .iter()
+            .map(|c| match c {
+                WorkflowCommand::RecordSideEffect { .. } => "SideEffectRecorded",
+                WorkflowCommand::StartTimer { .. } => "TimerStarted",
+                other => panic!("unexpected command {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["SideEffectRecorded", "TimerStarted"]);
+    }
+
+    #[test]
+    fn frozen_business_day_payload_round_trips() {
+        // R11: the frozen payload carries a `v` schema tag so it can evolve
+        // without breaking already-recorded histories.
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let res = crate::calendar::BusinessDayResolution {
+            deadline: bd_utc("2026-07-06T09:00:00Z"),
+            skipped: vec![chrono::NaiveDate::from_ymd_opt(2026, 7, 4).expect("valid")],
+        };
+        for original in [
+            FrozenBusinessDay::resolved(anchor, "biz".into(), &res, None),
+            FrozenBusinessDay::unknown_calendar(anchor, "biz".into()),
+            FrozenBusinessDay::rejected(
+                anchor,
+                "biz".into(),
+                crate::calendar::BusinessDayRejection::ScanExhausted { scanned_days: 21 },
+            ),
+        ] {
+            let json = serde_json::to_value(&original).expect("serializes");
+            assert_eq!(json["v"], 1, "schema version tag is present: {json}");
+            let back: FrozenBusinessDay = serde_json::from_value(json).expect("round-trips");
+            assert_eq!(back, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn freeze_completes_well_under_suspension_timeout_at_max_n() {
+        // R10: the executor gives a decision cycle a 100 ms budget. The scan is
+        // bounded and uses BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
+        let holidays: Vec<chrono::NaiveDate> = (0..400)
+            .filter_map(|i| {
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
+            })
+            .collect();
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", holidays);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let start = std::time::Instant::now();
+        let out = ctx.business_days_from_now("d", crate::calendar::MAX_BUSINESS_DAYS, "biz");
+        let elapsed = start.elapsed();
+        // Assert the outcome, not just the timing: discarding the Result would
+        // let the scan bail out immediately with an error and still "pass".
+        // With no declared coverage horizon the resolution must SUCCEED, and it
+        // must land past the 400 blocked days.
+        let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
+        assert!(
+            deadline > bd_utc("2027-02-05T00:00:00Z"),
+            "MAX_BUSINESS_DAYS (~14 years) must land far in the future, got {deadline}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "the bounded scan must stay far under the 100 ms suspension budget, took {elapsed:?}"
+        );
+    }
+
+    /// The `MAX_BUSINESS_DAYS` boundary: exactly the cap is accepted, one past
+    /// it is a prologue rejection with **zero** commands recorded.
+    #[test]
+    fn max_business_days_boundary_accepts_cap_and_rejects_cap_plus_one() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let at_cap = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals.clone());
+        assert!(
+            at_cap
+                .business_days_from_now("ok", crate::calendar::MAX_BUSINESS_DAYS, "biz")
+                .is_ok(),
+            "exactly MAX_BUSINESS_DAYS must be accepted"
+        );
+
+        let over = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let err = over
+            .business_days_from_now("bad", crate::calendar::MAX_BUSINESS_DAYS + 1, "biz")
+            .expect_err("one past the cap must be rejected");
+        assert!(
+            matches!(err, HarvestError::Config(ref m) if m.contains("MAX_BUSINESS_DAYS")),
+            "the over-cap rejection must name the bound, got: {err}"
+        );
+        assert!(
+            over.drain_commands().is_empty(),
+            "an over-cap rejection is a PROLOGUE error: it must record no commands"
+        );
+    }
+
     #[test]
     fn new_uuid_is_v7_and_captured() {
         let ctx = WorkflowContext::new_test();
@@ -16670,6 +19870,148 @@ mod tests {
             result.unwrap_err(),
             HarvestError::NonDeterministic { .. }
         ));
+    }
+
+    /// AC4 (issue #697): a child spawned by a pinned parent must inherit the
+    /// parent's shard, so data residency is transitive across the whole
+    /// workflow tree. The `ExecutionId` carries the shard in its first two
+    /// bytes, so an `ExecutionId::new()` (UNENCODED sentinel) child would be
+    /// routed to the deployment's *default* shard by every id-based lookup
+    /// even though its row lands on the parent's shard.
+    #[tokio::test]
+    async fn awaited_child_workflow_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(7);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx.spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}));
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh awaited child must suspend on its result channel"
+        );
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartChildWorkflow { child_id, .. } = &cmds[0] else {
+            panic!("expected StartChildWorkflow, got {cmds:?}");
+        };
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "an awaited child must inherit the parent's shard (issue #697 AC4)"
+        );
+    }
+
+    /// AC4 (issue #697): the `ctx.race()` child-workflow branch mints its own
+    /// `ExecutionId` and must inherit the parent's shard for the same reason
+    /// the plain awaited path does.
+    #[tokio::test]
+    async fn race_child_workflow_branch_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(11);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx
+            .race()
+            .child_workflow_raw("leg_a", serde_json::json!({}))
+            .child_workflow_raw("leg_b", serde_json::json!({}))
+            .run();
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh child race must suspend awaiting its branches"
+        );
+
+        let started: Vec<ExecutionId> = ctx
+            .drain_commands()
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "both race branches must be dispatched");
+        for child_id in started {
+            assert_eq!(
+                child_id.shard(),
+                parent_shard,
+                "a raced child must inherit the parent's shard (issue #697 AC4)"
+            );
+        }
+    }
+
+    /// AC4 (issue #697): the child-or-deadline race (`#779`) mints its own
+    /// child `ExecutionId` on a fresh dispatch and must inherit the parent's
+    /// shard. Already correct pre-#697 -- locked in so a future refactor of the
+    /// mixed `StartChildWorkflow + StartTimer` suspension cannot silently
+    /// regress residency for a deadline-bounded sub-orchestration.
+    #[tokio::test]
+    async fn child_timeout_race_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(9);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx.spawn_child_workflow_timeout(
+            "bounded_child",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(60),
+        );
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh child-timeout race must suspend awaiting the child or the deadline"
+        );
+
+        let commands = ctx.drain_commands();
+        let child_id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .expect("the race must dispatch exactly one child");
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "a deadline-bounded child must inherit the parent's shard (issue #697 AC4)"
+        );
+    }
+
+    /// AC4 (issue #697): the detached path already inherits -- lock it in so a
+    /// future refactor cannot silently regress residency for detached children.
+    #[tokio::test]
+    async fn detached_child_workflow_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(3);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let child_id = ctx
+            .spawn_child_workflow_detached_raw(
+                "audit_trail",
+                serde_json::json!({}),
+                crate::ParentClosePolicy::Abandon,
+            )
+            .expect("detached spawn should succeed");
+
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "a detached child must inherit the parent's shard (issue #697 AC4)"
+        );
     }
 
     #[tokio::test]
@@ -18855,7 +22197,10 @@ mod tests {
                 already_requested,
                 ..
             } => {
-                assert_eq!(*target, target_id);
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::ExecutionId(target_id)
+                );
                 assert_eq!(signal_name, "tenant_cancel");
                 assert!(
                     !already_requested,
@@ -18942,7 +22287,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "tenant_cancel".into(),
                 payload: serde_json::json!({"reason": "billing_lapse"}),
                 idempotency_key: Some("recorded_key".into()),
@@ -19000,7 +22345,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "tenant_cancel".into(),
                 payload: serde_json::json!({"reason": "billing_lapse"}),
                 idempotency_key: None,
@@ -19036,7 +22381,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19077,7 +22422,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "notify".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19117,7 +22462,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19156,7 +22501,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19205,7 +22550,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19253,7 +22598,7 @@ mod tests {
                 already_requested,
                 ..
             } => {
-                assert_eq!(*t, target_clone);
+                assert_eq!(*t, crate::types::ExternalTarget::ExecutionId(target_clone));
                 assert!(
                     !already_requested,
                     "first call should not be already_requested"
@@ -19276,7 +22621,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19300,7 +22648,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelFailed {
                 cancel_id,
                 reason_code: "target_unknown".into(),
@@ -19334,7 +22685,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19372,10 +22726,308 @@ mod tests {
                 ..
             } => {
                 assert_eq!(reason_code, "self_cancel");
-                assert_eq!(target, own_id);
+                assert_eq!(target, crate::types::ExternalTarget::ExecutionId(own_id));
             }
             other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
         }
+    }
+
+    // ── workflow_id-targeted signal/cancel tests (issue #751) ────────────────
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_self_signal_rejected() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .signal_external_workflow_by_id("order_flow", "order-42", "tenant_cancel", Value::Null)
+            .await;
+
+        assert!(result.is_err(), "self-signal by id should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed {
+                reason_code,
+                target,
+                ..
+            } => {
+                assert_eq!(reason_code, "self_signal");
+                assert_eq!(
+                    target,
+                    crate::types::ExternalTarget::from_workflow_id("order_flow", "order-42")
+                );
+            }
+            other => panic!("expected ExternalSignalFailed(self_signal), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-signal rejection must record no history / emit no commands"
+        );
+    }
+
+    /// AC#6's critical nuance: self-targeting is compared by BUSINESS KEY, not
+    /// `ExecutionId` -- a workflow that has continued-as-new (and therefore
+    /// runs under a fresh `exec_id`) must still recognise its own
+    /// `(workflow_name, workflow_id)` as itself.
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_self_signal_rejected_across_continue_as_new() {
+        // A DIFFERENT exec_id than any "original" -- simulating a
+        // continue-as-new successor -- sharing the same business key.
+        let successor_exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            successor_exec_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .signal_external_workflow_by_id("order_flow", "order-42", "tenant_cancel", Value::Null)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "self-signal by id must be rejected even under a different exec_id \
+             (continue-as-new), since it is compared by business key"
+        );
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "self_signal");
+            }
+            other => panic!("expected ExternalSignalFailed(self_signal), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_live_mode_emits_command_with_workflow_id_target() {
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut = ctx.signal_external_workflow_by_id(
+            "billing_reconciliation",
+            "tenant-7",
+            "tenant_cancel",
+            serde_json::json!({"reason": "billing_lapse"}),
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(cmds.len(), 1, "one SignalExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                target,
+                signal_name,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::from_workflow_id(
+                        "billing_reconciliation",
+                        "tenant-7"
+                    )
+                );
+                assert_eq!(signal_name, "tenant_cancel");
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_replays_delivered_outcome() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::from_workflow_id(
+                    "billing_reconciliation",
+                    "tenant-7",
+                ),
+                signal_name: "tenant_cancel".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .signal_external_workflow_by_id(
+                "billing_reconciliation",
+                "tenant-7",
+                "tenant_cancel",
+                Value::Null,
+            )
+            .await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_self_cancel_rejected() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .request_cancel_external_workflow_by_id("order_flow", "order-42")
+            .await;
+
+        assert!(result.is_err(), "self-cancel by id should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed {
+                reason_code,
+                target,
+                ..
+            } => {
+                assert_eq!(reason_code, "self_cancel");
+                assert_eq!(
+                    target,
+                    crate::types::ExternalTarget::from_workflow_id("order_flow", "order-42")
+                );
+            }
+            other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-cancel rejection must record no history / emit no commands"
+        );
+    }
+
+    /// Same continue-as-new nuance as
+    /// `signal_external_workflow_by_id_self_signal_rejected_across_continue_as_new`.
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_self_cancel_rejected_across_continue_as_new() {
+        let successor_exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            successor_exec_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .request_cancel_external_workflow_by_id("order_flow", "order-42")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "self-cancel by id must be rejected even under a different exec_id \
+             (continue-as-new), since it is compared by business key"
+        );
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "self_cancel");
+            }
+            other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_live_mode_emits_command_with_workflow_id_target() {
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut =
+            ctx.request_cancel_external_workflow_by_id("billing_reconciliation", "tenant-7");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "one RequestCancelExternalWorkflow command expected"
+        );
+        match &cmds[0] {
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                target,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::from_workflow_id(
+                        "billing_reconciliation",
+                        "tenant-7"
+                    )
+                );
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected RequestCancelExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_replays_delivered_outcome() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::from_workflow_id(
+                    "billing_reconciliation",
+                    "tenant-7",
+                ),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .request_cancel_external_workflow_by_id("billing_reconciliation", "tenant-7")
+            .await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
     }
 
     // ── await_external_workflow tests (issue #757) ───────────────────────────
@@ -19584,7 +23236,10 @@ mod tests {
                 activity_id,
                 output: serde_json::json!("done"),
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19623,7 +23278,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::SignalReceived {
                 signal_name: "approved".into(),
                 payload: serde_json::json!({"ok": true}),
@@ -19678,6 +23336,9 @@ mod tests {
 
     fn make_workflow_info(name: &'static str) -> crate::info::WorkflowInfo {
         crate::info::WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "test",
@@ -20127,6 +23788,457 @@ mod tests {
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
     }
 
+    // ── Durable workflow logs (issue #790) ────────────────────────────
+    //
+    // The durable sink is OPT-IN: with no `WorkflowLogPolicy` threaded in,
+    // `ctx.logger()` must behave exactly as it did before #790 (tracing-only,
+    // zero commands). These tests pin both halves of that contract plus the
+    // exactly-once dedup identity the durable write depends on.
+
+    /// Collect every `RecordLog` command as `(seq, level, message)` triples.
+    fn recorded_logs(cmds: &[WorkflowCommand]) -> Vec<(u64, WorkflowLogLevel, String)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::RecordLog {
+                    seq,
+                    level,
+                    message,
+                } => Some((*seq, *level, message.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn logger_pushes_no_command_when_persistence_is_disabled() {
+        // AC6 (opt-in / additive): with the sink disabled — the DEFAULT — the
+        // logger is tracing-only and emits ZERO commands, so an existing
+        // workflow's drained command stream is byte-for-byte unchanged.
+        let ctx = WorkflowContext::new_test();
+        ctx.log_info("starting");
+        ctx.logger().warn("careful");
+        ctx.log_error("boom");
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "with no WorkflowLogPolicy configured the logger must push no \
+             RecordLog command at all (opt-in, additive)"
+        );
+    }
+
+    #[test]
+    fn logger_pushes_record_log_command_when_persistence_is_enabled() {
+        // AC1: the durable sink persists lines emitted through the EXISTING
+        // ctx.logger()/ctx.log_* entry points, keyed by level + message + a
+        // deterministic ordering key.
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(WorkflowLogPolicy::default()));
+        ctx.log_info("one");
+        ctx.logger().warn("two");
+        ctx.log_error("three");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(logs.len(), 3, "one RecordLog command per log call");
+        assert_eq!(logs[0].1, WorkflowLogLevel::Info);
+        assert_eq!(logs[0].2, "one");
+        assert_eq!(logs[1].1, WorkflowLogLevel::Warn);
+        assert_eq!(logs[1].2, "two");
+        assert_eq!(logs[2].1, WorkflowLogLevel::Error);
+        assert_eq!(logs[2].2, "three");
+    }
+
+    #[test]
+    fn logger_is_suppressed_during_replay_even_when_persistence_is_enabled() {
+        // AC2: emission already no-ops during replay (issue #379) and the
+        // durable write INHERITS that property — so a workflow replayed N
+        // times yields one copy of each line.
+        let events = vec![
+            WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now()),
+            WorkflowEvent::MarkerRecorded {
+                name: "m".to_string(),
+                details: serde_json::json!(null),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        assert!(ctx.is_replaying(), "context must be in replay mode");
+        ctx.log_info("replayed line");
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "a log emitted during replay must push NO RecordLog command"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_strictly_increases_within_a_cycle() {
+        // Ordering key: lines are read back in emission order (AC3), so the
+        // seq must strictly increase within one decision cycle.
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(WorkflowLogPolicy::default()));
+        ctx.log_info("a");
+        ctx.log_info("b");
+        ctx.log_info("c");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert!(
+            logs[0].0 < logs[1].0 && logs[1].0 < logs[2].0,
+            "seq must strictly increase within a cycle, got {:?}",
+            logs.iter().map(|l| l.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_deterministic_for_a_re_driven_position() {
+        // THE exactly-once mechanism (AC2). Replay-suppression alone is NOT
+        // enough: a cycle that logs and then parks can be re-driven by a
+        // spurious wake with the history UNCHANGED, so `is_replaying()` is
+        // still false and the line is emitted again. Two contexts over the
+        // SAME recorded history must therefore mint the SAME seq, so the
+        // durable INSERT can dedup on it.
+        let history = vec![WorkflowEvent::workflow_started(
+            serde_json::json!(null),
+            Utc::now(),
+        )];
+        let seqs_for = |events: Vec<WorkflowEvent>| {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+                .with_log_policy(Some(WorkflowLogPolicy::default()));
+            ctx.log_info("first");
+            ctx.log_warn("second");
+            recorded_logs(&ctx.drain_commands())
+                .into_iter()
+                .map(|l| l.0)
+                .collect::<Vec<_>>()
+        };
+        let first = seqs_for(history.clone());
+        // Non-vacuity guard: `WorkflowStarted` is auto-consumed, so this
+        // context IS at the live frontier and MUST have emitted. Without this
+        // the equality below would pass trivially on two empty vecs.
+        assert_eq!(first.len(), 2, "both lines must actually be emitted live");
+        assert_eq!(
+            first,
+            seqs_for(history),
+            "a re-driven position must deterministically re-mint the SAME seq \
+             so the durable write dedups instead of duplicating"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_stable_when_the_cycle_appends_an_event_before_a_later_log() {
+        // Regression (issue #790 review, P1). The FIRST design keyed `seq` to
+        // the loaded-history length at cycle start. That is not an identity: a
+        // cycle that appends ANY event between two log calls -- here a
+        // deterministic side effect, but equally a marker or a version gate --
+        // comes back on the next cycle with a longer history, so the second
+        // line re-minted a DIFFERENT seq and was stored TWICE.
+        //
+        //   cycle 1: history=[Started]                  "A"@0  side-effect  "B"@1
+        //   cycle 2: history=[Started, SideEffect]  "A" replayed (suppressed), "B" live
+        //
+        // "B" is the SAME logical line in both cycles and must carry the same
+        // seq so the store's UNIQUE(exec, seq) collapses the re-emission.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle1.log_info("A");
+        let _ = cycle1.new_uuid(); // appends SideEffectRecorded when persisted
+        cycle1.log_info("B");
+        let first = recorded_logs(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both lines must be emitted live in cycle 1");
+        let b_seq_cycle1 = first[1].0;
+
+        // Cycle 2 loads the history cycle 1 persisted.
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle2.log_info("A"); // replaying -> suppressed, but still claims its ordinal
+        let _ = cycle2.new_uuid(); // consumes the recorded side effect
+        assert!(
+            !cycle2.is_replaying(),
+            "after consuming the recorded side effect the cycle is at the frontier"
+        );
+        cycle2.log_info("B");
+        let second = recorded_logs(&cycle2.drain_commands());
+        assert_eq!(
+            second.len(),
+            1,
+            "only the frontier line re-emits; the replayed one stays suppressed"
+        );
+        assert_eq!(second[0].2, "B", "the re-emitted line is B");
+        assert_eq!(
+            second[0].0, b_seq_cycle1,
+            "the same logical line must re-mint the SAME seq across cycles, or \
+             the store cannot dedup it and B is written twice"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_stable_across_a_pause_resume() {
+        // Regression (issue #790 review, P1), the second reachable shape.
+        // `WorkflowExecutionPaused`/`Resumed` are pre-marked replay-transparent
+        // by `HistoryMatcher::new`, so after a resume the workflow is at the
+        // very same logical position -- but the loaded history is two events
+        // LONGER. Under the history-length model that re-minted a different
+        // seq and duplicated the line; the call ordinal is unmoved by events
+        // the workflow never consumes.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        before.log_info("awaiting approval");
+        let before_logs = recorded_logs(&before.drain_commands());
+        assert_eq!(before_logs.len(), 1, "the line must be emitted live");
+
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        )
+        .with_log_policy(Some(WorkflowLogPolicy::default()));
+        assert!(
+            !after.is_replaying(),
+            "pause/resume events are replay-transparent, so the resumed cycle \
+             is still at the frontier"
+        );
+        after.log_info("awaiting approval");
+        let after_logs = recorded_logs(&after.drain_commands());
+        assert_eq!(after_logs.len(), 1, "the line re-emits after the resume");
+        assert_eq!(
+            after_logs[0].0, before_logs[0].0,
+            "a pause/resume must not shift a line's seq, or resuming a parked \
+             workflow duplicates every line it logged before parking"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_advances_for_a_genuinely_new_line_in_a_later_cycle() {
+        // The complement of the two regressions above: the ordinal MUST still
+        // distinguish a genuinely new line. Cycle 2 replays (and suppresses)
+        // the first line, then emits a second -- which must NOT collide with
+        // the first line's stored row.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle1.log_info("first");
+        let first_seq = recorded_logs(&cycle1.drain_commands())[0].0;
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle2.log_info("first"); // suppressed, claims ordinal 0
+        let _ = cycle2.new_uuid();
+        cycle2.log_info("second"); // live, ordinal 1
+        let logs = recorded_logs(&cycle2.drain_commands());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].2, "second");
+        assert_ne!(
+            logs[0].0, first_seq,
+            "a genuinely new line must not collide with an earlier line's seq"
+        );
+        assert!(logs[0].0 > first_seq, "and it must sort after it");
+    }
+
+    #[test]
+    fn record_log_message_is_capped_on_utf8_boundary() {
+        // Bounded volume applies per line as well as per execution: an
+        // unbounded message must be truncated, never rejected, and never split
+        // mid-codepoint.
+        let policy = WorkflowLogPolicy::default().with_max_message_bytes(8);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        ctx.log_info("😀😀😀😀");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(logs.len(), 1, "an oversize message is capped, not dropped");
+        assert_eq!(
+            logs[0].2, "😀😀",
+            "truncation must land on a UTF-8 character boundary"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_bounded_by_the_line_cap() {
+        // Regression (issue #790 review round 2, P2). `max_lines` was enforced
+        // ONLY at the database write, so a workflow that logs in a large loop
+        // without suspending retained one capped `String` per call — hundreds of
+        // thousands of them — in the in-memory command queue for the whole
+        // decision cycle, despite advertising a 1,000-line cap. The bound must
+        // bite at ENQUEUE, before the message is even cloned.
+        //
+        // The bound is `max_lines + 1`, not `max_lines`: the store admits at
+        // most `max_lines` rows from any batch, so queuing exactly `max_lines`
+        // would make `admit == lines.len()` and the truncation marker would
+        // never fire — turning AC4's *visible* overflow into silent loss. One
+        // extra command guarantees `admit < lines.len()` and a visible marker.
+        let policy = WorkflowLogPolicy::default().with_max_lines(3);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..8 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(
+            logs.len(),
+            4,
+            "a cycle must queue at most max_lines + 1 RecordLog commands, got {}",
+            logs.len()
+        );
+        // The queued lines are the OLDEST ones (drop-newest, matching the
+        // store's own admission rule) and their seqs are a contiguous prefix.
+        assert_eq!(
+            logs.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
+            vec!["line 0", "line 1", "line 2", "line 3"],
+            "drop-newest: the first lines of a run are the ones that explain it"
+        );
+        assert_eq!(
+            logs.iter().map(|l| l.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_dropped_log_call_still_consumes_its_seq_ordinal() {
+        // The enqueue bound must NOT disturb the call-ordinal identity that AC2
+        // depends on. A call dropped by the bound still claims its slot, so if a
+        // later re-drive takes a shorter path (fewer early lines) the surviving
+        // lines keep the seqs they would have had — the ordinal counts CALLS,
+        // never queued commands.
+        let policy = WorkflowLogPolicy::default().with_max_lines(2);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..5 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        // Non-vacuity: the bound must actually have dropped calls here, or the
+        // assertion below would hold trivially.
+        assert_eq!(
+            recorded_logs(&ctx.drain_commands()).len(),
+            3,
+            "max_lines(2) bounds the queue at 3, so 2 of the 5 calls were dropped"
+        );
+        // 5 calls were made, so the ordinal advanced 5 times even though only
+        // 3 commands were queued. Assert on the counter itself, since the
+        // dropped calls leave no command to inspect.
+        assert_eq!(
+            ctx.log_call_ordinal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "every ctx.log_* call must consume an ordinal, queued or not"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_unbounded_when_persistence_is_disabled() {
+        // AC6 guard: the bound is a property of the durable sink. With the sink
+        // off there is nothing to bound and nothing is queued at all, so the
+        // new counter must never change the disabled path.
+        let ctx = WorkflowContext::new_test();
+        for i in 0..5_000 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "the disabled sink queues nothing, bound or no bound"
+        );
+    }
+
+    #[test]
+    fn workflow_log_policy_defaults_are_the_documented_values() {
+        // `docs/workflow-logs.md` publishes 1,000 lines / 4 KiB per message as
+        // THE documented defaults, and AC4 requires the default be documented.
+        // Pin them here so a silent change to either breaks the docs contract
+        // loudly rather than only surfacing as a behaviour drift in production.
+        let policy = WorkflowLogPolicy::default();
+        assert_eq!(
+            policy.max_lines(),
+            DEFAULT_WORKFLOW_LOG_MAX_LINES,
+            "the default per-execution line cap is a documented value"
+        );
+        assert_eq!(
+            policy.max_lines(),
+            1_000,
+            "docs/workflow-logs.md documents 1,000 lines"
+        );
+        assert_eq!(
+            policy.max_message_bytes(),
+            DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES,
+            "the default per-message byte cap is a documented value"
+        );
+        assert_eq!(
+            policy.max_message_bytes(),
+            4_096,
+            "docs/workflow-logs.md documents 4 KiB per message"
+        );
+    }
+
+    #[test]
+    fn workflow_log_policy_clamps_degenerate_caps_to_one() {
+        // A zero cap is a footgun, not a feature: `max_lines(0)` would store
+        // nothing at all (silent total loss, the exact failure AC4's visible
+        // truncation marker exists to prevent) and `max_message_bytes(0)` would
+        // truncate every message to the empty string. Both clamp UP to 1 so the
+        // sink always stores *something* an operator can see.
+        assert_eq!(
+            WorkflowLogPolicy::default().with_max_lines(0).max_lines(),
+            1,
+            "a zero line cap must clamp to 1, never store nothing"
+        );
+        assert_eq!(
+            WorkflowLogPolicy::default()
+                .with_max_message_bytes(0)
+                .max_message_bytes(),
+            1,
+            "a zero message cap must clamp to 1, never empty every message"
+        );
+        // A legitimate value is passed through untouched.
+        assert_eq!(
+            WorkflowLogPolicy::default().with_max_lines(7).max_lines(),
+            7
+        );
+        assert_eq!(
+            WorkflowLogPolicy::default()
+                .with_max_message_bytes(64)
+                .max_message_bytes(),
+            64
+        );
+    }
+
+    #[test]
+    fn workflow_log_level_round_trips_through_its_wire_form() {
+        // The level is stored as TEXT and filtered on by the read route
+        // (`?level=`), so the string form is a wire contract.
+        for level in [
+            WorkflowLogLevel::Info,
+            WorkflowLogLevel::Warn,
+            WorkflowLogLevel::Error,
+        ] {
+            assert_eq!(
+                WorkflowLogLevel::from_wire(level.as_str()),
+                Some(level),
+                "{level:?} must round-trip through its wire form"
+            );
+        }
+        assert_eq!(
+            WorkflowLogLevel::from_wire("INFO"),
+            Some(WorkflowLogLevel::Info),
+            "level parsing is case-insensitive for operator ergonomics"
+        );
+        assert_eq!(
+            WorkflowLogLevel::from_wire("debug"),
+            None,
+            "an unknown level must be rejected, not silently coerced"
+        );
+    }
+
     #[test]
     fn set_current_details_empty_string_pushes_empty_command() {
         // The context's job is only to forward the raw value (capped, replay-
@@ -20545,6 +24657,314 @@ mod tests {
                 WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![loser_id]
             )),
             "the still-open loser must be queued for cancellation: {commands:?}"
+        );
+        Ok(())
+    }
+
+    /// RED reproducer for issue #1126: a `ctx.race()` that resolves while a
+    /// LOSING activity branch is still in-flight (its `ActivityStarted` is
+    /// recorded but it has no terminal yet) must NOT leave the loser's
+    /// `ActivityStarted` unconsumed at the matcher cursor. If it does, ANY
+    /// follow-on positional durable command in the same decision cycle (a plain
+    /// activity, `ctx.mutex(k).acquire()`, a timer, etc.) diverges on that
+    /// leftover event -> nd-block -> permanent wedge. This asserts the follow-on
+    /// `match_activity` lands cleanly (`NoMatch` = fresh dispatch at the live
+    /// frontier) rather than `Diverged`.
+    #[tokio::test]
+    async fn race_with_in_flight_activity_loser_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let winner_id = ActivityExecId::new();
+        let loser_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "a"});
+
+        // Live resolving cycle: the winner (branch 0) completed; the loser
+        // (branch 1) was scheduled AND started but has no terminal yet.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: winner_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(
+            winner.index, 0,
+            "branch a resolved first in history and must win"
+        );
+        assert_eq!(winner.value, winner_output);
+
+        // The winner marker + loser cancellation are queued as usual.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![loser_id]
+            )),
+            "the still-open loser must be queued for cancellation: {commands:?}"
+        );
+
+        // The bug: a follow-on positional command in the SAME cycle must land
+        // cleanly on the live frontier (NoMatch), not diverge on the loser's
+        // leftover in-flight ActivityStarted. Pre-fix this is Diverged
+        // (expected ActivityScheduled(next_step), actual ActivityStarted).
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after a race with an in-flight \
+             loser must land cleanly (NoMatch = fresh dispatch), not diverge on \
+             the loser's leftover ActivityStarted: {follow_on:?}"
+        );
+        Ok(())
+    }
+
+    /// Issue #1126: a single race with MORE THAN ONE in-flight loser resolves
+    /// cleanly — exercising the multi-id `contains` loop in
+    /// `consume_race_loser_frontier`. Both losers' `ActivityStarted` events must
+    /// be consumed so a follow-on command lands at the frontier (`NoMatch`)
+    /// rather than diverging on the first loser's leftover started event.
+    #[tokio::test]
+    async fn race_with_multiple_in_flight_losers_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let winner_id = ActivityExecId::new();
+        let loser1_id = ActivityExecId::new();
+        let loser2_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "a"});
+
+        // Live resolving cycle: the winner (branch 0) completed; both losers
+        // (branches 1 and 2) were scheduled AND started but have no terminal.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(3u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser1_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser2_id,
+                name: "fetch_c".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser1_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser2_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: winner_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .activity_raw("fetch_c", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 0, "branch a resolved first and must win");
+
+        // Both still-open losers are queued for cancellation.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. }
+                    if activities.contains(&loser1_id) && activities.contains(&loser2_id)
+            )),
+            "both still-open losers must be queued for cancellation: {commands:?}"
+        );
+
+        // Neither loser's leftover in-flight ActivityStarted may strand the
+        // cursor: the follow-on lands cleanly on the live frontier.
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after a race with TWO in-flight \
+             losers must land cleanly (NoMatch), not diverge: {follow_on:?}"
+        );
+        Ok(())
+    }
+
+    /// Issue #1126: two races each with a live in-flight loser, resolved in the
+    /// SAME decision cycle (the `futures::join!(race1, race2)` shape). This pins
+    /// the reviewer-flagged cursor-advance interaction: `consume_race_loser_frontier`
+    /// must consume ONLY its own race's loser events (id-scoped) and leave the
+    /// cursor positioned so the SECOND race matches its own marker/branches and a
+    /// follow-on command lands cleanly. Pre-fix, race1's stranded loser
+    /// `ActivityStarted` wedges race2's follow-on (`Diverged` → nd-block).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn join_of_two_races_each_with_an_in_flight_loser_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let r1_win = ActivityExecId::new();
+        let r1_los = ActivityExecId::new();
+        let r2_win = ActivityExecId::new();
+        let r2_los = ActivityExecId::new();
+        let r1_out = serde_json::json!({"race": 1});
+        let r2_out = serde_json::json!({"race": 2});
+
+        // `join!`-shape history: both races' open markers + all four schedules
+        // are recorded up front (one suspension batch), then the started /
+        // completed events arrive interleaved, each race's winner completing
+        // while its own loser is still merely started.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r1_win,
+                name: "r1a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r1_los,
+                name: "r1b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race:2".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r2_win,
+                name: "r2a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r2_los,
+                name: "r2b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r1_los,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r1_win,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: r1_win,
+                output: r1_out.clone(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r2_los,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r2_win,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: r2_win,
+                output: r2_out.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Resolve both races in turn (sequential `.run()` mirrors what `join!`
+        // records: each race independently consults the same shared history).
+        let w1 = ctx
+            .race()
+            .activity_raw("r1a", Value::Null, "default")
+            .activity_raw("r1b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(w1.index, 0, "race 1 branch a wins");
+        assert_eq!(w1.value, r1_out);
+
+        let w2 = ctx
+            .race()
+            .activity_raw("r2a", Value::Null, "default")
+            .activity_raw("r2b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(w2.index, 0, "race 2 branch a wins");
+        assert_eq!(w2.value, r2_out);
+
+        // Each race must have queued cancellation for its OWN loser only.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![r1_los]
+            )),
+            "race 1's loser must be queued for cancellation: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![r2_los]
+            )),
+            "race 2's loser must be queued for cancellation: {commands:?}"
+        );
+
+        // Neither race's in-flight loser events stranded the cursor: the
+        // follow-on command after BOTH races lands cleanly at the frontier.
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after join!(race1, race2) with \
+             in-flight losers in both must land cleanly (NoMatch), not diverge \
+             on a stranded loser ActivityStarted: {follow_on:?}"
         );
         Ok(())
     }
@@ -22301,5 +26721,569 @@ mod tests {
         let info = ctx.info();
         let cloned = info.clone();
         assert_eq!(info, cloned);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Activity run metadata: pure deadline helpers (issue #783)
+// ---------------------------------------------------------------------------
+
+/// The absolute instant at which the engine will kill the current activity
+/// attempt, or `None` when the attempt is genuinely unbounded (issue #783).
+///
+/// This is the **earlier** of the two *static* clocks that can terminate a
+/// `RUNNING` activity row:
+///
+/// * the per-attempt `start_to_close` budget — `started_at + start_to_close`,
+///   byte-for-byte the predicate `timeout::start_to_close_timeout_query`
+///   enforces; and
+/// * the cross-retry `schedule_to_close_at` wall-clock deadline (issue #378),
+///   whose scanner (`timeout::schedule_to_close_timeout_query`) matches
+///   `state IN ('RUNNING', 'PENDING')` and therefore kills an in-flight
+///   attempt too.
+///
+/// Both inputs NULL-propagate exactly as the scanners' SQL does: a row with no
+/// `started_at` (or no `start_to_close`) is never start-to-close-timed-out, so
+/// that clock contributes no deadline. In particular this must **never** fall
+/// back to `scheduled_at` — the schedule-to-start *metric* does that, but doing
+/// it here would report a deadline the enforcer does not honour.
+///
+/// Over-reporting is the destructive direction: an activity that believes it
+/// has more budget than it does keeps working and is killed mid-flight, losing
+/// everything since its last checkpoint. Under-reporting merely costs one
+/// avoidable retry.
+///
+/// # The heartbeat clock is deliberately excluded
+///
+/// A third scanner predicate also matches `state = 'RUNNING'`:
+/// `COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout < NOW()`. It is
+/// **not** folded in here, for two reasons:
+///
+/// * it is *dynamic* — every flushed `ctx.heartbeat(..)` pushes it forward, so
+///   there is no single instant to freeze at claim time. Folding in the
+///   worst case (`started_at + heartbeat_timeout`) would make a *correctly
+///   heartbeating* activity with a short `heartbeat_timeout` believe it is
+///   permanently out of budget, so a `is_expiring_within` guard would yield on
+///   every attempt and the activity would never make progress — a strictly
+///   worse failure than the one it would prevent; and
+/// * "heartbeat-timeout remaining time" is explicitly out of scope for issue
+///   #783.
+///
+/// The practical consequence: an activity configured with
+/// `heartbeat_timeout < start_to_close` can be killed by the heartbeat scanner
+/// *before* [`ActivityContext::deadline`], so it must actually heartbeat rather
+/// than rely on [`ActivityContext::is_expiring_within`] alone.
+/// [`ActivityContext::heartbeat_timeout`] exposes the configured value for an
+/// author who wants to compute that clock themselves.
+///
+/// The only non-test caller is the `db`-gated worker dispatch path, so the
+/// no-`db` build sees it as dead code (same treatment as
+/// [`ActivityContext::new_local_activity`]).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn attempt_deadline(
+    started_at: Option<DateTime<Utc>>,
+    start_to_close: Option<chrono::Duration>,
+    schedule_to_close_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let per_attempt = started_at
+        .zip(start_to_close)
+        .and_then(|(started, budget)| started.checked_add_signed(budget));
+    match (per_attempt, schedule_to_close_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// Time left before `deadline` as of `now`, **saturating at zero** (issue
+/// #783). `None` when the attempt is unbounded.
+///
+/// `chrono::Duration::to_std` fails only for a negative duration (a positive
+/// one cannot overflow `u64` seconds within `chrono`'s representable range), so
+/// the `unwrap_or(ZERO)` saturates an elapsed deadline exactly as AC2 requires
+/// and can never mis-report a far-future deadline as zero.
+pub(crate) fn time_remaining_from(
+    deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<std::time::Duration> {
+    let deadline = deadline?;
+    Some(
+        (deadline - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO),
+    )
+}
+
+/// Whether an activity should stop and checkpoint: `true` iff the attempt has a
+/// known deadline **and** strictly less than `reserve` remains (issue #783).
+///
+/// An unbounded attempt returns `false`. That case is the whole reason this
+/// helper exists: `Option`'s `Ord` orders `None` **before** `Some(_)`, so the
+/// natural-looking `ctx.time_remaining() < Some(reserve)` is `true` for an
+/// unbounded activity and spins it in a bail-checkpoint-retry loop that never
+/// makes progress.
+pub(crate) fn should_checkpoint(
+    remaining: Option<std::time::Duration>,
+    reserve: std::time::Duration,
+) -> bool {
+    remaining.is_some_and(|left| left < reserve)
+}
+
+#[cfg(test)]
+mod activity_deadline_helper_tests {
+    use super::{attempt_deadline, should_checkpoint, time_remaining_from};
+    use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+    use std::time::Duration;
+
+    fn at(secs: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    #[test]
+    fn attempt_deadline_is_started_at_plus_start_to_close() {
+        assert_eq!(
+            attempt_deadline(Some(at(0)), Some(ChronoDuration::seconds(30)), None),
+            Some(at(30))
+        );
+    }
+
+    /// TRAP 1: the scanner's SQL NULL-propagates, so a row with no `started_at`
+    /// is never start-to-close-timed-out. Falling back to `scheduled_at` (as
+    /// the schedule-to-start *metric* does) would disagree with the enforcer.
+    #[test]
+    fn attempt_deadline_is_none_without_started_at() {
+        assert_eq!(
+            attempt_deadline(None, Some(ChronoDuration::seconds(30)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn attempt_deadline_is_none_without_start_to_close() {
+        assert_eq!(attempt_deadline(Some(at(0)), None, None), None);
+    }
+
+    #[test]
+    fn attempt_deadline_is_none_when_both_absent() {
+        assert_eq!(attempt_deadline(None, None, None), None);
+    }
+
+    /// `schedule_to_close_at` (issue #378) also kills a RUNNING activity, so
+    /// the reported deadline must be the EARLIER of the two clocks. Reporting
+    /// only `start_to_close` would over-report remaining time — the
+    /// destructive direction (the activity keeps working and is killed).
+    #[test]
+    fn attempt_deadline_takes_the_earlier_of_start_to_close_and_schedule_to_close() {
+        // schedule_to_close is earlier -> it wins.
+        assert_eq!(
+            attempt_deadline(
+                Some(at(0)),
+                Some(ChronoDuration::seconds(300)),
+                Some(at(60))
+            ),
+            Some(at(60))
+        );
+        // start_to_close is earlier -> it wins.
+        assert_eq!(
+            attempt_deadline(
+                Some(at(0)),
+                Some(ChronoDuration::seconds(30)),
+                Some(at(600))
+            ),
+            Some(at(30))
+        );
+    }
+
+    /// A cross-retry deadline binds even when this attempt has no
+    /// `start_to_close` of its own.
+    #[test]
+    fn attempt_deadline_uses_schedule_to_close_alone() {
+        assert_eq!(
+            attempt_deadline(Some(at(0)), None, Some(at(90))),
+            Some(at(90))
+        );
+        assert_eq!(attempt_deadline(None, None, Some(at(90))), Some(at(90)));
+    }
+
+    #[test]
+    fn attempt_deadline_overflow_saturates_to_none() {
+        assert_eq!(
+            attempt_deadline(
+                Some(chrono::DateTime::<Utc>::MAX_UTC),
+                Some(ChronoDuration::seconds(1)),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn time_remaining_from_is_none_when_unbounded() {
+        assert_eq!(time_remaining_from(None, at(0)), None);
+    }
+
+    #[test]
+    fn time_remaining_from_reports_the_gap() {
+        assert_eq!(
+            time_remaining_from(Some(at(30)), at(10)),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    /// AC2: `time_remaining()` is never negative.
+    #[test]
+    fn time_remaining_from_saturates_at_zero_past_the_deadline() {
+        assert_eq!(
+            time_remaining_from(Some(at(10)), at(600)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            time_remaining_from(Some(at(10)), at(10)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// Misuse guard: `Option: Ord` makes `None < Some(_)`, so a naive
+    /// `ctx.time_remaining() < Some(reserve)` is TRUE for an unbounded
+    /// activity — an infinite bail loop. `should_checkpoint` returns `false`.
+    #[test]
+    fn should_checkpoint_is_false_when_unbounded() {
+        assert!(!should_checkpoint(None, Duration::from_secs(5)));
+        // Demonstrate the trap the helper exists to avoid.
+        assert!(None::<Duration> < Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn should_checkpoint_is_true_below_the_reserve() {
+        assert!(should_checkpoint(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5)
+        ));
+        assert!(should_checkpoint(
+            Some(Duration::ZERO),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn should_checkpoint_boundary_is_strict() {
+        // Exactly at the reserve is NOT yet expiring.
+        assert!(!should_checkpoint(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        ));
+        assert!(!should_checkpoint(
+            Some(Duration::from_secs(6)),
+            Duration::from_secs(5)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod activity_info_tests {
+    use super::{ActivityContext, ActivityExecutionInfo, ActivityIdentity};
+    use crate::types::{ActivityExecId, ExecutionId};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
+
+    fn configured() -> ActivityContext {
+        ActivityContext::new_test()
+            .with_execution_id(ExecutionId::new())
+            .with_workflow_id("cart-42")
+            .with_workflow_type("checkout")
+            .with_activity_type("charge_card")
+            .with_activity_id(ActivityExecId::new())
+            .with_queue_name("payments")
+            .with_attempt(2)
+            .with_max_attempts(5)
+    }
+
+    /// `with_activity_id` must keep the derived idempotency key in step.
+    ///
+    /// The docs promise `activity_id` backs `idempotency_key()`, and production
+    /// dispatch builds both from the same id. A builder that moved only the
+    /// identity would hand tests a context the engine never produces — an
+    /// activity keying an external call off `idempotency_key()` would look
+    /// correct in a test and collide in production.
+    #[test]
+    fn with_activity_id_re_derives_the_idempotency_key() {
+        let first = ActivityContext::new_test();
+        let original = first
+            .idempotency_key()
+            .expect("new_test attaches a key")
+            .clone();
+
+        let moved = ActivityExecId::new();
+        let ctx = first.with_activity_id(moved);
+        let key = ctx.idempotency_key().expect("key survives the move");
+
+        assert_ne!(key, &original, "the key must follow the new activity id");
+        assert_eq!(
+            key,
+            &crate::types::IdempotencyKey::from_activity_exec_id(moved),
+            "and must be exactly the key production would derive from that id"
+        );
+        assert_eq!(ctx.info().activity_id, moved);
+    }
+
+    /// ...but it never manufactures a key on a context that had none.
+    ///
+    /// `new_local_activity` starts keyless until the worker attaches one; a
+    /// builder that invented a key here would turn `idempotency_key()`'s
+    /// documented `Config` error into a silent success.
+    #[test]
+    fn with_activity_id_does_not_invent_a_key_when_none_is_attached() {
+        let ctx = ActivityContext::new_local_activity(
+            super::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        )
+        .with_activity_id(ActivityExecId::new());
+
+        assert!(
+            ctx.idempotency_key().is_err(),
+            "a keyless context must stay keyless"
+        );
+    }
+
+    /// An explicit key set *after* the id wins — the documented escape hatch.
+    #[test]
+    fn explicit_idempotency_key_after_the_id_wins() {
+        let custom = crate::types::IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+        let ctx = ActivityContext::new_test()
+            .with_activity_id(ActivityExecId::new())
+            .with_idempotency_key(custom.clone());
+        assert_eq!(ctx.idempotency_key().expect("custom key"), &custom);
+    }
+
+    /// AC1: every field the issue names is present and readable.
+    #[test]
+    fn info_exposes_every_ac1_field() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let task_id = uuid::Uuid::new_v4();
+        let ctx = ActivityContext::new_test()
+            .with_execution_id(exec_id)
+            .with_workflow_id("cart-42")
+            .with_workflow_type("checkout")
+            .with_activity_type("charge_card")
+            .with_activity_id(activity_id)
+            .with_queue_name("payments")
+            .with_task_id(Some(task_id))
+            .with_attempt(3)
+            .with_max_attempts(7);
+
+        let info: ActivityExecutionInfo = ctx.info();
+        assert_eq!(info.execution_id, exec_id);
+        assert_eq!(info.workflow_id, "cart-42");
+        assert_eq!(info.workflow_type, "checkout");
+        assert_eq!(info.activity_type, "charge_card");
+        assert_eq!(info.activity_id, activity_id);
+        assert_eq!(info.attempt, 3);
+        assert_eq!(info.max_attempts, 7);
+        assert!(!info.is_local);
+        assert_eq!(info.queue_name, "payments");
+        assert_eq!(info.task_id, Some(task_id));
+    }
+
+    /// AC1: `info()` agrees with each standalone accessor — one source of truth.
+    #[test]
+    fn info_agrees_with_the_standalone_accessors() {
+        let ctx = configured();
+        let info = ctx.info();
+        assert_eq!(info.execution_id, ctx.execution_id());
+        assert_eq!(info.workflow_id, ctx.workflow_id());
+        assert_eq!(info.workflow_type, ctx.workflow_type());
+        assert_eq!(info.activity_type, ctx.activity_type());
+        assert_eq!(info.activity_id, ctx.activity_id());
+        assert_eq!(info.attempt, ctx.attempt());
+        assert_eq!(info.max_attempts, ctx.max_attempts());
+        assert_eq!(info.is_local, ctx.is_local());
+        assert_eq!(info.queue_name, ctx.queue_name());
+        assert_eq!(info.task_id, ctx.task_id());
+        // Pin the projection field-by-field, so an `identity()` that returns a
+        // constant (or drops a field) cannot hide behind an equality-only
+        // retry-stability assertion.
+        assert_eq!(
+            info.identity(),
+            ActivityIdentity::new(
+                info.execution_id,
+                &info.workflow_id,
+                &info.workflow_type,
+                &info.activity_type,
+                info.activity_id,
+            )
+        );
+        // The cheap context-level accessor must agree with the info-level one.
+        assert_eq!(ctx.identity(), info.identity());
+    }
+
+    /// `with_heartbeat_details` seeds the resume snapshot a retry attempt reads
+    /// back — but only on a context that actually has a flusher, matching a real
+    /// retry. It must NOT paper over a missing flusher: silently accepting a
+    /// checkpoint that goes nowhere is worse than rejecting it.
+    #[test]
+    fn with_heartbeat_details_seeds_the_resume_snapshot_when_a_flusher_is_attached() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let ctx = ActivityContext::new_test_with_heartbeat(tx)
+            .with_heartbeat_details(Some(serde_json::json!({"next": 4})));
+        assert_eq!(
+            ctx.heartbeat_details::<serde_json::Value>()
+                .expect("a flusher-backed context can read its resume snapshot"),
+            Some(serde_json::json!({"next": 4}))
+        );
+
+        // Without a flusher the read is rejected, exactly as `heartbeat()` is —
+        // a checkpoint written here would be silently dropped.
+        let bare = ActivityContext::new_test()
+            .with_heartbeat_details(Some(serde_json::json!({"next": 4})));
+        assert!(
+            bare.heartbeat_details::<serde_json::Value>().is_err(),
+            "a flusher-less context must not pretend to carry a checkpoint"
+        );
+    }
+
+    /// `new_test_local` is the only way downstream code can reach the
+    /// `is_local() == true` branch, since `is_local` is constructor-set.
+    #[test]
+    fn new_test_local_reports_the_local_dispatch_path() {
+        let ctx = ActivityContext::new_test_local();
+        assert!(ctx.is_local(), "must report the local dispatch path");
+        assert_eq!(
+            ctx.task_id(),
+            None,
+            "a local activity has no harvest_task_queue row"
+        );
+        assert_eq!(ctx.info().is_local, ctx.is_local());
+        // And it genuinely cannot heartbeat, matching real inline dispatch.
+        assert!(ctx.heartbeat_details::<serde_json::Value>().is_err());
+    }
+
+    /// AC3: the reported id is the exact management-API `{exec_id}` path
+    /// segment — it must round-trip through `Display` / `FromStr` unchanged,
+    /// because that string is what an operator pastes into a URL.
+    #[test]
+    fn info_execution_id_round_trips_through_its_string_form() {
+        let ctx = configured();
+        let rendered = ctx.info().execution_id.to_string();
+        let parsed: ExecutionId = rendered.parse().expect("execution id must parse back");
+        assert_eq!(parsed, ctx.info().execution_id);
+        // The pasteable form must be the bare UUID, never a Debug wrapper.
+        assert!(!rendered.contains("ExecutionId"), "got {rendered}");
+        assert_eq!(rendered, ctx.info().execution_id.as_uuid().to_string());
+    }
+
+    /// AC4: only `attempt` (and the deadline) advance between retries.
+    #[test]
+    fn identity_is_stable_across_attempts_while_attempt_advances() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let build = |attempt: u32| {
+            ActivityContext::new_test()
+                .with_execution_id(exec_id)
+                .with_workflow_id("cart-42")
+                .with_workflow_type("checkout")
+                .with_activity_type("charge_card")
+                .with_activity_id(activity_id)
+                .with_attempt(attempt)
+        };
+        let first = build(1).info();
+        let second = build(2).info();
+
+        let a: ActivityIdentity = first.identity();
+        let b: ActivityIdentity = second.identity();
+        assert_eq!(a, b, "identity must be stable across attempts");
+        assert_ne!(first.attempt, second.attempt);
+        assert_eq!(first.attempt, 1);
+        assert_eq!(second.attempt, 2);
+    }
+
+    /// The identity subset must exclude the per-attempt fields, or the AC4
+    /// assertion above would be vacuous the moment `attempt` joined it.
+    #[test]
+    fn identity_excludes_the_per_attempt_fields() {
+        let ctx = configured();
+        let identity = ctx.info().identity();
+        let rendered = format!("{identity:?}");
+        assert!(
+            !rendered.contains("attempt"),
+            "identity must not carry attempt: {rendered}"
+        );
+        assert!(rendered.contains("cart-42"));
+        assert!(rendered.contains("charge_card"));
+    }
+
+    /// AC5: `is_local` distinguishes the two dispatch paths.
+    #[test]
+    fn is_local_is_false_for_a_queue_dispatch_and_true_for_an_inline_one() {
+        assert!(!ActivityContext::new_test().is_local());
+        let local = ActivityContext::new_local_activity(
+            crate::context::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        );
+        assert!(local.is_local());
+        assert!(local.info().is_local);
+    }
+
+    /// AC2: no `start_to_close` configured -> unbounded.
+    #[test]
+    fn deadline_and_time_remaining_are_none_when_unbounded() {
+        let ctx = ActivityContext::new_test();
+        assert_eq!(ctx.deadline(), None);
+        assert_eq!(ctx.time_remaining(), None);
+        // Misuse guard: the convenience predicate must not fire when unbounded.
+        assert!(!ctx.is_expiring_within(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn deadline_round_trips_and_time_remaining_is_positive_for_a_future_deadline() {
+        let deadline = Utc::now() + ChronoDuration::seconds(60);
+        let ctx = ActivityContext::new_test().with_deadline(Some(deadline));
+        assert_eq!(ctx.deadline(), Some(deadline));
+        let left = ctx
+            .time_remaining()
+            .expect("bounded attempt has remaining time");
+        assert!(
+            left > Duration::from_secs(50) && left <= Duration::from_secs(60),
+            "expected ~60s, got {left:?}"
+        );
+        assert!(!ctx.is_expiring_within(Duration::from_secs(5)));
+        assert!(ctx.is_expiring_within(Duration::from_secs(120)));
+    }
+
+    /// AC2: never negative.
+    #[test]
+    fn time_remaining_saturates_at_zero_for_an_elapsed_deadline() {
+        let ctx = ActivityContext::new_test()
+            .with_deadline(Some(Utc::now() - ChronoDuration::minutes(10)));
+        assert_eq!(ctx.time_remaining(), Some(Duration::ZERO));
+        assert!(ctx.is_expiring_within(Duration::from_secs(1)));
+    }
+
+    /// `new_test()` must mint a coherent identity out of the box: the
+    /// `activity_id` reported by `info()` is the same one backing the
+    /// idempotency key, so the two never disagree in an author's logs.
+    #[test]
+    fn new_test_mints_a_coherent_identity() {
+        let ctx = ActivityContext::new_test();
+        let info = ctx.info();
+        let key = ctx
+            .idempotency_key()
+            .expect("new_test sets an idempotency key");
+        assert_eq!(key.as_str(), info.activity_id.as_uuid().to_string());
+        assert_eq!(info.attempt, 1);
+        assert_eq!(info.max_attempts, 1);
+        assert_eq!(info.task_id, None);
+    }
+
+    #[test]
+    fn info_is_clone_and_eq() {
+        let info = configured().info();
+        assert_eq!(info.clone(), info);
+        let identity = info.identity();
+        assert_eq!(identity.clone(), identity);
     }
 }

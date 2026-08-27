@@ -426,6 +426,9 @@ pub mod flows {
         #[must_use]
         pub fn info() -> ::autumn_harvest::WorkflowInfo {
             ::autumn_harvest::WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "my_absolute_wf",
                 module: "flows",
@@ -484,6 +487,9 @@ pub mod relative_test_self {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_self::flows",
@@ -532,6 +538,9 @@ pub mod relative_test_super {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_super::flows",
@@ -584,6 +593,9 @@ pub mod relative_test_plain {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_plain::flows",

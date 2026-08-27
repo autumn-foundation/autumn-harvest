@@ -154,6 +154,9 @@ fn long_running_target<'a>(
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "cross_workflow_await_tests",
@@ -203,6 +206,7 @@ fn default_start_params(
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -1071,6 +1075,7 @@ async fn test_await_continued_as_new_target_follows_chain_to_successor() {
         &[WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: successor,
             input: serde_json::json!({}),
+            new_workflow_type: None,
         }],
         thist.next_event_id,
     )

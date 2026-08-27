@@ -162,6 +162,7 @@ async fn insert_versioned_execution(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -254,6 +255,7 @@ async fn insert_execution_without_marker(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

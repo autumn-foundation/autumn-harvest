@@ -1,0 +1,22 @@
+-- before-count-star-healthy --
+                                                                        QUERY PLAN                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=17.57..17.58 rows=1 width=1) (actual rows=1 loops=1)
+   Output: ($0 >= 10000)
+   Buffers: shared hit=3 read=2
+   InitPlan 1 (returns $0)
+     ->  Aggregate  (cost=17.56..17.57 rows=1 width=8) (actual rows=1 loops=1)
+           Output: count(*)
+           Buffers: shared hit=3 read=2
+           ->  Index Only Scan using idx_harvest_events_history_page on public.harvest_events  (cost=0.56..16.93 rows=250 width=0) (actual rows=5 loops=1)
+                 Output: harvest_events.workflow_exec_id, harvest_events.id
+                 Index Cond: (harvest_events.workflow_exec_id = '08ca4ae9-2fb8-473e-9417-1ad754921031'::uuid)
+                 Heap Fetches: 0
+                 Buffers: shared hit=3 read=2
+ Query Identifier: -8476920030312731657
+ Planning:
+   Buffers: shared hit=237
+ Planning Time: 0.679 ms
+ Execution Time: 0.101 ms
+(17 rows)
+

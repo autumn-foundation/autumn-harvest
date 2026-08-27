@@ -17,6 +17,16 @@ async fn quick_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+#[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel_running"))]
+async fn latest_wins_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Ok(String::new())
+}
+
+#[workflow(concurrency(key = "input.doc_id", limit = 3, on_conflict = "defer"))]
+async fn explicit_defer_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Ok(String::new())
+}
+
 #[workflow(concurrency(key = "input.tenant_id", limit = 10))]
 async fn concurrency_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
     Ok("done".into())
@@ -119,6 +129,49 @@ fn workflow_concurrency_macro_sets_policy() {
         .expect("concurrency workflow must have a policy");
     assert_eq!(policy.key_expr, "input.tenant_id");
     assert_eq!(policy.limit, 10);
+    // Issue #811 AC1: omitting `on_conflict` keeps today's defer behaviour.
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        "a policy that omits on_conflict must default to Defer, so every \
+         pre-#811 workflow is byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn workflow_concurrency_macro_parses_cancel_running() {
+    // Issue #811 AC1: the attribute parses and attaches the latest-wins
+    // strategy to the registered `WorkflowInfo`.
+    let info = __autumn_workflow_info_latest_wins_workflow();
+    assert_eq!(info.name, "latest_wins_workflow");
+    let policy = info
+        .concurrency
+        .expect("latest-wins workflow must have a policy");
+    assert_eq!(policy.key_expr, "input.doc_id");
+    assert_eq!(policy.limit, 1);
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::CancelRunning
+    );
+    assert!(policy.on_conflict.is_cancel_running());
+}
+
+#[test]
+fn workflow_concurrency_macro_parses_explicit_defer() {
+    // Spelling `on_conflict = "defer"` explicitly must resolve to exactly the
+    // same policy as omitting it — the attribute is additive, never a mode
+    // switch that changes the other fields' meaning.
+    let info = __autumn_workflow_info_explicit_defer_workflow();
+    let policy = info
+        .concurrency
+        .expect("explicit-defer workflow must have a policy");
+    assert_eq!(policy.key_expr, "input.doc_id");
+    assert_eq!(policy.limit, 3);
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    );
+    assert!(!policy.on_conflict.is_cancel_running());
 }
 
 #[workflow(
@@ -286,4 +339,128 @@ fn workflow_custom_enum_failure_stays_untyped() {
             .error_type
             .is_none()
     );
+}
+
+// ── Issue #802 — opt-in declared activity/child dependencies ─────────────────
+//
+// The declaration is recorded verbatim as registration metadata; it is the
+// *preflight* check (`check_catalog_consistency`) that resolves each name
+// against the registry. The macro deliberately does NOT resolve the listed
+// identifiers to their companion `_info()` symbols: a bare ident in an
+// attribute is never name-resolved by the compiler, so a typo stays a
+// preflight failure (the exact failure mode AC2 specifies) rather than
+// becoming a compile error, and the author needs no extra `use` in scope.
+
+#[activity]
+#[allow(clippy::unused_async)]
+async fn dep_send_email(_ctx: &ActivityContext, addr: String) -> Result<String, String> {
+    Ok(addr)
+}
+
+#[workflow]
+#[allow(clippy::unused_async)]
+async fn dep_generate_report(_ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(
+    activities = [dep_send_email, charge_card],
+    children = [dep_generate_report]
+)]
+#[allow(clippy::unused_async)]
+async fn onboarding_declared(_ctx: &WorkflowContext, _input: String) -> Result<(), String> {
+    Ok(())
+}
+
+// Every path qualifier form must parse. `crate` / `self` / `super` are
+// KEYWORDS, not `Ident`s, so a peek-based guard would reject them before
+// `syn::Path` ever saw the token — each is covered here deliberately.
+#[workflow(activities = [
+    crate::billing::charge_card,
+    self::sibling_activity,
+    super::parent_activity,
+    ::root_crate::rooted_activity,
+    bare_ident_activity,
+    "raw_dispatched_name",
+])]
+#[allow(clippy::unused_async)]
+async fn path_and_literal_declared(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(activities = [], children = [])]
+#[allow(clippy::unused_async)]
+async fn explicitly_declares_nothing(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn workflow_declared_dependencies_attribute_parses(/* issue #802 AC1 */) {
+    let info = __autumn_workflow_info_onboarding_declared();
+    assert_eq!(info.name, "onboarding_declared");
+    assert_eq!(
+        info.declared_activities,
+        Some(["dep_send_email", "charge_card"].as_slice()),
+        "activities = [..] must be recorded in declaration order"
+    );
+    assert_eq!(
+        info.declared_children,
+        Some(["dep_generate_report"].as_slice()),
+        "children = [..] must be recorded in declaration order"
+    );
+}
+
+#[test]
+fn workflow_declared_dependencies_accept_paths_and_string_literals() {
+    // A path records its LAST segment (the registered name is always the fn
+    // ident — neither macro has a `name = "..."` rename attribute), and a
+    // string literal is accepted verbatim so a raw-dispatched name
+    // (`ctx.execute_activity_raw("raw_dispatched_name", ..)`) can be declared
+    // even though it is not an identifier in scope.
+    let info = __autumn_workflow_info_path_and_literal_declared();
+    assert_eq!(
+        info.declared_activities,
+        Some(
+            [
+                "charge_card",         // crate::billing::charge_card
+                "sibling_activity",    // self::sibling_activity
+                "parent_activity",     // super::parent_activity
+                "rooted_activity",     // ::root_crate::rooted_activity
+                "bare_ident_activity", // bare ident
+                "raw_dispatched_name", // string literal
+            ]
+            .as_slice()
+        ),
+        "every path qualifier form must reduce to its last segment, and a \
+         string literal must pass through verbatim"
+    );
+    assert!(info.declared_children.is_none());
+}
+
+#[test]
+fn workflow_without_dependency_attributes_has_none(/* issue #802 AC4 */) {
+    // The zero-false-positive guarantee is structural: a workflow that never
+    // opts in carries `None`, which preflight skips entirely.
+    let info = __autumn_workflow_info_test_workflow();
+    assert!(info.declared_activities.is_none());
+    assert!(info.declared_children.is_none());
+}
+
+#[test]
+fn workflow_empty_declaration_is_opt_in_not_absent() {
+    // `Some(&[])` ("I depend on nothing") is a deliberately different state
+    // from `None` ("I did not opt in"), so an author can assert emptiness.
+    let info = __autumn_workflow_info_explicitly_declares_nothing();
+    assert_eq!(info.declared_activities, Some([].as_slice()));
+    assert_eq!(info.declared_children, Some([].as_slice()));
+}
+
+#[test]
+fn workflow_info_declared_dependency_builders_set_fields() {
+    // Fluent parity for programmatic (non-macro) registration.
+    let info = __autumn_workflow_info_test_workflow()
+        .with_declared_activities(&["send_email"])
+        .with_declared_children(&["generate_report"]);
+    assert_eq!(info.declared_activities, Some(["send_email"].as_slice()));
+    assert_eq!(info.declared_children, Some(["generate_report"].as_slice()));
 }

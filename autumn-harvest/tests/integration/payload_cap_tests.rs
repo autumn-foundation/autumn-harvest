@@ -47,6 +47,9 @@ fn fake_activity_info(name: &'static str) -> ActivityInfo {
 
 fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "test",
@@ -72,12 +75,14 @@ fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
 }
 
 // ---------------------------------------------------------------------------
-// AC: PayloadKind enum exists with all 7 variants
+// AC: PayloadKind enum exists with all 7 variants (issue #252) plus
+// `QuotaKey`, added by issue #946's per-tenant resolved-key length bound.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn payload_kind_all_variants_exist() {
-    // All 7 variants must exist and be constructable.
+    // All 7 issue-#252 variants plus issue #946's `QuotaKey` must exist and
+    // be constructable.
     let _ = PayloadKind::ActivityInput;
     let _ = PayloadKind::ActivityResult;
     let _ = PayloadKind::SignalPayload;
@@ -85,6 +90,7 @@ fn payload_kind_all_variants_exist() {
     let _ = PayloadKind::ChildWorkflowInput;
     let _ = PayloadKind::ChildWorkflowResult;
     let _ = PayloadKind::SideEffectValue;
+    let _ = PayloadKind::QuotaKey;
 }
 
 #[test]
@@ -234,6 +240,9 @@ fn builder_custom_payload_caps_survive_build() {
 #[test]
 fn workflow_info_has_max_input_bytes_field() {
     let info = WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "test_wf",
         module: "test",
@@ -260,6 +269,9 @@ fn workflow_info_has_max_input_bytes_field() {
     assert!(info.max_input_bytes.is_none());
 
     let info_with_cap = WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "large_wf",
         module: "test",

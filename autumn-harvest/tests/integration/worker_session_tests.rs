@@ -97,6 +97,7 @@ mod db_tests {
     async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
         let exec_id = ExecutionId::new();
         let row = NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -753,6 +754,9 @@ mod db_tests {
 
         let registry = std::sync::Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "session_test_wf",
                 module: "worker_session_tests",
@@ -821,6 +825,7 @@ mod db_tests {
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
+                        capability_miss_max_redeliveries: 5,
                         workflow_task_timeout: Duration::from_secs(20),
                         workflow_panic_max_attempts: 3,
                         labels: std::collections::HashMap::new(),

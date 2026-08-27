@@ -583,6 +583,14 @@ pub struct WorkflowMetadata {
     pub sla: Option<std::time::Duration>,
     /// Declared workflow-type retry policy default (issue #523).
     pub retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Declared per-tenant resource quota policy (issue #946), enforced at
+    /// admission inside `start_or_load_workflow_execution_collect` -- the
+    /// completion-trigger start path (both the same-shard inline start and
+    /// the cross-shard outbox relay) funnels through that same function, so
+    /// mirroring this field here is what makes a completion-trigger-started
+    /// workflow observe its declared quota just like every other
+    /// registry-aware start path.
+    pub quota: Option<crate::quota::QuotaPolicy>,
 }
 
 #[cfg(feature = "db")]
@@ -745,6 +753,23 @@ enum RelayOutcome {
     /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014), so the
     /// relay does NOT re-record it — `reason` is kept only for the tracing log.
     Blocked { reason: String },
+    /// A declared per-tenant quota (issue #946, Task #7 hardening) is exhausted
+    /// on the target at relay time. Unlike `Blocked` (an operator-lifted
+    /// admission gate, with no natural "retry later" cadence, so the row is
+    /// dropped) this is TEMPORARY -- the tenant's usage frees up as an
+    /// existing execution completes or is deleted -- so the outbox row is
+    /// left claimable (neither deleted nor the fires row touched) rather than
+    /// dropped or propagated as an error. `enforce_completion_triggers_outbox`
+    /// naturally re-attempts an unclaimed row on its next scan; the core
+    /// start primitive already recorded `harvest.quota.rejected` inside
+    /// `start_or_load_workflow_execution_collect`, so the relay does NOT
+    /// re-record it here.
+    QuotaBlocked {
+        key: String,
+        resource: crate::quota::QuotaResource,
+        limit: u64,
+        current: u64,
+    },
 }
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
@@ -894,6 +919,35 @@ async fn relay_gate_checked_start(
                     .map_err(crate::error::database_error)?;
                     Ok(RelayOutcome::Blocked { reason })
                 }
+                // issue #946 (Task #7 hardening): a declared per-tenant quota
+                // is exhausted on the target at relay time. Must be matched
+                // BEFORE the generic `Err(e)` arm below: that arm propagates
+                // via `?` out of this whole claim transaction, which would
+                // (a) abort this relay attempt for no better reason than a
+                // TEMPORARY per-tenant condition and (b) -- since this
+                // function is called in a loop from
+                // `enforce_completion_triggers_outbox`, itself one of many
+                // `?`-chained scanner duties inside `enforce_timeouts_once`
+                // -- starve every OTHER completion-trigger relay this tick
+                // and every LATER scanner duty (history-ceiling enforcement,
+                // broken-session/mutex-lease reclaim, start-idempotency
+                // sweep, ...) on every tick for as long as this one
+                // quota-blocked target sits at the head of the outbox scan.
+                // Leave the row claimable (neither delete nor touch fires) so
+                // a later scan re-attempts it once the target's usage frees
+                // up.
+                Err(crate::error::HarvestError::QuotaExceeded {
+                    key,
+                    resource,
+                    limit,
+                    current,
+                    ..
+                }) => Ok(RelayOutcome::QuotaBlocked {
+                    key,
+                    resource,
+                    limit,
+                    current,
+                }),
                 Err(e) => Err(e),
                 Ok(_started) => {
                     // Fresh start OR an idempotent attach to a still-active run:
@@ -937,6 +991,25 @@ async fn relay_gate_checked_start(
                 "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropped the outbox row"
             );
         }
+        RelayOutcome::QuotaBlocked {
+            key,
+            resource,
+            limit,
+            current,
+        } => {
+            // `harvest.quota.rejected` was already recorded by the core start
+            // primitive inside `start_or_load_workflow_execution_collect`; the
+            // relay does NOT re-record it (issue #946, mirrors the `Blocked`
+            // arm's no-double-count precedent above).
+            tracing::debug!(
+                outbox_id = %outbox_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "[completion_trigger] cross-shard relay blocked by a per-tenant quota on the target; row left claimable for a later scan"
+            );
+        }
     }
     Ok(())
 }
@@ -959,6 +1032,8 @@ pub struct DeferredTriggerStart {
     pub queue_name: Option<String>,
     pub concurrency_key: Option<String>,
     pub concurrency_limit: Option<u32>,
+    /// Per-key overflow strategy (issue #811) resolved at trigger-evaluation time.
+    pub concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     pub priority: crate::types::Priority,
     pub max_workflow_input_bytes: u64,
     pub trigger_name: String,
@@ -1071,6 +1146,7 @@ impl DeferredTriggerStart {
                 inherited_chain_deadline_at: None,
                 concurrency_key: self.concurrency_key,
                 concurrency_limit: self.concurrency_limit,
+                concurrency_on_conflict: self.concurrency_on_conflict,
                 priority: self.priority,
                 max_workflow_input_bytes: self.max_workflow_input_bytes,
                 start_at: None,
@@ -1132,7 +1208,7 @@ pub fn evaluate_triggers_for_execution<'a>(
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1140,6 +1216,7 @@ pub fn evaluate_triggers_for_execution<'a>(
 
         let execution = execs_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
+            .select(WorkflowExecution::as_select())
             .first::<WorkflowExecution>(conn)
             .await
             .optional()
@@ -1501,15 +1578,15 @@ pub fn evaluate_triggers_for_execution<'a>(
             }
 
             // Resolve target concurrency parameters
-            let (concurrency_key, concurrency_limit) = {
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
                     .and_then(|meta| meta.concurrency.as_ref())
-                    .map_or((None, None), |policy| {
+                    .map_or((None, None, crate::concurrency::ConcurrencyOnConflict::Defer), |policy| {
                         let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &target_input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     })
             };
 
@@ -1539,13 +1616,36 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                let start_res = match start_or_load_workflow_execution(
+                // `_with_metrics` (not the metrics-less wrapper) so a latest-wins
+                // supersede performed by this target is counted (issue #811,
+                // Codex round 2): the wrapper discards the collected
+                // cancellations, so `harvest.concurrency.superseded` and the
+                // incumbent's cancelled terminal were both dropped even though a
+                // recorder is in scope here. Emission is inline, matching every
+                // other counter this function already records inside the source's
+                // terminal transaction (`record_completion_trigger_fired`).
+                //
+                // Residual (Codex round 3): emission happens at return, not after
+                // the enclosing terminal transaction commits, so a rollback of that
+                // transaction leaves both counters emitted for a supersede that never
+                // became durable. Bounded to rolled-back terminal transactions, and
+                // strictly better than the pre-fix state (never emitted at all, an
+                // unconditional under-count). Deferring emission needs a post-commit
+                // collector threaded out of `evaluate_triggers_for_execution`, which
+                // changes its return type across 71 call sites; tracked as a
+                // follow-up issue.
+                let start_res = match start_or_load_workflow_execution_with_metrics(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
                         workflow_id: &target_workflow_id,
                         exec_id: target_exec_id,
-                        input: target_input,
+                        // Cloned (not moved) — `target_input` and `concurrency_key`
+                        // must stay available after this call for the new
+                        // `QuotaExceeded` outbox-fallback arm below (issue #946,
+                        // Codex round-3 review), which needs the original values
+                        // to construct a `DeferredTriggerStart` for retry.
+                        input: target_input.clone(),
                         parent_id: None,
                         queue_name: &queue_name,
                         execution_timeout: None,
@@ -1558,8 +1658,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                         chain_execution_timeout: None,
                         max_workflow_chain_timeout_ceiling: None,
                         inherited_chain_deadline_at: None,
-                        concurrency_key,
+                        concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
+                        concurrency_on_conflict,
                         priority: Priority::default(),
                         max_workflow_input_bytes,
                         start_at: None,
@@ -1583,6 +1684,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_source_ref: Some(source_exec_id_str.as_str()),
                         started_by: None,
                     },
+                    metrics,
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
                     // `admission_blocked` bookkeeping and the first-time-only block
@@ -1612,6 +1714,117 @@ pub fn evaluate_triggers_for_execution<'a>(
                         if let Some(m) = metrics {
                             m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
                         }
+                        continue;
+                    }
+                    // issue #946 (Codex round-3 review): a same-shard target's
+                    // per-tenant quota is exhausted right now. This branch runs
+                    // INLINE inside the SOURCE execution's own terminal
+                    // transaction (see the fn's callers in worker.rs/timeout.rs/
+                    // execution.rs/poison_pill.rs, all of which commit this
+                    // trigger evaluation as part of sealing the source's terminal
+                    // state) -- unlike the `Blocked`/`QuotaBlocked` handling in
+                    // `relay_gate_checked_start` above, which only ever runs
+                    // AFTER that transaction has already committed. So neither
+                    // of that function's two options apply here as-is:
+                    // propagating the error via `?`/`return Err(e)` (the
+                    // pre-fix behaviour) rolls back the SOURCE's own
+                    // completion/failure right along with the blocked trigger --
+                    // a full tenant quota can therefore wedge every unrelated
+                    // source workflow that happens to fire a trigger at this
+                    // target, forever, until the quota frees up on its own.
+                    // `continue`-ing like the `PayloadTooLarge` arm above is
+                    // also wrong: unlike an oversized payload (which can never
+                    // succeed no matter how many times it's retried), a quota
+                    // is a TEMPORARY condition, so silently dropping the
+                    // trigger here would permanently lose it.
+                    //
+                    // The fix: fall back to the exact same durable outbox +
+                    // `DeferredTriggerStart` retry mechanism the cross-shard
+                    // branch below already uses for every one of its starts,
+                    // with `target_shard == source_shard`. The outbox row is
+                    // inserted on THIS connection, so it commits atomically
+                    // with the source's own terminal transaction (never
+                    // orphaned by a rollback, never leaked by a commit that
+                    // somehow skipped it); `enforce_completion_triggers_outbox`
+                    // already scans by `target_shard.eq_any(shard_assignments)`
+                    // with no same-shard-vs-cross-shard distinction, so it
+                    // requires no change to retry this row on its own shard.
+                    // The trigger's own `harvest.quota.rejected` metric was
+                    // already recorded by `enforce_quota_admission` inside the
+                    // failed start attempt above; only `completion_trigger_fired`
+                    // needs recording here, using the SAME "started" label the
+                    // cross-shard branch uses for "queued for async delivery"
+                    // (as opposed to "delivered") -- see the `else` branch below.
+                    Err(crate::error::HarvestError::QuotaExceeded {
+                        key,
+                        resource,
+                        limit,
+                        current,
+                        ..
+                    }) => {
+                        tracing::info!(
+                            trigger_id = %trigger_db.id,
+                            target_workflow_name = %trigger_db.target_workflow_name,
+                            quota_key = %key,
+                            resource = %resource,
+                            limit,
+                            current,
+                            "same-shard completion-trigger target is at its per-tenant quota; \
+                             deferring the start to the outbox for retry rather than blocking \
+                             the source execution's own completion"
+                        );
+
+                        if let Some(m) = metrics {
+                            m.record_completion_trigger_fired(&trigger_name, "started");
+                        }
+
+                        let outbox_row = diesel::insert_into(
+                            crate::schema::harvest_completion_trigger_outbox::table,
+                        )
+                        .values(&NewCompletionTriggerOutboxDb {
+                            source_exec_id: exec_id.as_uuid(),
+                            trigger_id: trigger_db.id,
+                            target_shard: source_shard.as_i32(),
+                            target_workflow_name: trigger_db.target_workflow_name.clone(),
+                            target_workflow_id: target_workflow_id.clone(),
+                            target_input: target_input.clone(),
+                            queue_name: trigger_db.queue_name.clone(),
+                            concurrency_key: concurrency_key.clone(),
+                            concurrency_limit: concurrency_limit
+                                .map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
+                            priority: serde_json::to_value(Priority::default())
+                                .unwrap_or(Value::Null),
+                            max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes)
+                                .unwrap_or(i64::MAX),
+                        })
+                        .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                        deferred_starts.push(DeferredTriggerStart {
+                            outbox_id: outbox_row.id,
+                            source_exec_id: exec_id.as_uuid(),
+                            trigger_id: trigger_db.id,
+                            source_shard,
+                            target_shard: source_shard,
+                            target_workflow_name: trigger_db.target_workflow_name.clone(),
+                            target_workflow_id,
+                            target_input,
+                            queue_name: trigger_db.queue_name.clone(),
+                            concurrency_key,
+                            concurrency_limit,
+                            concurrency_on_conflict,
+                            priority: Priority::default(),
+                            max_workflow_input_bytes,
+                            trigger_name,
+                            owner: target_owner,
+                            runbook_url: target_runbook_url,
+                            severity: target_severity,
+                            sla: target_sla,
+                            retry_policy: target_retry_policy,
+                            max_workflow_attempts_ceiling,
+                        });
+
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -1668,6 +1881,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     queue_name: trigger_db.queue_name.clone(),
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes,
                     trigger_name,
@@ -1773,6 +1987,21 @@ pub async fn enforce_completion_triggers_outbox(
             .ok()
             .and_then(|g| *g);
 
+        // Latest-wins overflow strategy (issue #811) is re-resolved from the
+        // registered workflow metadata at relay time rather than persisted on the
+        // outbox row -- the row already carries the resolved key + limit, and
+        // adding a column would need a migration that AC5 rules out.
+        let relay_concurrency_on_conflict = {
+            let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+            lock.as_ref()
+                .and_then(|guard| guard.as_ref())
+                .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
+                .and_then(|meta| meta.concurrency.as_ref())
+                .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
+                    policy.on_conflict
+                })
+        };
+
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
         let params = crate::execution::StartWorkflowParams {
@@ -1796,6 +2025,7 @@ pub async fn enforce_completion_triggers_outbox(
             concurrency_limit: task
                 .concurrency_limit
                 .map(|l| u32::try_from(l).unwrap_or(0)),
+            concurrency_on_conflict: relay_concurrency_on_conflict,
             priority,
             max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
             start_at: None,

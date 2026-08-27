@@ -255,6 +255,8 @@ fn trigger_targeting_a_registered_dag_panics_at_build_time() {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let result = std::panic::catch_unwind(|| {
         build_webhook_routes(&triggers, &[], &[dag], &HarvestApiState::new())

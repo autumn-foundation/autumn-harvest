@@ -18,6 +18,21 @@ against the current codebase and exits non-zero on any regression, blocking the 
 - Payload codec mismatches if fixtures were exported with encrypted payloads
 - DAG-run replay regressions (a DAG-level verifier is a follow-up feature)
 
+> **`replay-verify` is for *completed* histories, and replays them strictly.**
+> To gate a deploy on the executions that are **in flight right now**, use the
+> replay-drift gate instead — see
+> [`docs/replay-drift-gate.md`](replay-drift-gate.md). It exports a stratified
+> cross-shard sample of non-terminal histories (`harvest history export-sample`)
+> and replays it with `WorkflowReplayer::replay_bundle`, which is
+> *frontier-tolerant*: a healthy in-flight execution correctly suspends at its
+> recorded frontier, which strict replay would report as a divergence. The two
+> gates are complements — pin curated completed histories here, and sample live
+> in-flight work there.
+>
+> When a gate says a history *does* diverge, step through it interactively with
+> `harvest debug` to find the exact command that changed — see
+> [`docs/replay-debugger.md`](replay-debugger.md).
+
 ---
 
 ## Quick start (Rust API)
@@ -130,14 +145,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Export fresh fixtures from a staging DB (or from the fixtures store in the repo).
-      # This step is optional if your team commits fixtures to the repo.
+      # Export fresh fixtures from a staging deployment (or use the fixtures
+      # committed to the repo). Optional if your team commits fixtures.
       # - name: Export fixtures
+      #   env:
+      #     HARVEST_API_URL: ${{ secrets.HARVEST_STAGING_API_URL }}
+      #     HARVEST_TOKEN:   ${{ secrets.HARVEST_STAGING_READ_TOKEN }}
       #   run: |
-      #     cargo run --bin harvest-history-export -- \
-      #       --db-url "${{ secrets.STAGING_DB_URL }}" \
-      #       --out ./fixtures/replay \
-      #       --batch
+      #     cargo run --release -p autumn-harvest-cli -- \
+      #       history export-batch \
+      #       --state-group terminal \
+      #       --limit 200 \
+      #       --output-file ./fixtures/replay/batch.json
 
       - name: Run replay-verify
         run: |

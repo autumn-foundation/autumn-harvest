@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,10 +26,11 @@ use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
 use crate::context::{
-    ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
+    ActivityContext, ActivityIdentity, SharedState, WorkflowCommand, WorkflowHistoryPolicy,
+    empty_shared_state,
 };
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::{CapabilityMissPhase, HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution_collect,
@@ -203,6 +204,12 @@ pub struct WorkerRuntimeConfig {
     /// Consecutive worker crashes a task may cause before quarantine (issue #367).
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
+    /// Consecutive claims by workers with no handler registered for a task's
+    /// workflow/activity type before it escalates to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    /// Writes no dead-letter row. `0` escalates on the first miss (pre-#804
+    /// fail-fast behaviour).
+    pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).
     /// `Duration::ZERO` disables the timeout (unbounded dispatch time).
@@ -229,6 +236,55 @@ pub struct WorkerRuntimeConfig {
 }
 
 impl WorkerRuntimeConfig {
+    /// Resolve an **empty** (auto) [`shard_assignments`] into the concrete set
+    /// of shards this worker will poll (issue #961, AC1).
+    ///
+    /// Empty means *auto*: cover every shard the configured
+    /// [`sharded_pool`](Self::sharded_pool) exposes, so an operator who adds a
+    /// shard without also editing `shard_assignments` still gets it drained
+    /// instead of silently stranding every workflow routed there. With **no**
+    /// sharded pool the list is left **empty**: there is no shard identity to
+    /// resolve, and fabricating `[ShardId::new(0)]` would assert a shard number
+    /// this process never established (issue #961 review, Codex round 2). Empty
+    /// is also the shape every read-side consumer already normalises as
+    /// "covers whatever shard the row was read from" — see
+    /// `shard_fanout::worker_covers_shard` and issue #1150.
+    ///
+    /// **Idempotent by construction** — a non-empty list (whether explicitly
+    /// configured or already auto-resolved) is left untouched, so
+    /// [`Worker::new`] and `runner.rs` may both call it without drifting or
+    /// double-applying.
+    ///
+    /// It is also why `From<WorkerConfig>` must **not** call it: a runner
+    /// assigns [`sharded_pool`](Self::sharded_pool) onto the runtime config
+    /// *after* the conversion, so resolving during the conversion would see no
+    /// pool and accomplish nothing. Resolve only where the pool is final —
+    /// `Worker::new` and the runner, both of which run after assignment.
+    ///
+    /// [`shard_assignments`]: Self::shard_assignments
+    #[cfg(feature = "db")]
+    pub fn resolve_shard_assignments(&mut self) {
+        let pool_shards: Vec<crate::types::ShardId> = self
+            .sharded_pool
+            .as_ref()
+            .map(super::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default();
+        self.shard_assignments = crate::builder::resolve_shard_assignments(
+            std::mem::take(&mut self.shard_assignments),
+            &pool_shards,
+        );
+    }
+
+    /// Non-`db` builds have no sharded pool, so an auto (empty) list stays
+    /// empty and an explicit list is deduplicated.
+    #[cfg(not(feature = "db"))]
+    pub fn resolve_shard_assignments(&mut self) {
+        self.shard_assignments = crate::builder::resolve_shard_assignments(
+            std::mem::take(&mut self.shard_assignments),
+            &[],
+        );
+    }
+
     /// Validate this configuration.
     ///
     /// # Errors
@@ -333,7 +389,23 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
-            shard_assignments: cfg.shard_assignments,
+            // Deduplicated here, not only in `with_shard_assignments`, because
+            // `shard_assignments` is a `pub` field an embedder can set
+            // directly. This `From` is the single choke point every worker's
+            // config passes through on its way to the per-shard monitor
+            // fan-out (issue #797).
+            //
+            // An **empty** list means "auto: cover every pool shard" (issue
+            // #961) and is deliberately left EMPTY here. Resolving at this
+            // point would be actively wrong: a runner assigns `sharded_pool`
+            // onto the *runtime* config **after** this conversion, so an early
+            // resolution would see `None`, collapse the "auto" sentinel to
+            // `[ShardId::new(0)]`, and — because resolution is idempotent on a
+            // non-empty list — permanently pin a multi-shard worker to shard 0.
+            // Resolution therefore happens only where the pool is final:
+            // `Worker::new` (and `runner.rs`, which resolves first so its
+            // coverage warning sees the effective set).
+            shard_assignments: crate::builder::dedup_shard_assignments(cfg.shard_assignments),
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
             build_id: cfg.build_id,
             deployment_name: cfg.deployment_name,
@@ -341,6 +413,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
+            capability_miss_max_redeliveries: cfg.capability_miss_max_redeliveries,
             workflow_task_timeout: cfg.workflow_task_timeout,
             workflow_panic_max_attempts: cfg.workflow_panic_max_attempts,
             max_workflow_pause_duration: cfg.max_workflow_pause_duration,
@@ -446,6 +519,10 @@ pub struct HandlerRegistry {
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` (the
+    /// default) disables the sink: `ctx.logger()` stays tracing-only, no
+    /// `RecordLog` command is ever pushed, and the worker performs no log write.
+    pub workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on `workflow_attempt` (issue #523). `None` = no
     /// ceiling. Applied to scheduler-fired starts so automated fires respect
     /// the same operator-configured cap as API/manual starts.
@@ -461,6 +538,19 @@ pub struct HandlerRegistry {
     /// DEFAULT (must reach every start, AC4), whereas the per-run ceiling only
     /// caps a specified value.
     pub max_workflow_chain_timeout: Option<std::time::Duration>,
+    /// Server-side ceiling on the per-run `execution_timeout` (issue #243),
+    /// threaded here (rather than resolved per-request from `api_state` like
+    /// the HTTP start paths) so the scheduler tick, buffered-drain, and manual
+    /// DAG trigger paths -- core-crate components with no `api_state` -- apply
+    /// the SAME fleet-wide ceiling to scheduler-initiated starts that manual
+    /// HTTP starts already apply (issue #743 review). `None` = no ceiling
+    /// applied fleet-wide.
+    ///
+    /// Unlike [`Self::max_workflow_chain_timeout`], this only CAPS a specified
+    /// value -- it is not itself a fleet-wide default when the workflow/DAG
+    /// declares no `execution_timeout` at all (mirrors the HTTP start paths'
+    /// `(other, _) => other` clamp rule in `execution.rs`).
+    pub max_workflow_execution_timeout: Option<std::time::Duration>,
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -492,6 +582,21 @@ pub struct HandlerRegistry {
     /// Builder-level default activity `start_to_close` (issue #620). `None` = no
     /// floor configured.
     default_activity_start_to_close: Option<Duration>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint (issue #744).
+    /// Not opt-in — always applied. Mirrored from
+    /// [`crate::builder::WorkerConfig::retry_after_ceiling`]; default
+    /// [`crate::builder::DEFAULT_RETRY_AFTER_CEILING`] (15 minutes).
+    pub retry_after_ceiling: Duration,
+    /// Names of unified DAGs auto-registered as shadow workflows by
+    /// `HarvestBuilder::dags()` (issue #256).
+    ///
+    /// Those names live in [`Self::workflows`] like any other type, so a
+    /// core-crate component cannot otherwise tell a DAG apart from a plain
+    /// workflow — the plugin's `is_registered_dag` is unavailable here.
+    /// Threaded for the same reason as [`Self::max_workflow_execution_timeout`]:
+    /// so a core path can enforce a rule the HTTP layer already enforces.
+    /// Empty (the default) = no DAGs registered.
+    dag_workflow_names: std::collections::HashSet<String>,
 }
 
 impl HandlerRegistry {
@@ -575,6 +680,7 @@ impl HandlerRegistry {
                             input_schema: w.input_schema,
                             sla: w.sla,
                             retry_policy: w.retry_policy.clone(),
+                            quota: w.quota,
                         },
                     )
                 })
@@ -625,11 +731,14 @@ impl HandlerRegistry {
             max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            workflow_log_policy: None,
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
+            max_workflow_execution_timeout: None,
+            dag_workflow_names: std::collections::HashSet::new(),
             payload_offloader: None,
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
@@ -640,6 +749,7 @@ impl HandlerRegistry {
             wasm_module_registrations: Vec::new(),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         }
     }
 
@@ -704,6 +814,19 @@ impl HandlerRegistry {
         self
     }
 
+    /// Install the opt-in durable workflow-log sink policy (issue #790).
+    ///
+    /// `None` (the default) disables the sink entirely: no `RecordLog` command
+    /// is pushed by the context and the worker performs no log write.
+    #[must_use]
+    pub const fn with_workflow_log_policy(
+        mut self,
+        policy: Option<crate::context::WorkflowLogPolicy>,
+    ) -> Self {
+        self.workflow_log_policy = policy;
+        self
+    }
+
     /// Set the server-side ceiling on `workflow_attempt` (issue #523).
     #[must_use]
     pub fn with_max_workflow_attempts_ceiling(mut self, ceiling: Option<u32>) -> Self {
@@ -727,6 +850,34 @@ impl HandlerRegistry {
         ceiling: Option<std::time::Duration>,
     ) -> Self {
         self.max_workflow_chain_timeout = ceiling;
+        self
+    }
+
+    /// Set the server-side ceiling on the per-run `execution_timeout`
+    /// (issue #743 review). Applied to scheduler-tick, buffered-drain, and
+    /// manual DAG trigger starts so a fleet-wide cap configured via
+    /// `HarvestBuilder::max_workflow_execution_timeout` reaches
+    /// scheduler-initiated starts identically to manual/HTTP starts.
+    #[must_use]
+    pub const fn with_max_workflow_execution_timeout(
+        mut self,
+        ceiling: Option<std::time::Duration>,
+    ) -> Self {
+        self.max_workflow_execution_timeout = ceiling;
+        self
+    }
+
+    /// Record which registered workflow names are auto-registered unified DAGs
+    /// (issue #256), so core paths can enforce DAG-specific rules the plugin's
+    /// `is_registered_dag` guards at the HTTP layer — currently the issue #803
+    /// rejection of a cross-type continue-as-new into a DAG.
+    #[must_use]
+    pub fn with_dag_workflow_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.dag_workflow_names = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -842,6 +993,16 @@ impl HandlerRegistry {
         self.default_activity_start_to_close
     }
 
+    /// Set the ceiling on an author-supplied `Retry-After` delay hint (issue
+    /// #744). Mirrors [`crate::builder::WorkerConfig::with_retry_after_ceiling`];
+    /// installed here so the ceiling is reachable at the worker dispatch call
+    /// site without threading a separate parameter through every caller.
+    #[must_use]
+    pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
+        self.retry_after_ceiling = ceiling;
+        self
+    }
+
     /// Clone the shared state reference for runtime contexts.
     #[must_use]
     pub fn shared_state(&self) -> SharedState {
@@ -922,6 +1083,7 @@ impl std::fmt::Debug for HandlerRegistry {
         let mut d = f.debug_struct("HandlerRegistry");
         d.field("workflows", &self.workflows.keys())
             .field("activities", &self.activities.keys())
+            .field("dag_workflow_names", &self.dag_workflow_names)
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
             .field("signal_handler_count", &self.signal_handlers.len())
@@ -933,6 +1095,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_current_details_bytes", &self.max_current_details_bytes)
+            .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
             .field(
                 "max_workflow_attempts_ceiling",
@@ -941,6 +1104,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "max_workflow_chain_timeout",
                 &self.max_workflow_chain_timeout,
+            )
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
             .field(
@@ -954,7 +1121,8 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "default_activity_start_to_close",
                 &self.default_activity_start_to_close,
-            );
+            )
+            .field("retry_after_ceiling", &self.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         d.field("wasm_activity_count", &self.wasm_activities.len())
             .field("wasm_store_configured", &self.wasm_store.is_some())
@@ -1008,6 +1176,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::AwaitExternalWorkflow { .. } => "AwaitExternalWorkflow",
@@ -1075,6 +1244,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1097,6 +1267,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1128,6 +1299,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1381,6 +1553,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1413,6 +1586,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1464,6 +1638,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1523,6 +1698,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1552,6 +1728,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1671,6 +1848,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // Anything else (activity, activity wait, signal wait, external
@@ -1854,7 +2032,10 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
 #[derive(Clone)]
 struct SignalExternalWorkflowRun {
     signal_id: crate::types::ExternalSignalId,
-    target: ExecutionId,
+    /// Either a specific [`ExecutionId`] or a `(workflow_name, workflow_id)`
+    /// business key resolved to the current run at delivery time (issue
+    /// #751).
+    target: crate::types::ExternalTarget,
     signal_name: String,
     payload: serde_json::Value,
     /// `true` when `ExternalSignalRequested` is already durable — worker crashed
@@ -1870,7 +2051,10 @@ struct SignalExternalWorkflowRun {
 #[derive(Clone)]
 struct CancelExternalWorkflowRun {
     cancel_id: crate::types::ExternalCancelId,
-    target: ExecutionId,
+    /// Either a specific [`ExecutionId`] or a `(workflow_name, workflow_id)`
+    /// business key resolved to the current run at delivery time (issue
+    /// #751).
+    target: crate::types::ExternalTarget,
     already_requested: bool,
 }
 
@@ -2117,7 +2301,8 @@ fn split_mixed_signal_batch(
             WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::PublishProgress { .. } => {}
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
     }
@@ -2237,7 +2422,7 @@ async fn persist_external_signal_inline(
                         if !run.already_requested {
                             let requested = WorkflowEvent::ExternalSignalRequested {
                                 signal_id: run.signal_id,
-                                target: run.target,
+                                target: run.target.clone(),
                                 signal_name: run.signal_name.clone(),
                                 payload: run.payload.clone(),
                                 idempotency_key: run.idempotency_key.clone(),
@@ -2253,42 +2438,120 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // If cross-shard, skip inline delivery entirely and let
-                        // the background outbox handle it.
-                        if run.target.shard() != exec_id.shard() {
+                        // If cross-shard, skip inline delivery entirely and
+                        // let the background outbox handle it. An
+                        // undeterminable owning shard (`None`, only possible
+                        // for a `WorkflowId` target when the process-global
+                        // router isn't initialized) falls back to "assume
+                        // same shard as the caller" — see
+                        // `external_target_owning_shard`'s doc comment.
+                        if crate::shard::external_target_owning_shard(&run.target)
+                            .is_some_and(|owning| owning != exec_id.shard())
+                        {
                             continue;
+                        }
+
+                        // Chaos: pause/kill after the *Requested event is durable
+                        // but before the inline terminal, still inside the txn —
+                        // the #492 window where a concurrent outbox sweep can
+                        // observe a half-written external signal (AC4). Fire only
+                        // for a same-shard *fresh* signal: the half-write window
+                        // exists only because *this* txn just appended the
+                        // `ExternalSignalRequested` event above. On a
+                        // crash-recovery re-delivery (`already_requested`) that
+                        // event is durable from a prior, crashed attempt and
+                        // this txn appends nothing before the inline terminal, so
+                        // there is no new half-write to observe — skip the point,
+                        // matching its name and the #492 reproducer's intent.
+                        // (Cross-shard signals `continue`d to the outbox above,
+                        // so this is reached only for same-shard delivery.)
+                        if !run.already_requested {
+                            crate::chaos_point!(OUTBOX_INLINE_AFTER_REQUESTED);
                         }
 
                         // Same-shard delivery attempt. A deduped insert
                         // (`Ok(false)`, idempotency-key collision) means the
                         // signal already landed once — that is success, so
                         // both outcomes record `ExternalSignalDelivered`.
-                        let terminal_opt = match signal::send_signal_idempotent(
-                            conn,
-                            run.target,
-                            &run.signal_name,
-                            run.payload,
-                            run.idempotency_key.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(_delivered_or_deduped) => {
-                                Some(WorkflowEvent::ExternalSignalDelivered {
-                                    signal_id: run.signal_id,
-                                })
+                        let terminal_opt = match &run.target {
+                            crate::types::ExternalTarget::ExecutionId(target_id) => {
+                                match signal::send_signal_idempotent(
+                                    conn,
+                                    *target_id,
+                                    &run.signal_name,
+                                    run.payload,
+                                    run.idempotency_key.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(_delivered_or_deduped) => {
+                                        Some(WorkflowEvent::ExternalSignalDelivered {
+                                            signal_id: run.signal_id,
+                                        })
+                                    }
+                                    Err(HarvestError::NotFound(_)) => {
+                                        // Same-shard target not found: suspend
+                                        // inline delivery and leave resolution
+                                        // to outbox.
+                                        None
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                        signal_id: run.signal_id,
+                                        reason_code: "target_terminal".to_string(),
+                                    }),
+                                }
                             }
-                            Err(HarvestError::NotFound(_)) => {
-                                // Same-shard target not found: suspend inline
-                                // delivery and leave resolution to outbox.
-                                None
+                            crate::types::ExternalTarget::WorkflowId {
+                                workflow_name,
+                                workflow_id,
+                            } => {
+                                match signal::resolve_and_signal_by_workflow_id(
+                                    conn,
+                                    workflow_name,
+                                    workflow_id,
+                                    &run.signal_name,
+                                    run.payload,
+                                    run.idempotency_key.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(signal::ByIdSignalOutcome::Delivered) => {
+                                        Some(WorkflowEvent::ExternalSignalDelivered {
+                                            signal_id: run.signal_id,
+                                        })
+                                    }
+                                    // The current run for this business key is
+                                    // already terminal — a genuine, immediate
+                                    // failure (unlike cancel, a signal's goal
+                                    // is never already met by a terminal
+                                    // target).
+                                    Ok(signal::ByIdSignalOutcome::NotRunning) => {
+                                        Some(WorkflowEvent::ExternalSignalFailed {
+                                            signal_id: run.signal_id,
+                                            reason_code: "not_running".to_string(),
+                                        })
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    // No run has ever existed for this business
+                                    // key, or the resolved run raced to a
+                                    // CONTINUED_AS_NEW successor between
+                                    // resolution and delivery: leave the bare
+                                    // `Requested` event and let the outbox's
+                                    // unconditional per-tick retry re-resolve
+                                    // (issue #751 AC2/AC3/AC4). Any other error
+                                    // is likewise left unresolved.
+                                    Ok(
+                                        signal::ByIdSignalOutcome::NoRunFound
+                                        | signal::ByIdSignalOutcome::RacedToSuccessor,
+                                    )
+                                    | Err(_) => None,
+                                }
                             }
-                            Err(HarvestError::Database(e)) => {
-                                return Err(HarvestError::Database(e));
-                            }
-                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                signal_id: run.signal_id,
-                                reason_code: "target_terminal".to_string(),
-                            }),
                         };
 
                         if let Some(terminal) = terminal_opt {
@@ -2307,7 +2570,7 @@ async fn persist_external_signal_inline(
                         if !run.already_requested {
                             let requested = WorkflowEvent::ExternalCancelRequested {
                                 cancel_id: run.cancel_id,
-                                target: run.target,
+                                target: run.target.clone(),
                             };
                             store::append_events(
                                 conn,
@@ -2320,8 +2583,12 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // Cross-shard: leave for the outbox scanner.
-                        if run.target.shard() != exec_id.shard() {
+                        // Cross-shard: leave for the outbox scanner. See the
+                        // identical comment on the signal arm above for the
+                        // undeterminable-owning-shard fallback.
+                        if crate::shard::external_target_owning_shard(&run.target)
+                            .is_some_and(|owning| owning != exec_id.shard())
+                        {
                             continue;
                         }
 
@@ -2331,34 +2598,95 @@ async fn persist_external_signal_inline(
                         // Use the collect variant so the target's
                         // completion-trigger starts are spawned only after this
                         // outer transaction commits (issue #492).
-                        let terminal_opt = match cancel_workflow_execution_collect(
-                            conn,
-                            run.target,
-                            "cancelled by external request",
-                        )
-                        .await
-                        {
-                            Err(HarvestError::NotFound(_)) => {
-                                // Target not found: leave for outbox grace window.
-                                None
-                            }
-                            Err(HarvestError::Database(e)) => {
-                                return Err(HarvestError::Database(e));
-                            }
-                            Ok((_cancelled, deferred, checks, metrics_opt)) => {
-                                deferred_starts.extend(deferred);
-                                deferred_checks.extend(checks);
-                                if let Some(m) = metrics_opt {
-                                    cancel_metrics.push(m);
+                        let terminal_opt = match &run.target {
+                            crate::types::ExternalTarget::ExecutionId(target_id) => {
+                                match cancel_workflow_execution_collect(
+                                    conn,
+                                    *target_id,
+                                    "cancelled by external request",
+                                )
+                                .await
+                                {
+                                    Err(HarvestError::NotFound(_)) => {
+                                        // Target not found: leave for outbox
+                                        // grace window.
+                                        None
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    Ok((_cancelled, deferred, checks, metrics_opt)) => {
+                                        deferred_starts.extend(deferred);
+                                        deferred_checks.extend(checks);
+                                        if let Some(m) = metrics_opt {
+                                            cancel_metrics.push(m);
+                                        }
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    // Other Err (already terminal) = no-op success.
+                                    Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
+                                        cancel_id: run.cancel_id,
+                                    }),
                                 }
-                                Some(WorkflowEvent::ExternalCancelDelivered {
-                                    cancel_id: run.cancel_id,
-                                })
                             }
-                            // Other Err (already terminal) = no-op success.
-                            Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
-                                cancel_id: run.cancel_id,
-                            }),
+                            crate::types::ExternalTarget::WorkflowId {
+                                workflow_name,
+                                workflow_id,
+                            } => {
+                                match crate::execution::resolve_and_cancel_by_workflow_id(
+                                    conn,
+                                    workflow_name,
+                                    workflow_id,
+                                    "cancelled by external request",
+                                )
+                                .await
+                                {
+                                    Ok(crate::execution::ByIdCancelOutcome::Cancelled {
+                                        deferred,
+                                        closed_children,
+                                        metrics,
+                                        ..
+                                    }) => {
+                                        deferred_starts.extend(deferred);
+                                        deferred_checks.extend(closed_children);
+                                        if let Some(m) = metrics {
+                                            cancel_metrics.push(m);
+                                        }
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    // The current run for this business key is
+                                    // already terminal — the cancel goal
+                                    // ("nothing is running under this key") is
+                                    // already met (issue #751 AC5).
+                                    Ok(crate::execution::ByIdCancelOutcome::AlreadyTerminal) => {
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    // No run has ever existed for this business
+                                    // key: leave for outbox grace window. A
+                                    // resolved run that raced to a
+                                    // CONTINUED_AS_NEW successor between
+                                    // resolution and the cancel attempt is
+                                    // left unresolved too, so the outbox's
+                                    // unconditional per-tick retry re-resolves
+                                    // and cancels the live successor (issue
+                                    // #751 AC2/AC3). Any other error is
+                                    // likewise left unresolved.
+                                    Ok(
+                                        crate::execution::ByIdCancelOutcome::NoRunFound
+                                        | crate::execution::ByIdCancelOutcome::RacedToSuccessor,
+                                    )
+                                    | Err(_) => None,
+                                }
+                            }
                         };
 
                         if let Some(terminal) = terminal_opt {
@@ -2493,6 +2821,191 @@ async fn persist_external_signal_inline(
     Ok(new_events)
 }
 
+/// The owning run's identity, read off the execution row the caller already
+/// loaded (issue #783) — no extra query.
+///
+/// A named struct rather than a `(&str, &str)` tuple: `workflow_id` and
+/// `workflow_type` are both plain strings on the same row, so a positional
+/// transposition would type-check silently and mislabel the owning run in every
+/// log line and idempotency key this feature exists to produce.
+#[derive(Debug, Clone, Copy)]
+struct OwningRun<'a> {
+    /// The run's business-level workflow identifier
+    /// (`harvest_workflow_executions.workflow_id`).
+    workflow_id: &'a str,
+    /// The run's logical workflow type
+    /// (`harvest_workflow_executions.workflow_name`).
+    workflow_type: &'a str,
+}
+
+/// The wall-clock budget a **workflow** task dispatch actually gets (issue
+/// #494).
+///
+/// `Duration::ZERO` disables the feature. Otherwise the configured
+/// `workflow_task_timeout` is raised to at least
+/// `max_local_activity_start_to_close`: local activities execute **inline**
+/// inside the workflow task, so a budget below the local cap would kill a
+/// workflow that is legitimately waiting on an in-progress local activity.
+///
+/// This interacts with issue #783's local-activity
+/// [`ActivityContext::deadline`], which reports the *minimum* of the attempt's
+/// own budget and this enclosing one (see [`local_attempt_deadline`]). Without
+/// the `max`, a workflow-task timeout below the local cap would make the
+/// enclosing clock dominate every local attempt's reported deadline — cutting
+/// it short rather than merely bounding it.
+const fn effective_workflow_task_timeout(configured: Duration, local_cap: Duration) -> Duration {
+    if configured.is_zero() {
+        Duration::ZERO
+    } else if configured.as_nanos() >= local_cap.as_nanos() {
+        configured
+    } else {
+        local_cap
+    }
+}
+
+/// The deadline a **local** activity attempt reports via
+/// [`ActivityContext::deadline`] (issue #783).
+///
+/// The earlier of the two clocks that can actually cut the attempt off:
+/// * its own per-attempt budget, `now + per_attempt_timeout` — already clamped
+///   to `max_local_activity_start_to_close` — enforced by the per-attempt
+///   `tokio::time::timeout`; and
+/// * the enclosing workflow-task budget (issue #494), an *absolute* instant
+///   captured when that dispatch's `tokio::time::timeout` was armed.
+///
+/// Taking the minimum matters because the enclosing clock starts at the top of
+/// the decision cycle, not at this attempt. Everything spent before we get here
+/// — history load, earlier commands, a previous attempt of this same local
+/// activity — is charged to it and not to us, so `now + per_attempt_timeout`
+/// alone **over-reports**: on stock defaults the two budgets are equal
+/// (`max(10s, 60s)` against a 60s local cap), so even a first attempt drifts,
+/// and a second attempt can claim nearly a full budget moments before the outer
+/// timeout cancels it. Over-reporting is the destructive direction — it is
+/// exactly what makes a deadline-aware activity skip its checkpoint and lose
+/// the work this feature exists to preserve.
+///
+/// `None` for the enclosing budget means the workflow-task timeout is disabled
+/// (`Duration::ZERO`), leaving the per-attempt budget as the only clock.
+fn local_attempt_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    per_attempt_timeout: Duration,
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let own = chrono::Duration::from_std(per_attempt_timeout)
+        .ok()
+        .and_then(|budget| now.checked_add_signed(budget));
+    match (own, workflow_task_deadline) {
+        (Some(own), Some(enclosing)) => Some(own.min(enclosing)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// The claimed workflow-task row whose capability-miss accounting describes the
+/// frontier a local activity is about to resolve (issue #804, Codex round-21
+/// P1).
+///
+/// Carried into [`run_local_activity_inline`] so the reset can commit in the
+/// SAME transaction as the events that make the progress durable — see
+/// [`append_frontier_resolution`].
+#[derive(Clone, Copy)]
+struct FrontierAccounting<'a> {
+    /// `harvest_task_queue.id` of the workflow task being dispatched.
+    task_id: uuid::Uuid,
+    /// The worker holding the claim; guards the reset so it can only ever clear
+    /// accounting on a row this dispatch still owns.
+    worker_id: &'a str,
+    /// Set once a frontier reset has **committed** in this dispatch (issue
+    /// #804, Codex round-22 P2).
+    ///
+    /// This is how `handle_capability_miss` knows the persisted counters
+    /// without re-reading them. Because the reset commits in the same
+    /// transaction as the frontier-resolving append, the flag is exact rather
+    /// than advisory: set means the row was written to `(0, [])`, clear means
+    /// nothing in this dispatch touched those columns, so the claim-time
+    /// snapshot is still current. Nothing else writes them between claim and
+    /// the miss (a concurrent reclaim changes `worker_id`, which the release's
+    /// own guard turns into a `0 rows affected` no-op), so the two cases are
+    /// exhaustive.
+    reset_committed: &'a std::sync::atomic::AtomicBool,
+}
+
+/// Append a local activity's **frontier-resolving** events and clear the
+/// capability-miss accounting atomically (issue #804, Codex round-21 P1).
+///
+/// The reset is bookkeeping *about* the appended events: it says "the misses
+/// recorded so far were recorded against a handler this run has now moved past".
+/// Writing it separately would make it an independent failure point AFTER the
+/// progress became durable — and a failure there strands the claimed row
+/// (`RUNNING`, owned by a live worker, so neither the workflow-task timeout nor
+/// the poison-pill orphan reclaim recovers it). Committing both together means
+/// the only failure mode left is the pre-existing "the append itself failed",
+/// in which case no progress became durable and the counters still describe
+/// reality.
+///
+/// Called only for the two outcomes that actually retire a frontier — success
+/// (`LocalActivityCompleted`) and retry exhaustion (the
+/// `LocalActivityFailed` + `LocalActivityExhausted` pair). A non-terminal
+/// failure leaves the SAME local activity as the frontier, so it must not reset.
+///
+/// # Why only the capability columns
+///
+/// The three *consecutive-failure* strike states — `crash_strikes` (#367), the
+/// workflow-task-timeout strike (#494) and the panic strike (#782) — are
+/// deliberately **not** cleared here, and a later mid-body capability miss
+/// deliberately preserves them (see [`CapabilityMissPhase::clears_crash_strikes`]
+/// and its two siblings). Retiring a frontier is not evidence about any of
+/// them, because the thing they measure happens *after* it (Codex round-24 P2).
+///
+/// Clearing them here would be self-defeating rather than merely lax. Every
+/// dispatch of a task that completes one local activity and then kills its
+/// worker reaches this commit first, so the zero would land on the crashing
+/// dispatch too; `poison_pill::reclaim_orphaned_tasks` then increments from the
+/// row's *current* value, so `crash_strikes` could never exceed `1` and the
+/// default `poison_pill_threshold` of 3 would be unreachable — for the whole
+/// class of poison that crashes after making some progress. #494 and #782 have
+/// the identical shape: a body that hangs, or panics, after its first local
+/// activity completes that activity on every redelivery.
+///
+/// Clearing at *release* time instead (only when this dispatch made progress)
+/// avoids that, but reintroduces the blameless-third-party laundering the phase
+/// gating exists to prevent: an incapable worker that registers local activity 1
+/// but not local activity 2 — the ordinary rolling-deploy shape — would zero a
+/// capable peer's crash/hang/panic streak on every claim.
+///
+/// The counters are only ever *preserved* here, never incremented, so AC4 holds;
+/// and genuine progress still clears them by the intended route, the clean
+/// continuation ([`crate::queue::CleanContinuationChangeset`]), which fires when
+/// the body actually carries forward to a suspension instead of stalling at a
+/// later frontier.
+async fn append_frontier_resolution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    event_start: i32,
+    frontier: FrontierAccounting<'_>,
+) -> HarvestResult<()> {
+    let owned: Vec<WorkflowEvent> = events.to_vec();
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        store::append_events(conn, exec_id, &owned, event_start).await?;
+        queue::reset_capability_misses_after_inline_progress(
+            conn,
+            frontier.task_id,
+            frontier.worker_id,
+        )
+        .await?;
+        Ok(())
+    }))
+    .await?;
+    // Only after the commit: a rolled-back transaction reset nothing, so the
+    // claim-time snapshot is still the truth and must stay the basis for the
+    // release-vs-escalate decision (issue #804, Codex round-22 P2).
+    frontier
+        .reset_committed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// Run a local activity inline, appending durability events to `harvest_events`.
 ///
 /// Retries the handler up to `max_attempts` times (per the retry policy),
@@ -2510,9 +3023,20 @@ async fn run_local_activity_inline(
     max_start_to_close: Duration,
     next_event_id: &mut i32,
     context_headers: std::sync::Arc<std::collections::HashMap<String, String>>,
-    // Owning workflow task queue, used only as the `queue` label on the
-    // contained-local-activity-panic metric (issue #782).
+    // Owning workflow task queue, used as the `queue` label on the
+    // contained-local-activity-panic metric (issue #782) and reported by
+    // `ActivityContext::queue_name()` (issue #783) — a local activity runs on
+    // the owning workflow task, so it has no queue of its own.
     queue_name: &str,
+    owner: OwningRun<'_>,
+    // Issue #783: absolute instant the enclosing workflow-task dispatch is cut
+    // off at (issue #494), or `None` when that timeout is disabled. Clamps the
+    // reported per-attempt deadline so it can never out-live the cycle.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #804 (Codex round-21 P1): the claimed row whose capability-miss
+    // accounting is retired atomically with this activity's frontier-resolving
+    // append. See `append_frontier_resolution`.
+    frontier: FrontierAccounting<'_>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -2520,9 +3044,29 @@ async fn run_local_activity_inline(
         detached_commands,
         run,
     } = batch;
-    let activity = registry.activities.get(&run.name).ok_or_else(|| {
-        HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
-    })?;
+    // Issue #804: a local activity runs INLINE on the workflow worker, so a
+    // worker without its handler cannot make progress on this *workflow* task.
+    // The typed error releases the workflow task for a capable peer rather than
+    // failing the run (the pre-#804 `Config` error propagated to
+    // `fail_execution_on_error` and sealed it terminally).
+    //
+    // In practice `missing_local_activity_handler` has already raised this a few
+    // frames up (Codex round-19 P2), before the caller commits the batch's
+    // sibling side effects — this lookup is still the one that yields the
+    // `&ActivityInfo`, so it stays as the backstop that keeps the two honest.
+    // Both consult `registry.activities`, so they cannot disagree about
+    // *whether* a handler exists; only about how much work happened first.
+    let activity =
+        registry
+            .activities
+            .get(&run.name)
+            .ok_or_else(|| HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: run.name.clone(),
+                // The workflow body is mid-flight: it suspended on this local
+                // activity and has NOT returned its commands.
+                phase: CapabilityMissPhase::DuringHandler,
+            })?;
     // Issue #965: a WASM-backed activity is dispatched through the remote
     // task-queue seam (`process_activity_task`), never inline. `wasm_activity()`
     // always registers a non-local activity, so this is unreachable via the
@@ -2647,14 +3191,37 @@ async fn run_local_activity_inline(
     let invocation = crate::interceptor::ActivityInvocation::new(&run.name, true, queue_name);
 
     for attempt in start_attempt..=max_attempts {
-        let ctx =
-            ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
-                .with_context_headers(std::sync::Arc::clone(&context_headers))
-                .with_metrics(registry.telemetry().metrics.clone())
-                .with_idempotency_key(local_idempotency_key.clone())
-                .with_attempt(attempt)
-                .with_max_attempts(max_attempts)
-                .with_previous_failure(previous_failure.clone());
+        // Issue #783: the earlier of this attempt's own budget (`now +
+        // per_attempt_timeout`, already clamped to
+        // `WorkerConfig::max_local_activity_start_to_close` per AC5) and the
+        // enclosing workflow-task budget (issue #494), which started at the top
+        // of the decision cycle rather than here. See `local_attempt_deadline`
+        // for why the minimum — not the per-attempt budget alone — is what the
+        // activity must see.
+        let attempt_deadline = local_attempt_deadline(
+            chrono::Utc::now(),
+            per_attempt_timeout,
+            workflow_task_deadline,
+        );
+        let ctx = ActivityContext::new_local_activity(
+            registry.shared_state(),
+            CancellationToken::new(),
+            ActivityIdentity::new(
+                exec_id,
+                owner.workflow_id,
+                owner.workflow_type,
+                run.name.clone(),
+                run.activity_id,
+            ),
+        )
+        .with_queue_name(queue_name.to_string())
+        .with_deadline(attempt_deadline)
+        .with_context_headers(std::sync::Arc::clone(&context_headers))
+        .with_metrics(registry.telemetry().metrics.clone())
+        .with_idempotency_key(local_idempotency_key.clone())
+        .with_attempt(attempt)
+        .with_max_attempts(max_attempts)
+        .with_previous_failure(previous_failure.clone());
         // Issue #782: contain a local-activity handler panic. Local activities
         // run inline in the workflow task, so an uncaught panic here would
         // unwind the whole workflow-task dispatch. Catch it and flatten into a
@@ -2715,11 +3282,15 @@ async fn run_local_activity_inline(
                     activity_id: run.activity_id,
                     output,
                 };
-                store::append_events(
+                // The success append retires this frontier, so it carries the
+                // capability-miss reset in its own transaction (issue #804,
+                // Codex round-21 P1).
+                append_frontier_resolution(
                     conn,
                     exec_id,
                     std::slice::from_ref(&completed_event),
                     *next_event_id,
+                    frontier,
                 )
                 .await?;
                 *next_event_id += 1;
@@ -2798,7 +3369,17 @@ async fn run_local_activity_inline(
                         attempt,
                     };
                     let terminal_pair = [failed_event, exhausted_event];
-                    store::append_events(conn, exec_id, &terminal_pair, *next_event_id).await?;
+                    // Retry exhaustion retires this frontier just as decisively
+                    // as success, so it too carries the capability-miss reset in
+                    // its own transaction (issue #804, Codex round-21 P1).
+                    append_frontier_resolution(
+                        conn,
+                        exec_id,
+                        &terminal_pair,
+                        *next_event_id,
+                        frontier,
+                    )
+                    .await?;
                     *next_event_id += i32::try_from(terminal_pair.len())
                         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
                     all_new_events.extend(terminal_pair);
@@ -2840,10 +3421,17 @@ async fn run_local_activity_inline(
                     });
                 }
 
-                if let Some(delay) = run
+                // Issue #744 (Codex review, PR #1140): honor an
+                // ActivityFailure::retry_after hint for local activities too,
+                // clamped to the configured ceiling -- previously this only
+                // ever consulted the registered RetryPolicy's own backoff,
+                // silently ignoring a downstream-supplied delay hint.
+                let policy_delay = run
                     .retry_policy
                     .as_ref()
-                    .and_then(|p| p.next_delay(attempt))
+                    .and_then(|p| p.next_delay(attempt));
+                if let Some(delay) =
+                    local_retry_delay(policy_delay, typed.as_ref(), registry.retry_after_ceiling)
                 {
                     tokio::time::sleep(delay).await;
                 }
@@ -2956,26 +3544,73 @@ fn next_retry_delay(
     task: &TaskQueueItem,
     error: &str,
     retry_policy: Option<&RetryPolicy>,
+    retry_after_ceiling: Duration,
 ) -> HarvestResult<Option<chrono::Duration>> {
-    // Non-retryable (typed flag or policy `non_retryable_errors`, incl. legacy
-    // `Err(String)`) short-circuits all remaining attempts. See
-    // `failure_is_non_retryable` for the shared rule.
-    if failure_is_non_retryable(error, retry_policy) {
+    // Issue #744: parse the error ONCE via `classify_activity_error` so both
+    // the non-retryable decision AND the activity-supplied `retry_after` hint
+    // (if any) come from a single parse -- `failure_is_non_retryable` alone
+    // would discard the recovered `ActivityFailure` and its `retry_after`.
+    let (failure, non_retryable) = crate::failure::classify_activity_error(error, retry_policy);
+
+    // AC4: non_retryable wins over retry_after unconditionally -- routes to
+    // the terminal/DLQ path immediately regardless of any delay hint.
+    if non_retryable {
         return Ok(None);
     }
 
-    if let Some(policy) = retry_policy {
-        return policy
-            .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
-            .map(|delay| chrono_duration_from_std(delay, "retry delay"))
-            .transpose();
-    }
+    let policy_delay: Option<Duration> = retry_policy.map_or_else(
+        || {
+            if task.attempt < task.max_attempts {
+                Some(Duration::from_secs(1))
+            } else {
+                None
+            }
+        },
+        |policy| policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task)),
+    );
 
-    if task.attempt < task.max_attempts {
-        return Ok(Some(chrono::Duration::seconds(1)));
-    }
+    // The attempt-cap gate is authoritative and must never be bypassed by a
+    // retry_after hint (AC2): once the policy/attempt-cap says "no more
+    // retries", retry_after cannot resurrect the attempt.
+    let Some(policy_delay) = policy_delay else {
+        return Ok(None);
+    };
 
-    Ok(None)
+    // AC3: a present, positive retry_after hint overrides the policy-computed
+    // backoff for THIS attempt only, clamped to `[0, retry_after_ceiling]`. A
+    // non-positive (<=0) or absent hint falls through to the policy delay.
+    let delay = crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
+        .unwrap_or(policy_delay);
+
+    chrono_duration_from_std(delay, "retry delay").map(Some)
+}
+
+/// Local-activity counterpart to [`next_retry_delay`] (issue #744, Codex
+/// review on PR #1140): resolve the sleep duration for a non-terminal
+/// local-activity retry attempt, honoring `ActivityFailure::retry_after`
+/// (clamped to `[0, retry_after_ceiling]`) over the policy-computed backoff,
+/// for this attempt only.
+///
+/// Local activities retry INLINE in `run_local_activity_inline`, an entirely
+/// separate code path from the remote/task-queue retry loop `next_retry_delay`
+/// governs -- local activities never get a `harvest_task_queue` row, so there
+/// is no `schedule_to_close`/attempt-cap re-derivation to share here. The
+/// caller already parses the failure once (`parse_typed_payload`, for the
+/// existing `non_retryable` check) and only invokes this helper on a
+/// NON-terminal attempt, where `policy_delay`
+/// (`run.retry_policy.next_delay(attempt)`) is always `Some` in practice --
+/// `attempt < max_attempts` is guaranteed by the caller's `terminal_attempt`
+/// computation, and `RetryPolicy::next_delay` returns `None` only when
+/// `attempt >= max_attempts`. The attempt-cap gate is therefore already
+/// authoritative before this helper ever runs and is never bypassed by a
+/// `retry_after` hint (AC2).
+fn local_retry_delay(
+    policy_delay: Option<Duration>,
+    typed: Option<&crate::failure::ActivityFailure>,
+    retry_after_ceiling: Duration,
+) -> Option<Duration> {
+    let hint = typed.and_then(|f| f.retry_after);
+    crate::policy::resolve_retry_after_hint(hint, retry_after_ceiling).or(policy_delay)
 }
 
 fn find_pending_scheduled_activity(
@@ -3107,6 +3742,36 @@ async fn lock_workflow_execution_row_and_load_history(
     Ok((execution, history))
 }
 
+/// Take the execution row's `FOR UPDATE` lock **without** loading history.
+///
+/// [`lock_workflow_execution_row_and_load_history`] pays a `load_history` the
+/// capability-miss escalation has already preloaded (issue #804, Codex round-29
+/// P1), so re-using it there would put the awaited read back inside the very
+/// window that round closed. This takes the lock alone.
+///
+/// The lock is taken for its **ordering**, not its row: `harvest_task_queue`'s
+/// documented lock order is **execution row → task row** (see `timeout.rs`), so
+/// a caller that must hold the task row across a terminal write takes this
+/// first rather than inverting against `enforce_activity_timeout` /
+/// `finalize_activity_completion`.
+///
+/// Returns `false` when the execution row is gone, which the caller treats as
+/// "nothing to serialize against" rather than an error.
+async fn lock_workflow_execution_row_only(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(harvest_workflow_executions::id)
+        .first::<uuid::Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
+}
+
 async fn task_state_for_update(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -3140,16 +3805,31 @@ fn pending_activity_id_for_task(
     find_pending_scheduled_activity(history, activity_name).map(Some)
 }
 
+/// The activity id claimed by [`append_activity_started_if_pending`], plus the
+/// owning workflow's identity read off the row that call already locks.
+///
+/// The `SELECT ... FOR UPDATE` behind the append loads the full
+/// [`WorkflowExecution`] row regardless, so surfacing `workflow_id` /
+/// `workflow_name` here costs no extra query — it is what lets
+/// `ActivityContext::info()` (issue #783) report the owning workflow's identity
+/// without the dispatch path growing a lookup.
+struct StartedActivity {
+    activity_id: ActivityExecId,
+    workflow_id: String,
+    workflow_name: String,
+}
+
 async fn append_activity_started_if_pending(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
     activity_name: &str,
     worker_id: &str,
-) -> HarvestResult<Option<ActivityExecId>> {
+) -> HarvestResult<Option<StartedActivity>> {
     Box::pin(
-        conn.transaction::<Option<ActivityExecId>, HarvestError, _>(async |conn| {
-            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+        conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
             let Some(activity_id) =
                 pending_activity_id_for_task(&history.events, task, activity_name)?
             else {
@@ -3167,7 +3847,11 @@ async fn append_activity_started_if_pending(
                 worker_id: WorkerId::new(worker_id),
             };
             store::append_events(conn, exec_id, &[started_event], history.next_event_id).await?;
-            Ok(Some(activity_id))
+            Ok(Some(StartedActivity {
+                activity_id,
+                workflow_id: execution.workflow_id,
+                workflow_name: execution.workflow_name,
+            }))
         }),
     )
     .await
@@ -3339,6 +4023,1708 @@ fn nd_block_backoff(block_count: i32) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
+// Capability-miss release / escalate (issue #804)
+// ---------------------------------------------------------------------------
+
+/// Stable, greppable prefix on the terminal error recorded when a task is
+/// escalated after exhausting its capability-miss redelivery budget (issue
+/// #804).
+///
+/// Operators alert on this string to tell "no live worker in the fleet has
+/// this handler" apart from an ordinary application failure.
+pub const NO_CAPABLE_WORKER_PREFIX: &str = "no_capable_worker:";
+
+/// Base delay before the first capability-miss redelivery (issue #804).
+const CAPABILITY_MISS_BACKOFF_BASE_SECS: u64 = 1;
+
+/// Ceiling on the capability-miss redelivery delay (issue #804).
+///
+/// Deliberately much smaller than the ND-block cap (300s): a capability miss
+/// is expected to resolve within one rolling-deploy pod flip, and every second
+/// of backoff is latency added to a task some live peer could already be
+/// running.
+const CAPABILITY_MISS_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Which claim-time handler lookup missed.
+///
+/// This names the *handler kind* and feeds the escalation reason string and
+/// the structured log line. It is deliberately NOT the metric label: the
+/// `task_type` label carries the owning task row's own kind (bounded by the DB
+/// CHECK constraint), which differs here for a local-activity or
+/// activity-scheduling miss — both are raised while processing a workflow task
+/// (issue #804).
+///
+/// Exactly two values, ever — `task_type` on
+/// [`crate::telemetry::METRIC_TASK_CAPABILITY_MISS`] must stay bounded per
+/// ADR-0001 §7. The *name* of the missing handler is deliberately never a
+/// label: it is read from the database and is not bounded by this worker's
+/// registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissKind {
+    /// A workflow task whose `workflow_name` is not in this worker's registry.
+    Workflow,
+    /// An activity task whose `activity_name` is not in this worker's registry.
+    Activity,
+}
+
+impl CapabilityMissKind {
+    /// The bounded metric-label value for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+/// What to do with a claimed task this worker has no handler for (issue #804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissAction {
+    /// Release the claim back to `PENDING` so a capable peer can claim it.
+    Release,
+    /// The redelivery budget is exhausted — fall through to the existing
+    /// terminal-failure path with a `no_capable_worker:` reason.
+    Escalate,
+}
+
+/// Multiplier turning the distinct-worker budget into an **absolute** ceiling on
+/// total capability-miss releases for one task (issue #804).
+///
+/// The primary bound counts *distinct* incapable workers, which is what stops a
+/// single worker from consuming the whole budget by repeatedly winning the claim
+/// race. But a fleet smaller than the budget can never grow the distinct set
+/// past its own size, so the distinct bound alone would let a lone incapable
+/// worker bounce a task forever — violating AC3's "release is bounded". This
+/// multiplier supplies that termination guarantee.
+///
+/// It is deliberately generous. Reaching it *while a capable peer is live*
+/// requires that peer to lose the claim race `budget * MULTIPLIER` consecutive
+/// times (2⁻⁵⁰ for the default budget against an even two-worker split), so it
+/// effectively never fires when a capable worker exists — while a genuinely
+/// capability-less fleet still terminates, at the 30 s backoff cap, in bounded
+/// time rather than bouncing indefinitely.
+pub const CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER: i32 = 10;
+
+/// Decide whether a capability miss releases the task for a peer or escalates
+/// to the terminal-failure path (issue #804).
+///
+/// Two bounds, both must hold to release:
+///
+/// * `distinct_workers_after` — how many **distinct** workers will have missed
+///   this task after recording this one. This is the primary budget. A repeat
+///   miss by a worker already in the set does not move it, so no single
+///   incapable worker can exhaust the budget by winning the claim race over and
+///   over (the released task is eligible to every worker again, and the claim
+///   query has no capability filter).
+/// * `misses_after_increment` — the total-release value the UPDATE would
+///   persist to `harvest_task_queue.capability_misses`, so the **first** miss on
+///   a task arrives here as `1`. Bounded by
+///   [`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × the budget, which is what
+///   terminates a fleet too small to ever grow the distinct set to the budget.
+///
+/// The budget is a **count of permitted redeliveries**, not a threshold to
+/// reach: `max_redeliveries = N` allows exactly `N` distinct-worker releases and
+/// escalates on the `N + 1`th, so escalation fires at `>` rather than `>=`. This is
+/// deliberately *not* the `>=` shape of
+/// [`crate::poison_pill::quarantine_decision`] — that knob is named
+/// `poison_pill_threshold` ("reach it and act"), whereas this one is named for
+/// the number of redeliveries it grants. Under `>=` a budget of 5 would permit
+/// only four releases, and [`no_capable_worker_reason`] would misreport the
+/// count it names in the terminal error.
+///
+/// `max_redeliveries == 0` escalates on the first miss — the documented
+/// rollback switch that restores the pre-#804 "fail terminally on first claim
+/// by an incapable worker" behaviour. Note this is the *opposite* sentinel to
+/// `poison_pill_threshold`'s `0` (which disables quarantine): "max
+/// redeliveries = 0" literally means no redeliveries are allowed.
+///
+/// **Storage ceiling.** A value of `i32::MAX` always escalates, whatever the
+/// budget. `capability_misses` is a Postgres `INT`, and Rust's saturating
+/// arithmetic diverges from Postgres's here: `i32::saturating_add` clamps, but
+/// `capability_misses + 1` at `2147483647` raises `integer out of range` and
+/// aborts the statement. Releasing at the ceiling would therefore issue an
+/// UPDATE that can only fail, leaving the task `RUNNING` and owned by a *live*
+/// worker — which the poison-pill orphan reclaimer deliberately skips, since it
+/// only reclaims rows whose worker has no live heartbeat. The invariant is
+/// stated on the value about to be persisted rather than on the budget: **never
+/// let the column reach `i32::MAX`**, so `+ 1` is always representable however
+/// the counter got there. Organically it never does (2^31 releases at the 30 s
+/// backoff cap is roughly two thousand years), but the column is writable by an
+/// operator, a backfill, or a test seed.
+/// How long a worker may go without a heartbeat before the fleet treats it as
+/// dead.
+///
+/// `2 × heartbeat_interval`, with a 1 s floor for sub-second intervals and a
+/// one-year cap so an absurd configured interval cannot overflow the
+/// `chrono::Duration` arithmetic downstream. The doubling happens *before*
+/// rounding to whole seconds so a fractional interval (e.g. 1500 ms → 3 s, not
+/// 2 s) keeps the documented window.
+///
+/// Extracted so the three subsystems that ask "is this worker alive?" — the
+/// poison-pill orphan reclaimer (#367), the broken-worker-session scanner
+/// (#606), and the capability-miss fleet lookup (#804) — cannot drift apart on
+/// the answer.
+#[must_use]
+pub fn worker_stale_secs(heartbeat_interval: Duration) -> i64 {
+    let doubled = heartbeat_interval.saturating_mul(2);
+    i64::try_from(doubled.as_secs())
+        .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+        .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+        .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS)
+}
+
+/// The slowest `worker_heartbeat_interval` a peer may be configured with and
+/// still be seen as alive by another worker's capability-miss fleet lookup
+/// (issue #804, Codex round-19 P1).
+///
+/// This is a *fleet-wide* contract, not a per-worker one, and it exists because
+/// nothing in `harvest_workers` records a worker's own cadence — a reader has
+/// only `last_heartbeat_at`, so it cannot ask "is this row fresh *for the
+/// worker that wrote it*". Naming the ceiling is what lets a single window be
+/// safe for every peer; [`crate::builder::HarvestBuilder::try_build`] warns a
+/// worker configured past it, so the assumption is surfaced rather than silent.
+pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Duration::from_secs(60);
+
+/// Floor on the liveness window used by the capability-miss fleet lookup
+/// (issue #804, Codex round-19 P1).
+///
+/// [`worker_stale_secs`] answers "is a worker alive?" from *this* worker's
+/// configured cadence, which is correct for the two subsystems that ask it
+/// about **themselves and their own tasks** — the poison-pill reclaimer (#367)
+/// and the broken-session scanner (#606) both compare a window they chose
+/// against rows they are entitled to judge. The capability-miss lookup asks a
+/// different question: "could some **other** worker still run this?" Applying
+/// the claimant's window there judges every peer by the claimant's cadence, so
+/// a worker heartbeating every second queries a two-second window and drops a
+/// live peer running the **default** five-second cadence — a default-config
+/// hazard, not an exotic one. With that peer gone the narrowed fleet holds only
+/// the incapable claimant, [`fleet_capability_evidence`] reports
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and round 15's
+/// configured-total bound terminally fails the execution while a capable peer
+/// is polling the queue.
+///
+/// The floor is `2 ×` [`MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`],
+/// so it covers any peer at or under the supported cadence whatever the
+/// claimant's own interval, and it is applied with `max` rather than replacing
+/// the computed window — the result is never *narrower* than before, so this
+/// can only ever retain more peers and no fleet that escalated correctly can
+/// begin escalating spuriously.
+///
+/// Retaining a worker that is genuinely gone is the safe direction and is
+/// bounded: a stale row that is not in `capability_miss_workers` holds the
+/// evidence at [`FleetCapabilityEvidence::CapablePeerMayExist`], which withholds
+/// **both** evidence-derived bounds — the distinct bound (gated on
+/// `!CapablePeerMayExist`) and the configured-total bound (gated on
+/// `AllLiveWorkersMissed`) — leaving the **ungated** ones in force: the absolute
+/// `10 ×` release ceiling, the `i32::MAX` storage ceiling, the zero-budget
+/// fail-fast, and the session-pinned carve-out. AC3 therefore still holds, but
+/// via the ceiling alone, so the delay this floor can impose is bounded by that
+/// ceiling rather than by `max_redeliveries`. The cost is a delayed escalation;
+/// the cost of the opposite error is the execution. That is the same trade every
+/// prior round took for unprovable coverage: release for longer, never fail
+/// sooner.
+pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
+
+/// The liveness window the capability-miss fleet lookup must use.
+///
+/// [`worker_stale_secs`] widened by [`CAPABILITY_MISS_MIN_FLEET_STALE_SECS`], so
+/// a fast-heartbeating claimant cannot conclude a slower — but healthy — peer is
+/// dead. Deliberately a distinct function rather than a change to
+/// `worker_stale_secs`: the poison-pill reclaimer and the broken-session scanner
+/// judge rows they own with a window they chose, and widening theirs would delay
+/// orphan recovery for no benefit. Only the peer question needs the floor.
+#[must_use]
+pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
+    worker_stale_secs(heartbeat_interval).max(CAPABILITY_MISS_MIN_FLEET_STALE_SECS)
+}
+
+/// Narrow a [`ShardId`](crate::types::ShardId) to the bounded `u16` used as the
+/// `shard` metric label (issue #961).
+///
+/// Every valid shard id fits: encodable ids are `0..=0xFFFE` and the
+/// `UNENCODED` sentinel is `0xFFFF`. An out-of-contract id — only reachable by
+/// constructing `ShardId::new(-1)` / `ShardId::new(70_000)` by hand and handing
+/// it to `ShardedDbPool::from_map`, which does not range-check its keys — would
+/// otherwise be silently merged into shard 0's series, inflating it while the
+/// real shard reads as flatlined (which the dashboard panel shows as
+/// *starvation*). Debug builds assert; release builds keep the pre-existing
+/// `unwrap_or(0)` convention rather than panicking a live poll loop.
+#[must_use]
+fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
+    let raw = shard.as_i32();
+    debug_assert!(
+        u16::try_from(raw).is_ok(),
+        "shard id is outside the encodable range and would be reported as \
+         shard 0 on the harvest.shard.dispatched metric",
+    );
+    u16::try_from(raw).unwrap_or(0)
+}
+
+/// The `shard_assignments` slice a single per-shard monitor should scan
+/// (issue #961 review, Codex P1).
+///
+/// `spawn_monitoring_tasks` starts one timeout checker (and poison-pill
+/// reclaimer, session reconciler, ...) **per assigned shard**. Each pass of
+/// `enforce_timeouts_once` then calls cross-shard helpers —
+/// `fire_due_debounced_starts`, `fire_due_throttled_starts`,
+/// `fire_due_event_batches`, `fire_due_completion_deliveries`,
+/// `sweep_expired_start_idempotency`, and the three external outboxes — that
+/// each iterate the `shard_assignments` they are handed. Passing every checker
+/// the **full** list therefore made an N-shard worker perform N x N pool
+/// acquisitions and table scans every poll interval, and coupled the shards
+/// together: `fire_due_event_batches` propagates a pool-acquisition error with
+/// `?`, so one unreachable shard aborted the remainder of *every* healthy
+/// shard's pass (completion-callback delivery and the idempotency sweep run
+/// after it).
+///
+/// Narrowing each monitor to its own shard makes the union across the N
+/// monitors cover every shard exactly once — O(N) total, and a shard's failure
+/// is contained to its own checker, which is the correct blast radius since
+/// that checker already holds a connection from that same pool. It also
+/// removes the `FOR UPDATE SKIP LOCKED` contention of N checkers racing for
+/// the same rows.
+///
+/// The trade-off is that a wedged per-shard checker no longer has N-1 peers
+/// incidentally covering its shard. That exposure already existed for the
+/// checker's own-database work (`find_timed_out_tasks` has always scanned only
+/// the connection's own database), and issue #797 shipped per-shard
+/// `harvest.scanner.tick` liveness with a bounded `shard` label precisely to
+/// detect it.
+///
+/// `None` is the single-pool fallback (no sharded pool, or no assignments), where
+/// there is no per-shard fan-out to narrow: the full list is passed through and
+/// the helpers take their non-sharded branch, byte-for-byte unchanged.
+#[must_use]
+pub(crate) fn monitor_shard_scope(
+    monitor_shard: Option<crate::types::ShardId>,
+    all_assignments: &[crate::types::ShardId],
+) -> Vec<crate::types::ShardId> {
+    monitor_shard.map_or_else(|| all_assignments.to_vec(), |shard| vec![shard])
+}
+
+/// Floor for [`shard_acquire_bound`].
+///
+/// Generous on purpose. The bound's job is to convert an *indefinite* park into
+/// a skip, so it must be comfortably longer than any healthy acquisition — a
+/// bounded pool whose connections are all busy dispatching legitimately takes
+/// far longer than a poll interval to hand one over, and a bound that fires
+/// there would starve a merely-busy shard rather than protect its peers.
+const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
+
+/// The per-shard pool-acquisition bound (issue #961 review, Codex P1).
+///
+/// Harvest configures no deadpool `Timeouts`, so every `pool.get().await` is an
+/// **unbounded** wait. The multi-shard path visits its shards *sequentially* in
+/// two places, and in both a single exhausted or unreachable pool parks the one
+/// future and strands every peer shard:
+///
+/// * `run_multi_shard`'s startup loop (`register_in_fleet` +
+///   `register_rate_limit_buckets` per shard) - a shard that never yields a
+///   connection means the poll loop is never reached **at all**;
+/// * `run_poll_loop_multi`, which awaits each shard's `poll_once` in turn -
+///   round-robin rotation cannot help, because the loop never reaches the
+///   rotation.
+///
+/// Auto-resolution (this issue) makes that the *default* shape for any
+/// multi-shard pool, which is why it is bounded here.
+///
+/// Bounding converts the head-of-line block into "skip this shard for one
+/// iteration". Both call sites already have a graceful failure branch: a failed
+/// registration arms the per-shard pending flag the heartbeat task retries, and
+/// a failed poll simply returns `false` and rotates on. Under genuine
+/// saturation the shard is retried on the next pass rather than blocking its
+/// peers indefinitely.
+///
+/// The cost is amortized, not free: a shard whose pool stays unavailable is
+/// re-probed once per rotation, so the loop pays the bound each time round.
+/// That is degraded throughput for the remaining shards, never stranding — the
+/// property this fix is for. Skipping a known-bad shard for a cooldown, or
+/// polling shards concurrently, would remove even that cost and is a natural
+/// follow-up; it needs `poll_once` to distinguish "acquisition timed out" from
+/// "no work", which it deliberately does not today.
+///
+/// `false` - the single-shard path - returns `None`, which keeps the original
+/// unbounded `pool.get().await` byte-for-byte (AC7): with one shard there are
+/// no peers to starve, and blocking until a connection frees is the desired
+/// behaviour.
+#[must_use]
+pub(crate) const fn shard_acquire_bound(
+    multi_shard: bool,
+    poll_interval: Duration,
+) -> Option<Duration> {
+    if !multi_shard {
+        return None;
+    }
+    // Never below the floor: the bound exists to stop an *indefinite* block,
+    // not to police normal contention. A short `poll_interval` (tests use 50ms;
+    // a latency-sensitive deployment may too) is far below how long a perfectly
+    // healthy acquisition takes when a bounded pool is busy dispatching, so
+    // using it directly made the bound fire constantly and starve a shard that
+    // merely had a deep backlog.
+    if poll_interval.as_nanos() > MIN_SHARD_ACQUIRE_BOUND.as_nanos() {
+        Some(poll_interval)
+    } else {
+        Some(MIN_SHARD_ACQUIRE_BOUND)
+    }
+}
+
+/// A pooled connection, optionally acquired under a bound.
+///
+/// The single source of truth for [`shard_acquire_bound`]'s two behaviours, so
+/// the multi-shard startup path and the poll loop cannot drift on whether the
+/// wait is capped. `None` is a plain `pool.get().await` — byte-for-byte the
+/// pre-#961 single-shard code path.
+///
+/// Both outcomes collapse to `Err(String)` so each caller's existing
+/// pool-failure branch handles a timeout identically to a pool error: the
+/// shard is skipped, its graceful recovery (pending-flag retry, or the next
+/// poll iteration) takes over, and no peer shard is affected.
+async fn acquire_shard_conn(
+    pool: &DbPool,
+    acquire_bound: Option<Duration>,
+) -> Result<
+    deadpool::managed::Object<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
+    String,
+> {
+    match acquire_bound {
+        Some(bound) => match tokio::time::timeout(bound, pool.get()).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_elapsed) => Err(format!(
+                "pool acquisition exceeded {bound:?}; skipping this shard for one iteration"
+            )),
+        },
+        None => pool.get().await.map_err(|e| e.to_string()),
+    }
+}
+
+/// Whether the single-pool `run_with_listener` entrypoint must refuse to start
+/// (issue #961 review, Codex P1).
+///
+/// `run_with_listener` registers, heartbeats and polls exactly the one `pool`
+/// it is handed, and attributes every dispatch to `shard_assignments[0]`. That
+/// was consistent while the default assignment was a literal `[ShardId::new(0)]`,
+/// but auto-resolution (this issue) widens an otherwise-unconfigured worker to
+/// **every pool shard** — so a direct embedder calling this public entrypoint
+/// with a multi-shard pool would register a fleet row advertising N shards
+/// while draining exactly one.
+///
+/// That is worse than merely losing throughput: a worker falsely advertising
+/// coverage is precisely what suppresses the stranded-shard signals this issue
+/// shipped (`harvest.shard.stranded_pending`, shard health's `no_live_worker`
+/// readiness gate), so the undrained shards would be invisible as well as idle.
+///
+/// Refusing to start mirrors the fail-closed posture `run()` already takes for
+/// `missing_assigned_shard_pools`: better a loud non-start than silent partial
+/// coverage. Callers that genuinely want multi-shard use `Worker::run`, which
+/// routes to `run_multi_shard` with a per-shard listener each.
+///
+/// # Why a sharded pool is required for the rejection
+///
+/// The loss of coverage is real only when the assignments resolve to *different*
+/// databases, and that can only happen when a `ShardedDbPool` is configured.
+/// With **no** sharded pool the shard-target resolution in `run` maps every
+/// assignment onto the caller's one `pool` (`pool.clone()` per assignment), so a
+/// single poll loop over that pool genuinely drains every assigned logical
+/// shard — the "several logical shards colocated on one physical database"
+/// shape, which is a legitimate deployment (and the pattern the cross-shard
+/// outbox tests use, where the outbox's `execs.shard_id = ANY(..)` filter is the
+/// only thing that needs both ids). Rejecting there would refuse to start a
+/// worker whose coverage is complete.
+///
+/// The residual cost in that shape is fidelity, not stranding: every dispatch is
+/// attributed to `shard_assignments[0]`, so `harvest.shard.dispatched{shard}`
+/// under-reports the other logical shards. `harvest.shard.stranded_pending` is
+/// unaffected — the worker's fleet row does advertise both shards and it does
+/// poll the database holding them — so no coverage alarm is suppressed. This
+/// matches the pre-#961 behaviour for the same configuration.
+#[must_use]
+pub(crate) const fn single_pool_entrypoint_rejects(
+    resolved_assignments: usize,
+    has_sharded_pool: bool,
+) -> bool {
+    resolved_assignments > 1 && has_sharded_pool
+}
+
+/// Whether a shard's poll loop may claim tasks, given that shard's pending
+/// fleet-registration state (issue #804, Codex round-54 P1).
+///
+/// A worker whose atomic register+invalidate pair has not committed is **not a
+/// fleet member**, and claiming while unregistered is actively harmful in two
+/// compounding ways:
+///
+/// 1. **It is invisible to peers' capability evidence.** `live_workers_on_queue`
+///    reads `harvest_workers`, so a worker with no row is absent from the live
+///    fleet. An incapable peer can then see only itself, derive
+///    `AllLiveWorkersMissed`, and terminally fail a task *this* worker could
+///    have run. Round 51 stopped an unverified row from being read as
+///    affirmative *false* evidence; it could not make an absent row count as a
+///    live claimant, because nothing records that the worker exists.
+///
+/// 2. **Its claims cannot be durably held.** With no `harvest_workers` row,
+///    every task it claims matches
+///    [`crate::poison_pill::orphaned_running_tasks_query`] — `RUNNING` with a
+///    `worker_id` that has no fresh heartbeat — so the reclaimer takes it back
+///    *and increments `crash_strikes`*. After `poison_pill_threshold` strikes
+///    (default 3) the task is quarantined to the dead-letter queue and its
+///    workflow failed terminally. So an unregistered worker does not merely
+///    fail to help: repeatedly claiming work it cannot hold manufactures the
+///    very terminal failures issue #804 exists to prevent.
+///
+/// Together those retire the round-51 argument for letting it keep polling
+/// ("it might be capable and rescue the task"): it cannot reliably rescue
+/// anything, and each attempt burns a strike toward a terminal quarantine.
+///
+/// Only the **claim** is gated, never the worker. The heartbeat task keeps
+/// running — it is what retries the registration — so the gate lifts by itself
+/// on the first tick that commits the pair, with no restart and no operator
+/// action. A worker that registered cleanly never observes the gate.
+#[must_use]
+pub const fn may_claim_tasks(registration_pending: bool) -> bool {
+    !registration_pending
+}
+
+/// The redelivery budget as an `i32`, clamped for the persisted counter's type.
+///
+/// `max_redeliveries` is a `u32` but `capability_misses` is a Postgres `INT`, so
+/// a budget above `i32::MAX` can never be reached; clamp rather than wrap.
+/// Shared by [`capability_miss_decision`] and [`EscalationCause::resolve`] so
+/// the decision and the reason it reports can never disagree about which bound
+/// was crossed.
+const fn capability_miss_budget(max_redeliveries: u32) -> i32 {
+    if max_redeliveries > i32::MAX.cast_unsigned() {
+        i32::MAX
+    } else {
+        max_redeliveries.cast_signed()
+    }
+}
+
+#[must_use]
+pub const fn capability_miss_decision(
+    distinct_workers_after: i32,
+    misses_after_increment: i32,
+    max_redeliveries: u32,
+    evidence: FleetCapabilityEvidence,
+) -> CapabilityMissAction {
+    if max_redeliveries == 0 {
+        return CapabilityMissAction::Escalate;
+    }
+    if misses_after_increment == i32::MAX {
+        // See "Storage ceiling" above: persisting this would make the next
+        // `+ 1` unrepresentable in the column, so the budget is exhausted by
+        // storage regardless of what it was configured to.
+        return CapabilityMissAction::Escalate;
+    }
+    let budget = capability_miss_budget(max_redeliveries);
+    // PRIMARY bound: distinct incapable workers, GATED ON FLEET EVIDENCE.
+    //
+    // A repeat miss by a worker already known to be incapable does not move
+    // this number, so no single worker can consume the budget by winning the
+    // claim race repeatedly (issue #804, Codex round-6 P1). But the count alone
+    // still has no relationship to the live fleet: a rollout with `budget + 1`
+    // old pods and one new capable pod can hand `budget + 1` distinct old
+    // worker ids to this check while the capable pod is live and polling, and
+    // the terminal failure would then assert the exact opposite of the truth
+    // (Codex round-8 P1).
+    //
+    // So the budget may only terminate the task once the registry agrees that
+    // no live worker on the queue is still unaccounted for. While a live worker
+    // has never missed it, that worker may be capable and this bound is
+    // withheld — the absolute ceiling below remains the backstop, which is what
+    // keeps AC3's "bounded release" true even when coverage is unreachable.
+    if distinct_workers_after > budget
+        && !matches!(evidence, FleetCapabilityEvidence::CapablePeerMayExist)
+    {
+        return CapabilityMissAction::Escalate;
+    }
+    // CONFIGURED TOTAL bound: once the registry confirms every live eligible
+    // worker on this queue has already missed the task, the distinct set cannot
+    // grow from the fleet as it stands, so the distinct bound is unreachable for
+    // any fleet SMALLER than the budget -- with one incapable worker and the
+    // default budget of 5, `distinct_after` is pinned at 1 forever. Left to the
+    // absolute ceiling alone that permits 50 releases and escalates on the 51st
+    // claim, roughly 23 minutes at the backoff cap, so
+    // `capability_miss_max_redeliveries` stopped being a *maximum* for the
+    // common small deployment and the issue's own bound ("with zero capable
+    // workers, escalate within <= N") was violated (Codex round-15 P1).
+    //
+    // Gated on `AllLiveWorkersMissed` SPECIFICALLY, not merely
+    // `!CapablePeerMayExist`. On `Unavailable` this bound would fire after
+    // `budget` releases that may all have been won by the SAME worker, which is
+    // exactly the round-6 P1 the distinct bound exists to prevent -- one
+    // incapable worker exhausting the budget by winning the claim race over and
+    // over. The distinct bound may fire on `Unavailable` because `budget + 1`
+    // distinct workers is strong evidence on its own; this one may not, because
+    // its evidence comes entirely from the registry. A fleet the registry cannot
+    // describe therefore keeps the absolute ceiling as its only bound, which is
+    // the "release for longer, never fail sooner" direction every prior round
+    // has chosen for unprovable coverage.
+    if matches!(evidence, FleetCapabilityEvidence::AllLiveWorkersMissed)
+        && misses_after_increment > budget
+    {
+        return CapabilityMissAction::Escalate;
+    }
+    // ABSOLUTE bound: total releases. Backstop for the two evidence states the
+    // bound above deliberately withholds itself from, so AC3's "bounded release"
+    // stays true even when fleet coverage is unprovable.
+    if misses_after_increment > budget.saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER) {
+        return CapabilityMissAction::Escalate;
+    }
+    CapabilityMissAction::Release
+}
+
+/// Capped exponential backoff before a capability-missed task becomes
+/// claimable again: `1s * 2^count`, capped at 30s (issue #804).
+///
+/// `misses_before_this_release` is the task's persisted `capability_misses`
+/// *before* this release increments it, so the first release waits 1s.
+///
+/// The backoff exists to stop the releasing worker from immediately
+/// re-claiming its own release in a hot loop; it is not a fairness mechanism.
+/// Thin wrapper over [`crate::policy::compute_retry_delay`] (1-based
+/// `attempt`), mirroring [`nd_block_backoff`].
+#[must_use]
+pub fn capability_miss_backoff(misses_before_this_release: i32) -> Duration {
+    let attempt = u32::try_from(misses_before_this_release.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(CAPABILITY_MISS_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(CAPABILITY_MISS_BACKOFF_CAP_SECS),
+        attempt,
+    )
+}
+
+/// Marker inside the escalation reason for a task that was **never releasable**
+/// because it is hard-pinned to a worker session (issue #606).
+///
+/// The two escalations have genuinely different causes and therefore different
+/// fixes, so they must be tellable apart in the execution's `error` column.
+/// Greppable alongside [`NO_CAPABLE_WORKER_PREFIX`], which both variants keep.
+pub const SESSION_PINNED_ESCALATION_MARKER: &str = "pinned to worker session";
+
+/// Marker inside the escalation reason for a task that was **never releasable**
+/// because redelivery is disabled (`capability_miss_max_redeliveries = 0`).
+///
+/// Greppable alongside [`NO_CAPABLE_WORKER_PREFIX`], which every variant keeps.
+pub const ZERO_BUDGET_ESCALATION_MARKER: &str = "capability-miss redelivery is disabled";
+
+/// What the worker registry says about whether a **capable peer could still
+/// claim this task** (issue #804).
+///
+/// The task's `capability_miss_workers` array records workers that have
+/// demonstrably no handler for it. On its own that is only ever evidence about
+/// the workers that happened to win a claim race — never about the fleet. A
+/// fixed redelivery budget therefore cannot distinguish "six incapable pods and
+/// nothing else" from "six incapable pods plus the new capable one", and would
+/// terminally fail the task in both cases as soon as `budget + 1` distinct
+/// workers had claimed it. This enum is the missing half: it compares the miss
+/// set against the workers that are actually **live on the task's queue**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetCapabilityEvidence {
+    /// Every live worker advertising this queue has now missed this task, so
+    /// "no live worker on this queue has the handler" is a *conclusion*.
+    AllLiveWorkersMissed,
+    /// At least one live worker advertising this queue has never missed this
+    /// task, so it may well be capable and merely lost the claim races so far.
+    /// The distinct-worker budget must **not** escalate while this holds.
+    CapablePeerMayExist,
+    /// The registry returned no usable answer, so no conclusion is available in
+    /// either direction and the configured budget is the only bound left.
+    ///
+    /// Detected self-referentially: the worker that just claimed the task is by
+    /// definition live and polling this queue, so if the registry does not list
+    /// it, the registry is not describing this fleet (heartbeats disabled, a
+    /// queue advertised under a different name, a stale window shorter than the
+    /// heartbeat interval, …). Trusting a set that cannot even see the claimant
+    /// would let a misconfigured registry suppress escalation forever.
+    Unavailable,
+}
+
+/// Narrow a queue's live workers to those that could actually **claim this
+/// task** (issue #804, Codex round-10 P2).
+///
+/// Advertising the queue is only `claim_task`'s first gate. It also rejects a
+/// worker whose build is not compatible with the task's `required_build_id`
+/// (#171) and one whose labels do not satisfy its `required_capabilities`
+/// (#522). A worker failing either can never win the claim, so it can never
+/// enter `capability_miss_workers` — and left in the live set it would make
+/// [`fleet_capability_evidence`] answer [`FleetCapabilityEvidence::CapablePeerMayExist`]
+/// *permanently*, withholding the configured distinct-worker budget and leaving
+/// the far larger `10x` total ceiling as the only bound on a task no live
+/// worker can run.
+///
+/// The two predicates are the same helpers the #522 stranded-demand sampler
+/// uses for the same "could this worker claim it?" question
+/// (`BuildCompatibilitySet::is_eligible` and
+/// `eligibility::matches_requirements`), so the two answers cannot drift.
+///
+/// **Unparseable `required_capabilities` keeps the worker.** Excluding on a
+/// value we cannot read would shrink the live set toward empty and fabricate an
+/// `AllLiveWorkersMissed` conclusion — escalating a task a capable peer could
+/// still run. The failure direction is deliberately "release for longer", never
+/// "fail sooner", matching the sampler's own no-false-positive rule.
+#[must_use]
+pub fn claim_eligible_workers(
+    live: &[crate::workers::LiveWorker],
+    compat: &crate::build_routing::BuildCompatibilitySet,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Vec<String> {
+    // Parsed once, not per worker: the requirement list is a property of the
+    // task. `None` here covers both "no requirement" and "unreadable", which
+    // this function treats identically on purpose (see the doc comment).
+    let reqs = required_capabilities.and_then(|caps| {
+        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone()).ok()
+    });
+    live.iter()
+        .filter(|w| {
+            if !compat.is_eligible(&w.build_id, required_build_id) {
+                return false;
+            }
+            reqs.as_ref().is_none_or(|reqs| {
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_value(w.labels.clone()).unwrap_or_default();
+                crate::eligibility::matches_requirements(reqs, &labels)
+            })
+        })
+        .map(|w| w.worker_id.clone())
+        .collect()
+}
+
+/// Narrow the live fleet to the workers that could actually win this task's
+/// claim, tolerating an unreadable compatibility table (issue #804).
+///
+/// `compat` is `None` when [`crate::build_routing::load_compat_set`] failed.
+/// That is **not** the same as an empty set, and the difference is the whole
+/// point of this wrapper:
+/// [`crate::build_routing::BuildCompatibilitySet::is_eligible`] answers `false`
+/// for any worker whose build differs from the requirement unless a declaration
+/// says otherwise, so degrading a failed read to `default()` does not lose
+/// information — it *asserts the opposite of what we know*, silently dropping
+/// every cross-build peer `claim_task` would still admit through
+/// `harvest_build_compat` (#171).
+///
+/// The consequence is not cosmetic. The narrowed fleet then contains only the
+/// incapable claimer, [`fleet_capability_evidence`] fabricates
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and
+/// [`capability_miss_decision`]'s configured-total bound escalates at
+/// `budget + 1` — turning one transient `SELECT` failure into a terminally
+/// failed execution while a live, eligible, capable peer was polling the queue
+/// (Codex round-18 P1).
+///
+/// So an unreadable table suppresses the **build** axis only, by asking
+/// [`claim_eligible_workers`] to evaluate no build requirement at all
+/// (`is_eligible(_, None)` is unconditionally `true`). The #522 label axis is
+/// still readable from the worker rows themselves and stays enforced, so this
+/// gives back exactly the narrowing that became unknowable and no more.
+///
+/// This is the same doctrine the unparseable-`required_capabilities` case
+/// already follows inside [`claim_eligible_workers`] ("an unreadable
+/// requirement falls back to keeping the worker"), and the same direction every
+/// prior round chose for unprovable coverage: release for longer, never fail
+/// sooner. Retaining a worker that turns out to be genuinely ineligible costs
+/// at most a delay to the absolute ceiling; dropping a capable one costs the
+/// execution.
+#[must_use]
+pub fn narrow_live_fleet(
+    live: &[crate::workers::LiveWorker],
+    compat: Option<&crate::build_routing::BuildCompatibilitySet>,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let unreadable = crate::build_routing::BuildCompatibilitySet::new();
+    // The rule, stated once: apply the build requirement only if we were able
+    // to read the declarations that decide it. `and` yields the requirement
+    // when `compat` is `Some` and `None` otherwise, and `is_eligible(_, None)`
+    // is unconditionally `true` — so an unreadable table narrows on labels
+    // alone rather than asserting that cross-build peers are ineligible.
+    let build_requirement = compat.and(required_build_id);
+    claim_eligible_workers(
+        live,
+        compat.unwrap_or(&unreadable),
+        build_requirement,
+        required_capabilities,
+    )
+}
+
+/// Classify the live fleet against the workers already known to lack this
+/// task's handler (issue #804).
+///
+/// `miss_workers` is the **post-increment** set — it includes `claiming_worker`,
+/// which has just proven it has no handler — because the question being asked
+/// is about the fleet as it stands *after* this miss.
+#[must_use]
+pub fn fleet_capability_evidence(
+    live_workers: &[String],
+    miss_workers: &[String],
+    claiming_worker: &str,
+) -> FleetCapabilityEvidence {
+    let every_live_worker_missed = live_workers
+        .iter()
+        .all(|live| miss_workers.iter().any(|missed| missed == live));
+    if !every_live_worker_missed {
+        // An untried live peer wins over the claimant-absent check below
+        // (Codex round-38 P1). `Unavailable` is detected self-referentially,
+        // so it says nothing about whether the REST of the set is readable: a
+        // claimant whose registration failed, or whose heartbeats went stale
+        // while it kept polling, yields `Unavailable` from a registry that is
+        // otherwise perfectly readable and may be naming a live peer that has
+        // never missed this task.
+        //
+        // Round 15 lets the distinct bound fire on `Unavailable` because
+        // `budget + 1` distinct missers is strong evidence *on its own*,
+        // independent of the registry. That holds when the registry tells us
+        // nothing, and breaks here, where it is actively naming an untried
+        // peer — escalating would terminally fail a task while a worker that
+        // may hold the handler is live and polling, which is the round-8 P1
+        // failure mode reached through the `Unavailable` door.
+        return FleetCapabilityEvidence::CapablePeerMayExist;
+    }
+    if !live_workers.iter().any(|w| w == claiming_worker) {
+        // Includes the empty-set case: a registry that cannot see the worker
+        // currently holding the claim cannot be used to reason about peers.
+        // Reached only when nobody live is untried, so round 15's bound still
+        // has nothing to yield to.
+        return FleetCapabilityEvidence::Unavailable;
+    }
+    FleetCapabilityEvidence::AllLiveWorkersMissed
+}
+
+/// Why a capability miss escalated instead of being released (issue #804).
+///
+/// Resolved from the inputs already available to [`no_capable_worker_reason`],
+/// so naming the four cases costs no extra plumbing at the call site — but
+/// makes the match exhaustive, so a future fifth escalation branch cannot
+/// silently inherit another branch's wording (which is exactly how the
+/// session-pinned and zero-budget cases came to claim a budget they never
+/// spent, and how the release-ceiling case briefly claimed the fleet-wide
+/// conclusion after it was added in review round 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscalationCause {
+    /// The configured `max_redeliveries` budget was exhausted, and the registry
+    /// raised no objection. Only this case supports the fleet-wide conclusion.
+    ///
+    /// Two ways to get here, matching [`capability_miss_decision`]'s two
+    /// budget-bearing bounds: `max_redeliveries + 1` **distinct** workers each
+    /// missed the task, or — once the registry confirms every live eligible
+    /// worker has already missed it, so the distinct set can no longer grow —
+    /// `max_redeliveries + 1` total releases. The second is what makes the knob
+    /// a real maximum for a fleet smaller than the budget, where the distinct
+    /// count is pinned below it forever.
+    BudgetExhausted {
+        /// Redeliveries that actually **completed** (the persisted counter),
+        /// on the same basis as [`ReleaseCeilingExhausted::completed_releases`].
+        ///
+        /// Carried rather than derived from `max_redeliveries` because the two
+        /// coincide only in the canonical shape where each worker misses once
+        /// (Codex round-23 P1). Under
+        /// [`FleetCapabilityEvidence::Unavailable`] a repeat miss grows this
+        /// counter without moving `distinct_after`, and the configured TOTAL
+        /// bound is gated off, so releases can run far past the budget before a
+        /// fresh distinct worker trips the distinct bound.
+        completed_releases: i32,
+        /// How many distinct workers those completed releases were spread
+        /// across (the persisted array's length, on the same basis).
+        released_workers: i32,
+        /// `true` when the live fleet on this queue was enumerated and every
+        /// member of it had missed the task
+        /// ([`FleetCapabilityEvidence::AllLiveWorkersMissed`]) — the conclusion
+        /// is then substantiated rather than assumed. `false` means the
+        /// registry gave no usable answer
+        /// ([`FleetCapabilityEvidence::Unavailable`]) and the budget alone
+        /// bounded the release, which the reason string must say out loud.
+        fleet_confirmed: bool,
+    },
+    /// The absolute release ceiling
+    /// ([`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × budget) tripped while the
+    /// distinct-misser set stayed within budget — so the releases were
+    /// concentrated in **fewer** workers than the budget allows, and the fleet
+    /// as a whole was never shown to lack the handler.
+    ///
+    /// Also covers the non-organic storage ceiling
+    /// ([`capability_miss_decision`]'s `i32::MAX` guard) when the distinct set
+    /// is within budget. The named `10 ×` bound is then not literally the one
+    /// that tripped, but `releases` reports the real value, which is what triage
+    /// acts on.
+    ReleaseCeilingExhausted {
+        /// Redeliveries that actually **completed** (the persisted counter).
+        /// The escalating claim is not one of them: the escalation branch never
+        /// runs the release UPDATE, so counting it would overstate the record
+        /// by one in the very string an operator uses to reconstruct events.
+        completed_releases: i32,
+        /// How many distinct workers those completed releases were spread
+        /// across (the persisted array's length, on the same basis).
+        released_workers: i32,
+        /// `true` when a live worker on this queue had still never missed the
+        /// task ([`FleetCapabilityEvidence::CapablePeerMayExist`]) — i.e. the
+        /// ceiling, not the fleet, is what ended the retries. Materially
+        /// changes the operator's next step, so the reason string branches on
+        /// it.
+        capable_peer_may_exist: bool,
+    },
+    /// Redelivery is disabled, so the task was failed on its first claim by a
+    /// single incapable worker, having been offered to no peer at all.
+    ZeroBudgetFailFast,
+    /// The task is hard-pinned to one host and could never reach a peer,
+    /// whatever the budget says.
+    SessionPinned(uuid::Uuid),
+}
+
+impl EscalationCause {
+    /// The pin outranks the config: a session-pinned task escalates on the
+    /// first miss even with a generous budget, so raising the budget off `0`
+    /// cannot help it. Naming the config there would hand the operator a fix
+    /// that is a guaranteed no-op.
+    ///
+    /// The two remaining branches mirror [`capability_miss_decision`]'s two
+    /// bounds in the same order, using the same clamped budget, so the reason
+    /// always names the bound that actually tripped.
+    const fn resolve(
+        max_redeliveries: u32,
+        session_id: Option<uuid::Uuid>,
+        escalation: CapabilityMissEscalation,
+    ) -> Self {
+        let fleet_blocks_budget = matches!(
+            escalation.evidence,
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
+        match session_id {
+            Some(session) => Self::SessionPinned(session),
+            None if max_redeliveries == 0 => Self::ZeroBudgetFailFast,
+            None if !fleet_blocks_budget
+                && escalation.distinct_after > capability_miss_budget(max_redeliveries) =>
+            {
+                Self::BudgetExhausted {
+                    completed_releases: escalation.completed_releases,
+                    released_workers: escalation.released_workers,
+                    fleet_confirmed: matches!(
+                        escalation.evidence,
+                        FleetCapabilityEvidence::AllLiveWorkersMissed
+                    ),
+                }
+            }
+            // The configured TOTAL bound (Codex round-15 P1). Mirrors
+            // `capability_miss_decision`'s third branch exactly, on the same
+            // clamped budget and the same `AllLiveWorkersMissed` gate, so a
+            // small fleet that exhausts the budget by total releases reports the
+            // budget it exhausted rather than inheriting the ceiling's wording.
+            // `completed_releases` is the persisted counter before this claim,
+            // so `+ 1` is the value the decision compared.
+            None if matches!(
+                escalation.evidence,
+                FleetCapabilityEvidence::AllLiveWorkersMissed
+            ) && escalation.completed_releases.saturating_add(1)
+                > capability_miss_budget(max_redeliveries) =>
+            {
+                Self::BudgetExhausted {
+                    completed_releases: escalation.completed_releases,
+                    released_workers: escalation.released_workers,
+                    fleet_confirmed: true,
+                }
+            }
+            None => Self::ReleaseCeilingExhausted {
+                completed_releases: escalation.completed_releases,
+                released_workers: escalation.released_workers,
+                capable_peer_may_exist: fleet_blocks_budget,
+            },
+        }
+    }
+
+    /// The `outcome` label value this cause records on
+    /// [`crate::telemetry::METRIC_TASK_CAPABILITY_MISS`].
+    ///
+    /// The split is by **operator conclusion**, not by cause count. The first
+    /// two causes both actually offered the task around the queue, with backoff
+    /// between each release, so both support "no live worker on this queue
+    /// registers the handler" strongly enough to page — the conclusion the
+    /// page-severity `harvest_no_capable_worker` rule exists to assert.
+    ///
+    /// `ReleaseCeilingExhausted` pages despite its weaker evidence because the
+    /// executions are being failed either way, and under-paging is the worse
+    /// error for the outage #804 exists to surface. Since round 15 it is
+    /// reachable only on the two evidence states the configured total bound
+    /// withholds itself from — a live worker that never missed the task
+    /// (`CapablePeerMayExist`), or a registry that could not be read
+    /// (`Unavailable`) with no more distinct incapable workers than the budget
+    /// (under `Unavailable` the fleet's actual size is exactly what is not
+    /// knowable, so the distinct set is all this can be said about) — so it now
+    /// means
+    /// *"bounded by the ceiling because the fleet could not be concluded about"*
+    /// rather than *"small fleet"*. Its alternative reading (a capable peer kept
+    /// losing the claim race) requires losing `10 × budget` consecutive races
+    /// across ~25 minutes of backoff, which is not a realistic steady state. The
+    /// reason string states both readings so triage is not misled either way.
+    ///
+    /// The other two escalate on the FIRST claim after zero releases, where a
+    /// capable worker may be live and idle on the queue the whole time. They
+    /// share one value because they share that conclusion (and the recovery:
+    /// reset the named executions); the reason string on the execution row is
+    /// what tells the two apart during triage.
+    const fn outcome_label(self) -> &'static str {
+        match self {
+            Self::BudgetExhausted { .. } | Self::ReleaseCeilingExhausted { .. } => {
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED
+            }
+            Self::ZeroBudgetFailFast | Self::SessionPinned(_) => {
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED
+            }
+        }
+    }
+}
+
+/// Everything an escalation needs in order to name the bound that actually
+/// tripped and report it truthfully (issue #804).
+///
+/// Bundled so [`no_capable_worker_reason`] and [`EscalationCause::resolve`]
+/// cannot be handed the `i32`s in the wrong order, and so the *decision* input
+/// and the *reported* counts stay visibly distinct — they are deliberately on
+/// different bases:
+///
+/// - `distinct_after` is **post-increment**: this claim is itself evidence that
+///   the claiming worker lacks the handler, so the decision must count it.
+/// - `completed_releases` / `released_workers` are **as persisted**: the
+///   escalation branch never runs the release UPDATE, so the durable record has
+///   one fewer release (and possibly one fewer distinct worker) than the
+///   decision saw. Reporting the decision's numbers as if they were history
+///   would tell an operator reconstructing the incident that a redelivery
+///   happened which never did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityMissEscalation {
+    /// Distinct workers known to lack the handler **including this claim** —
+    /// the value the escalation decision was made on.
+    pub distinct_after: i32,
+    /// Redeliveries that actually completed (the row's persisted
+    /// `capability_misses`, before this claim).
+    pub completed_releases: i32,
+    /// Distinct workers that actually released (the persisted
+    /// `capability_miss_workers` length, before this claim).
+    pub released_workers: i32,
+    /// What the worker registry says about a capable peer still being live.
+    pub evidence: FleetCapabilityEvidence,
+}
+
+/// Build the escalation report from the **persisted** row plus the resolution
+/// that decided to escalate (issue #804).
+///
+/// Exists as its own function so the one rule that is easy to get wrong at the
+/// call site is testable in isolation: the escalation branch never runs the
+/// release UPDATE, so `resolution.total_after` (and a freshly-appended distinct
+/// worker) describe a release that **did not happen**. Reporting them would
+/// overstate the durable record by one in the exact string an operator uses to
+/// reconstruct the incident (Codex round-8 P2). The decision input
+/// (`distinct_after`) is carried through unchanged, because the decision
+/// genuinely was made on it.
+#[must_use]
+pub fn escalation_from_persisted(
+    persisted_misses: i32,
+    persisted_miss_workers: usize,
+    resolution: &CapabilityMissResolution,
+) -> CapabilityMissEscalation {
+    CapabilityMissEscalation {
+        distinct_after: resolution.distinct_after,
+        completed_releases: persisted_misses,
+        released_workers: i32::try_from(persisted_miss_workers).unwrap_or(i32::MAX),
+        evidence: resolution.evidence,
+    }
+}
+
+/// Build the terminal error recorded when a capability miss escalates
+/// (issue #804).
+///
+/// Prefixed with [`NO_CAPABLE_WORKER_PREFIX`] so the "this task could not reach
+/// a worker that has its handler" case is greppable and alertable, and distinct
+/// from an ordinary application failure. Every variant keeps that prefix: the
+/// runbook's recovery sweep matches it over `GET /workflows?state=FAILED`, and
+/// the recovery action (re-start or reset the run) is the same for all three.
+///
+/// Four variants, because the branches have different causes and therefore
+/// different operator fixes. The distinction is load-bearing rather than
+/// cosmetic: **only the first supports the unqualified fleet-wide conclusion.**
+///
+/// - **Budget exhausted** — `max_redeliveries + 1` *distinct* workers each
+///   missed the task, so "no live worker on this queue has the handler" is a
+///   supported conclusion. Fix: deploy the handler or roll the fleet forward.
+/// - **Release ceiling** — the absolute
+///   [`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × budget bound tripped while
+///   the distinct-misser set stayed *within* budget, so the releases were
+///   concentrated in fewer workers than the budget allows. This is the bound
+///   that terminates a fleet smaller than the budget (a single incapable worker
+///   bouncing its own release), and it is the ONLY bound such a fleet can trip.
+///   Two readings, both named in the reason: those few workers genuinely lack
+///   the handler, or a capable peer lost every one of the claim races. Fix:
+///   check the named workers first, then the fleet.
+/// - **Zero budget** (`max_redeliveries == 0`) — redelivery is disabled (the
+///   pre-#804 fail-fast behaviour), so the task was failed on its first claim
+///   by a single incapable worker, having been released **zero** times. Exactly
+///   one worker demonstrated it lacks the handler; a capable peer may well
+///   exist and never have been asked. Fix: raise the knob off `0`.
+/// - **Session-pinned** (`session_id: Some(_)`) — the task escalated on the
+///   **first** miss because the claim gate
+///   (`session_id IS NULL OR sticky_worker_id = $1`) can only ever return it to
+///   the same host (see [`capability_miss_releasable`]). Fix: go to the pinned
+///   host, not the fleet.
+///
+/// In the latter two the task was released zero times, so naming
+/// `max_redeliveries` would state a release count that never happened, and the
+/// fleet-wide clause may be outright false. That matters operationally: the
+/// runbook's first triage step is `GET /admin/workflow-types/reachability`,
+/// which in both cases can report `in_use` and flatly contradict the reason,
+/// stranding whoever is holding the page on a missing deploy that does not
+/// exist.
+#[must_use]
+pub fn no_capable_worker_reason(
+    detail: &str,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+    escalation: CapabilityMissEscalation,
+) -> String {
+    match EscalationCause::resolve(max_redeliveries, session_id, escalation) {
+        EscalationCause::BudgetExhausted {
+            completed_releases,
+            released_workers,
+            fleet_confirmed,
+        } => {
+            let basis = if fleet_confirmed {
+                "every worker with a live heartbeat here has now missed it, so no live worker on \
+                 this queue has the handler"
+            } else {
+                "the worker registry could not be used to confirm the live fleet (the claiming \
+                 worker is not listed against this queue — check worker heartbeats and the queue \
+                 names workers advertise), so the configured budget alone bounded the release and \
+                 a capable worker may still exist"
+            };
+            // The REAL release count, not `max_redeliveries` (Codex round-23
+            // P1). The two coincide only in the canonical shape where each
+            // worker misses exactly once; under `Unavailable` evidence a repeat
+            // miss grows the release count without moving `distinct_after`, and
+            // the configured TOTAL bound is gated off, so five workers can spend
+            // twenty releases before a sixth distinct worker trips this bound.
+            // Naming the budget there understates the durable record fourfold in
+            // the exact string an operator reconstructs the incident from.
+            //
+            // The knob still has to appear, because raising it is the fix -- but
+            // as its own labelled value, not in the position that reads as a
+            // release count.
+            format!(
+                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {completed_releases} \
+                 capability-miss redeliveries across {released_workers} distinct worker(s); \
+                 capability_miss_max_redeliveries = {max_redeliveries}; {basis})"
+            )
+        }
+        EscalationCause::ReleaseCeilingExhausted {
+            completed_releases,
+            released_workers,
+            capable_peer_may_exist,
+        } => {
+            let basis = if capable_peer_may_exist {
+                "a live worker on this queue never missed this task, so it may well have the \
+                 handler and simply lost every claim race — check whether it is saturated, \
+                 draining, advertising a stale queue list, or ineligible for this activity's \
+                 registered capability requirements before concluding the handler is missing"
+            } else {
+                "fewer distinct workers missed this task than the budget allows, so either those \
+                 workers lack the handler or a capable peer lost every claim race — check the \
+                 workers that missed it before concluding the whole queue lacks the handler"
+            };
+            // The ceiling that actually tripped, computed with the SAME clamped,
+            // saturating expression `capability_miss_decision` compares against,
+            // so the printed bound cannot drift from the enforced one (Codex
+            // round-23 P2). Previously this rendered
+            // `10x capability_miss_max_redeliveries = 5` -- an equation that is
+            // false as one, and off by the whole multiplier: an operator sizing
+            // the knob off it concludes the fleet gave up after 5 releases when
+            // 51 had been spent.
+            let ceiling = capability_miss_budget(max_redeliveries)
+                .saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER);
+            format!(
+                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {completed_releases} \
+                 capability-miss redeliveries spread across only {released_workers} distinct \
+                 worker(s), hitting the absolute release ceiling of {ceiling} releases \
+                 ({CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries \
+                 ({max_redeliveries})); {basis})"
+            )
+        }
+        EscalationCause::ZeroBudgetFailFast => format!(
+            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated immediately after 0 redeliveries: \
+             {ZERO_BUDGET_ESCALATION_MARKER} (capability_miss_max_redeliveries = 0), so this task \
+             was failed on its first claim by an incapable worker and was never offered to a peer; \
+             a capable worker may exist on this queue)"
+        ),
+        EscalationCause::SessionPinned(session) => format!(
+            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated immediately after 0 redeliveries: \
+             task is {SESSION_PINNED_ESCALATION_MARKER} {session} and can only ever run on that \
+             host, so it cannot be released to a capable peer; the pinned host does not register \
+             the handler)"
+        ),
+    }
+}
+
+/// Scan `commands` for the first one whose **persistence** resolves a handler
+/// this worker does not register (issue #804), returning `(kind, name)`.
+///
+/// This is the pre-pass that runs in `process_workflow_task` *ahead of the
+/// terminal telemetry*, mirroring the three in-transaction checks:
+///
+/// | Command | Persist site | Registry |
+/// |---|---|---|
+/// | `ScheduleActivity` | `persist_scheduled_activities` | `activities` |
+/// | `StartChildWorkflow` | `persist_all_started_child_workflows`, `persist_child_timeout_race` | `workflows` |
+/// | `SpawnDetachedChildWorkflow` | `create_detached_child_executions` | `workflows` |
+///
+/// Those checks stay in place as the authoritative all-or-nothing guard inside
+/// the transaction; this pre-pass exists so the miss is detected *before*
+/// `record_workflow_completed` / `harvest.workflow.terminal` (#519) are emitted.
+/// Without it, every capability-miss redelivery of a terminal decision rolls the
+/// transaction back but leaves a spurious `terminal{outcome="completed"}`
+/// increment behind for an execution that is still `RUNNING` — the success-rate
+/// SLO would count one logical run many times over.
+///
+/// `RunLocalActivity` is deliberately **absent**: it is resolved during
+/// *execution* (already ahead of the telemetry) and that site is replay-aware —
+/// a local activity whose result is already recorded replays without touching
+/// the registry at all. Flagging it here would release a task that this worker
+/// could have replayed perfectly well.
+///
+/// The match is **exhaustive with no wildcard arm** on purpose: adding a
+/// `WorkflowCommand` variant is a compile error here until someone decides
+/// whether persisting it needs a registered handler. This is the same
+/// coverage-guard pattern as `WorkerConfigView::from_worker_config` (#695) and
+/// `ShardRouter::parts` (#697).
+fn first_persist_capability_miss(
+    registry: &HandlerRegistry,
+    commands: &[WorkflowCommand],
+) -> Option<(&'static str, String)> {
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::ScheduleActivity { name, .. } => {
+                if !registry.activities.contains_key(name.as_str()) {
+                    return Some((CapabilityMissKind::Activity.as_str(), name.clone()));
+                }
+            }
+            WorkflowCommand::StartChildWorkflow { workflow_name, .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } => {
+                if !registry.workflows.contains_key(workflow_name.as_str()) {
+                    return Some((CapabilityMissKind::Workflow.as_str(), workflow_name.clone()));
+                }
+            }
+            // Every remaining variant persists without resolving a handler.
+            // `RunLocalActivity` is checked at execution time instead (see the
+            // doc comment above); the rest are bookkeeping, waits, timers,
+            // external-workflow verbs, mutex ops, or terminal markers.
+            WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::RunLocalActivity { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::AcquireMutex { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
+        }
+    }
+    None
+}
+
+/// The cross-type continue-as-new target this worker cannot dispatch, if the
+/// cycle's outcome is a continuation into an unregistered type (issue #804,
+/// Codex round-45 P1).
+///
+/// Companion to [`first_persist_capability_miss`], and separate from it for a
+/// mechanical reason: `drive_workflow` `swap_remove`s the `ContinueAsNew`
+/// command out of the command list and returns it as the *outcome*, so the
+/// command-scanning pre-pass never sees it. Issue #803's cross-type
+/// continuation (`ctx.continue_as_new_as`) resolves the TARGET type's handler,
+/// which makes an unregistered target the same blameless fleet condition every
+/// other #804 site releases for — canonically a rolling deploy where the old
+/// pod runs the source phase and only the new peer registers the target phase.
+/// Without this, `check_continue_as_new_type` funnels it into
+/// `persist_workflow_failure` and the predecessor is terminally failed by a
+/// worker that simply arrived first.
+///
+/// **Only the unregistered case.** `classify_continue_as_new_target` rejects a
+/// target for five other reasons, and none of them is about this worker:
+///
+/// - **Blank target.** A config error; releasing would loop the task around a
+///   fleet where no peer can help, and an empty name would reach the
+///   `harvest.task.capability_miss` labels as a phantom workflow.
+/// - **Registered DAG target.** Excluded here by construction rather than by a
+///   second condition: a unified DAG's shadow `WorkflowInfo` lives in
+///   `registry.workflows` (issue #256), so `contains_key` already returns true
+///   and the target falls through to #803's terminal
+///   "trigger it with `POST /dags/{name}/trigger`" rejection. That is a scope
+///   decision, identical on every worker.
+/// - **Cross-shard routing, an unrepresentable successor deadline, and a
+///   `(target, workflow_id)` slot already held.** All resolved after this,
+///   inside `check_continue_as_new_type`, and all fleet-invariant: every peer
+///   would reach the same verdict, so releasing could only burn the budget and
+///   then escalate with a `no_capable_worker:` reason that misdescribes the
+///   fault.
+fn continue_as_new_target_capability_miss(
+    registry: &HandlerRegistry,
+    outcome: &WorkflowOutcome,
+) -> Option<(&'static str, String)> {
+    let WorkflowOutcome::ContinuedAsNew {
+        new_workflow_type: Some(target),
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    if target.trim().is_empty() || registry.workflows.contains_key(target.as_str()) {
+        return None;
+    }
+    Some((CapabilityMissKind::Workflow.as_str(), target.clone()))
+}
+
+/// The first local activity in this cycle's commands whose handler this worker
+/// does not register (issue #804, Codex round-19 P2).
+///
+/// The inline local-activity arm of `process_workflow_task` commits five things
+/// before it ever reaches `run_local_activity_inline`'s registry lookup:
+/// search-attribute patches, the `current_details` breadcrumb, durable workflow
+/// logs (#790), ephemeral progress notifications (#791), and any early mutex
+/// release (#691). Once a miss became *releasable*, an incapable worker would
+/// pay for all five and then hand the task on, and the next worker would redo
+/// them — up to once per redelivery.
+///
+/// None of those five is *corrupted* by the repeat: logs carry a deterministic
+/// `seq` and insert `ON CONFLICT DO NOTHING` precisely so a re-drive is a no-op,
+/// attribute and breadcrumb writes are last-write-wins, and a repeated mutex
+/// release is fenced to zero rows. Progress frames do re-fire, but they are
+/// declared ephemeral and at-least-once with a `seq` clients dedup on, and every
+/// other re-drive trigger (#494 timeout, #782 panic containment, #603 ND-block)
+/// already re-runs the same frontier through the same commits. So this is not a
+/// correctness fix — it is the reviewer's first suggested remedy, and it is
+/// strictly better: an incapable worker should discover it cannot run the batch
+/// *before* doing work a capable peer will redo.
+///
+/// Checks **every** `RunLocalActivity` in the batch, not just the first:
+/// [`extract_run_local_activity`] keeps the *last* one, so a first-only check
+/// would wave through exactly the command about to run. A batch this worker
+/// cannot finish is one it should not start, whichever command the extractor
+/// picks — and the extras it flags are ones a later re-drive of the same batch
+/// would reach anyway.
+fn missing_local_activity_handler<'a>(
+    registry: &HandlerRegistry,
+    commands: &'a [WorkflowCommand],
+) -> Option<&'a str> {
+    commands.iter().find_map(|cmd| match cmd {
+        WorkflowCommand::RunLocalActivity { name, .. }
+            if !registry.activities.contains_key(name.as_str()) =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// Should this task be released for a capable peer at all, or escalated
+/// immediately regardless of the redelivery budget (issue #804)?
+///
+/// A task hard-pinned to a **worker session** (issue #606) exists precisely so
+/// it runs on one specific host that holds machine-local state; the claim gate
+/// (`session_id IS NULL OR sticky_worker_id = $1`) will never hand it to a peer.
+/// Releasing it would therefore bounce it back to the same incapable host until
+/// the budget drained, wasting the whole window on a premise ("a capable peer
+/// may claim this") that is false by construction. Escalate immediately instead,
+/// so the operator sees the real condition without the delay.
+#[must_use]
+pub const fn capability_miss_releasable(session_id: Option<uuid::Uuid>) -> bool {
+    session_id.is_none()
+}
+
+/// Outcome of [`resolve_capability_miss`] (issue #804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityMissResolution {
+    /// Release the claim for a peer, or escalate to terminal failure.
+    pub action: CapabilityMissAction,
+    /// Value the release UPDATE will persist to `capability_misses`.
+    pub total_after: i32,
+    /// How many distinct workers will have missed this task afterwards. Equal
+    /// to `distinct_before` when this worker had already missed it.
+    pub distinct_after: i32,
+    /// `true` when this worker is not yet in the task's distinct-miss set, so
+    /// the release must append it.
+    pub worker_is_new: bool,
+    /// Completed releases recorded against the current frontier **before** this
+    /// claim — the number an escalation must report.
+    ///
+    /// Carried here rather than re-read off the task row (issue #804, Codex
+    /// round 27): after round 26 a peer's re-registration can invalidate its own
+    /// stale entry on this row mid-dispatch, so the claim-time snapshot may name
+    /// a worker the decision no longer counted. Reporting from the same values
+    /// the decision consumed is what keeps round 23's contract — every number in
+    /// an escalation reason is the one that actually acted — true.
+    pub misses_before: i32,
+    /// Distinct workers recorded against the current frontier **before** this
+    /// claim. Same provenance as [`Self::misses_before`].
+    pub distinct_before: usize,
+    /// What the worker registry said about a capable peer still being live
+    /// (issue #804). Carried out of the resolution so the escalation reason can
+    /// report the same evidence the decision was made on.
+    pub evidence: FleetCapabilityEvidence,
+}
+
+/// The capability-miss counters the release-vs-escalate decision must be made
+/// on (issue #804, Codex rounds 20 and 22).
+///
+/// The claim-time snapshot is **not** unconditionally current: one dispatch can
+/// resolve several local-activity frontiers inline, and each resolution resets
+/// the counters (they describe the frontier the run is stuck at, so misses
+/// recorded against a handler the run has moved past are stale by
+/// construction). Deciding on a snapshot taken before such a reset charges a
+/// prior frontier's spend to a frontier no peer has ever been offered, and
+/// terminally fails a run the fleet can still finish.
+///
+/// Rather than re-read the row, the caller reports whether **this dispatch**
+/// committed a reset. That is exact, not advisory, and the two cases are
+/// exhaustive:
+///
+/// * `reset_committed` — the reset ran in the *same transaction* as the
+///   frontier-resolving append (see [`append_frontier_resolution`]), so the row
+///   was written to `(0, [])`. A rolled-back transaction leaves the flag clear.
+/// * otherwise — nothing in this dispatch touched those columns, so the
+///   snapshot is still exactly what the row holds.
+///
+/// The `reset_committed` branch is exact and infallible, and deliberately so:
+/// it deliberately replaces a *fabricated* clean frontier that round 21 P2 had
+/// substituted when a DB re-read failed. That fabrication bypassed the
+/// storage-ceiling guard, so a row already at `i32::MAX` would be released and
+/// the `capability_misses + 1` in the release statement would raise
+/// `integer out of range` — stranding a `RUNNING` row under a live worker that
+/// orphan reclamation skips. An in-memory fact about this dispatch has no such
+/// mode, and it stays the first branch for that reason.
+///
+/// # The snapshot is not authoritative on its own
+///
+/// This function is the *fallback* half of the decision input, not the whole of
+/// it: see [`current_frontier_miss_state`], which re-reads the row first. Until
+/// round 26 nothing could write these columns between the claim and the miss —
+/// every writer was ownership-guarded, so a concurrent poison-pill reclaim
+/// changed `worker_id` and turned the release into a `0 rows affected` no-op.
+/// `queue::invalidate_capability_miss_evidence_for_worker` broke that invariant
+/// on purpose: it must reach a row under an active claim, because that is the
+/// row whose decision stale evidence poisons.
+///
+/// # AC3 (bounded) still holds per task, not just per frontier
+///
+/// Keying by frontier (round 46) means the absolute ceiling
+/// (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`) counts per frontier rather than
+/// per task, so it is worth stating why the release loop is still bounded.
+///
+/// A frontier is a pure function of the recorded history: with no new events
+/// and no park, the replay is deterministic and lands on the SAME handler, so
+/// two dispatches cannot oscillate between frontiers on their own. The frontier
+/// moves only when history grows — an ingested timer fire or signal, an
+/// activity or local-activity terminal — and every one of those appends an
+/// event that is consumed once and never re-appended. So the number of
+/// frontiers a single task can present is bounded by the history hard cap, the
+/// same argument `reset_capability_misses_after_inline_progress` already makes
+/// for the inline-progress reset. The total release count is therefore bounded
+/// by (frontiers × ceiling), and — the property AC3 actually asks for — no
+/// frontier can release forever.
+#[must_use]
+fn frontier_miss_state(
+    task: &TaskQueueItem,
+    reset_committed: bool,
+    frontier: &str,
+) -> (i32, Vec<String>) {
+    if reset_committed {
+        return (0, Vec::new());
+    }
+    // The snapshot's counters are evidence about the frontier the row RECORDS,
+    // which is not necessarily the one this dispatch is missing (issue #804,
+    // Codex round-46 P1) -- `prepare_workflow_task_with_cache` can ingest a
+    // timer fire or a pending signal ahead of the capability gate and move the
+    // replay onto a branch needing a different handler, with no park and no
+    // inline progress to reset anything. Charging the old frontier's spend to a
+    // frontier no peer has ever been offered is what terminally fails a run the
+    // fleet can still finish, so a mismatch reads as a fresh budget. A `None`
+    // key (nothing recorded yet) is a mismatch too, which is the safe
+    // direction. This mirrors the SQL in `read_capability_miss_state_query`,
+    // which applies the identical rule to the authoritative read.
+    if task.capability_miss_handler.as_deref() != Some(frontier) {
+        return (0, Vec::new());
+    }
+    (task.capability_misses, task.capability_miss_workers.clone())
+}
+
+/// The capability-miss counters to decide on, refreshed from the row
+/// (issue #804, Codex round-27 P1).
+///
+/// A worker's claim-time snapshot can be stale by the time it decides.
+/// `queue::invalidate_capability_miss_evidence_for_worker` (round 26) runs when
+/// a worker registers and is deliberately **not** ownership-guarded, so a pod
+/// restarting onto a capable build clears its stale entry from rows other
+/// workers are mid-dispatch on. Deciding on the snapshot then reads that pod as
+/// still incapable *and* the registry reports it live — which is
+/// `AllLiveWorkersMissed`, the terminal failure round 26 exists to prevent,
+/// reintroduced through the back door.
+///
+/// So the row is re-read, and the three outcomes are kept **distinct** rather
+/// than collapsed onto one pair of counters (issue #804, Codex round-28 P1) —
+/// see [`CurrentMissState`] for why each one decides differently.
+///
+/// The read is unconditional, including when this dispatch committed a frontier
+/// reset. Round 22 short-circuited that case on the grounds that the counters
+/// are an exact in-memory fact no read can improve on, and that is still true:
+/// the reset is a durable `capability_misses = 0, capability_miss_workers = '{}'`
+/// write, so a successful read returns exactly those values. But the read now
+/// answers a *second* question the in-memory fact cannot — whether this worker
+/// still owns the claim — and that question has no cheap local answer. The
+/// reset's counters survive as the read-failure fallback, so nothing about
+/// round 22 is lost; only an ownership probe is gained, on a path that is rare
+/// by construction.
+async fn current_frontier_miss_state(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    reset_committed: bool,
+    frontier: &str,
+) -> CurrentMissState {
+    match queue::read_capability_miss_state(conn, task.id, worker_id, frontier).await {
+        Ok(Some((misses, workers))) => CurrentMissState::Owned { misses, workers },
+        Ok(None) => CurrentMissState::ClaimLost,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %error,
+                "failed to re-read capability-miss state; suppressing evidence-derived \
+                 escalation and deciding on the claim-time snapshot"
+            );
+            let (misses, workers) = frontier_miss_state(task, reset_committed, frontier);
+            CurrentMissState::Unreadable { misses, workers }
+        }
+    }
+}
+
+/// What re-reading the capability-miss counters found (issue #804, Codex
+/// round-28 P1). The three cases decide differently, and collapsing any two of
+/// them reintroduces a terminal failure this issue exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CurrentMissState {
+    /// Fresh counters read from a row this worker still holds. Authoritative:
+    /// invalidation only ever *removes* entries, so a fresher view can only
+    /// weaken the fleet evidence, and weaker evidence can only bias toward
+    /// releasing (AC1).
+    Owned { misses: i32, workers: Vec<String> },
+    /// The row is no longer `RUNNING` under this worker's claim — a poison-pill
+    /// reclaim or an operator action took it.
+    ///
+    /// This is **positive evidence of a lost claim**, not merely an absence of
+    /// fresh data, and the difference is the whole point: the release path is
+    /// ownership-guarded (`worker_id = $2`, whose `0 rows affected` the caller
+    /// already handles) but the **escalation** path is not —
+    /// `queue::fail_task` accepts any `PENDING` or `RUNNING` row regardless of
+    /// `worker_id`, and `fail_task_and_execution` transitions the execution.
+    /// So a stale dispatcher that decides `Escalate` here terminally fails a
+    /// task another worker now owns, which a zero-budget, session-pinned, or
+    /// already-exhausted task reaches on its very first miss. The caller must
+    /// therefore return without making a terminal decision at all.
+    ClaimLost,
+    /// The row could not be read. The counters fall back to the claim-time
+    /// snapshot — deliberately **not** a fabricated clean frontier, which is
+    /// the round-21 P2 hazard (a row already at `i32::MAX` would be released
+    /// and the release statement's `capability_misses + 1` would raise
+    /// `integer out of range`, stranding a `RUNNING` row under a live worker
+    /// that orphan reclamation skips).
+    ///
+    /// But those counters may no longer match storage, because round 26's
+    /// invalidation is an unguarded concurrent writer, so the evidence they
+    /// carry is only good enough for the **ungated** bounds. See
+    /// [`MissEvidenceConfidence`].
+    Unreadable { misses: i32, workers: Vec<String> },
+}
+
+impl CurrentMissState {
+    /// The counters to decide on, or `None` when the claim is gone and no
+    /// terminal decision may be made at all.
+    const fn decidable_counters(&self) -> Option<(i32, &[String])> {
+        match self {
+            Self::Owned { misses, workers } | Self::Unreadable { misses, workers } => {
+                Some((*misses, workers.as_slice()))
+            }
+            Self::ClaimLost => None,
+        }
+    }
+}
+
+/// Whether the miss evidence the decision is about to weigh is known to be
+/// current (issue #804, Codex round-28 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissEvidenceConfidence {
+    /// Read fresh from the owned row, and unchanged across the fleet read.
+    Current,
+    /// The row could not be re-read, or it changed while the fleet was being
+    /// read. Either way the distinct set may name a worker that has since
+    /// invalidated its own entry, so no fleet-wide conclusion may be drawn
+    /// from it.
+    PossiblyStale,
+}
+
+/// Compare the two miss-state reads that bracket the fleet read (issue #804,
+/// Codex round-28 P1).
+///
+/// The fleet read and the miss read are separate statements, so under `READ
+/// COMMITTED` each gets its own snapshot and a registration can commit between
+/// them. Neither ordering is safe on its own: read the fleet first and a
+/// registration landing in the gap leaves the peer *absent from the fleet* but
+/// its evidence *already cleared*, so the claimant is the only live worker and
+/// the only misser — `AllLiveWorkersMissed`; read the miss state first and the
+/// same registration leaves the peer *present in the fleet* with its evidence
+/// *still stale*, so it reads as covered — `AllLiveWorkersMissed` again. Both
+/// terminally fail a run while the capable peer is up.
+///
+/// So the miss state is read on **both** sides of the fleet read and the two
+/// are required to agree. Registration and invalidation commit atomically (see
+/// `Worker::register_in_fleet`), and snapshots are monotonic in time, so any
+/// commit that the fleet read could have seen is also visible to the second
+/// miss read — which makes it differ from the first. Agreement therefore
+/// certifies that no registration landed anywhere inside the bracket, and the
+/// three reads describe one coherent world.
+fn miss_evidence_confidence(
+    first: &CurrentMissState,
+    second: &CurrentMissState,
+) -> MissEvidenceConfidence {
+    match (first, second) {
+        (CurrentMissState::Owned { .. }, CurrentMissState::Owned { .. }) if first == second => {
+            MissEvidenceConfidence::Current
+        }
+        _ => MissEvidenceConfidence::PossiblyStale,
+    }
+}
+
+/// Resolve what to do about a capability miss on a claimed task (issue #804).
+///
+/// Pure decision function: takes the distinct workers that have already missed
+/// this task, the persisted total-miss count **before** this miss, the claiming
+/// worker's id, the configured budget, and whether the task is session-pinned.
+///
+/// The claiming worker's id is load-bearing: the budget is consumed **per
+/// distinct worker**, so a worker that has already missed this task can miss it
+/// again for free. Without that, the backoff — which makes the task eligible to
+/// every worker again, this one included — let one incapable worker exhaust the
+/// whole budget by winning the claim race repeatedly, terminally failing a run
+/// while a capable peer was live.
+///
+/// Split out from the async dispatch path so the whole release-vs-escalate
+/// policy — both budget bounds, the session carve-out, and the `0`-budget
+/// fail-fast — is unit-testable with no database and no worker.
+#[must_use]
+pub fn resolve_capability_miss(
+    distinct_workers_before: &[String],
+    misses_before: i32,
+    worker_id: &str,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+    live_workers_on_queue: &[String],
+) -> CapabilityMissResolution {
+    resolve_capability_miss_with_confidence(
+        distinct_workers_before,
+        misses_before,
+        worker_id,
+        max_redeliveries,
+        session_id,
+        live_workers_on_queue,
+        MissEvidenceConfidence::Current,
+    )
+}
+
+/// [`resolve_capability_miss`], told whether the miss evidence it is weighing
+/// is known to be current (issue #804, Codex round-28 P1).
+///
+/// `PossiblyStale` forces the fleet answer to
+/// [`FleetCapabilityEvidence::CapablePeerMayExist`], which is not a fudge but
+/// the literal truth of the situation: the distinct set may name a peer that
+/// has since re-registered onto a capable build and invalidated its own entry,
+/// so a capable peer may indeed exist. That one substitution withholds exactly
+/// the two **evidence-derived** bounds — the primary distinct bound (gated on
+/// `!CapablePeerMayExist`) and the configured total bound (gated on
+/// `AllLiveWorkersMissed`) — while leaving every **ungated** bound in force:
+/// the absolute `10x` ceiling, the `i32::MAX` storage ceiling, the zero-budget
+/// fail-fast, and the session-pinned carve-out. AC3's "bounded release"
+/// therefore still holds under suppression; a permanently-unreadable row
+/// terminates at the ceiling rather than releasing forever.
+///
+/// Suppressing the *distinct* bound as well as the total one is deliberate. Its
+/// input is `capability_miss_workers`, which is the very array a re-registration
+/// invalidates, so its length is precisely what goes stale.
+#[must_use]
+pub fn resolve_capability_miss_with_confidence(
+    distinct_workers_before: &[String],
+    misses_before: i32,
+    worker_id: &str,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+    live_workers_on_queue: &[String],
+    confidence: MissEvidenceConfidence,
+) -> CapabilityMissResolution {
+    let total_after = misses_before.saturating_add(1);
+    let worker_is_new = !distinct_workers_before.iter().any(|w| w == worker_id);
+    let distinct_before = i32::try_from(distinct_workers_before.len()).unwrap_or(i32::MAX);
+    let distinct_after = if worker_is_new {
+        distinct_before.saturating_add(1)
+    } else {
+        distinct_before
+    };
+    // The miss set as it stands *after* this claim: the claiming worker has
+    // just proven it lacks the handler, so fleet coverage must count it.
+    let mut miss_after: Vec<String> = distinct_workers_before.to_vec();
+    if worker_is_new {
+        miss_after.push(worker_id.to_string());
+    }
+    let evidence = match confidence {
+        MissEvidenceConfidence::Current => {
+            fleet_capability_evidence(live_workers_on_queue, &miss_after, worker_id)
+        }
+        // The miss set may name an already-invalidated peer, so no fleet-wide
+        // conclusion may be drawn from it. See the doc comment above for why
+        // this single substitution is the exact suppression required.
+        MissEvidenceConfidence::PossiblyStale => FleetCapabilityEvidence::CapablePeerMayExist,
+    };
+    if !capability_miss_releasable(session_id) {
+        return CapabilityMissResolution {
+            action: CapabilityMissAction::Escalate,
+            total_after,
+            distinct_after,
+            worker_is_new,
+            evidence,
+            misses_before,
+            distinct_before: distinct_workers_before.len(),
+        };
+    }
+    CapabilityMissResolution {
+        action: capability_miss_decision(distinct_after, total_after, max_redeliveries, evidence),
+        total_after,
+        distinct_after,
+        worker_is_new,
+        evidence,
+        misses_before,
+        distinct_before: distinct_workers_before.len(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Contained workflow handler-panic retry (issue #782)
 // ---------------------------------------------------------------------------
 
@@ -3426,6 +5812,82 @@ fn clear_panic_strike(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&exec_id);
+}
+
+/// Would a failure carrying `error` clear the issue #782 consecutive-panic
+/// strike for its execution?
+///
+/// `true` for an ordinary error, which terminally fails the execution: the entry
+/// must go or the map leaks one `u32` per such execution.
+///
+/// `false` for a **pre-/mid-handler** capability miss (issue #804), which is
+/// *non-terminal* — `fail_execution_on_error` passes it through un-failed so the
+/// dispatch path can release the task for a capable peer. Clearing there would
+/// let a worker that alternates between panicking on the body and missing an
+/// unregistered local activity reset `workflow_panic_max_attempts` forever
+/// (Codex round-13 P2). The phase rule is owned by
+/// [`CapabilityMissPhase::clears_panic_strike`], so this predicate never
+/// re-derives it.
+const fn failure_clears_panic_strike(error: &HarvestError) -> bool {
+    match error.capability_miss_phase() {
+        Some(phase) => phase.clears_panic_strike(),
+        None => true,
+    }
+}
+
+/// Apply [`failure_clears_panic_strike`] to `result`, mutating the strike map.
+///
+/// Extracted from `fail_workflow_execution_clearing_strikes` so both the
+/// decision *and* its effect on the map are unit-testable without a database
+/// connection.
+fn apply_panic_strike_clear_for_failure<T>(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+    result: &HarvestResult<T>,
+) {
+    if let Err(error) = result
+        && failure_clears_panic_strike(error)
+    {
+        clear_panic_strike(strikes, exec_id);
+    }
+}
+
+/// Clear the issue #782 panic strike when a capability miss **escalated**
+/// (issue #804, Codex round-16 P2).
+///
+/// [`failure_clears_panic_strike`] deliberately preserves the strike for a
+/// pre-/mid-handler miss, because that miss normally *releases* the task and the
+/// execution keeps running (round 13). Escalation is the other outcome: it
+/// routes through `fail_task_and_execution`, so the execution is terminally
+/// failed and no later cycle for it exists. Preserving the entry there leaks one
+/// map slot per such execution for the worker's lifetime — the same leak the
+/// ordinary-error arm of `apply_panic_strike_clear_for_failure` exists to
+/// prevent.
+///
+/// **The discriminator is the re-raised typed error, and that is load-bearing.**
+/// `escalate_capability_miss` re-raises `HandlerNotRegistered` only *after*
+/// `fail_task_and_execution` returned `Ok`, and the release arm never returns
+/// that variant at all — so this shape means "escalated **and** the terminal
+/// write landed", and nothing else. A failed terminal write propagates as its
+/// own error variant, leaves the row stranded `RUNNING`, and keeps the strike:
+/// that row is re-claimed and re-driven later, which is exactly the case round
+/// 13's protection is for.
+///
+/// `workflow_exec_id` is `None` only for a task with no owning execution, which
+/// has no key in this map.
+fn clear_panic_strike_on_capability_miss_escalation<T>(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    workflow_exec_id: Option<uuid::Uuid>,
+    outcome: &HarvestResult<T>,
+) {
+    if let Some(exec_id) = workflow_exec_id
+        && outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.handler_not_registered().is_some())
+    {
+        clear_panic_strike(strikes, exec_id);
+    }
 }
 
 /// Encode a contained **activity** handler-panic message as the typed
@@ -3764,6 +6226,15 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     Ok(())
 }
 
+/// Resolve `(concurrency_key, limit)` for a worker-side enqueue.
+///
+/// Deliberately does NOT surface [`crate::concurrency::ConcurrencyOnConflict`]
+/// (issue #811): every caller here populates a [`queue::EnqueueParams`] task row
+/// for *in-flight continuation* — a child spawn, a detached child, or a
+/// continue-as-new successor — rather than admitting a fresh run through
+/// [`crate::execution::start_or_load_workflow_execution`]. Latest-wins supersede
+/// is an *admission* decision and is scoped to the start path, matching how
+/// admission gates (#618) and start throttles (#607) treat these same paths.
 fn resolve_workflow_concurrency(
     registry: &HandlerRegistry,
     workflow_name: &str,
@@ -4024,6 +6495,11 @@ async fn persist_workflow_failure(
                     inherited_chain_deadline_at: exec_ref.chain_deadline_at,
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    // Workflow-level retry (issue #523) is the same logical run
+                    // continuing, not a fresh admission, so it never supersedes
+                    // (issue #811). Letting it cancel a run admitted AFTER the
+                    // failure would invert latest-wins.
+                    concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
                     priority,
                     max_workflow_input_bytes: 0,
                     start_at: None,
@@ -4085,6 +6561,26 @@ async fn persist_workflow_failure(
                             },
                         )
                         .await?;
+                        // Issue #843: carry the logical run's whole signal
+                        // mailbox across the fresh-history boundary, re-arming
+                        // consumed rows. The retry replays an EMPTY history and
+                        // re-runs every step from zero, so a signal this attempt
+                        // observed is one the retry must observe again — else a
+                        // workflow that replays back to `wait_for_signal` blocks
+                        // forever on a signal its caller was already told landed.
+                        // This attempt's own `SignalReceived` events stay in its
+                        // history, so the audit record is unaffected.
+                        let forwarded =
+                            crate::signal::forward_signals_to_retry_attempt(conn, exec_id, rid)
+                                .await?;
+                        if forwarded > 0 {
+                            tracing::debug!(
+                                execution_id = %exec_id,
+                                retry_exec_id = %rid,
+                                forwarded,
+                                "harvest: forwarded signal mailbox to the retry attempt"
+                            );
+                        }
                         retry_committed = true;
                     }
                     Err(e) => {
@@ -4130,8 +6626,18 @@ async fn persist_workflow_failure(
         );
     }
 
+    // Best-effort diagnostics — a failure here must never affect the terminal
+    // write. Each check runs in its own savepoint so a swallowed error cannot
+    // leave the *enclosing* transaction aborted: since issue #804's round-31
+    // commit boundary, this function can run inside
+    // `commit_terminal_failure_if_still_claimed`'s outer transaction, where an
+    // aborted connection would silently downgrade its COMMIT to a ROLLBACK and
+    // report a terminal write that never landed.
     for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
+        let _ = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await
+        }))
+        .await;
     }
 
     for start in deferred {
@@ -4480,11 +6986,31 @@ fn apply_search_attrs_patch_in_memory(
 /// `search_attrs` (issue #603 fix: kept the two callers' snapshots from
 /// silently reintroducing cleared ND diagnostic keys, e.g. into a
 /// continue-as-new successor built from the stale pre-clear reference).
+///
+/// `search_attrs` is an unvalidated `Option<serde_json::Value>` at the model
+/// layer (the start API accepts any JSON value, not only objects), so `base`
+/// can legitimately be a scalar or array. When the patch contains ONLY
+/// removals — the shape every current caller passes
+/// ([`nd_search_attrs_clear_patch`]'s six-key diagnostic strip, used by the
+/// rerun (#777) and reset-fork (#148/#538) clones and the #603 recovery
+/// clear) — none of the patch's keys can possibly exist inside a
+/// scalar/array value, so applying it is a no-op by definition; return `base`
+/// UNCHANGED rather than silently discarding it into a fresh empty object.
+/// Only when the patch contains at least one INSERTION do we coerce a
+/// non-object base to a map, since representing new key/value data requires
+/// an object shape and there is no faithful alternative.
 pub(crate) fn apply_raw_search_attrs_patch_in_memory(
     base: Option<serde_json::Value>,
     patch: &std::collections::HashMap<String, Option<serde_json::Value>>,
 ) -> Option<serde_json::Value> {
     if patch.is_empty() {
+        return base;
+    }
+    let has_insertion = patch.values().any(Option::is_some);
+    if !has_insertion
+        && let Some(v) = &base
+        && !v.is_object()
+    {
         return base;
     }
     let mut merged = match base {
@@ -4611,6 +7137,83 @@ async fn persist_current_details_from_commands(
         }
     }
     Ok(())
+}
+
+/// Collect this cycle's [`WorkflowCommand::RecordLog`] commands into the
+/// store-layer line shape, in emission order (issue #790).
+///
+/// Pure and total: no DB, no I/O. `seq` is a `u64` in the command (the shared
+/// `encode_progress_seq` encoding) and an `i64` in the column; the saturating
+/// cast is unreachable for a real execution (`epoch` would have to exceed 2^39)
+/// and pins to `i64::MAX - 1` rather than wrapping into the reserved truncation
+/// slot, so a pathological value can never masquerade as the marker.
+fn collect_log_lines(commands: &[WorkflowCommand]) -> Vec<store::WorkflowLogLine> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordLog {
+                seq,
+                level,
+                message,
+            } => Some(store::WorkflowLogLine {
+                // Clamp strictly BELOW the reserved truncation slot. `try_from`
+                // alone would let a `seq` of exactly `i64::MAX` convert
+                // successfully and land ON the sentinel, letting a real line
+                // masquerade as the marker. Unreachable for a real execution
+                // (it needs 2^63 log calls in one cycle), but the guarantee is
+                // "can never be forged", so make it total.
+                seq: i64::try_from(*seq)
+                    .unwrap_or(i64::MAX)
+                    .min(store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+                level: level.as_str(),
+                message: message.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Persist this cycle's durable workflow log lines (issue #790).
+///
+/// **Best-effort by design — a log write must never fail a workflow.** Logs are
+/// observational; wedging a run because an observability table is missing or
+/// erroring would be a self-inflicted outage. Two things make "best-effort"
+/// actually hold here:
+///
+/// 1. The write is wrapped in its own nested `transaction`, which Postgres
+///    implements as a SAVEPOINT. Without it, a failed statement would poison
+///    the *enclosing* persist transaction (every later statement erroring with
+///    "current transaction is aborted"), so swallowing the error would not save
+///    the cycle — it would corrupt it. The savepoint rolls back just this write.
+/// 2. The error is then logged and dropped.
+///
+/// A no-op (`lines.is_empty()`, i.e. the sink is disabled or the workflow logged
+/// nothing) opens no savepoint at all, so the disabled path costs one slice
+/// scan and nothing else.
+async fn persist_workflow_logs_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    max_lines: u32,
+) {
+    let lines = collect_log_lines(commands);
+    if lines.is_empty() {
+        return;
+    }
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_workflow_logs(c, exec_id, &lines, max_lines).await?;
+        Ok(())
+    }))
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            execution_id = %exec_id,
+            error = %e,
+            lines = lines.len(),
+            "harvest: failed to persist durable workflow logs (issue #790); \
+             logs are observational and best-effort, so the workflow continues"
+        );
+    }
 }
 
 /// Fire a best-effort `pg_notify` for each [`WorkflowCommand::PublishProgress`]
@@ -5122,11 +7725,18 @@ async fn persist_scheduled_activities(
     let mut dynamic_rate_buckets: Vec<(String, f64, f64)> = Vec::new();
 
     for scheduled in scheduled_activities {
+        // Issue #804: enqueueing needs the activity's registered defaults
+        // (queue, retry policy, timeouts), so a worker without the handler
+        // cannot persist this workflow decision. Release the *workflow* task for
+        // a capable peer instead of terminally failing the run.
         let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
-            HarvestError::Config(format!(
-                "no activity handler registered for '{}'",
-                scheduled.name
-            ))
+            HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: scheduled.name.clone(),
+                // Reached only while persisting a decision the body already
+                // produced.
+                phase: CapabilityMissPhase::AfterHandler,
+            }
         })?;
 
         let queue_name = if scheduled.queue.is_empty() {
@@ -5770,12 +8380,18 @@ async fn persist_all_started_child_workflows(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): this worker cannot resolve the CHILD's handler,
+    // so releasing the parent's task lets a capable peer persist the decision.
+    // Terminally failing the parent here would turn a rolling deploy that
+    // introduces a new child type into a lost parent execution. Checked for
+    // every child before any is inserted, so the dispatch stays all-or-nothing.
     for child in children {
         if !registry.workflows.contains_key(&child.workflow_name) {
-            return Err(HarvestError::Config(format!(
-                "no workflow handler registered for '{}'",
-                child.workflow_name
-            )));
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: child.workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
+            });
         }
     }
 
@@ -5841,7 +8457,7 @@ async fn persist_all_started_child_workflows(
     let telemetry = registry.telemetry().clone();
     let execute_span = execute_span.clone();
 
-    let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+    let deferred = match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         let children = children.clone();
         let pre_events_by_pos = pre_events_by_pos.clone();
         let start_child_cmd_indices = start_child_cmd_indices.clone();
@@ -5953,54 +8569,77 @@ async fn persist_all_started_child_workflows(
         )
         .await?;
 
+        // Issue #946, Codex round-5 review: pre-acquire every distinct quota
+        // advisory lock this fan-out will need, in one deterministic (sorted)
+        // order, BEFORE inserting any child row below. Without this, the
+        // per-child loop below acquires each `pg_advisory_xact_lock` one at a
+        // time as it iterates children in COMMAND order -- if two concurrent
+        // parents fan out to the same set of quota-governed keys in OPPOSITE
+        // command orders, each transaction can hold one key while waiting on
+        // the other (a classic ABBA wait-for cycle). Postgres resolves that
+        // by aborting one transaction with a raw `deadlock_detected` error,
+        // which is not `QuotaExceeded` and therefore not recovered by the
+        // loop below -- it propagates to `fail_execution_on_error` and
+        // terminally fails an otherwise-healthy parent over a transient
+        // serialization conflict, never a real quota breach. Sorting the
+        // lock-acquisition order makes a wait-for cycle impossible: every
+        // transaction that reaches this fan-out acquires the SAME keys in
+        // the SAME order, so no two transactions can ever hold a lock the
+        // other is waiting on. `lock_quota_key`'s `pg_advisory_xact_lock` is
+        // safely re-entrant within one session/transaction, so the per-child
+        // loop's own `enforce_quota_admission` -> `lock_quota_key` call below
+        // simply re-acquires what is already held here -- no other change
+        // needed. The set mirrors exactly what that loop would lock (a
+        // declared policy with `has_any_cap()` and a resolvable key), so no
+        // lock is taken here that the loop would not otherwise have taken.
+        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for child in &new_children {
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
         // Insert rows and enqueue tasks for new children.
         // Provenance ref for every child in this fan-out is the parent
         // execution id (issue #740); compute it once outside the loop.
         let parent_exec_id_str = parent_exec_id.to_string();
         for child in &new_children {
             let child_workflow_id = child.child_id.to_string();
-            let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-            let (
-                owner,
-                runbook_url,
-                severity,
-                child_sla,
-                child_execution_timeout,
-                child_chain_execution_timeout,
-                child_retry_policy,
-            ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
-                (
-                    w.owner,
-                    w.runbook_url,
-                    w.severity,
-                    w.sla,
-                    w.execution_timeout,
-                    w.chain_execution_timeout,
-                    w.retry_policy.clone(),
-                )
-            });
-            let child_execution_timeout =
-                child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-            let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-            let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
-            let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
-            // A child is its own logical workflow → fresh chain origin
-            // (issue #617). Resolve the child's OWN `chain_execution_timeout`
-            // exactly like its per-run timeout above and anchor the chain
-            // deadline at the child's start. No builder ceiling is threaded
-            // into the spawn path, matching how `execution_timeout` is
-            // resolved here.
-            let child_chain_execution_timeout =
-                child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-            // `checked_add_signed` guards against `Duration::MAX` overflow
-            // (issue #617): `DateTime + Duration` panics; yield `None`.
-            let child_chain_deadline_at = child_chain_execution_timeout
-                .and_then(|d| chrono::Utc::now().checked_add_signed(d));
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            // Resolve + bound the CHILD's own quota key from ITS OWN declared
+            // policy (issue #946, Codex round-3 review) -- a spawned child
+            // accumulates its own history/DLQ/active-execution footprint
+            // against its own key, so it must be visible to quota
+            // accounting exactly like any other registry-aware start. This
+            // mirrors the same resolve-then-bound-check sequence the plain
+            // start path runs in `execution.rs`, applied per child here.
+            let child_quota_key: Option<String> = defaults
+                .quota
+                .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
+            if let Some(key) = child_quota_key.as_deref()
+                && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+            {
+                return Err(HarvestError::PayloadTooLarge {
+                    kind: crate::error::PayloadKind::QuotaKey,
+                    observed_bytes,
+                    cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+                    workflow_type: child.workflow_name.clone(),
+                    activity_name: None,
+                });
+            }
             let child_row = NewWorkflowExecution {
                 continued_from_exec_id: None,
                 first_exec_id: None,
-                chain_execution_timeout: child_chain_execution_timeout,
-                chain_deadline_at: child_chain_deadline_at,
+                chain_execution_timeout: defaults.chain_execution_timeout,
+                chain_deadline_at: defaults.chain_deadline_at,
                 id: child.child_id.as_uuid(),
                 workflow_name: &child.workflow_name,
                 workflow_id: &child_workflow_id,
@@ -6009,23 +8648,22 @@ async fn persist_all_started_child_workflows(
                 input: child.input.clone(),
                 parent_id: Some(parent_exec_id.as_uuid()),
                 queue_name: &queue_name,
-                execution_timeout: child_execution_timeout,
-                deadline_at: child_deadline_at,
-                sla: child_sla,
-                sla_deadline_at: child_sla_deadline_at,
+                execution_timeout: defaults.execution_timeout,
+                deadline_at: defaults.deadline_at,
+                sla: defaults.sla,
+                sla_deadline_at: defaults.sla_deadline_at,
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: parent_execution.assigned_build_id.clone(),
                 parent_close_policy: None, // awaited child
-                owner,
-                runbook_url,
-                severity,
+                owner: defaults.owner,
+                runbook_url: defaults.runbook_url,
+                severity: defaults.severity,
                 context_headers: parent_execution.context_headers.clone(),
                 schedule_id: None, // child workflows are not scheduled fires
                 scheduled_for: None,
                 workflow_attempt: 1,
-                workflow_retry_policy: child_retry_policy
-                    .and_then(|p| serde_json::to_value(&p).ok()),
+                workflow_retry_policy: defaults.retry_policy,
                 retry_of_exec_id: None,
                 origin: None, // child workflow, not a schedule fire (issue #534)
                 // Children get only builder-wide default callback
@@ -6035,6 +8673,13 @@ async fn persist_all_started_child_workflows(
                 start_source: Some(crate::types::StartSource::Child.as_str()),
                 start_source_ref: Some(parent_exec_id_str.as_str()),
                 started_by: None,
+                // A spawned child is enforced against its OWN declared quota
+                // policy (issue #946, Codex round-3 review) -- resolved and
+                // bound-checked above via `child_quota_key`. Stamping it here
+                // (rather than `None`) keeps the row correctly tagged for
+                // future usage accounting even on a re-park path where this
+                // child already exists and enforcement below is skipped.
+                quota_key: child_quota_key.as_deref(),
             };
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
@@ -6062,6 +8707,34 @@ async fn persist_all_started_child_workflows(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
+            // Enforce the child's OWN declared quota (issue #946) against the
+            // row this same transaction just inserted -- the identical
+            // insert-then-enforce contract `enforce_quota_admission` already
+            // has for every other registry-aware start path. Run this
+            // BEFORE the child's own `WorkflowStarted` event is appended
+            // below: `enforce_quota_admission` documents (and the plain
+            // start path in `execution.rs` establishes) that the row it is
+            // called about has appended no events yet, so `history_bytes`
+            // reports usage strictly BEFORE this admission. Appending the
+            // event first would let the child's own start event count
+            // toward the very cap deciding whether to admit it -- an
+            // off-by-one that could wrongly reject a spawn that should have
+            // succeeded (Codex round-4 review). A violation rolls back the
+            // WHOLE transaction (this child, any siblings already inserted
+            // in this loop, and any parent-side event appends recorded
+            // above) -- caught at this function's outer
+            // `conn.transaction(...)` call site below, which parks and wakes
+            // the parent task rather than letting it reach
+            // `fail_execution_on_error` and terminally fail the parent over
+            // an unrelated tenant's quota (Codex round-3 review).
+            crate::execution::enforce_quota_admission(
+                conn,
+                defaults.quota,
+                child_quota_key.as_deref(),
+                &child.workflow_name,
+                Some(registry.telemetry().metrics.as_ref()),
+            )
+            .await?;
             store::append_events_offloaded(
                 conn,
                 child.child_id,
@@ -6121,12 +8794,138 @@ async fn persist_all_started_child_workflows(
 
         Ok(race_deferred)
     }))
-    .await?;
+    .await
+    {
+        Ok(deferred) => deferred,
+        // A child's declared quota (issue #946) is an ADMISSION constraint
+        // on an unrelated tenant key, not a genuine parent-workflow failure
+        // -- terminally failing the parent here (the default outcome for any
+        // other `Err` reaching `fail_execution_on_error` in
+        // `handle_suspended_workflow`) would be strictly worse than the
+        // pre-#946 behavior, where a spawned child was simply invisible to
+        // quota accounting. Instead: the whole transaction above already
+        // rolled back (no child rows, no parent event appends, nothing
+        // committed), and we park + immediately wake the parent task so a
+        // LATER poll re-drives the identical decision cycle -- mirroring
+        // `requeue_parent_on_transient_ingest_conflict`'s "no event
+        // appended, no state changed, no retry attempt consumed" contract
+        // (issue #779) for the closely analogous transient-conflict case.
+        // `park_workflow_task` (not `_preserving_capability_misses`) is
+        // correct here: this catch is reached only AFTER the transaction's
+        // capability-miss pre-check and handler resolution already
+        // succeeded, so capability is proven -- only the quota-governed
+        // key's admission is blocked (Codex round-3 review).
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            tracing::warn!(
+                parent_execution_id = %parent_exec_id,
+                workflow_name = %workflow_name,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "quota exceeded spawning a child workflow; parking the parent \
+                 task to retry once capacity frees up rather than failing the \
+                 parent over an unrelated tenant's quota",
+            );
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     for start in deferred {
         start.spawn();
     }
     Ok(())
+}
+
+/// Per-child spawn defaults resolved from the target's OWN registered
+/// `WorkflowInfo`, never inherited from the parent — a child is its own
+/// logical workflow (issue #617/#487/#523).
+///
+/// Shared by every awaited-child spawn site
+/// ([`insert_awaited_child_execution`] and the fan-out loop in
+/// [`persist_all_started_child_workflows`]) so the resolution logic (and its
+/// `Duration::MAX`-overflow guard on the chain deadline) can never drift
+/// between them.
+struct ChildWorkflowDefaults {
+    owner: Option<&'static str>,
+    runbook_url: Option<&'static str>,
+    severity: Option<&'static str>,
+    sla: Option<chrono::Duration>,
+    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    chain_execution_timeout: Option<chrono::Duration>,
+    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    retry_policy: Option<serde_json::Value>,
+    /// The child's OWN declared quota policy (issue #946), resolved from its
+    /// registered `WorkflowInfo` — never inherited from the parent. A child
+    /// spawn is a genuine fresh admission from a resource-accumulation
+    /// standpoint (it can itself fan out further children, run its own
+    /// activities, and accrue its own history/DLQ footprint), so it must be
+    /// visible to the target type's own quota accounting exactly like any
+    /// other registry-aware start path.
+    quota: Option<crate::quota::QuotaPolicy>,
+}
+
+fn resolve_child_workflow_defaults(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+) -> ChildWorkflowDefaults {
+    let child_wf_info = registry.workflows.get(workflow_name);
+    let (
+        owner,
+        runbook_url,
+        severity,
+        sla,
+        execution_timeout,
+        chain_execution_timeout,
+        retry_policy,
+        quota,
+    ) = child_wf_info.map_or((None, None, None, None, None, None, None, None), |w| {
+        (
+            w.owner,
+            w.runbook_url,
+            w.severity,
+            w.sla,
+            w.execution_timeout,
+            w.chain_execution_timeout,
+            w.retry_policy.clone(),
+            w.quota,
+        )
+    });
+    let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
+    let sla_deadline_at = sla.map(|d| chrono::Utc::now() + d);
+    // A child is its own logical workflow → fresh chain origin (issue #617).
+    let chain_execution_timeout =
+        chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    // `checked_add_signed` guards against `Duration::MAX` overflow (issue
+    // #617): `DateTime + Duration` panics; yield `None` instead.
+    let chain_deadline_at =
+        chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
+    ChildWorkflowDefaults {
+        owner,
+        runbook_url,
+        severity,
+        sla,
+        sla_deadline_at,
+        execution_timeout,
+        deadline_at,
+        chain_execution_timeout,
+        chain_deadline_at,
+        retry_policy: retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        quota,
+    }
 }
 
 /// Insert a single genuinely-new **awaited** child execution row, append its own
@@ -6153,43 +8952,32 @@ async fn insert_awaited_child_execution(
     let child_workflow_id = child.child_id.to_string();
     // Provenance ref for the child is the parent execution id (issue #740).
     let parent_exec_id_str = parent_exec_id.to_string();
-    let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-    let (
-        owner,
-        runbook_url,
-        severity,
-        child_sla,
-        child_execution_timeout,
-        child_chain_execution_timeout,
-        child_retry_policy,
-    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
-        (
-            w.owner,
-            w.runbook_url,
-            w.severity,
-            w.sla,
-            w.execution_timeout,
-            w.chain_execution_timeout,
-            w.retry_policy.clone(),
-        )
-    });
-    let child_execution_timeout =
-        child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-    let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
-    let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
-    // Child = its own logical workflow → fresh chain origin (issue #617).
-    let child_chain_execution_timeout =
-        child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    // `checked_add_signed` guards against `Duration::MAX` overflow (issue #617):
-    // `DateTime + Duration` panics; yield `None` instead.
-    let child_chain_deadline_at =
-        child_chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
+    let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+    // A child-timeout-race child (issue #779) accumulates its own
+    // history/DLQ/active-execution footprint exactly like any other
+    // registry-aware start, so it is resolved against and enforced under
+    // its OWN declared quota (issue #946, Codex round-3 review) -- it is
+    // not exempt as "in-flight continuation" the way #946 AC3 exempts
+    // continue-as-new/reset/workflow-level-retry.
+    let child_quota_key: Option<String> = defaults
+        .quota
+        .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
+    if let Some(key) = child_quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        return Err(HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: child.workflow_name.clone(),
+            activity_name: None,
+        });
+    }
     let child_row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
-        chain_execution_timeout: child_chain_execution_timeout,
-        chain_deadline_at: child_chain_deadline_at,
+        chain_execution_timeout: defaults.chain_execution_timeout,
+        chain_deadline_at: defaults.chain_deadline_at,
         id: child.child_id.as_uuid(),
         workflow_name: &child.workflow_name,
         workflow_id: &child_workflow_id,
@@ -6198,22 +8986,22 @@ async fn insert_awaited_child_execution(
         input: child.input.clone(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name: &queue_name,
-        execution_timeout: child_execution_timeout,
-        deadline_at: child_deadline_at,
-        sla: child_sla,
-        sla_deadline_at: child_sla_deadline_at,
+        execution_timeout: defaults.execution_timeout,
+        deadline_at: defaults.deadline_at,
+        sla: defaults.sla,
+        sla_deadline_at: defaults.sla_deadline_at,
         memo: None,
         search_attrs: None,
         assigned_build_id: parent_execution.assigned_build_id.clone(),
         parent_close_policy: None, // awaited child
-        owner,
-        runbook_url,
-        severity,
+        owner: defaults.owner,
+        runbook_url: defaults.runbook_url,
+        severity: defaults.severity,
         context_headers: parent_execution.context_headers.clone(),
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: child_retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        workflow_retry_policy: defaults.retry_policy,
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets, resolved at
@@ -6222,6 +9010,7 @@ async fn insert_awaited_child_execution(
         start_source: Some(crate::types::StartSource::Child.as_str()),
         start_source_ref: Some(parent_exec_id_str.as_str()),
         started_by: None,
+        quota_key: child_quota_key.as_deref(),
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
@@ -6243,6 +9032,25 @@ async fn insert_awaited_child_execution(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // Enforce quota BEFORE the child's own `WorkflowStarted` event is
+    // appended (issue #946, Codex round-4 review). `enforce_quota_admission`
+    // subtracts 1 from `active_executions` to exclude the row it is itself
+    // being called about, but its `history_bytes` check has NO such
+    // compensation -- it relies entirely on being called before any event
+    // exists for this row. Calling it AFTER the append (the pre-fix
+    // ordering) let the child's own just-appended `WorkflowStarted` payload
+    // count against the very admission deciding whether to allow it, which
+    // could wrongly reject a spawn whose usage was truly zero. This mirrors
+    // the reference ordering in `start_or_load_workflow_execution_collect`
+    // (execution.rs): INSERT -> enforce_quota_admission -> append event.
+    crate::execution::enforce_quota_admission(
+        conn,
+        defaults.quota,
+        child_quota_key.as_deref(),
+        &child.workflow_name,
+        Some(registry.telemetry().metrics.as_ref()),
+    )
+    .await?;
     store::append_events_offloaded(
         conn,
         child.child_id,
@@ -6285,11 +9093,14 @@ async fn persist_child_timeout_race(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): release the parent's task for a capable peer
+    // rather than terminally failing it because the child type is unknown here.
     if !registry.workflows.contains_key(&child.workflow_name) {
-        return Err(HarvestError::Config(format!(
-            "no workflow handler registered for '{}'",
-            child.workflow_name
-        )));
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: child.workflow_name.clone(),
+            phase: CapabilityMissPhase::AfterHandler,
+        });
     }
 
     let parent_exec_id = execution_id_from_uuid(parent_execution.id);
@@ -6297,7 +9108,7 @@ async fn persist_child_timeout_race(
     let telemetry = registry.telemetry().clone();
     let execute_span = execute_span.clone();
 
-    let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+    let deferred = match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         use crate::schema::harvest_task_queue::dsl as queue_dsl;
         let telemetry = telemetry.clone();
         let execute_span = execute_span.clone();
@@ -6458,7 +9269,43 @@ async fn persist_child_timeout_race(
 
         Ok(deferred)
     }))
-    .await?;
+    .await
+    {
+        Ok(deferred) => deferred,
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            // Same rationale as the fan-out awaited-child path: a quota-full
+            // TARGET tenant must never terminally fail the PARENT (which may
+            // belong to an entirely unrelated tenant) over a transient
+            // capacity condition. The whole transaction above rolled back
+            // (no child row, no timer row, no parent events persisted), so
+            // park the parent's still-RUNNING task row back to PENDING and
+            // wake it -- the next poll re-drives this exact decision cycle
+            // from the unchanged recorded history and retries the child
+            // spawn once the target tenant's quota has capacity again
+            // (issue #946, Codex round-3 review).
+            tracing::warn!(
+                parent_execution_id = %parent_exec_id,
+                workflow_name = %workflow_name,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "quota exceeded spawning a child-timeout-race child; parking \
+                 the parent task to retry once capacity frees up rather than \
+                 failing the parent over an unrelated tenant's quota",
+            );
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     for start in deferred {
         start.spawn();
@@ -6624,8 +9471,12 @@ pub async fn ingest_due_timers_and_signals(
 /// event-id conflict (issue #779), instead of terminally failing the run.
 ///
 /// The task is currently claimed by this worker (`state = 'RUNNING'`,
-/// `worker_id` set). We first [`park`](queue::park_workflow_task) it to release
-/// the claim, then [`wake`](queue::wake_workflow_task) it to re-pend the row to
+/// `worker_id` set). We first
+/// [`park`](queue::park_workflow_task_preserving_capability_misses) it to
+/// release the claim — with the issue #804 capability-miss accounting
+/// preserved, since this path runs *before* the handler lookup and so proves
+/// nothing about this worker's capability — then
+/// [`wake`](queue::wake_workflow_task) it to re-pend the row to
 /// `PENDING` with an immediate `scheduled_at` and a `pg_notify`, so an idle
 /// poller re-claims it promptly. This is the exact pause(park)/resume(wake)
 /// mechanism used elsewhere; no event is appended, no state is changed, no
@@ -6646,7 +9497,17 @@ async fn requeue_parent_on_transient_ingest_conflict(
     } else {
         Some(queue::StickyHint::new(worker_id, sticky_timeout))
     };
-    let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+    // The shared park SQL zeroes `capability_misses` (issue #804), which is
+    // correct for every OTHER caller because they are all reached after the
+    // handler lookup in `process_workflow_task` succeeded. This one is not: the
+    // wake-event ingest runs before that lookup, so a worker with no handler for
+    // the type reaches it too, and letting it zero the counter would restart the
+    // consecutive-miss budget on a path that proves nothing about capability —
+    // weakening the escalation bound. Park with the accounting preserved in the
+    // same statement; this runs in autocommit, so zeroing and restoring it
+    // afterwards would leave a window for a peer to claim the parked row and
+    // record (or legitimately clear) a miss in between.
+    let _ = queue::park_workflow_task_preserving_capability_misses(conn, task.id, sticky).await?;
     queue::wake_workflow_task(conn, exec_id).await?;
     Ok(())
 }
@@ -6723,13 +9584,64 @@ async fn fail_task_and_execution(
     worker_id: &str,
     error: &str,
 ) -> HarvestResult<()> {
-    let Some(exec_uuid) = task.workflow_exec_id else {
-        return fail_task_only(conn, task.id, error).await;
-    };
+    let preloaded = preload_failure_history(conn, task).await;
+    fail_task_and_execution_with_history(conn, task, worker_id, error, preloaded).await
+}
 
+/// The history read [`fail_task_and_execution`] needs, resolved ahead of the
+/// terminal write (issue #804, Codex round-29 P1).
+///
+/// Loading a workflow's history is an *awaited database read* whose cost grows
+/// with the history, and it used to sit between a capability-miss escalation's
+/// last evidence check and its terminal write — so the window in which a
+/// capable peer could go live without being noticed was neither small nor
+/// bounded. Hoisting the read into a value the committing call *consumes* makes
+/// that ordering a compile-time property rather than a comment: an escalation
+/// cannot reach the write without having already paid the read, so its final
+/// revalidation is the last thing before the commit.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub enum PreloadedFailureHistory {
+    /// The task has no owning execution; only the queue row is failed.
+    NoExecution,
+    /// The next event id to append the terminal `WorkflowFailed` at.
+    Loaded {
+        exec_id: ExecutionId,
+        next_event_id: i32,
+    },
+    /// The history could not be read; rows are updated without an event append.
+    Unavailable { exec_id: ExecutionId },
+}
+
+impl PreloadedFailureHistory {
+    /// The execution this terminal write will touch, if any.
+    ///
+    /// Used by the escalation commit to take the execution row's lock **before**
+    /// the task row's, preserving the documented `harvest_task_queue` lock order
+    /// (issue #804, Codex round-31 P1).
+    #[must_use]
+    pub const fn exec_id(&self) -> Option<ExecutionId> {
+        match self {
+            Self::NoExecution => None,
+            Self::Loaded { exec_id, .. } | Self::Unavailable { exec_id } => Some(*exec_id),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn preload_failure_history(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> PreloadedFailureHistory {
+    let Some(exec_uuid) = task.workflow_exec_id else {
+        return PreloadedFailureHistory::NoExecution;
+    };
     let exec_id = execution_id_from_uuid(exec_uuid);
-    let history = match store::load_history(conn, exec_id).await {
-        Ok(h) => h,
+    match store::load_history(conn, exec_id).await {
+        Ok(h) => PreloadedFailureHistory::Loaded {
+            exec_id,
+            next_event_id: h.next_event_id,
+        },
         Err(history_error) => {
             tracing::warn!(
                 task_id = %task.id,
@@ -6737,16 +9649,38 @@ async fn fail_task_and_execution(
                 error = %history_error,
                 "failed to load workflow history while persisting task failure; updating rows without event append"
             );
+            PreloadedFailureHistory::Unavailable { exec_id }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn fail_task_and_execution_with_history(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &str,
+    preloaded: PreloadedFailureHistory,
+) -> HarvestResult<()> {
+    let (exec_id, next_event_id) = match preloaded {
+        PreloadedFailureHistory::NoExecution => {
+            return fail_task_only(conn, task.id, error).await;
+        }
+        PreloadedFailureHistory::Unavailable { exec_id } => {
             update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
             return queue::fail_task(conn, task.id, error).await;
         }
+        PreloadedFailureHistory::Loaded {
+            exec_id,
+            next_event_id,
+        } => (exec_id, next_event_id),
     };
 
     persist_workflow_failure(
         conn,
         task.id,
         exec_id,
-        history.next_event_id,
+        next_event_id,
         worker_id,
         error,
         None,
@@ -7177,6 +10111,22 @@ async fn create_detached_child_executions(
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): pre-validate EVERY detached child's handler before
+    // inserting any of them, so a miss on the second child cannot leave the
+    // first already created. Releasing the parent's task lets a capable peer
+    // persist the whole batch instead of terminally failing the parent.
+    for cmd in commands {
+        if let WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } = cmd
+            && !registry.workflows.contains_key(workflow_name.as_str())
+        {
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
+            });
+        }
+    }
+
     // Provenance ref for every detached child is the parent execution id (#740).
     let parent_exec_id_str = parent_execution.id.to_string();
     for cmd in commands {
@@ -7189,12 +10139,6 @@ async fn create_detached_child_executions(
         else {
             continue;
         };
-
-        if !registry.workflows.contains_key(workflow_name.as_str()) {
-            return Err(HarvestError::Config(format!(
-                "no workflow handler registered for '{workflow_name}'"
-            )));
-        }
 
         // Idempotent: skip if already created (crash-restart replay).
         let already_exists: bool = harvest_workflow_executions::table
@@ -7210,14 +10154,15 @@ async fn create_detached_child_executions(
 
         let child_workflow_id = child_id.to_string();
         let detached_wf_info = registry.workflows.get(workflow_name.as_str());
-        let (owner, runbook_url, severity, child_sla, detached_retry_policy) = detached_wf_info
-            .map_or((None, None, None, None, None), |w| {
+        let (owner, runbook_url, severity, child_sla, detached_retry_policy, detached_quota) =
+            detached_wf_info.map_or((None, None, None, None, None, None), |w| {
                 (
                     w.owner,
                     w.runbook_url,
                     w.severity,
                     w.sla,
                     w.retry_policy.clone(),
+                    w.quota,
                 )
             });
         // Clamp the detached child's retry policy by the server-side ceiling (issue #523).
@@ -7231,6 +10176,27 @@ async fn create_detached_child_executions(
         });
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+        // A detached child accumulates its own history/DLQ/active-execution
+        // footprint exactly like any other registry-aware start, so it is
+        // resolved against and enforced under its OWN declared quota (issue
+        // #946, Codex round-3 review) -- it is not exempt as "in-flight
+        // continuation" the way #946 AC3 exempts
+        // continue-as-new/reset/workflow-level-retry. `ParentClosePolicy`
+        // (#347) governs the detached child's *lifecycle*, not its *tenant
+        // capacity*, so the two concerns are orthogonal.
+        let child_quota_key: Option<String> =
+            detached_quota.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
+        if let Some(key) = child_quota_key.as_deref()
+            && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+        {
+            return Err(HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::QuotaKey,
+                observed_bytes,
+                cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+                workflow_type: workflow_name.clone(),
+                activity_name: None,
+            });
+        }
         let child_row = NewWorkflowExecution {
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -7272,6 +10238,7 @@ async fn create_detached_child_executions(
             start_source: Some(crate::types::StartSource::Child.as_str()),
             start_source_ref: Some(parent_exec_id_str.as_str()),
             started_by: None,
+            quota_key: child_quota_key.as_deref(),
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -7279,6 +10246,29 @@ async fn create_detached_child_executions(
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
+
+        // Enforced right after the row INSERT but BEFORE the child's own
+        // `WorkflowStarted` event is appended (issue #946, Codex round-4
+        // review). `enforce_quota_admission` subtracts 1 from
+        // `active_executions` to exclude the row it is itself being called
+        // about, so it must run once that row genuinely exists -- but its
+        // `history_bytes` check has NO such compensation, so it must ALSO run
+        // before any event exists for this row (matching the reference
+        // ordering in `start_or_load_workflow_execution_collect`,
+        // execution.rs: INSERT -> enforce_quota_admission -> append event). A
+        // `QuotaExceeded` here rolls back the whole enclosing transaction
+        // (nothing durable was created) and propagates via `?` to whichever
+        // caller-side recovery point applies -- `recover_from_child_quota_
+        // exceeded` parks the PARENT's task and wakes it, rather than
+        // terminally failing it over the CHILD's tenant quota.
+        crate::execution::enforce_quota_admission(
+            conn,
+            detached_quota,
+            child_quota_key.as_deref(),
+            workflow_name.as_str(),
+            Some(registry.telemetry().metrics.as_ref()),
+        )
+        .await?;
 
         // Start child history.
         // Note: the ChildWorkflowSpawnedDetached event for the PARENT history is
@@ -7584,6 +10574,7 @@ async fn handle_activity_result(
     activity_name_for_cap: &str,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
+    retry_after_ceiling: Duration,
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
@@ -7615,7 +10606,7 @@ async fn handle_activity_result(
             {
                 metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
             }
-            let delay_result = next_retry_delay(task, &error, retry_policy);
+            let delay_result = next_retry_delay(task, &error, retry_policy, retry_after_ceiling);
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
             if let Some(delay) = delay {
@@ -8037,10 +11028,17 @@ async fn process_activity_task(
     }
 
     let Some(activity) = registry.activities.get(activity_name) else {
-        let error = format!("no activity handler registered for '{activity_name}'");
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
-        return Err(HarvestError::Config(error));
+        // Issue #804 (AC2): mirror of the workflow path above. Return the typed
+        // capability-miss error un-failed so the dispatch path can release this
+        // claim for a capable peer instead of terminally failing the owning
+        // execution over a transient fleet-capability skew.
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Activity.as_str(),
+            name: activity_name.to_owned(),
+            // The activity body never ran. (An activity task carries no
+            // workflow-timeout strike, so the phase is informational here.)
+            phase: CapabilityMissPhase::BeforeHandler,
+        });
     };
 
     // Circuit breaker (issue #369): consult the breaker before doing anything
@@ -8112,12 +11110,13 @@ async fn process_activity_task(
     // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
-    let activity_id = {
+    let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result =
             append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
                 .await;
-        let Some(id) = fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
+        let Some(started) =
+            fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
         else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
@@ -8144,9 +11143,10 @@ async fn process_activity_task(
             }
             return Ok(());
         };
-        id
+        started
         // conn is dropped here, returning the slot to the pool
     };
+    let activity_id = started.activity_id;
 
     // Schedule-to-start latency (issue #501): record here, once the activity has
     // genuinely started (ActivityStarted appended). This is *past* the
@@ -8211,6 +11211,7 @@ async fn process_activity_task(
             activity_name,
             registry.payload_offloader(),
             telemetry.metrics.as_ref(),
+            registry.retry_after_ceiling,
         )
         .await;
     }
@@ -8238,6 +11239,15 @@ async fn process_activity_task(
             || std::sync::Arc::new(std::collections::HashMap::new()),
             std::sync::Arc::new,
         );
+    // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
+    // already locked (no extra query) plus the claimed task row.
+    let activity_identity = ActivityIdentity::new(
+        exec_id,
+        started.workflow_id,
+        started.workflow_name,
+        activity_name.to_string(),
+        activity_id,
+    );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),
@@ -8245,7 +11255,18 @@ async fn process_activity_task(
         cancel.clone(),
         task.id,
         pool.clone(),
+        activity_identity,
     )
+    .with_queue_name(task.queue_name.clone())
+    // The attempt deadline is the earliest of this attempt's `start_to_close`
+    // budget and the activity's cross-retry `schedule_to_close` deadline
+    // (issue #378) — the scanner kills a RUNNING row on either, so reporting
+    // only the per-attempt budget would over-report the time available.
+    .with_deadline(crate::context::attempt_deadline(
+        task.started_at,
+        task.start_to_close,
+        task.schedule_to_close_at,
+    ))
     .with_trace_context(trace_carrier.clone())
     .with_context_headers(activity_context_headers)
     // Issue #682: surface the activity's heartbeat timeout so a handler can
@@ -8293,7 +11314,13 @@ async fn process_activity_task(
         { ATTR_ATTEMPT } = task.attempt,
         { ATTR_QUEUE } = %task.queue_name,
     );
-    let started_at = std::time::Instant::now();
+    // Monotonic clock for this attempt's duration metric and the WASM
+    // start-to-close anchor. Deliberately NOT named `started_at`: that name
+    // belongs to `task.started_at`, the wall-clock `TIMESTAMPTZ` the
+    // start-to-close *scanner* compares against and the anchor
+    // `ctx.deadline()` is derived from (issue #783). Conflating the two would
+    // silently disagree with the mechanism that actually kills the attempt.
+    let attempt_clock_start = std::time::Instant::now();
 
     // Issue #782: wrap the activity handler in a panic-containing value adapter.
     // A caught panic is flattened into the existing `Result<Value, String>` Err
@@ -8361,11 +11388,20 @@ async fn process_activity_task(
                         // whole pre-guest interval — resolution (this checkout +
                         // active-hash lookup + cold-cache byte fetch) plus compile
                         // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `started_at` was captured above,
-                        // just before this dispatch resolution began, so it
-                        // aligns with the start-to-close clock that started when
-                        // `ActivityStarted` was recorded.
-                        started_at,
+                        // #965 review round 7). `attempt_clock_start` was captured
+                        // above, just before this dispatch resolution began, so it
+                        // APPROXIMATES the start-to-close anchor (issue #965
+                        // review round 10 — it does not equal it). The
+                        // authoritative anchor is `task.started_at`, set at claim,
+                        // and `ActivityStarted` is appended earlier still, so the
+                        // setup between them is not charged to the guest. Under
+                        // pool contention the guest's budget therefore starts
+                        // slightly later than the timeout scanner's. That is
+                        // safe-direction — the scanner fires first, the guest's own
+                        // epoch ceiling still bounds it, and a late result lands on
+                        // an already-terminal task — and it matches native
+                        // activities, which are equally unaware of `started_at`.
+                        attempt_clock_start,
                     )
                     .await
                     // `conn` is dropped at the end of this arm, before the guest runs.
@@ -8531,7 +11567,7 @@ async fn process_activity_task(
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
 
-    let duration_secs = started_at.elapsed().as_secs_f64();
+    let duration_secs = attempt_clock_start.elapsed().as_secs_f64();
     let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
@@ -8673,6 +11709,7 @@ async fn process_activity_task(
         activity_name,
         registry.payload_offloader(),
         telemetry.metrics.as_ref(),
+        registry.retry_after_ceiling,
     )
     .await
 }
@@ -9512,6 +12549,17 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Persist durable workflow logs (issue #790) — best-effort, never fails
+    // the cycle. No-op when the sink is disabled (the default).
+    if let Some(policy) = registry.workflow_log_policy {
+        persist_workflow_logs_from_commands(
+            conn,
+            context.persistence.exec_id,
+            commands,
+            policy.max_lines(),
+        )
+        .await;
+    }
     // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
     notify_progress_from_commands(conn, context.persistence.exec_id, commands).await;
 
@@ -9684,23 +12732,36 @@ async fn handle_suspended_workflow(
         .await
     } else {
         let error = suspended_workflow_error(commands);
-        persist_workflow_failure(
+        fail_suspended_workflow_if_still_claimed(
             conn,
-            context.persistence.task.id,
+            context.persistence.task,
             context.persistence.exec_id,
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::types::Priority::default(),
         )
         .await
-        .map(|_| ())
     };
+
+    // Issue #946, Codex round-3/round-4 review: a `QuotaExceeded` reaching
+    // here can originate from `persist_all_started_child_workflows`/
+    // `persist_child_timeout_race` (both already caught locally at their own
+    // transaction boundary and never surface it this far) or from
+    // `DetachedSpawnPersistence::persist` inside any of the OTHER branches
+    // above (e.g. a bookkeeping-only or activity-scheduling cycle that also
+    // detaches a child). Defer with a bounded backoff rather than terminally
+    // failing this execution over an unrelated tenant's quota.
+    if let Err(ref error) = result
+        && recover_from_child_quota_exceeded(
+            conn,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            error,
+        )
+        .await?
+    {
+        return Ok(());
+    }
 
     fail_execution_on_error(
         conn,
@@ -9721,8 +12782,223 @@ async fn fail_execution_on_error<T>(
         Ok(val) => return Ok(val),
         Err(e) => e,
     };
+    // Issue #804: a capability miss is a blameless fleet condition, not a
+    // workload failure. Pass it through un-failed so the dispatch path
+    // (`process_task`) can release the claim for a capable peer; it decides
+    // release-vs-escalate, and only the escalation branch routes back through
+    // the terminal-failure path.
+    if error.handler_not_registered().is_some() {
+        return Err(error);
+    }
+    // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
+    // claim is the identical "blameless, no decision made" shape as a
+    // capability miss -- pass it through un-failed so the caller can roll
+    // back the enclosing transaction and perform the standalone claim
+    // release afterward, rather than terminally failing the run here.
+    if error.suspended_claim_ambiguous().is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Lower/upper bounds for the randomized reschedule delay after a child
+/// spawn is deferred by a full target-tenant quota (issue #946, Codex
+/// round-4 review). A worker-capacity-style congestion signal, not a
+/// worker-crash or divergent-build signal, so this uses a fixed (non-growing)
+/// jittered window rather than [`nd_block_backoff`]'s unbounded exponential
+/// ramp -- quota capacity is expected to free up on an ordinary timescale (a
+/// sibling execution of the target type completing, an operator clearing DLQ
+/// entries) rather than requiring a deploy rollback. Reuses
+/// [`crate::sessions::acquire_retry_backoff`], the same pure jittered-backoff
+/// primitive worker-session-slot contention already relies on, just with a
+/// window sized for DB-backed tenant-quota capacity rather than in-process
+/// semaphore contention.
+///
+/// Deliberately kept well under `wait_for_execution_state`'s 10s default test
+/// timeout (`tests/integration/integration_e2e.rs`): `acquire_retry_backoff`
+/// can draw arbitrarily close to `max`, and the requeued task still needs a
+/// subsequent worker poll to notice `scheduled_at` has arrived, so a max
+/// anywhere near 10s would make the "parks parent then succeeds" regression
+/// tests flaky under CI load. A 3s ceiling leaves several seconds of margin
+/// for that poll-interval + dispatch overhead while still comfortably
+/// avoiding a hot loop (the actual bug this backoff fixes -- see below).
+const QUOTA_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const QUOTA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(3);
+
+/// If `error` is a quota-exceeded rejection (issue #946) surfaced while
+/// spawning a child workflow -- fan-out, the child-timeout race, a detached
+/// child, or an inline local activity's own detached spawn -- this is never
+/// the CALLER's fault: it is a capacity signal on the TARGET workflow type's
+/// tenant key. `enforce_quota_admission` is called only after the child row
+/// has been inserted (and BEFORE its `WorkflowStarted`/`ChildWorkflowStarted`
+/// event is appended -- issue #946, Codex round-4 review) inside the
+/// enclosing transaction, so a `QuotaExceeded` here rolls that whole
+/// transaction back -- nothing durable was created. Terminally failing the
+/// CALLING execution over another tenant's quota would be wrong
+/// (`fail_task_and_execution` seals the run `FAILED`), so instead re-pend the
+/// caller's task with a bounded jittered backoff: the next scheduled poll
+/// re-drives this exact decision cycle from the unchanged recorded history
+/// and retries the spawn once the target tenant's quota has capacity again.
+///
+/// A `RUNNING` -> `PENDING`-at-`scheduled_at` requeue (via
+/// [`queue::requeue_for_retry`]), not a park-then-immediate-wake: nothing
+/// external will ever call [`queue::wake_workflow_task`] for THIS execution
+/// when the target's quota frees up (quota capacity is a property of OTHER
+/// executions of the target type, never an event tied to this caller's
+/// `exec_id`), so parking (which waits for an explicit wake) is the wrong
+/// primitive here and a park immediately followed by an unconditional wake
+/// degenerates into a zero-delay retry loop that hot-spins on a persistently
+/// full quota (e.g. `max_dead_letters`, which only clears via manual operator
+/// action) -- hammering the database with no backoff at all. A durably
+/// scheduled retry is self-throttling and survives a worker restart, unlike
+/// an in-process delayed-wake timer.
+///
+/// Every OTHER call site that can reach this helper's callers with a
+/// `QuotaExceeded` already caught it locally at its own transaction boundary
+/// (the fan-out and child-timeout-race paths); this is the shared fallback
+/// for every remaining child-spawn path -- `handle_suspended_workflow`'s
+/// dispatch tail (a detached-only suspension, or a mixed batch whose
+/// `DetachedSpawnPersistence::persist` call is the source of the error),
+/// the master persist transaction's terminal-commands path
+/// (`persist_terminal_outcome_commands`, which calls
+/// `create_detached_child_executions` directly), and an inline local
+/// activity's own detached-spawn persist.
+///
+/// Returns `Ok(true)` (already handled -- caller should return `Ok(())`)
+/// when `error` was a quota rejection and the backoff requeue succeeded;
+/// `Ok(false)` when the caller should fall through to its own error handling.
+async fn recover_from_child_quota_exceeded(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    error: &HarvestError,
+) -> HarvestResult<bool> {
+    let HarvestError::QuotaExceeded {
+        workflow_name,
+        key,
+        resource,
+        limit,
+        current,
+    } = error
+    else {
+        return Ok(false);
+    };
+    let backoff = crate::sessions::acquire_retry_backoff(
+        rand::random::<f64>(),
+        QUOTA_RETRY_BACKOFF_MIN,
+        QUOTA_RETRY_BACKOFF_MAX,
+    );
+    tracing::warn!(
+        execution_id = %exec_id,
+        target_workflow_name = %workflow_name,
+        quota_key = %key,
+        resource = %resource,
+        limit = *limit,
+        current = *current,
+        backoff_ms = backoff.as_millis(),
+        "quota exceeded spawning a child workflow; deferring the retry with \
+         a bounded jittered backoff rather than immediately re-driving it or \
+         failing the execution over an unrelated tenant's quota",
+    );
+    let backoff_chrono =
+        chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
+    queue::requeue_for_retry(conn, task_id, backoff_chrono, &error.to_string()).await?;
+    Ok(true)
+}
+
+/// Fail a suspended workflow dispatch that made **zero** replay-significant
+/// progress -- an empty command set, or a command combination this worker
+/// does not know how to persist -- but only when this worker still holds the
+/// claim (issue #1182).
+///
+/// [`handle_suspended_workflow`]'s catch-all branch used to reach straight for
+/// [`persist_workflow_failure`], with no ownership recheck at all. A live
+/// dispatch that suspends empty-handed because it was still mid-flight on
+/// some other I/O -- a slow downstream call, a database round trip -- when
+/// [`crate::executor::SUSPENSION_TIMEOUT`] elapses would then be failed
+/// terminally under the **stale** `worker_id`, even when the row had already
+/// changed hands to a concurrent poison-pill reclaim, an operator action, or
+/// exactly the claim-theft race issue #804's round-28 fix guards the
+/// `AfterHandler` capability-miss branch against. That guard covers only the
+/// path reached via [`persist_scheduled_activities`]; a handler that never
+/// got far enough to push a single command skips that branch and lands here,
+/// where nothing checked the claim.
+///
+/// This reuses the same commit-if-still-claimed guarantee
+/// ([`commit_terminal_failure_if_still_claimed`]) with no escalation
+/// attached, so a [`TerminalWriteOutcome::ClaimLost`] result writes nothing
+/// terminal. `EvidenceChanged` cannot occur here (it is only produced when an
+/// `escalation` is supplied) but is handled identically for completeness and
+/// to keep this function robust to a future change in that guarantee.
+///
+/// `ClaimLost` does not, by itself, mean the row's new owner is free to drive
+/// the run to completion -- [`queue::claim_still_held_for_update`]'s `SKIP
+/// LOCKED` guard cannot distinguish a genuine ownership transfer from a
+/// concurrent, *unrelated* lock holder (e.g. [`queue::wake_workflow_task`]'s
+/// `wake_requested` fallback, momentarily locking this exact row for a
+/// sibling event) merely contending for it at that instant; both read back
+/// as "not ours right now" (Codex review of #1182). If this dispatch simply
+/// returned `Ok(())` in that second case, the row would strand `RUNNING`
+/// under a worker who has already given up on it, with nothing left to ever
+/// re-claim it -- so a lost claim (or a changed evidence snapshot) must
+/// still be released.
+///
+/// **The release itself does not happen here.** This function is called
+/// from inside `process_workflow_task`'s persistence transaction, which
+/// holds the *execution* row's lock for its whole duration
+/// ([`check_paused_and_park`]'s `FOR UPDATE`). `commit_terminal_failure_if_
+/// still_claimed` opens its own transaction internally, but since one is
+/// already open here, Diesel issues a `SAVEPOINT` rather than a fresh
+/// `BEGIN` -- and Postgres does **not** release a lock held by the outer
+/// transaction when a nested savepoint is released, only when the
+/// *outermost* transaction ends. Attempting the blocking, non-`SKIP LOCKED`
+/// [`queue::release_suspended_workflow_claim`] from here would therefore
+/// contend for the task row *while still holding the execution row* -- the
+/// exact ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
+/// (task-row-first) lock order that `SKIP LOCKED` exists to avoid in the
+/// first place (Codex review round 2 of #1182).
+///
+/// So an ambiguous claim is surfaced as [`HarvestError::SuspendedClaimAmbiguous`]
+/// instead, and propagated with `?`. This forces the *entire* enclosing
+/// transaction to roll back -- releasing the execution-row lock, and
+/// discarding any bookkeeping write [`handle_suspended_workflow`] made
+/// earlier in the same dispatch cycle, so a rolled-back "no decision" can
+/// never commit half of one -- before the release is even attempted. Only
+/// after that rollback and the enclosing `.await` have both returned does
+/// the caller invoke [`queue::release_suspended_workflow_claim`] standalone,
+/// holding no other lock: a genuine transfer updates nothing (the new owner
+/// keeps the row, unchanged), while a spurious skip-locked miss is released
+/// back to `PENDING` for a fresh dispatch attempt.
+#[doc(hidden)]
+pub async fn fail_suspended_workflow_if_still_claimed(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    let preloaded = PreloadedFailureHistory::Loaded {
+        exec_id,
+        next_event_id,
+    };
+    let write = commit_terminal_failure_if_still_claimed(
+        conn,
+        task,
+        worker_id,
+        error,
+        preloaded,
+        None,
+        |_| {},
+    )
+    .await?;
+    match write {
+        TerminalWriteOutcome::Committed(_) => Ok(()),
+        TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            Err(HarvestError::SuspendedClaimAmbiguous { task_id: task.id })
+        }
+    }
 }
 
 /// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
@@ -9735,6 +13011,11 @@ async fn fail_execution_on_error<T>(
 /// here or it leaks one `u32` per such execution. The panic re-dispatch path
 /// returns `Ok(())` and is never routed through this wrapper, so its
 /// just-incremented strike is preserved (mirrors `workflow_task_timeout_strikes`).
+///
+/// A pre-/mid-handler capability miss (issue #804) is likewise preserved: it is
+/// non-terminal — `fail_execution_on_error` passes it through so the dispatch
+/// path can release the task — so it is not evidence the body stopped panicking.
+/// See [`failure_clears_panic_strike`].
 async fn fail_workflow_execution_clearing_strikes<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -9743,9 +13024,7 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     workflow_panic_strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
     exec_id: uuid::Uuid,
 ) -> HarvestResult<T> {
-    if result.is_err() {
-        clear_panic_strike(workflow_panic_strikes, exec_id);
-    }
+    apply_panic_strike_clear_for_failure(workflow_panic_strikes, exec_id, &result);
     fail_execution_on_error(conn, task, worker_id, result).await
 }
 
@@ -9987,19 +13266,627 @@ async fn reject_child_continue_as_new(
     Ok(true)
 }
 
+/// Outcome of validating a continue-as-new's target workflow type (issue #803).
+enum ContinueAsNewTypeCheck<'a> {
+    /// The target type is blank or unregistered on this worker: the execution
+    /// has already been failed terminally and the caller must bail.
+    Rejected,
+    /// `new_workflow_type` was `None` — a same-type continuation, the legacy
+    /// path. Every lifecycle column is carried forward verbatim.
+    SameType,
+    /// A cross-type continuation into a type that *is* registered here. The
+    /// successor's lifecycle defaults come from this [`WorkflowInfo`].
+    CrossType(&'a crate::info::WorkflowInfo),
+}
+
+/// Validate a cross-type continue-as-new target before anything is persisted
+/// (issue #803 AC5).
+///
+/// Continuing into a type no worker can dispatch would seal the predecessor
+/// and leave a successor stuck `RUNNING` forever with nothing to claim it, so
+/// the check runs **before** the seal transaction opens and fails the
+/// predecessor terminally instead — the same shape as
+/// [`reject_child_continue_as_new`], and the same fail-closed posture the
+/// child-spawn paths already take for an unregistered child type.
+///
+/// Consequence worth knowing: the target must be registered on the worker that
+/// runs the *transition*, so a new phase handler has to reach the whole fleet
+/// before code that continues into it does.
+///
+/// The **unregistered-target** case no longer normally reaches here: issue
+/// #804's persist gate ([`continue_as_new_target_capability_miss`]) runs
+/// earlier in `process_workflow_task` and releases the claim for a capable
+/// peer, since that case is a transient fleet condition rather than a fault.
+/// The arm below is kept as the fail-closed backstop for the narrow window
+/// where the target is *deregistered* between that gate and this call.
+async fn check_continue_as_new_type<'a>(
+    conn: &mut AsyncPgConnection,
+    registry: &'a HandlerRegistry,
+    persistence: &WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    new_workflow_type: Option<&str>,
+    slot: &mut SuccessorSlot,
+) -> HarvestResult<ContinueAsNewTypeCheck<'a>> {
+    let error = match classify_continue_as_new_target(registry, new_workflow_type) {
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => {
+            // Routing first: the slot resolution below can only see the
+            // predecessor's shard, so it is only sound once we know the target
+            // key routes to that same shard (Codex P1 on PR #1159).
+            if let Err(error) = reject_cross_shard_continue_as_new(
+                info.name,
+                &execution.workflow_name,
+                &execution.workflow_id,
+                execution.shard_id,
+            ) {
+                error
+            } else if let Err(error) = classify_successor_deadline_representable(
+                info.name,
+                // Judge the EFFECTIVE timeout (post-ceiling), matching what
+                // `resolve_continue_as_new_successor_defaults` will actually
+                // store — otherwise a configured ceiling that makes the
+                // declaration perfectly valid would still be rejected.
+                info.execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|t| {
+                        registry
+                            .max_workflow_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map_or(t, |ceiling| t.min(ceiling))
+                    }),
+                chrono::Utc::now(),
+            ) {
+                error
+            } else {
+                // The successor takes a DIFFERENT uniqueness slot —
+                // `(target, workflow_id)` — and sealing the predecessor does not
+                // free it. Resolve that slot now, under the same transaction, so a
+                // collision is an actionable terminal failure rather than a bare
+                // Postgres unique violation that rolls the whole cycle back.
+                match resolve_successor_slot(conn, info.name, &execution.workflow_id, execution.id)
+                    .await?
+                {
+                    Ok(resolved) => {
+                        *slot = resolved;
+                        return Ok(ContinueAsNewTypeCheck::CrossType(info));
+                    }
+                    Err(error) => error,
+                }
+            }
+        }
+        Ok(resolved) => return Ok(resolved),
+        Err(error) => error,
+    };
+
+    // Root-only by construction: `reject_child_continue_as_new` runs first, so
+    // a child execution never reaches here. Retry is deliberately not offered
+    // (`None` for the execution) — a re-run would resolve the same missing
+    // registration and fail identically, matching the child-guard precedent.
+    persist_workflow_failure(
+        conn,
+        persistence.task.id,
+        persistence.exec_id,
+        persistence.next_event_id,
+        persistence.worker_id,
+        &error,
+        None,
+        None,
+        None,
+        None,
+        None,
+        crate::types::Priority::default(),
+    )
+    .await?;
+    Ok(ContinueAsNewTypeCheck::Rejected)
+}
+
+/// State of the `(workflow_name, workflow_id)` uniqueness slot the successor
+/// is about to take (issue #803).
+///
+/// For a **same-type** continuation the predecessor *is* the occupant, and
+/// sealing it `CONTINUED_AS_NEW` inside the transaction frees the slot — which
+/// is why the legacy insert needed no check at all. A **cross-type**
+/// continuation takes a different slot that sealing the predecessor does not
+/// free, so it must be resolved explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuccessorSlot {
+    /// Nothing to do: nobody occupies the slot, or (the same-type case) the
+    /// predecessor's own seal frees it.
+    Free,
+}
+
+/// Reject a cross-type continuation whose target key routes to a *different*
+/// shard than the predecessor lives on (issue #803, Codex P1 on PR #1159).
+///
+/// Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so
+/// changing the type changes the shard the key resolves to — empirically for
+/// ~75% of ids on a 4-shard router. The successor, however, is inserted on the
+/// predecessor's shard: the seal and the insert are one transaction, and
+/// Postgres has no cross-shard transaction to move it with.
+///
+/// Left unguarded that silently breaks two things a multi-shard deployment
+/// relies on:
+///
+/// 1. **`workflow_id`-addressed signal/cancel/await (issue #751)** resolves its
+///    target with `shard::external_target_owning_shard`, which hashes the new
+///    pair — so it queries the wrong database and reports the live successor as
+///    `target_unknown`. That is precisely the addressing mode this feature tells
+///    callers to use for an entity that changes type.
+/// 2. **`(workflow_name, workflow_id)` uniqueness**, because
+///    [`resolve_successor_slot`] can only see the predecessor's shard: a live
+///    run of the target type sitting on the hash-derived shard is invisible, so
+///    the successor is created alongside it and two live runs share one key.
+///
+/// So this fails the transition **closed**, matching what the feature already
+/// does for every other unsupported target (blank, unregistered, DAG, occupied
+/// slot): a loud, deterministic, actionable terminal failure instead of silent
+/// misrouting and a broken uniqueness invariant.
+///
+/// **Single-shard deployments are unaffected** — one shard means the key can
+/// only ever resolve to it, so this never fires. It is also inert when no
+/// global router is installed (tests, embedders that never call
+/// `install_global_router`), since the target shard is then unknowable and
+/// guessing would be worse than the status quo.
+fn reject_cross_shard_continue_as_new(
+    target: &str,
+    predecessor_type: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+) -> Result<(), String> {
+    // Cheap exemption first: naming the run's own type changes no key, so it
+    // needs no routing lookup at all (Codex P2 on PR #1159).
+    if target == predecessor_type {
+        return Ok(());
+    }
+    let target_shard =
+        crate::shard::external_target_owning_shard(&crate::types::ExternalTarget::WorkflowId {
+            workflow_name: target.to_string(),
+            workflow_id: workflow_id.to_string(),
+        });
+    classify_cross_shard_continue_as_new(
+        target,
+        predecessor_type,
+        workflow_id,
+        predecessor_shard,
+        target_shard,
+    )
+}
+
+/// Pure decision behind [`reject_cross_shard_continue_as_new`].
+///
+/// Split out so the inert / co-located / divergent matrix is unit-testable
+/// without installing a process-global router (which would race sibling tests
+/// in the same binary), matching how [`classify_successor_slot`] and
+/// [`classify_continue_as_new_target`] are tested.
+///
+/// `target_shard == None` means no global router is installed.
+fn classify_cross_shard_continue_as_new(
+    target: &str,
+    predecessor_type: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+    target_shard: Option<crate::types::ShardId>,
+) -> Result<(), String> {
+    if target == predecessor_type {
+        // Naming the run's OWN type is a supported request (it re-resolves that
+        // type's declared defaults) and leaves `(workflow_name, workflow_id)`
+        // untouched, so the misrouting rationale below does not apply and the
+        // successor stays on the predecessor's shard exactly as a legacy
+        // same-type continuation does.
+        //
+        // Load-bearing, not theoretical: with explicit shard placement (issue
+        // #697) a run is deliberately pinned OFF its hash-derived shard, so
+        // without this arm every such entity would be failed terminally the
+        // moment it named its own type.
+        return Ok(());
+    }
+    let Some(target_shard) = target_shard else {
+        // No global router installed: the target shard is unknowable here, and
+        // a deployment without a router is single-shard by construction.
+        return Ok(());
+    };
+    if target_shard.as_i32() == predecessor_shard {
+        return Ok(());
+    }
+    Err(format!(
+        "continue_as_new into '{target}' would place the successor on shard {predecessor_shard} \
+         (the predecessor's shard, since the seal and the successor insert are one transaction), \
+         but the key ('{target}', '{workflow_id}') routes to shard {}. Cross-shard relocation is \
+         not supported, and proceeding would make the successor unreachable by workflow_id-\
+         addressed signal/cancel (issue #751) and could admit a second live run of the target type \
+         on the routed shard. Keep this entity on one type and branch internally, or run a \
+         single-shard deployment",
+        target_shard.as_i32()
+    ))
+}
+
+/// Reject a cross-type continuation whose target declares an
+/// `execution_timeout` that cannot be represented as an absolute deadline
+/// (issue #803, Codex P2 on PR #1159).
+///
+/// The scanner is authoritative on `deadline_at`, not on `execution_timeout`:
+/// `enforce_workflow_execution_timeouts` selects
+/// `deadline_at IS NOT NULL AND deadline_at < now`, so a NULL deadline is never
+/// enforced. Persisting `execution_timeout = Some(..)` with `deadline_at =
+/// NULL` would therefore leave a row that *claims* a hard runaway cap it does
+/// not actually have — the exact failure a hard timeout exists to prevent.
+///
+/// This is the FIRST path that resolves the target type's own declaration: the
+/// normal start path computes `target_start_time + d` with a plain `+`
+/// (`execution.rs`), which panics on overflow rather than persisting such a
+/// run, so a type whose declaration overflows could never have been started
+/// directly anyway. Refusing here reaches the same "no run is created with a
+/// lying field" outcome as a diagnosable terminal failure instead of a panic.
+///
+/// Takes the **effective** timeout (already clamped by the operator's
+/// fleet-wide ceiling), so a configured ceiling rescues an otherwise
+/// unrepresentable declaration rather than failing the transition.
+///
+/// The SLA (#487) is deliberately NOT handled here: an overflowing soft budget
+/// maps to "no SLA" in [`resolve_continue_as_new_successor_defaults`], matching
+/// the documented start-path behaviour. Dropping an observational counter is
+/// benign; silently dropping a runaway cap is not.
+fn classify_successor_deadline_representable(
+    target: &str,
+    effective_timeout: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let Some(timeout) = effective_timeout else {
+        // No declared timeout: `deadline_at = NULL` is then correct and agrees
+        // with `execution_timeout = NULL`.
+        return Ok(());
+    };
+    if now.checked_add_signed(timeout).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "continue_as_new into '{target}' cannot resolve its declared \
+         execution_timeout ({} seconds) to an absolute deadline: the resulting instant is outside \
+         the representable timestamp range. Persisting it would store a hard timeout the timeout \
+         scanner can never enforce (it requires a non-NULL deadline_at), so the successor would \
+         claim a runaway cap it does not have. Declare a smaller execution_timeout on '{target}', \
+         omit it to mean 'no timeout', or configure a fleet-wide \
+         max_workflow_execution_timeout ceiling",
+        timeout.num_seconds()
+    ))
+}
+
+/// Resolve the successor's uniqueness slot for a cross-type continuation.
+///
+/// Takes the occupying row (if any) `FOR UPDATE` so the decision is stable for
+/// the rest of the enclosing transaction — a concurrent start of the target
+/// type under the same `workflow_id` cannot slip in between this check and the
+/// successor insert.
+///
+/// Scope note: this can only see the **predecessor's shard**. That is sound
+/// only because [`reject_cross_shard_continue_as_new`] has already rejected any
+/// transition whose target key routes elsewhere, so the routed shard and the
+/// queried shard are necessarily the same one.
+///
+/// `Ok(Err(msg))` is a *rejection* (an operator-facing message), not a database
+/// error: a **live** run of the target type already owns the identity, and
+/// harvest's `(workflow_name, workflow_id)` uniqueness admits exactly one.
+async fn resolve_successor_slot(
+    conn: &mut AsyncPgConnection,
+    target: &str,
+    workflow_id: &str,
+    predecessor: uuid::Uuid,
+) -> HarvestResult<Result<SuccessorSlot, String>> {
+    let occupant: Option<(uuid::Uuid, String)> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(target))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+        ))
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    Ok(classify_successor_slot(
+        target,
+        workflow_id,
+        predecessor,
+        occupant.as_ref().map(|(id, state)| (*id, state.as_str())),
+    ))
+}
+
+/// Pure decision behind [`resolve_successor_slot`] (issue #803).
+///
+/// Split out so the free / self / terminal-occupant / live-occupant matrix is
+/// unit-testable without a database.
+fn classify_successor_slot(
+    target: &str,
+    workflow_id: &str,
+    predecessor: uuid::Uuid,
+    occupant: Option<(uuid::Uuid, &str)>,
+) -> Result<SuccessorSlot, String> {
+    let Some((id, state)) = occupant else {
+        return Ok(SuccessorSlot::Free);
+    };
+    if id == predecessor {
+        // The caller named its OWN type — a supported request (it re-resolves
+        // that type's declared defaults, which the legacy `continue_as_new`
+        // deliberately does not). The predecessor is its own occupant, and its
+        // seal inside this same transaction frees the slot, exactly as it does
+        // for a same-type continuation. Without this arm the natural typed
+        // form `continue_as_new_as(&own_info(), input)` would report the run as
+        // blocking itself and fail it terminally.
+        return Ok(SuccessorSlot::Free);
+    }
+    if crate::erase::is_terminal_state(state) {
+        // A prior run of this phase finished — a win-back loop such as
+        // `churned -> trial -> churned`, or the separate run an external caller
+        // started by naming the old type.
+        //
+        // An earlier cut RELEASED the slot by rewriting that run's state to
+        // `CONTINUED_AS_NEW`, reasoning that this is what the predecessor's own
+        // seal does. It is not, and two Codex P1s on PR #1159 were right to
+        // reject it — the predecessor genuinely did continue into the
+        // successor and records a `WorkflowContinuedAsNew` event saying so,
+        // whereas this occupant is an UNRELATED completed run:
+        //
+        // 1. `CONTINUED_AS_NEW` is read as a LINK, not a terminal.
+        //    `execution::read_external_await_terminal` walks history for the
+        //    successor id and returns `NotYetTerminal` when none is recorded,
+        //    so an `await_external_workflow` (#757) on that old id would park
+        //    FOREVER; `/result` (#527) likewise stops reporting its outcome.
+        //    Appending a link event instead would be worse, not better: the old
+        //    run never continued into the successor, so `/result` and awaits on
+        //    it would start reporting the SUCCESSOR's outcome as its own.
+        // 2. For a schedule-attributed run it corrupts #488 carryover.
+        //    `resolve_carryover`'s output query selects `state = 'COMPLETED'`,
+        //    so re-stating the most recent slot drops it and the next fire
+        //    reads an older or empty `last_completion_result` — an incremental
+        //    cursor rolling BACKWARD. `execution.rs`'s re-run path already
+        //    forbids sealing a schedule-attributed source in as many words.
+        //
+        // No seal state is safe: `TERMINATED` avoids the infinite park but
+        // still rewrites a COMPLETED run's reported outcome and still drops it
+        // from carryover. A terminal run is a durable historical record that
+        // callers may hold an id for, so it is not this path's to rewrite —
+        // reject and let the operator decide.
+        return Err(format!(
+            "continue_as_new target workflow type '{target}' already has a terminal execution \
+             ({id}, state {state}) for workflow_id '{workflow_id}', and harvest's \
+             (workflow_name, workflow_id) uniqueness counts a terminal run as occupying the key. \
+             Releasing it would rewrite that run's recorded outcome — breaking await/result for \
+             anyone holding its id, and rolling a scheduled carryover cursor backward — so this \
+             run was failed instead. Reset (issue #148) or erase execution {id} to free the key, \
+             or continue under a different workflow_id"
+        ));
+    }
+    Err(format!(
+        "continue_as_new target workflow type '{target}' already has a live execution ({id}, \
+         state {state}) for workflow_id '{workflow_id}'; harvest admits one active run per \
+         (workflow_name, workflow_id), so this run was failed rather than displacing it — \
+         resolve execution {id}, then restart or reset (issue #148) this entity to reach that phase"
+    ))
+}
+
+/// Pure decision behind [`check_continue_as_new_type`] (issue #803).
+///
+/// `Ok` carries the resolved continuation shape; `Err` carries the operator-
+/// facing message the caller records as the predecessor's terminal failure.
+/// Split out so the blank/unregistered/registered matrix is unit-testable
+/// without a database.
+fn classify_continue_as_new_target<'a>(
+    registry: &'a HandlerRegistry,
+    new_workflow_type: Option<&str>,
+) -> Result<ContinueAsNewTypeCheck<'a>, String> {
+    let Some(target) = new_workflow_type else {
+        return Ok(ContinueAsNewTypeCheck::SameType);
+    };
+    if target.trim().is_empty() {
+        return Err("continue_as_new target workflow type must not be blank".to_string());
+    }
+    // A unified DAG's shadow `WorkflowInfo` sits in `registry.workflows` like
+    // any other type (issue #256), so without this it would be accepted — and
+    // the successor would run the DAG's level-walker while bypassing the
+    // `max_active_runs` and paused-schedule admission gates that
+    // `trigger_unified_dag` enforces on every other entry point. DAG
+    // continue-as-new is out of scope for issue #803, so reject it rather than
+    // half-support it with the gates off.
+    if registry.dag_workflow_names.contains(target) {
+        return Err(format!(
+            "continue_as_new target '{target}' is a registered DAG, not a plain workflow type; \
+             continuing into a DAG would bypass its admission gates — trigger it with \
+             POST /dags/{target}/trigger instead"
+        ));
+    }
+    registry.workflows.get(target).map_or_else(
+        || {
+            Err(format!(
+                "continue_as_new target workflow type '{target}' is not registered on this \
+                 worker; register the handler across the fleet before continuing into it"
+            ))
+        },
+        |info| Ok(ContinueAsNewTypeCheck::CrossType(info)),
+    )
+}
+
+/// Lifecycle defaults for a continue-as-new successor row (issue #803).
+///
+/// Borrows string metadata from whichever source won, so the caller can hand
+/// these straight to `NewWorkflowExecution`'s `&str` fields.
+struct ContinueAsNewSuccessorDefaults<'a> {
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    sla: Option<chrono::Duration>,
+    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    owner: Option<&'a str>,
+    runbook_url: Option<&'a str>,
+    severity: Option<&'a str>,
+    workflow_retry_policy: Option<serde_json::Value>,
+    /// Issue #617 chain lifetime cap. Carried **verbatim** in both arms —
+    /// re-resolving it from the target type would make a type change an
+    /// escape hatch from the runaway-loop budget. Threaded through this
+    /// struct (rather than read straight off the row at the insert site) so
+    /// the invariant is covered by the pure `can803_*` tests instead of only
+    /// by a Docker-gated one.
+    chain_execution_timeout: Option<chrono::Duration>,
+    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Decide the successor's lifecycle defaults for a continue-as-new (issue #803).
+///
+/// **Presence decides.** `target_info == None` is a same-type continuation and
+/// is byte-identical to the pre-#803 behavior: every column is carried verbatim
+/// from the predecessor row and only the two per-run deadlines are re-anchored
+/// to `now`. `Some(info)` is a cross-type continuation and resolves from *that
+/// type's* declared defaults, exactly as a spawned child resolves its own —
+/// so a phase's timeout, SLA, retry policy, and on-call ownership follow the
+/// phase rather than being inherited from the phase it replaced.
+///
+/// The #617 chain cap (`chain_execution_timeout` / `chain_deadline_at`) IS
+/// returned, but carried **verbatim in both arms**: the cap is anchored at the
+/// chain's first run, so changing type must not reset it. It is threaded
+/// through this struct rather than read off the row at the insert site purely
+/// so the "not an escape hatch" invariant is covered by the pure tests.
+///
+/// Deliberately **not** decided here, because they are carried verbatim and
+/// have no target-type analogue: queue, shard, schedule lineage, build id, and
+/// search attributes.
+fn resolve_continue_as_new_successor_defaults<'a>(
+    execution: &'a WorkflowExecution,
+    target_info: Option<&'a crate::info::WorkflowInfo>,
+    max_execution_timeout_ceiling: Option<chrono::Duration>,
+    max_workflow_attempts_ceiling: Option<u32>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ContinueAsNewSuccessorDefaults<'a> {
+    let Some(info) = target_info else {
+        return ContinueAsNewSuccessorDefaults {
+            execution_timeout: execution.execution_timeout,
+            // Plain `+` (not `checked_add_signed`) preserves the pre-#803 path
+            // exactly. Safe because the value is a stored duration that was
+            // already validated when the chain's first run started.
+            deadline_at: execution.execution_timeout.map(|d| now + d),
+            sla: execution.sla,
+            sla_deadline_at: execution.sla.map(|d| now + d),
+            owner: execution.owner.as_deref(),
+            runbook_url: execution.runbook_url.as_deref(),
+            severity: execution.severity.as_deref(),
+            workflow_retry_policy: execution.workflow_retry_policy.clone(),
+            chain_execution_timeout: execution.chain_execution_timeout,
+            chain_deadline_at: execution.chain_deadline_at,
+        };
+    };
+
+    // Apply the operator's fleet-wide ceiling (issue #243) exactly as every
+    // other registry-aware start path does — otherwise a type change would be
+    // an escape hatch from the per-run cap the same declaration is clamped by
+    // when started over HTTP or fired by the scheduler.
+    let execution_timeout = info
+        .execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|t| max_execution_timeout_ceiling.map_or(t, |ceiling| t.min(ceiling)));
+    // Clamp the soft SLA to at most the hard timeout, mirroring the start
+    // path's resolution — never a soft deadline the hard one would preempt.
+    // A non-positive budget is treated as "no SLA" for the same reason the
+    // start path does: an `sla_deadline_at` at or before `started_at` would be
+    // reported breached by the very next scan (issue #487).
+    let sla = info
+        .sla
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .filter(|sla| *sla > chrono::Duration::zero())
+        .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)))
+        // An SLA whose absolute deadline is unrepresentable maps to "no SLA" —
+        // BOTH fields NULL — rather than storing a budget with a NULL
+        // `sla_deadline_at` the breach scanner can never observe (Codex P2 on
+        // PR #1159). This mirrors the documented #487 start-path rule that an
+        // out-of-range duration maps to "no SLA", and keeps the row honest.
+        //
+        // Deliberately softer than the hard-timeout treatment, which REJECTS
+        // the transition (`classify_successor_deadline_representable`): the SLA
+        // is observational, so degrading it is benign, whereas silently
+        // dropping a runaway cap is not. Narrow in practice — the clamp above
+        // already bounds the SLA by a representable `execution_timeout`, so
+        // this can only fire when the target declares no hard timeout at all.
+        .filter(|sla| now.checked_add_signed(*sla).is_some());
+    ContinueAsNewSuccessorDefaults {
+        execution_timeout,
+        // `checked_add_signed` here (unlike the verbatim arm above): these are
+        // freshly converted `WorkflowInfo` durations that no start path has
+        // range-checked, and `DateTime + Duration` panics on overflow.
+        deadline_at: execution_timeout.and_then(|d| now.checked_add_signed(d)),
+        sla,
+        sla_deadline_at: sla.and_then(|d| now.checked_add_signed(d)),
+        owner: info.owner,
+        runbook_url: info.runbook_url,
+        severity: info.severity,
+        // Clamp the target's declared retry budget by the operator's fleet-wide
+        // ceiling (issue #523) before serializing, exactly as the normal start
+        // path (`execution.rs`) and the detached-child spawn path do. Both of
+        // those clamp at their own write site precisely because they resolve a
+        // policy from a `WorkflowInfo` and bypass `StartWorkflowParams`, where
+        // the ceiling is otherwise applied — and this is the third such site.
+        //
+        // Load-bearing: the retry consumer (`schedule_workflow_retry`'s
+        // `attempt >= policy.max_attempts` gate) reads the STORED value and
+        // never re-clamps, so an unclamped write here is authoritative. Without
+        // this, changing type would be an escape hatch from the fleet-wide cap
+        // (Codex P1). The same-type arm above needs no clamp: it carries the
+        // predecessor's already-clamped stored value verbatim.
+        workflow_retry_policy: info
+            .retry_policy
+            .as_ref()
+            .map(|p| {
+                let mut p = p.clone();
+                if let Some(ceiling) = max_workflow_attempts_ceiling {
+                    p.max_attempts = p.max_attempts.min(ceiling);
+                }
+                p
+            })
+            .and_then(|p| serde_json::to_value(&p).ok()),
+        // Verbatim, deliberately: see the field docs. The chain cap belongs to
+        // the CHAIN, not to any one phase of it.
+        chain_execution_timeout: execution.chain_execution_timeout,
+        chain_deadline_at: execution.chain_deadline_at,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     input: serde_json::Value,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    new_workflow_type: Option<String>,
 ) -> HarvestResult<()> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
+
+    let offloader = registry.payload_offloader();
 
     if reject_child_continue_as_new(conn, &persistence, execution).await? {
         return Ok(());
     }
+
+    // Issue #803: validate a cross-type target before anything is written, so
+    // an unregistered type can never seal the predecessor and strand an
+    // undispatchable successor.
+    // Same-type: the predecessor's own seal frees the slot, so nothing to do.
+    // Cross-type: `check_continue_as_new_type` resolves the target slot into
+    // this and rejects a live occupant before anything is persisted.
+    let mut successor_slot = SuccessorSlot::Free;
+    let target_info = match check_continue_as_new_type(
+        conn,
+        registry,
+        &persistence,
+        execution,
+        new_workflow_type.as_deref(),
+        &mut successor_slot,
+    )
+    .await?
+    {
+        ContinueAsNewTypeCheck::Rejected => {
+            return Ok(());
+        }
+        ContinueAsNewTypeCheck::SameType => None,
+        ContinueAsNewTypeCheck::CrossType(info) => Some(info),
+    };
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -10037,41 +13924,141 @@ async fn persist_workflow_continue_as_new(
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id,
         input: input.clone(),
+        new_workflow_type: new_workflow_type.clone(),
     };
-    // Re-anchor deadline to the new execution's start time (issue #243).
-    let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
-    // Re-anchor soft SLA deadline per-run (issue #487).
-    let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
-    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM. Unlike
-    // the per-run `deadline_at`/`sla_deadline_at` above (re-anchored to `now`), the
-    // chain deadline is anchored at the FIRST run's start and must NOT be
-    // recomputed as `now + timeout` — copying the predecessor's absolute
-    // `chain_deadline_at` is what makes the whole continue-as-new chain share one
-    // lifetime cap, so a runaway loop cannot escape it by continuing-as-new.
+    // Successor lifecycle defaults (issues #243/#487/#372/#523, and #803 for the
+    // cross-type case): carried verbatim from the predecessor for a same-type
+    // continuation, resolved from the target type's own `WorkflowInfo` for a
+    // cross-type one. Per-run deadlines are re-anchored to the successor's start
+    // in both cases.
+    let defaults = resolve_continue_as_new_successor_defaults(
+        execution,
+        target_info,
+        registry
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        registry.max_workflow_attempts_ceiling,
+        chrono::Utc::now(),
+    );
+    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM, for a
+    // cross-type continuation too. Unlike the per-run `deadline_at`/
+    // `sla_deadline_at` above (re-anchored to `now`), the chain deadline is
+    // anchored at the FIRST run's start and must NOT be recomputed as
+    // `now + timeout` — copying the predecessor's absolute `chain_deadline_at` is
+    // what makes the whole continue-as-new chain share one lifetime cap, so a
+    // runaway loop cannot escape it by continuing-as-new *or by changing type*.
+
+    // The successor runs as the named type when one was requested, else as the
+    // predecessor's own (issue #803). Borrowed from the owned local, which
+    // outlives `new_row`.
+    let successor_workflow_name = new_workflow_type
+        .as_deref()
+        .unwrap_or(execution.workflow_name.as_str());
+
+    // Per-tenant quota key (issue #946). Continue-as-new is in-flight
+    // continuation of an already-admitted run, not a fresh admission, so --
+    // like the concurrency key just above -- this does NOT re-run
+    // enforcement (`quota::check_quota` is never called here). But unlike a
+    // plain bookkeeping value, `quota_key` backs an AGGREGATE accounting
+    // query (`quota::load_quota_usage`) that the tenant's NEXT genuinely-new
+    // admission reads: stamping `None` here would make the predecessor's
+    // active-execution slot (and its history bytes) silently invisible to
+    // that accounting the instant it continues-as-new, letting a looping
+    // entity workflow leak unbounded quota headroom on every hop. Same-type:
+    // carry the predecessor's already-resolved key forward verbatim (mirrors
+    // `execution.quota_key`, exactly like the concurrency key propagation
+    // below). Cross-type (#803): re-resolve against the TARGET type's own
+    // declared policy and the new input, reading `registry` directly --
+    // mirroring `resolve_workflow_concurrency` immediately below -- rather
+    // than the process-global `GLOBAL_WORKFLOW_METADATA` mirror, which is
+    // populated only by `HandlerRegistry::with_state_and_telemetry` and
+    // would silently resolve `None` for a `Worker` built from the raw
+    // `HandlerRegistry::new(..)` constructor even when `registry` itself
+    // has the target's `WorkflowInfo.quota` set correctly.
+    let successor_quota_key: Option<String> = new_workflow_type.as_deref().map_or_else(
+        || execution.quota_key.clone(),
+        |target| {
+            registry
+                .workflows
+                .get(target)
+                .and_then(|info| info.quota)
+                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, &input))
+        },
+    );
+    // Issue #946 (Codex round-3 review): a cross-type continuation
+    // re-resolves the quota key against the TARGET type's own declared
+    // policy and the fresh input -- unlike the same-type carry-forward
+    // above, which reuses a key that was already bound-checked at whatever
+    // earlier point it was first resolved. Reject rather than silently
+    // persisting an oversized key: the aggregate `quota::load_quota_usage`
+    // accounting keys on this column, and every OTHER path that stamps
+    // `quota_key` (fresh starts, the fan-out/child-timeout-race/detached
+    // child spawns) enforces this same bound before the row is written.
+    //
+    // Codex round-3 follow-up: this MUST fail the predecessor terminally
+    // in-place rather than returning `Err` out of this function. This whole
+    // call chain runs on ONE Diesel transaction
+    // (`process_workflow_task`'s `conn.transaction(async |conn| { .. })`),
+    // so a bare `Err` propagating via `?` rolls back everything written on
+    // `conn` so far this cycle and leaves the predecessor stuck `RUNNING`
+    // forever with no error ever recorded. `check_continue_as_new_type`'s
+    // own rejection arm (blank target, unregistered type, DAG target,
+    // occupied successor slot, cross-shard mismatch, unrepresentable
+    // deadline) already writes the terminal failure in-place and returns
+    // `Ok(..)` -- mirror that pattern rather than inventing a second
+    // failure-signalling convention inside this same function.
+    if let Some(key) = successor_quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        let error = HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: successor_workflow_name.to_string(),
+            activity_name: None,
+        }
+        .to_string();
+        persist_workflow_failure(
+            conn,
+            task_id,
+            exec_id,
+            next_event_id,
+            worker_id,
+            &error,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::types::Priority::default(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
-        workflow_name: &execution.workflow_name,
+        workflow_name: successor_workflow_name,
         workflow_id: &execution.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: execution.shard_id,
         input: input.clone(),
         parent_id: None,
         queue_name: &execution.queue_name,
-        execution_timeout: execution.execution_timeout,
-        deadline_at: new_deadline_at,
+        execution_timeout: defaults.execution_timeout,
+        deadline_at: defaults.deadline_at,
         // Carried verbatim across continue-as-new (issue #617) — see comment above.
-        chain_execution_timeout: execution.chain_execution_timeout,
-        chain_deadline_at: execution.chain_deadline_at,
-        sla: execution.sla,
-        sla_deadline_at: new_sla_deadline_at,
+        chain_execution_timeout: defaults.chain_execution_timeout,
+        chain_deadline_at: defaults.chain_deadline_at,
+        sla: defaults.sla,
+        sla_deadline_at: defaults.sla_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
         parent_close_policy: None, // root workflow
-        owner: execution.owner.as_deref(),
-        runbook_url: execution.runbook_url.as_deref(),
-        severity: execution.severity.as_deref(),
+        owner: defaults.owner,
+        runbook_url: defaults.runbook_url,
+        severity: defaults.severity,
         context_headers: execution.context_headers.clone(),
         schedule_id: execution.schedule_id, // preserve schedule lineage through continue-as-new
         // Same logical slot as the predecessor: keep carryover ordering stable so the
@@ -10079,9 +14066,11 @@ async fn persist_workflow_continue_as_new(
         scheduled_for: execution.scheduled_for,
         // Continue-as-new starts a fresh run: attempt counter resets to 1,
         // but the retry policy is carried forward so the chain can still retry
-        // transient failures on the continued run.
+        // transient failures on the continued run. A cross-type continuation
+        // instead adopts the target type's own policy (issue #803) — the
+        // successor IS that type, so that type's declared retry governs it.
         workflow_attempt: 1,
-        workflow_retry_policy: execution.workflow_retry_policy.clone(),
+        workflow_retry_policy: defaults.workflow_retry_policy,
         retry_of_exec_id: None,
         // Preserve dispatch origin through continue-as-new so a continued scheduled run
         // stays attributed to its schedule's cadence (issue #534).
@@ -10101,18 +14090,33 @@ async fn persist_workflow_continue_as_new(
         start_source: Some(crate::types::StartSource::ContinueAsNew.as_str()),
         start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
+        quota_key: successor_quota_key.as_deref(),
     };
+    // Per-key concurrency (issue #247). Same-type: propagate the current task's
+    // key so the continued run stays under the same fair-share cap. Cross-type
+    // (issue #803): re-resolve against the TARGET type's own policy and the new
+    // input — the predecessor's key belonged to a different type's policy, and
+    // a target declaring no policy correctly yields no key at all.
+    let (successor_concurrency_key, successor_concurrency_cap) =
+        new_workflow_type.as_deref().map_or_else(
+            || {
+                (
+                    persistence.task.concurrency_key.clone(),
+                    persistence
+                        .task
+                        .concurrency_cap
+                        .and_then(|cap| u32::try_from(cap).ok()),
+                )
+            },
+            |target| resolve_workflow_concurrency(registry, target, &input),
+        );
+
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = execution.assigned_build_id.clone();
-    // Propagate the concurrency key from the current task so the new run
-    // continues to be governed by the same fair-share cap (issue #247).
-    enqueue.concurrency_key = persistence.task.concurrency_key.clone();
-    enqueue.max_concurrent = persistence
-        .task
-        .concurrency_cap
-        .and_then(|cap| u32::try_from(cap).ok());
+    enqueue.concurrency_key = successor_concurrency_key;
+    enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
@@ -10147,6 +14151,14 @@ async fn persist_workflow_continue_as_new(
         // sweep); guarded, so a no-op when the feature/table is unused.
         crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
 
+        // Issue #803: a cross-type successor takes the `(target, workflow_id)`
+        // uniqueness slot, which sealing the predecessor above does NOT free.
+        // Release a *terminal* prior run of that phase (a win-back loop, or the
+        // separate run an external caller started by naming the old type) the
+        // same way the predecessor's own seal releases its slot. A LIVE
+        // occupant was already rejected before this transaction opened, and the
+        // `FOR UPDATE` taken there holds until commit, so nothing can claim the
+        // slot in between.
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&new_row)
             .execute(conn)
@@ -10164,6 +14176,14 @@ async fn persist_workflow_continue_as_new(
         // delivered while the workflow body was running do not disappear
         // through the transition. Consumed signals stay on the old run
         // for audit purposes.
+        //
+        // Deliberately NARROWER than the retry path's
+        // `signal::forward_signals_to_retry_attempt` (issue #843), which moves
+        // the WHOLE mailbox and re-arms `consumed`: a continue-as-new is
+        // VOLUNTARY and carries whatever it still needs in the successor's
+        // input, so a signal this run already observed has already been folded
+        // into that input. A retry carries nothing forward and replays from an
+        // empty history, so it must observe those signals again.
         diesel::update(
             harvest_signals::table
                 .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -10354,18 +14374,28 @@ async fn persist_workflow_outcome(
             }
             result.map(|()| (false, Vec::new()))
         }
-        (WorkflowOutcome::ContinuedAsNew { input }, _) => {
+        (
+            WorkflowOutcome::ContinuedAsNew {
+                input,
+                new_workflow_type,
+            },
+            _,
+        ) => {
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
             let worker_id = persistence.worker_id;
             let exec_id = persistence.exec_id;
+            // The completion-trigger sweep keys on the run that just went
+            // terminal — the PREDECESSOR — so this stays its own name even for
+            // a cross-type continuation (issue #803).
             let workflow_name = execution.workflow_name.clone();
             let result = persist_workflow_continue_as_new(
                 conn,
+                registry,
                 persistence,
                 execution,
                 input,
-                registry.payload_offloader(),
+                new_workflow_type,
             )
             .await;
             fail_execution_on_error(conn, task, worker_id, result)
@@ -10495,6 +14525,16 @@ async fn persist_terminal_outcome_commands(
         .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+    if let Some(policy) = registry.workflow_log_policy {
+        persist_workflow_logs_from_commands(
+            conn,
+            persistence.exec_id,
+            pending_cmds,
+            policy.max_lines(),
+        )
+        .await;
+    }
     // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
     notify_progress_from_commands(conn, persistence.exec_id, pending_cmds).await;
 
@@ -10882,9 +14922,208 @@ async fn move_workflow_to_dlq_for_history_cap(
     Ok((deferred, closed_children))
 }
 
+/// Pure decision for a bounded retry sequence (issue #704, PR #1139
+/// review): given the outcome of each attempt IN ORDER, resolves to the
+/// first `Ok`, or -- if every attempt failed -- the *last* `Err` (the
+/// freshest failure, not the stale first one; an easy off-by-one to get
+/// backwards in a hand-rolled loop, and the one that actually matters for
+/// diagnosing a persistent failure). A fast, DB-free, directly
+/// unit-testable pin of that exact semantic.
+///
+/// `count_history_events_with_retries` below hand-rolls the equivalent
+/// *lazy* loop rather than calling this directly: each attempt there is a
+/// real, costly DB round-trip, so it must stop as soon as one succeeds
+/// instead of eagerly running every attempt regardless of an earlier
+/// success (which is what accepting an already-materialized `Vec` here
+/// would require of a caller). Consequently this function itself has no
+/// production caller -- it exists solely as a fast, DB-free pin of the
+/// decision shape the hand-rolled loop below must match, hence `#[cfg(test)]`.
+#[cfg(test)]
+fn resolve_retry_attempts<T, E>(attempts: Vec<Result<T, E>>) -> Result<T, E> {
+    let mut last_err = None;
+    for attempt in attempts {
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(error) => last_err = Some(error),
+        }
+    }
+    Err(last_err.expect("caller must supply at least one attempt"))
+}
+
+/// Bounded in-process retry around [`crate::store::count_history_events`]
+/// (issue #704, PR #1139 review).
+///
+/// The caller of this function runs strictly *after* the persist
+/// transaction has already committed (autocommit) -- the workflow's real,
+/// durable decision has already landed regardless of what this read does.
+/// Without a retry, a single transient failure here (a momentary statement
+/// timeout, connection blip, or replica hiccup) silently gives up on this
+/// cycle's chance to mark/emit the soft-threshold warning; the documented
+/// "at-least-once, re-checked on a later decision cycle" fallback only
+/// holds if a later decision cycle actually happens, which is not
+/// guaranteed for an execution that then suspends on a signal or timer that
+/// may never fire again. A few bounded, closely-spaced retries substantially
+/// narrow (without fully eliminating) that window for the concrete failure
+/// mode named by the review -- a transient error clearing within
+/// milliseconds -- at negligible cost.
+///
+/// Deliberately still best-effort: retries are exhausted quietly and the
+/// caller falls through to its existing "skip this cycle's warning"
+/// handling on a persistent failure. Moving this read *inside* the
+/// already-committed persist transaction (so a failure here would abort and
+/// retry the whole workflow decision cycle) was considered and rejected: it
+/// would let a best-effort telemetry read delay or fail the workflow's
+/// actual, durable progress, directly contradicting this code path's
+/// explicit contract -- see [`emit_history_bloat_warning_if_crossed`]'s doc
+/// comment, and the multiple earlier review rounds on this same PR that
+/// settled on "never fail the decision" for this exact metric.
+///
+/// Mirrors [`resolve_retry_attempts`]'s decision shape (short-circuit on
+/// the first success, else surface the last failure) as a lazy loop --
+/// see that function's doc comment for why this is hand-rolled rather than
+/// calling it directly.
+async fn count_history_events_with_retries(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    const ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match crate::store::count_history_events(conn, exec_id).await {
+            Ok(count) => return Ok(count),
+            Err(error) => {
+                last_err = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop body runs at least once, so this is always Some on exhaustion"))
+}
+
+/// Pure decision for the operator early-warning soft threshold on workflow
+/// history bloat (issue #704, AC3/AC4).
+///
+/// Returns `true` iff an execution's history event count has JUST crossed
+/// `fraction * cap` for the first time -- i.e. `already_warned` is `false`,
+/// `fraction` is a strictly-positive (non-disabled) configured value, and
+/// `current_history_event_count` has reached the computed threshold. Never
+/// `true` when `already_warned` (the caller must not re-stamp an execution
+/// that already crossed the threshold on an earlier cycle) or when
+/// `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
+///
+/// The threshold is the smallest integer event count satisfying
+/// `count >= cap * fraction` -- i.e. `(cap as f64 * fraction).ceil()`, NOT a
+/// truncating cast (PR #1139 review, third round). `cap * fraction` is
+/// non-integral whenever `cap` isn't evenly divisible by the fraction's
+/// denominator (e.g. cap=10, fraction=0.75 -> 7.5), and a truncating cast
+/// would round DOWN to 7, firing at the 7th event (70% of the cap) instead
+/// of the first integer count that actually reaches 75% (the 8th event,
+/// 80%) -- the fraction's whole point is to warn at-or-past the configured
+/// percentage, never noticeably before it.
+///
+/// This is a PURE function of its four inputs -- it performs no I/O and has
+/// no knowledge of the execution's identity, the outcome shape, or whether
+/// the caller is a synthetic canary probe (issue #796). Used from two call
+/// shapes: (1) the still-RUNNING `WorkflowOutcome::Suspended` path in
+/// `process_workflow_task`, gated there by callers combining this with
+/// `matches!(&outcome, WorkflowOutcome::Suspended { .. })` and `!is_canary`;
+/// and (2) `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+/// (PR #1139 review), evaluated there against the DURABLE post-failure
+/// event count -- never a prospective, not-yet-persisted one (PR #1139
+/// review, second round) -- since a single decision can grow durably
+/// recorded history from below the soft threshold straight past the hard
+/// cap in one inline append batch, bypassing (1) entirely; the crossing
+/// still happened in the same decision, so it is evaluated there too
+/// rather than silently dropped.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn history_bloat_threshold_crossed(
+    current_history_event_count: u64,
+    cap: u64,
+    fraction: f64,
+    already_warned: bool,
+) -> bool {
+    if already_warned || fraction <= 0.0 {
+        return false;
+    }
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    // Issue #704 (PR #1139 review, Nth round): clamp the threshold below
+    // `cap` here, unconditionally of `fraction` -- `context.rs`'s public
+    // clamp of `fraction` to `MAX_HISTORY_BLOAT_WARN_FRACTION` (0.999) is
+    // fraction-only and cannot see `cap`, so it cannot guarantee
+    // `ceil(cap * fraction) < cap` for every cap value: for cap=100,
+    // `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`, meaning the soft
+    // warning would fire on the EXACT SAME decision cycle as the hard cap
+    // itself (zero intervention window) for any cap below 1000 -- the
+    // opposite of the "warn before the hard cap" contract this signal
+    // exists to provide. Clamping the threshold to `cap.saturating_sub(1)`
+    // here, where BOTH `cap` and `fraction` are known together, guarantees
+    // at least one full event of warning room below the hard cap for
+    // every (cap, fraction) combination the caller can construct --
+    // independent of, and strictly stronger than, whatever ceiling
+    // `context.rs` clamps `fraction` to.
+    let threshold = raw_threshold.min(cap.saturating_sub(1));
+    current_history_event_count >= threshold
+}
+
+/// Emits and marks the operator early-warning soft-threshold counter for
+/// workflow history bloat (issue #704, AC3/AC4), if `should_warn` is `true`.
+///
+/// Delivery semantics (PR #1139 review): this is deliberately
+/// **at-least-once, biased toward a rare duplicate over a possible
+/// permanent loss** -- the counter is emitted FIRST, then the durable guard
+/// (`store::mark_history_bloat_warned`, `WHERE history_bloat_warned_at IS
+/// NULL`) is set. If the worker crashes in the narrow window between the
+/// two, `history_bloat_warned_at` stays `NULL`, so a future retry of the
+/// same decision cycle (this codebase's existing crash-recovery mechanism
+/// -- no new machinery introduced here) re-detects the crossing and
+/// re-emits, rather than the mark permanently silencing a signal that was
+/// never actually delivered. This trade-off is deliberate for THIS
+/// counter specifically: unlike a recurring per-cycle counter, the guard
+/// is a one-shot, non-recurring gate -- there is no "next crossing" for a
+/// given execution to fall back on, so a lost-forever failure mode is
+/// worse here than for this codebase's other best-effort telemetry
+/// emissions (`run_deferred_schedule_counter`, `emit_update_result_metrics`,
+/// `emit_unhandled_signal_metrics`), which this function otherwise mirrors:
+/// a failure to persist the mark is logged and swallowed, never fails or
+/// rolls back the caller's already-durable workflow decision. A rare
+/// crash-retry duplicate increment is an accepted cost for an early-WARNING
+/// signal, not a correctness-critical durable record.
+async fn emit_history_bloat_warning_if_crossed(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    should_warn: bool,
+) {
+    if !should_warn {
+        return;
+    }
+    telemetry
+        .metrics
+        .record_workflow_history_bloat(workflow_name);
+    if let Err(error) = store::mark_history_bloat_warned(conn, exec_id).await {
+        tracing::warn!(
+            exec_id = %exec_id,
+            %error,
+            "failed to mark history-bloat early-warning threshold after emitting \
+             the counter (best-effort, not fatal; a future retry of this decision \
+             cycle may re-emit rather than silently losing the signal)"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
     telemetry: &crate::telemetry::TelemetryConfig,
     task: &TaskQueueItem,
     execution: &WorkflowExecution,
@@ -10912,6 +15151,34 @@ async fn fail_workflow_for_history_cap(
         WorkflowStatus::Failed,
     );
 
+    // Issue #704 (PR #1139 review, second round): decide the crossing from
+    // `terminal_count` -- the DURABLE post-failure event count, computed
+    // above from `next_event_id` (the running count of events actually
+    // appended so far this cycle) -- never from the `event_count` parameter.
+    // `event_count` is whatever value tripped the HARD cap at the call
+    // site, and for the `WorkflowOutcome::Suspended` preflight branch that
+    // value can be purely PROSPECTIVE: `suspended_command_event_count`
+    // predicts how many events a batch of still-pending commands (e.g. a
+    // large activity fan-out) WOULD produce if persisted, and this function
+    // never persists them -- the whole point of the hard-cap preflight is
+    // to reject the batch and fail terminally instead. A run sitting at 10
+    // durably recorded events that merely PROPOSED 90 more (against a cap
+    // of 100) would otherwise stamp a permanent crossing off a count that
+    // never lands in `harvest_events`, leaving a terminal execution the
+    // live (non-terminal) discovery query can never find. `terminal_count`
+    // is exactly what WILL be durably recorded once the `WorkflowFailed`
+    // event below is appended, so it is the only value this decision can
+    // correctly be based on -- at every other call site (a genuinely
+    // already-appended batch) `terminal_count` and `event_count` coincide,
+    // so this is a strict correctness fix with no behavior change there.
+    let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
+        && history_bloat_threshold_crossed(
+            terminal_count,
+            cap,
+            registry.history_policy().history_bloat_warn_fraction(),
+            execution.history_bloat_warned_at.is_some(),
+        );
+
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
         cap,
@@ -10928,6 +15195,41 @@ async fn fail_workflow_for_history_cap(
         Some(telemetry.metrics.as_ref()),
     )
     .await?;
+
+    // Issue #704 (PR #1139 review, Nth round): emit/stamp the crossing only
+    // AFTER `move_workflow_to_dlq_for_history_cap` above has returned `Ok`
+    // -- never before it. Until that call's transaction commits,
+    // `terminal_count` is only a PREDICTION of what next_event_id will
+    // become once `WorkflowFailed` lands, not a durable fact. Emitting and
+    // stamping the guard ahead of that commit (the previous ordering) left
+    // a crash/transaction-failure window between the two steps that would
+    // permanently mark `history_bloat_warned_at` off a crossing that never
+    // actually became durable: the `?` above would propagate the error,
+    // the execution would stay RUNNING at its true (uncrossed) count, but
+    // `execution.history_bloat_warned_at` was already committed as set --
+    // so a future retry of this same decision cycle (or any later cycle
+    // that reaches the hard-cap path again) would see `already_warned` and
+    // could never correct the false crossing, permanently silencing a
+    // signal that never fired for real. Emitting only once the terminal
+    // transition has committed guarantees `terminal_count` IS exactly what
+    // is now durably recorded, so the "at-least-once, biased toward a rare
+    // duplicate over a possible permanent loss" delivery semantics
+    // documented on `emit_history_bloat_warning_if_crossed` hold as
+    // written: the only residual crash window is between this commit and
+    // the guard stamp immediately below, and losing that narrow window
+    // means (at worst) one already-terminal execution's warning is never
+    // marked/counted -- a single missed sample on a run that has already
+    // sealed, not a permanently wrong guard on a run that could still
+    // self-correct. Never fires for the synthetic liveness canary (issue
+    // #796), matching the sibling `WorkflowOutcome::Suspended` path.
+    emit_history_bloat_warning_if_crossed(
+        conn,
+        telemetry,
+        exec_id,
+        &execution.workflow_name,
+        should_warn_history_bloat,
+    )
+    .await;
 
     check_and_report_unfinished_handlers_for_worker(
         conn,
@@ -10965,6 +15267,14 @@ async fn process_workflow_task(
     // execution) and the configured re-dispatch budget.
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
+    // (issue #494), forwarded to inline local activities so their reported
+    // deadline cannot out-live the cycle. `None` when that timeout is disabled.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #804 (Codex round-22 P2): set by this dispatch when a frontier
+    // reset commits, so a later capability miss can decide on the counters the
+    // row actually holds without re-reading them. See `frontier_miss_state`.
+    frontier_reset_committed: &std::sync::atomic::AtomicBool,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -10983,12 +15293,20 @@ async fn process_workflow_task(
         return Ok(());
     };
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
-        let error = format!(
-            "no workflow handler registered for '{}'",
-            prepared.execution.workflow_name
-        );
-        fail_task_and_execution(conn, task, worker_id, &error).await?;
-        return Err(HarvestError::Config(error));
+        // Issue #804 (AC1): this worker cannot run this type, but a peer on the
+        // same queue may well be able to (a rolling deploy that introduces a new
+        // workflow type puts every pod in this state for a window). Return the
+        // typed capability-miss error WITHOUT failing the execution — the
+        // dispatch path (`process_task`) intercepts it and releases the claim
+        // back to `PENDING` for a capable peer, escalating to the ordinary
+        // terminal-failure path only once the redelivery budget is exhausted.
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: prepared.execution.workflow_name.clone(),
+            // The workflow body never ran, so this dispatch observed nothing
+            // about whether it still hangs.
+            phase: CapabilityMissPhase::BeforeHandler,
+        });
     };
 
     let telemetry = registry.telemetry().clone();
@@ -11234,6 +15552,7 @@ async fn process_workflow_task(
                         per.max(registry.max_workflow_input_bytes)
                     }),
                 registry.max_current_details_bytes,
+                registry.workflow_log_policy,
                 exec_context_headers.clone(),
                 registry
                     .payload_offloader()
@@ -11258,12 +15577,38 @@ async fn process_workflow_task(
                         .iter()
                         .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
+                // Issue #804 (Codex round-19 P2): bail out for a capable peer
+                // BEFORE the five commits below. `run_local_activity_inline`
+                // resolves the handler at its top, so raising here is
+                // behaviourally identical — same typed error, same
+                // `DuringHandler` phase (the body began and did not conclude:
+                // it suspended on this local activity) — except that an
+                // incapable worker no longer patches attributes, writes the
+                // breadcrumb, appends logs, fires progress frames, or resolves
+                // a mutex release on the way to discovering it cannot run this.
+                if let Some(name) = missing_local_activity_handler(registry, &commands) {
+                    return Err(HarvestError::HandlerNotRegistered {
+                        kind: CapabilityMissKind::Activity.as_str(),
+                        name: name.to_string(),
+                        phase: CapabilityMissPhase::DuringHandler,
+                    });
+                }
                 // Apply any search-attribute patches before running the local
                 // activity so that attributes are visible even if the worker
                 // crashes during inline execution.
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Persist durable workflow logs (issue #790) — best-effort, before inline run.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
+                    )
+                    .await;
+                }
                 // Fire ephemeral progress chunks (issue #791) — best-effort, before inline run.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping (an
@@ -11334,6 +15679,7 @@ async fn process_workflow_task(
                         {
                             let deferred = fail_workflow_for_history_cap(
                                 conn,
+                                registry,
                                 &telemetry,
                                 task,
                                 &prepared.execution,
@@ -11372,11 +15718,36 @@ async fn process_workflow_task(
                     &mut next_event_id,
                     local_context_headers,
                     &task.queue_name,
+                    OwningRun {
+                        workflow_id: prepared.execution.workflow_id.as_str(),
+                        workflow_type: prepared.execution.workflow_name.as_str(),
+                    },
+                    workflow_task_deadline,
+                    FrontierAccounting {
+                        task_id: task.id,
+                        worker_id,
+                        reset_committed: frontier_reset_committed,
+                    },
                 )
                 .await
                 {
                     Ok(outcome) => outcome,
                     Err(e) => {
+                        // Issue #946, Codex round-3/round-4 review:
+                        // `run_local_activity_inline` calls
+                        // `DetachedSpawnPersistence::persist` ->
+                        // `create_detached_child_executions`, which can
+                        // reject with `QuotaExceeded` when the detached
+                        // child's OWN target quota is full. Defer with a
+                        // bounded backoff rather than terminally failing
+                        // this execution over an unrelated tenant's quota;
+                        // the transaction inside `run_local_activity_inline`
+                        // already rolled back the whole cycle.
+                        if recover_from_child_quota_exceeded(conn, task.id, prepared.exec_id, &e)
+                            .await?
+                        {
+                            return Ok(());
+                        }
                         return fail_workflow_execution_clearing_strikes(
                             conn,
                             task,
@@ -11397,6 +15768,7 @@ async fn process_workflow_task(
                         history_events.extend(events);
                         let deferred = fail_workflow_for_history_cap(
                             conn,
+                            registry,
                             &telemetry,
                             task,
                             &prepared.execution,
@@ -11417,6 +15789,24 @@ async fn process_workflow_task(
                         return Ok(());
                     }
                 };
+                // Issue #804 (Codex round-20 P1): the local activity resolved
+                // and its events are durably appended, so the workflow's
+                // frontier has moved permanently past it. Every capability miss
+                // recorded before now was recorded against a handler this run no
+                // longer needs, so the next frontier must start with a clean
+                // budget — otherwise a miss on X and a later miss on Y read as
+                // "two distinct workers missed this task" and terminally fail a
+                // run the fleet can still finish.
+                //
+                // Bounded: a completed local activity replays from history
+                // (`HistoryMatch::Matched`) and emits no command, so a frontier
+                // can make inline progress at most once.
+                //
+                // The reset itself lives inside `run_local_activity_inline`,
+                // committed in the SAME transaction as the frontier-resolving
+                // append (Codex round-21 P1) — writing it here would be an
+                // independent failure point after the progress became durable,
+                // and a failure would strand this still-claimed row.
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
@@ -11425,6 +15815,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11462,6 +15853,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
                 }) && !commands
@@ -11529,6 +15921,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
+                    )
+                    .await;
+                }
                 // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
@@ -11568,6 +15970,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11766,6 +16169,16 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
+                    )
+                    .await;
+                }
                 // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping BEFORE
@@ -11829,6 +16242,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -12037,6 +16451,44 @@ async fn process_workflow_task(
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
+    // Issue #804 (Codex round-6 P2): detect a capability miss on this cycle's
+    // commands BEFORE any terminal telemetry is emitted.
+    //
+    // The authoritative all-or-nothing checks live inside the persistence
+    // transaction (`persist_scheduled_activities`,
+    // `persist_all_started_child_workflows`, `create_detached_child_executions`),
+    // but by the time they fire, `record_workflow_completed` and
+    // `harvest.workflow.terminal` (#519) have already been recorded. Rolling the
+    // transaction back then leaves the execution `RUNNING` with a spurious
+    // `terminal{outcome="completed"}` increment behind — and because a
+    // capability miss is *repeatable* (every redelivery re-runs the same
+    // decision), one logical run would be counted once per redelivery,
+    // corrupting the success-rate SLO. Gating here returns the typed error to
+    // `dispatch_task`, which releases the claim for a capable peer with the
+    // telemetry never touched.
+    //
+    // Placed before the history-cap check's DB round-trips too, so an incapable
+    // worker releases the task without paying for work a capable peer will redo.
+    // Commands first, so the reported name stays deterministic in command order
+    // for every batch that carries one; then the outcome's cross-type
+    // continue-as-new target, which `drive_workflow` moved OUT of the command
+    // list and so cannot be seen by the scan above (issue #804, Codex round-45).
+    if let Some((kind, name)) = first_persist_capability_miss(
+        registry,
+        update_result_command_source(&outcome, &pending_cmds),
+    )
+    .or_else(|| continue_as_new_target_capability_miss(registry, &outcome))
+    {
+        return Err(HarvestError::HandlerNotRegistered {
+            kind,
+            name,
+            // Reached only after `drive_workflow` returned an outcome: the body
+            // ran to a conclusion inside its deadline, and only persisting its
+            // commands found an unregistered type.
+            phase: CapabilityMissPhase::AfterHandler,
+        });
+    }
+
     let terminal_parent_close_cascade_events = if matches!(
         &outcome,
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
@@ -12079,6 +16531,7 @@ async fn process_workflow_task(
     {
         let deferred = fail_workflow_for_history_cap(
             conn,
+            registry,
             &telemetry,
             task,
             &prepared.execution,
@@ -12345,6 +16798,29 @@ async fn process_workflow_task(
     // via the #603 gate returning early above, never reaches here on an
     // ND-carrying Failed), so this is a no-op on every non-terminal path.
     let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
+    // Issue #704: capture (pure, no I/O) whether this cycle is even eligible
+    // to mark the operator early-warning soft threshold for workflow history
+    // bloat. Computed here -- before the persist transaction moves `outcome`
+    // -- but the actual *crossing decision* is deliberately deferred to
+    // post-commit (see the `Persisted` arm below), where it is computed
+    // against the true durably-persisted event count rather than this
+    // cycle's prospective `current_history_event_count`. That prospective
+    // count is a deliberately conservative *over-estimate* for several
+    // suspension shapes (e.g. `suspended_command_event_count`'s `AcquireMutex`
+    // branch counts +1 for a contended acquire that only enqueues and grants
+    // nothing) -- fine for the hard-cap preflight above, which only needs to
+    // fail fast on a true overflow, but wrong for a threshold-*crossing*
+    // decision that permanently marks `history_bloat_warned_at`: a decision
+    // cycle one event below threshold that merely enqueues a contended mutex
+    // acquire must not stamp "warned" for a mark that may never actually be
+    // reached. Never fires for the synthetic liveness canary (issue #796) --
+    // it contributes to no `harvest.workflow.*` business signal, matching the
+    // sibling `record_workflow_completed`/`history_size`/`continue_as_new`
+    // gates right above.
+    let may_warn_history_bloat = !is_canary
+        && matches!(&outcome, WorkflowOutcome::Suspended { .. })
+        && registry.history_policy().event_hard_cap().is_some();
+    let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -12398,6 +16874,12 @@ async fn process_workflow_task(
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
                 };
+            // Chaos: kill/delay inside the persist transaction, after the
+            // outcome is written but before the outer commit — the #367 window
+            // (worker dies after claim, before the terminal is durable). A kill
+            // (owned conn in the reproducer's spawned task) rolls the persist
+            // back, leaving the task RUNNING with a dead worker (AC4).
+            crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
             Ok(WorkflowPersistFlow::Persisted {
                 retry_scheduled,
                 deferred_checks,
@@ -12417,6 +16899,11 @@ async fn process_workflow_task(
             deferred_checks,
             race_deferred_triggers,
         }) => {
+            // Chaos: kill/delay after the outer persist commit but before the
+            // deferred-trigger fan-out — committed work whose in-process
+            // follow-up side effects have not fired yet. Convergence must still
+            // hold: the completion-trigger outbox recovers un-fired triggers.
+            crate::chaos_point!(WORKER_AFTER_OUTER_COMMIT);
             // Only spawned now that the transaction above has committed (see
             // apply_race_loser_cancellations's doc comment) — spawning inside
             // the transaction closure could start a trigger workflow for a
@@ -12468,13 +16955,108 @@ async fn process_workflow_task(
                 &update_metric_queue,
                 &unhandled_signal_metrics,
             );
+            // Issue #704: mark + emit the operator early-warning soft
+            // threshold, post-commit, in autocommit -- mirroring
+            // `run_deferred_schedule_counter`'s documented discipline: a
+            // best-effort write that must never roll back or fail the
+            // durably-persisted workflow decision. Shared with
+            // `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+            // via `emit_history_bloat_warning_if_crossed` so the two call
+            // shapes can never drift.
+            //
+            // The crossing decision itself is computed here, against the
+            // *true* durably-persisted event count (a fresh, lock-free
+            // `COUNT(*)`), rather than the pre-transaction prospective
+            // estimate -- closing a Codex-review finding where a decision
+            // cycle that merely enqueued (never granted) a contended
+            // `AcquireMutex` could over-count by one and cross the threshold
+            // a cycle early. A bounded retry (issue #704, PR #1139 review --
+            // see `count_history_events_with_retries`'s doc comment) narrows
+            // the window where a transient read failure silently and
+            // permanently drops this execution's one-shot warning chance; a
+            // still-persistent failure degrades to "don't warn this cycle"
+            // rather than risking a false mark or panicking a best-effort
+            // telemetry path.
+            let should_warn_history_bloat = if may_warn_history_bloat {
+                match registry.history_policy().event_hard_cap() {
+                    Some(cap) => {
+                        match count_history_events_with_retries(conn, prepared.exec_id).await {
+                            Ok(durable_count) => history_bloat_threshold_crossed(
+                                durable_count,
+                                cap,
+                                registry.history_policy().history_bloat_warn_fraction(),
+                                history_bloat_already_warned,
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    exec_id = %prepared.exec_id,
+                                    %error,
+                                    "failed to count durable history events for the history-bloat \
+                                     soft-threshold check after retries; skipping this cycle's warning"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            emit_history_bloat_warning_if_crossed(
+                conn,
+                &telemetry,
+                prepared.exec_id,
+                &prepared.execution.workflow_name,
+                should_warn_history_bloat,
+            )
+            .await;
         }
         Err(error) => {
-            // Preserve per-path error handling: a terminal-with-commands persist
-            // failure durably fails the task + execution (matching the prior
-            // `fail_execution_on_error` wrapping); a suspended/simple-terminal
-            // persist failure propagates so the task is retried.
+            // Issue #1182 (Codex review round 3): an ambiguous suspended-
+            // dispatch claim is deliberately NOT intercepted here, unlike
+            // round 2's first cut. `?` inside the transaction closure has
+            // already rolled the *whole* persistence transaction back --
+            // releasing the execution row's lock and discarding any
+            // bookkeeping write made earlier in this cycle (see
+            // `fail_suspended_workflow_if_still_claimed`'s doc comment for
+            // why the release cannot happen from inside that transaction) --
+            // but the release itself is a deliberately *blocking* (not
+            // `SKIP LOCKED`) wait for a transient lock holder to clear, and
+            // this whole function's future is wrapped in the issue #494
+            // `workflow_task_timeout` budget by `run_under_workflow_body_
+            // budget`. Performing the release here risked that wait alone
+            // consuming the remaining budget and being cancelled mid-flight
+            // -- reporting `BodyTimedOut` and banking a timeout strike
+            // against a workflow whose handler had in fact completed fine;
+            // only the *cleanup* waited on unrelated row contention (Codex
+            // review round 3). So this error, like a capability miss, is
+            // simply propagated here: the caller (`process_task`) performs
+            // the release *after* the budgeted cycle has already returned,
+            // exactly mirroring how it already handles
+            // `handler_not_registered()`.
+            //
+            // Preserve per-path error handling otherwise: a
+            // terminal-with-commands persist failure durably fails the task
+            // + execution (matching the prior `fail_execution_on_error`
+            // wrapping, which itself passes an ambiguous-claim error through
+            // un-failed); a suspended/simple-terminal persist failure
+            // (including this one) propagates so the caller can act on it.
+            //
+            // Issue #946, Codex round-3/round-4 review: `persist_terminal_
+            // outcome_commands` calls `create_detached_child_executions`
+            // directly, so a `QuotaExceeded` from a detached child's target
+            // quota can surface here for the `is_terminal_with_commands`
+            // path. Defer with a bounded backoff rather than terminally
+            // failing this execution over an unrelated tenant's quota; the
+            // transaction above already rolled back the whole cycle, so
+            // nothing durable was created.
             if is_terminal_with_commands {
+                if recover_from_child_quota_exceeded(conn, task.id, prepared.exec_id, &error)
+                    .await?
+                {
+                    return Ok(());
+                }
                 return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
             }
             return Err(error);
@@ -12498,6 +17080,133 @@ async fn process_workflow_task(
     Ok(())
 }
 
+/// What a dispatch actually did, so the poll loop can tell a task this worker
+/// genuinely ran apart from one it handed straight back (issue #804).
+///
+/// The distinction is load-bearing, not cosmetic. The dispatch site treats a
+/// plain `Ok(())` as evidence the execution made progress and clears the issue
+/// #494 consecutive-workflow-task-timeout strike map for it. A capability-miss
+/// release is *usually* not that evidence — but whether it is depends on
+/// **where** the miss was detected, which is why `Released` carries the answer
+/// rather than hard-coding one:
+///
+/// - Detected **before or during** the handler (an unregistered workflow type,
+///   or an inline local activity mid-body): this worker observed nothing about
+///   whether the body still hangs, so the strike must survive. Clearing it
+///   would let an incapable worker erase a genuinely hung execution's
+///   hang-detection streak — the mirror image of the argument that says a
+///   capability miss must never *increment* `crash_strikes`.
+/// - Detected **after** the handler returned (persisting its commands found an
+///   unregistered activity or child type): the body *did* run to a conclusion
+///   inside its deadline, so this dispatch is real evidence of health and the
+///   strike must clear. Preserving it would let a healthy workflow accumulate
+///   strikes from misses it had nothing to do with, and a single later
+///   transient timeout could tip it into poison-pill quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDispatchOutcome {
+    /// The handler ran to a normal conclusion for this dispatch cycle.
+    Completed,
+    /// A capability miss handed the claim back (or found it already taken).
+    Released {
+        /// Did the workflow body reach a conclusion before the miss? Only then
+        /// may the dispatch site clear the issue #494 timeout strike. Sourced
+        /// from [`CapabilityMissPhase::clears_workflow_timeout_strike`].
+        clears_timeout_strike: bool,
+    },
+    /// The issue #494 wall-clock budget elapsed while the workflow decision
+    /// cycle was still running, so the cycle was cancelled.
+    ///
+    /// Reported as an outcome rather than raised as an error because the
+    /// dispatch site owns the recovery: the consecutive-timeout strike, the
+    /// `harvest.workflow.task_timeout` metric, and the requeue-or-quarantine
+    /// decision. It exists at all because the budget now lives *inside*
+    /// `process_task`, wrapped around the decision cycle alone — see
+    /// [`run_under_workflow_body_budget`] (issue #804, Codex round-25 P1).
+    BodyTimedOut,
+}
+
+/// Run the workflow decision cycle under its issue #494 wall-clock budget.
+///
+/// Deliberately generic and free of every engine type, because the thing worth
+/// pinning is the *scoping* rule rather than any particular body: whatever is
+/// sequenced **after** this call is outside the budget and can never be
+/// cancelled by it. That is load-bearing for issue #804. The capability-miss
+/// release/escalation runs after the decision cycle returns, and it is DB I/O
+/// (a rate-limit refund, a fleet/compatibility read, and the release or
+/// escalation statement). While it sat inside the budget, a workflow that
+/// returned near its deadline and only then tripped the post-handler preflight
+/// could have that cleanup cancelled mid-flight — banking an issue #494
+/// timeout strike, emitting the wrong metric, and, once
+/// `poison_pill_threshold` strikes accumulated, terminally failing an
+/// execution whose body had in fact completed and whose correct outcome was a
+/// blameless release (Codex round-25 P1).
+///
+/// `None` means no budget: the activity path was never wrapped in one, and the
+/// workflow path opts out when `workflow_task_timeout` is zero.
+///
+/// Returns `None` when the budget elapsed first, which the caller reports as
+/// [`TaskDispatchOutcome::BodyTimedOut`].
+async fn run_under_workflow_body_budget<F: std::future::Future>(
+    budget: Option<Duration>,
+    body: F,
+) -> Option<F::Output> {
+    match budget {
+        Some(budget) => tokio::time::timeout(budget, body).await.ok(),
+        None => Some(body.await),
+    }
+}
+
+/// Issue #1182 (Codex review round 3): performs the release for an ambiguous
+/// suspended-dispatch claim -- if `error` names one -- and returns `None`
+/// (a no-op) for every other error, so the caller falls through to the
+/// capability-miss check unchanged.
+///
+/// Deliberately called from `process_task` *after*
+/// [`run_under_workflow_body_budget`] has already returned, rather than from
+/// inside `process_workflow_task`'s own timeout-wrapped decision cycle: the
+/// release is intentionally blocking (see
+/// `fail_suspended_workflow_if_still_claimed`'s doc comment on why it must
+/// wait for the row lock rather than skip ownership verification), so
+/// performing it *inside* the budget risked the wait alone consuming the
+/// remaining issue #494 `workflow_task_timeout` and being cancelled --
+/// reporting a false [`TaskDispatchOutcome::BodyTimedOut`] and banking a
+/// timeout strike against a workflow whose handler had in fact already
+/// completed within its budget; only the *cleanup* waited on unrelated row
+/// contention.
+async fn handle_ambiguous_suspended_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &HarvestError,
+) -> Option<HarvestResult<TaskDispatchOutcome>> {
+    let task_id = error.suspended_claim_ambiguous()?;
+    let released =
+        match queue::release_suspended_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
+            .await
+        {
+            Ok(released) => released,
+            Err(err) => return Some(Err(err)),
+        };
+    tracing::info!(
+        task_id = %task_id,
+        queue = %task.queue_name,
+        released,
+        "a suspended workflow dispatch made no replay-significant progress; the claim guard \
+         could not confirm ownership (a genuine transfer, or a concurrent, unrelated lock \
+         holder), so the enclosing transaction was rolled back and no terminal decision was \
+         made; the task was released back to the queue if it was still ours"
+    );
+    // The handler ran to a conclusion -- this is the "suspended, empty-
+    // handed" persist path, reached only after the workflow body returned --
+    // and only the final claim recheck found ambiguity, so this dispatch is
+    // genuine evidence of health: clear the issue #494 timeout strike,
+    // mirroring the `AfterHandler` capability-miss rule
+    // (`TaskDispatchOutcome::Released`'s doc comment).
+    Some(Ok(TaskDispatchOutcome::Released {
+        clears_timeout_strike: true,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_task(
     pool: &DbPool,
@@ -12516,33 +17225,70 @@ async fn process_task(
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
-) -> HarvestResult<()> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
+    // (issue #494); `None` when that timeout is disabled. Workflow path only —
+    // an activity task is not wrapped in it.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #804: the redelivery budget and the fleet-liveness window that
+    // gates it.
+    capability_miss_policy: CapabilityMissPolicy,
+    // Issue #804 (Codex round-25 P1): the issue #494 wall-clock budget, applied
+    // HERE around the workflow decision cycle alone rather than by the dispatch
+    // site around this whole function — so it can never cancel the
+    // capability-miss cleanup below. `None` on the activity path (never bounded
+    // by it) and when `workflow_task_timeout` is zero.
+    workflow_body_timeout: Option<Duration>,
+) -> HarvestResult<TaskDispatchOutcome> {
+    // Issue #804 (Codex round-22 P2): the workflow path sets this when a
+    // frontier reset commits, so the capability-miss interception below knows
+    // the persisted counters without re-reading them. Activity tasks never
+    // resolve a frontier inline, so it stays clear on that path and their
+    // claim-time snapshot is trivially current.
+    let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
 
-    match ClaimedTaskKind::from_db(&task.task_type)? {
+    let (mut conn, outcome) = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
-            process_workflow_task(
-                &mut conn,
-                registry.as_ref(),
-                &task,
-                worker_id,
-                build_id,
-                sticky_timeout,
-                max_local_activity_start_to_close,
-                workflow_cache,
-                dispatched_at,
-                &workflow_panic_strikes,
-                workflow_panic_max_attempts,
-            )
-            .await
+            // The connection is acquired *inside* the budget so a pool stall
+            // still counts against the decision cycle exactly as it did when
+            // the dispatch site owned the timeout.
+            // Boxed so `process_task`'s own future does not grow by the whole
+            // decision cycle's state (clippy::large_futures).
+            let cycle = Box::pin(async {
+                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+                let outcome = process_workflow_task(
+                    &mut conn,
+                    registry.as_ref(),
+                    &task,
+                    worker_id,
+                    build_id,
+                    sticky_timeout,
+                    max_local_activity_start_to_close,
+                    workflow_cache,
+                    dispatched_at,
+                    &workflow_panic_strikes,
+                    workflow_panic_max_attempts,
+                    workflow_task_deadline,
+                    &frontier_reset_committed,
+                )
+                .await;
+                Ok::<_, HarvestError>((conn, outcome))
+            });
+            let Some(finished) = run_under_workflow_body_budget(workflow_body_timeout, cycle).await
+            else {
+                // Dropping `cycle` already returned the connection to the pool,
+                // exactly as cancelling the whole of `process_task` used to.
+                // Never reuse it: the cancelled cycle may have left a
+                // transaction open on it.
+                return Ok(TaskDispatchOutcome::BodyTimedOut);
+            };
+            finished?
         }
         ClaimedTaskKind::Activity => {
-            // Drop the connection before the handler runs: run_transactional
-            // acquires a second pool slot inside the handler, and holding this
-            // one during execution would cause a deadlock when max_size
-            // connections are all claimed by concurrent activity tasks.
-            drop(conn);
-            process_activity_task(
+            // No connection is held while the handler runs: run_transactional
+            // acquires a pool slot inside the handler, and holding one here
+            // would deadlock when max_size connections are all claimed by
+            // concurrent activity tasks.
+            let result = process_activity_task(
                 pool,
                 registry.as_ref(),
                 &task,
@@ -12552,9 +17298,1247 @@ async fn process_task(
                 max_concurrent_sessions,
                 session_slots_in_use,
             )
+            .await;
+            // Acquire only if we actually need to act on a capability miss:
+            // the happy path must not pay for a checkout at all.
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.handler_not_registered().is_some())
+            {
+                let conn = pool.get().await.map_err(crate::error::database_error)?;
+                (conn, result)
+            } else {
+                return result.map(|()| TaskDispatchOutcome::Completed);
+            }
+        }
+    };
+
+    // Issue #804: single interception point for every capability miss, whichever
+    // of the four raise sites produced it (workflow-handler lookup, activity-
+    // handler lookup, the local-activity inline dispatch, or the
+    // schedule-activity enqueue). `fail_execution_on_error` passes the typed
+    // variant through un-failed precisely so it lands here.
+    let Err(error) = &outcome else {
+        return outcome.map(|()| TaskDispatchOutcome::Completed);
+    };
+    // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
+    // claim is intercepted HERE -- after `run_under_workflow_body_budget`
+    // has already returned -- rather than inside `process_workflow_task`.
+    // See `handle_ambiguous_suspended_claim`'s doc comment for why.
+    if let Some(result) = handle_ambiguous_suspended_claim(&mut conn, &task, worker_id, error).await
+    {
+        return result;
+    }
+    let Some((kind, name)) = error.handler_not_registered() else {
+        return outcome.map(|()| TaskDispatchOutcome::Completed);
+    };
+    // Both accessors read the same variant, so the phase is always present here.
+    // Defaulting is unreachable; `BeforeHandler` is the conservative choice
+    // (preserve the strike) if a future variant ever separates them.
+    let phase = error
+        .capability_miss_phase()
+        .unwrap_or(CapabilityMissPhase::BeforeHandler);
+    let resolved = handle_capability_miss(
+        &mut conn,
+        &task,
+        worker_id,
+        registry.telemetry().metrics.as_ref(),
+        MissingHandler { kind, name, phase },
+        capability_miss_policy,
+        // Fully qualified: diesel's blanket `RunQueryDsl` puts a `load` in scope
+        // for every type, which otherwise wins method resolution here.
+        std::sync::atomic::AtomicBool::load(
+            &frontier_reset_committed,
+            std::sync::atomic::Ordering::Relaxed,
+        ),
+    )
+    .await;
+    // An escalation terminally failed the execution, so its #782 strike entry
+    // has nothing left to measure and must not outlive it (Codex round-16 P2).
+    // A release leaves the execution running and keeps the entry — see
+    // `clear_panic_strike_on_capability_miss_escalation` for why the re-raised
+    // typed error is the exact discriminator.
+    clear_panic_strike_on_capability_miss_escalation(
+        &workflow_panic_strikes,
+        task.workflow_exec_id,
+        &resolved,
+    );
+    resolved
+}
+
+/// The handler a claiming worker turned out not to register (issue #804).
+///
+/// Bundles what `HarvestError::HandlerNotRegistered` carries so the parts always
+/// travel together: every diagnostic on the miss path — the reason string, the
+/// log fields, and the re-raised error — needs all of them, and splitting them
+/// across argument lists is how they drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingHandler<'a> {
+    /// `"workflow"` or `"activity"` — the registry that was consulted.
+    pub kind: &'static str,
+    /// The registered name the claiming worker looked up and did not find.
+    pub name: &'a str,
+    /// Where in the dispatch cycle the miss was detected. Decides whether the
+    /// release may clear the issue #494 timeout strike.
+    pub phase: CapabilityMissPhase,
+}
+
+impl MissingHandler<'_> {
+    /// The human half of the escalation reason string.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!("no {} handler registered for '{}'", self.kind, self.name)
+    }
+
+    /// The durable identity of the frontier this miss is about (issue #804,
+    /// Codex round-46 P1).
+    ///
+    /// `capability_misses` / `capability_miss_workers` describe **one**
+    /// frontier — the position the workflow is stuck at, and therefore the
+    /// single handler a claiming worker must register to move it. This is what
+    /// the row records so that claim can be checked, rather than assumed.
+    ///
+    /// `kind` is included, not just `name`: the two registries are separate
+    /// namespaces, so an activity and a workflow may legitimately share a name
+    /// and are different frontiers.
+    #[must_use]
+    pub fn frontier_key(&self) -> String {
+        format!("{}:{}", self.kind, self.name)
+    }
+}
+
+/// The two knobs that govern the capability-miss path (issue #804).
+///
+/// Bundled because they are only ever meaningful together: the budget decides
+/// *how many* redeliveries are allowed, and the liveness window decides
+/// *whether the fleet may withhold that bound at all*. Threading them
+/// separately invites a call site that passes one and defaults the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityMissPolicy {
+    /// `WorkerConfig::capability_miss_max_redeliveries`.
+    pub max_redeliveries: u32,
+    /// Liveness window for the worker-fleet lookup that gates the redelivery
+    /// budget.
+    ///
+    /// Build it with [`capability_miss_fleet_stale_secs`], not
+    /// [`worker_stale_secs`]: this window is applied to *peers*, so it must
+    /// carry the fleet-wide floor that keeps a slower-but-healthy peer visible
+    /// to a fast-heartbeating claimant (Codex round-19 P1).
+    pub worker_stale_secs: i64,
+}
+
+/// One coherent observation of the miss evidence and the live fleet
+/// (issue #804, Codex rounds 28 and 30).
+///
+/// The fleet read and the miss read are separate statements, so under `READ
+/// COMMITTED` a registration can commit between them — and **both** orderings
+/// lose (see [`miss_evidence_confidence`]). The miss state is therefore read on
+/// both sides of the fleet read and the two must agree before any
+/// evidence-derived bound may fire.
+///
+/// This exists as a shared constructor because round 29 re-derived the same
+/// sequence by hand at the commit boundary and silently dropped the bracket,
+/// reintroducing exactly the race round 28 had closed. Both the decision and
+/// its revalidation now take their `(fleet, confidence)` pair from here, so the
+/// two cannot drift apart again.
+struct BracketedMissObservation {
+    before: CurrentMissState,
+    after: CurrentMissState,
+    live_workers: Vec<String>,
+    confidence: MissEvidenceConfidence,
+}
+
+async fn observe_miss_and_fleet(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
+    frontier: &str,
+) -> BracketedMissObservation {
+    let before =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed, frontier)
+            .await;
+    // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
+    // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
+    // an empty set instead of propagating.
+    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
+    let after =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed, frontier)
+            .await;
+    let confidence = miss_evidence_confidence(&before, &after);
+    BracketedMissObservation {
+        before,
+        after,
+        live_workers,
+        confidence,
+    }
+}
+
+/// Read the live worker fleet for `task`'s queue, degrading to an EMPTY set.
+///
+/// A registry failure must not propagate: doing so would turn a transient blip
+/// into a dispatch error that leaves the row `RUNNING` under a live worker,
+/// where the poison-pill reclaimer (which requires a dead heartbeat) cannot see
+/// it. An empty set is the conservative direction — it cannot contain the
+/// claiming worker, so [`fleet_capability_evidence`] reports
+/// [`FleetCapabilityEvidence::Unavailable`], which withholds the
+/// registry-derived configured-total bound (that one fires only on a confirmed
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`]) while leaving the distinct
+/// bound and the absolute ceiling in force, so AC3 still holds. It also makes
+/// the escalation reason say out loud that the fleet was not confirmed.
+///
+/// Note the asymmetry with the compatibility read below, and why it is
+/// deliberate: an empty *fleet* is inert — it concludes nothing about peers —
+/// whereas an empty *compatibility set* actively asserts that cross-build peers
+/// are ineligible. Only the first is safe to reach by degrading.
+///
+/// Only ever called on the miss path, which is rare by construction, so the
+/// happy path never pays for this query.
+async fn read_live_fleet_or_degrade(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_stale_secs: i64,
+) -> Vec<String> {
+    let live = match crate::workers::live_workers_on_queue(
+        conn,
+        &task.queue_name,
+        worker_stale_secs,
+    )
+    .await
+    {
+        Ok(workers) => workers,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                %error,
+                "could not read the live worker fleet for a capability miss; falling back to \
+                 the configured redelivery budget alone"
+            );
+            return Vec::new();
+        }
+    };
+
+    // Narrow to workers that could actually claim THIS task (issue #804,
+    // round-10 P2). A build-incompatible or label-ineligible worker never wins
+    // the claim, so it never joins `capability_miss_workers` and would
+    // otherwise hold the evidence at `CapablePeerMayExist` forever.
+    //
+    // A compat-set read FAILURE is not evidence of incompatibility: degrading
+    // it to an empty set would assert that every cross-build peer is
+    // ineligible, fabricate `AllLiveWorkersMissed`, and terminally fail the
+    // execution at `budget + 1` while a declared, capable peer was live
+    // (Codex round-18 P1). `narrow_live_fleet` therefore suppresses the build
+    // axis on failure and keeps the still-readable label axis.
+    let compat = match crate::build_routing::load_compat_set(conn).await {
+        Ok(compat) => Some(compat),
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                %error,
+                "could not read the build-compatibility declarations for a capability miss; \
+                 keeping cross-build peers in the live fleet rather than concluding they are \
+                 ineligible"
+            );
+            None
+        }
+    };
+    narrow_live_fleet(
+        &live,
+        compat.as_ref(),
+        task.required_build_id.as_deref(),
+        task.required_capabilities.as_ref(),
+    )
+}
+
+/// Give back the per-activity rate-limit token this claim spent, when it spent
+/// one (issue #804 x #332, Codex round-11 P2).
+///
+/// `claim_task` debits a token in its `rate_limit_debit` CTE for any task
+/// carrying a `rate_limit_key` whose activity is **not** circuit-breaker
+/// tracked; for a tracked activity the debit is deferred to dispatch (#369) and
+/// the claim skips it. A capability miss can only ever be the untracked case:
+/// the tracked set is derived from this worker's own registered activities, so
+/// an activity it does not register cannot be in it. A present `rate_limit_key`
+/// therefore means this claim debited, and the presence check alone is the
+/// correct — and drift-proof — predicate, mirroring `claim_task`'s own gate.
+///
+/// Keeping the token would charge real capacity to a dispatch that ran nothing.
+/// That is not cosmetic on a slow bucket: the capable peer waits out a refill
+/// interval it should not have to, and the incapable worker — whose release
+/// backoff starts at one second — is well placed to take the next minted token
+/// too, so a low-refill activity can be starved by a worker that cannot run it.
+///
+/// A refund failure is logged, never propagated: the release itself is the
+/// load-bearing action, and failing the dispatch over unreturned capacity would
+/// strand the row `RUNNING` under a live worker, which is strictly worse than
+/// the leak (the poison-pill reclaimer only recovers rows whose worker has
+/// stopped heartbeating).
+///
+/// # Why this is deliberately NOT gated on still owning the claim
+///
+/// Codex round 42 read the unconditional refund as an over-credit: a stale
+/// dispatcher resuming after `poison_pill::reclaim_orphaned_tasks` re-pended
+/// its task would "refund the replacement claim's token", letting an extra
+/// activity through. Tokens are fungible, so the only meaningful question is
+/// the **balance**: outstanding debits must equal the number of activities that
+/// ran or are running. Trace it with a burst-`T` bucket, where `A` is the stale
+/// dispatcher and `B` the replacement:
+///
+/// | step                                   | bucket | running |
+/// |----------------------------------------|--------|---------|
+/// | `A` claims (debits)                    | `T-1`  | 0       |
+/// | orphan reclaim re-pends — **no refund**| `T-1`  | 0       |
+/// | `B` claims (debits) and runs           | `T-2`  | 1       |
+/// | `A` resumes and refunds *here*         | `T-1`  | 1       |
+///
+/// `T-1` for one running activity is the correct balance. The refund does not
+/// take capacity from `B`; it returns the debit `A` stranded, because
+/// `requeue_orphan` re-pends the row without touching the bucket. Gating this
+/// on ownership would stop at `T-2` — a permanent leak on a `refill_rate = 0`
+/// bucket, and the direction that starves the capable peer.
+///
+/// The refund is safe to make unconditional because it is exactly one refund
+/// per claim-time debit: `claim_task` debits every rate-limited claim it grants
+/// (bar the breaker-tracked ones, unreachable here — see above), this is the
+/// only site that returns a claim-time debit, and it runs once per dispatch. No
+/// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
+/// second credit for one debit cannot arise.
+///
+/// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
+/// `capability_miss_tests`, which drives the exact interleaving above and
+/// asserts the middle column.
+#[doc(hidden)]
+pub async fn refund_capability_miss_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) {
+    let Some(key) = task.rate_limit_key.as_deref() else {
+        return;
+    };
+    if let Err(error) = queue::refund_rate_limit_token(conn, key).await {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token for a capability miss; the activity did not \
+             run, so this leaks one token of capacity until the bucket refills"
+        );
+    }
+}
+
+/// Release a claim taken by a worker with no handler for the task's type, or
+/// escalate it once the redelivery budget is exhausted (issue #804).
+///
+/// Returns `Ok(())` on a release: the task is back at `PENDING` with a backoff,
+/// and this dispatch is a clean no-op from the poll loop's perspective — the
+/// worker did nothing wrong. On escalation it routes through the ordinary
+/// terminal-failure path (`fail_task_and_execution`, which appends
+/// `WorkflowFailed` and moves the task to the DLQ exactly as any other terminal
+/// failure does) and returns the error, so nothing about the terminal contract
+/// changes — only its *reason* string and the delay before reaching it.
+async fn handle_capability_miss(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    missing: MissingHandler<'_>,
+    policy: CapabilityMissPolicy,
+    // Issue #804 (Codex round-22 P2): did this dispatch commit a frontier
+    // reset? See `frontier_miss_state` for why this replaces a DB re-read.
+    frontier_reset_committed: bool,
+) -> HarvestResult<TaskDispatchOutcome> {
+    // Give back the rate-limit token this claim spent (issue #804, Codex
+    // round-11 P2). Unconditional here, before the release-vs-escalate branch,
+    // because the activity did not run in EITHER case — the capacity was
+    // charged to a dispatch that did nothing.
+    refund_capability_miss_rate_limit_token(conn, task).await;
+
+    // The handler this dispatch is stuck on, which is what the row's counters
+    // are evidence ABOUT (issue #804, Codex round-46 P1). Newly ingested
+    // history — a pending signal, a due timer, an external delta — can move the
+    // replay onto a different branch between two dispatches of the same task
+    // without any park or inline progress in between, so the counters can carry
+    // a prior frontier's missers. Keying by this makes them apply only to the
+    // handler a claiming worker must actually register.
+    let frontier = missing.frontier_key();
+
+    // Issue #804 (Codex rounds 20, 22, 27 and 28): decide on the counters as
+    // they stand NOW, which is not the claim-time snapshot in `task` — this
+    // dispatch may have retired a frontier, and a peer's re-registration may
+    // have invalidated its own stale evidence on this very row.
+    //
+    // The miss state is read on BOTH sides of the fleet read, and the two must
+    // agree before any evidence-derived bound may fire. See
+    // `miss_evidence_confidence` for why neither ordering is safe on its own.
+    let BracketedMissObservation {
+        before: before_fleet,
+        after: after_fleet,
+        live_workers,
+        confidence,
+    } = observe_miss_and_fleet(
+        conn,
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+        &frontier,
+    )
+    .await;
+
+    // A lost claim is not a decision to make. The escalation write is not
+    // ownership-guarded, so deciding here would let a stale dispatcher
+    // terminally fail a task another worker now owns (Codex round-28 P1).
+    // Either read observing the loss is enough — the claim does not come back.
+    let (Some((misses_before, distinct_before)), Some(_)) = (
+        before_fleet.decidable_counters(),
+        after_fleet.decidable_counters(),
+    ) else {
+        tracing::debug!(
+            task_id = %task.id,
+            "capability-miss state re-read matched no owned row; the claim was already \
+             taken, so this dispatch makes no decision about it"
+        );
+        // `Released`, not `Completed`: this worker observed nothing about the
+        // execution, so it must not be treated as a clean dispatch (see
+        // `TaskDispatchOutcome`).
+        return Ok(TaskDispatchOutcome::Released {
+            clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+        });
+    };
+    let distinct_before = distinct_before.to_vec();
+    let resolution = resolve_capability_miss_with_confidence(
+        &distinct_before,
+        misses_before,
+        worker_id,
+        policy.max_redeliveries,
+        task.session_id,
+        &live_workers,
+        confidence,
+    );
+
+    let ctx = CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    };
+    match resolution.action {
+        CapabilityMissAction::Release => {
+            release_capability_miss(
+                conn,
+                ctx,
+                misses_before,
+                policy.max_redeliveries,
+                &resolution,
+            )
             .await
         }
+        CapabilityMissAction::Escalate => {
+            match escalate_capability_miss(conn, ctx, policy, frontier_reset_committed).await? {
+                Some(outcome) => Ok(outcome),
+                // Withdrawn at the commit boundary: the row must still leave
+                // this worker's hands, or it would sit `RUNNING` under a LIVE
+                // worker where the orphan reclaimer (which needs a dead
+                // heartbeat) cannot see it.
+                None => {
+                    release_capability_miss(
+                        conn,
+                        ctx,
+                        misses_before,
+                        policy.max_redeliveries,
+                        &resolution,
+                    )
+                    .await
+                }
+            }
+        }
     }
+}
+
+/// The per-dispatch identity a capability-miss arm needs (issue #804).
+///
+/// Bundled so the release and escalation arms take the same four values in the
+/// same order and neither drifts a positional argument past the other.
+#[derive(Clone, Copy)]
+struct CapabilityMissCtx<'a> {
+    task: &'a TaskQueueItem,
+    worker_id: &'a str,
+    metrics: &'a dyn crate::telemetry::MetricsRecorder,
+    missing: MissingHandler<'a>,
+}
+
+/// Return an incapable claim to the queue for a peer (issue #804, AC1/AC2).
+///
+/// Shared by the ordinary release arm and by an escalation withdrawn at the
+/// commit boundary (Codex round-29 P1), so the two can never drift on the
+/// backoff, the phase-gated counter handling, or the metric.
+async fn release_capability_miss(
+    conn: &mut AsyncPgConnection,
+    ctx: CapabilityMissCtx<'_>,
+    misses_before: i32,
+    max_redeliveries: u32,
+    resolution: &CapabilityMissResolution,
+) -> HarvestResult<TaskDispatchOutcome> {
+    let CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    } = ctx;
+    {
+        {
+            // Back off before the next redelivery so the dwell window outlasts a
+            // pod flip: without it the budget would be spent in milliseconds by
+            // the same incapable worker re-claiming its own released row.
+            // The backoff is applied against the DB clock inside the release
+            // statement, so host/Postgres skew cannot swallow it.
+            // Scaled off the CURRENT frontier's miss count (issue #804, Codex
+            // round-20 P1), not the claim-time snapshot: a frontier the fleet
+            // has not been asked about yet must start at the base delay rather
+            // than inherit a prior frontier's backoff.
+            let delay = capability_miss_backoff(misses_before);
+            // The phase governs both conditional clauses of the release:
+            // issue #367's `crash_strikes` may only be cleared by a dispatch
+            // that ran the handler to a conclusion (Codex round-12 P1), and
+            // `attempt` may only be restored by one that never reached the
+            // handler at all (Codex round-17 P2). See
+            // `CapabilityMissPhase::clears_crash_strikes` /
+            // `::restores_dispatch_attempt`.
+            // The returned cardinality is the one this `UPDATE` committed, not
+            // the one `observe_miss_and_fleet` snapshotted -- a peer's
+            // re-registration can invalidate an entry in between (Codex
+            // round-36 P2). See `release_task_for_capability_miss`.
+            let released = queue::release_task_for_capability_miss(
+                conn,
+                task.id,
+                worker_id,
+                delay,
+                missing.phase,
+                // The claim epoch this dispatch holds. A poison-pill requeue
+                // bumps it and lets the SAME worker re-claim, so `worker_id`
+                // alone would also match that replacement claim (Codex
+                // round-37 P1).
+                task.crash_strikes,
+                // The frontier these counters are evidence about (Codex
+                // round-46 P1): a release that lands on a DIFFERENT handler
+                // than the row records restarts the count at 1 rather than
+                // inheriting the prior frontier's missers.
+                &missing.frontier_key(),
+            )
+            .await?;
+            let Some(durable_distinct_workers) = released else {
+                // A concurrent poison-pill reclaim (or an operator action) took
+                // the row out from under this claim. Nothing to do and nothing
+                // to count: the row is no longer ours to release.
+                tracing::debug!(
+                    task_id = %task.id,
+                    "capability-miss release matched no row; the claim was already taken"
+                );
+                // Still `Released`, not `Completed`: this worker observed
+                // nothing about the execution, so it must not be treated as a
+                // clean dispatch (see `TaskDispatchOutcome`).
+                return Ok(TaskDispatchOutcome::Released {
+                    clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+                });
+            };
+            metrics.record_task_capability_miss(
+                &task.queue_name,
+                &task.task_type,
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_RELEASED,
+            );
+            tracing::info!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                task_type = %task.task_type,
+                handler_kind = missing.kind,
+                handler = missing.name,
+                capability_misses = resolution.total_after,
+                distinct_incapable_workers =
+                    reported_distinct_workers(resolution, Some(durable_distinct_workers)),
+                fleet_evidence = ?resolution.evidence,
+                worker_is_new_misser = resolution.worker_is_new,
+                max_redeliveries,
+                backoff_secs = delay.as_secs(),
+                "released task for a capable peer: no handler registered on this worker"
+            );
+            Ok(TaskDispatchOutcome::Released {
+                clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+            })
+        }
+    }
+}
+
+/// Whether an escalation decided a moment ago still stands at the commit
+/// boundary (issue #804, Codex round-29 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationRevalidation {
+    /// Commit the terminal failure, reporting the carried **fresh** resolution.
+    ///
+    /// The initial decision and the revalidation can both say `Escalate` for
+    /// *different* causes — a task past the absolute release ceiling escalates
+    /// as `BudgetExhausted` while every live worker has missed it, and as
+    /// `ReleaseCeilingExhausted` the moment a never-tried capable peer appears.
+    /// Reporting the obsolete cause would tell an operator no live worker
+    /// registers the handler when one demonstrably does (issue #804, Codex
+    /// round-31 P2), so the fresh resolution travels with the verdict and is
+    /// what derives the reason string, the metric label, and the log line.
+    Stands(CapabilityMissResolution),
+    /// Abandon it — the reason is `&'static str` so the log line and the test
+    /// assert on the same value.
+    Withdrawn(&'static str),
+}
+
+/// The rule that decides it.
+///
+/// A decision is only allowed to become a terminal write if the claim is still
+/// ours *and* re-running it against freshly-read evidence reaches the same
+/// answer. Both inputs are re-read immediately before this call, so `Stands`
+/// means "no awaited read separates this conclusion from its commit".
+///
+/// Withdrawal is always safe: the row returns to the release path, which is
+/// itself ownership-guarded and a no-op on a lost claim, and AC3's bounds are
+/// unaffected — the absolute ceiling and the storage ceiling are re-evaluated
+/// on every redelivery, so a task that genuinely has no capable worker still
+/// terminates.
+const fn revalidate_escalation(
+    current: &CurrentMissState,
+    fresh: Option<CapabilityMissResolution>,
+) -> EscalationRevalidation {
+    match current {
+        // A row that changed hands must not be failed by the dispatcher that
+        // lost it. This is the cheap, early half of that guard: the terminal
+        // write itself re-checks ownership under the row's `FOR UPDATE` lock
+        // (round-31 P1), because an unlocked re-read only narrows the window.
+        CurrentMissState::ClaimLost => EscalationRevalidation::Withdrawn("claim_lost"),
+        _ => match fresh {
+            Some(fresh) => match fresh.action {
+                CapabilityMissAction::Escalate => EscalationRevalidation::Stands(fresh),
+                // A capable peer went live, or its evidence was invalidated,
+                // between the decision and here. Release rather than fail the
+                // run it can serve.
+                CapabilityMissAction::Release => {
+                    EscalationRevalidation::Withdrawn("evidence_changed")
+                }
+            },
+            // Unreachable in practice: `decidable_counters` returns `None` only
+            // for `ClaimLost`, which the arm above already took. Withdrawing is
+            // the safe direction for a state we cannot re-decide from.
+            None => EscalationRevalidation::Withdrawn("evidence_unavailable"),
+        },
+    }
+}
+
+/// Pay the escalation's expensive read, then re-validate it (issue #804, Codex
+/// round-29 P1).
+///
+/// `fail_task_and_execution` used to load the workflow's history *after* the
+/// last evidence check, so the window in which a capable peer could go live
+/// unnoticed contained an awaited read whose cost grows with the history — not
+/// the "few microseconds of in-memory work" the round-27 note claimed. The read
+/// is paid here first, and the returned [`PreloadedFailureHistory`] is
+/// *consumed* by the committing call, so the ordering is a compile-time
+/// property rather than a comment that can drift.
+///
+/// Only then are the evidence and the fleet re-read and the same pure decision
+/// re-run. A peer that re-registered during the history load appears here either
+/// as a cleared miss entry or as a newly-live capable worker, and both flip the
+/// answer to `Release`.
+async fn prepare_escalation_commit(
+    conn: &mut AsyncPgConnection,
+    ctx: CapabilityMissCtx<'_>,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
+) -> (PreloadedFailureHistory, EscalationRevalidation) {
+    let CapabilityMissCtx {
+        task,
+        worker_id,
+        missing,
+        ..
+    } = ctx;
+    let frontier = missing.frontier_key();
+    let preloaded = preload_failure_history(conn, task).await;
+    let revalidation = revalidate_escalation_evidence(
+        conn,
+        EscalationEvidenceRecheck {
+            task,
+            worker_id,
+            policy,
+            frontier_reset_committed,
+            frontier: &frontier,
+        },
+    )
+    .await;
+    (preloaded, revalidation)
+}
+
+/// The inputs the escalation's evidence re-decision needs, and nothing else.
+///
+/// Deliberately narrower than [`CapabilityMissCtx`]: the re-decision reads
+/// evidence, so it must not carry a metrics recorder (a re-read is not an
+/// emission point) or the missing-handler *detail* — the human-facing rendering
+/// is what was already decided from. It does carry the frontier KEY, because
+/// that is not a rendering: it is the identity the counters are evidence about,
+/// and without it the re-read cannot tell whose missers it is looking at
+/// (Codex round-46 P1).
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct EscalationEvidenceRecheck<'a> {
+    /// The claim the dispatcher holds.
+    pub task: &'a TaskQueueItem,
+    /// The worker whose escalation is being re-decided.
+    pub worker_id: &'a str,
+    /// The configured budget and staleness policy.
+    pub policy: CapabilityMissPolicy,
+    /// Whether this dispatch already committed a frontier reset.
+    pub frontier_reset_committed: bool,
+    /// The frontier this miss is about (`{kind}:{name}`), so the re-read
+    /// applies the row's counters only if they are evidence about THIS handler
+    /// (issue #804, Codex round-46 P1).
+    pub frontier: &'a str,
+}
+
+/// The escalation half of a terminal write: what to re-decide from, and how to
+/// report the decision it lands on.
+///
+/// The two travel together on purpose. A re-decision that cannot change the
+/// reported reason is the round-34 P2 bug (the boundary escalates for a fresh
+/// cause while paging with the stale one), so the boundary never accepts one
+/// without the other.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct EscalationCommit<'a> {
+    /// What to re-read and re-decide from, under the task lock.
+    pub recheck: EscalationEvidenceRecheck<'a>,
+    /// Renders the terminal reason for whatever resolution the re-decision
+    /// lands on.
+    pub derive_reason: &'a (dyn Fn(&CapabilityMissResolution) -> String + Send + Sync),
+}
+
+/// Re-decide an escalation from freshly-read evidence.
+///
+/// Shared by the pre-transaction check (which avoids opening a transaction at
+/// all when the evidence has already moved) and by the authoritative re-check
+/// inside the terminal transaction, so the two can never drift on how evidence
+/// is observed or how a verdict is derived from it.
+async fn revalidate_escalation_evidence(
+    conn: &mut AsyncPgConnection,
+    recheck: EscalationEvidenceRecheck<'_>,
+) -> EscalationRevalidation {
+    let EscalationEvidenceRecheck {
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+        frontier,
+    } = recheck;
+    // The revalidation uses the SAME bracketed observation the decision does
+    // (issue #804, Codex round-30 P1). Round 29 re-derived a single miss read
+    // here and so reintroduced the round-28 race: a peer re-registering between
+    // that read and the fleet read is still named in the miss array while
+    // already appearing live, which derives `AllLiveWorkersMissed` and fails a
+    // run a capable worker could serve.
+    let BracketedMissObservation {
+        before,
+        after,
+        live_workers,
+        confidence,
+    } = observe_miss_and_fleet(
+        conn,
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+        frontier,
+    )
+    .await;
+    // Either read observing a lost claim is enough — the claim does not come
+    // back — so `before` decides and `after` only has to agree it is still ours.
+    // Re-decide from the fresh reads and carry the WHOLE resolution, not just
+    // its verdict: an escalation that still stands may now stand for a
+    // different reason, and the reason is what an operator is paged with
+    // (issue #804, Codex round-31 P2).
+    let fresh = match (before.decidable_counters(), after.decidable_counters()) {
+        (Some((misses, distinct)), Some(_)) => Some(resolve_capability_miss_with_confidence(
+            distinct,
+            misses,
+            worker_id,
+            policy.max_redeliveries,
+            task.session_id,
+            &live_workers,
+            confidence,
+        )),
+        // No owned row: `revalidate_escalation` withdraws on `ClaimLost`
+        // regardless, so there is nothing to re-decide from.
+        _ => None,
+    };
+    let observed = if matches!(after, CurrentMissState::ClaimLost) {
+        &after
+    } else {
+        &before
+    };
+    revalidate_escalation(observed, fresh)
+}
+
+/// Which distinct-worker count a capability-miss log line may report
+/// (issue #804, Codex round-35 P2).
+///
+/// The two branches have **opposite** correct answers, and getting it backwards
+/// is exactly what round 34 did: the release log was flipped to the pre-claim
+/// count it must not use, while the escalation log kept the post-claim count it
+/// must not use. Both now go through here so they cannot drift again.
+///
+/// - `Some(durable)` — the release branch. The value is what the release
+///   `UPDATE` itself returned, so it *is* the durable set, matching
+///   `capability_misses` (also reported post-update) on the same line. It is
+///   deliberately **not** `resolution.distinct_after`: that is derived from the
+///   snapshot `observe_miss_and_fleet` read, and a peer restarting onto a
+///   capable build can `array_remove` an entry between that read and the write,
+///   leaving the snapshot one higher than the row (Codex round-36 P2).
+/// - `None` — the escalation branch never runs that `UPDATE`, so the claimant
+///   was never appended and there is no post-update count to report. The
+///   persisted set is the pre-claim count, matching `completed_releases` and the
+///   reason string on the same line (Codex round-8 P2).
+///
+/// The two sources also have different Rust types (`i32` vs `usize`), which is
+/// part of why swapping them compiled silently — `tracing` accepts either. The
+/// helper normalises to one type so the choice is a deliberate argument rather
+/// than an incidental field name.
+fn reported_distinct_workers(resolution: &CapabilityMissResolution, released: Option<i32>) -> i64 {
+    released.map_or_else(
+        || i64::try_from(resolution.distinct_before).unwrap_or(i64::MAX),
+        i64::from,
+    )
+}
+
+/// Log an escalation withdrawn at the terminal write, naming why.
+fn log_terminal_withdrawal(task: &TaskQueueItem, write: &TerminalWriteOutcome) {
+    let reason = match write {
+        TerminalWriteOutcome::ClaimLost => "claim_lost",
+        TerminalWriteOutcome::EvidenceChanged(reason) => reason,
+        TerminalWriteOutcome::Committed(_) => return,
+    };
+    tracing::info!(
+        task_id = %task.id,
+        queue = %task.queue_name,
+        reason,
+        "withdrew a capability-miss escalation at the terminal write; releasing instead"
+    );
+}
+
+/// Renders an escalation's cause, reason string and metric label from one
+/// resolution, so the three can never tell an operator different stories about
+/// the same escalation (issue #804, Codex round-34 P2).
+///
+/// The *reported* counts are the persisted ones. The decision was made on the
+/// post-increment distinct count (this claim is evidence), but the escalation
+/// branch never runs the release `UPDATE`, so no redelivery and no
+/// distinct-worker append actually happened for this claim (Codex round-8 P2,
+/// extended to the log field in round 34).
+struct EscalationReporter {
+    detail: String,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+}
+
+impl EscalationReporter {
+    fn escalation(resolution: &CapabilityMissResolution) -> CapabilityMissEscalation {
+        escalation_from_persisted(
+            resolution.misses_before,
+            resolution.distinct_before,
+            resolution,
+        )
+    }
+
+    fn cause(&self, resolution: &CapabilityMissResolution) -> EscalationCause {
+        EscalationCause::resolve(
+            self.max_redeliveries,
+            self.session_id,
+            Self::escalation(resolution),
+        )
+    }
+
+    fn reason(&self, resolution: &CapabilityMissResolution) -> String {
+        no_capable_worker_reason(
+            &self.detail,
+            self.max_redeliveries,
+            self.session_id,
+            Self::escalation(resolution),
+        )
+    }
+}
+
+/// The log line for an escalation, keyed on the cause.
+///
+/// The message must match the branch, not just carry a field naming it: a
+/// session-pinned escalation is NOT evidence that the queue has no capable
+/// worker (see [`no_capable_worker_reason`]), and logging it as such sends
+/// whoever is reading logs after a page to look for a missing deploy that may
+/// not exist.
+const fn escalation_log_message(cause: EscalationCause) -> &'static str {
+    match cause {
+        EscalationCause::SessionPinned(_) => {
+            "escalated task: pinned to a worker session whose host does not register the handler"
+        }
+        EscalationCause::ZeroBudgetFailFast => {
+            "escalated task: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0), so the task was never offered to a peer"
+        }
+        EscalationCause::BudgetExhausted {
+            fleet_confirmed: true,
+            ..
+        } => "escalated task: no capable worker on this queue registers the handler",
+        EscalationCause::BudgetExhausted {
+            fleet_confirmed: false,
+            ..
+        } => {
+            "escalated task: the redelivery budget was exhausted, but the worker registry could not confirm the live fleet (this worker is not listed against this queue); a capable worker may still exist"
+        }
+        EscalationCause::ReleaseCeilingExhausted {
+            capable_peer_may_exist: false,
+            ..
+        } => {
+            "escalated task: hit the absolute capability-miss release ceiling with fewer distinct workers than the budget allows; check the workers that missed it before concluding the queue lacks the handler"
+        }
+        EscalationCause::ReleaseCeilingExhausted {
+            capable_peer_may_exist: true,
+            ..
+        } => {
+            "escalated task: hit the absolute capability-miss release ceiling while a live worker on this queue had still never missed it; check whether that worker is saturated, draining, or advertising a stale queue list"
+        }
+    }
+}
+
+/// Whether the ownership-guarded terminal write actually committed (issue #804,
+/// Codex round-31 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TerminalWriteOutcome {
+    /// The claim was still ours under the row lock; the failure is durable.
+    ///
+    /// Carries the resolution the boundary actually decided from when an
+    /// evidence re-check was attached, so the caller's log reports the same
+    /// story the persisted reason string tells (issue #804, Codex round-34 P2).
+    Committed(Option<CapabilityMissResolution>),
+    /// The row changed hands. Nothing was written.
+    ClaimLost,
+    /// The claim was still ours, but the capability-miss evidence moved under
+    /// the lock — a peer re-registered and is no longer named as incapable, so
+    /// the run this was about to fail terminally now has a worker that can
+    /// serve it. Nothing was written (issue #804, Codex round-33 P1).
+    EvidenceChanged(&'static str),
+}
+
+/// Fail the task and its execution **only if this worker still holds the
+/// claim**, atomically (issue #804, Codex round-31 P1).
+///
+/// Every earlier round narrowed the window between an escalation's last
+/// ownership check and its terminal write — by re-reading the row
+/// ([`current_frontier_miss_state`]), by hoisting the history load out of the
+/// way ([`preload_failure_history`]), by re-validating the decision
+/// ([`revalidate_escalation`]). None of them *closed* it, because the check and
+/// the write remained separate database operations and
+/// [`queue::fail_task`] accepts any `PENDING`/`RUNNING` row regardless of
+/// `worker_id`: a poison-pill reclaim or an operator action landing in between
+/// still let a stale dispatcher terminally fail the **new** owner's task, and
+/// append `WorkflowFailed` to a run that a capable worker had just picked up.
+///
+/// This makes the check and the write one transaction, with the task row's lock
+/// held from the guard to the last write. A concurrent transfer either commits
+/// before the guard runs (and is seen, so nothing is written), holds the row's
+/// lock while the guard runs (and is skipped, so nothing is written — see
+/// [`queue::claim_still_held_for_update`] on why the guard does not *wait*), or
+/// starts after the guard has the lock (and blocks until this transaction
+/// commits, finding a row that is already terminal). There is no interleaving in
+/// which the guard passes and the write lands on someone else's claim.
+///
+/// **The claim, not just the worker.** The guard matches `crash_strikes` as well
+/// as `worker_id`, because [`crate::poison_pill::requeue_orphan`] hands a
+/// reclaimed row back to the pool with the *same* `worker_id` still eligible to
+/// re-claim it. A `(state, worker_id)`-only guard would pass for the new claim
+/// and let this stale escalation terminally fail work that had just been
+/// legitimately restarted.
+///
+/// **Event id.** The preloaded `next_event_id` is re-derived under the execution
+/// row's lock before it is used, because it was read before this transaction
+/// opened and a parallel activity completion may have consumed it. Appending at
+/// a consumed id aborts the terminal transaction on
+/// `UNIQUE(workflow_exec_id, event_id)` and strands the row `RUNNING` under a
+/// live worker (Codex round-31 P1). Round 29's hoist is preserved: the *full*
+/// history load stays outside; only the indexed `MAX(event_id)` runs here.
+///
+/// **Lock order.** The execution row is locked first, then the task row —
+/// `harvest_task_queue`'s documented order (`enforce_activity_timeout`,
+/// `finalize_activity_completion`, and the write path below all take execution →
+/// task). Taking the task row first would invert against them and risk an ABBA
+/// deadlock on exactly the terminal path this guard protects.
+///
+/// **Evidence, not just ownership.** A peer re-registering clears itself from
+/// the task's `capability_miss_workers` without touching `worker_id` or
+/// `crash_strikes`, so the claim guard above is blind to it: the escalation
+/// would still commit and terminally fail a run the newly-capable peer could
+/// serve (Codex round-33 P1). When `recheck` is `Some`, the escalation is
+/// therefore re-decided from evidence read *under the task lock* — the
+/// authoritative decision. The pre-transaction check in
+/// [`prepare_escalation_commit`] is kept as a cheap early exit, not as the
+/// guarantee. Both read no new locks (the miss state is the row already held;
+/// the fleet read is an unlocked `SELECT`), so adding the re-read introduces no
+/// new lock edge.
+///
+/// Honest scope: the *reason string* is still the one derived outside the
+/// transaction, so an escalation that stands here but for a subtly different
+/// cause is reported with the second-most-recent cause. That is a diagnostic
+/// nuance, not a correctness gap — the metric label cannot move between the two
+/// (see [`EscalationCause::outcome_label`]), and the only thing this re-check
+/// changes is *whether* the escalation stands at all.
+///
+/// `before_write` runs once, after the guard passes and before the write, so a
+/// caller's page-severity counter still fires when the write itself fails
+/// transiently — the case that most needs the page — but never fires for an
+/// escalation that was withdrawn.
+///
+/// # Errors
+///
+/// Propagates any database error; the transaction rolls back, so a failed
+/// terminal write never leaves a partially-failed run.
+#[doc(hidden)]
+pub async fn commit_terminal_failure_if_still_claimed<F>(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &str,
+    preloaded: PreloadedFailureHistory,
+    escalation: Option<EscalationCommit<'_>>,
+    before_write: F,
+) -> HarvestResult<TerminalWriteOutcome>
+where
+    F: Fn(Option<&CapabilityMissResolution>) + Send + Sync,
+{
+    let error = error.to_string();
+    Box::pin(
+        conn.transaction::<TerminalWriteOutcome, HarvestError, _>(async |conn| {
+            // Lock the execution row FIRST (the documented execution -> task
+            // order) and re-derive the event id under that lock. The preloaded
+            // id was read *before* this transaction opened, so a parallel
+            // activity completing in between has already consumed it; appending
+            // at a consumed id aborts the whole terminal transaction on
+            // `UNIQUE(workflow_exec_id, event_id)` and leaves the row `RUNNING`
+            // under a LIVE incapable worker -- unclaimable, and invisible to
+            // orphan reclamation, which requires a dead heartbeat (issue #804,
+            // Codex round-31 P1).
+            //
+            // This does not undo round 29. What round 29 hoisted out of the
+            // window was the *full* `store::load_history`, whose cost grows with
+            // the history; `next_event_id_for` is an indexed `MAX(event_id)`
+            // whose cost does not, and it takes the same execution-row lock, so
+            // it replaces the explicit lock rather than adding a read.
+            let preloaded = match preloaded {
+                PreloadedFailureHistory::Loaded { exec_id, .. } => {
+                    PreloadedFailureHistory::Loaded {
+                        exec_id,
+                        next_event_id: store::next_event_id_for(conn, exec_id).await?,
+                    }
+                }
+                // Appends nothing, so there is no id to refresh -- but the
+                // execution row is still locked first, for the ordering.
+                other => {
+                    if let Some(exec_id) = other.exec_id() {
+                        lock_workflow_execution_row_only(conn, exec_id).await?;
+                    }
+                    other
+                }
+            };
+            if !queue::claim_still_held_for_update(conn, task.id, worker_id, task.crash_strikes)
+                .await?
+            {
+                return Ok(TerminalWriteOutcome::ClaimLost);
+            }
+            // The claim is ours and pinned. Re-decide the escalation from
+            // evidence read UNDER that lock: ownership does not move when a
+            // peer re-registers, so the guard above cannot see a peer that
+            // cleared itself from `capability_miss_workers` between the
+            // pre-transaction observation and this point.
+            let fresh = match escalation {
+                None => None,
+                Some(escalation) => {
+                    match revalidate_escalation_evidence(conn, escalation.recheck).await {
+                        EscalationRevalidation::Withdrawn(reason) => {
+                            return Ok(TerminalWriteOutcome::EvidenceChanged(reason));
+                        }
+                        EscalationRevalidation::Stands(fresh) => Some(fresh),
+                    }
+                }
+            };
+            // The escalation still stands -- but possibly for a DIFFERENT cause
+            // than the pre-transaction decision found, and the cause is what the
+            // operator is paged with. Derive the reason from the evidence this
+            // boundary actually decided on, never from the older one
+            // (issue #804, Codex round-34 P2).
+            let error = match (fresh.as_ref(), escalation.as_ref()) {
+                (Some(fresh), Some(escalation)) => (escalation.derive_reason)(fresh),
+                _ => error.clone(),
+            };
+            before_write(fresh.as_ref());
+            fail_task_and_execution_with_history(conn, task, worker_id, &error, preloaded).await?;
+            Ok(TerminalWriteOutcome::Committed(fresh))
+        }),
+    )
+    .await
+}
+
+/// Route an exhausted capability miss through the ordinary terminal-failure
+/// path (issue #804).
+///
+/// Split out of [`handle_capability_miss`] so the release arm — the one that
+/// runs on every ordinary redelivery — stays readable next to the escalation
+/// arm, which runs at most once per task.
+///
+/// Returns `Ok(None)` when the escalation is withdrawn at the commit boundary;
+/// the caller then falls through to the release path.
+async fn escalate_capability_miss(
+    conn: &mut AsyncPgConnection,
+    ctx: CapabilityMissCtx<'_>,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
+) -> HarvestResult<Option<TaskDispatchOutcome>> {
+    let CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    } = ctx;
+    let max_redeliveries = policy.max_redeliveries;
+    // The identity the row's counters are evidence about (Codex round-46 P1).
+    let frontier = missing.frontier_key();
+
+    let (preloaded, revalidation) =
+        prepare_escalation_commit(conn, ctx, policy, frontier_reset_committed).await;
+    // The re-decided resolution, not the one from a moment ago: an escalation
+    // that still stands may stand for a *different* cause now, and the cause is
+    // what the reason string, the metric label, and the log line report
+    // (issue #804, Codex round-31 P2).
+    let EscalationRevalidation::Stands(resolution) = revalidation else {
+        let EscalationRevalidation::Withdrawn(why) = revalidation else {
+            unreachable!("EscalationRevalidation has exactly two variants")
+        };
+        tracing::info!(
+            task_id = %task.id,
+            queue = %task.queue_name,
+            reason = why,
+            "withdrew a capability-miss escalation at the commit boundary; releasing instead"
+        );
+        return Ok(None);
+    };
+
+    // Resolve the cause ONCE and derive the reason string, the metric label,
+    // and the log line from it, so the three can never tell an operator
+    // different stories about the same escalation.
+    //
+    // The decision was made on the POST-increment distinct count (this claim is
+    // evidence), but the *reported* counts are the persisted ones: this branch
+    // never runs the release UPDATE, so no redelivery and no distinct-worker
+    // append actually happened for this claim (Codex round-8 P2). Reporting the
+    // post-increment total here would tell an operator that N+1 redeliveries
+    // occurred when only N did.
+    let escalation = escalation_from_persisted(
+        resolution.misses_before,
+        resolution.distinct_before,
+        &resolution,
+    );
+    let cause = EscalationCause::resolve(max_redeliveries, task.session_id, escalation);
+    let reason = no_capable_worker_reason(
+        &missing.detail(),
+        max_redeliveries,
+        task.session_id,
+        escalation,
+    );
+    // Recorded BEFORE the terminal write, deliberately. This counter is what
+    // the page-severity `harvest_no_capable_worker` rule selects on, and the
+    // terminal write can fail transiently — which is precisely the case that
+    // most needs the page: a failed `fail_task_and_execution` leaves the row
+    // `RUNNING` under a *live* worker, where the poison-pill orphan reclaimer
+    // (which requires a dead heartbeat) cannot see it. Ordering the metric
+    // after the `?` would silence the alert in exactly that stranding case.
+    //
+    // The counter therefore reports the escalation *decision*, which is final
+    // by the time it is emitted. A stranded row is re-claimed later and
+    // escalates again, so the counter is at-least-once rather than
+    // exactly-once — the right trade for a paging signal.
+    //
+    // The label is cause-specific: only budget exhaustion actually offered the
+    // task around the queue, so only it may page the fleet-exhaustion rule.
+    // See `EscalationCause::outcome_label`.
+    // Derive the reported cause from whichever resolution the boundary actually
+    // decided on. Both the pre-transaction and the in-transaction paths go
+    // through this one closure, so the reason string, the metric label, and the
+    // log line can never disagree about the same escalation.
+    let reporter = EscalationReporter {
+        detail: missing.detail(),
+        max_redeliveries,
+        session_id: task.session_id,
+    };
+    let reason_of = |resolution: &CapabilityMissResolution| reporter.reason(resolution);
+    let write = commit_terminal_failure_if_still_claimed(
+        conn,
+        task,
+        worker_id,
+        &reason,
+        preloaded,
+        // The authoritative evidence re-decision: read under the task lock,
+        // so a peer that re-registered after the pre-transaction check
+        // cannot be missed (issue #804, Codex round-33 P1).
+        Some(EscalationCommit {
+            recheck: EscalationEvidenceRecheck {
+                task,
+                worker_id,
+                policy,
+                frontier_reset_committed,
+                frontier: &frontier,
+            },
+            derive_reason: &reason_of,
+        }),
+        |fresh| {
+            let label = fresh.map_or_else(
+                || cause.outcome_label(),
+                |r| reporter.cause(r).outcome_label(),
+            );
+            metrics.record_task_capability_miss(&task.queue_name, &task.task_type, label);
+        },
+    )
+    .await?;
+    let (resolution, cause) = match write {
+        TerminalWriteOutcome::Committed(fresh) => {
+            let resolution = fresh.unwrap_or(resolution);
+            (resolution, reporter.cause(&resolution))
+        }
+        TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            log_terminal_withdrawal(task, &write);
+            return Ok(None);
+        }
+    };
+    let message = escalation_log_message(cause);
+    tracing::error!(
+        task_id = %task.id,
+        queue = %task.queue_name,
+        task_type = %task.task_type,
+        handler_kind = missing.kind,
+        handler = missing.name,
+        completed_releases = resolution.misses_before,
+        distinct_incapable_workers = reported_distinct_workers(&resolution, None),
+        fleet_evidence = ?resolution.evidence,
+        max_redeliveries,
+        session_pinned = task.session_id.is_some(),
+        session_id = ?task.session_id,
+        outcome = cause.outcome_label(),
+        "{message}"
+    );
+    Err(HarvestError::HandlerNotRegistered {
+        kind: missing.kind,
+        name: missing.name.to_owned(),
+        phase: missing.phase,
+    })
 }
 
 /// Periodically sample per-queue pending-task counts and forward them to the
@@ -12911,6 +18895,79 @@ fn spawn_dlq_depth_sampler(
                     tracing::debug!(error = %error, "dlq depth sample failed");
                 }
             }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
+/// Spawn the paused-queue sampler (issue #619).
+///
+/// Emits the `harvest.queue.paused` gauge (`1`/`0` per queue) so an operator
+/// hold is visible on a dashboard and can drive an alert if it is left on too
+/// long (AC8). Iterates every shard pool so a shard-scoped pause is surfaced
+/// while the other shards keep dispatching; a queue paused on *any* shard reads
+/// `1`, which is the honest fleet-wide reading of "work on this queue is being
+/// held somewhere".
+///
+/// Zero-fill: a queue that was reported paused on a previous cycle but is no
+/// longer paused is emitted once with `false`, so a resumed queue's series drops
+/// to `0` instead of going stale at `1` forever. Skipped entirely when no
+/// metrics recorder is configured — the per-shard query is not free.
+#[cfg(feature = "db")]
+fn spawn_queue_pause_sampler(
+    // One pool per shard to aggregate over (see spawn_queue_depth_sampler).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        // Queues reported paused on the previous cycle, so a resume can be
+        // zero-filled exactly once rather than leaving a stale `1`.
+        let mut previously_paused: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut currently_paused: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut read_failed = false;
+
+            for pool in &pools {
+                let Ok(mut conn) = pool.get().await else {
+                    read_failed = true;
+                    continue;
+                };
+                match crate::queue_pause::paused_queue_names(&mut conn).await {
+                    Ok(names) => currently_paused.extend(names),
+                    Err(error) => {
+                        read_failed = true;
+                        tracing::debug!(error = %error, "queue pause sample failed");
+                    }
+                }
+            }
+
+            // A shard we could not read might be holding a queue we would
+            // otherwise zero-fill, so an incomplete scan suppresses the
+            // zero-fill only — never the holds it did observe, which are true
+            // regardless of the failed shard. See
+            // `compute_queue_pause_emissions`.
+            let (emissions, next_previously_paused) =
+                compute_queue_pause_emissions(&previously_paused, &currently_paused, read_failed);
+            for (queue, paused) in emissions {
+                telemetry.metrics.record_queue_paused(&queue, paused);
+            }
+            previously_paused = next_previously_paused;
 
             if cancel.is_cancelled() {
                 break;
@@ -13437,6 +19494,8 @@ struct WorkerMonitoringHandles {
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
     /// itself no-ops when metrics are disabled); `None` without `db`.
     schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Paused-queue gauge sampler (issue #619). `None` without the `db` feature.
+    queue_pause_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -13462,7 +19521,18 @@ fn spawn_pause_auto_resumer(
     interval: Duration,
     max_pause_duration: Duration,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
+    // Issue #797: declare the loop before its first iteration so the
+    // `scanner_liveness` check expects it and grants it boot grace. The shard
+    // is carried so a multi-shard worker's snapshot can name WHICH shard's
+    // auto-resumer wedged -- the tick counter carries no shard label.
+    let owner = crate::scanner_health::register_scanner_for_shard(
+        &*telemetry.metrics,
+        crate::scanner_health::Scanner::PauseAutoResume,
+        interval,
+        shard,
+    );
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -13493,10 +19563,17 @@ fn spawn_pause_auto_resumer(
                 }
             }
 
+            // Issue #797: unconditional end-of-iteration liveness tick.
+            crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+
             if cancel.is_cancelled() {
                 break;
             }
         }
+        // Issue #797: a graceful stop retires this loop from the expected
+        // scanner set. A panic unwinds past here, so a panicked loop stays
+        // registered and correctly ages into `Wedged`.
+        crate::scanner_health::deregister_scanner(owner);
     })
 }
 
@@ -13679,6 +19756,61 @@ impl ActiveWorkflowState {
 /// same set of `(workflow, state, count)` tuples), but the returned `Vec`'s
 /// order follows `HashMap` iteration and is **not** order-stable. That is fine:
 /// the consumer calls `.set()` once per series, order-independently.
+/// Decide what the `harvest.queue.paused` gauge emits for one sampler cycle
+/// (issue #619), and what the next cycle should treat as previously paused.
+///
+/// Returns `(emissions, next_previously_paused)` where each emission is
+/// `(queue_name, paused)`.
+///
+/// # Why an incomplete scan still emits the holds it saw
+///
+/// A pause is **boolean per queue**, so a hold observed on a readable shard is
+/// correct regardless of what an unreadable shard would have said — "work on
+/// this queue is being held somewhere" is already true. Suppressing the whole
+/// cycle on any read failure (as this originally did) meant a queue genuinely
+/// paused on a healthy shard never set the gauge to `1`, so the dashboard showed
+/// nothing and `harvest_queue_paused_too_long` could not fire for the entire
+/// duration of an *unrelated* shard outage — AC8 broken in exactly the
+/// compound-incident case an operator most needs it (issue #619 review).
+///
+/// This is the opposite call from [`compute_active_gauge_emissions`], and
+/// deliberately so: that gauge reports a *count*, where a partial fan-out is a
+/// wrong number, so skipping the tick is the only honest option there.
+///
+/// # What an incomplete scan must still suppress
+///
+/// The **zero-fill**. A queue absent from a partial scan may simply live on the
+/// shard we could not read, so emitting `false` would claim the hold was
+/// released during a database blip — the inverse lie. Such a queue is instead
+/// *retained* in the returned set (union, not replace), so it is neither
+/// forgotten nor falsely cleared, and a later **complete** scan that finds it
+/// genuinely resumed zero-fills it exactly once rather than leaving it stale at
+/// `1` forever.
+pub(crate) fn compute_queue_pause_emissions(
+    previously_paused: &std::collections::BTreeSet<String>,
+    currently_paused: &std::collections::BTreeSet<String>,
+    read_failed: bool,
+) -> (Vec<(String, bool)>, std::collections::BTreeSet<String>) {
+    // Always report what we actually observed.
+    let mut emissions: Vec<(String, bool)> = currently_paused
+        .iter()
+        .map(|queue| (queue.clone(), true))
+        .collect();
+
+    if read_failed {
+        // Union: keep any hold we could not re-observe this cycle so it stays
+        // zero-fillable, without asserting it was released.
+        let mut retained = previously_paused.clone();
+        retained.extend(currently_paused.iter().cloned());
+        return (emissions, retained);
+    }
+
+    for queue in previously_paused.difference(currently_paused) {
+        emissions.push((queue.clone(), false));
+    }
+    (emissions, currently_paused.clone())
+}
+
 pub(crate) fn compute_active_gauge_emissions(
     last_keys: &std::collections::HashSet<(String, ActiveWorkflowState)>,
     this_counts: &std::collections::HashMap<(String, ActiveWorkflowState), u64>,
@@ -13905,6 +20037,30 @@ fn build_dispatch_semaphore(
     )
 }
 
+/// Resolve the LISTEN/NOTIFY URL for one shard on the multi-shard poll path.
+///
+/// Takes **only** the per-shard map by design: the global
+/// `notification_database_url` is configured independently of `sharded_pool`,
+/// so it cannot be shown to target any particular shard's database — a pool
+/// override (`HarvestRunnerResources::with_sharded_pool`) can leave it aimed at
+/// the original `harvest_pool` entirely. Not accepting it as an argument makes
+/// a wrong-database listener unrepresentable here rather than guarded by a
+/// heuristic (issue #522 review; re-affirmed by the issue #961 review).
+///
+/// `None` means poll-only for this shard — a latency cost, never a correctness
+/// one, since claiming always runs against the shard's own pool.
+#[cfg(feature = "db")]
+#[must_use]
+fn multi_shard_listener_url(
+    per_shard: &[(crate::types::ShardId, String)],
+    shard: crate::types::ShardId,
+) -> Option<&str> {
+    per_shard
+        .iter()
+        .find(|(s, _)| *s == shard)
+        .map(|(_, url)| url.as_str())
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -13912,6 +20068,17 @@ impl Worker {
     ///
     /// Returns [`HarvestError::Config`] if the config fails validation.
     pub fn new(config: WorkerRuntimeConfig, registry: Arc<HandlerRegistry>) -> HarvestResult<Self> {
+        // Resolve auto (empty) shard assignments against the pool that is now
+        // final (issue #961, AC1). `From<WorkerConfig>` deliberately does NOT
+        // run this — a runner assigns `sharded_pool` onto the runtime config
+        // *after* that conversion, so resolving there would permanently collapse
+        // the "auto" sentinel to `[ShardId(0)]`. This pass is idempotent, so a
+        // caller that already resolved (e.g. `HarvestRunner`) is unaffected, and
+        // a direct `Worker::new` caller that never went through the runner is
+        // still widened here. A non-empty list — whether operator-configured or
+        // already auto-resolved — is left untouched.
+        let mut config = config;
+        config.resolve_shard_assignments();
         config.validate()?;
 
         // Validate the history ceiling against the soft threshold from the registry.
@@ -14283,6 +20450,78 @@ impl Worker {
     /// Fleet presence (register + heartbeat + status) is written to **each**
     /// assigned shard's pool so that the shard-health readiness gate (Slice B)
     /// can see a covering live worker per shard.
+    /// Build one LISTEN/NOTIFY listener per assigned shard.
+    ///
+    /// A shard with no listener falls back to poll-interval dispatch latency,
+    /// which is correct but slower — a `NOTIFY` on the wrong database never
+    /// wakes us, so a listener is only ever built from a URL that provably
+    /// points at that shard's own database.
+    ///
+    /// The global `notification_database_url` is **never** consulted here.
+    /// It is configured independently of `sharded_pool`, so nothing proves it
+    /// targets the database backing any particular shard — and a pool override
+    /// (`HarvestRunnerResources::with_sharded_pool`) can leave it pointing at
+    /// the *original* `harvest_pool` entirely. Matching on the numeric default
+    /// shard id would not establish that identity. This is the same call the
+    /// single-shard `global_safe` gate already documents for real multi-shard
+    /// routing: an absent per-shard URL means **poll-only** for that shard
+    /// rather than risking a listener on the wrong database (issue #522
+    /// review; re-affirmed by the issue #961 review).
+    ///
+    /// Consequence: a deployment that auto-widens onto the multi-shard path
+    /// (issue #961) and has no `shard_notification_database_urls` falls back to
+    /// poll-interval dispatch latency on **every** shard. That is a latency
+    /// cost, never a correctness one — claiming always runs against the shard's
+    /// own pool — and the warning below names the one-call fix.
+    async fn build_shard_listeners(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+    ) -> Vec<Option<crate::notify::QueueListener>> {
+        if self.config.shard_notification_database_urls.is_empty() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                "harvest: multi-shard worker has no shard_notification_database_urls; \
+                 every shard falls back to poll-interval dispatch latency. The global \
+                 notification_database_url is deliberately not used as a fallback here \
+                 because nothing proves it targets a given shard's database. Set \
+                 WorkerConfig::with_shard_notification_database_urls to restore \
+                 LISTEN/NOTIFY wake-ups per shard."
+            );
+        }
+
+        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
+        for (shard_id, _) in shard_targets {
+            let listener_url =
+                multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard_id);
+            let listener = match listener_url {
+                Some(url) => {
+                    match crate::notify::QueueListener::connect(url, &self.config.queues).await {
+                        Ok(l) => {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                "per-shard LISTEN/NOTIFY listener connected"
+                            );
+                            Some(l)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            shard_listeners.push(listener);
+        }
+        shard_listeners
+    }
+
     async fn run_multi_shard(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
@@ -14295,10 +20534,29 @@ impl Worker {
             "worker starting (multi-shard)"
         );
 
-        // Register + rate-limit buckets on every shard pool.
+        // Register + rate-limit buckets on every shard pool. Each shard keeps
+        // its OWN pending flag: a shard whose registration failed must retry
+        // even when a sibling shard succeeded (issue #804, Codex round-50 P1).
+        // Each flag is SHARED (not copied) between that shard's heartbeat task
+        // and that shard's slot in the poll loop: the heartbeat retries and
+        // eventually clears it, and the poll loop must observe the clearing to
+        // resume claiming on that shard. See `may_claim_tasks`.
+        //
+        // Every per-shard acquisition here is bounded (issue #961 review,
+        // Codex P1): this loop is sequential, so an unreachable or exhausted
+        // pool on ONE shard would otherwise park it forever and the poll loop
+        // below would never start at all — stranding every healthy shard. A
+        // bounded failure instead arms that shard's pending flag, which its own
+        // heartbeat task retries. See `shard_acquire_bound`.
+        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
+            Vec::with_capacity(shard_targets.len());
         for (_, shard_pool) in &shard_targets {
-            self.register_in_fleet(shard_pool).await;
-            self.register_rate_limit_buckets(shard_pool).await;
+            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
+                self.register_in_fleet(shard_pool, startup_bound).await,
+            )));
+            self.register_rate_limit_buckets(shard_pool, startup_bound)
+                .await;
         }
 
         // Monitoring tasks use the default pool for non-shard-specific monitors;
@@ -14320,53 +20578,26 @@ impl Worker {
         // above, so every shard's row reports the same tuned in-flight view.
         let heartbeat_handles: Vec<_> = shard_targets
             .iter()
-            .map(|(_, shard_pool)| {
+            .zip(&registration_pending_per_shard)
+            .map(|((_, shard_pool), pending)| {
                 self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
+                    Arc::clone(pending),
                 )
             })
             .collect();
 
-        // Build per-shard listeners from shard_notification_database_urls.
-        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
-        for (shard_id, _) in &shard_targets {
-            let listener_url = self
-                .config
-                .shard_notification_database_urls
-                .iter()
-                .find(|(s, _)| s == shard_id)
-                .map(|(_, url)| url.as_str());
-            let listener = if let Some(url) = listener_url {
-                match crate::notify::QueueListener::connect(url, &self.config.queues).await {
-                    Ok(l) => {
-                        tracing::info!(
-                            worker_id = %self.config.worker_id,
-                            shard_id = %shard_id.as_i32(),
-                            "per-shard LISTEN/NOTIFY listener connected"
-                        );
-                        Some(l)
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            shard_id = %shard_id.as_i32(),
-                            error = %error,
-                            "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            shard_listeners.push(listener);
-        }
+        let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
-        self.run_poll_loop_multi(shard_targets.clone(), shard_listeners)
-            .await;
+        self.run_poll_loop_multi(
+            shard_targets.clone(),
+            shard_listeners,
+            &registration_pending_per_shard,
+        )
+        .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -14412,6 +20643,7 @@ impl Worker {
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
+        registration_pending_per_shard: &[Arc<AtomicBool>],
     ) {
         let n = shard_targets.len();
         // Rotating start index prevents the first shard from being permanently
@@ -14422,8 +20654,38 @@ impl Worker {
             let mut any_claimed = false;
             for i in 0..n {
                 let idx = (start_idx + i) % n;
-                if self.poll_once(&shard_targets[idx].1).await {
+                // Skip a shard whose own registration is still unverified: on
+                // that shard this worker is not a fleet member, so it must not
+                // claim (see `may_claim_tasks`). Sibling shards are unaffected,
+                // which is why the flag is per shard (round-50 P1).
+                // Fully qualified: diesel's blanket `RunQueryDsl::load` is in
+                // scope here and shadows the inherent `AtomicBool::load` through
+                // the `Arc` deref.
+                if !may_claim_tasks(AtomicBool::load(
+                    &registration_pending_per_shard[idx],
+                    Ordering::Relaxed,
+                )) {
+                    continue;
+                }
+                if self
+                    .poll_once(
+                        &shard_targets[idx].1,
+                        shard_acquire_bound(true, self.config.poll_interval),
+                    )
+                    .await
+                {
                     any_claimed = true;
+                    // Per-shard dispatch counter (issue #961, AC5). Emitted
+                    // here rather than inside `poll_once`/`dispatch_task`
+                    // because a task row carries no `shard_id` column — "which
+                    // shard" *is* "which pool", and only the poll loop knows
+                    // which pool it just claimed from. `poll_once` returns
+                    // `true` exactly when it dispatched, so this counts
+                    // dispatches, not poll attempts.
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_shard_dispatched(shard_metric_label(shard_targets[idx].0));
                     // Advance start past the shard that just claimed so the
                     // next hot iteration tries the next shard first.
                     start_idx = (idx + 1) % n;
@@ -14555,6 +20817,11 @@ impl Worker {
         {
             tracing::warn!(error = %error, "schedule overdue sampler failed during shutdown");
         }
+        if let Some(handle) = monitors.queue_pause_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "queue pause sampler failed during shutdown");
+        }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "slot tuner loop failed during shutdown");
@@ -14577,11 +20844,53 @@ impl Worker {
             "worker starting"
         );
 
-        // Register this worker in the fleet table.
-        self.register_in_fleet(pool).await;
+        // Fail closed on a multi-shard config reaching this single-pool
+        // entrypoint (issue #961 review, Codex P1). This registers, heartbeats
+        // and polls exactly `pool`, and attributes every dispatch to
+        // `shard_assignments[0]` -- so with auto-resolved multi-shard
+        // assignments it would advertise fleet coverage for shards it never
+        // drains, which is what suppresses the very stranded-shard signals this
+        // issue shipped. `Worker::run` routes a genuine multi-shard config to
+        // `run_multi_shard`; its internal call reaches here only when
+        // `use_multi_shard` is false, so this guard fires solely for a direct
+        // embedder.
+        //
+        // Gated on a configured `ShardedDbPool`: without one, every assignment
+        // resolves to this same `pool`, so one poll loop drains them all and the
+        // coverage is genuine. See `single_pool_entrypoint_rejects`.
+        #[cfg(feature = "db")]
+        let has_sharded_pool = self.config.sharded_pool.is_some();
+        #[cfg(not(feature = "db"))]
+        let has_sharded_pool = false;
+        if single_pool_entrypoint_rejects(self.config.shard_assignments.len(), has_sharded_pool) {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                shard_assignments = ?self
+                    .config
+                    .shard_assignments
+                    .iter()
+                    .map(|s| s.as_i32())
+                    .collect::<Vec<_>>(),
+                "run_with_listener drains a single pool but this worker resolved multiple shard \
+                 assignments; refusing to start rather than advertising coverage for shards it \
+                 would never poll — call Worker::run for multi-shard, or pin this worker with \
+                 WorkerConfig::with_shard_assignments([one_shard])"
+            );
+            return;
+        }
+
+        // Register this worker in the fleet table. The returned flag arms this
+        // pool's heartbeat retry when the atomic pair did not commit.
+        //
+        // The flag is shared (not copied) between this pool's heartbeat task and
+        // its poll loop: the heartbeat is what retries and eventually clears it,
+        // and the poll loop must observe that clearing to resume claiming. See
+        // `may_claim_tasks` for why an unregistered worker must not claim.
+        let registration_pending =
+            Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
-        self.register_rate_limit_buckets(pool).await;
+        self.register_rate_limit_buckets(pool, None).await;
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
@@ -14590,9 +20899,28 @@ impl Worker {
             Arc::clone(&monitors.workflow_slot_target),
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
+            Arc::clone(&registration_pending),
         );
 
-        self.run_poll_loop(pool, listener).await;
+        // The single-shard path resolves at most one shard target, and that
+        // target is always `shard_assignments[0]` (see the shard-target
+        // resolution in `run`). `shard_assignments` is non-empty by
+        // construction after `resolve_shard_assignments` (issue #961), so the
+        // fallback is unreachable in practice and only guards a hand-built
+        // `WorkerRuntimeConfig` that bypassed `Worker::new`.
+        //
+        // Match on the slice rather than calling `.first()`: diesel's
+        // query-DSL prelude is in scope and `.first()` on a `Vec` sends the
+        // trait solver into overflow (the same footgun documented at the
+        // shard-target resolution in `run`).
+        // `None` when the worker has no shard identity at all (no assignments
+        // and no sharded pool) — see the emission site in `run_poll_loop`.
+        let poll_shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => Some(*shard),
+            [] => None,
+        };
+        self.run_poll_loop(pool, poll_shard, listener, &registration_pending)
+            .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
@@ -14720,76 +21048,93 @@ impl Worker {
             self.registry.telemetry().clone(),
             self.config.poll_interval,
         );
+        // Issue #619: surface operator queue holds on dashboards.
+        #[cfg(feature = "db")]
+        let queue_pause_sampler = Some(spawn_queue_pause_sampler(
+            sampler_pools.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        ));
+        #[cfg(not(feature = "db"))]
+        let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
         // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
         // per-shard so that orphaned tasks, over-long pauses, and timed-out
         // tasks/executions on every assigned shard are recovered (fix #3,
         // issue #522). When a ShardedDbPool is available each shard gets its own
         // instance; otherwise the single default pool is used.
+        //
+        // Each pool is paired with the `ShardId` it was resolved from (issue
+        // #797): all N per-shard instances share one `Scanner` label, so the
+        // liveness snapshot needs the id to name WHICH shard is unprotected
+        // when one of them wedges. `None` on the single-pool fallback, where
+        // there is no per-shard fan-out to disambiguate.
         #[cfg(feature = "db")]
-        let shard_pools_for_monitors: Vec<DbPool> = {
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> = {
             let assignments = &self.config.shard_assignments;
             match (assignments.is_empty(), self.config.sharded_pool.as_ref()) {
                 (false, Some(sp)) => assignments
                     .iter()
-                    .map(|s| sp.pool_for(*s).clone())
+                    .map(|s| (sp.pool_for(*s).clone(), Some(*s)))
                     .collect(),
-                _ => vec![pool.clone()],
+                _ => vec![(pool.clone(), None)],
             }
         };
         #[cfg(not(feature = "db"))]
-        let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> =
+            vec![(pool.clone(), None)];
 
-        // Worker-stale threshold mirrors the fleet-health classifier:
-        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
-        // Double *before* rounding to whole seconds so a fractional interval
-        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
-        // cap at one year so an absurd interval can never overflow the
-        // chrono::Duration arithmetic in the reclaim path. Shared by the
-        // poison-pill reclaimer and the worker-session broken-session scanner
-        // (issue #606, folded into `enforce_timeouts_once`) -- both use the
-        // exact same "is this worker's heartbeat too old" liveness signal.
-        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
-        let worker_stale_secs = i64::try_from(doubled.as_secs())
-            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
-            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
-            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
+        // Worker-stale threshold mirrors the fleet-health classifier. Shared by
+        // the poison-pill reclaimer, the worker-session broken-session scanner
+        // (issue #606, folded into `enforce_timeouts_once`), and the
+        // capability-miss fleet lookup (issue #804) -- all three use the exact
+        // same "is this worker's heartbeat too old" liveness signal, so the
+        // computation lives in one place.
+        let worker_stale_secs = worker_stale_secs(self.config.worker_heartbeat_interval);
 
         // One timeout checker per assigned shard. `enforce_timeouts_once` scans
         // the connection's *own* database (find_timed_out_tasks, external-task
         // timeouts, workflow-execution deadlines, SLA breaches, history
         // ceiling, broken worker sessions), so a single checker on the default
         // pool would leave expired tasks/executions on the other shards stuck
-        // RUNNING/PENDING forever. The cross-shard outbox helpers inside each
-        // pass still receive the full sharded_pool + shard_assignments so
-        // peer-shard delivery is unchanged.
+        // RUNNING/PENDING forever.
+        //
+        // Each checker is handed the full `sharded_pool` (needed to *route* a
+        // started follow-up to its target shard) but only **its own** shard in
+        // the assignment list: the cross-shard helpers inside each pass iterate
+        // that list, so passing the full list to all N checkers made the pass
+        // O(N^2) and let one unreachable shard abort every healthy shard's
+        // remaining work. See `monitor_shard_scope`.
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
-                crate::timeout::spawn_timeout_checker(
+            .map(|(shard_pool, shard)| {
+                crate::timeout::spawn_timeout_checker_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
                     self.registry.telemetry().clone(),
                     self.config.unknown_target_grace_window,
                     self.config.sharded_pool.clone(),
-                    self.config.shard_assignments.clone(),
+                    monitor_shard_scope(*shard, &self.config.shard_assignments),
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
                 )
             })
             .collect();
 
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
-                crate::poison_pill::spawn_poison_pill_reclaimer(
+            .map(|(shard_pool, shard)| {
+                crate::poison_pill::spawn_poison_pill_reclaimer_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     self.config.poison_pill_threshold,
                     worker_stale_secs,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
@@ -14805,7 +21150,7 @@ impl Worker {
         // same interval via `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, _shard)| {
                 crate::sessions::spawn_session_slot_reconciler(
                     shard_pool.clone(),
                     Arc::clone(&self.session_slots_in_use),
@@ -14816,13 +21161,14 @@ impl Worker {
             .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, shard)| {
                 spawn_pause_auto_resumer(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     self.config.max_workflow_pause_duration,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
@@ -15038,6 +21384,7 @@ impl Worker {
             worker_slot_sampler,
             stranded_work_sampler,
             schedule_overdue_sampler,
+            queue_pause_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -15052,12 +21399,19 @@ impl Worker {
     // that value at any time. Untuned workers pass an atomic fixed at the
     // configured max, so `compute_in_flight`'s accounting is byte-identical
     // to before this field existed.
+    ///
+    /// `registration_pending` is this **pool's own** flag, returned by
+    /// `register_in_fleet` for this same pool. It is deliberately not a field
+    /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a
+    /// shared flag would let a shard whose registration succeeded clear the
+    /// retry a *failed* shard still needs (issue #804, Codex round-50 P1).
     fn spawn_heartbeat_task(
         &self,
         pool: &DbPool,
         workflow_slot_target: Arc<AtomicUsize>,
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
+        registration_pending: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
@@ -15098,16 +21452,56 @@ impl Worker {
             Arc::clone(&self.remote_drain_deadline),
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
+            registration_pending,
         )
     }
 
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
         mut listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
     ) {
         while !self.shutdown.is_cancelled() {
-            if self.poll_once(pool).await {
+            // Do not claim while this pool's registration is unverified: an
+            // unregistered worker is invisible to peers' capability evidence AND
+            // cannot durably hold a claim (the orphan reclaimer takes it back and
+            // charges a crash strike). See `may_claim_tasks`. The heartbeat task
+            // keeps retrying, so the gate lifts on its own.
+            if !may_claim_tasks(registration_pending.load(Ordering::Relaxed)) {
+                tokio::select! {
+                    () = self.shutdown.cancelled() => break,
+                    () = tokio::time::sleep(self.config.poll_interval) => {}
+                }
+                continue;
+            }
+
+            if self
+                .poll_once(pool, shard_acquire_bound(false, self.config.poll_interval))
+                .await
+            {
+                // Per-shard dispatch counter (issue #961, AC5). Emitted on the
+                // single-shard path too, so `harvest.shard.dispatched` is a
+                // uniform series across deployment shapes whenever the worker
+                // knows which shard it is draining.
+                //
+                // `None` = a legacy worker with no shard assignments and no
+                // sharded pool: its plain `DbPool` carries no shard number, so
+                // there is nothing to attribute the dispatch to. Emitting
+                // `{shard="0"}` there would fabricate an identity that is wrong
+                // for any deployment whose single shard is numbered otherwise
+                // (issue #961 review, Codex P2) — the same reason the worker
+                // now registers an empty `shard_assignments` on that path. Such
+                // a deployment has exactly one shard and therefore no split to
+                // observe; its dispatch remains visible on
+                // `harvest.queue.dispatched{queue}` (issue #515).
+                if let Some(shard) = shard {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_shard_dispatched(shard_metric_label(shard));
+                }
                 continue;
             }
 
@@ -15261,6 +21655,15 @@ impl Worker {
                 "schedule overdue sampler failed during shutdown"
             );
         }
+        if let Some(handle) = monitors.queue_pause_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "queue pause sampler failed during shutdown"
+            );
+        }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
                 tracing::warn!(
@@ -15273,7 +21676,18 @@ impl Worker {
     }
 
     /// Register or re-register this worker in the fleet table.
-    async fn register_in_fleet(&self, pool: &DbPool) {
+    ///
+    /// Returns `true` when the atomic register+invalidate pair did **not**
+    /// commit, so the caller must arm this pool's heartbeat retry (issue #804,
+    /// Codex rounds 49 and 50).
+    ///
+    /// The answer is returned rather than stored on `Worker` because
+    /// registration is **per shard pool**: `run_multi_shard` registers against
+    /// every shard, and a single worker-wide flag would let a shard that
+    /// succeeded clear a flag a *different* shard still needs, leaving that
+    /// shard advertising the old build forever. A returned value cannot be
+    /// shared by construction.
+    async fn register_in_fleet(&self, pool: &DbPool, acquire_bound: Option<Duration>) -> bool {
         let shard_ids: Vec<i32> = self
             .config
             .shard_assignments
@@ -15291,50 +21705,89 @@ impl Worker {
         let host = crate::workers::local_hostname();
         let version = env!("CARGO_PKG_VERSION");
 
-        match pool.get().await {
+        // This registration may be a RESTART of the same configured worker_id
+        // onto a NEW build (register_worker upserts on worker_id and refreshes
+        // build_id/started_at). Capability-miss evidence stores bare IDs, so
+        // the restarted -- possibly now capable -- instance would otherwise be
+        // indistinguishable from the old incapable one, and another claimant
+        // would derive `AllLiveWorkersMissed` and terminally fail a run at
+        // exactly the moment the fix arrived (issue #804, Codex round-26 P1).
+        //
+        // Publishing the worker while that cleanup fails is strictly worse than
+        // not publishing it, so the two are ATOMIC (Codex round-28 P1): a failed
+        // invalidation rolls the registration back, and the heartbeat's
+        // `Ok(0)` self-heal retries the pair within one interval. See
+        // `register_worker_and_clear_stale_miss_evidence`.
+        let registration = crate::workers::WorkerRegistration {
+            worker_id: self.config.worker_id.clone(),
+            queues: self.config.queues.clone(),
+            shard_assignments: shard_ids,
+            max_concurrency,
+            host: host.clone(),
+            version: Some(version.to_string()),
+            build_id: self.config.build_id.clone(),
+            deployment_name: self.config.deployment_name.clone(),
+            labels: self.config.labels.clone(),
+            max_concurrent_sessions: self.config.max_concurrent_sessions,
+        };
+        match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
-                if let Err(error) = crate::workers::register_worker(
+                match crate::workers::register_worker_and_clear_stale_miss_evidence(
                     &mut conn,
-                    &self.config.worker_id,
-                    &self.config.queues,
-                    &shard_ids,
-                    max_concurrency,
-                    &host,
-                    Some(version),
-                    &self.config.build_id,
-                    self.config.deployment_name.as_deref(),
-                    &self.config.labels,
-                    self.config.max_concurrent_sessions,
+                    &registration,
                 )
                 .await
                 {
-                    tracing::warn!(
-                        worker_id = %self.config.worker_id,
-                        error = %error,
-                        "failed to register worker in fleet table; continuing without fleet registration"
-                    );
-                } else {
-                    tracing::info!(
-                        worker_id = %self.config.worker_id,
-                        host = %host,
-                        max_concurrency,
-                        "worker registered in fleet"
-                    );
+                    Ok(cleared) => {
+                        tracing::info!(
+                            worker_id = %self.config.worker_id,
+                            host = %host,
+                            max_concurrency,
+                            cleared_capability_miss_evidence = cleared,
+                            "worker registered in fleet"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        // Arm the heartbeat retry. Necessary because the
+                        // heartbeat's own `Ok(0)` re-registration only fires
+                        // when the row is ABSENT: a reused `worker_id` leaves
+                        // the previous row alive, the heartbeat updates it, and
+                        // without this the atomic pair would never be retried
+                        // (issue #804, Codex round-49 P1).
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            error = %error,
+                            "failed to register worker in fleet table (registration and \
+                             capability-miss cleanup are atomic, so neither landed); the \
+                             heartbeat will retry"
+                        );
+                        true
+                    }
                 }
             }
             Err(error) => {
+                // Also arms the retry (issue #804, Codex round-50 P1). Nothing
+                // was even attempted, so a surviving row from a previous
+                // instance under a reused `worker_id` still advertises the old
+                // build and still carries this id's stale capability-miss
+                // evidence — exactly the state the retry exists to clear. The
+                // heartbeat's `Ok(0)` arm cannot see it, because that row is
+                // present.
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
                     error = %error,
-                    "failed to get pool connection for fleet registration"
+                    "failed to get pool connection for fleet registration; the \
+                     heartbeat will retry"
                 );
+                true
             }
         }
     }
 
     /// Auto-upsert rate-limiting buckets for activities registered on this worker.
-    async fn register_rate_limit_buckets(&self, pool: &DbPool) {
-        match pool.get().await {
+    async fn register_rate_limit_buckets(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+        match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
                 for activity in self.registry.activities.values() {
                     // A dynamic rate_limit(key = ...) with no rps is an invalid
@@ -15464,9 +21917,15 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    ///
+    /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
+    /// the single-shard path (byte-for-byte the original unbounded
+    /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
+    /// several shards in sequence, so an exhausted pool on one shard cannot
+    /// park the loop and strand its peers -- see `shard_acquire_bound`.
     #[allow(clippy::too_many_lines)]
-    async fn poll_once(&self, pool: &DbPool) -> bool {
-        let mut conn = match pool.get().await {
+    async fn poll_once(&self, pool: &DbPool, acquire_bound: Option<Duration>) -> bool {
+        let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(error = %e, "failed to get connection from pool");
@@ -15652,21 +22111,11 @@ impl Worker {
         let workflow_cache = Arc::clone(&self.workflow_cache);
 
         // Workflow-task timeout (issue #494): only apply to workflow tasks.
-        // Local activities execute inline inside the workflow task, so the
-        // effective budget must be at least as large as
-        // max_local_activity_start_to_close to avoid prematurely killing a
-        // workflow that is legitimately waiting for an in-progress local
-        // activity.  When workflow_task_timeout is 0 the feature is disabled.
         let workflow_task_timeout = match kind {
-            ClaimedTaskKind::Workflow => {
-                if self.config.workflow_task_timeout.is_zero() {
-                    Duration::ZERO
-                } else {
-                    self.config
-                        .workflow_task_timeout
-                        .max(self.config.max_local_activity_start_to_close)
-                }
-            }
+            ClaimedTaskKind::Workflow => effective_workflow_task_timeout(
+                self.config.workflow_task_timeout,
+                self.config.max_local_activity_start_to_close,
+            ),
             ClaimedTaskKind::Activity => Duration::ZERO,
         };
         let poison_pill_threshold = self.config.poison_pill_threshold;
@@ -15674,6 +22123,23 @@ impl Worker {
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
+        // Issue #804: the redelivery budget plus the liveness window for the
+        // fleet lookup. Derived here rather than threaded from
+        // `spawn_monitoring_tasks` because the poll loop and the monitors are
+        // independent spawn paths.
+        //
+        // Deliberately `capability_miss_fleet_stale_secs`, NOT the bare
+        // `worker_stale_secs` the poison-pill reclaimer and broken-session
+        // scanner use (Codex round-19 P1): those judge rows with a window they
+        // chose, whereas this judges *peers* by a cadence they did not. Without
+        // the floor a fast-heartbeating claimant drops a live peer on the
+        // default cadence and terminally fails an execution it could have run.
+        let capability_miss_policy = CapabilityMissPolicy {
+            max_redeliveries: self.config.capability_miss_max_redeliveries,
+            worker_stale_secs: capability_miss_fleet_stale_secs(
+                self.config.worker_heartbeat_interval,
+            ),
+        };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
@@ -15720,28 +22186,44 @@ impl Worker {
             // Apply per-workflow-task wall-clock budget when configured and
             // this is a workflow task with a non-zero timeout.
             if !workflow_task_timeout.is_zero() && task_type == "workflow" {
-                match tokio::time::timeout(
-                    workflow_task_timeout,
-                    process_task(
-                        &pool,
-                        Arc::clone(&registry),
-                        task,
-                        &worker_id,
-                        &build_id,
-                        cancellation_grace_period,
-                        sticky_timeout,
-                        max_local_activity_start_to_close,
-                        workflow_cache,
-                        dispatched_at,
-                        max_concurrent_sessions,
-                        &session_slots_in_use,
-                        Arc::clone(&panic_strikes),
-                        workflow_panic_max_attempts,
-                    ),
+                // Issue #783: the absolute instant this dispatch is cut off at,
+                // captured against the same `now` the timeout below is armed
+                // with, and threaded down so an inline local activity's
+                // reported deadline can never out-live the cycle.
+                let workflow_task_deadline = chrono::Duration::from_std(workflow_task_timeout)
+                    .ok()
+                    .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
+                // Issue #804 (Codex round-25 P1): the budget is handed to
+                // `process_task`, which scopes it to the decision cycle, rather
+                // than wrapped around the call. Wrapping it here also bounded
+                // the capability-miss release/escalation that follows the
+                // cycle, so a workflow that returned near its deadline and only
+                // then tripped the post-handler preflight could have that
+                // blameless cleanup cancelled — banking a timeout strike it did
+                // not earn and, at `poison_pill_threshold`, terminally failing
+                // an execution whose body had completed.
+                match process_task(
+                    &pool,
+                    Arc::clone(&registry),
+                    task,
+                    &worker_id,
+                    &build_id,
+                    cancellation_grace_period,
+                    sticky_timeout,
+                    max_local_activity_start_to_close,
+                    workflow_cache,
+                    dispatched_at,
+                    max_concurrent_sessions,
+                    &session_slots_in_use,
+                    Arc::clone(&panic_strikes),
+                    workflow_panic_max_attempts,
+                    workflow_task_deadline,
+                    capability_miss_policy,
+                    Some(workflow_task_timeout),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {
+                    Ok(TaskDispatchOutcome::Completed) => {
                         // Success: clear the consecutive-timeout counter for
                         // this execution so a later transient timeout doesn't
                         // inherit previous strikes.
@@ -15752,7 +22234,35 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
-                    Ok(Err(error)) => {
+                    Ok(TaskDispatchOutcome::Released {
+                        clears_timeout_strike,
+                    }) => {
+                        // Issue #804: whether a capability-miss release may
+                        // clear the strike map depends on where the miss was
+                        // detected (see `CapabilityMissPhase`).
+                        //
+                        // Pre-/mid-handler: do NOT clear. This dispatch is not
+                        // evidence that the workflow body stopped hanging, and
+                        // clearing here would let an incapable worker reset a
+                        // genuinely hung execution's consecutive-timeout streak
+                        // every time it happened to claim the row, so
+                        // `poison_pill_threshold` would never be reached in a
+                        // mixed fleet and issue #494's protection would be
+                        // silently defeated by a blameless third party.
+                        //
+                        // Post-handler: DO clear. The body returned its
+                        // commands inside its deadline and only persisting them
+                        // found an unregistered type, so this dispatch is
+                        // genuine evidence of health — withholding it would let
+                        // a healthy workflow bank strikes it did not earn.
+                        if clears_timeout_strike && let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
+                    }
+                    Err(error) => {
                         // Task returned a clean error (not a timeout): clear
                         // the strike counter and log the error normally.
                         if let Some(exec_id) = exec_id_for_timeout {
@@ -15769,14 +22279,13 @@ impl Worker {
                             "task execution failed"
                         );
                     }
-                    Err(_elapsed) => {
+                    Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
                         // tasks can be dispatched while we do recovery I/O
-                        // (metric DB lookup + reset/quarantine).  The
-                        // `process_task` future was already cancelled by
-                        // tokio::time::timeout, but `permit` lives in this
-                        // outer scope and would otherwise be held until the
-                        // recovery awaits complete.
+                        // (metric DB lookup + reset/quarantine).  The decision
+                        // cycle was already cancelled inside `process_task`,
+                        // but `permit` lives in this outer scope and would
+                        // otherwise be held until the recovery awaits complete.
                         drop(permit);
                         let timeout_secs = workflow_task_timeout.as_secs();
                         let new_strikes = exec_id_for_timeout.map_or(1, |exec_id| {
@@ -15876,6 +22385,13 @@ impl Worker {
                     &session_slots_in_use,
                     panic_strikes,
                     workflow_panic_max_attempts,
+                    // No enclosing workflow-task budget on this arm, so the
+                    // local per-attempt budget is the only clock (issue #783).
+                    None,
+                    capability_miss_policy,
+                    // Same reason: this arm is the "no timeout configured, or
+                    // not a workflow task" path, which was never wrapped.
+                    None,
                 )
                 .await
                 {
@@ -16398,6 +22914,31 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         // rather than waiting for the expired lease of the hung worker.
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
+        // `capability_misses` is deliberately NOT reset here (issue #804).
+        //
+        // It is tempting to: a workflow-task timeout usually means the handler
+        // was found and ran long, which would be proof of capability. But that
+        // premise does not hold on this path. The timeout is armed around the
+        // whole of `process_task`, and `pool.get()` plus the full history load
+        // both sit inside it — strictly *before* the registry lookup that
+        // defines a capability miss. Under pool starvation or a slow shard the
+        // budget expires with the lookup never having run, so reaching here
+        // proves nothing about the claiming worker.
+        //
+        // Resetting on that false premise is the worse error of the two: a
+        // genuinely unregistered type under load would have its consecutive-miss
+        // streak zeroed indefinitely and never escalate, so the run never
+        // reaches the `no_capable_worker:` terminal AC3 promises and the
+        // operator sees only the ticket-severity sustained-release rule instead
+        // of the page. It also erases an in-flight miss when the release UPDATE
+        // itself is what timed out.
+        //
+        // Accepted cost: a capable-but-slow worker's timeout leaves a stale
+        // streak, so a later genuine miss can escalate before spending the full
+        // budget. That direction is fail-safe — it produces a loud, actionable
+        // terminal failure rather than a silently un-escalating task — and the
+        // two `park_workflow_task` queries already cover the dominant
+        // proof-of-capability path (the handler ran and suspended).
     ))
     .execute(&mut conn)
     .await
@@ -16428,12 +22969,137 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
 }
 
 // ---------------------------------------------------------------------------
+// Chaos drive helpers (issue #940) — test-only, `chaos` feature.
+// ---------------------------------------------------------------------------
+
+/// Drive exactly one already-claimed workflow task through the production
+/// [`process_workflow_task`] decision cycle on its own dedicated connection.
+///
+/// The connection is **non-pooled** and the cycle runs inside a spawned task —
+/// so a chaos `Kill` at a wired injection point crashes *this* task (surfacing
+/// as a `JoinError`) and drops the owned connection mid-flight, which rolls
+/// back any uncommitted work server-side exactly as a crashed worker process
+/// would. The claim (`RUNNING` + `worker_id`), committed by `claim_task` before
+/// this runs, survives the crash, leaving the row stranded `RUNNING` with a
+/// now-dead worker — the #367 poison-pill orphan condition (issue #940
+/// `AC1a`/AC4).
+///
+/// Non-`Kill` faults (`Hold`, `Delay`) drive the cycle to completion; the
+/// `Ok(HarvestResult<()>)` mirrors what the poll loop would observe.
+///
+/// The connection is established fresh from `db_url` rather than borrowed from
+/// a pool precisely so its drop closes a real socket: a pooled connection
+/// returned to the pool on unwind may be recycled rather than closed, which
+/// would not reproduce the server-side rollback of a crashed process.
+///
+/// All defaults mirror the poll-loop call site: `build_id = ""`,
+/// `sticky_timeout = 5s`, `max_local_activity_start_to_close = 60s`, a fresh
+/// 16-slot [`crate::cache::WorkflowCache`], `dispatched_at = Instant::now()`,
+/// a fresh per-run panic-strike map, `workflow_panic_max_attempts = 3`,
+/// `workflow_task_deadline = None`, and a fresh frontier-reset flag.
+///
+/// # Errors
+///
+/// Returns the [`tokio::task::JoinError`] when the driven cycle panics — the
+/// chaos `Kill` path. The inner `HarvestResult<()>` is `process_workflow_task`'s
+/// own result on every non-panic path.
+#[cfg(feature = "chaos")]
+pub async fn chaos_drive_one_workflow_task(
+    db_url: &str,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: String,
+) -> Result<HarvestResult<()>, tokio::task::JoinError> {
+    let db_url = db_url.to_string();
+    tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&db_url)
+            .await
+            .expect("chaos: establish owned workflow-task connection");
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            16,
+        )));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            uuid::Uuid,
+            u32,
+        >::new()));
+        let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        process_workflow_task(
+            &mut conn,
+            registry.as_ref(),
+            &task,
+            &worker_id,
+            "",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            workflow_cache,
+            std::time::Instant::now(),
+            &workflow_panic_strikes,
+            3,
+            None,
+            &frontier_reset_committed,
+        )
+        .await
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Tests (unit, no DB)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release and escalation branches must report OPPOSITE distinct-worker
+    /// bases, and round 34 got it backwards on both (issue #804, round-35 P2).
+    ///
+    /// This is the pin that would have caught it: a tracing field is invisible
+    /// to every other test in the suite, so the choice is routed through one
+    /// helper and asserted here.
+    #[test]
+    fn the_two_branches_report_opposite_distinct_worker_bases() {
+        let resolution = CapabilityMissResolution {
+            action: CapabilityMissAction::Escalate,
+            total_after: 6,
+            distinct_after: 4,
+            worker_is_new: true,
+            misses_before: 5,
+            distinct_before: 3,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        };
+        // The release branch reports what its own UPDATE returned. The durable
+        // value (2) is deliberately lower than BOTH the snapshot's
+        // `distinct_after` (4) and its `distinct_before` (3) -- the round-36
+        // case, with two peers re-registering and having their evidence
+        // invalidated between the read and the write. Two rather than one so
+        // the durable count cannot coincide with either snapshot field, which
+        // is what makes the assertions below discriminating.
+        assert_eq!(
+            reported_distinct_workers(&resolution, Some(2)),
+            2,
+            "the release branch must report the cardinality its UPDATE committed, \
+             not the snapshot's distinct_after"
+        );
+        assert_ne!(
+            reported_distinct_workers(&resolution, Some(2)),
+            i64::from(resolution.distinct_after),
+            "the fixture must keep the durable and snapshot counts distinct, or \
+             this proves nothing about which source is used"
+        );
+        assert_eq!(
+            reported_distinct_workers(&resolution, None),
+            i64::try_from(resolution.distinct_before).unwrap(),
+            "the escalation branch never runs that UPDATE, so the claimant was \
+             never appended and the durable set is the pre-claim count"
+        );
+        assert_ne!(
+            reported_distinct_workers(&resolution, Some(2)),
+            reported_distinct_workers(&resolution, None),
+            "if these ever coincide the test proves nothing -- the fixture must \
+             keep the two branches' answers distinct"
+        );
+    }
     use crate::types::ParentClosePolicy;
     use serde_json::Value;
     use tokio::sync::oneshot;
@@ -16441,6 +23107,154 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Operator early-warning for workflow history bloat (issue #704) ───────
+
+    #[test]
+    fn history_bloat_threshold_crossed_fires_at_and_above_the_computed_threshold() {
+        // cap = 100, fraction = 0.75 -> threshold = 75.
+        assert!(!history_bloat_threshold_crossed(74, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(75, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(76, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(u64::MAX, 100, 0.75, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_never_fires_once_already_warned() {
+        // Even a wildly-over-threshold count must not re-fire once
+        // `already_warned` is true -- the caller's exactly-once contract.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.75, true));
+        assert!(!history_bloat_threshold_crossed(75, 100, 0.75, true));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_disabled_at_zero_fraction() {
+        // fraction = 0.0 is the documented AC4 "disabled" sentinel: never
+        // fires regardless of how far over any notional threshold the count
+        // is.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.0, false));
+        assert!(!history_bloat_threshold_crossed(0, 0, 0.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_negative_fraction_is_also_disabled() {
+        // Defensive: `WorkflowHistoryPolicy::with_history_bloat_warn_fraction`
+        // already clamps into [0.0, 1.0] at configuration time, but this pure
+        // function must not misbehave (e.g. compute a negative/garbage
+        // threshold) if it is ever called with an unclamped value directly.
+        assert!(!history_bloat_threshold_crossed(
+            1_000_000, 100, -0.5, false
+        ));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_fraction_one_still_leaves_one_event_of_room_below_the_cap() {
+        // PR #1139 review (Nth round): a raw `ceil(cap * fraction)` of
+        // `1.0` used to require reaching the FULL cap (threshold == cap
+        // exactly, zero warning room). The threshold is now always clamped
+        // to `cap - 1`, so even a fraction of `1.0` still leaves the
+        // promised one-event window before the hard cap fires.
+        assert!(!history_bloat_threshold_crossed(98, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(99, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 1.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_small_cap_at_the_builder_ceiling_still_leaves_room() {
+        // The concrete regression this clamp fixes: at the PUBLIC builder
+        // ceiling (`MAX_HISTORY_BLOAT_WARN_FRACTION` = 0.999), a cap below
+        // 1000 previously collapsed the threshold onto the cap itself --
+        // e.g. cap=100: `ceil(100 * 0.999) = ceil(99.9) = 100 == cap` --
+        // so the soft warning fired on the EXACT SAME decision cycle as
+        // the hard cap, giving zero intervention window. The threshold
+        // must now be strictly below `cap` regardless of how small `cap`
+        // is.
+        let fraction = crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION;
+        assert!(!history_bloat_threshold_crossed(98, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(99, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(100, 100, fraction, false));
+
+        // A pathologically small cap (10) at the same ceiling: `ceil(10 *
+        // 0.999) = ceil(9.99) = 10 == cap` before the fix; must still stay
+        // below `cap` after it.
+        assert!(!history_bloat_threshold_crossed(8, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(9, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(10, 10, fraction, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_rounds_a_non_integral_product_up_not_down() {
+        // PR #1139 review (third round): cap=10, fraction=0.75 -> the exact
+        // product is 7.5, non-integral. A truncating cast would floor to 7,
+        // firing at 70% of the cap; the correct threshold is the smallest
+        // integer >= 7.5, i.e. 8 (80%) -- the first count that actually
+        // meets or exceeds the configured 75% fraction.
+        assert!(!history_bloat_threshold_crossed(6, 10, 0.75, false));
+        assert!(!history_bloat_threshold_crossed(7, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(8, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(9, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(10, 10, 0.75, false));
+
+        // A second non-exact pair with a different fraction/cap combination,
+        // to guard against a fix that happens to work only for this one
+        // numerator/denominator: cap=7, fraction=0.5 -> exact product 3.5 ->
+        // threshold 4, not 3.
+        assert!(!history_bloat_threshold_crossed(3, 7, 0.5, false));
+        assert!(history_bloat_threshold_crossed(4, 7, 0.5, false));
+
+        // An EXACT product (cap=8, fraction=0.75 -> 6.0) must stay unaffected
+        // by switching from truncation to ceiling -- ceil(6.0) == 6.0, same
+        // as before, so the pre-existing exact-division tests elsewhere in
+        // this suite (and the DB-backed counter-emission tests) are
+        // unaffected by this fix.
+        assert!(!history_bloat_threshold_crossed(5, 8, 0.75, false));
+        assert!(history_bloat_threshold_crossed(6, 8, 0.75, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_zero_cap_fires_immediately_when_enabled() {
+        // A pathological but well-defined edge: cap = 0 means the threshold
+        // math (`0 * fraction`) is also 0, so any non-negative count "crosses"
+        // it immediately. This function does not decide whether a `cap` of 0
+        // is a sane configuration -- it only computes the threshold predicate.
+        assert!(history_bloat_threshold_crossed(0, 0, 0.75, false));
+        assert!(history_bloat_threshold_crossed(1, 0, 0.75, false));
+    }
+
+    // ── Bounded retry decision (issue #704, PR #1139 review) ─────────────────
+    // `resolve_retry_attempts` is pure and DB-free, so these exercise the
+    // exact semantic `count_history_events_with_retries`'s hand-rolled lazy
+    // loop mirrors -- no Postgres connection, no async runtime needed.
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_first_success() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("transient"), Err("transient"), Ok(7)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(7));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_success_at_the_front_wins_over_a_later_entry() {
+        // Proves the first `Ok` is what gets returned, not the last one --
+        // mirrors "a first-try success must not need a later attempt".
+        let attempts: Vec<Result<u32, &str>> = vec![Ok(1), Ok(99)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(1));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_last_error_on_total_failure() {
+        // The freshest failure (attempt 3), not the stale first one -- an
+        // easy off-by-one to get backwards in a hand-rolled loop, and the
+        // one that actually matters for diagnosing a persistent failure.
+        let attempts: Vec<Result<u32, u32>> = vec![Err(1), Err(2), Err(3)];
+        assert_eq!(resolve_retry_attempts(attempts), Err(3));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_single_failure_surfaces_it() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("boom")];
+        assert_eq!(resolve_retry_attempts(attempts), Err("boom"));
+    }
 
     // ── Active-workflow population gauge (issue #770) ────────────────────────
 
@@ -16479,6 +23293,111 @@ mod tests {
     fn active_workflow_state_label_strings_are_lowercase() {
         assert_eq!(ActiveWorkflowState::Running.as_str(), "running");
         assert_eq!(ActiveWorkflowState::Paused.as_str(), "paused");
+    }
+
+    /// Issue #619 review (round 12): a hold observed on a **readable** shard must
+    /// reach the gauge even when an unrelated shard's read failed. Suppressing it
+    /// leaves `harvest.queue.paused` unset, so the dashboard shows nothing and
+    /// `harvest_queue_paused_too_long` cannot fire — for the whole duration of an
+    /// outage that has nothing to do with the paused queue (AC8).
+    ///
+    /// Unlike the active-workflow *count* gauge, where a partial fan-out would be
+    /// a wrong number, pause is boolean-per-queue: an observed hold is correct
+    /// regardless of what the other shards would have said.
+    #[test]
+    fn queue_pause_emissions_report_observed_holds_on_an_incomplete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = BTreeSet::new();
+        let current: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ true);
+
+        assert_eq!(
+            emissions,
+            vec![("payments".to_owned(), true)],
+            "an observed hold must be emitted even when another shard failed"
+        );
+        assert!(
+            next_previous.contains("payments"),
+            "the observed hold must be retained so it can be zero-filled later"
+        );
+    }
+
+    /// The zero-fill is what an incomplete scan must suppress: a shard we could
+    /// not read might still be holding the queue, so reporting it released would
+    /// claim the hold is gone during a database blip.
+    #[test]
+    fn queue_pause_emissions_never_zero_fill_on_an_incomplete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+        let current: BTreeSet<String> = BTreeSet::new();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ true);
+
+        assert!(
+            emissions.is_empty(),
+            "a queue absent from an incomplete scan must not be reported released: {emissions:?}"
+        );
+        assert!(
+            next_previous.contains("payments"),
+            "it must stay remembered so a later COMPLETE scan can zero-fill it exactly once"
+        );
+    }
+
+    /// A complete scan keeps the round-10 behaviour: emit every hold, zero-fill
+    /// exactly the queues that dropped out, and replace the previous set.
+    #[test]
+    fn queue_pause_emissions_zero_fill_once_on_a_complete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = ["payments".to_owned(), "email".to_owned()]
+            .into_iter()
+            .collect();
+        let current: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ false);
+
+        assert!(emissions.contains(&("payments".to_owned(), true)));
+        assert!(
+            emissions.contains(&("email".to_owned(), false)),
+            "a resumed queue must drop to 0 rather than going stale at 1: {emissions:?}"
+        );
+        assert_eq!(next_previous, current, "a complete scan replaces the set");
+    }
+
+    /// A queue held on the shard we could not read is retained across the
+    /// incomplete scan and then zero-filled exactly once when the shard recovers
+    /// and reports it resumed — never left stale at `1` forever.
+    #[test]
+    fn queue_pause_emissions_zero_fill_a_forgotten_hold_after_recovery() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        // Cycle 1: shard holding `payments` is unreadable.
+        let (_, after_blip) =
+            compute_queue_pause_emissions(&previous, &BTreeSet::new(), /* read_failed */ true);
+        assert!(
+            after_blip.contains("payments"),
+            "not forgotten during the blip"
+        );
+
+        // Cycle 2: shard recovers and the queue has since been resumed.
+        let (emissions, after_recovery) = compute_queue_pause_emissions(
+            &after_blip,
+            &BTreeSet::new(),
+            /* read_failed */ false,
+        );
+        assert_eq!(emissions, vec![("payments".to_owned(), false)]);
+        assert!(
+            after_recovery.is_empty(),
+            "zero-filled exactly once, then dropped"
+        );
     }
 
     #[test]
@@ -16693,6 +23612,22 @@ mod tests {
         assert!(labels_to_clear(&previous, &current, true).is_empty());
     }
 
+    /// A pool that builds without connecting, aimed at a closed port.
+    ///
+    /// Lets the shard-coverage guards be exercised with no database: the guards
+    /// under test all decide *before* any acquisition, so a pool that can never
+    /// hand out a connection is exactly the right instrument — a call that
+    /// reaches the pool is a call that failed the guard.
+    fn unreachable_pool(url: &str) -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
             worker_id: "test-worker-1".to_string(),
@@ -16714,6 +23649,7 @@ mod tests {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -16731,6 +23667,31 @@ mod tests {
     fn worker_config_validates() {
         let cfg = default_runtime_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// `shard_assignments` is a `pub` field, so an embedder can set it
+    /// directly and bypass `with_shard_assignments`. The `From` conversion is
+    /// the choke point every worker's config passes through on its way to the
+    /// per-shard monitor fan-out, so it must dedup too (issue #797).
+    #[test]
+    fn runtime_config_dedupes_directly_set_shard_assignments() {
+        // Deliberately bypassing `with_shard_assignments`, exactly as an
+        // embedder setting the `pub` field can.
+        let worker_config = crate::builder::WorkerConfig {
+            shard_assignments: vec![
+                crate::types::ShardId::new(0),
+                crate::types::ShardId::new(1),
+                crate::types::ShardId::new(0),
+            ],
+            ..crate::builder::WorkerConfig::default()
+        };
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.shard_assignments,
+            vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
+            "a duplicate shard must not reach the per-shard monitor fan-out, \
+             which spawns one control-loop set per assignment entry",
+        );
     }
 
     #[test]
@@ -16947,6 +23908,92 @@ mod tests {
         );
     }
 
+    // ── Durable workflow logs (issue #790) ────────────────────────────
+
+    #[test]
+    fn collect_log_lines_preserves_emission_order_and_levels() {
+        let cmds = vec![
+            WorkflowCommand::RecordLog {
+                seq: 10,
+                level: crate::context::WorkflowLogLevel::Info,
+                message: "first".to_string(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "noise".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::RecordLog {
+                seq: 11,
+                level: crate::context::WorkflowLogLevel::Error,
+                message: "second".to_string(),
+            },
+        ];
+        let lines = collect_log_lines(&cmds);
+        assert_eq!(lines.len(), 2, "unrelated commands must be ignored");
+        assert_eq!((lines[0].seq, lines[0].level), (10, "info"));
+        assert_eq!((lines[1].seq, lines[1].level), (11, "error"));
+        assert_eq!(lines[1].message, "second");
+    }
+
+    #[test]
+    fn collect_log_lines_is_empty_without_record_log_commands() {
+        // The sink-disabled path: the context pushes no RecordLog at all, so
+        // the worker must resolve to "nothing to write" and open no savepoint.
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: "x".to_string(),
+            explicit_clear: false,
+        }];
+        assert!(collect_log_lines(&cmds).is_empty());
+    }
+
+    #[test]
+    fn collect_log_lines_saturates_rather_than_colliding_with_the_truncation_marker() {
+        // `seq` is u64 on the command and i64 in the column. An unrepresentable
+        // value must pin BELOW the reserved truncation slot, never wrap into it
+        // (which would let a real line masquerade as the marker).
+        let cmds = vec![WorkflowCommand::RecordLog {
+            seq: u64::MAX,
+            level: crate::context::WorkflowLogLevel::Warn,
+            message: "extreme".to_string(),
+        }];
+        let lines = collect_log_lines(&cmds);
+        assert_eq!(lines[0].seq, i64::MAX - 1);
+        assert_ne!(
+            lines[0].seq,
+            store::WORKFLOW_LOG_TRUNCATION_SEQ,
+            "a real line must never collide with the truncation marker slot"
+        );
+    }
+
+    #[test]
+    fn record_log_is_pure_bookkeeping_for_every_worker_classifier() {
+        // The 11 non-compile-enforced classifiers in this file fail SILENTLY at
+        // runtime if a new bookkeeping command is missed (a stalled workflow,
+        // not a build break). These are the highest-blast-radius ones: assert
+        // RecordLog is treated exactly like the SetCurrentDetails precedent.
+        let log = || WorkflowCommand::RecordLog {
+            seq: 1,
+            level: crate::context::WorkflowLogLevel::Info,
+            message: "m".to_string(),
+        };
+        assert_eq!(workflow_command_name(&log()), "RecordLog");
+        assert!(
+            only_bookkeeping_commands(&[log()]),
+            "a log-only cycle must be classified as bookkeeping-only, or the \
+             worker would misread it as an unsupported suspension"
+        );
+        assert!(
+            should_requeue_signal_wait(&[
+                WorkflowCommand::WaitForSignal {
+                    signal_name: "go".to_string(),
+                    result_tx: tokio::sync::oneshot::channel().0,
+                },
+                log(),
+            ]),
+            "a signal-wait park carrying a log line must still be requeued"
+        );
+    }
+
     #[test]
     fn latest_current_details_update_trailing_truncated_noop_does_not_fall_back_to_earlier_set() {
         // Last-write-wins means the LAST command decides the outcome, even
@@ -16988,6 +24035,108 @@ mod tests {
         );
     }
 
+    /// Issue #783: the enclosing workflow-task budget must never be the shorter
+    /// clock than a local activity's reported deadline, which is itself clamped
+    /// to `max_local_activity_start_to_close`. On stock defaults (10s task
+    /// timeout vs a 60s local cap) that means the raise is load-bearing — drop
+    /// the `max` and every default-config local activity would report ~60s
+    /// remaining against a real ~10s cut-off, the destructive direction.
+    #[test]
+    fn effective_workflow_task_timeout_is_never_below_the_local_activity_cap() {
+        let stock_task_timeout = Duration::from_secs(10);
+        let stock_local_cap = Duration::from_secs(60);
+        assert_eq!(
+            effective_workflow_task_timeout(stock_task_timeout, stock_local_cap),
+            stock_local_cap,
+            "a task timeout below the local cap must be raised to the cap"
+        );
+
+        // Already above the cap: left alone.
+        assert_eq!(
+            effective_workflow_task_timeout(Duration::from_secs(120), stock_local_cap),
+            Duration::from_secs(120)
+        );
+        // Exactly equal: left alone (no off-by-one raise).
+        assert_eq!(
+            effective_workflow_task_timeout(stock_local_cap, stock_local_cap),
+            stock_local_cap
+        );
+        // Zero disables the feature entirely — never raised to the cap.
+        assert_eq!(
+            effective_workflow_task_timeout(Duration::ZERO, stock_local_cap),
+            Duration::ZERO,
+            "a zero task timeout disables the budget; raising it would enable it"
+        );
+        // Sub-second precision is preserved (no truncation to whole seconds).
+        assert_eq!(
+            effective_workflow_task_timeout(
+                Duration::from_millis(1500),
+                Duration::from_millis(500)
+            ),
+            Duration::from_millis(1500)
+        );
+    }
+
+    /// Issue #783: a local attempt must never report a deadline that out-lives
+    /// the enclosing workflow-task budget.
+    ///
+    /// The enclosing clock starts at the top of the decision cycle, so anything
+    /// spent before this attempt — history load, earlier commands, a previous
+    /// attempt — is charged to it and not to the attempt. Reporting `now +
+    /// per_attempt_timeout` alone over-reports, which is the destructive
+    /// direction: a deadline-aware activity skips its checkpoint and loses work.
+    #[test]
+    fn local_attempt_deadline_clamps_to_the_enclosing_workflow_task_budget() {
+        let cycle_start = chrono::Utc::now();
+        let enclosing = cycle_start + chrono::Duration::seconds(60);
+
+        // The stock-defaults case: both budgets are 60s, but the attempt starts
+        // 30s into the cycle (a previous local attempt burned it). Unclamped it
+        // would claim 30s past the kill.
+        let now = cycle_start + chrono::Duration::seconds(30);
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
+            Some(enclosing),
+            "the enclosing cut-off wins once the cycle has burned into the budget"
+        );
+
+        // Even a first attempt drifts: the cycle always starts before us.
+        let now = cycle_start + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
+            Some(enclosing),
+            "equal budgets mean the enclosing clock always wins by the cycle head start"
+        );
+
+        // A genuinely shorter per-attempt budget still wins — the clamp only
+        // ever takes the earlier clock, it never extends one.
+        let now = cycle_start;
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(5), Some(enclosing)),
+            Some(now + chrono::Duration::seconds(5)),
+            "a short start_to_close is the earlier clock and must be reported"
+        );
+
+        // Workflow-task timeout disabled: the per-attempt budget is the only clock.
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(5), None),
+            Some(now + chrono::Duration::seconds(5))
+        );
+
+        // An unrepresentable per-attempt budget falls back to the enclosing
+        // clock rather than reporting nothing.
+        assert_eq!(
+            local_attempt_deadline(now, Duration::MAX, Some(enclosing)),
+            Some(enclosing),
+            "an overflowing own budget must not erase a real enclosing deadline"
+        );
+        assert_eq!(
+            local_attempt_deadline(now, Duration::MAX, None),
+            None,
+            "with neither clock representable there is no deadline to report"
+        );
+    }
+
     #[test]
     fn workflow_task_timeout_threshold_decision_under_threshold() {
         // A consecutive-timeout count strictly below the threshold → Requeue.
@@ -17020,6 +24169,94 @@ mod tests {
         assert_eq!(
             crate::poison_pill::quarantine_decision(100, 0),
             crate::poison_pill::ReclaimAction::Requeue
+        );
+    }
+
+    /// `None` means "no issue #494 budget", so the body runs unbounded — the
+    /// activity path and a zero `workflow_task_timeout`.
+    #[tokio::test]
+    async fn body_budget_of_none_runs_the_cycle_unbounded() {
+        let out = run_under_workflow_body_budget(None, async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, Some(7), "an unbudgeted cycle must run to completion");
+    }
+
+    /// A cycle that outruns its budget is cancelled and reported as `None`,
+    /// which the caller turns into `TaskDispatchOutcome::BodyTimedOut`.
+    #[tokio::test]
+    async fn body_budget_cancels_a_cycle_that_overruns_it() {
+        let out = run_under_workflow_body_budget(Some(Duration::from_millis(20)), async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, None, "an overrunning cycle must be cut by the budget");
+    }
+
+    /// A cycle that finishes inside its budget is admitted untouched.
+    #[tokio::test]
+    async fn body_budget_admits_a_cycle_that_finishes_inside_it() {
+        let out = run_under_workflow_body_budget(Some(Duration::from_secs(30)), async { 7 }).await;
+        assert_eq!(out, Some(7));
+    }
+
+    /// The round-25 P1 itself: work sequenced **after** the budgeted cycle must
+    /// survive, even when it outlives every millisecond the budget had left.
+    ///
+    /// That "after" work is the issue #804 capability-miss release/escalation —
+    /// several DB round-trips that a workflow returning near its deadline only
+    /// reaches once the post-handler preflight has already found an
+    /// unregistered activity or child. Cancelling it there banks an issue #494
+    /// timeout strike the execution did not earn, emits
+    /// `harvest.workflow.task_timeout` instead of
+    /// `harvest.task.capability_miss`, and at `poison_pill_threshold` strikes
+    /// quarantines and terminally fails a run whose body had completed —
+    /// breaking AC1, AC4 and AC5 at once.
+    ///
+    /// The control below is the shape this replaced: one timeout spanning both
+    /// halves, which does cancel the cleanup. Both halves are driven by the
+    /// same clock here, so the contrast is the assertion, not the timing.
+    #[tokio::test]
+    async fn cleanup_sequenced_after_the_budget_is_not_cancelled_by_it() {
+        let budget = Duration::from_millis(30);
+        let cleanup = Duration::from_millis(150);
+
+        // The shipped shape: budget wraps the cycle only.
+        let cleanup_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cleanup_ran);
+        let cycle = run_under_workflow_body_budget(Some(budget), async { 7 }).await;
+        assert_eq!(
+            cycle,
+            Some(7),
+            "the cycle itself finished inside its budget"
+        );
+        // Stands in for handle_capability_miss: refund, fleet read, release.
+        tokio::time::sleep(cleanup).await;
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            std::sync::atomic::AtomicBool::load(&cleanup_ran, std::sync::atomic::Ordering::Relaxed),
+            "cleanup sequenced after the budget must always complete"
+        );
+
+        // The control: one timeout spanning cycle + cleanup cancels the
+        // cleanup, which is exactly the defect this scoping removes.
+        let control_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let control_flag = std::sync::Arc::clone(&control_ran);
+        let spanned = tokio::time::timeout(budget, async move {
+            tokio::time::sleep(cleanup).await;
+            control_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+        assert!(spanned.is_err(), "the control's spanning budget must fire");
+        assert!(
+            !std::sync::atomic::AtomicBool::load(
+                &control_ran,
+                std::sync::atomic::Ordering::Relaxed
+            ),
+            "a budget spanning the cleanup cancels it — the round-25 P1"
         );
     }
 
@@ -17221,6 +24458,7 @@ mod tests {
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: crate::builder::DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -17229,6 +24467,7 @@ mod tests {
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -17269,6 +24508,9 @@ mod tests {
     #[test]
     fn handler_registry_indexes_by_name() {
         let wf = WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "onboarding",
             module: "app::workflows",
@@ -17493,6 +24735,354 @@ mod tests {
         assert!(worker.is_ok());
     }
 
+    /// A registration that cannot even acquire a connection must arm the
+    /// heartbeat retry (issue #804, Codex round-50 P1).
+    ///
+    /// Nothing is attempted in that arm, so with a reused `worker_id` a
+    /// surviving row still advertises the old build and still carries this
+    /// id's stale capability-miss evidence — precisely the state the retry
+    /// exists to clear, and one the heartbeat's `Ok(0)` arm cannot see because
+    /// that row is present.
+    #[tokio::test]
+    async fn registration_arms_the_retry_when_the_connection_cannot_be_acquired() {
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        // A pool pointed at a port nothing listens on: `pool.get()` fails, so
+        // the `Err` arm under test is the one taken.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://127.0.0.1:1/nonexistent");
+        // No timeouts configured: deadpool only demands an explicit `Runtime`
+        // when it has a timeout to schedule, and a connect to a dead local port
+        // fails immediately with ECONNREFUSED, so `pool.get()` cannot hang.
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+
+        assert!(
+            worker.register_in_fleet(&pool, None).await,
+            "an unattempted registration must still arm the retry -- otherwise a \
+             surviving row under a reused worker_id advertises the old build forever"
+        );
+    }
+
+    /// Issue #961 (AC1), regression guard for the ordering trap that made the
+    /// first cut of this feature a no-op.
+    ///
+    /// A runner assigns `sharded_pool` onto the **runtime** config *after*
+    /// `From<WorkerConfig>` has run. Because auto-resolution is idempotent on a
+    /// non-empty list, resolving during that conversion would collapse the
+    /// "auto" sentinel to `[ShardId::new(0)]` while the pool was still `None`,
+    /// and every later resolution would then be a no-op — permanently pinning a
+    /// multi-shard worker to shard 0, i.e. exactly the silent single-shard
+    /// drain #961 exists to close. So the conversion must leave the list empty
+    /// and `Worker::new` must be what widens it.
+    /// The multi-shard listener resolver returns a shard's own URL when the
+    /// per-shard map carries one.
+    #[test]
+    fn multi_shard_listener_url_returns_the_per_shard_entry() {
+        let per_shard = vec![
+            (
+                crate::types::ShardId::new(0),
+                "postgres://host/shard0".to_string(),
+            ),
+            (
+                crate::types::ShardId::new(1),
+                "postgres://host/shard1".to_string(),
+            ),
+        ];
+        assert_eq!(
+            multi_shard_listener_url(&per_shard, crate::types::ShardId::new(1)),
+            Some("postgres://host/shard1"),
+        );
+    }
+
+    /// **Issue #961 review (Codex P2).** A shard with no per-shard URL resolves
+    /// to `None` — poll-only — and there is deliberately no global-URL fallback
+    /// to reach for.
+    ///
+    /// The global `notification_database_url` is configured independently of
+    /// `sharded_pool`, so nothing proves it targets the database backing the
+    /// pool's default shard; a pool override
+    /// (`HarvestRunnerResources::with_sharded_pool`) can leave it aimed at the
+    /// original `harvest_pool`. An earlier cut of #961 fell back to it for the
+    /// numerically-matching default shard, which would have opened a listener
+    /// on the **wrong database**: real NOTIFYs from the polled shard would be
+    /// missed and unrelated ones would trigger needless claim attempts.
+    ///
+    /// This is the call the single-shard `global_safe` gate already documents
+    /// for real multi-shard routing (issue #522 review). The helper takes only
+    /// the per-shard map, so the hazard is unrepresentable rather than guarded.
+    #[test]
+    fn multi_shard_listener_url_has_no_global_fallback_for_the_default_shard() {
+        // Shard 0 is the pool's default shard and has no per-shard entry.
+        let per_shard = vec![(
+            crate::types::ShardId::new(1),
+            "postgres://host/shard1".to_string(),
+        )];
+        assert_eq!(
+            multi_shard_listener_url(&per_shard, crate::types::ShardId::new(0)),
+            None,
+            "the default shard must be poll-only without a per-shard URL; \
+             falling back to the global URL risks a wrong-database listener",
+        );
+        // And an empty map is poll-only for every shard.
+        assert_eq!(
+            multi_shard_listener_url(&[], crate::types::ShardId::new(0)),
+            None
+        );
+        assert_eq!(
+            multi_shard_listener_url(&[], crate::types::ShardId::new(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_shard_assignments_resolve_after_the_runner_assigns_the_pool() {
+        // No explicit assignments -> "auto".
+        let mut cfg: WorkerRuntimeConfig = crate::builder::WorkerConfig::default().into();
+        assert!(
+            cfg.shard_assignments.is_empty(),
+            "`From<WorkerConfig>` must preserve the empty 'auto' sentinel; resolving there would see no pool and pin the worker to shard 0",
+        );
+
+        // The runner supplies the real pool only now.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(2),
+            unreachable_pool("postgres://127.0.0.1:1/s2"),
+        );
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        assert_eq!(
+            worker.config.shard_assignments,
+            vec![
+                crate::types::ShardId::new(0),
+                crate::types::ShardId::new(1),
+                crate::types::ShardId::new(2)
+            ],
+            "`Worker::new` must widen an auto assignment to every pool shard",
+        );
+    }
+
+    /// Each per-shard monitor scans only its own shard (issue #961 review,
+    /// Codex P1).
+    ///
+    /// `spawn_monitoring_tasks` starts one timeout checker per assigned shard,
+    /// and every pass fans out over the assignment list it was handed. Handing
+    /// all N checkers the full list made the pass O(N^2) and let one
+    /// unreachable shard abort every healthy shard's remaining work.
+    #[test]
+    fn monitor_shard_scope_narrows_a_per_shard_monitor_to_its_own_shard() {
+        let all = vec![
+            crate::types::ShardId::new(0),
+            crate::types::ShardId::new(1),
+            crate::types::ShardId::new(2),
+        ];
+
+        for shard in &all {
+            assert_eq!(
+                monitor_shard_scope(Some(*shard), &all),
+                vec![*shard],
+                "a per-shard monitor must scan only its own shard; the union across all \
+                 monitors still covers every shard exactly once",
+            );
+        }
+    }
+
+    /// The single-pool fallback has no per-shard fan-out to narrow, so the list
+    /// passes through untouched and the helpers take their non-sharded branch.
+    #[test]
+    fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
+        let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        assert_eq!(monitor_shard_scope(None, &all), all);
+        assert!(monitor_shard_scope(None, &[]).is_empty());
+    }
+
+    /// The multi-shard loop bounds its pool acquisition; the single-shard path
+    /// stays unbounded, byte-for-byte (issue #961 review, Codex P1 / AC7).
+    #[test]
+    fn shard_acquire_bound_is_multi_shard_only() {
+        // Below the floor -> floored. A poll interval is tuned for idle polling
+        // cadence, not for how long a healthy acquisition takes on a busy pool;
+        // using it directly starved a shard that merely had a deep backlog.
+        assert_eq!(
+            shard_acquire_bound(true, Duration::from_millis(50)),
+            Some(MIN_SHARD_ACQUIRE_BOUND),
+            "a short poll interval must not tighten the bound below the floor",
+        );
+        assert_eq!(
+            shard_acquire_bound(true, Duration::from_millis(500)),
+            Some(MIN_SHARD_ACQUIRE_BOUND),
+        );
+
+        // Above the floor -> the operator's own (slower) cadence wins.
+        let slow = Duration::from_secs(60);
+        assert_eq!(
+            shard_acquire_bound(true, slow),
+            Some(slow),
+            "a slow loop should not be bounded tighter than its own cadence",
+        );
+
+        // AC7: the single-shard path keeps the original unbounded acquisition
+        // at every cadence.
+        for interval in [
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+            Duration::from_secs(60),
+        ] {
+            assert_eq!(
+                shard_acquire_bound(false, interval),
+                None,
+                "the single-shard path must keep the original unbounded pool.get().await",
+            );
+        }
+    }
+
+    /// The single-pool entrypoint refuses a multi-shard config, and only when
+    /// that config actually spans several databases (issue #961 review, Codex
+    /// P1, corrected).
+    #[test]
+    fn single_pool_entrypoint_rejects_only_multi_database_configs() {
+        for has_sharded_pool in [false, true] {
+            // No shard identity at all, and a genuinely single-shard worker:
+            // both are exactly what this entrypoint is for.
+            assert!(!single_pool_entrypoint_rejects(0, has_sharded_pool));
+            assert!(!single_pool_entrypoint_rejects(1, has_sharded_pool));
+        }
+
+        // Several logical shards colocated on ONE database: the shard-target
+        // resolution in `run` maps every assignment onto the caller's single
+        // pool, so one poll loop drains them all. Refusing here would refuse a
+        // worker whose coverage is complete.
+        assert!(!single_pool_entrypoint_rejects(2, false));
+        assert!(!single_pool_entrypoint_rejects(8, false));
+
+        // A configured ShardedDbPool means the assignments are meant to reach
+        // different databases, which one pool cannot do.
+        assert!(single_pool_entrypoint_rejects(2, true));
+        assert!(single_pool_entrypoint_rejects(8, true));
+    }
+
+    /// `run_with_listener` returns immediately for a multi-*database* config
+    /// rather than entering its single-pool loop (issue #961 review, Codex P1).
+    ///
+    /// Falsifiable without a database: with the guard the call returns before
+    /// touching the pool at all, so it completes promptly. Without it, the
+    /// worker registers against the one pool and enters `run_poll_loop`, which
+    /// runs until shutdown — so the bounded wait below elapses instead.
+    #[tokio::test]
+    async fn run_with_listener_refuses_a_multi_database_config() {
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
+        );
+
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.run_with_listener(&pool, None),
+        )
+        .await
+        .expect(
+            "run_with_listener must refuse a multi-database config and return, not enter its \
+             single-pool loop advertising coverage it never drains",
+        );
+    }
+
+    /// The mirror of the guard: several logical shards colocated on ONE
+    /// database is a legitimate configuration and must still start.
+    ///
+    /// `run` maps every assignment onto the caller's single pool when no
+    /// `ShardedDbPool` is configured, so one poll loop genuinely drains them
+    /// all — the shape the cross-shard outbox integration tests use, where the
+    /// outbox's `execs.shard_id = ANY(..)` filter is the only thing that needs
+    /// both ids. Falsifiable: with the over-broad guard this returns promptly
+    /// (refused) instead of entering the loop and elapsing the bounded wait.
+    #[tokio::test]
+    async fn run_with_listener_accepts_colocated_logical_shards() {
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        assert!(
+            cfg.sharded_pool.is_none(),
+            "this test is about the no-sharded-pool shape",
+        );
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        let entered = tokio::time::timeout(
+            Duration::from_secs(2),
+            worker.run_with_listener(&pool, None),
+        )
+        .await;
+        assert!(
+            entered.is_err(),
+            "a worker whose logical shards share one database must enter its poll loop, not \
+             refuse to start: one pool covers every assignment",
+        );
+        worker.shutdown();
+    }
+
+    /// The pending flag is per pool, not per worker (issue #804, Codex
+    /// round-50 P1).
+    ///
+    /// `run_multi_shard` registers against every shard. A single worker-wide
+    /// flag would let a shard whose registration succeeded clear the retry a
+    /// *different*, failed shard still needs, leaving that shard advertising
+    /// the old build forever. Returning the answer makes sharing impossible by
+    /// construction; this pins that two pools genuinely get independent
+    /// answers rather than one shared cell.
+    #[tokio::test]
+    async fn registration_pending_is_answered_per_pool() {
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let a = unreachable_pool("postgres://127.0.0.1:1/shard_a");
+        let b = unreachable_pool("postgres://127.0.0.1:1/shard_b");
+
+        // Both fail here, which is enough to prove the shape: each call
+        // produces its own answer, so no shard can clear another's retry.
+        let pending_a = worker.register_in_fleet(&a, None).await;
+        let pending_b = worker.register_in_fleet(&b, None).await;
+        assert!(
+            pending_a && pending_b,
+            "each shard pool must be answered independently; a shared flag would \
+             let one shard's outcome speak for another's"
+        );
+    }
+
     /// Build a bare `ActivityInfo` with the rate-limit fields overridden,
     /// everything else defaulted — for the `Worker::new` positivity gate tests
     /// (issue #699 review, Codex P2).
@@ -17699,7 +25289,7 @@ mod tests {
     fn signal_requested(signal_id: crate::types::ExternalSignalId) -> WorkflowEvent {
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target: ExecutionId::new(),
+            target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
             signal_name: "s".to_string(),
             payload: serde_json::json!({}),
             idempotency_key: None,
@@ -17709,7 +25299,7 @@ mod tests {
     fn cancel_requested(cancel_id: crate::types::ExternalCancelId) -> WorkflowEvent {
         WorkflowEvent::ExternalCancelRequested {
             cancel_id,
-            target: ExecutionId::new(),
+            target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
         }
     }
 
@@ -18668,6 +26258,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_started_timer_for_suspension_accepts_freeze_plus_timer() {
+        // ONE DECISION CYCLE (issue #806). `timer_business_days` emits exactly
+        // [RecordSideEffect(the frozen resolution), StartTimer] in one batch. If
+        // `RecordSideEffect` ever left this allow-list the extractor would return
+        // None, the batch would fall through to the fail-loud "unsupported
+        // commands" path, and arming a business-day timer would silently need a
+        // second decision cycle (or fail outright).
+        let batch = vec![
+            WorkflowCommand::RecordSideEffect {
+                kind: crate::event::SideEffectKind::Custom,
+                name: Some("__harvest_business_day:sla".to_string()),
+                value: serde_json::json!({"v": 1, "outcome": "resolved"}),
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: TimerId::new("sla"),
+                duration_secs: 345_600,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        let extracted = extract_started_timer_for_suspension(&batch)
+            .expect("a business-day freeze + timer must ride ONE suspension batch");
+        assert_eq!(extracted.timer_id.as_str(), "sla");
+        assert_eq!(extracted.duration_secs, 345_600);
+    }
+
+    #[test]
     fn extract_child_timeout_race_rejects_second_timer_or_signal_wait() {
         // A second StartTimer means this is not the canonical one-child /
         // one-timer race — fall through to fail-loud rather than silently
@@ -18940,6 +26556,2610 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Capability-miss release / escalate (issue #804)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_miss_decision_releases_under_the_bound() {
+        // `misses_after_increment` is the value the release UPDATE will persist,
+        // so the first miss arrives here as 1. The budget names how many
+        // REDELIVERIES are granted, so a budget of 5 releases misses 1..=5.
+        for misses in 1..=5 {
+            assert_eq!(
+                capability_miss_decision(misses, misses, 5, ALL_MISSED),
+                CapabilityMissAction::Release,
+                "miss {misses} of 5 must release for a capable peer",
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_decision_permits_exactly_the_configured_redeliveries() {
+        // The public knob is named `capability_miss_max_redeliveries`, so a
+        // budget of N must grant exactly N releases and escalate on the N+1th
+        // claim. This deliberately differs from `poison_pill::quarantine_decision`,
+        // whose knob is a *threshold* (reach it -> act).
+        for budget in [1_u32, 3, 5, 20] {
+            let bound = i32::try_from(budget).expect("test budgets fit in i32");
+            for misses in 1..=bound {
+                assert_eq!(
+                    capability_miss_decision(misses, misses, budget, ALL_MISSED),
+                    CapabilityMissAction::Release,
+                    "budget {budget} must grant redelivery {misses}",
+                );
+            }
+            assert_eq!(
+                capability_miss_decision(bound + 1, bound + 1, budget, ALL_MISSED),
+                CapabilityMissAction::Escalate,
+                "budget {budget} must escalate on claim {}",
+                bound + 1
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_decision_escalates_over_the_bound() {
+        assert_eq!(
+            capability_miss_decision(6, 6, 5, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+        assert_eq!(
+            capability_miss_decision(i32::MAX, i32::MAX, 5, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_decision_zero_budget_escalates_on_the_first_miss() {
+        // `0` is the documented rollback switch: no redeliveries allowed, so the
+        // very first capability miss takes the pre-#804 terminal-failure path.
+        assert_eq!(
+            capability_miss_decision(1, 1, 0, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_decision_tolerates_a_nonpositive_persisted_count() {
+        // Defensive: the column is NOT NULL DEFAULT 0 and only ever incremented,
+        // but a hand-edited/corrupt row must not silently disable escalation.
+        assert_eq!(
+            capability_miss_decision(0, 0, 5, ALL_MISSED),
+            CapabilityMissAction::Release
+        );
+        assert_eq!(
+            capability_miss_decision(-1, -1, 5, ALL_MISSED),
+            CapabilityMissAction::Release
+        );
+        assert_eq!(
+            capability_miss_decision(0, 0, 0, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_backoff_starts_at_base_and_doubles() {
+        // `misses_before_this_release` is 0-based: the first release waits 1s.
+        assert_eq!(capability_miss_backoff(0), Duration::from_secs(1));
+        assert_eq!(capability_miss_backoff(1), Duration::from_secs(2));
+        assert_eq!(capability_miss_backoff(2), Duration::from_secs(4));
+        assert_eq!(capability_miss_backoff(3), Duration::from_secs(8));
+        assert_eq!(capability_miss_backoff(4), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn capability_miss_backoff_caps_at_thirty_seconds() {
+        // 1 * 2^5 = 32 > 30 — the first count that hits the cap.
+        assert_eq!(capability_miss_backoff(5), Duration::from_secs(30));
+        assert_eq!(capability_miss_backoff(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn capability_miss_backoff_saturates_on_extreme_counts() {
+        assert_eq!(capability_miss_backoff(-1), Duration::from_secs(1));
+        assert_eq!(capability_miss_backoff(i32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn capability_miss_default_budget_dwell_outlasts_a_pod_flip() {
+        // The success metric depends on a released task still being PENDING
+        // while a rolling deploy replaces pods. Summing the backoff of every
+        // release the default budget grants gives the minimum queue dwell
+        // before escalation.
+        //
+        // The release count is DERIVED from the shipped default rather than
+        // hard-coded, so a change to either the budget default or the
+        // release/escalate boundary moves this number instead of silently
+        // leaving the assertion stale.
+        let budget = WorkerConfig::default().capability_miss_max_redeliveries;
+        assert_eq!(budget, 5, "the shipped default the dwell is derived from");
+
+        let releases = (1..=i32::try_from(budget).expect("small budget") + 1)
+            .take_while(|misses| {
+                capability_miss_decision(*misses, *misses, budget, ALL_MISSED)
+                    == CapabilityMissAction::Release
+            })
+            .count();
+        assert_eq!(
+            releases, 5,
+            "a budget of {budget} must grant {budget} redeliveries"
+        );
+
+        let dwell: Duration = (0..i32::try_from(releases).expect("small"))
+            .map(capability_miss_backoff)
+            .sum();
+        assert_eq!(dwell, Duration::from_secs(1 + 2 + 4 + 8 + 16));
+        assert_eq!(dwell, Duration::from_secs(31));
+    }
+
+    #[test]
+    fn single_worker_fleet_honors_the_configured_redelivery_maximum() {
+        // Codex round-15 P1. In a fleet SMALLER than the budget the distinct
+        // bound is unreachable by construction: one incapable worker pins
+        // `distinct_after` at 1 forever, and `1 > 5` never holds. Before the
+        // fix the only remaining bound was the 10x ceiling, so a budget of 5
+        // permitted 50 releases and escalated on the 51st claim -- roughly 23
+        // minutes at the backoff cap -- and `capability_miss_max_redeliveries`
+        // stopped being a maximum for the common small deployment.
+        let budget = WorkerConfig::default().capability_miss_max_redeliveries;
+        assert_eq!(budget, 5, "the shipped default this bound is derived from");
+
+        // One distinct worker, missing over and over, with the registry
+        // confirming it is the whole live fleet. Bounded comfortably above the
+        // old `10x` ceiling so a regression reports the real number (50) rather
+        // than hanging.
+        let probe_limit = i32::try_from(budget).expect("small budget")
+            * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER
+            + 5;
+        let releases = (1..=probe_limit)
+            .take_while(|misses| {
+                capability_miss_decision(1, *misses, budget, ALL_MISSED)
+                    == CapabilityMissAction::Release
+            })
+            .count();
+        assert_eq!(
+            releases,
+            usize::try_from(budget).expect("small budget"),
+            "a single-worker fleet must still be bounded by the CONFIGURED budget, \
+             not by the {CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x ceiling"
+        );
+
+        // And the dwell must match the documented one, not ~23 minutes.
+        let dwell: Duration = (0..i32::try_from(releases).expect("small"))
+            .map(capability_miss_backoff)
+            .sum();
+        assert_eq!(dwell, Duration::from_secs(31));
+    }
+
+    #[test]
+    fn configured_total_bound_requires_confirmed_fleet_coverage() {
+        let budget = 5_u32;
+        // `Unavailable`: the registry gave no usable answer, so `budget` total
+        // releases may all have been won by the SAME worker -- exactly the
+        // round-6 P1 the distinct bound exists to prevent. The tight bound must
+        // NOT fire; the ceiling remains the only backstop.
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::Unavailable),
+            CapabilityMissAction::Release,
+            "an unreadable registry must not let one worker's repeat misses exhaust \
+             the budget -- that is the round-6 defect, reintroduced"
+        );
+        // ... and it is still bounded, by the ceiling.
+        assert_eq!(
+            capability_miss_decision(1, 51, budget, FleetCapabilityEvidence::Unavailable),
+            CapabilityMissAction::Escalate
+        );
+        // `CapablePeerMayExist`: a live worker has never missed it, so it may be
+        // capable. Same conclusion, for the round-8 reason.
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::CapablePeerMayExist),
+            CapabilityMissAction::Release
+        );
+        // Confirmed coverage is what makes "one worker missed it N times"
+        // equivalent to "the whole live fleet lacks the handler".
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+        assert_eq!(
+            capability_miss_decision(1, 5, budget, ALL_MISSED),
+            CapabilityMissAction::Release,
+            "the budget is a count of PERMITTED redeliveries: the Nth still releases"
+        );
+    }
+
+    #[test]
+    fn small_fleet_budget_exhaustion_reports_the_budget_not_the_ceiling() {
+        // The reason string an operator reads must name the bound that actually
+        // tripped. Before the fix this shape could only ever reach the ceiling;
+        // now it must resolve to BudgetExhausted with the fleet-wide conclusion
+        // substantiated, because the registry confirmed the coverage.
+        let budget = 5_u32;
+        let escalation = CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 5,
+            released_workers: 1,
+            evidence: ALL_MISSED,
+        };
+        assert_eq!(
+            EscalationCause::resolve(budget, None, escalation),
+            EscalationCause::BudgetExhausted {
+                completed_releases: 5,
+                released_workers: 1,
+                fleet_confirmed: true,
+            }
+        );
+        let reason = no_capable_worker_reason("workflow 'onboarding'", budget, None, escalation);
+        assert!(
+            reason.contains("escalated after 5 capability-miss redeliveries"),
+            "must name the configured budget it exhausted: {reason}"
+        );
+        assert!(
+            !reason.contains("absolute release ceiling"),
+            "must not inherit the ceiling's wording: {reason}"
+        );
+        assert!(
+            reason.contains("every worker with a live heartbeat here has now missed it"),
+            "confirmed coverage is what licenses the fleet-wide conclusion: {reason}"
+        );
+    }
+
+    /// Shorthand for the fleet evidence these arithmetic tests are not about:
+    /// the registry confirmed every live worker on the queue has missed the
+    /// task, so the budget/ceiling bounds are free to act. The fleet *gate*
+    /// itself is covered separately by the `..._gated_on_fleet_evidence` tests.
+    const ALL_MISSED: FleetCapabilityEvidence = FleetCapabilityEvidence::AllLiveWorkersMissed;
+
+    /// Counts for a genuine **distinct-worker** budget exhaustion: `budget + 1`
+    /// different workers each missed the task once, which is the only shape that
+    /// supports the unqualified fleet-wide conclusion.
+    fn budget_exhausted_counts(budget: u32) -> CapabilityMissEscalation {
+        let n = i32::try_from(budget)
+            .expect("test budget fits i32")
+            .saturating_add(1);
+        CapabilityMissEscalation {
+            distinct_after: n,
+            // The escalating claim never runs the release UPDATE, so the
+            // durable record is one release (and one distinct worker) behind
+            // the decision input.
+            completed_releases: n - 1,
+            released_workers: n - 1,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        }
+    }
+
+    /// Counts as they stand on the FIRST miss — the state the never-offered
+    /// causes (zero budget, session pin) escalate from.
+    const fn first_miss_counts() -> CapabilityMissEscalation {
+        CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 0,
+            released_workers: 0,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        }
+    }
+
+    #[test]
+    fn no_capable_worker_reason_carries_the_stable_prefix_and_detail() {
+        let reason = no_capable_worker_reason(
+            "no workflow handler registered for 'wf'",
+            5,
+            None,
+            budget_exhausted_counts(5),
+        );
+        assert!(
+            reason.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "escalation reason must be greppable by its stable prefix: {reason}"
+        );
+        assert!(reason.contains("no workflow handler registered for 'wf'"));
+        assert!(
+            reason.contains("after 5 capability-miss redeliveries"),
+            "reason must name the exact redelivery budget that was exhausted \
+             (a single-char containment check cannot catch an off-by-one): {reason}"
+        );
+    }
+
+    /// The reason must describe the branch that was actually taken.
+    ///
+    /// A session-pinned task escalates on the FIRST miss, having been released
+    /// zero times — so the budget-exhausted wording states a release count that
+    /// never happened, and its "no live worker on this queue has the handler"
+    /// clause can be outright false: a capable peer may exist and simply be
+    /// ineligible for this row, because the claim gate
+    /// (`session_id IS NULL OR sticky_worker_id = $1`) pins it to one host.
+    ///
+    /// That is not cosmetic. The runbook's first triage step is
+    /// `GET /admin/workflow-types/reachability`, which in that case reports
+    /// `in_use` — directly contradicting the reason, and stranding whoever is
+    /// holding the page on a missing deploy that does not exist.
+    #[test]
+    fn session_pinned_escalation_reason_names_the_pin_not_a_phantom_budget() {
+        let session = uuid::Uuid::new_v4();
+        let pinned = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            50,
+            Some(session),
+            first_miss_counts(),
+        );
+
+        // Still greppable and still identifies the missing handler: the runbook
+        // tells operators to match this prefix on the execution `error` column,
+        // and both escalation causes must remain findable by that one query.
+        assert!(
+            pinned.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "both escalation causes keep the stable prefix: {pinned}"
+        );
+        assert!(pinned.contains("transcode"), "{pinned}");
+
+        // It must NOT claim a budget it never spent. `50` is the budget the
+        // integration test configures, which under the old shared wording
+        // produced "after 50 ... redeliveries" after zero releases.
+        assert!(
+            !pinned.contains("after 50"),
+            "a session-pinned task is released ZERO times; naming the configured \
+             budget states a release count that never happened: {pinned}"
+        );
+        assert!(
+            pinned.contains("0 redeliveries"),
+            "the real release count must be stated: {pinned}"
+        );
+
+        // It must NOT assert the fleet-wide conclusion, which may be false.
+        assert!(
+            !pinned.contains("no live worker on this queue has the handler"),
+            "a capable peer may exist and merely be ineligible for a pinned row, \
+             so this conclusion must not be asserted: {pinned}"
+        );
+
+        // It must name the actual constraint, and the session it is pinned to.
+        assert!(
+            pinned.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the pin is the cause and must be greppable: {pinned}"
+        );
+        assert!(
+            pinned.contains(&session.to_string()),
+            "the operator needs the session id to find the host: {pinned}"
+        );
+
+        // The budget-exhausted variant is unchanged and stays distinguishable.
+        let exhausted = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            50,
+            None,
+            budget_exhausted_counts(50),
+        );
+        assert!(
+            exhausted.contains("after 50 capability-miss redeliveries"),
+            "{exhausted}"
+        );
+        assert!(
+            exhausted.contains("no live worker on this queue has the handler"),
+            "the budget-exhausted branch DID offer the task around the queue, so \
+             its stronger conclusion is supported: {exhausted}"
+        );
+        assert!(
+            !exhausted.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the two causes must be tellable apart by grep: {exhausted}"
+        );
+    }
+
+    /// A budget of `0` escalates on the FIRST claim, so the fleet-wide
+    /// conclusion is unsupported there for exactly the same reason it is
+    /// unsupported for a session-pinned task: the task was offered to one
+    /// worker and released zero times.
+    ///
+    /// `0` is a documented, supported config (the pre-#804 fail-fast behaviour),
+    /// and it is the rollback switch an operator reaches for *during* an
+    /// incident when #804's release behaviour is itself suspected — so this
+    /// wording fires precisely when someone is already mid-page. Saying
+    /// "escalated after 0 redeliveries; no live worker on this queue has the
+    /// handler" is self-contradictory (offered zero times, yet concluding
+    /// nobody took it) and sends them to hunt a missing deploy that may not
+    /// exist.
+    #[test]
+    fn zero_budget_escalation_reason_does_not_claim_a_fleet_wide_conclusion() {
+        let zero = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            0,
+            None,
+            first_miss_counts(),
+        );
+
+        assert!(
+            zero.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "all escalation causes keep the stable prefix: {zero}"
+        );
+        assert!(zero.contains("transcode"), "{zero}");
+
+        // The defect: the fleet-wide conclusion is not supported by a single
+        // incapable claim.
+        assert!(
+            !zero.contains("no live worker on this queue has the handler"),
+            "with a budget of 0 the task was never offered to a peer, so this \
+             conclusion is unsupported and may be outright false: {zero}"
+        );
+
+        // It must name the config as the cause, so the fix is obvious.
+        assert!(
+            zero.contains(ZERO_BUDGET_ESCALATION_MARKER),
+            "the disabled-redelivery config is the cause and must be greppable: {zero}"
+        );
+        assert!(
+            zero.contains("capability_miss_max_redeliveries"),
+            "name the knob so the operator can act without reading source: {zero}"
+        );
+
+        // It is a distinct cause from the session pin, not a relabel of it.
+        assert!(
+            !zero.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the three causes must be tellable apart by grep: {zero}"
+        );
+
+        // A session-pinned task with a zero budget reports the PIN, because the
+        // pin is the load-bearing constraint: raising the budget off 0 would
+        // still escalate immediately, so naming the config would misdirect.
+        let both = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            0,
+            Some(uuid::Uuid::new_v4()),
+            first_miss_counts(),
+        );
+        assert!(
+            both.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the pin outranks the config: raising the budget cannot help a \
+             pinned task, so the pin is the actionable cause: {both}"
+        );
+        assert!(!both.contains(ZERO_BUDGET_ESCALATION_MARKER), "{both}");
+    }
+
+    /// The cause-specific *reason string* is not enough on its own: the paging
+    /// signal is the **metric**, and it was still recording one shared
+    /// `outcome="escalated"` for all three causes.
+    ///
+    /// `harvest_no_capable_worker` is severity `page` and its entire narrative
+    /// — description, `first_action`, runbook — is the fleet-wide conclusion
+    /// "no live worker on this queue registers the handler". Recording a
+    /// never-offered escalation under the same label value pages that rule for
+    /// a task that was failed on its FIRST claim without ever being offered to
+    /// a peer, while a capable worker may be live and idle on the queue the
+    /// whole time. On-call is then sent to
+    /// `GET /admin/workflow-types/reachability`, which reports `in_use` and
+    /// contradicts the page they are holding.
+    ///
+    /// So the label must split exactly where the *conclusion* splits: budget
+    /// exhaustion is evidence about the fleet; the other two are evidence about
+    /// one config knob or one task's pin.
+    #[test]
+    fn escalation_cause_outcome_label_separates_never_offered_from_budget_exhaustion() {
+        use crate::telemetry::{
+            CAPABILITY_MISS_OUTCOME_ESCALATED, CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        };
+
+        // Only budget exhaustion actually offered the task around the queue.
+        assert_eq!(
+            EscalationCause::BudgetExhausted {
+                completed_releases: 5,
+                released_workers: 5,
+                fleet_confirmed: true,
+            }
+            .outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            "budget exhaustion is the fleet-exhaustion signal and keeps the \
+             value the paging rule selects"
+        );
+
+        // Both zero-offer causes report the same, distinct value: they share an
+        // operator conclusion ("this task was never offered to a peer, so draw
+        // no conclusion about the fleet") even though their fixes differ, and
+        // the reason string already tells them apart for whoever triages.
+        assert_eq!(
+            EscalationCause::ZeroBudgetFailFast.outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        );
+        assert_eq!(
+            EscalationCause::SessionPinned(uuid::Uuid::new_v4()).outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        );
+
+        // The whole point: the paging value must not be reachable from a cause
+        // that released the task zero times.
+        for cause in [
+            EscalationCause::ZeroBudgetFailFast,
+            EscalationCause::SessionPinned(uuid::Uuid::new_v4()),
+        ] {
+            assert_ne!(
+                cause.outcome_label(),
+                CAPABILITY_MISS_OUTCOME_ESCALATED,
+                "{cause:?} never offered the task to a peer, so it must not page \
+                 harvest_no_capable_worker"
+            );
+        }
+
+        // And the label must agree with the reason string's own claim, so the
+        // metric and the error column can never tell an operator two different
+        // stories about the same escalation.
+        let detail = "no activity handler registered for 'transcode'";
+        for (max, session) in [
+            (0_u32, None),
+            (50, Some(uuid::Uuid::new_v4())),
+            (0, Some(uuid::Uuid::new_v4())),
+        ] {
+            let counts = first_miss_counts();
+            let reason = no_capable_worker_reason(detail, max, session, counts);
+            assert!(
+                !reason.contains("no live worker on this queue has the handler"),
+                "reason must not assert the fleet-wide conclusion: {reason}"
+            );
+            assert_eq!(
+                EscalationCause::resolve(max, session, counts).outcome_label(),
+                CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+                "...and the metric must agree with it: {reason}"
+            );
+        }
+    }
+
+    /// The absolute release ceiling must NOT claim the fleet-wide conclusion.
+    ///
+    /// Review round 6 added a secondary bound —
+    /// `CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER x budget` total releases — so a
+    /// fleet SMALLER than the budget still terminates (with one incapable
+    /// worker the distinct set can never exceed a budget of 5, so the primary
+    /// bound alone would bounce forever and AC3 would not hold). But it left
+    /// that new branch resolving to `BudgetExhausted`, which reports "escalated
+    /// after {budget} capability-miss redeliveries; no live worker on this queue
+    /// has the handler" — two false statements at once: the real release count
+    /// is `10 x` higher, and the task may have been missed by a single worker
+    /// while a capable peer merely lost the claim races.
+    ///
+    /// That is precisely the failure the exhaustive `EscalationCause` match was
+    /// introduced to prevent, so the ceiling gets its own variant that states
+    /// the counts it actually observed.
+    ///
+    /// (The quoted wording above is the round-6 state, kept because it is what
+    /// this test was written against. `BudgetExhausted` reports its real
+    /// persisted counts too since round 23 — but the variants stay separate,
+    /// because the split is about the *conclusion* and the `outcome_label()`,
+    /// not only about which numbers get printed.)
+    #[test]
+    fn release_ceiling_escalation_reports_its_real_counts_not_a_fleet_conclusion() {
+        use crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED;
+
+        const BUDGET: u32 = 5;
+        // The shape only this bound can produce: releases past the ceiling,
+        // distinct workers still comfortably within budget.
+        //
+        // `Unavailable` is load-bearing since round 15. With confirmed coverage
+        // the configured budget now bounds TOTAL releases as well, so a
+        // one-worker fleet escalates at 6 and can never accumulate 51 -- the
+        // ceiling is reachable only when coverage could not be established. The
+        // assertions below are unchanged; only the evidence that makes this
+        // shape reachable is.
+        let counts = CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 51,
+            released_workers: 1,
+            evidence: FleetCapabilityEvidence::Unavailable,
+        };
+        assert_eq!(
+            capability_miss_decision(
+                counts.distinct_after,
+                counts.completed_releases + 1,
+                BUDGET,
+                counts.evidence
+            ),
+            CapabilityMissAction::Escalate,
+            "the ceiling must be what terminates a one-worker bounce"
+        );
+        assert_eq!(
+            EscalationCause::resolve(BUDGET, None, counts),
+            EscalationCause::ReleaseCeilingExhausted {
+                completed_releases: 51,
+                released_workers: 1,
+                capable_peer_may_exist: false,
+            },
+            "a ceiling trip must not be reported as distinct-worker exhaustion"
+        );
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            counts,
+        );
+        assert!(reason.starts_with(NO_CAPABLE_WORKER_PREFIX), "{reason}");
+
+        // The counts must be the real ones, not the budget.
+        assert!(
+            reason.contains("after 51 capability-miss redeliveries"),
+            "the real release count must be stated, not the budget: {reason}"
+        );
+        assert!(
+            !reason.contains("after 5 capability-miss redeliveries"),
+            "naming the budget as the release count is the misreport: {reason}"
+        );
+        assert!(
+            reason.contains("1 distinct worker(s)"),
+            "the distinct count is what distinguishes this from fleet \
+             exhaustion, so it must be stated: {reason}"
+        );
+
+        // And it must not assert the unqualified fleet-wide conclusion.
+        assert!(
+            !reason.contains("no live worker on this queue has the handler"),
+            "fewer distinct workers missed this than the budget allows, so the \
+             fleet-wide conclusion is unsupported: {reason}"
+        );
+        assert!(
+            reason.contains("lost every claim race"),
+            "the alternative reading must be offered so triage is not misled: {reason}"
+        );
+
+        // It still pages: the executions are failing either way, and
+        // under-paging a genuinely missing handler is the worse error.
+        assert_eq!(
+            EscalationCause::ReleaseCeilingExhausted {
+                completed_releases: 51,
+                released_workers: 1,
+                capable_peer_may_exist: false,
+            }
+            .outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+        );
+
+        // A genuine distinct-worker exhaustion is still reported as such.
+        assert_eq!(
+            EscalationCause::resolve(BUDGET, None, budget_exhausted_counts(BUDGET)),
+            EscalationCause::BudgetExhausted {
+                completed_releases: BUDGET.cast_signed(),
+                released_workers: BUDGET.cast_signed(),
+                fleet_confirmed: true,
+            },
+        );
+    }
+
+    /// The ceiling wording must print the ceiling that actually tripped, not the
+    /// multiplier applied to a number it then fails to multiply (Codex round-23
+    /// P2).
+    ///
+    /// `{MULTIPLIER}x capability_miss_max_redeliveries = {max_redeliveries}`
+    /// reads as an equation and is false as one: with the default budget it
+    /// renders `10x capability_miss_max_redeliveries = 5` while the bound that
+    /// terminated the task was 50. An operator sizing the knob off that string
+    /// concludes the fleet gave up after 5 releases and that raising the budget
+    /// to 6 is enough, when 51 releases had already been spent.
+    #[test]
+    fn release_ceiling_reason_prints_the_computed_ceiling_not_the_bare_budget() {
+        const BUDGET: u32 = 5;
+        // The product `capability_miss_decision` actually compares against.
+        let ceiling =
+            capability_miss_budget(BUDGET).saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER);
+        assert_eq!(
+            ceiling, 50,
+            "guard the arithmetic this test is asserting on"
+        );
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 1,
+                completed_releases: ceiling + 1,
+                released_workers: 1,
+                evidence: FleetCapabilityEvidence::Unavailable,
+            },
+        );
+        assert!(
+            reason.contains(&format!("absolute release ceiling of {ceiling} releases")),
+            "the printed ceiling must be the product that tripped, not a factor \
+             of it: {reason}"
+        );
+        // The knob is still named -- with its own, correct value -- because
+        // raising it is the fix. It just must not masquerade as the ceiling.
+        assert!(
+            reason.contains(&format!(
+                "{CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries \
+                 ({BUDGET})"
+            )),
+            "the knob and its multiplier must still be stated so the fix is \
+             obvious: {reason}"
+        );
+        assert!(
+            !reason.contains(&format!(
+                "{CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries = \
+                 {BUDGET}"
+            )),
+            "the defect: an equation whose right-hand side is the unmultiplied \
+             budget: {reason}"
+        );
+    }
+
+    /// Distinct-bound exhaustion must report the releases that actually
+    /// happened, not the budget (Codex round-23 P1).
+    ///
+    /// The two are equal only in the canonical shape where every worker misses
+    /// exactly once. Under `Unavailable` evidence a repeat miss grows
+    /// `completed_releases` without moving `distinct_after`, and the configured
+    /// TOTAL bound is gated off (it requires `AllLiveWorkersMissed`), so the
+    /// releases can run far past the budget before a fresh distinct worker
+    /// finally trips the distinct bound. Printing `max_redeliveries` there
+    /// understates the durable record by an unbounded factor -- and it is the
+    /// string an operator reconstructs the incident from.
+    #[test]
+    fn distinct_bound_exhaustion_reports_real_releases_not_the_budget() {
+        const BUDGET: u32 = 5;
+        // Five workers bounced the task 20 times between them (no registry
+        // evidence, so repeats were free), then a sixth distinct worker missed
+        // it and pushed the distinct count over budget.
+        let counts = CapabilityMissEscalation {
+            distinct_after: 6,
+            completed_releases: 20,
+            released_workers: 5,
+            evidence: FleetCapabilityEvidence::Unavailable,
+        };
+        // Premise: this shape really does reach the DISTINCT bound, not the
+        // ceiling -- 21 total releases is well under the ceiling of 50.
+        assert_eq!(
+            capability_miss_decision(
+                counts.distinct_after,
+                counts.completed_releases + 1,
+                BUDGET,
+                counts.evidence
+            ),
+            CapabilityMissAction::Escalate,
+        );
+        assert_eq!(
+            EscalationCause::resolve(BUDGET, None, counts),
+            EscalationCause::BudgetExhausted {
+                completed_releases: 20,
+                released_workers: 5,
+                fleet_confirmed: false,
+            },
+            "the cause must carry the counts it will report"
+        );
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            counts,
+        );
+        assert!(
+            reason.contains("escalated after 20 capability-miss redeliveries"),
+            "20 releases were persisted; the string must say so: {reason}"
+        );
+        assert!(
+            !reason.contains("escalated after 5 capability-miss redeliveries"),
+            "the defect: reporting the budget as the release count understates \
+             the record fourfold here: {reason}"
+        );
+        assert!(
+            reason.contains("across 5 distinct worker(s)"),
+            "the distinct count is the bound that tripped and must be stated: {reason}"
+        );
+        // The knob still has to be named, because raising it is the fix -- just
+        // not in the position that claims to be a release count.
+        assert!(
+            reason.contains("capability_miss_max_redeliveries = 5"),
+            "name the knob so the operator can act without reading source: {reason}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fleet-gated redelivery budget (issue #804, Codex round-8 P1)
+    // -----------------------------------------------------------------------
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A worker that advertises the queue but cannot pass the task's *own*
+    /// claim gates must not count as a possible capable peer (issue #804,
+    /// Codex round-10 P2).
+    ///
+    /// `claim_task` rejects a worker whose build is not compatible with the
+    /// task's `required_build_id` (#171) or whose labels do not satisfy its
+    /// `required_capabilities` (#522). Such a worker can never claim, so it can
+    /// never enter `capability_miss_workers` — and if the live set counted it,
+    /// `fleet_capability_evidence` would report `CapablePeerMayExist` *forever*,
+    /// withholding the configured budget and leaving the 10x total ceiling as
+    /// the only bound on a genuinely unhandled task.
+    #[test]
+    fn claim_ineligible_workers_are_excluded_from_the_live_fleet() {
+        let compat = crate::build_routing::BuildCompatibilitySet::default();
+        let caps = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+
+        let live = vec![
+            // Wrong build: `claim_task`'s required_build_id gate rejects it.
+            crate::workers::LiveWorker::for_test(
+                "wrong-build",
+                "v1",
+                serde_json::json!({"gpu": "true"}),
+            ),
+            // Right build, but the label requirement is unmet.
+            crate::workers::LiveWorker::for_test(
+                "wrong-labels",
+                "v2",
+                serde_json::json!({"gpu": "false"}),
+            ),
+            // Satisfies both — the genuine capable-peer candidate.
+            crate::workers::LiveWorker::for_test(
+                "eligible",
+                "v2",
+                serde_json::json!({"gpu": "true"}),
+            ),
+        ];
+
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, Some("v2"), Some(&caps)),
+            ids(&["eligible"]),
+            "only a worker that could actually win the claim is a possible peer"
+        );
+
+        // A task with no build or capability requirement gates nobody out.
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, None, None),
+            ids(&["wrong-build", "wrong-labels", "eligible"]),
+            "an unconstrained task keeps the whole live set"
+        );
+
+        // A legacy worker (empty build_id) may claim anything (#171).
+        let legacy = vec![crate::workers::LiveWorker::for_test(
+            "legacy",
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert_eq!(
+            claim_eligible_workers(&legacy, &compat, Some("v2"), Some(&caps)),
+            ids(&["legacy"])
+        );
+
+        // Unparseable capabilities must not silently exclude the whole fleet:
+        // that would fabricate an `AllLiveWorkersMissed` conclusion and
+        // escalate a task a capable peer could still run.
+        let junk = serde_json::json!("not-a-requirement-list");
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, None, Some(&junk)),
+            ids(&["wrong-build", "wrong-labels", "eligible"]),
+            "an unreadable requirement falls back to keeping the worker"
+        );
+    }
+
+    /// An **unreadable** compatibility table is not evidence of
+    /// incompatibility (issue #804, Codex round-18 P1).
+    ///
+    /// `BuildCompatibilitySet::is_eligible` answers `false` for a worker whose
+    /// build differs from the requirement unless a declaration says otherwise,
+    /// so degrading a failed `load_compat_set` to `default()` does not merely
+    /// lose information — it *asserts the opposite*, silently dropping every
+    /// cross-build peer `claim_task` would still let claim through
+    /// `harvest_build_compat`. The narrowed fleet then contains only the
+    /// incapable claimer, `fleet_capability_evidence` fabricates
+    /// `AllLiveWorkersMissed`, and the round-15 configured-total bound fires at
+    /// `budget + 1` — terminally failing an execution a live capable peer was
+    /// eligible to run, on the strength of one transient `SELECT` failure.
+    ///
+    /// This is the same doctrine the unparseable-`required_capabilities` case
+    /// above already follows ("an unreadable requirement falls back to keeping
+    /// the worker"); the compat read was simply never held to it.
+    #[test]
+    fn unknown_compat_keeps_a_declared_peer_instead_of_fabricating_a_fleet_conclusion() {
+        // The task was started on build "v1".
+        let required = Some("v1");
+        // "v2" is declared compatible with "v1", so a v2 worker CAN claim it.
+        let mut compat = crate::build_routing::BuildCompatibilitySet::new();
+        compat.add_declaration("v2", "v1");
+
+        let live = vec![
+            // Exact-build worker that has already missed: it lacks the handler.
+            crate::workers::LiveWorker::for_test("incapable-v1", "v1", serde_json::json!({})),
+            // Cross-build peer that HAS the handler and has never missed.
+            crate::workers::LiveWorker::for_test("capable-v2", "v2", serde_json::json!({})),
+        ];
+
+        // Baseline: with the table readable, the peer is retained.
+        assert_eq!(
+            narrow_live_fleet(&live, Some(&compat), required, None),
+            ids(&["incapable-v1", "capable-v2"]),
+            "a declared cross-build peer is claim-eligible"
+        );
+
+        // The fix: an unreadable table must NOT narrow by build at all.
+        assert_eq!(
+            narrow_live_fleet(&live, None, required, None),
+            ids(&["incapable-v1", "capable-v2"]),
+            "an unreadable compat table must keep cross-build peers -- absence \
+             of declaration data is not evidence of incompatibility"
+        );
+
+        // ...and that difference is exactly the difference between releasing
+        // for a live capable peer and terminally failing the execution.
+        let budget = capability_miss_budget(5);
+        let missed = ids(&["incapable-v1"]);
+
+        let with_fix = narrow_live_fleet(&live, None, required, None);
+        assert_eq!(
+            fleet_capability_evidence(&with_fix, &missed, "incapable-v1"),
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
+        assert_eq!(
+            capability_miss_decision(
+                1,
+                budget + 1,
+                5,
+                fleet_capability_evidence(&with_fix, &missed, "incapable-v1")
+            ),
+            CapabilityMissAction::Release,
+            "the run keeps being offered to the live peer that can finish it"
+        );
+
+        // The falsifying control: treating the unreadable table as an empty
+        // one is what produced the terminal failure.
+        let pre_fix = claim_eligible_workers(
+            &live,
+            &crate::build_routing::BuildCompatibilitySet::default(),
+            required,
+            None,
+        );
+        assert_eq!(
+            pre_fix,
+            ids(&["incapable-v1"]),
+            "control: the empty-set degrade drops the capable peer"
+        );
+        assert_eq!(
+            capability_miss_decision(
+                1,
+                budget + 1,
+                5,
+                fleet_capability_evidence(&pre_fix, &missed, "incapable-v1")
+            ),
+            CapabilityMissAction::Escalate,
+            "control: which escalates -- the P1 this test pins shut"
+        );
+
+        // A worker the label filter rejects is still excluded: suppressing the
+        // BUILD narrowing must not suppress the #522 capability narrowing too.
+        let caps = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let mixed = vec![
+            crate::workers::LiveWorker::for_test(
+                "no-gpu",
+                "v2",
+                serde_json::json!({"gpu": "false"}),
+            ),
+            crate::workers::LiveWorker::for_test("gpu", "v2", serde_json::json!({"gpu": "true"})),
+        ];
+        assert_eq!(
+            narrow_live_fleet(&mixed, None, required, Some(&caps)),
+            ids(&["gpu"]),
+            "only the build axis is suppressed; labels are still readable"
+        );
+    }
+
+    /// An untried live peer withholds the distinct bound even when the registry
+    /// cannot see the claimant (issue #804, Codex round-38 P1).
+    ///
+    /// `Unavailable` is detected self-referentially — the claimant is missing
+    /// from the live set — but that says nothing about whether the *rest* of the
+    /// set is readable. A worker whose registration failed, or whose heartbeats
+    /// went stale while it kept polling, produces `Unavailable` from a registry
+    /// that is otherwise perfectly readable and may be listing a live peer that
+    /// has never missed this task.
+    ///
+    /// Round 15 lets the distinct bound fire on `Unavailable` because `budget +
+    /// 1` distinct missers is strong evidence *on its own*, independent of the
+    /// registry. That reasoning holds when the registry tells us nothing — and
+    /// breaks here, where it is actively naming an untried peer. Escalating
+    /// would terminally fail a task while a worker that may well hold the
+    /// handler is live and polling: the round-8 P1 failure mode, reached
+    /// through the `Unavailable` door.
+    ///
+    /// So an untried peer wins over the claimant-absent check. A registry that
+    /// names nobody untried still resolves `Unavailable` and keeps round 15's
+    /// bound.
+    #[test]
+    fn an_untried_live_peer_withholds_the_bound_even_if_the_claimant_is_missing() {
+        const BUDGET: u32 = 5;
+
+        // Claimant "zz" is absent from the live set (=> would be `Unavailable`),
+        // but "peer" is live and has never missed this task.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "peer"]), &ids(&["a", "zz"]), "zz"),
+            FleetCapabilityEvidence::CapablePeerMayExist,
+            "a live peer that never missed this task may be capable; the \
+             claimant's own absence from the registry does not make that peer \
+             disappear"
+        );
+
+        // ... and the decision must therefore withhold the distinct bound.
+        assert_eq!(
+            capability_miss_decision(
+                BUDGET.cast_signed() + 1,
+                6,
+                BUDGET,
+                fleet_capability_evidence(&ids(&["a", "peer"]), &ids(&["a", "zz"]), "zz"),
+            ),
+            CapabilityMissAction::Release,
+            "escalating here asserts `no_capable_worker` while the registry is \
+             naming a live worker that has never missed this task"
+        );
+
+        // The control that keeps round 15 honest: a registry naming NOBODY
+        // untried still resolves `Unavailable`, and the distinct bound still
+        // fires. Without this, always-withholding would satisfy the assertion
+        // above while silently unbounding the small-fleet case.
+        assert_eq!(
+            fleet_capability_evidence(&[], &ids(&["a"]), "a"),
+            FleetCapabilityEvidence::Unavailable
+        );
+        assert_eq!(
+            capability_miss_decision(
+                BUDGET.cast_signed() + 1,
+                6,
+                BUDGET,
+                FleetCapabilityEvidence::Unavailable,
+            ),
+            CapabilityMissAction::Escalate,
+            "a registry that names no untried peer gives the distinct bound \
+             nothing to yield to (round 15)"
+        );
+    }
+
+    #[test]
+    fn fleet_evidence_classifies_the_three_cases() {
+        // Every live worker has missed it -> a genuine fleet conclusion.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "b"]), &ids(&["a", "b"]), "b"),
+            FleetCapabilityEvidence::AllLiveWorkersMissed
+        );
+        // A live worker that has never missed it may be capable.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "b", "c"]), &ids(&["a", "b"]), "b"),
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
+        // The registry cannot see the worker holding the claim, so it is not
+        // describing this fleet: no conclusion in either direction.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a"]), &ids(&["a", "zz"]), "zz"),
+            FleetCapabilityEvidence::Unavailable
+        );
+        // Empty registry is the same case, reached the same way.
+        assert_eq!(
+            fleet_capability_evidence(&[], &ids(&["a"]), "a"),
+            FleetCapabilityEvidence::Unavailable
+        );
+    }
+
+    /// The success metric's load-bearing half: *"zero spurious FAILED
+    /// executions ... as long as >= 1 capable worker is live"*.
+    ///
+    /// A rolling deploy with `budget + 1` old pods and one new capable pod can
+    /// hand `budget + 1` DISTINCT incapable worker ids to the decision while the
+    /// capable pod is live and polling. Before the fleet gate that escalated,
+    /// terminally failing a run whose handler was live the whole time and
+    /// asserting the exact opposite of the truth in its error column.
+    #[test]
+    fn budget_never_escalates_while_a_live_worker_has_never_missed() {
+        const BUDGET: u32 = 5;
+        let old_pods = ids(&["old-0", "old-1", "old-2", "old-3", "old-4", "old-5"]);
+        let mut live = old_pods.clone();
+        live.push("new-capable".to_string());
+
+        // Walk the whole rollout: every one of the six old pods claims in turn.
+        for (i, claimant) in old_pods.iter().enumerate() {
+            let seen = &old_pods[..i];
+            let r = resolve_capability_miss(
+                seen,
+                i32::try_from(i).expect("small"),
+                claimant,
+                BUDGET,
+                None,
+                &live,
+            );
+            assert_eq!(
+                r.evidence,
+                FleetCapabilityEvidence::CapablePeerMayExist,
+                "the capable pod is live and has never missed this task"
+            );
+            assert_eq!(
+                r.action,
+                CapabilityMissAction::Release,
+                "miss {} by {claimant} must be released for the live capable peer, not escalated \
+                 (distinct_after = {})",
+                i + 1,
+                r.distinct_after
+            );
+        }
+        // Sanity: the sixth miss really did cross the raw distinct bound, so the
+        // gate is what suppressed it rather than the arithmetic never firing.
+        assert!(
+            6 > capability_miss_budget(BUDGET),
+            "the scenario must actually exceed the budget for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn budget_escalates_once_every_live_worker_has_missed() {
+        const BUDGET: u32 = 5;
+        let fleet = ids(&["w0", "w1", "w2", "w3", "w4", "w5"]);
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], BUDGET, None, &fleet);
+        assert_eq!(r.evidence, FleetCapabilityEvidence::AllLiveWorkersMissed);
+        assert_eq!(r.action, CapabilityMissAction::Escalate);
+        assert_eq!(
+            EscalationCause::resolve(
+                BUDGET,
+                None,
+                CapabilityMissEscalation {
+                    distinct_after: r.distinct_after,
+                    completed_releases: 5,
+                    released_workers: 5,
+                    evidence: r.evidence,
+                }
+            ),
+            EscalationCause::BudgetExhausted {
+                completed_releases: 5,
+                released_workers: 5,
+                fleet_confirmed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_registry_falls_back_to_the_budget_and_says_so() {
+        const BUDGET: u32 = 5;
+        let fleet = ids(&["w0", "w1", "w2", "w3", "w4", "w5"]);
+        // No live-worker rows at all: the budget must still bound the release
+        // (a broken registry must not suppress escalation forever), but the
+        // reason must not claim a fleet conclusion it never established.
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], BUDGET, None, &[]);
+        assert_eq!(r.evidence, FleetCapabilityEvidence::Unavailable);
+        assert_eq!(r.action, CapabilityMissAction::Escalate);
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: r.distinct_after,
+                completed_releases: 5,
+                released_workers: 5,
+                evidence: r.evidence,
+            },
+        );
+        assert!(
+            reason.contains("could not be used to confirm the live fleet"),
+            "an unconfirmed fleet must be stated, not glossed: {reason}"
+        );
+        assert!(
+            !reason.contains("no live worker on this queue has the handler"),
+            "the fleet-wide conclusion is NOT supported without registry evidence: {reason}"
+        );
+    }
+
+    /// Codex round-8 P2: the escalation branch never runs the release UPDATE,
+    /// so the durable record has one fewer redelivery than the decision saw.
+    /// The reason string is what an operator reconstructs the incident from, so
+    /// it must report completed redeliveries only.
+    #[test]
+    fn escalation_reports_only_completed_redeliveries() {
+        const BUDGET: u32 = 5;
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 1,
+                completed_releases: 50,
+                released_workers: 1,
+                // `Unavailable`, not confirmed coverage: since round 15 the
+                // configured budget also bounds TOTAL releases once coverage is
+                // confirmed, so a one-worker fleet could never reach 50
+                // releases under `AllLiveWorkersMissed`. The ceiling wording
+                // this test is about is reachable only here.
+                evidence: FleetCapabilityEvidence::Unavailable,
+            },
+        );
+        assert!(
+            reason.contains("after 50 capability-miss redeliveries"),
+            "50 releases were persisted; the 51st claim escalated without releasing: {reason}"
+        );
+        assert!(
+            !reason.contains("after 51 capability-miss redeliveries"),
+            "the escalating claim is not itself a redelivery: {reason}"
+        );
+    }
+
+    /// The call-site half of Codex round-8 P2: the reported counts must come
+    /// from the PERSISTED row, never from the resolution's post-increment
+    /// decision inputs. Constructed so the two differ by exactly one, which is
+    /// the whole bug.
+    #[test]
+    fn escalation_report_uses_persisted_counts_not_the_decision_inputs() {
+        let fleet = ids(&["w0"]);
+        // 50 releases already persisted by one worker; this 51st claim is the
+        // one that escalates, and it releases nothing.
+        let resolution = resolve_capability_miss(&fleet, 50, "w0", 5, None, &fleet);
+        assert_eq!(resolution.action, CapabilityMissAction::Escalate);
+        assert_eq!(
+            resolution.total_after, 51,
+            "the DECISION is made on the post-increment count"
+        );
+
+        let escalation = escalation_from_persisted(50, fleet.len(), &resolution);
+        assert_eq!(
+            escalation.completed_releases, 50,
+            "the escalating claim never ran the release UPDATE, so only 50 \
+             redeliveries actually completed"
+        );
+        assert_eq!(escalation.released_workers, 1);
+        assert_eq!(
+            escalation.distinct_after, resolution.distinct_after,
+            "the decision input is carried through unchanged"
+        );
+    }
+
+    #[test]
+    fn ceiling_escalation_names_the_live_peer_when_one_still_exists() {
+        const BUDGET: u32 = 5;
+        let cause = EscalationCause::resolve(
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 6,
+                completed_releases: 50,
+                released_workers: 6,
+                evidence: FleetCapabilityEvidence::CapablePeerMayExist,
+            },
+        );
+        assert_eq!(
+            cause,
+            EscalationCause::ReleaseCeilingExhausted {
+                completed_releases: 50,
+                released_workers: 6,
+                capable_peer_may_exist: true,
+            },
+            "with a live never-missing peer the distinct bound is gated, so only \
+             the ceiling can have tripped -- and it must say so"
+        );
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'x'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 6,
+                completed_releases: 50,
+                released_workers: 6,
+                evidence: FleetCapabilityEvidence::CapablePeerMayExist,
+            },
+        );
+        assert!(
+            reason.contains("never missed this task"),
+            "the operator's next step is the live peer, not the deploy: {reason}"
+        );
+    }
+
+    #[test]
+    fn worker_stale_secs_doubles_the_heartbeat_interval_with_a_floor() {
+        assert_eq!(worker_stale_secs(Duration::from_secs(30)), 60);
+        // Sub-second interval keeps a 1s floor rather than collapsing to 0.
+        assert_eq!(worker_stale_secs(Duration::from_millis(100)), 1);
+        // Doubling happens before rounding: 1500ms -> 3s, not 2s.
+        assert_eq!(worker_stale_secs(Duration::from_millis(1500)), 3);
+        // Absurd values clamp instead of overflowing downstream chrono math.
+        assert_eq!(
+            worker_stale_secs(Duration::from_secs(u64::MAX)),
+            crate::poison_pill::MAX_WORKER_STALE_SECS
+        );
+    }
+
+    #[test]
+    fn capability_miss_fleet_window_never_shrinks_the_liveness_window() {
+        // The whole safety argument for the floor is that it can only ever
+        // RETAIN more peers than the pre-round-19 window did, so no fleet that
+        // escalated correctly before can start escalating spuriously now.
+        for secs in [0, 1, 2, 5, 10, 30, 59, 60, 61, 120, 600, 86_400] {
+            let interval = Duration::from_secs(secs);
+            assert!(
+                capability_miss_fleet_stale_secs(interval) >= worker_stale_secs(interval),
+                "the capability-miss window must never be narrower than the shared \
+                 liveness window it replaces (interval {secs}s)"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_fleet_window_covers_a_peer_on_the_default_cadence() {
+        // The round-19 P1 itself: a claimant configured to heartbeat every
+        // second must not conclude a peer running the DEFAULT 5s cadence is
+        // dead. This is a default-configuration hazard, not an exotic one.
+        let fast_claimant = Duration::from_secs(1);
+        let default_peer = Duration::from_secs(5);
+        assert!(
+            capability_miss_fleet_stale_secs(fast_claimant) >= worker_stale_secs(default_peer),
+            "a 1s-cadence claimant must still see a peer on the default 5s cadence"
+        );
+        // Falsifying control: the window this replaces did NOT cover that peer,
+        // which is exactly how a live capable peer got dropped from the fleet.
+        assert!(
+            worker_stale_secs(fast_claimant) < worker_stale_secs(default_peer),
+            "pre-fix, the claimant's own window was narrower than the default \
+             peer's -- without that gap this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_worker_may_not_claim_tasks() {
+        // Issue #804, Codex round-54 P1. A worker whose atomic register+
+        // invalidate pair has not committed is not a fleet member: it is
+        // invisible to peers' capability evidence, AND every task it claims
+        // matches the orphan-reclaim predicate (RUNNING with a worker_id that
+        // has no fresh `harvest_workers` heartbeat), so the reclaimer takes the
+        // task back and charges a crash strike toward a poison-pill quarantine.
+        assert!(
+            !may_claim_tasks(true),
+            "a worker whose fleet registration has not committed must not claim: \
+             it cannot durably hold the claim, and each attempt burns a crash \
+             strike toward a terminal quarantine"
+        );
+        // And the gate must be exactly that condition -- a registered worker is
+        // never slowed down by it, so the common path is unchanged.
+        assert!(
+            may_claim_tasks(false),
+            "a registered worker must claim normally; the gate is not a throttle"
+        );
+    }
+
+    #[test]
+    fn capability_miss_fleet_window_still_tracks_a_slower_claimant() {
+        // The floor is a floor, not a cap: a claimant slower than the supported
+        // ceiling keeps its own (larger) window rather than being narrowed to it.
+        let slow = Duration::from_secs(600);
+        assert_eq!(
+            capability_miss_fleet_stale_secs(slow),
+            worker_stale_secs(slow),
+            "a claimant slower than the floor must keep its own window"
+        );
+        assert!(capability_miss_fleet_stale_secs(slow) > CAPABILITY_MISS_MIN_FLEET_STALE_SECS);
+    }
+
+    #[test]
+    fn capability_miss_fleet_floor_matches_the_documented_supported_cadence() {
+        // The floor and the cadence ceiling the builder warns about are one
+        // contract stated twice; pin them together so they cannot drift.
+        assert_eq!(
+            CAPABILITY_MISS_MIN_FLEET_STALE_SECS,
+            worker_stale_secs(MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS),
+            "the floor must be exactly the window a peer at the supported \
+             cadence ceiling needs"
+        );
+    }
+
+    #[test]
+    fn capability_miss_kind_labels_are_bounded() {
+        // Metric label cardinality (ADR-0001 §7): exactly two values, ever.
+        assert_eq!(CapabilityMissKind::Workflow.as_str(), "workflow");
+        assert_eq!(CapabilityMissKind::Activity.as_str(), "activity");
+    }
+
+    /// Build a registry knowing exactly `workflow` and `activity` by name.
+    fn registry_knowing(workflow: &'static str, activity: &'static str) -> HandlerRegistry {
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: workflow,
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![ActivityInfo {
+                name: activity,
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                rate_limit_key_expr: None,
+                circuit_breaker: None,
+                requires: None,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }],
+        )
+    }
+
+    /// A `ScheduleActivity` command naming `name`, with every optional field
+    /// at its default. Only `name` is load-bearing for the pre-pass.
+    fn schedule_activity_cmd(name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::ScheduleActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            queue: String::new(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_tx,
+        }
+    }
+
+    /// A `StartChildWorkflow` command naming `workflow_name`.
+    fn start_child_cmd(workflow_name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::StartChildWorkflow {
+            child_id: crate::types::ExecutionId::new(),
+            workflow_name: workflow_name.to_string(),
+            input: serde_json::Value::Null,
+            result_tx,
+        }
+    }
+
+    /// A `RunLocalActivity` command naming `name`. Only `name` is load-bearing
+    /// for the preflight.
+    fn run_local_cmd(name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            start_to_close: None,
+            retry_policy: None,
+            result_tx,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn missing_local_activity_handler_names_the_activity_that_cannot_run() {
+        // Issue #804 (Codex round-19 P2): the inline local-activity arm commits
+        // durable logs (#790), progress notifications (#791), search-attribute
+        // and current-details patches, and mutex releases (#691) BEFORE
+        // `run_local_activity_inline` consults the registry. Once a miss became
+        // releasable, every incapable redelivery re-ran those commits. This
+        // preflight is what lets the arm bail out ahead of them.
+        let registry = registry_knowing("known_wf", "known_act");
+
+        // A registered local activity must NOT be flagged -- otherwise every
+        // healthy local-activity cycle would release instead of running.
+        assert_eq!(
+            missing_local_activity_handler(&registry, &[run_local_cmd("known_act")]),
+            None
+        );
+        assert_eq!(
+            missing_local_activity_handler(&registry, &[run_local_cmd("missing_act")]),
+            Some("missing_act")
+        );
+
+        // `extract_run_local_activity` keeps the LAST `RunLocalActivity` in the
+        // batch, so a preflight that stopped at the first would wave through
+        // exactly the command about to run.
+        assert_eq!(
+            missing_local_activity_handler(
+                &registry,
+                &[run_local_cmd("known_act"), run_local_cmd("missing_act")]
+            ),
+            Some("missing_act")
+        );
+
+        // The sibling commands whose premature commit this exists to prevent
+        // must never flag on their own -- and neither must a `ScheduleActivity`
+        // for an unregistered handler, which the persist-time pre-pass already
+        // catches ahead of the same commits.
+        assert_eq!(
+            missing_local_activity_handler(
+                &registry,
+                &[
+                    WorkflowCommand::RecordLog {
+                        seq: 1,
+                        level: crate::context::WorkflowLogLevel::Info,
+                        message: "hello".to_string(),
+                    },
+                    schedule_activity_cmd("missing_act"),
+                ]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn persist_capability_miss_finds_each_handler_bearing_command() {
+        // Issue #804 (Codex round-6 P2): the three commands whose PERSISTENCE
+        // resolves a handler must all be caught by the pre-pass that runs
+        // *ahead* of the terminal telemetry, mirroring the in-transaction
+        // checks in persist_scheduled_activities /
+        // persist_all_started_child_workflows / create_detached_child_executions.
+        let registry = registry_knowing("known_wf", "known_act");
+
+        assert_eq!(
+            first_persist_capability_miss(&registry, &[schedule_activity_cmd("missing_act")]),
+            Some((
+                CapabilityMissKind::Activity.as_str(),
+                "missing_act".to_string()
+            )),
+        );
+
+        assert_eq!(
+            first_persist_capability_miss(&registry, &[start_child_cmd("missing_wf")]),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "missing_wf".to_string()
+            )),
+        );
+
+        let unknown_detached = WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id: crate::types::ExecutionId::new(),
+            workflow_name: "missing_detached".to_string(),
+            input: serde_json::Value::Null,
+            parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+        };
+        assert_eq!(
+            first_persist_capability_miss(&registry, std::slice::from_ref(&unknown_detached)),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "missing_detached".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn continue_as_new_to_an_unregistered_type_is_a_capability_miss() {
+        // Issue #804 (Codex round-45 P1). A cross-type continue-as-new (issue
+        // #803) resolves the TARGET type's handler, so during a rolling deploy
+        // an old pod that runs the source type but not the new target is in
+        // exactly the state #804 exists for: blameless, transient, and fixable
+        // by a peer that registers both. It must release, not seal the
+        // predecessor.
+        //
+        // It needs its own check because the `ContinueAsNew` command never
+        // reaches `first_persist_capability_miss`: `drive_workflow`
+        // `swap_remove`s it out of the command list and returns it as the
+        // OUTCOME, so the command-scanning pre-pass sees an empty batch.
+        let registry = registry_knowing("known_wf", "known_act");
+        assert_eq!(
+            continue_as_new_target_capability_miss(
+                &registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: Some("paid_subscription".to_string()),
+                },
+            ),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "paid_subscription".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn continue_as_new_capability_miss_spares_every_terminal_rejection() {
+        // The other reasons `classify_continue_as_new_target` rejects a target
+        // are NOT capability misses, and releasing for them would loop the task
+        // around a fleet where no peer can help until the budget escalates it
+        // with a `no_capable_worker:` reason that misdescribes the fault.
+        let registry = registry_knowing("known_wf", "known_act");
+        let miss = |target: Option<&str>| {
+            continue_as_new_target_capability_miss(
+                &registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: target.map(str::to_string),
+                },
+            )
+        };
+
+        // Same-type continuation: resolves no target handler at all.
+        assert_eq!(miss(None), None);
+        // Registered target: the happy cross-type path.
+        assert_eq!(miss(Some("known_wf")), None);
+        // Blank target: a config error no peer can fix, and an empty name would
+        // reach the `queue`/`task_type` metric as a phantom workflow.
+        assert_eq!(miss(Some("")), None);
+        assert_eq!(miss(Some("   ")), None);
+
+        // A unified DAG's shadow `WorkflowInfo` lives in `registry.workflows`
+        // (issue #256), so a DAG target is excluded here by construction and
+        // falls through to #803's terminal "trigger it with POST /dags/..."
+        // rejection -- which is a scope decision, not a fleet condition.
+        let mut dag_registry = registry_knowing("nightly_rollup", "known_act");
+        dag_registry
+            .dag_workflow_names
+            .insert("nightly_rollup".to_string());
+        assert_eq!(
+            continue_as_new_target_capability_miss(
+                &dag_registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: Some("nightly_rollup".to_string()),
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn continue_as_new_capability_miss_ignores_non_continuation_outcomes() {
+        let registry = registry_knowing("known_wf", "known_act");
+        for outcome in [
+            WorkflowOutcome::Completed {
+                output: serde_json::Value::Null,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::Suspended {
+                commands: Vec::new(),
+            },
+        ] {
+            assert_eq!(
+                continue_as_new_target_capability_miss(&registry, &outcome),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn persist_capability_miss_is_silent_when_every_handler_is_registered() {
+        let registry = registry_knowing("known_wf", "known_act");
+        let commands = vec![
+            schedule_activity_cmd("known_act"),
+            start_child_cmd("known_wf"),
+            WorkflowCommand::SetCurrentDetails {
+                value: "step 1".to_string(),
+                explicit_clear: false,
+            },
+        ];
+        assert_eq!(first_persist_capability_miss(&registry, &commands), None);
+    }
+
+    #[test]
+    fn persist_capability_miss_ignores_local_activities() {
+        // RunLocalActivity is resolved DURING execution (before any terminal
+        // telemetry), and that site is replay-aware: a local activity whose
+        // result is already recorded replays without ever touching the
+        // registry. Flagging it here would release the task on a worker that
+        // could have replayed the recorded result perfectly well -- a
+        // regression, not a fix. So the pre-pass deliberately skips it.
+        let registry = registry_knowing("known_wf", "known_act");
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        let commands = vec![WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "missing_local".to_string(),
+            input: serde_json::Value::Null,
+            start_to_close: None,
+            retry_policy: None,
+            result_tx,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        }];
+        assert_eq!(first_persist_capability_miss(&registry, &commands), None);
+    }
+
+    #[test]
+    fn persist_capability_miss_reports_the_first_miss_in_command_order() {
+        // All-or-nothing dispatch: the batch is rejected on the FIRST miss, so
+        // the reported name is deterministic regardless of how many commands
+        // in the batch are unresolvable.
+        let registry = registry_knowing("known_wf", "known_act");
+        let commands = vec![
+            start_child_cmd("first_missing"),
+            schedule_activity_cmd("second_missing"),
+        ];
+        assert_eq!(
+            first_persist_capability_miss(&registry, &commands),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "first_missing".to_string()
+            )),
+        );
+    }
+
+    /// The frontier [`frontier_task`] records its counters against. Tests that
+    /// mean "these counters are about the handler I am missing" pass this.
+    const SAME_FRONTIER: &str = "workflow:stuck_here";
+
+    /// A `TaskQueueItem` carrying only the capability-miss columns this rule
+    /// reads; every other field is irrelevant to it.
+    ///
+    /// The recorded frontier is [`SAME_FRONTIER`], so a test asserting the
+    /// snapshot is *preserved* must pass that key — passing anything else is
+    /// the round-46 mismatch, which zeroes.
+    fn frontier_task(misses: i32, workers: &[&str]) -> TaskQueueItem {
+        TaskQueueItem {
+            capability_misses: misses,
+            capability_miss_workers: workers.iter().map(|w| (*w).to_owned()).collect(),
+            capability_miss_handler: Some(SAME_FRONTIER.to_string()),
+            ..retry_after_test_task(1, 5)
+        }
+    }
+
+    #[test]
+    fn a_committed_frontier_reset_decides_on_the_clean_frontier_not_the_snapshot() {
+        // Issue #804, Codex rounds 20 and 22. This dispatch resolved a local
+        // activity inline, which reset the row to (0, []) in the SAME
+        // transaction as the append. The claim-time snapshot still describes
+        // the PRIOR frontier, and it had spent the whole budget.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
+        let live = vec!["worker-a".to_string(), "worker-b".to_string()];
+
+        // Deciding on that snapshot terminally fails a run whose new frontier
+        // no peer has ever been offered -- this control is what makes the rule
+        // worth having.
+        let (stale_misses, stale_workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
+        let stale =
+            resolve_capability_miss(&stale_workers, stale_misses, "worker-c", 2, None, &live);
+        assert_eq!(stale.action, CapabilityMissAction::Escalate);
+
+        // With the reset committed, the row really holds (0, []), so the miss
+        // releases and the persisted count lands at 1.
+        let (misses, workers) = frontier_miss_state(&task, true, SAME_FRONTIER);
+        assert_eq!((misses, workers.as_slice()), (0, [].as_slice()));
+        let clean = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
+        assert_eq!(
+            (clean.action, clean.total_after),
+            (CapabilityMissAction::Release, 1)
+        );
+    }
+
+    #[test]
+    fn no_frontier_reset_preserves_the_storage_ceiling_guard() {
+        // Issue #804, Codex round-22 P2. The predecessor of this rule
+        // fabricated a clean frontier whenever a re-read failed, which bypassed
+        // the `i32::MAX` guard: the resolver said Release, and the release
+        // statement's `capability_misses + 1` against the REAL row then raised
+        // `integer out of range`, stranding a RUNNING row under a live worker.
+        //
+        // Reporting the snapshot when no reset committed keeps the guard on the
+        // value the column actually holds.
+        let task = frontier_task(i32::MAX, &["worker-a"]);
+        let (misses, workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
+        assert_eq!(misses, i32::MAX, "the ceiling must survive the rule");
+        let at_ceiling = resolve_capability_miss(&workers, misses, "worker-b", 5, None, &[]);
+        assert_eq!(
+            at_ceiling.action,
+            CapabilityMissAction::Escalate,
+            "a column already at the storage ceiling escalates rather than \
+             issuing an UPDATE that can only fail"
+        );
+
+        // And a spent-but-representable budget still escalates on its own terms.
+        let spent = frontier_task(5, &["w0", "w1", "w2", "w3", "w4"]);
+        let (m, w) = frontier_miss_state(&spent, false, SAME_FRONTIER);
+        let over = resolve_capability_miss(&w, m, "w5", 5, None, &[]);
+        assert_eq!(
+            over.action,
+            CapabilityMissAction::Escalate,
+            "without a reset the configured budget is enforced on the true count"
+        );
+    }
+
+    /// Counters recorded against a DIFFERENT handler are not evidence about
+    /// this one (issue #804, Codex round-46 P1).
+    ///
+    /// The reset flag only covers the two ways a dispatch can *itself* retire a
+    /// frontier: a park, or inline local-activity progress. Newly ingested
+    /// history retires one without either — `prepare_workflow_task_with_cache`
+    /// appends a due timer fire or a pending signal ahead of the capability
+    /// gate, so the very next replay can be stuck on a different handler with
+    /// nothing having reset the columns. Charging the old frontier's spend to a
+    /// handler no peer has ever been offered is what terminally fails a run the
+    /// fleet can still finish.
+    #[test]
+    fn counters_recorded_against_another_handler_are_not_evidence_about_this_one() {
+        // The budget is fully spent -- against `SAME_FRONTIER`.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
+        let live = vec!["worker-a".to_string(), "worker-b".to_string()];
+
+        // Read as evidence about that same frontier, it escalates. This control
+        // is what makes the rule falsifiable: without the key, EVERY read below
+        // would look like this one.
+        let (same_misses, same_workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
+        assert_eq!((same_misses, same_workers.len()), (2, 2));
+        let spent = resolve_capability_miss(&same_workers, same_misses, "worker-c", 2, None, &live);
+        assert_eq!(spent.action, CapabilityMissAction::Escalate);
+
+        // Read as evidence about the frontier we are ACTUALLY stuck on, the
+        // same row yields a fresh budget and the miss releases for a peer.
+        let (misses, workers) = frontier_miss_state(&task, false, "activity:moved_on_to");
+        assert_eq!(
+            (misses, workers.as_slice()),
+            (0, [].as_slice()),
+            "another handler's missers must not be charged to this frontier"
+        );
+        let fresh = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
+        assert_eq!(
+            (fresh.action, fresh.total_after),
+            (CapabilityMissAction::Release, 1),
+            "a frontier no peer has been offered starts its budget at the base"
+        );
+    }
+
+    /// A row with no frontier recorded yet reads as a mismatch, which is the
+    /// safe direction: a full budget releases, where a fabricated match could
+    /// charge a spend nobody made (issue #804, Codex round-46 P1).
+    #[test]
+    fn an_unrecorded_frontier_reads_as_a_fresh_budget() {
+        let task = TaskQueueItem {
+            capability_miss_handler: None,
+            ..frontier_task(2, &["worker-a", "worker-b"])
+        };
+        assert_eq!(
+            frontier_miss_state(&task, false, SAME_FRONTIER),
+            (0, Vec::new()),
+            "a NULL handler is not a claim that these counters are about us"
+        );
+    }
+
+    /// The two registries are separate namespaces, so a same-named activity and
+    /// workflow are different frontiers and must not share a budget.
+    #[test]
+    fn the_frontier_key_separates_the_two_handler_namespaces() {
+        let workflow = MissingHandler {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: "shared_name",
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        let activity = MissingHandler {
+            kind: CapabilityMissKind::Activity.as_str(),
+            name: "shared_name",
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        assert_ne!(
+            workflow.frontier_key(),
+            activity.frontier_key(),
+            "a workflow and an activity sharing a name are different frontiers"
+        );
+
+        // And the key a task records is matched by an equal key, so a genuine
+        // re-dispatch on the SAME frontier keeps accumulating.
+        let task = TaskQueueItem {
+            capability_miss_handler: Some(workflow.frontier_key()),
+            ..frontier_task(1, &["worker-a"])
+        };
+        assert_eq!(
+            frontier_miss_state(&task, false, &workflow.frontier_key()),
+            (1, vec!["worker-a".to_string()]),
+            "the same frontier must carry its own evidence forward"
+        );
+        assert_eq!(
+            frontier_miss_state(&task, false, &activity.frontier_key()),
+            (0, Vec::new()),
+            "the other namespace's same-named handler must not inherit it"
+        );
+    }
+
+    // -- Codex round-28 P1s: ownership, staleness, and read coherence --------
+
+    /// A re-read that matches no owned row is POSITIVE evidence that the claim
+    /// is gone, not merely an absence of fresh data. It must not fall back to
+    /// the snapshot and let the decision proceed: the escalation write is not
+    /// ownership-guarded (`queue::fail_task` accepts any PENDING/RUNNING row
+    /// regardless of `worker_id`), so a stale dispatcher deciding `Escalate`
+    /// terminally fails a task another worker now owns (Codex round-28 P1).
+    #[test]
+    fn a_lost_claim_is_distinguished_from_an_unreadable_row() {
+        let task = frontier_task(3, &["worker-a"]);
+        let (misses, workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
+
+        let lost = CurrentMissState::ClaimLost;
+        assert!(
+            lost.decidable_counters().is_none(),
+            "a lost claim yields no counters to decide on -- the caller must \
+             return without making a terminal decision"
+        );
+
+        let unreadable = CurrentMissState::Unreadable {
+            misses,
+            workers: workers.clone(),
+        };
+        assert_eq!(
+            unreadable.decidable_counters(),
+            Some((misses, workers.as_slice())),
+            "an unreadable row still decides on the snapshot, so the storage \
+             ceiling keeps its real count (the round-21 P2 hazard)"
+        );
+    }
+
+    /// Two agreeing reads of an owned row are the only state that licenses an
+    /// evidence-derived escalation. Anything else -- an unreadable row, or a
+    /// row that changed while the fleet was being read -- means the distinct
+    /// set may name a worker that has since invalidated its own entry.
+    #[test]
+    fn evidence_confidence_requires_two_agreeing_owned_reads() {
+        let owned = |m: i32, w: &[&str]| CurrentMissState::Owned {
+            misses: m,
+            workers: w.iter().map(|s| (*s).to_string()).collect(),
+        };
+
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a", "b"]), &owned(2, &["a", "b"])),
+            MissEvidenceConfidence::Current,
+            "an unchanged owned row across both reads is a coherent snapshot"
+        );
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a", "b"]), &owned(2, &["b"])),
+            MissEvidenceConfidence::PossiblyStale,
+            "a peer invalidating its entry between the two reads is exactly the \
+             registration this decision must not talk over"
+        );
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a"]), &owned(3, &["a"])),
+            MissEvidenceConfidence::PossiblyStale,
+            "any disagreement at all, including the count"
+        );
+        assert_eq!(
+            miss_evidence_confidence(
+                &CurrentMissState::Unreadable {
+                    misses: 2,
+                    workers: vec!["a".to_string()],
+                },
+                &owned(2, &["a"]),
+            ),
+            MissEvidenceConfidence::PossiblyStale,
+            "an unreadable read is not evidence of agreement"
+        );
+    }
+
+    /// Possibly-stale evidence withholds BOTH evidence-derived bounds. The
+    /// distinct bound is included deliberately: its input is the very array a
+    /// re-registration invalidates, so its length is what goes stale.
+    #[test]
+    fn stale_evidence_withholds_both_evidence_derived_bounds() {
+        const BUDGET: u32 = 5;
+        let fleet: Vec<String> = (0..6).map(|i| format!("w{i}")).collect();
+
+        // Budget spent by 5 distinct workers, and the registry says every live
+        // worker has missed -- normally an escalation on both bounds at once.
+        let current = resolve_capability_miss_with_confidence(
+            &fleet[..5],
+            5,
+            &fleet[5],
+            BUDGET,
+            None,
+            &fleet,
+            MissEvidenceConfidence::Current,
+        );
+        assert_eq!(
+            current.action,
+            CapabilityMissAction::Escalate,
+            "control: a coherent snapshot still escalates at the budget"
+        );
+
+        let stale = resolve_capability_miss_with_confidence(
+            &fleet[..5],
+            5,
+            &fleet[5],
+            BUDGET,
+            None,
+            &fleet,
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            stale.action,
+            CapabilityMissAction::Release,
+            "evidence that may name an already-invalidated peer must not \
+             terminally fail the run"
+        );
+        assert_eq!(
+            stale.evidence,
+            FleetCapabilityEvidence::CapablePeerMayExist,
+            "and the reported evidence must say so, rather than claiming a \
+             fleet-wide conclusion the read could not support"
+        );
+    }
+
+    /// Suppression is bounded (AC3): the ungated backstops are untouched, so a
+    /// permanently-unreadable row still terminates rather than releasing
+    /// forever.
+    #[test]
+    fn stale_evidence_keeps_every_ungated_bound() {
+        let ceiling = CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER * 5;
+        let lone = "w1".to_string();
+        let seen = vec![lone.clone()];
+
+        let over_ceiling = resolve_capability_miss_with_confidence(
+            &seen,
+            ceiling,
+            &lone,
+            5,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            over_ceiling.action,
+            CapabilityMissAction::Escalate,
+            "the absolute ceiling is ungated and must survive suppression"
+        );
+
+        let storage = resolve_capability_miss_with_confidence(
+            &seen,
+            i32::MAX,
+            &lone,
+            5,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            storage.action,
+            CapabilityMissAction::Escalate,
+            "so must the storage ceiling -- releasing would issue an UPDATE \
+             that can only raise `integer out of range`"
+        );
+
+        let zero_budget = resolve_capability_miss_with_confidence(
+            &[],
+            0,
+            "w1",
+            0,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            zero_budget.action,
+            CapabilityMissAction::Escalate,
+            "a disabled budget is a configured knob, not fleet evidence"
+        );
+
+        let pinned = resolve_capability_miss_with_confidence(
+            &[],
+            0,
+            "w1",
+            5,
+            Some(uuid::Uuid::new_v4()),
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            pinned.action,
+            CapabilityMissAction::Escalate,
+            "a session-pinned task can only ever return to one host, which is \
+             a structural fact rather than an evidence-derived one"
+        );
+    }
+
+    /// The 6-argument form is the confident one, so every existing call site
+    /// keeps its meaning.
+    #[test]
+    fn the_unconfidenced_form_still_means_current() {
+        let fleet: Vec<String> = (0..6).map(|i| format!("w{i}")).collect();
+        assert_eq!(
+            resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None, &fleet).action,
+            resolve_capability_miss_with_confidence(
+                &fleet[..5],
+                5,
+                &fleet[5],
+                5,
+                None,
+                &fleet,
+                MissEvidenceConfidence::Current,
+            )
+            .action,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex round-29 P1: an escalation is revalidated at the commit boundary.
+    // -----------------------------------------------------------------------
+
+    /// A resolution carrying `action`, with the counts/evidence a fully
+    /// fleet-confirmed budget exhaustion would have.
+    fn fresh(action: CapabilityMissAction) -> CapabilityMissResolution {
+        CapabilityMissResolution {
+            action,
+            total_after: 6,
+            distinct_after: 6,
+            worker_is_new: true,
+            misses_before: 5,
+            distinct_before: 5,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        }
+    }
+
+    #[test]
+    fn a_lost_claim_withdraws_the_escalation_at_the_commit_boundary() {
+        // The escalation write is not ownership-guarded, so a row that changed
+        // hands during the (now hoisted) history load must not be failed by the
+        // dispatcher that lost it -- even though its own decision said escalate.
+        assert_eq!(
+            revalidate_escalation(
+                &CurrentMissState::ClaimLost,
+                Some(fresh(CapabilityMissAction::Escalate))
+            ),
+            EscalationRevalidation::Withdrawn("claim_lost"),
+        );
+    }
+
+    #[test]
+    fn a_capable_peer_going_live_withdraws_the_escalation() {
+        // The whole point of the revalidation: the fresh re-run says release, so
+        // the terminal write must not happen.
+        assert_eq!(
+            revalidate_escalation(
+                &CurrentMissState::Owned {
+                    misses: 5,
+                    workers: vec!["w0".to_string()],
+                },
+                Some(fresh(CapabilityMissAction::Release)),
+            ),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+    }
+
+    #[test]
+    fn an_unchanged_decision_still_commits() {
+        // And the common case is untouched: nothing moved, so the escalation
+        // decided a moment ago is the one that commits.
+        assert_eq!(
+            revalidate_escalation(
+                &CurrentMissState::Owned {
+                    misses: 5,
+                    workers: vec!["w0".to_string()],
+                },
+                Some(fresh(CapabilityMissAction::Escalate)),
+            ),
+            EscalationRevalidation::Stands(fresh(CapabilityMissAction::Escalate)),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_is_judged_by_its_fresh_action_not_by_being_unreadable() {
+        // `Unreadable` is not itself a withdrawal: the staleness it implies is
+        // handled upstream by `PossiblyStale`, which withholds the two
+        // evidence-derived bounds. An escalation that survives THAT (the
+        // absolute ceiling, the storage ceiling, a zero budget, a session pin)
+        // is still a real one, so AC3 keeps terminating.
+        let unreadable = CurrentMissState::Unreadable {
+            misses: 5,
+            workers: vec!["w0".to_string()],
+        };
+        assert_eq!(
+            revalidate_escalation(&unreadable, Some(fresh(CapabilityMissAction::Escalate))),
+            EscalationRevalidation::Stands(fresh(CapabilityMissAction::Escalate)),
+        );
+        assert_eq!(
+            revalidate_escalation(&unreadable, Some(fresh(CapabilityMissAction::Release))),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+    }
+
+    #[test]
+    fn a_peer_reregistering_inside_the_commit_bracket_withdraws_the_escalation() {
+        // Codex round-30 P1. Round 29 re-derived a SINGLE miss read at the
+        // commit boundary, so a peer whose entry is invalidated between that
+        // read and the fleet read still counted as a misser while already
+        // appearing live -- `AllLiveWorkersMissed`, and a terminal write.
+        //
+        // This composes exactly what `prepare_escalation_commit` now does with
+        // the shared bracket: the two reads disagree, so the confidence is
+        // `PossiblyStale`, which withholds both evidence-derived bounds, so the
+        // fresh action is `Release`, so the escalation is withdrawn.
+        let before = CurrentMissState::Owned {
+            misses: 5,
+            workers: vec!["pod-a".to_string(), "pod-b".to_string()],
+        };
+        // `pod-a` re-registered onto a capable build and cleared its own entry.
+        let after = CurrentMissState::Owned {
+            misses: 5,
+            workers: vec!["pod-b".to_string()],
+        };
+        let confidence = miss_evidence_confidence(&before, &after);
+        assert_eq!(confidence, MissEvidenceConfidence::PossiblyStale);
+
+        let (misses, distinct) = before
+            .decidable_counters()
+            .expect("the row is still owned in both reads");
+        let fleet = vec!["pod-a".to_string(), "pod-b".to_string()];
+        let stale = resolve_capability_miss_with_confidence(
+            distinct, misses, "pod-b", 5, None, &fleet, confidence,
+        );
+        assert_eq!(
+            revalidate_escalation(&before, Some(stale)),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+
+        // And the control: had the bracket agreed, the same numbers escalate --
+        // so the withdrawal above is the bracket doing work, not the budget
+        // failing to be reached.
+        let agreed = miss_evidence_confidence(&before, &before);
+        assert_eq!(agreed, MissEvidenceConfidence::Current);
+        let agreed_resolution = resolve_capability_miss_with_confidence(
+            distinct, misses, "pod-b", 5, None, &fleet, agreed,
+        );
+        assert_eq!(
+            revalidate_escalation(&before, Some(agreed_resolution)),
+            EscalationRevalidation::Stands(agreed_resolution),
+        );
+    }
+
+    #[test]
+    fn the_reported_cause_is_the_revalidated_one_not_the_obsolete_one() {
+        // Codex round-31 P2. The initial decision and the commit-boundary
+        // revalidation can BOTH say escalate for different reasons: a task past
+        // the absolute release ceiling escalates as `BudgetExhausted` while
+        // every live worker has missed it, and as `ReleaseCeilingExhausted` the
+        // moment a never-tried capable peer appears during the commit. Reporting
+        // the obsolete cause tells an operator no live worker registers the
+        // handler when one demonstrably does, sending them to look for a missing
+        // deploy that is not missing.
+        let obsolete = CapabilityMissResolution {
+            action: CapabilityMissAction::Escalate,
+            total_after: 51,
+            distinct_after: 51,
+            worker_is_new: true,
+            misses_before: 50,
+            distinct_before: 50,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        };
+        // Same counts; a capable peer has since appeared, so the budget bound is
+        // withheld and only the absolute ceiling still terminates.
+        let revalidated = CapabilityMissResolution {
+            evidence: FleetCapabilityEvidence::CapablePeerMayExist,
+            ..obsolete
+        };
+
+        let owned = CurrentMissState::Owned {
+            misses: 50,
+            workers: vec!["w0".to_string()],
+        };
+        let verdict = revalidate_escalation(&owned, Some(revalidated));
+        let EscalationRevalidation::Stands(carried) = verdict else {
+            panic!("both resolutions escalate, so the verdict must stand: {verdict:?}");
+        };
+        // The verdict carries the FRESH resolution, not the one it was asked
+        // about a moment ago.
+        assert_eq!(carried, revalidated);
+        assert_ne!(carried, obsolete);
+
+        // And the two genuinely name different causes, so carrying the wrong one
+        // would genuinely mislead -- this test cannot pass vacuously.
+        let cause_of = |r: &CapabilityMissResolution| {
+            EscalationCause::resolve(
+                5,
+                None,
+                escalation_from_persisted(r.misses_before, r.distinct_before, r),
+            )
+        };
+        assert!(matches!(
+            cause_of(&obsolete),
+            EscalationCause::BudgetExhausted { .. }
+        ));
+        assert!(matches!(
+            cause_of(&carried),
+            EscalationCause::ReleaseCeilingExhausted {
+                capable_peer_may_exist: true,
+                ..
+            }
+        ));
+        // The metric *label* is deliberately shared by the two budget-ish
+        // causes (both were genuinely offered around the queue), and the two
+        // inputs that could change it -- the session pin and the configured
+        // budget -- are properties of the task and the config, not of the
+        // resolution, so a revalidation can never move it. The operator-visible
+        // difference is therefore the reason string and the log message, and
+        // that is what must follow the fresh resolution.
+        assert_eq!(
+            cause_of(&obsolete).outcome_label(),
+            cause_of(&carried).outcome_label(),
+        );
+        let reason_of = |r: &CapabilityMissResolution| {
+            no_capable_worker_reason(
+                "activity 'charge'",
+                5,
+                None,
+                escalation_from_persisted(r.misses_before, r.distinct_before, r),
+            )
+        };
+        let obsolete_reason = reason_of(&obsolete);
+        let carried_reason = reason_of(&carried);
+        assert_ne!(obsolete_reason, carried_reason);
+        // Both keep the stable machine-readable prefix AC3/AC5 promise.
+        assert!(obsolete_reason.starts_with("no_capable_worker:"));
+        assert!(carried_reason.starts_with("no_capable_worker:"));
+        // And the obsolete one makes the claim the fresh evidence contradicts.
+        assert!(obsolete_reason.contains("no live worker"));
+        assert!(!carried_reason.contains("no live worker"));
+    }
+
+    #[test]
+    fn a_clean_frontier_still_escalates_a_session_pin_and_a_zero_budget() {
+        // The reset path must not become a way to dodge the two escalations
+        // that are decided BEFORE any budget bound.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
+        let (misses, workers) = frontier_miss_state(&task, true, SAME_FRONTIER);
+
+        let pinned = resolve_capability_miss(
+            &workers,
+            misses,
+            "worker-a",
+            5,
+            Some(uuid::Uuid::new_v4()),
+            &[],
+        );
+        assert_eq!(
+            pinned.action,
+            CapabilityMissAction::Escalate,
+            "a session-pinned task cannot be released to a peer, reset or not"
+        );
+
+        let zero_budget = resolve_capability_miss(&workers, misses, "worker-a", 0, None, &[]);
+        assert_eq!(
+            zero_budget.action,
+            CapabilityMissAction::Escalate,
+            "an operator who configured a zero budget still gets an immediate escalation"
+        );
+    }
+
+    #[test]
+    fn resolve_capability_miss_releases_then_escalates_at_the_bound() {
+        // Default budget of 5 against a fleet of DISTINCT incapable workers:
+        // misses 1..=5 release, the 6th distinct worker escalates. The returned
+        // count is what gets persisted, so it must be the POST-increment value
+        // (the release SQL does `+ 1` in the same UPDATE).
+        let fleet: Vec<String> = (0..6).map(|i| format!("worker-{i}")).collect();
+        for before in 0..5_i32 {
+            let seen_count = usize::try_from(before).expect("non-negative");
+            let r = resolve_capability_miss(
+                &fleet[..seen_count],
+                before,
+                &fleet[seen_count],
+                5,
+                None,
+                &[],
+            );
+            assert_eq!(
+                (r.action, r.total_after),
+                (CapabilityMissAction::Release, before + 1),
+                "miss {} of 5 (by a NEW worker) must release",
+                before + 1
+            );
+        }
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Escalate, 6),
+            "a 6th DISTINCT incapable worker exhausts the default budget of 5"
+        );
+    }
+
+    #[test]
+    fn capability_miss_budget_is_not_consumed_twice_by_the_same_worker() {
+        // Issue #804 (Codex round-6 P1): the backoff makes a released task
+        // eligible to EVERY worker again, including the one that just released
+        // it, and the claim query has no capability filter. Under plain
+        // total-miss accounting, six consecutive claim-race wins by ONE
+        // incapable worker terminally failed the run while a capable peer was
+        // live — the exact rolling-deploy outage #804 exists to prevent.
+        //
+        // The budget is therefore consumed per DISTINCT worker: a repeat miss
+        // by a worker already known to be incapable for this task is free.
+        let noisy = "incapable-pod-1".to_string();
+        let seen = vec![noisy.clone()];
+        for total_before in 1..40 {
+            let r = resolve_capability_miss(&seen, total_before, &noisy, 5, None, &[]);
+            assert_eq!(
+                r.action,
+                CapabilityMissAction::Release,
+                "repeat miss #{total_before} by the SAME worker must not consume budget"
+            );
+            assert_eq!(
+                r.distinct_after, 1,
+                "the distinct-worker set must not grow on a repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_total_ceiling_bounds_a_single_worker_bounce() {
+        // The distinct budget alone cannot terminate a fleet SMALLER than the
+        // budget (a lone incapable worker never grows the distinct set past 1),
+        // so AC3's "bounded release" needs an absolute ceiling as well.
+        //
+        // The empty `live_workers` here is load-bearing: it makes the evidence
+        // `Unavailable`, which is exactly the state the round-15 configured
+        // total bound withholds itself from (it would otherwise let one worker's
+        // repeat misses exhaust the budget -- the round-6 defect). So this is
+        // the case the ceiling still exists for, and it is a generous multiple
+        // of the budget: reaching it while a capable peer is live requires that
+        // peer to lose the claim race that many times in a row, which is
+        // vanishingly unlikely, while a genuinely capability-less fleet still
+        // terminates rather than bouncing forever.
+        let lone = "only-pod".to_string();
+        let seen = vec![lone.clone()];
+        let ceiling = 5 * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER;
+
+        let r = resolve_capability_miss(&seen, ceiling - 1, &lone, 5, None, &[]);
+        assert_eq!(
+            r.action,
+            CapabilityMissAction::Release,
+            "one below the ceiling still releases"
+        );
+
+        let r = resolve_capability_miss(&seen, ceiling, &lone, 5, None, &[]);
+        assert_eq!(
+            r.action,
+            CapabilityMissAction::Escalate,
+            "the total ceiling terminates a lone-incapable-worker bounce"
+        );
+    }
+
+    #[test]
+    fn resolve_capability_miss_zero_budget_escalates_immediately() {
+        // `0` is the pre-#804 fail-fast behaviour, NOT an unlimited-release
+        // switch — releasing forever would let a genuinely-unregistered type
+        // bounce around the fleet indefinitely.
+        let r = resolve_capability_miss(&[], 0, "w1", 0, None, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Escalate, 1)
+        );
+    }
+
+    #[test]
+    fn session_pinned_task_escalates_immediately_regardless_of_budget() {
+        // Issue #606: a session-pinned task's claim gate is
+        // `session_id IS NULL OR sticky_worker_id = $1`, so it can only ever go
+        // back to the SAME host. "Release it for a capable peer" is false by
+        // construction there, and bouncing it would burn the whole budget
+        // window before surfacing the real condition.
+        let session = Some(uuid::Uuid::new_v4());
+        assert!(!capability_miss_releasable(session));
+        let r = resolve_capability_miss(&[], 0, "w1", 5, session, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Escalate, 1),
+            "a session-pinned task must escalate on the FIRST miss"
+        );
+        // ...and the un-pinned control still releases with the same budget.
+        let r = resolve_capability_miss(&[], 0, "w1", 5, None, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Release, 1)
+        );
+    }
+
+    #[test]
+    fn resolve_capability_miss_tolerates_a_saturating_persisted_count() {
+        // A pathological persisted value must not panic on overflow.
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", 5, None, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Escalate, i32::MAX)
+        );
+    }
+
+    /// The Rust counter saturates; the Postgres column does **not**.
+    ///
+    /// `saturating_add` clamps at `i32::MAX`, but `capability_misses INT` is a
+    /// signed 4-byte column and `capability_misses + 1` at `2147483647` raises
+    /// `integer out of range` and aborts the statement. So a decision of
+    /// `Release` at the ceiling issues an UPDATE that can only fail, leaving the
+    /// task `RUNNING` and owned by a **live** worker — which the poison-pill
+    /// orphan reclaimer deliberately skips, because it only reclaims rows whose
+    /// worker has no live heartbeat.
+    ///
+    /// The guard is stated as an invariant on the value about to be persisted,
+    /// not on the budget: **never let the column reach `i32::MAX`**, so `+ 1` is
+    /// always representable. That covers both the already-saturated count and
+    /// the last legitimate increment, and holds however the ceiling was reached
+    /// (organically it never is — 2^31 releases at the 30 s backoff cap is
+    /// ~2000 years — but the column is writable by an operator, a backfill, or
+    /// a test seed).
+    /// The phase a raise site stamps must reach the dispatch site's strike
+    /// decision unchanged (issue #804, round 10).
+    ///
+    /// Pins the wiring, not the rule: `CapabilityMissPhase`'s own truth table
+    /// lives in `error.rs`. What can silently break *here* is the derivation in
+    /// `handle_capability_miss` — an inverted boolean, or a hard-coded `false`
+    /// reintroducing the pre-round-10 "never clear" behaviour that let a
+    /// healthy workflow bank issue #494 strikes it did not earn.
+    #[test]
+    fn missing_handler_phase_reaches_the_timeout_strike_decision() {
+        for (phase, expected) in [
+            (CapabilityMissPhase::AfterHandler, true),
+            (CapabilityMissPhase::BeforeHandler, false),
+            (CapabilityMissPhase::DuringHandler, false),
+        ] {
+            let missing = MissingHandler {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: "send_email",
+                phase,
+            };
+            // The exact expression both `Released` construction sites use.
+            assert_eq!(
+                missing.phase.clears_workflow_timeout_strike(),
+                expected,
+                "{phase:?} must {} the strike",
+                if expected { "clear" } else { "preserve" }
+            );
+            // And it must survive the trip through the outcome value.
+            let outcome = TaskDispatchOutcome::Released {
+                clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+            };
+            assert_eq!(
+                outcome,
+                TaskDispatchOutcome::Released {
+                    clears_timeout_strike: expected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_decision_escalates_at_the_storage_ceiling() {
+        // The exact shape flagged in review: a budget at or above the column's
+        // maximum cannot bound a saturated counter by comparison alone.
+        assert_eq!(
+            capability_miss_decision(i32::MAX, i32::MAX, i32::MAX.cast_unsigned(), ALL_MISSED),
+            CapabilityMissAction::Escalate,
+            "a saturated counter must escalate even when the budget is i32::MAX"
+        );
+        assert_eq!(
+            capability_miss_decision(i32::MAX, i32::MAX, u32::MAX, ALL_MISSED),
+            CapabilityMissAction::Escalate,
+            "a budget above the column's range is clamped, not wrapped, and still \
+             must not authorise an overflowing increment"
+        );
+        // One below the ceiling is the last value the column may hold, so this
+        // is where the guard starts: persisting it would make the NEXT `+ 1`
+        // unrepresentable.
+        assert_eq!(
+            capability_miss_decision(i32::MAX - 1, i32::MAX - 1, u32::MAX, ALL_MISSED),
+            CapabilityMissAction::Release,
+            "the guard must fire only at the ceiling, not one short of it"
+        );
+        // End to end through the real entry point.
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", u32::MAX, None, &[]);
+        assert_eq!(
+            (r.action, r.total_after),
+            (CapabilityMissAction::Escalate, i32::MAX),
+            "the persisted-count path must reach the same verdict"
+        );
+        // A normal budget is completely unaffected.
+        assert_eq!(
+            capability_miss_decision(3, 3, 5, ALL_MISSED),
+            CapabilityMissAction::Release,
+            "the ceiling guard must not perturb ordinary budgets"
+        );
+    }
+
+    // (A near-duplicate of `no_capable_worker_reason_carries_the_stable_prefix_and_detail`
+    // lived here. Its assertions were a strict subset — and its budget check was
+    // `contains('5')`, a single-char containment that could not detect an
+    // off-by-one — so it was folded into that test and the session-variant test
+    // above rather than kept as a weaker second copy.)
+
+    // -----------------------------------------------------------------------
     // Contained workflow handler-panic retry (issue #782)
     // -----------------------------------------------------------------------
 
@@ -18972,6 +29192,183 @@ mod tests {
         assert_eq!(panic_retry_decision(1, 0), PanicRetryDecision::Terminal);
         // max == 1 is terminal on the first strike.
         assert_eq!(panic_retry_decision(1, 1), PanicRetryDecision::Terminal);
+    }
+
+    #[test]
+    fn failure_clears_panic_strike_preserves_pre_and_mid_handler_capability_misses() {
+        // An ordinary error terminally fails the execution here, so the strike
+        // entry must go -- retaining it would leak one `u32` per such execution.
+        assert!(
+            failure_clears_panic_strike(&HarvestError::NotFound("gone".into())),
+            "an ordinary error ends the execution, so its strike entry must be \
+             released"
+        );
+        // A capability miss (issue #804) is NON-terminal on the pre-/mid-handler
+        // phases: `fail_execution_on_error` passes it through un-failed so the
+        // dispatch path can release the task for a capable peer. It observed
+        // nothing about the body, so it must not reset the panic streak.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let miss = HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase,
+            };
+            assert!(
+                !failure_clears_panic_strike(&miss),
+                "a {phase:?} capability miss is released, not failed: clearing \
+                 here lets a worker alternating panics and local-activity misses \
+                 reset `workflow_panic_max_attempts` forever (Codex round-13 P2)"
+            );
+        }
+        // A post-handler miss DID watch the body return its commands, so it is
+        // genuine evidence the panic streak is broken.
+        assert!(
+            failure_clears_panic_strike(&HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase: CapabilityMissPhase::AfterHandler,
+            }),
+            "the body ran to a conclusion without panicking"
+        );
+    }
+
+    #[test]
+    fn apply_panic_strike_clear_for_failure_mutates_the_map_per_phase() {
+        // The decision is only useful if it reaches the map, so exercise the
+        // mutation itself -- no DB connection required.
+        let exec_id = uuid::Uuid::new_v4();
+        let seed = || std::sync::Mutex::new(std::collections::HashMap::from([(exec_id, 2_u32)]));
+
+        // `Ok` never touches the map (a clean cycle clears the strike through
+        // the panic gate, not through this failure path).
+        let strikes = seed();
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &Ok::<(), HarvestError>(()));
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "a successful result is not a failure and must not mutate the map"
+        );
+
+        // A pre-/mid-handler capability miss preserves the streak.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let strikes = seed();
+            let result: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
+                kind: "workflow",
+                name: "onboarding".into(),
+                phase,
+            });
+            apply_panic_strike_clear_for_failure(&strikes, exec_id, &result);
+            assert_eq!(
+                strikes.lock().unwrap().get(&exec_id).copied(),
+                Some(2),
+                "a {phase:?} miss releases the task; the streak must survive"
+            );
+        }
+
+        // A post-handler miss, and any ordinary error, clear it.
+        let strikes = seed();
+        let after: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+            phase: CapabilityMissPhase::AfterHandler,
+        });
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &after);
+        assert!(strikes.lock().unwrap().is_empty());
+
+        let strikes = seed();
+        let ordinary: HarvestResult<()> = Err(HarvestError::NotFound("gone".into()));
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &ordinary);
+        assert!(strikes.lock().unwrap().is_empty());
+    }
+
+    /// **Issue #804 round-16 P2.** An *escalated* capability miss must clear the
+    /// #782 panic strike, because escalation terminally fails the execution.
+    ///
+    /// Round 13 stopped a pre-/mid-handler miss from clearing the strike, which
+    /// is right for the **release** path — the execution stays `RUNNING` and the
+    /// streak must survive. Escalation is the opposite: it routes through
+    /// `fail_task_and_execution`, so there is no later cycle for that execution
+    /// and the entry would sit in the map for the worker's lifetime — exactly
+    /// the leak `apply_panic_strike_clear_for_failure`'s ordinary-error arm
+    /// exists to prevent.
+    ///
+    /// The discriminator is deliberately the **re-raised typed error**:
+    /// `escalate_capability_miss` re-raises `HandlerNotRegistered` only *after*
+    /// `fail_task_and_execution` succeeded, so this shape means "terminally
+    /// failed" and nothing else. A DB error from the terminal write propagates
+    /// as its own variant and preserves the strike, which is what the
+    /// stranded-row re-drive needs.
+    #[test]
+    fn capability_miss_escalation_clears_the_panic_strike() {
+        let exec_id = uuid::Uuid::new_v4();
+        let seed = || std::sync::Mutex::new(std::collections::HashMap::from([(exec_id, 2_u32)]));
+
+        // Escalation re-raises the typed miss after the terminal write landed.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let strikes = seed();
+            let escalated: HarvestResult<TaskDispatchOutcome> =
+                Err(HarvestError::HandlerNotRegistered {
+                    kind: "workflow",
+                    name: "onboarding".into(),
+                    phase,
+                });
+            clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &escalated);
+            assert!(
+                strikes.lock().unwrap().is_empty(),
+                "a {phase:?} escalation terminally fails the execution, so the \
+                 strike entry must not outlive it"
+            );
+        }
+
+        // A release is non-terminal: round 13's protection stands.
+        let strikes = seed();
+        let released: HarvestResult<TaskDispatchOutcome> = Ok(TaskDispatchOutcome::Released {
+            clears_timeout_strike: false,
+        });
+        clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &released);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "a released task keeps running; clearing here would let a worker \
+             alternating panic/miss hold workflow_panic_max_attempts out of reach"
+        );
+
+        // The terminal write failed, so the row is stranded `RUNNING` and will
+        // be re-driven. Preserving the streak is the whole point of round 13.
+        let strikes = seed();
+        let write_failed: HarvestResult<TaskDispatchOutcome> =
+            Err(HarvestError::NotFound("terminal write lost the row".into()));
+        clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &write_failed);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "no terminal write means no terminal execution; the strike survives"
+        );
+
+        // A task with no owning execution has no key to clear.
+        let strikes = seed();
+        let escalated: HarvestResult<TaskDispatchOutcome> =
+            Err(HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase: CapabilityMissPhase::BeforeHandler,
+            });
+        clear_panic_strike_on_capability_miss_escalation(&strikes, None, &escalated);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "an orphan task cannot name an execution, so nothing is cleared"
+        );
     }
 
     #[test]
@@ -19120,6 +29517,41 @@ mod tests {
         patch.insert("build_id".to_string(), Some(serde_json::json!("v1")));
         let result = apply_raw_search_attrs_patch_in_memory(None, &patch);
         assert_eq!(result, Some(serde_json::json!({"build_id": "v1"})));
+    }
+
+    /// Issue #777 review (Codex): `search_attrs` is an unvalidated JSON value
+    /// at the model layer -- a string or array base with a removal-only
+    /// patch (the shape `nd_search_attrs_clear_patch` always produces) must
+    /// be preserved verbatim, not silently discarded into `{}`.
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_non_object_base_removal_only_patch_preserves_base() {
+        let string_base = Some(serde_json::json!("just_a_string"));
+        let array_base = Some(serde_json::json!([1, 2, 3]));
+        let removal_only = nd_search_attrs_clear_patch();
+
+        assert_eq!(
+            apply_raw_search_attrs_patch_in_memory(string_base.clone(), &removal_only),
+            string_base,
+            "a non-object string base must survive a removal-only patch unchanged"
+        );
+        assert_eq!(
+            apply_raw_search_attrs_patch_in_memory(array_base.clone(), &removal_only),
+            array_base,
+            "a non-object array base must survive a removal-only patch unchanged"
+        );
+    }
+
+    /// Documents the deliberate asymmetry: a non-object base survives a
+    /// removal-only patch, but a patch that also INSERTS a key has no
+    /// faithful non-object representation, so it still coerces to a fresh
+    /// object -- unchanged from the pre-fix behavior for this shape.
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_non_object_base_with_insertion_still_coerces() {
+        let base = Some(serde_json::json!("just_a_string"));
+        let mut patch = std::collections::HashMap::new();
+        patch.insert("key".to_string(), Some(serde_json::json!("val")));
+        let result = apply_raw_search_attrs_patch_in_memory(base, &patch);
+        assert_eq!(result, Some(serde_json::json!({"key": "val"})));
     }
 
     #[test]
@@ -19472,7 +29904,10 @@ mod tests {
                 handler_panic: false,
                 unhandled_signals: std::collections::BTreeMap::new(),
             },
-            WorkflowOutcome::ContinuedAsNew { input: Value::Null },
+            WorkflowOutcome::ContinuedAsNew {
+                input: Value::Null,
+                new_workflow_type: None,
+            },
         ] {
             let source = update_result_command_source(&outcome, &pending_cmds);
             assert_eq!(
@@ -19667,8 +30102,11 @@ mod tests {
             "a Suspended outcome is not terminal — nothing to emit"
         );
         assert!(
-            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew { input: Value::Null })
-                .is_empty(),
+            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew {
+                input: Value::Null,
+                new_workflow_type: None
+            })
+            .is_empty(),
             "continue-as-new carries no unhandled-signal map"
         );
     }
@@ -19703,5 +30141,1130 @@ mod tests {
             &outcome_unhandled_signals(&WorkflowOutcome::Suspended { commands: vec![] }),
         );
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    // ── Issue #744 — `next_retry_delay` pure unit tests ──────────────────────
+    //
+    // Before this section, `next_retry_delay` had ZERO direct unit tests --
+    // every AC2/AC3/AC4/AC5 behavior was exercised only indirectly through the
+    // slow, wall-clock-tolerant DB-backed tests in
+    // `tests/integration/retry_after_tests.rs` (whose windows are wide enough
+    // that e.g. a zero-hint fallthrough test still passes even if the whole
+    // `retry_after` feature were reverted -- see the PR #744 review). These
+    // tests pin the EXACT resolved delay at the point it is computed, with
+    // zero I/O, zero wall-clock tolerance, and zero database dependency.
+
+    use crate::failure::{ActivityFailure, IntoActivityErrorString as _};
+
+    fn retry_after_test_task(attempt: i32, max_attempts: i32) -> TaskQueueItem {
+        TaskQueueItem {
+            id: uuid::Uuid::nil(),
+            queue_name: "default".to_owned(),
+            task_type: "activity".to_owned(),
+            workflow_exec_id: None,
+            activity_name: Some("call_api".to_owned()),
+            activity_id: None,
+            input: Value::Null,
+            state: "RUNNING".to_owned(),
+            priority: 0,
+            worker_id: None,
+            attempt,
+            max_attempts,
+            scheduled_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            output: None,
+            error: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+            crash_strikes: 0,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
+            created_at: None,
+            wake_requested: false,
+            session_id: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+            capability_miss_handler: None,
+        }
+    }
+
+    #[test]
+    fn next_retry_delay_non_retryable_wins_over_retry_after() {
+        // AC4: non_retryable must win over retry_after unconditionally, even
+        // when the hint is tiny and attempts remain.
+        let task = retry_after_test_task(1, 5);
+        let policy = RetryPolicy::fixed(5, Duration::from_secs(30));
+        let error = ActivityFailure::non_retryable("Fatal", "boom")
+            .with_retry_after(Duration::from_millis(1))
+            .into_error_payload();
+        let delay =
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_attempt_cap_reached_with_policy_ignores_retry_after() {
+        // AC2: once the policy's attempt cap denies a retry, retry_after
+        // cannot resurrect it -- the cap gate runs strictly before the hint
+        // is ever consulted.
+        let task = retry_after_test_task(2, 2);
+        let policy = RetryPolicy::fixed(2, Duration::from_secs(30));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay =
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_attempt_cap_reached_without_policy_ignores_retry_after() {
+        // The `retry_policy: None` fallback branch gates on `task.attempt >=
+        // task.max_attempts` identically -- AC2 holds on both branches.
+        let task = retry_after_test_task(3, 3);
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_retry_after_overrides_policy_delay_with_exact_value() {
+        // AC2: the hint replaces the policy-computed backoff for this attempt
+        // only -- exact value, not merely "close to" it.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(999));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(2))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn next_retry_delay_retry_after_over_ceiling_is_clamped_to_exact_ceiling() {
+        // AC3: an over-ceiling hint clamps DOWN to the ceiling, never rejected.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(999));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(999))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(1))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn next_retry_delay_zero_retry_after_falls_through_to_exact_policy_delay() {
+        // AC3: a non-positive (here, exactly zero) hint falls through to the
+        // policy delay -- it must NOT resolve to an immediate retry.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::ZERO)
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(
+            delay,
+            chrono::Duration::seconds(2),
+            "a zero hint must fall through to the policy delay, not resolve to an immediate retry"
+        );
+    }
+
+    #[test]
+    fn next_retry_delay_no_retry_after_falls_through_to_exact_policy_delay() {
+        // A plain legacy `Err(String)` recovers no typed `ActivityFailure`, so
+        // `retry_after` is `None` and the policy delay is used verbatim.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+        let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(5));
+    }
+
+    #[test]
+    fn next_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry() {
+        // Documents a real, confirmed edge case (issue #744 review): a
+        // ceiling of ZERO does NOT disable the retry_after mechanism. For any
+        // positive hint, `hint.min(ZERO) == ZERO`, so the retry is scheduled
+        // IMMEDIATELY (delay == 0) rather than falling back to the policy
+        // delay -- the opposite of what an operator setting "0 = off" would
+        // likely expect. There is no separate "disable retry_after honoring"
+        // switch today; see `resolve_retry_after_hint`'s doc comment.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(30));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::ZERO)
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(0));
+    }
+
+    #[test]
+    fn next_retry_delay_no_policy_no_retry_after_uses_one_second_fallback() {
+        // The `retry_policy: None` branch's own `Duration::from_secs(1)`
+        // fallback (when an attempt remains) is untouched when no hint is
+        // present.
+        let task = retry_after_test_task(1, 3);
+        let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn next_retry_delay_no_policy_retry_after_overrides_one_second_fallback() {
+        // AC7: retry_after is honored uniformly -- including the
+        // `retry_policy: None` fallback branch, not just an explicit
+        // `RetryPolicy`.
+        let task = retry_after_test_task(1, 3);
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_millis(250))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::milliseconds(250));
+    }
+
+    // ── local activities must honor retry_after too (issue #744, Codex ──
+    // ── review on PR #1140) ────────────────────────────────────────────
+    //
+    // `run_local_activity_inline`'s non-terminal-retry sleep is a code path
+    // entirely separate from `next_retry_delay` above (local activities never
+    // get a `harvest_task_queue` row -- their retry loop runs inline in the
+    // workflow task). Before this fix it read only
+    // `run.retry_policy.next_delay(attempt)`, ignoring both
+    // `ActivityFailure::retry_after` and the configured ceiling. These tests
+    // exercise the extracted pure helper `local_retry_delay` directly, mirroring
+    // the `next_retry_delay_*` suite above exactly.
+
+    #[test]
+    fn local_retry_delay_hint_overrides_policy_delay_with_exact_value() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(2));
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(999)),
+            Some(&failure),
+            Duration::from_secs(900),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn local_retry_delay_no_hint_falls_through_to_exact_policy_delay() {
+        let delay = local_retry_delay(Some(Duration::from_secs(5)), None, Duration::from_secs(900));
+        assert_eq!(delay, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn local_retry_delay_zero_hint_falls_through_to_exact_policy_delay() {
+        let failure = ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::ZERO);
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(5)),
+            Some(&failure),
+            Duration::from_secs(900),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn local_retry_delay_over_ceiling_hint_is_clamped_to_exact_ceiling() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(999));
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(5)),
+            Some(&failure),
+            Duration::from_secs(1),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn local_retry_delay_no_policy_delay_and_no_hint_is_none() {
+        // Defensive: the real call site only reaches this helper on a
+        // non-terminal attempt, where `policy_delay` is always `Some` in
+        // practice (see `local_retry_delay`'s doc comment) -- but the helper
+        // itself must not panic or fabricate a delay when it is `None`.
+        let delay = local_retry_delay(None, None, Duration::from_secs(900));
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn local_retry_delay_hint_present_with_no_policy_delay_still_uses_hint() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(3));
+        let delay = local_retry_delay(None, Some(&failure), Duration::from_secs(900));
+        assert_eq!(delay, Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn local_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry() {
+        // Mirrors `next_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry`
+        // -- a ceiling of ZERO is not a "disable retry_after" switch here either.
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(5));
+        let delay = local_retry_delay(Some(Duration::from_secs(5)), Some(&failure), Duration::ZERO);
+        assert_eq!(delay, Some(Duration::ZERO));
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ─────────────────────────────
+
+    /// Minimal registered workflow type for the #803 target-resolution tests.
+    fn can803_wf_info(name: &'static str) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "app::phases",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    /// Predecessor row shaped like a live entity run whose lifecycle columns
+    /// all differ from the target type's declared defaults, so a test can tell
+    /// "carried verbatim" apart from "resolved from the new type".
+    fn can803_predecessor() -> WorkflowExecution {
+        WorkflowExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "trial_subscription".to_string(),
+            workflow_id: "sub-42".to_string(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            input: serde_json::json!({}),
+            output: None,
+            error: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            parent_id: None,
+            queue_name: "default".to_string(),
+            execution_timeout: Some(chrono::Duration::seconds(600)),
+            deadline_at: None,
+            sla: Some(chrono::Duration::seconds(300)),
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
+            memo: None,
+            search_attrs: None,
+            sticky_worker_id: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: Some("growth-team".to_string()),
+            runbook_url: Some("https://runbooks/trial".to_string()),
+            severity: Some("SEV3".to_string()),
+            context_headers: None,
+            paused_at: None,
+            pause_reason: None,
+            pause_actor: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: Some(serde_json::json!({"predecessor": true})),
+            retry_of_exec_id: None,
+            nd_blocked_at: None,
+            nd_block_reason: None,
+            nd_block_count: 0,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            origin: None,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            current_details: None,
+            chain_execution_timeout: Some(chrono::Duration::seconds(86_400)),
+            chain_deadline_at: Some(chrono::Utc::now() + chrono::Duration::seconds(80_000)),
+            history_bloat_warned_at: None,
+            triage_note: None,
+            quota_key: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// AC1/AC4: a same-type continuation (`new_workflow_type: None`) keeps the
+    /// pre-#803 behavior exactly — every lifecycle column carried verbatim from
+    /// the predecessor, only the two per-run deadlines re-anchored.
+    #[test]
+    fn can803_same_type_carries_every_lifecycle_column_verbatim() {
+        let execution = can803_predecessor();
+        let now = chrono::Utc::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
+
+        assert_eq!(defaults.execution_timeout, execution.execution_timeout);
+        assert_eq!(defaults.sla, execution.sla);
+        assert_eq!(defaults.owner, Some("growth-team"));
+        assert_eq!(defaults.runbook_url, Some("https://runbooks/trial"));
+        assert_eq!(defaults.severity, Some("SEV3"));
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(serde_json::json!({"predecessor": true}))
+        );
+        // Per-run deadlines re-anchor to the successor's start.
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + chrono::Duration::seconds(600))
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(300))
+        );
+        // The #617 chain cap is CHAIN-scoped: carried verbatim, never re-anchored.
+        assert_eq!(
+            defaults.chain_execution_timeout,
+            execution.chain_execution_timeout
+        );
+        assert_eq!(defaults.chain_deadline_at, execution.chain_deadline_at);
+    }
+
+    /// AC4 + issue #617: a *cross-type* continuation resolves per-run defaults
+    /// from the target, but the chain lifetime cap is still carried **verbatim**
+    /// — otherwise changing type would be an escape hatch from the runaway-loop
+    /// budget the whole chain shares. The target here deliberately declares its
+    /// OWN, different `chain_execution_timeout` so a re-resolve would be visible.
+    #[test]
+    fn can803_cross_type_carries_the_chain_cap_verbatim_not_from_the_target() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.chain_execution_timeout = Some(Duration::from_secs(3));
+        let now = chrono::Utc::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+
+        assert_eq!(
+            defaults.chain_execution_timeout, execution.chain_execution_timeout,
+            "the chain cap belongs to the chain, not to the phase being entered"
+        );
+        assert_eq!(
+            defaults.chain_deadline_at, execution.chain_deadline_at,
+            "the absolute chain deadline must be copied, never re-anchored to now"
+        );
+        assert_ne!(
+            defaults.chain_execution_timeout,
+            target
+                .chain_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok()),
+            "a type change must not adopt the target's own chain cap"
+        );
+    }
+
+    /// AC4 (the headline): a cross-type continuation resolves the successor's
+    /// lifecycle defaults from the TARGET type's `WorkflowInfo`, not the
+    /// predecessor's row.
+    #[test]
+    fn can803_cross_type_resolves_defaults_from_the_target_type() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(7_200));
+        target.sla = Some(Duration::from_secs(1_800));
+        target.owner = Some("billing-team");
+        target.runbook_url = Some("https://runbooks/paid");
+        target.severity = Some("SEV1");
+        target.retry_policy = Some(crate::policy::RetryPolicy::fixed(5, Duration::from_secs(2)));
+
+        let now = chrono::Utc::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::seconds(7_200)),
+            "execution_timeout must come from the target type (#243)"
+        );
+        assert_eq!(
+            defaults.sla,
+            Some(chrono::Duration::seconds(1_800)),
+            "sla must come from the target type (#487)"
+        );
+        assert_eq!(
+            defaults.owner,
+            Some("billing-team"),
+            "ops metadata follows the phase (#372)"
+        );
+        assert_eq!(defaults.runbook_url, Some("https://runbooks/paid"));
+        assert_eq!(defaults.severity, Some("SEV1"));
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(
+                serde_json::to_value(crate::policy::RetryPolicy::fixed(5, Duration::from_secs(2)))
+                    .unwrap()
+            ),
+            "the successor retries under its own type's policy (#523)"
+        );
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + chrono::Duration::seconds(7_200))
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(1_800))
+        );
+    }
+
+    /// A target type that declares no lifecycle defaults yields none — the
+    /// predecessor's are NOT inherited as a fallback, or the successor would
+    /// silently run under a timeout its own type never declared.
+    #[test]
+    fn can803_cross_type_target_without_defaults_clears_them() {
+        let execution = can803_predecessor();
+        let target = can803_wf_info("churned");
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+
+        assert!(defaults.execution_timeout.is_none());
+        assert!(defaults.deadline_at.is_none());
+        assert!(defaults.sla.is_none());
+        assert!(defaults.sla_deadline_at.is_none());
+        assert!(defaults.owner.is_none());
+        assert!(defaults.runbook_url.is_none());
+        assert!(defaults.severity.is_none());
+        assert!(defaults.workflow_retry_policy.is_none());
+    }
+
+    /// The soft SLA is clamped to at most the hard execution timeout, mirroring
+    /// the start path — never a soft deadline the hard one would preempt.
+    #[test]
+    fn can803_cross_type_clamps_sla_to_the_execution_timeout() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(60));
+        target.sla = Some(Duration::from_secs(600));
+
+        let now = chrono::Utc::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        assert_eq!(
+            defaults.sla,
+            Some(chrono::Duration::seconds(60)),
+            "sla must clamp down to the hard timeout"
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(60))
+        );
+    }
+
+    /// A pathological declared duration must yield `None` rather than panic on
+    /// the `DateTime + Duration` overflow.
+    ///
+    /// Note this pins the *resolver's* no-panic behaviour only. Such a
+    /// declaration never reaches persistence: the transition is rejected
+    /// upstream by `classify_successor_deadline_representable`, so a row with
+    /// `execution_timeout = Some(..)` and `deadline_at = NULL` is unreachable
+    /// (see `can803_unrepresentable_execution_timeout_is_rejected`). The
+    /// no-panic guarantee is kept as defense in depth for any future caller.
+    #[test]
+    fn can803_cross_type_overflowing_timeout_does_not_panic() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(u64::from(u32::MAX) * 4_000));
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(
+            defaults.deadline_at.is_none(),
+            "an unrepresentable deadline must degrade to None, never panic"
+        );
+    }
+
+    /// AC5: the blank / unregistered / registered matrix for a continuation
+    /// target, decided without touching a database.
+    #[test]
+    fn can803_target_classification_matrix() {
+        let registry = HandlerRegistry::new(vec![can803_wf_info("paid_subscription")], vec![]);
+
+        assert!(
+            matches!(
+                classify_continue_as_new_target(&registry, None),
+                Ok(ContinueAsNewTypeCheck::SameType)
+            ),
+            "no target named => same-type continuation"
+        );
+        assert!(
+            matches!(
+                classify_continue_as_new_target(&registry, Some("paid_subscription")),
+                Ok(ContinueAsNewTypeCheck::CrossType(_))
+            ),
+            "a registered target resolves to its WorkflowInfo"
+        );
+
+        let unregistered = classify_continue_as_new_target(&registry, Some("churned"))
+            .err()
+            .expect("an unregistered target must be rejected");
+        assert!(
+            unregistered.contains("churned") && unregistered.contains("not registered"),
+            "the operator message must name the type and the reason, got {unregistered}"
+        );
+
+        for blank in ["", "   "] {
+            let err = classify_continue_as_new_target(&registry, Some(blank))
+                .err()
+                .expect("a blank target must be rejected");
+            assert!(err.contains("blank"), "got {err}");
+        }
+    }
+
+    /// A unified DAG's shadow `WorkflowInfo` lives in `registry.workflows` like
+    /// any other type, so without an explicit check it would be accepted and
+    /// the successor would run the DAG's level-walker with the `max_active_runs`
+    /// / paused-schedule admission gates bypassed. DAG continue-as-new is out
+    /// of scope for issue #803: reject it, don't half-support it.
+    #[test]
+    fn can803_rejects_a_unified_dag_target() {
+        let registry = HandlerRegistry::new(
+            vec![
+                can803_wf_info("paid_subscription"),
+                can803_wf_info("nightly_rollup"),
+            ],
+            vec![],
+        )
+        .with_dag_workflow_names(["nightly_rollup"]);
+
+        let err = classify_continue_as_new_target(&registry, Some("nightly_rollup"))
+            .err()
+            .expect("a DAG target must be rejected even though it is 'registered'");
+        assert!(
+            err.contains("nightly_rollup") && err.contains("DAG") && err.contains("trigger"),
+            "the message must name the DAG and point at the trigger route, got {err}"
+        );
+
+        // A plain workflow of the same registry is unaffected.
+        assert!(matches!(
+            classify_continue_as_new_target(&registry, Some("paid_subscription")),
+            Ok(ContinueAsNewTypeCheck::CrossType(_))
+        ));
+    }
+
+    /// The successor takes the `(target, workflow_id)` uniqueness slot, which
+    /// sealing the predecessor does NOT free. **Any** occupant is rejected —
+    /// live because harvest admits one active run per identity, terminal
+    /// because releasing it would rewrite an unrelated run's recorded outcome
+    /// (Codex P1s on PR #1159) — EXCEPT the predecessor itself, whose own seal
+    /// frees the slot in the same transaction.
+    #[test]
+    fn can803_successor_slot_classification_matrix() {
+        let predecessor = uuid::Uuid::new_v4();
+        let occupant = uuid::Uuid::new_v4();
+
+        assert_eq!(
+            classify_successor_slot("paid_subscription", "sub-1", predecessor, None),
+            Ok(SuccessorSlot::Free),
+            "an unoccupied slot needs no release"
+        );
+
+        // A TERMINAL occupant is rejected, never released. Releasing it by
+        // re-stating it `CONTINUED_AS_NEW` would make it read as a dangling
+        // LINK (parking `await_external_workflow` forever, blanking `/result`)
+        // and would drop a schedule-attributed run out of #488 carryover,
+        // rolling an incremental cursor backward.
+        for terminal in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"] {
+            let err = classify_successor_slot(
+                "paid_subscription",
+                "sub-1",
+                predecessor,
+                Some((occupant, terminal)),
+            )
+            .expect_err("a terminal occupant must be rejected, not silently released");
+            assert!(
+                err.contains("paid_subscription")
+                    && err.contains("sub-1")
+                    && err.contains(terminal)
+                    && err.contains(&occupant.to_string()),
+                "the message must name the type, workflow_id, state and execution, got {err}"
+            );
+            assert!(
+                err.contains("Reset") || err.contains("reset"),
+                "the message must tell the operator how to free the key, got {err}"
+            );
+        }
+
+        for live in ["RUNNING", "PAUSED"] {
+            let err = classify_successor_slot(
+                "paid_subscription",
+                "sub-1",
+                predecessor,
+                Some((occupant, live)),
+            )
+            .expect_err("a live occupant must be rejected");
+            assert!(
+                err.contains("paid_subscription")
+                    && err.contains("sub-1")
+                    && err.contains(live)
+                    && err.contains(&occupant.to_string()),
+                "the message must name the type, workflow_id, state and execution, got {err}"
+            );
+        }
+
+        // Naming your OWN type is supported (it re-resolves that type's
+        // declared defaults). The predecessor occupies the slot it is about to
+        // vacate, so it must never be read as blocking itself.
+        for own_state in ["RUNNING", "PAUSED"] {
+            assert_eq!(
+                classify_successor_slot(
+                    "paid_subscription",
+                    "sub-1",
+                    predecessor,
+                    Some((predecessor, own_state))
+                ),
+                Ok(SuccessorSlot::Free),
+                "the predecessor's own seal frees the slot; it cannot block itself"
+            );
+        }
+    }
+
+    /// The fleet-wide `execution_timeout` ceiling (#243) applies to a
+    /// cross-type successor exactly as it does to every other registry-aware
+    /// start path — otherwise a type change would be an escape hatch from the
+    /// per-run cap the same declaration is clamped by over HTTP.
+    #[test]
+    fn can803_cross_type_applies_the_execution_timeout_ceiling() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(30 * 24 * 3_600));
+
+        let now = chrono::Utc::now();
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(1)),
+            None,
+            now,
+        );
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::hours(1)),
+            "the declared 30d must clamp down to the operator's 1h ceiling"
+        );
+        assert_eq!(defaults.deadline_at, Some(now + chrono::Duration::hours(1)));
+
+        // A declaration already under the ceiling is untouched.
+        target.execution_timeout = Some(Duration::from_secs(60));
+        let under = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(1)),
+            None,
+            now,
+        );
+        assert_eq!(under.execution_timeout, Some(chrono::Duration::seconds(60)));
+    }
+
+    /// The fleet-wide workflow-attempts ceiling (#523) applies to a cross-type
+    /// successor's retry policy, so changing type is not an escape hatch from
+    /// an operator's retry cap (Codex P1 on PR #1159).
+    ///
+    /// Load-bearing because the consumer is authoritative on the STORED value:
+    /// `schedule_workflow_retry` gates on `attempt >= policy.max_attempts` read
+    /// straight off the row and never re-clamps, so an unclamped write here
+    /// would let a target type declaring `max_attempts: 100` actually run 100
+    /// attempts under a ceiling of 3.
+    #[test]
+    fn can803_cross_type_applies_the_workflow_attempts_ceiling() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.retry_policy = Some(RetryPolicy::fixed(100, Duration::from_secs(1)));
+        let now = chrono::Utc::now();
+
+        let clamped = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            Some(3),
+            now,
+        );
+        let stored: RetryPolicy = serde_json::from_value(
+            clamped
+                .workflow_retry_policy
+                .expect("a declared policy must be carried"),
+        )
+        .expect("stored policy round-trips");
+        assert_eq!(
+            stored.max_attempts, 3,
+            "the declared 100 attempts must clamp down to the operator's ceiling of 3"
+        );
+
+        // A declaration already under the ceiling is untouched...
+        target.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
+        let under = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            Some(3),
+            now,
+        );
+        let stored: RetryPolicy =
+            serde_json::from_value(under.workflow_retry_policy.expect("policy carried"))
+                .expect("stored policy round-trips");
+        assert_eq!(
+            stored.max_attempts, 2,
+            "the ceiling must not RAISE a budget"
+        );
+
+        // ...and with no ceiling configured the declaration passes through.
+        target.retry_policy = Some(RetryPolicy::fixed(100, Duration::from_secs(1)));
+        let unbounded =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        let stored: RetryPolicy =
+            serde_json::from_value(unbounded.workflow_retry_policy.expect("policy carried"))
+                .expect("stored policy round-trips");
+        assert_eq!(stored.max_attempts, 100);
+    }
+
+    /// The SAME-type (legacy) arm carries the predecessor's stored policy
+    /// verbatim and must NOT be re-clamped: that value was already clamped when
+    /// the chain's first run started, and re-clamping here would silently
+    /// shrink an in-flight chain's budget if an operator lowered the ceiling
+    /// mid-flight. Pins the pre-#803 path as byte-identical.
+    #[test]
+    fn can803_same_type_retry_policy_is_not_reclamped_by_the_ceiling() {
+        let mut execution = can803_predecessor();
+        execution.workflow_retry_policy = Some(serde_json::json!({"max_attempts": 50}));
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            None,
+            None,
+            Some(3),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(serde_json::json!({"max_attempts": 50})),
+            "the same-type arm must carry the stored policy verbatim"
+        );
+    }
+
+    /// Naming the run's OWN type must never trip the cross-shard guard, even on
+    /// an execution whose pinned shard differs from its rendezvous hash
+    /// (Codex P2 on PR #1159).
+    ///
+    /// `continue_as_new_as(&own_info(), ..)` is a supported request (it
+    /// re-resolves that type's declared defaults, which the legacy
+    /// `continue_as_new` deliberately does not) and it does not change
+    /// `(workflow_name, workflow_id)` at all — so the misrouting rationale the
+    /// guard exists for simply does not apply. Explicit shard placement
+    /// (issue #697) makes this REACHABLE rather than theoretical: a pinned run
+    /// lives on an operator-chosen shard precisely so that it does NOT sit on
+    /// its hash-derived one, so without this arm every such entity would be
+    /// failed terminally the moment it named its own type.
+    #[test]
+    fn can803_naming_own_type_is_exempt_from_the_cross_shard_guard() {
+        use crate::types::ShardId;
+
+        // The reachable shape: pinned to shard 0 (issue #697), hashes to 2.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "trial_subscription",
+                "trial_subscription",
+                "sub-42",
+                0,
+                Some(ShardId::new(2)),
+            )
+            .is_ok(),
+            "naming the run's own type must be exempt: the key is unchanged, so a pinned \
+             execution whose hash points elsewhere must still be allowed to continue"
+        );
+
+        // ...and a GENUINE type change on that same divergent routing is still
+        // rejected, so the exemption above cannot be masking a dead guard.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-42",
+                0,
+                Some(ShardId::new(2)),
+            )
+            .is_err(),
+            "a real type change on divergent routing must still be rejected"
+        );
+    }
+
+    /// A target whose declared `execution_timeout` cannot be represented as an
+    /// absolute deadline must FAIL the transition, not silently produce a run
+    /// with `execution_timeout = Some(..)` and `deadline_at = NULL`
+    /// (Codex P2 on PR #1159).
+    ///
+    /// Load-bearing because the scanner is authoritative on `deadline_at`:
+    /// `enforce_workflow_execution_timeouts` selects
+    /// `deadline_at IS NOT NULL AND deadline_at < now` (`timeout.rs:1838-1847`),
+    /// so a NULL deadline is NEVER enforced. Storing the duration anyway would
+    /// leave a row that CLAIMS a hard runaway cap it does not have.
+    ///
+    /// This is the first path that resolves the TARGET type's declaration: the
+    /// normal start path computes `target_start_time + d` with a plain `+`
+    /// (`execution.rs:592`), which panics rather than persisting such a run, so
+    /// a type whose declaration overflows could never have been started
+    /// directly. Refusing here matches that "no run is created with a lying
+    /// field" outcome, as a diagnosable terminal failure instead of a panic.
+    #[test]
+    fn can803_unrepresentable_execution_timeout_is_rejected() {
+        let now = chrono::Utc::now();
+
+        // Representable: allowed, and no ceiling needed.
+        assert!(
+            classify_successor_deadline_representable(
+                "paid_subscription",
+                Some(chrono::Duration::hours(24)),
+                now,
+            )
+            .is_ok(),
+            "an ordinary declared timeout must not be rejected"
+        );
+
+        // Absent: allowed -- "no timeout" is a legitimate declaration, and
+        // `deadline_at = NULL` then agrees with `execution_timeout = NULL`.
+        assert!(
+            classify_successor_deadline_representable("paid_subscription", None, now).is_ok(),
+            "a target declaring no timeout must not be rejected"
+        );
+
+        // Unrepresentable: rejected, naming the target so an operator can find
+        // the offending declaration without reading the source.
+        let unrepresentable = chrono::Duration::seconds(8_640_000_000_000);
+        assert!(
+            now.checked_add_signed(unrepresentable).is_none(),
+            "fixture premise: this duration must overflow DateTime<Utc>"
+        );
+        let error = classify_successor_deadline_representable(
+            "paid_subscription",
+            Some(unrepresentable),
+            now,
+        )
+        .expect_err("an unrepresentable deadline must be rejected");
+        assert!(
+            error.contains("paid_subscription"),
+            "the rejection must name the target type: {error}"
+        );
+        assert!(
+            error.contains("execution_timeout"),
+            "the rejection must name the offending field: {error}"
+        );
+    }
+
+    /// The fleet-wide ceiling (#243) is applied BEFORE representability is
+    /// judged, so a configured ceiling rescues an otherwise-unrepresentable
+    /// declaration instead of failing the transition. Pins the ordering the
+    /// guard depends on -- judging the raw declaration would reject a run the
+    /// operator's own cap makes perfectly valid.
+    #[test]
+    fn can803_ceiling_rescues_an_unrepresentable_declaration() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(8_640_000_000_000));
+        let now = chrono::Utc::now();
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(24)),
+            None,
+            now,
+        );
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::hours(24)),
+            "the ceiling must clamp the declaration down"
+        );
+        assert!(
+            defaults.deadline_at.is_some(),
+            "a clamped timeout must produce a real deadline, never NULL"
+        );
+    }
+
+    /// An overflowing SLA (#487) maps to "no SLA" -- BOTH fields NULL -- rather
+    /// than failing the transition or storing a lying `sla` with a NULL
+    /// deadline. Deliberately different from the hard-timeout treatment above:
+    /// the SLA is observational (a counter), so degrading it is benign, and
+    /// this matches the documented #487 start-path behaviour ("an
+    /// out-of-range/overflowing duration maps to 'no SLA'").
+    #[test]
+    fn can803_unrepresentable_sla_maps_to_no_sla_not_a_lying_field() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.sla = Some(Duration::from_secs(8_640_000_000_000));
+        let now = chrono::Utc::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        assert_eq!(
+            defaults.sla, None,
+            "an unrepresentable SLA must be dropped, not stored with a NULL deadline"
+        );
+        assert_eq!(defaults.sla_deadline_at, None);
+    }
+
+    /// Establishes the PREMISE of the cross-shard guard: rendezvous routing
+    /// hashes the `(workflow_name, workflow_id)` **pair**, so changing the type
+    /// genuinely re-routes the key for most ids. Without this the guard below
+    /// could be dead code that nobody notices.
+    #[test]
+    fn can803_cross_type_key_routes_to_a_different_shard_for_most_ids() {
+        use crate::shard::ShardRouter;
+        use crate::types::ShardId;
+        let shards: Vec<ShardId> = (0..4).map(ShardId::new).collect();
+        let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+
+        let diverged = (0..200)
+            .filter(|i| {
+                let wid = format!("sub-{i}");
+                router.pick_for_new_workflow("trial_subscription", &wid)
+                    != router.pick_for_new_workflow("paid_subscription", &wid)
+            })
+            .count();
+
+        // ~3/4 expected on 4 shards. A loose floor keeps this a premise check
+        // rather than a brittle assertion on the hash function.
+        assert!(
+            diverged > 100,
+            "the pair-hash premise is false: only {diverged}/200 ids re-routed on a type change, \
+             so reject_cross_shard_continue_as_new would be guarding nothing"
+        );
+    }
+
+    /// The full inert / co-located / divergent matrix for the cross-shard
+    /// guard, driven through the pure decision so no process-global router is
+    /// installed (which would race sibling tests in this binary).
+    #[test]
+    fn can803_cross_shard_guard_matrix() {
+        use crate::types::ShardId;
+
+        // No router installed => inert. A deployment without one is
+        // single-shard by construction, and guessing would be worse.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-1",
+                0,
+                None
+            )
+            .is_ok(),
+            "with no router installed the guard must not reject"
+        );
+
+        // Target key routes to the predecessor's own shard => allowed. This is
+        // every single-shard deployment, and the co-located slice of a
+        // multi-shard one.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-1",
+                0,
+                Some(ShardId::new(0))
+            )
+            .is_ok(),
+            "a co-located target must never be rejected"
+        );
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-1",
+                3,
+                Some(ShardId::new(3))
+            )
+            .is_ok(),
+            "co-location on a non-zero shard must also be allowed"
+        );
+
+        // Divergent => rejected, and the message must name BOTH shards so an
+        // operator can tell which way it diverged without reading the source.
+        let error = classify_cross_shard_continue_as_new(
+            "paid_subscription",
+            "trial_subscription",
+            "sub-42",
+            0,
+            Some(ShardId::new(2)),
+        )
+        .expect_err("a target routing to another shard must be rejected");
+        assert!(
+            error.contains("shard 0") && error.contains("shard 2"),
+            "the rejection must name both the predecessor's and the routed shard: {error}"
+        );
+        assert!(
+            error.contains("paid_subscription") && error.contains("sub-42"),
+            "the rejection must name the target key: {error}"
+        );
+    }
+
+    /// A non-positive declared SLA is treated as "no SLA", mirroring the start
+    /// path: an `sla_deadline_at` at or before `started_at` would be reported
+    /// breached by the very next scan (#487).
+    #[test]
+    fn can803_cross_type_non_positive_sla_is_dropped() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.sla = Some(Duration::ZERO);
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(
+            defaults.sla.is_none() && defaults.sla_deadline_at.is_none(),
+            "a zero-length SLA must not persist an already-breached deadline"
+        );
     }
 }

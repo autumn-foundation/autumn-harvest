@@ -101,6 +101,9 @@ fn build_web_pool(url: &str) -> diesel_async::pooled_connection::deadpool::Pool<
 
 fn wf_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "tests",
@@ -686,6 +689,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: autumn_harvest::types::Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -918,6 +922,7 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: autumn_harvest::types::Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

@@ -62,6 +62,16 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (url, container)
 }
 
+/// Prefer `HARVEST_TEST_DATABASE_URL` (a real, already-running Postgres, for
+/// sandboxes with no Docker daemon) over spinning up a testcontainer.
+async fn overdue_read_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
+
 async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_tag("16")
@@ -159,6 +169,9 @@ fn test_app_state_without_database() -> AppState {
 fn echo_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "echo_workflow",
             module: "tests",
@@ -278,6 +291,7 @@ async fn insert_workflow_on_url(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -1288,6 +1302,72 @@ async fn ui_workers_partial_shard_failure_degraded() {
     );
 }
 
+/// Issue #619 review — a shard whose pause state cannot be read must not leave
+/// the Workers page silently claiming dispatch is flowing.
+///
+/// Nothing is paused on the reachable shard, so before this fix the paused-queue
+/// banner rendered *nothing at all* on a page where one shard's pause state was
+/// simply unknown — indistinguishable from a genuinely clean fleet, on exactly
+/// the page an operator lands on when investigating idle workers. A hold that
+/// exists only on the unread shard is likewise absent from the banner, which is
+/// why "we do not know" has to be said out loud.
+#[tokio::test]
+async fn ui_workers_warns_when_a_shards_pause_state_is_unreadable() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&good_url).await.unwrap();
+    insert_test_worker(&mut conn, "good-worker", "Active", 0).await;
+
+    // Shard 0 is live and holds no pause; shard 1 is unreachable, so its pause
+    // state is UNKNOWN rather than "not paused".
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&good_url));
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool("postgres://invalid:5432/nonexistent"),
+    );
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unreadable shard must degrade the page, never fail it: {html}"
+    );
+    assert!(
+        html.contains("Queue pause state incomplete"),
+        "the page must say the pause state is unknown, not render a silent clean \
+         banner: {html}"
+    );
+    assert!(
+        html.contains("/admin/queues/paused"),
+        "it must point at the authoritative per-shard read: {html}"
+    );
+    // Nothing is actually held on the reachable shard, so there must be no hold
+    // banner claiming otherwise.
+    assert!(
+        !html.contains("Queue dispatch paused"),
+        "no queue is held on the readable shard, so no hold may be claimed: {html}"
+    );
+}
+
 /// Performance: 1 k workers across 4 shards must render in ≤ 500 ms p95.
 ///
 /// Seeds 250 workers per shard, makes a single page request, and asserts:
@@ -2053,6 +2133,7 @@ async fn insert_child_workflow_on_url(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -2811,6 +2892,9 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "cust_wf",
                 module: "tests",
@@ -2945,6 +3029,8 @@ async fn ui_trigger_preserves_dag_metadata() {
         runbook_url: Some("http://ui-runbook"),
         severity: Some("sev3"),
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
 
     let dag_catalog =
@@ -2952,6 +3038,9 @@ async fn ui_trigger_preserves_dag_metadata() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: dag_name,
             module: "tests",
@@ -3012,6 +3101,143 @@ async fn ui_trigger_preserves_dag_metadata() {
     assert_eq!(execution.owner.as_deref(), Some("ui-team"));
     assert_eq!(execution.runbook_url.as_deref(), Some("http://ui-runbook"));
     assert_eq!(execution.severity.as_deref(), Some("sev3"));
+}
+
+/// Issue #743 review (PR #1141, Finding #6): `POST /schedules/{id}/trigger-now`
+/// (the Vantage UI manual-trigger route) is a DISTINCT DAG-start entry point
+/// from the scheduler tick, the buffered-drain, the direct HTTP/MCP trigger
+/// (`trigger_unified_dag`), and a backfill -- and its `execute_schedule_trigger_ui`
+/// handler hardcoded `execution_timeout`/`max_execution_timeout_ceiling` to
+/// `None`. Declares a 10h `execution_timeout` + 5h `sla` against a 1h
+/// fleet-wide ceiling, so both the ceiling clamp AND the clamp-sla-to-
+/// effective-timeout rule fire in one assertion (mirrors the sibling backfill
+/// test `backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling`
+/// in `api_scheduler_integration.rs`).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "ui_trigger_deadline_dag";
+
+    let dag_info = autumn_harvest::info::DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: |_dag| {},
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+    };
+
+    let dag_catalog =
+        Arc::new(autumn_harvest::compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+
+    // The DAG's shadow WorkflowInfo, registered under `dag_name` -- exactly
+    // what `DagInfo::as_workflow_info()` would produce, hand-built here
+    // (matching the pre-existing sibling test's convention) since
+    // `execute_schedule_trigger_ui` reads execution_timeout/sla from THIS
+    // registry lookup, not from `DagInfo` directly.
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: dag_name,
+                module: "tests",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+                chain_execution_timeout: None,
+                sla: Some(std::time::Duration::from_secs(5 * 3600)),
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
+    );
+
+    let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, _headers, _body) = post_form(
+        &app,
+        &format!("/schedules/{schedule_id}/trigger-now"),
+        String::new(),
+    )
+    .await;
+    assert!(
+        status.is_redirection(),
+        "UI trigger must redirect; got {status}"
+    );
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("triggered execution should exist");
+
+    assert_eq!(
+        execution.execution_timeout,
+        Some(chrono::Duration::seconds(3600)),
+        "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h"
+    );
+    let deadline_at = execution
+        .deadline_at
+        .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
+    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        deadline_delta.num_milliseconds().abs() < 2000,
+        "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}"
+    );
+    assert_eq!(
+        execution.sla,
+        Some(chrono::Duration::seconds(3600)),
+        "sla must clamp to the ceiling-clamped effective execution_timeout, not the raw 5h"
+    );
+    let sla_deadline_at = execution
+        .sla_deadline_at
+        .expect("sla_deadline_at must be set from the clamped sla");
+    let sla_deadline_delta =
+        (sla_deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        sla_deadline_delta.num_milliseconds().abs() < 2000,
+        "sla_deadline_at must be ~1h after started_at (clamped); delta={sla_deadline_delta}"
+    );
 }
 
 async fn load_latest_workflow_execution_by_name_from_url(
@@ -3228,6 +3454,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -3409,6 +3636,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -3705,6 +3933,7 @@ async fn dag957_seed_run(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

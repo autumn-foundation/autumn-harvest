@@ -144,6 +144,55 @@ pub const METRIC_ACTIVITY_ATTEMPTS: &str = "harvest.activity.attempts";
 /// never appear as labels here.
 pub const METRIC_ACTIVITY_RETRIES: &str = "harvest.activity.retries";
 
+/// Counter: incremented once per **effective** operator pause/resume action on
+/// an activity type (issue #807).
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `action` (= [`METRIC_LABEL_ACTION`]): [`ActivityPauseAction::as_str`] —
+///   exactly `pause` or `resume`
+///
+/// **Why a counter, not a gauge.** Its closest sibling `harvest.queue.paused`
+/// (issue #619) is a *gauge*, because a queue hold is a binary state whose
+/// *duration* is the thing an operator pages on. This one answers the
+/// different question issue #807 asks — how often the fleet is reaching for
+/// this lever, and on what — so it counts point-in-time actions. The current
+/// *state* is deliberately not derivable from it; `GET /activities`
+/// is the read model for that.
+///
+/// **Why not the `paused` noun.** `harvest_queue_paused` (gauge, issue #619)
+/// and `harvest_workflow_paused_total` (counter, issue #383) already disagree
+/// on instrument type under that noun. A third spelling would leave an
+/// operator guessing which shape they are graphing, so this one is named for
+/// what it actually counts.
+///
+/// **Emission contract.** Counted only when the action genuinely changed
+/// state — gate on `ActivityPauseOutcome::newly_paused` /
+/// `ActivityResumeOutcome::newly_resumed`, mirroring how
+/// [`MetricsRecorder::record_workflow_paused`] is gated on `newly_paused`
+/// (issue #383). Both mutations are idempotent by design, so an operator
+/// retry after a lost response must not read as a second hold.
+///
+/// **Cardinality (ADR-0001 §7).** `activity` is bounded **by bucketing**, not by
+/// validation. `activity_pause::validate_activity_name` bounds the name's
+/// *length*, not its *cardinality*, and the pause routes deliberately accept an
+/// **unregistered** name (so an operator can pre-pause an activity before its
+/// fleet rolls out, and a paused-but-unregistered hold stays inspectable) — so
+/// the raw name is caller-controlled free text. The emitter therefore resolves
+/// it against the registered activity catalogue and substitutes
+/// [`UNREGISTERED_ACTIVITY_NAME`] when it is absent, keeping the label bounded
+/// to the app's real activity set plus one sentinel series. Same fix, and same
+/// reason, as the #684 update-name label. `action` is bounded to two values by
+/// construction ([`ActivityPauseAction`]). `execution.id` is span-only and MUST
+/// NOT appear here.
+///
+/// The plain `activity` label (not the dotted `activity.name`) is the right
+/// one: the dotted variant exists solely so the circuit-breaker counters
+/// (issue #369) can match the ADR-0001 `activity.name` *span* attribute, while
+/// every other activity counter — `attempts`, `retries`, `panic`,
+/// `rate_limit.throttled` — uses [`METRIC_LABEL_ACTIVITY`].
+pub const METRIC_ACTIVITY_PAUSE_ACTIONS: &str = "harvest.activity.pause_actions";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -196,6 +245,22 @@ pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
 /// A healthy steady state is `0` on every shard.
 pub const METRIC_SHARD_STRANDED_PENDING: &str = "harvest.shard.stranded_pending";
 
+/// Counter: a task was dispatched from a given shard (issue #961).
+///
+/// The **shard-dimension twin** of [`METRIC_QUEUE_DISPATCHED`]: where #515's
+/// per-queue counter lets an operator confirm the live dispatch split matches
+/// `WorkerConfig::queue_weights`, this one lets them confirm the split across
+/// a multi-shard worker's assigned shards — i.e. that a deep backlog on one
+/// shard is not starving its siblings (AC5). The two compose: queue weights
+/// pick *which queue* within a shard, the round-robin poll order picks *which
+/// shard*.
+///
+/// Labels:
+///   - `"shard"` — the shard id (bounded cardinality, ADR-0001 §7).
+///
+/// `execution.id` is span-only and MUST NOT appear as a label.
+pub const METRIC_SHARD_DISPATCHED: &str = "harvest.shard.dispatched";
+
 /// Gauge: number of a worker's dispatch slots currently in use for one slot
 /// type (issue #531).
 ///
@@ -237,6 +302,21 @@ pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions"
 
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
+
+/// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
+/// (issue #619).
+///
+/// Emitted by the queue-pause sampler in `worker.rs` on the worker's poll
+/// cadence, labelled `{queue}`. Cardinality is bounded by the number of
+/// distinct queue names the fleet has ever paused within a process lifetime;
+/// a resumed queue is explicitly zero-filled for one cycle so the series drops
+/// to `0` rather than going stale at `1`. Per ADR-0001 §7, `execution.id` is
+/// never a label.
+///
+/// `max by (queue) (harvest_queue_paused) > 0` is the "a hold is in effect"
+/// signal; pairing it with Prometheus' own `for:` duration is how an operator
+/// alerts on a pause that was left on too long.
+pub const METRIC_QUEUE_PAUSED: &str = "harvest.queue.paused";
 
 /// Counter: incremented once per dead-letter entry processed by an operator
 /// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
@@ -373,6 +453,46 @@ pub const METRIC_WORKFLOW_TASK_TIMEOUT: &str = "harvest.workflow.task_timeout";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
 
+/// Counter: workflow history bloat early-warning (issue #704).
+///
+/// Fires the moment a workflow execution's recorded `harvest_events` count
+/// first crosses `history_bloat_warn_fraction * event_hard_cap`
+/// (`WorkflowHistoryPolicy`), from **two** emission sites: (1)
+/// `process_workflow_task`'s `Persisted` arm, post-commit, for an execution
+/// that is still RUNNING (non-terminal, `WorkflowOutcome::Suspended`) after
+/// the crossing decision cycle; and (2) `fail_workflow_for_history_cap`, when
+/// a single decision cycle grows history from below the soft threshold
+/// straight past `event_hard_cap` in one inline append batch (e.g.
+/// local-activity or external-signal persistence) -- the crossing still
+/// happened in that same decision, so it is emitted there too, immediately
+/// before the execution is terminally hard-cap-failed and moved to the DLQ.
+///
+/// **Delivery is at-least-once, not exactly-once**: the counter is emitted
+/// *before* the guard column (`history_bloat_warned_at`) is durably
+/// persisted, so a worker crash in the narrow window between the two leaves
+/// the guard unset and a later retry of the same decision cycle may re-emit
+/// -- a deliberate trade-off (documented on `emit_history_bloat_warning_if_crossed`)
+/// favoring "never silently lose the signal" over "never duplicate it" for a
+/// one-shot, non-recurring gate with no later crossing to fall back on for a
+/// given execution. Once the guard is durably set, the emission is
+/// idempotent for the life of that execution row (a continue-as-new
+/// successor or reset fork is a fresh row and is naturally eligible to warn
+/// again, since it tracks its own history size from zero).
+///
+/// This is an **operator early-warning**, not a lifecycle change on its own:
+/// path (1) never terminates or otherwise alters the run -- it is purely a
+/// signal that the run is approaching the point where the existing hard-cap
+/// terminal-fail (DLQ) behavior would trigger. Path (2) accompanies (not
+/// causes) a termination the hard cap was already going to enforce
+/// regardless of this counter.
+///
+/// Labeled by `workflow` (workflow name) ONLY -- no `queue` label, unlike its
+/// sibling counters above. The soft-threshold crossing is a property of the
+/// execution's own accumulated history size against a globally-configured
+/// fraction/cap, not a per-queue phenomenon, and `execution.id` stays
+/// span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_HISTORY_BLOAT: &str = "harvest.workflow.history_bloat";
+
 /// Counter: incremented each time a failed workflow execution is automatically
 /// rescheduled for a retry run (issue #523).
 ///
@@ -424,6 +544,104 @@ pub const METRIC_WORKFLOW_UNFINISHED_HANDLERS: &str = "harvest.workflow.unfinish
 /// Labeled by `queue` (task queue name) and `reason`
 /// (`"poison_pill"`). `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
+
+/// Counter: capability misses (issue #804).
+///
+/// Incremented each time a worker claims a task whose workflow or activity type
+/// it has no handler registered for — either releasing the claim back to
+/// `PENDING` for a capable peer, or escalating to the terminal-failure path once
+/// the redelivery budget is exhausted.
+///
+/// A sustained non-zero release rate is the operator-visible signature of
+/// **capability skew** across a queue's worker fleet — most commonly the
+/// transient window of a rolling deploy that introduces a new workflow or
+/// activity type. A non-zero *escalation* rate means no live worker on that
+/// queue registers the handler at all, and executions are being failed.
+///
+/// Labeled by:
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded).
+/// - `task_type` (= [`METRIC_LABEL_TASK_TYPE`]): `"workflow"` or `"activity"`
+///   (the owning task row's `task_type`, bounded by the DB CHECK constraint to
+///   `workflow` / `activity`; note a *local-activity* or activity-scheduling miss
+///   is raised while processing a **workflow** task, so it reports
+///   `task_type="workflow"` — the log line carries the handler kind separately).
+/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): [`CAPABILITY_MISS_OUTCOME_RELEASED`],
+///   [`CAPABILITY_MISS_OUTCOME_ESCALATED`], or
+///   [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] (bounded).
+///
+///
+/// The `outcome` dimension is a deliberate bounded **superset** of the label
+/// set named in issue #804 (`{queue, task_type}`): AC5 also requires operators
+/// to be able to "alert on the escalation", which is only expressible if the
+/// benign release and the executions-are-failing escalation are separable on
+/// the same counter. This matches the existing repo idiom
+/// (`harvest.schedule.fire_attempts{outcome}`, `harvest.workflow.terminal{outcome}`).
+///
+/// The workflow/activity **name** is deliberately NOT a label: it is bounded in
+/// practice but the `queue` + `task_type` pair is enough to localize a deploy
+/// skew, and `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_TASK_CAPABILITY_MISS: &str = "harvest.task.capability_miss";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: the claim was
+/// released back to `PENDING` for a capable peer to pick up (issue #804).
+pub const CAPABILITY_MISS_OUTCOME_RELEASED: &str = "released";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: the task was
+/// released to a peer at least once, and was then escalated (issue #804).
+///
+/// **This label is recorded by two different bounds, which do not license the
+/// same conclusion.** Read the `no_capable_worker:` reason string on the failed
+/// execution — it names the bound that actually tripped — before concluding
+/// anything about the fleet from a sample:
+///
+/// - **Coverage confirmed.** The task was offered around the queue with capped
+///   exponential backoff between releases, and the worker registry then agreed
+///   that every live eligible worker on the queue had already missed it. This
+///   is the *fleet-exhaustion* reading — "no live worker on this queue
+///   registers the handler" — and the one
+///   `GET /admin/workflow-types/reachability` corroborates.
+/// - **Release ceiling.** Coverage was never established: a live worker had
+///   still never been offered the task, or the registry could not be read. The
+///   absolute release ceiling stops the redeliveries anyway so AC3's bound
+///   holds, but such a sample does **not** show the queue was swept, and a
+///   capable worker may have been live on it the whole time.
+///
+/// Both are recorded here because under either reading the executions are
+/// being failed, and paging on only the provable half would under-page the
+/// outage #804 exists to surface. So treat the label as "executions on this
+/// queue are being failed for want of a handler", which is true of every
+/// sample, rather than as proof about the fleet, which is not. It is what the
+/// page-severity `harvest_no_capable_worker` rule selects.
+///
+/// Escalations where the task was **never offered to a peer at all** report
+/// [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] instead — see there for
+/// why conflating the two is an operator-misdirection bug, not a cosmetic one.
+pub const CAPABILITY_MISS_OUTCOME_ESCALATED: &str = "escalated";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated on the
+/// **first** claim, without the task ever having been offered to a peer
+/// (issue #804).
+///
+/// Two configurations reach this, both of which fail the execution after
+/// **zero** releases:
+///
+/// - `capability_miss_max_redeliveries = 0` — the documented pre-#804
+///   fail-fast rollback switch.
+/// - The task is pinned to a worker session (issue #606) whose host does not
+///   register the handler. Releasing it "for a capable peer" is false by
+///   construction: the claim gate `session_id IS NULL OR sticky_worker_id = $1`
+///   means no other worker can ever claim it.
+///
+/// Kept separate from [`CAPABILITY_MISS_OUTCOME_ESCALATED`] because the two
+/// carry **opposite** operator conclusions. Budget exhaustion is evidence about
+/// the *fleet*; a never-offered escalation is evidence about one config knob or
+/// one task's pin, and a capable worker may well be live and idle on the queue
+/// the whole time. Recording both under one value would page
+/// `harvest_no_capable_worker`, whose `first_action` sends on-call to
+/// `GET /admin/workflow-types/reachability` — which returns `in_use` and
+/// directly contradicts the page — and whose runbook would advise raising a
+/// budget that provably cannot help either cause.
+pub const CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED: &str = "escalated_never_offered";
 
 /// Counter: incremented each time an activity's circuit breaker trips open
 /// (closed → open) or re-opens after a failed half-open probe (issue #369).
@@ -484,6 +702,20 @@ pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
 /// `GET /admin/start-throttle` admin read instead. `execution.id` is span-only
 /// and must never appear here.
 pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
+
+/// Counter: incremented exactly once per in-flight run superseded by a newer
+/// admission under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+///
+/// A latest-wins start that sheds K incumbents emits K samples. A `Defer` start
+/// (the default), an attach, and an admission that was already under its limit
+/// all emit nothing.
+///
+/// Labeled by `workflow` (workflow type name) only. The resolved concurrency key
+/// is high-cardinality (tenant/entity input), so per ADR-0001 §7 it is
+/// deliberately **not** a metric label — per-key state is exposed via the
+/// `GET /admin/concurrency` admin read instead. `execution.id` is span-only and
+/// must never appear here.
+pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded";
 
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
@@ -630,6 +862,24 @@ pub const METRIC_ADMISSION_BLOCKED: &str = "harvest.admission.blocked";
 /// Gauge: current number of active admission gates.
 pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active";
 
+/// Counter: incremented each time a fresh workflow start is rejected because
+/// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
+/// one of its declared caps (issue #946).
+///
+/// Labels:
+///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
+///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
+///     [`crate::quota::QuotaResource::as_str`]).
+///
+/// The *resolved tenant key* is deliberately **not** a label — it is
+/// caller/tenant-controlled input and would be unbounded cardinality. Per-key
+/// usage-vs-quota is instead surfaced via `GET /admin/quotas`, mirroring how
+/// the admission gate keeps its per-key detail off `harvest.admission.blocked`
+/// and exposes it through the equivalent read route instead. Per ADR-0001 §7,
+/// `execution.id` is never a label here either.
+pub const METRIC_QUOTA_REJECTED: &str = "harvest.quota.rejected";
+
 /// Counter: incremented each time a start producer that is **exempt-by-design**
 /// from the admission gate relays a workflow start (issue #618).
 ///
@@ -759,6 +1009,42 @@ pub const METRIC_WEBHOOK_RECEIVED: &str = "harvest.webhook.received";
 /// counter.
 pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 
+/// Counter: incremented once for **every** message a broker event-source
+/// connector pulls off its topic/queue, before any mapping or dispatch is
+/// attempted (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`], the operator-declared binding
+/// name — a closed set fixed at `HarvestPlugin::build` time, exactly like the
+/// webhook receiver's `path`). Per ADR-0001 §7 the message key, partition and
+/// offset are **never** labels: they are unbounded broker-supplied values, so
+/// they stay span-/log-only.
+pub const METRIC_CONNECTOR_RECEIVED: &str = "harvest.connector.received";
+
+/// Counter: incremented once per connector message that reached a terminal
+/// disposition (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]) and `outcome`
+/// (= [`METRIC_LABEL_OUTCOME`], one of [`ConnectorOutcome`]'s bounded values).
+/// Never labeled by message coordinates (ADR-0001 §7).
+pub const METRIC_CONNECTOR_DISPATCHED: &str = "harvest.connector.dispatched";
+
+/// Counter: incremented once per connector message dead-lettered (issue #944).
+///
+/// A message is dead-lettered when it is malformed, deterministically refused
+/// by the target, or rejected by the mapping function past the poison
+/// threshold.
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]) and `reason`
+/// (= [`METRIC_LABEL_REASON`], one of [`PoisonReason`]'s bounded values).
+pub const METRIC_CONNECTOR_POISONED: &str = "harvest.connector.poisoned";
+
+/// Gauge: the broker-reported consumer lag for a connector source, sampled on
+/// each poll cycle for the adapters whose client exposes it (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]). Adapters that cannot report
+/// lag simply never emit this gauge.
+pub const METRIC_CONNECTOR_LAG: &str = "harvest.connector.lag";
+
 /// Counter: incremented once per worker-session acquisition attempt (issue
 /// #606), i.e. once per `ctx.create_session(...)` call.
 ///
@@ -767,6 +1053,30 @@ pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 /// values: `acquired`/`timed_out`/`broken`). Per ADR-0001 §7, `execution.id`
 /// is never a label -- a session's identity stays span-/log-only here.
 pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
+
+/// Counter: one background control-loop iteration completed (issue #797).
+///
+/// Incremented **unconditionally at the end of every iteration** of each
+/// background scanner — including iterations that found no work and
+/// iterations whose pass returned an error. That unconditional emission is
+/// the whole point: the pre-existing loop metrics
+/// ([`METRIC_RETENTION_DELETED`], [`METRIC_SCHEDULE_FIRE_ATTEMPTS`], the
+/// timeout/SLA/quarantine counters) only fire when there is work to do, so a
+/// healthy idle loop and a wedged one both read zero. Here a **flat-lined
+/// counter is itself the wedge signal**, and a wedged loop is detectable
+/// within `2 ×` its poll interval.
+///
+/// Labeled by `scanner` (= [`METRIC_LABEL_SCANNER`]) whose value set is
+/// bounded by construction to the seven
+/// [`Scanner`](crate::scanner_health::Scanner) variants. Per ADR-0001 §7,
+/// `execution.id` is never a label — these are process-level control loops
+/// and carry no execution identity at all.
+///
+/// Alert on the *rate*, not the value:
+/// `rate(harvest_scanner_tick_total[5m]) == 0`. The companion in-process
+/// last-tick registry is surfaced by the `scanner_liveness` check in
+/// `GET /admin/preflight` for deployments without a metrics pipeline.
+pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
@@ -922,6 +1232,26 @@ pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";
 /// mislabeling any legitimately-registered (declarative or imperative) handler.
 pub const UNREGISTERED_UPDATE_NAME: &str = "__unregistered__";
 
+/// Sentinel `activity` label for [`METRIC_ACTIVITY_PAUSE_ACTIONS`] when the
+/// paused name is not in this process's registered activity catalogue
+/// (issue #807).
+///
+/// The pause routes deliberately accept an **unregistered** name: an operator
+/// must be able to pre-pause an activity type before its worker fleet rolls
+/// out, and a paused-but-unregistered activity is a real hold that must remain
+/// inspectable. That makes the raw name caller-controlled free text (bounded in
+/// *length* by `activity_pause::MAX_ACTIVITY_NAME_LEN`, but not in
+/// *cardinality*), which ADR-0001 §7 forbids as a metric label — a buggy
+/// remediation loop templating a tenant id into the name would mint unbounded
+/// permanent series.
+///
+/// Bucketing exactly that case here keeps the label bounded to the app's real
+/// activity set plus this one extra series, without mislabeling any legitimately
+/// registered activity. The durable `harvest_activity_pauses` row and the read
+/// API keep the raw name; only the metric label is bucketed. Same shape and
+/// same reasoning as [`UNREGISTERED_UPDATE_NAME`].
+pub const UNREGISTERED_ACTIVITY_NAME: &str = "__unregistered__";
+
 /// Bounded outcome classification for a worker-session acquisition attempt
 /// (issue #606).
 ///
@@ -1013,6 +1343,90 @@ impl std::fmt::Display for WebhookOutcome {
     }
 }
 
+/// Bounded terminal outcomes for one message consumed by a broker event-source
+/// connector (issue #944), used as the `outcome` label on
+/// [`METRIC_CONNECTOR_DISPATCHED`].
+///
+/// Closed set: adding a variant is an additive change, but the set must stay
+/// small so the metric's cardinality is bounded by construction (ADR-0001 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorOutcome {
+    /// The message durably started a workflow or delivered a signal.
+    Dispatched,
+    /// The message was recognized as a redelivery of an already-dispatched
+    /// message; nothing new was committed, but the original dispatch is
+    /// durable so the message is safe to acknowledge.
+    IdempotentReplay,
+    /// The target workflow carries a throttle/debounce/batch policy and the
+    /// admission was durably parked (an HTTP `202`-equivalent). The start is
+    /// recorded and will fire on the owning scanner's schedule, so this is a
+    /// success from the connector's point of view.
+    Deferred,
+    /// The message was routed to a dead-letter destination (see
+    /// [`METRIC_CONNECTOR_POISONED`] for the reason breakdown).
+    DeadLettered,
+    /// A transient harvest-side failure left the message unacknowledged for
+    /// broker-native redelivery.
+    Retried,
+}
+
+impl ConnectorOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatched => "dispatched",
+            Self::IdempotentReplay => "idempotent_replay",
+            Self::Deferred => "deferred",
+            Self::DeadLettered => "dead_lettered",
+            Self::Retried => "retried",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bounded reasons a connector message was routed to a dead-letter
+/// destination (issue #944), used as the `reason` label on
+/// [`METRIC_CONNECTOR_POISONED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoisonReason {
+    /// The raw message body could not be decoded into the shape the binding's
+    /// mapping function expects. Deterministic — retrying can never help, so
+    /// this dead-letters on the first occurrence.
+    Malformed,
+    /// The mapping function ran but rejected the message, `threshold`
+    /// consecutive times.
+    MappingRejected,
+    /// The dispatch target refused the message deterministically (a `4xx`
+    /// from the start / signal-with-start path, e.g. published-schema
+    /// validation). Deterministic — dead-letters on the first occurrence.
+    TargetRejected,
+}
+
+impl PoisonReason {
+    /// Stable lower-case reason string used as the `reason` metric label and
+    /// persisted on the dead-letter record.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::MappingRejected => "mapping_rejected",
+            Self::TargetRejected => "target_rejected",
+        }
+    }
+}
+
+impl std::fmt::Display for PoisonReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -1020,6 +1434,14 @@ impl std::fmt::Display for WebhookOutcome {
 // (ATTR_EXECUTION_ID) deliberately has no entry here so it cannot be
 // accidentally used on a metric.
 // ---------------------------------------------------------------------------
+
+/// Metric label: the broker event-source binding name (issue #944).
+///
+/// A closed set fixed at `HarvestPlugin::build` time (one value per declared
+/// binding), so it is bounded by construction. The topic/queue, partition,
+/// offset and message key are deliberately **not** labels — they are
+/// unbounded broker-supplied values (ADR-0001 §7).
+pub const METRIC_LABEL_SOURCE: &str = "source";
 
 /// Metric label: the workflow name.
 pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
@@ -1032,6 +1454,9 @@ pub const METRIC_LABEL_ACTIVITY: &str = "activity";
 pub const METRIC_LABEL_ACTIVITY_NAME: &str = "activity.name";
 /// Metric label: the task queue name.
 pub const METRIC_LABEL_QUEUE: &str = "queue";
+/// Metric label: task-queue row kind (`"workflow"` or `"activity"`) — bounded
+/// by `CapabilityMissKind::as_str` (issue #804).
+pub const METRIC_LABEL_TASK_TYPE: &str = "task_type";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
 /// Metric label: active workflow lifecycle state (issue #770) — one of the
@@ -1051,6 +1476,9 @@ pub const METRIC_LABEL_NAME: &str = "name";
 pub const METRIC_LABEL_REASON: &str = "reason";
 /// Metric label: the concurrency group key.
 pub const METRIC_LABEL_KEY: &str = "key";
+/// Which per-tenant [`crate::quota::QuotaResource`] cap was exhausted
+/// (issue #946): `"active_executions"`, `"history_bytes"`, `"dead_letters"`.
+pub const METRIC_LABEL_RESOURCE: &str = "resource";
 /// Metric label: the query handler name (`query.name`).
 pub const METRIC_LABEL_QUERY: &str = "query.name";
 /// Metric label: terminal outcome (e.g. `"delivered"`, `"failed"`).
@@ -1070,6 +1498,26 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: the operator action taken on an activity-type pause
+/// (`"pause"` / `"resume"`, issue #807).
+///
+/// Bounded by construction to the [`ActivityPauseAction`] variants — a call
+/// site passes the enum's `as_str()`, never a free string (same discipline as
+/// [`METRIC_LABEL_SCANNER`] and [`METRIC_LABEL_DECISION`]).
+pub const METRIC_LABEL_ACTION: &str = "action";
+/// Metric label: background control loop identity (issue #797).
+///
+/// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
+/// variants — a call site passes the enum's `as_str()`, never a free string.
+pub const METRIC_LABEL_SCANNER: &str = "scanner";
+/// `shard` label value for a control loop that is **not** per-shard (issue #797).
+///
+/// The `retention` and `schedule` loops run once per process rather than once
+/// per assigned shard, and a single-shard deployment's per-shard loops have no
+/// shard id to report. They emit this sentinel so every
+/// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
+/// sometimes-present label is awkward to query and easy to mis-aggregate.
+pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -1480,6 +1928,32 @@ impl TunerDecision {
     }
 }
 
+/// The operator action taken on an activity-type pause (issue #807), used as
+/// the bounded `action` label on [`METRIC_ACTIVITY_PAUSE_ACTIONS`].
+///
+/// Exists so the label can never be a free string: the two values are the only
+/// two mutations `activity_pause` exposes, so cardinality is bounded by the
+/// type system rather than by convention (same reason [`TunerDecision`] and
+/// [`SlotType`] exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityPauseAction {
+    /// Dispatch for the activity type was held.
+    Pause,
+    /// A previously held activity type was released.
+    Resume,
+}
+
+impl ActivityPauseAction {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+        }
+    }
+}
+
 /// Sink for the harvest engine's standard metrics.
 ///
 /// Implementations fan these calls into an OpenTelemetry meter (or whatever
@@ -1528,6 +2002,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// nothing is silently slipping an active gate.
     fn record_admission_bypassed(&self, producer: &str) {
         let _ = producer;
+    }
+
+    /// A fresh workflow start was rejected because its resolved per-tenant
+    /// quota key is at or over a declared cap (issue #946).
+    ///
+    /// `workflow` is the workflow type name; `resource` is the bounded
+    /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted
+    /// cap. The resolved tenant key is intentionally not passed here — see
+    /// [`METRIC_QUOTA_REJECTED`] for why.
+    fn record_quota_rejected(&self, workflow: &str, resource: &str) {
+        let _ = (workflow, resource);
     }
 
     /// A workflow task entered the executor on a worker.
@@ -1770,6 +2255,67 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (queue_name, age_secs);
     }
 
+    /// One background control-loop iteration completed (issue #797).
+    ///
+    /// Maps to the counter [`METRIC_SCANNER_TICK`], labeled `scanner` (=
+    /// [`METRIC_LABEL_SCANNER`]) and `shard` (= [`METRIC_LABEL_SHARD`]).
+    /// `scanner` is always
+    /// [`Scanner::as_str`](crate::scanner_health::Scanner::as_str), so the
+    /// label's cardinality is bounded by construction.
+    ///
+    /// `shard` is what stops one healthy sibling from **masking** a wedged
+    /// one. A multi-shard worker spawns a `timeout`, `poison_pill`, and
+    /// `pause_auto_resume` loop *per assigned shard*; without a per-shard
+    /// dimension they would all increment one series, so a healthy shard's
+    /// ticks would keep `rate(...) > 0` while another shard's loop was dead
+    /// and the paging alert would never fire. Use
+    /// [`SCANNER_SHARD_LABEL_NONE`] for the process-wide loops (`retention`,
+    /// `schedule`) and single-shard deployments, so the label set is uniform
+    /// across the series family. Cardinality stays bounded: shard count is
+    /// operator-configured and small, matching the existing `shard`-labeled
+    /// metrics (`harvest.dlq.entries`, `harvest.shard.stranded_pending`).
+    ///
+    /// Called **unconditionally at the end of every iteration**, including
+    /// no-work iterations — that is what makes a flat-lined counter mean
+    /// "wedged" rather than merely "idle". Prefer the
+    /// [`record_scanner_tick`](crate::scanner_health::record_scanner_tick)
+    /// choke point over calling this directly: it also bumps the in-process
+    /// liveness registry that backs the `scanner_liveness` preflight check,
+    /// so the counter and the timestamp cannot drift apart.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
+    }
+
+    /// A background control loop registered itself, before its first
+    /// iteration (issue #797).
+    ///
+    /// Initializes that scanner's [`METRIC_SCANNER_TICK`] series **at zero**
+    /// rather than recording a separate metric — implementations should
+    /// increment the tick counter by `0`, with the same `scanner` and `shard`
+    /// labels [`record_scanner_tick`](Self::record_scanner_tick) uses, so the
+    /// initialized series is the one the ticks go on to increment.
+    ///
+    /// Without this, a loop that panics or hangs during its *first* iteration
+    /// never reaches [`record_scanner_tick`](Self::record_scanner_tick), so
+    /// the process exports no series for it at all. `rate(...) == 0` only
+    /// evaluates series that exist, and `absent()` is deliberately not used by
+    /// the shipped alert (an API-only replica legitimately exports nothing),
+    /// so that startup wedge would page *never* — the worst failure mode for a
+    /// liveness signal. Registration happens before the first iteration, which
+    /// is exactly when the process knows the loop is supposed to be running.
+    ///
+    /// A process that runs no control loops still exports nothing, so the
+    /// API-only-replica case that rules out `absent()` is unchanged.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
+    }
+
     /// Results of one retention-janitor tick on a shard.
     fn record_retention_tick(
         &self,
@@ -1826,6 +2372,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (key, deferred);
     }
 
+    /// A running execution was superseded by a newer admission for the same
+    /// concurrency key under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+    ///
+    /// Maps to the counter [`METRIC_CONCURRENCY_SUPERSEDED`]. Called once per
+    /// superseded run. The concurrency key is deliberately not a label
+    /// (ADR-0001 §7 cardinality rule).
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        let _ = workflow;
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -1863,6 +2419,35 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Whether a task queue is currently held by an operator queue pause
+    /// (issue #619): `paused = true` while the hold is in effect, `false` for
+    /// one cycle after it is released so the series drops rather than going
+    /// stale.
+    ///
+    /// Emitted by a periodic background sampler on the worker's poll cadence.
+    /// Maps to the gauge `harvest_queue_paused{queue}`.
+    fn record_queue_paused(&self, queue: &str, paused: bool) {
+        let _ = (queue, paused);
+    }
+
+    /// An operator paused or resumed dispatch for a whole activity type
+    /// (issue #807).
+    ///
+    /// Emitted from the pause/resume write path, **gated on the action having
+    /// genuinely changed state** (`newly_paused` / `newly_resumed`) so an
+    /// idempotent retry after a lost response does not read as a second hold —
+    /// the same gating [`record_workflow_paused`](Self::record_workflow_paused)
+    /// uses (issue #383).
+    ///
+    /// **Cardinality (ADR-0001 §7):** `activity_name` MUST be the validated,
+    /// canonicalised registered activity name (bounded); `action` is bounded to
+    /// two values by [`ActivityPauseAction`]. `execution.id` is never a label.
+    ///
+    /// Maps to the counter `harvest_activity_pause_actions_total{activity, action}`.
+    fn record_activity_pause_action(&self, activity_name: &str, action: ActivityPauseAction) {
+        let _ = (activity_name, action);
     }
 
     /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot
@@ -1914,6 +2499,18 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `METRIC_SHARD_STRANDED_PENDING{shard}`.
     fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
         let _ = (shard, count);
+    }
+
+    /// A task was dispatched from the given shard (issue #961).
+    ///
+    /// Recorded once per dispatched task by the worker's poll loop, which is
+    /// the only place that knows which shard the claim came from (a task row
+    /// carries no `shard_id` column — "which shard" *is* "which pool").
+    /// Lets operators confirm no assigned shard is being starved (AC5).
+    ///
+    /// Maps to the counter [`METRIC_SHARD_DISPATCHED`].
+    fn record_shard_dispatched(&self, shard: u16) {
+        let _ = shard;
     }
 
     /// A scheduled run was dispatched (either a DAG run or a workflow start).
@@ -2087,6 +2684,24 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A still-RUNNING (suspended, not terminal) workflow execution's
+    /// recorded history event count has just crossed the configured
+    /// early-warning fraction of the hard cap for the first time (issue
+    /// #704).
+    ///
+    /// Emitted **exactly once per execution**, worker-side, guarded by an
+    /// atomic `UPDATE ... WHERE history_bloat_warned_at IS NULL`. This is a
+    /// pure operator early-warning -- it never terminates, cancels, or
+    /// otherwise alters the run's lifecycle.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_HISTORY_BLOAT`] with label
+    /// `workflow` ONLY (no `queue`, unlike most sibling workflow counters --
+    /// see the constant's doc comment). Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_history_bloat(&self, workflow_name: &str) {
+        let _ = workflow_name;
+    }
+
     /// A failed workflow execution was automatically rescheduled for a retry run (issue #523).
     ///
     /// Maps to the counter `harvest.workflow.retries{workflow, queue}`.
@@ -2100,6 +2715,25 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// A worker claimed a task whose workflow/activity type it has no handler
+    /// registered for, and either released the claim for a capable peer or
+    /// escalated it after exhausting the redelivery budget (issue #804).
+    ///
+    /// Maps to the counter
+    /// `harvest.task.capability_miss{queue, task_type, outcome}`.
+    ///
+    /// `task_type` is `"workflow"` / `"activity"`; `outcome` is
+    /// [`CAPABILITY_MISS_OUTCOME_RELEASED`],
+    /// [`CAPABILITY_MISS_OUTCOME_ESCALATED`] (budget exhausted — the
+    /// fleet-exhaustion signal that pages), or
+    /// [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] (failed on the first
+    /// claim without ever being offered to a peer).
+    /// All three labels are bounded; per ADR-0001 §7 `execution.id` is never a
+    /// metric label (and is not a parameter here, so it cannot become one).
+    fn record_task_capability_miss(&self, queue: &str, task_type: &str, outcome: &str) {
+        let _ = (queue, task_type, outcome);
     }
 
     /// An operator redrive processed one dead-letter entry (issue #510).
@@ -2254,6 +2888,40 @@ pub trait MetricsRecorder: Send + Sync {
     /// and `outcome`. `outcome` is never [`WebhookOutcome::Accepted`] here.
     fn record_webhook_rejected(&self, path: &str, outcome: WebhookOutcome) {
         let _ = (path, outcome);
+    }
+
+    /// A broker event-source connector pulled a message off its topic/queue
+    /// (issue #944), before any mapping or dispatch was attempted.
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_RECEIVED`] with label `source`.
+    /// The message key/partition/offset are never labels (ADR-0001 §7).
+    fn record_connector_received(&self, source: &str) {
+        let _ = source;
+    }
+
+    /// A connector message reached a terminal disposition (issue #944).
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_DISPATCHED`] with labels
+    /// `source` and `outcome`.
+    fn record_connector_dispatched(&self, source: &str, outcome: ConnectorOutcome) {
+        let _ = (source, outcome);
+    }
+
+    /// A connector message was routed to a dead-letter destination
+    /// (issue #944).
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_POISONED`] with labels `source`
+    /// and `reason`.
+    fn record_connector_poisoned(&self, source: &str, reason: PoisonReason) {
+        let _ = (source, reason);
+    }
+
+    /// The broker-reported consumer lag for a connector source (issue #944).
+    ///
+    /// Maps to the gauge [`METRIC_CONNECTOR_LAG`] with label `source`.
+    /// Adapters whose client cannot report lag never call this.
+    fn record_connector_lag(&self, source: &str, lag: i64) {
+        let _ = (source, lag);
     }
 
     /// A saga compensation sequence started running forward (issue #801).
@@ -2509,6 +3177,30 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
         return;
     }
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
+}
+
+/// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
+///
+/// Callers reach this through [`crate::execution::emit_start_cancel_metrics`],
+/// which walks the [`crate::execution::StartCancelledRun`] list a start returns
+/// and emits this counter for every entry whose `superseded` flag is set. It
+/// MUST be called only **after** the outer transaction commits — a rollback
+/// would otherwise leave a phantom count for a supersede that never became
+/// durable.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`], so the synthetic liveness canary can never move a
+/// business-facing counter.
+pub fn emit_concurrency_superseded<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    superseded_workflow_names: &[String],
+) {
+    for workflow_name in superseded_workflow_names {
+        if crate::canary::is_canary_workflow(workflow_name) {
+            continue;
+        }
+        metrics.record_concurrency_superseded(workflow_name);
+    }
 }
 
 /// Default metrics recorder that discards every sample.
@@ -2789,6 +3481,11 @@ mod tests {
             "harvest.schedule.decision_write_failed"
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        // issue #811: latest-wins concurrency supersede counter.
+        assert_eq!(
+            METRIC_CONCURRENCY_SUPERSEDED,
+            "harvest.concurrency.superseded"
+        );
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
@@ -2973,6 +3670,67 @@ mod tests {
             6,
             "should emit once for each of the 6 terminal outcomes"
         );
+    }
+
+    #[test]
+    fn emit_concurrency_superseded_skips_canary_and_records_business_workflows() {
+        // Issue #811 AC7: the counter fires exactly once per superseded run,
+        // carrying the SUPERSEDED run's workflow name. Canary probes are
+        // excluded, mirroring `emit_workflow_terminal`, so the synthetic
+        // liveness canary can never move a business-facing counter.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct SupersededCounter(AtomicUsize, std::sync::Mutex<Vec<String>>);
+        impl MetricsRecorder for SupersededCounter {
+            fn record_concurrency_superseded(&self, workflow: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.lock().unwrap().push(workflow.to_owned());
+            }
+        }
+
+        let counter = Arc::new(SupersededCounter::default());
+
+        // An empty list (the overwhelmingly common `Defer` path) emits nothing.
+        emit_concurrency_superseded(counter.as_ref(), &[]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+
+        // A canary probe records NOTHING.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                crate::canary::CANARY_WORKFLOW_NAME_PREFIX.to_owned(),
+                "__harvest_canary_probe__default".to_owned(),
+            ],
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.concurrency.superseded"
+        );
+
+        // Business workflows emit exactly once per superseded run, in order,
+        // including the same name twice when limit = N sheds two runs.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                "doc_index".to_owned(),
+                "doc_index".to_owned(),
+                "checkout".to_owned(),
+            ],
+        );
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            counter.1.lock().unwrap().as_slice(),
+            &["doc_index", "doc_index", "checkout"],
+            "the counter must carry the superseded run's workflow name, once per run"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_concurrency_superseded(&*erased, &["billing".to_owned()]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -3309,6 +4067,18 @@ mod tests {
     }
 
     #[test]
+    fn shard_dispatched_counter_has_default_noop_impl() {
+        // AC5 (issue #961): the shard-dimension twin of #515's
+        // `harvest.queue.dispatched{queue}`, so an operator can confirm the
+        // live dispatch split ACROSS shards and prove no assigned shard is
+        // being starved by a deep backlog on a sibling.
+        let rec = NoOpMetrics;
+        rec.record_shard_dispatched(0);
+        rec.record_shard_dispatched(2);
+        assert_eq!(METRIC_SHARD_DISPATCHED, "harvest.shard.dispatched");
+    }
+
+    #[test]
     fn worker_slots_gauge_has_default_noop_impl() {
         // record_worker_slots must exist on MetricsRecorder with
         // (slot_type: SlotType, in_use: u64, available: u64). The constants are
@@ -3352,6 +4122,41 @@ mod tests {
         assert_eq!(TunerDecision::Grow.as_str(), "grow");
         assert_eq!(TunerDecision::Shrink.as_str(), "shrink");
         assert_eq!(TunerDecision::Hold.as_str(), "hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity-type pause/resume counter (issue #807)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn activity_pause_actions_counter_has_correct_name_and_labels() {
+        // OTel semantic naming: instrument.noun (dot-separated). Deliberately
+        // NOT `harvest.activity.paused`: `harvest.queue.paused` is a gauge
+        // (#619) and `harvest.workflow.paused` is a counter (#383), so a third
+        // reuse of that noun would be ambiguous about instrument type.
+        assert_eq!(
+            METRIC_ACTIVITY_PAUSE_ACTIONS,
+            "harvest.activity.pause_actions"
+        );
+        assert_eq!(METRIC_LABEL_ACTION, "action");
+        // The plain `activity` label, not the dotted circuit-breaker variant.
+        assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
+    }
+
+    #[test]
+    fn activity_pause_action_stringify_is_bounded() {
+        assert_eq!(ActivityPauseAction::Pause.as_str(), "pause");
+        assert_eq!(ActivityPauseAction::Resume.as_str(), "resume");
+    }
+
+    #[test]
+    fn activity_pause_action_counter_has_a_default_noop_impl() {
+        // record_activity_pause_action must exist on MetricsRecorder with a
+        // no-op default so adding it is not a breaking change for existing
+        // implementers (issue #807).
+        let rec = NoOpMetrics;
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
     }
 
     #[test]
@@ -3421,6 +4226,7 @@ mod tests {
         rec.record_summary_deleted("onboarding", 50);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
+        rec.record_workflow_history_bloat("onboarding");
         rec.record_schedule_to_start("default", 1.5);
         rec.record_queue_oldest_pending_age("default", 30.0);
         rec.record_worker_slots(SlotType::Workflow, 3, 5);
@@ -3462,6 +4268,76 @@ mod tests {
     }
 
     #[test]
+    fn connector_metric_names_are_stable() {
+        // These names are the operator-facing contract (dashboards, alerts).
+        assert_eq!(METRIC_CONNECTOR_RECEIVED, "harvest.connector.received");
+        assert_eq!(METRIC_CONNECTOR_DISPATCHED, "harvest.connector.dispatched");
+        assert_eq!(METRIC_CONNECTOR_POISONED, "harvest.connector.poisoned");
+        assert_eq!(METRIC_CONNECTOR_LAG, "harvest.connector.lag");
+        assert_eq!(METRIC_LABEL_SOURCE, "source");
+    }
+
+    #[test]
+    fn connector_outcome_stringifies_to_bounded_values() {
+        assert_eq!(ConnectorOutcome::Dispatched.as_str(), "dispatched");
+        assert_eq!(
+            ConnectorOutcome::IdempotentReplay.as_str(),
+            "idempotent_replay"
+        );
+        assert_eq!(ConnectorOutcome::Deferred.as_str(), "deferred");
+        assert_eq!(ConnectorOutcome::DeadLettered.as_str(), "dead_lettered");
+        assert_eq!(ConnectorOutcome::Retried.as_str(), "retried");
+        assert_eq!(ConnectorOutcome::Dispatched.to_string(), "dispatched");
+    }
+
+    #[test]
+    fn poison_reason_stringifies_to_bounded_values() {
+        assert_eq!(PoisonReason::Malformed.as_str(), "malformed");
+        assert_eq!(PoisonReason::MappingRejected.as_str(), "mapping_rejected");
+        assert_eq!(PoisonReason::TargetRejected.as_str(), "target_rejected");
+        assert_eq!(PoisonReason::Malformed.to_string(), "malformed");
+    }
+
+    #[test]
+    fn connector_outcome_label_values_are_a_small_closed_set() {
+        // ADR-0001 §7: the `outcome`/`reason` label values must be a bounded,
+        // closed set so `harvest.connector.*` cardinality stays
+        // `sources x small-constant`, never `sources x messages`.
+        let outcomes = [
+            ConnectorOutcome::Dispatched,
+            ConnectorOutcome::IdempotentReplay,
+            ConnectorOutcome::Deferred,
+            ConnectorOutcome::DeadLettered,
+            ConnectorOutcome::Retried,
+        ];
+        let distinct: std::collections::BTreeSet<&str> =
+            outcomes.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            outcomes.len(),
+            "outcome labels must be unique"
+        );
+
+        let reasons = [
+            PoisonReason::Malformed,
+            PoisonReason::MappingRejected,
+            PoisonReason::TargetRejected,
+        ];
+        let distinct_reasons: std::collections::BTreeSet<&str> =
+            reasons.iter().map(|r| r.as_str()).collect();
+        assert_eq!(distinct_reasons.len(), reasons.len());
+    }
+
+    #[test]
+    fn noop_metrics_implements_connector_methods_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_connector_received("orders");
+        rec.record_connector_dispatched("orders", ConnectorOutcome::Dispatched);
+        rec.record_connector_poisoned("orders", PoisonReason::Malformed);
+        rec.record_connector_lag("orders", 42);
+    }
+
+    #[test]
     fn session_acquisition_outcome_stringifies_to_bounded_values() {
         assert_eq!(SessionAcquisitionOutcome::Acquired.as_str(), "acquired");
         assert_eq!(SessionAcquisitionOutcome::TimedOut.as_str(), "timed_out");
@@ -3488,6 +4364,23 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_admission_bypassed("outbox");
         rec.record_admission_bypassed("api");
+    }
+
+    #[test]
+    fn metric_workflow_history_bloat_name_is_stable() {
+        assert_eq!(
+            METRIC_WORKFLOW_HISTORY_BLOAT,
+            "harvest.workflow.history_bloat"
+        );
+    }
+
+    #[test]
+    fn noop_metrics_implements_history_bloat_without_panicking() {
+        // issue #704: the new early-warning counter has a no-op default
+        // (additive) so a `MetricsRecorder` implementor that predates this
+        // issue keeps compiling unchanged.
+        let rec = NoOpMetrics;
+        rec.record_workflow_history_bloat("onboarding");
     }
 
     #[test]
@@ -3843,5 +4736,78 @@ mod tests {
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_saga_compensated("billing", "default");
         rec.record_saga_compensation_failed("billing", "default");
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability-miss release / escalate counter (issue #804)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metric_capability_miss_constant_has_correct_name() {
+        // AC5 names the counter `harvest.task.capability_miss`. It shares the
+        // `harvest.task.*` family with `harvest.task.quarantined` (issue #367)
+        // so the two fleet-health task signals sort together on a dashboard.
+        assert_eq!(METRIC_TASK_CAPABILITY_MISS, "harvest.task.capability_miss");
+    }
+
+    #[test]
+    fn metric_label_task_type_has_correct_name() {
+        assert_eq!(METRIC_LABEL_TASK_TYPE, "task_type");
+    }
+
+    #[test]
+    fn record_task_capability_miss_has_noop_default() {
+        // Additive no-op default so every existing MetricsRecorder impl
+        // compiles unchanged (the established recipe: #519, #367, #618).
+        let rec = NoOpMetrics;
+        rec.record_task_capability_miss("default", "workflow", "released");
+        rec.record_task_capability_miss("default", "activity", "escalated");
+    }
+
+    #[test]
+    fn capability_miss_outcome_labels_are_bounded() {
+        // AC5 requires that operators can "alert on the escalation" — that is
+        // only expressible if release and escalation are DISTINGUISHABLE on the
+        // counter. The issue text names `{queue, task_type}`; we ship a
+        // deliberate bounded SUPERSET with `outcome`, matching the repo idiom
+        // (`harvest.schedule.fire_attempts{outcome}`,
+        // `harvest.workflow.terminal{outcome}`).
+        //
+        // Exactly three values, all compile-time constants — no caller-supplied
+        // string can widen the cardinality.
+        assert_eq!(CAPABILITY_MISS_OUTCOME_RELEASED, "released");
+        assert_eq!(CAPABILITY_MISS_OUTCOME_ESCALATED, "escalated");
+        assert_eq!(
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+            "escalated_never_offered"
+        );
+
+        let all = [
+            CAPABILITY_MISS_OUTCOME_RELEASED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        ];
+        let distinct: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(distinct.len(), all.len(), "outcome values must be distinct");
+
+        // PromQL `=` is exact string equality, so the paging rule's
+        // `outcome="escalated"` selector excludes the never-offered value ONLY
+        // while that value is not itself `escalated`. Pin the non-prefix
+        // relationship the alert pack depends on: a future rename to something
+        // like `escalated` + a suffix matcher would silently re-conflate them.
+        assert_ne!(
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED
+        );
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_task_capability_miss() {
+        // Compile-level cardinality pin (ADR-0001 §7): the signature accepts
+        // exactly three bounded strings. An ExecutionId parameter would not
+        // compile, so unbounded per-execution series are impossible here by
+        // construction.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_task_capability_miss("default", "workflow", "released");
     }
 }

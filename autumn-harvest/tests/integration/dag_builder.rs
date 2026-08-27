@@ -117,6 +117,8 @@ fn harvest_builder_collects_dags() {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

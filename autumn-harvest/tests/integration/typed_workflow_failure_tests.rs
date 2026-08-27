@@ -191,7 +191,39 @@ mod db_handle_surface {
         autumn_harvest::full_migrations_sql().as_bytes().to_vec()
     }
 
-    async fn setup() -> (String, ContainerAsync<Postgres>) {
+    /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
+    /// (creating a fresh per-test database off it so tests in this binary never
+    /// share state), else fall back to testcontainers. Mirrors
+    /// `retry_chain_routing_tests`, so this suite is runnable on a host with a
+    /// Postgres but no Docker.
+    async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
+        if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            let db_name = format!("harvest_typedfail_{}", Uuid::new_v4().simple());
+            let mut admin = AsyncPgConnection::establish(&admin_url)
+                .await
+                .expect("connect to the admin database");
+            diesel::sql_query(format!("CREATE DATABASE {db_name}"))
+                .execute(&mut admin)
+                .await
+                .expect("create per-test database");
+            drop(admin);
+            let (prefix, _) = admin_url
+                .rsplit_once('/')
+                .expect("url must carry a database path");
+            let url = format!("{prefix}/{db_name}");
+            let mut conn = AsyncPgConnection::establish(&url)
+                .await
+                .expect("connect to the per-test database");
+            diesel_async::SimpleAsyncConnection::batch_execute(
+                &mut conn,
+                autumn_harvest::full_migrations_sql(),
+            )
+            .await
+            .expect("apply migrations");
+            drop(conn);
+            return (url, None);
+        }
+
         let container = Postgres::default()
             .with_init_sql(init_sql())
             .with_tag("16")
@@ -204,7 +236,7 @@ mod db_handle_surface {
             .await
             .expect("container postgres port");
         let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-        (database_url, container)
+        (database_url, Some(container))
     }
 
     fn build_pool(database_url: &str) -> DbPool {
@@ -229,6 +261,7 @@ mod db_handle_surface {
         let exec_id = ExecutionId::new();
         diesel::insert_into(dsl::harvest_workflow_executions)
             .values(&NewWorkflowExecution {
+                quota_key: None,
                 id: exec_id.as_uuid(),
                 workflow_name: "typed_failing_wf",
                 workflow_id: &format!("wf-typed-{}", Uuid::new_v4()),
@@ -371,9 +404,13 @@ mod db_handle_surface {
     /// the caller must see the FINAL attempt's typed fields — enriched from the
     /// *effective* execution, not the original handle id.
     ///
-    /// Also pins the consistency contract: `result_snapshot` does NOT follow the
-    /// chain (it reports the original row), so its typed fields must stay keyed
-    /// to the original execution it reports.
+    /// Also pins the issue #843 AC4 decision and its internal-consistency
+    /// requirement: `result_snapshot` DOES follow the chain (matching
+    /// `result_snapshot_with_wait` and the HTTP `/result` route, which already
+    /// did), and its typed `error_type`/`error_details`/`non_retryable` are
+    /// loaded from the execution the snapshot was actually read from — so a
+    /// routed snapshot can never pair an inner attempt's `error` with the
+    /// outer attempt's typed metadata.
     #[tokio::test]
     async fn result_raw_enriches_from_the_effective_retry_execution() {
         let (db_url, _container) = setup().await;
@@ -421,16 +458,32 @@ mod db_handle_surface {
             Some(&serde_json::json!({ "cat": "FinalClass" }))
         );
 
-        // result_snapshot does NOT follow the chain — it reports the original
-        // row, so its typed fields must stay consistent with THAT execution.
+        // Issue #843 AC4: result_snapshot follows the chain too, so EVERY field
+        // it reports — the untyped `error`/`state` and the typed
+        // `error_type`/`error_details`/`non_retryable` alike — comes from the
+        // SAME (final-attempt) execution. Asserting both halves is what makes
+        // this a mixed-source regression guard rather than a state check.
         let typed = autumn_harvest::TypedWorkflowHandle::<Value>::new(handle.clone());
         let snap = typed.result_snapshot().await.unwrap();
         assert_eq!(snap.state, WorkflowResultState::Failed);
         assert_eq!(
-            snap.error_type.as_deref(),
-            Some("OriginalClass"),
-            "result_snapshot reports the original row (no chain-follow), so its \
-             typed fields must match the original execution"
+            snap.error.as_deref(),
+            Some("final attempt also failed"),
+            "result_snapshot follows the retry chain, so its `error` is the \
+             final attempt's"
         );
+        assert_eq!(
+            snap.error_type.as_deref(),
+            Some("FinalClass"),
+            "the typed fields must be loaded from the execution the snapshot was \
+             READ FROM, never from the addressed id — else a routed snapshot \
+             pairs the final attempt's `error` with the original's `error_type`"
+        );
+        assert_eq!(
+            snap.error_details,
+            Some(serde_json::json!({ "cat": "FinalClass" })),
+            "error_details must come from the same execution as error_type"
+        );
+        assert_eq!(snap.non_retryable, Some(true));
     }
 }

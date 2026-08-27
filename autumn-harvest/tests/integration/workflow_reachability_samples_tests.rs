@@ -56,6 +56,7 @@ async fn insert_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

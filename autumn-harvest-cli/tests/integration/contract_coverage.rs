@@ -238,6 +238,14 @@ fn workflow_list_is_covered() {
 }
 
 #[test]
+fn workflow_list_history_bloat_min_events_is_covered() {
+    // Issue #704: operator early-warning discovery for workflow history bloat.
+    // Distinct query param from the server's general-purpose
+    // `min_history_events` filter (issue #493) -- see PR #1139 review.
+    assert_covered(&["workflow", "list", "--history-bloat-min-events", "5000"]);
+}
+
+#[test]
 fn workflow_summaries_is_covered() {
     assert_covered(&["workflow", "summaries"]);
     assert_covered(&[
@@ -267,6 +275,49 @@ fn workflow_timeline_is_covered() {
         "timeline",
         "00000000-0000-0000-0000-000000000001",
     ]);
+}
+
+#[test]
+fn workflow_logs_is_covered() {
+    // Issue #790. `assert_covered` strips the query string, so the flags'
+    // wire shape is pinned by the `request_mapping.rs` tests instead.
+    assert_covered(&["workflow", "logs", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn workflow_logs_with_filters_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "error",
+        "--limit",
+        "50",
+    ]);
+}
+
+#[test]
+fn workflow_awaitables_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "awaitables",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
+fn workflow_diagnose_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "diagnose",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
+fn workflow_tree_is_covered() {
+    assert_covered(&["workflow", "tree", "00000000-0000-0000-0000-000000000001"]);
 }
 
 #[test]
@@ -334,6 +385,26 @@ fn workflow_pause_is_covered() {
 #[test]
 fn workflow_resume_is_covered() {
     assert_covered(&["workflow", "resume", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn workflow_rerun_is_covered() {
+    assert_covered(&["workflow", "rerun", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn workflow_annotate_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+        "--note",
+        "claimed",
+    ]);
 }
 
 #[test]
@@ -423,6 +494,11 @@ fn history_export_single_is_covered() {
 #[test]
 fn history_export_batch_is_covered() {
     assert_covered(&["history", "export-batch"]);
+}
+
+#[test]
+fn history_export_sample_is_covered() {
+    assert_covered(&["history", "export-sample", "--output-dir", "./fixtures"]);
 }
 
 // ── external handoffs ─────────────────────────────────────────────────────────
@@ -690,7 +766,16 @@ fn workflow_start_body_fields_are_documented() {
         "reject_duplicate",
         "--conflict-policy",
         "use_existing",
+        "--residency-key",
+        "eu",
     ]);
+}
+
+/// issue #697: the `shard_id` placement field must be documented too. It is
+/// mutually exclusive with `--residency-key`, so it needs its own invocation.
+#[test]
+fn workflow_start_shard_id_body_field_is_documented() {
+    assert_body_fields_documented(&["workflow", "start", "my_workflow", "--shard-id", "1"]);
 }
 
 #[test]
@@ -712,6 +797,49 @@ fn workflow_pause_body_fields_are_documented() {
         "00000000-0000-0000-0000-000000000001",
         "--reason",
         "test",
+    ]);
+}
+
+#[test]
+fn workflow_rerun_body_fields_are_documented() {
+    // The bare form sends `{}`, which `assert_body_fields_documented` skips —
+    // pass both flags so `input` and `workflow_id` are actually cross-checked
+    // against the contract's `request_body.fields`.
+    assert_body_fields_documented(&[
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-json",
+        r#"{"user_id": 7}"#,
+        "--workflow-id",
+        "order-42-retry",
+    ]);
+}
+
+#[test]
+fn workflow_annotate_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+        "--note",
+        "claimed",
+    ]);
+}
+
+#[test]
+fn workflow_annotate_clear_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--clear-owner",
+        "--clear-severity",
+        "--clear-note",
     ]);
 }
 
@@ -1101,6 +1229,85 @@ fn build_ramp_set_body_fields_are_documented() {
 
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
+// ── Task-queue pause/resume (issue #619) ──────────────────────────────────────
+
+#[test]
+fn queue_pause_is_covered() {
+    assert_covered(&["queue", "pause", "email-workers", "--reason", "outage"]);
+    assert_body_fields_documented(&["queue", "pause", "email-workers", "--reason", "outage"]);
+}
+
+#[test]
+fn queue_pause_with_shard_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "outage",
+        "--shard-id",
+        "1",
+    ]);
+}
+
+#[test]
+fn queue_resume_is_covered() {
+    assert_covered(&["queue", "resume", "email-workers"]);
+    assert_body_fields_documented(&["queue", "resume", "email-workers", "--shard-id", "1"]);
+}
+
+#[test]
+fn queue_list_paused_is_covered() {
+    assert_covered(&["queue", "list-paused"]);
+}
+
+// ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
+
+#[test]
+fn activity_pause_is_covered() {
+    assert_covered(&["activity", "pause", "charge_card"]);
+    assert_body_fields_documented(&[
+        "activity",
+        "pause",
+        "charge_card",
+        "--reason",
+        "outage",
+        "--actor",
+        "alice",
+    ]);
+}
+
+#[test]
+fn activity_resume_is_covered() {
+    assert_covered(&["activity", "resume", "charge_card"]);
+    assert_body_fields_documented(&["activity", "resume", "charge_card"]);
+}
+
+#[test]
+fn activity_list_is_covered() {
+    assert_covered(&["activity", "list"]);
+    // `--json` only swaps the rendering, so it must still resolve to the same
+    // documented route rather than becoming an undocumented variant.
+    assert_covered(&["activity", "list", "--json"]);
+}
+
+#[test]
+fn activity_get_is_covered() {
+    assert_covered(&["activity", "get", "charge_card"]);
+}
+
+// ── Queue coverage (issue #774) ─────────────────────────────────────────────
+
+#[test]
+fn queue_coverage_is_covered() {
+    assert_covered(&["queue", "coverage"]);
+}
+
+#[test]
+fn queue_coverage_with_filter_is_covered() {
+    assert_covered(&["queue", "coverage", "--queue", "email-workers"]);
+}
+
 #[test]
 fn token_create_is_covered() {
     assert_covered(&["token", "create", "ci-bot", "--scope", "read"]);
@@ -1132,4 +1339,81 @@ fn token_create_body_fields_are_documented() {
         "--expires-at",
         "2027-01-01T00:00:00Z",
     ]);
+}
+
+// ── TTL'd runtime pacing overrides (issue #945) ─────────────────────────────
+
+#[test]
+fn rate_limit_override_is_covered() {
+    assert_covered(&[
+        "rate-limit",
+        "override",
+        "send_email",
+        "--refill-rate",
+        "50",
+        "--burst",
+        "100",
+        "--ttl-secs",
+        "300",
+    ]);
+}
+
+#[test]
+fn rate_limit_override_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "rate-limit",
+        "override",
+        "send_email",
+        "--refill-rate",
+        "50",
+        "--burst",
+        "100",
+        "--ttl-secs",
+        "300",
+    ]);
+}
+
+#[test]
+fn rate_limit_clear_is_covered() {
+    assert_covered(&["rate-limit", "clear", "send_email"]);
+}
+
+#[test]
+fn throttle_status_is_covered() {
+    assert_covered(&["throttle", "status"]);
+}
+
+#[test]
+fn throttle_override_is_covered() {
+    assert_covered(&[
+        "throttle",
+        "override",
+        "onboard_user",
+        "--refill-per-sec",
+        "2.5",
+        "--burst",
+        "5",
+        "--ttl-secs",
+        "600",
+    ]);
+}
+
+#[test]
+fn throttle_override_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "throttle",
+        "override",
+        "onboard_user",
+        "--refill-per-sec",
+        "2.5",
+        "--burst",
+        "5",
+        "--ttl-secs",
+        "600",
+    ]);
+}
+
+#[test]
+fn throttle_clear_is_covered() {
+    assert_covered(&["throttle", "clear", "onboard_user"]);
 }

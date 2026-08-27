@@ -105,6 +105,7 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -156,7 +157,12 @@ async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
 ) -> (ExecutionId, Vec<WorkflowEvent>) {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    // Deliberately a NON-default shard (issue #697 AC4): the reset fork must
+    // inherit the *source's* shard, so seeding on shard 0 -- which is this
+    // fixture's default shard -- would let a "always use default_shard"
+    // regression pass. Only the encoded shard changes; the row is still written
+    // through the single test pool, which every shard id resolves to here.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(4));
     start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
@@ -178,6 +184,7 @@ async fn seed_execution(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -352,7 +359,13 @@ async fn reset_forks_200_event_execution_and_tears_down_source() {
         .unwrap();
     assert_eq!(fork.state, "RUNNING");
     assert_eq!(fork.workflow_id, "wf-reset-success");
-    assert_eq!(new_exec_id.shard(), exec_id.shard());
+    assert_eq!(
+        new_exec_id.shard(),
+        exec_id.shard(),
+        "a reset fork must inherit the source's shard (issue #697 AC4); the \
+         source is seeded on a non-default shard so this also falsifies a \
+         `default_shard` regression, not just an `ExecutionId::new()` one"
+    );
 
     let fork_events: Vec<(i32, String)> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
@@ -427,6 +440,9 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "resettable",
             module: "workflow_reset_integration",

@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "contract_version": "2",
   "description": "Versioned machine-readable contract for the Harvest management API. Update this file and CHANGELOG.md whenever a route is added, removed, renamed, or its request/response shape changes.",
   "compatibility": {
@@ -125,18 +125,24 @@
           "in": "query",
           "required": false,
           "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
+        },
+        {
+          "name": "history_bloat_min_events",
+          "in": "query",
+          "required": false,
+          "description": "Operator early-warning discovery for workflow history bloat (issue #704). A non-negative integer N. Restricts the response to live (non-terminal) executions whose current recorded harvest_events count is >= N, sorted by history size descending (largest first), each row carrying its history_event_count so callers can rank/triage without a second call. Not supported together with cursor/page_size/order pagination (results are sorted by a computed value, which has no keyset cursor) -- combining them returns 400. A non-numeric or negative value returns 400. Deliberately a DIFFERENT query parameter from the unrelated, pre-existing general-purpose min_history_events filter (issue #493), which composes freely with state=/order=/pagination and returns executions of any state in the caller's chosen order -- the two parameters must never be conflated (see PR #1139 review)."
         }
       ],
       "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged. With history_bloat_min_events set (issue #704): each returned row additionally carries history_event_count (an integer, omitted on every other request); rows are always non-terminal and sorted by history_event_count descending regardless of any order= param (which is rejected when combined -- see the history_bloat_min_events param description). The unrelated pre-existing min_history_events filter (issue #493) composes with state=/order=/pagination normally and does not affect sort order or add history_event_count to the response."
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid filter value, bad RFC 3339 timestamp, or unknown order direction."
+          "description": "Invalid filter value, bad RFC 3339 timestamp, unknown order direction, or history_bloat_min_events combined with cursor/page_size/order pagination."
         },
         {
           "status": 500,
@@ -553,6 +559,78 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/tree",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) — never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call — a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Root execution UUID (may be any node in the tree)."
+        },
+        {
+          "name": "max_depth",
+          "in": "query",
+          "required": false,
+          "description": "Recursion depth cap below the root. Default 20, must be 1–50. Out of range is rejected with 400 rather than silently clamped."
+        },
+        {
+          "name": "max_nodes",
+          "in": "query",
+          "required": false,
+          "description": "Total node cap INCLUDING the root. Default 1000, must be 1–10000. Out of range is rejected with 400."
+        },
+        {
+          "name": "summary",
+          "in": "query",
+          "required": false,
+          "description": "`true`/`1` returns the per-state descendant roll-up instead of the nested tree."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "root",
+          "node_count",
+          "max_depth_reached",
+          "truncated",
+          "truncation_reason",
+          "truncated_parent_ids",
+          "truncated_parents_capped",
+          "limits",
+          "status",
+          "unavailable_shards",
+          "counts",
+          "total_descendants",
+          "retained_summary_parent_ids"
+        ],
+        "notes": "The body is POLYMORPHIC. Default (tree) mode returns root (a nested node whose `children` array recurses), node_count, and max_depth_reached. `?summary=true` returns root as a compact {execution_id, workflow_name, workflow_id, state} ref plus counts (map of lowercased state -> descendant count) and total_descendants, and omits node_count/children. Both shapes carry truncated, truncation_reason (omitted when null), truncated_parent_ids, truncated_parents_capped, limits (the bounds actually applied), status, and unavailable_shards. The fields list above is the UNION of both shapes. retained_summary_parent_ids (issue #752) names nodes in the returned tree that have at least one child DEMOTED INTO A RETENTION SUMMARY and therefore omitted from the tree along with everything beneath it; it is empty unless tiered summary retention is enabled. It is a THIRD, independent incompleteness signal: truncated=false AND status=complete together still do not mean every descendant is present -- check this list too. The omitted rows remain readable via GET /workflows/summaries."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID, or an out-of-range/non-numeric max_depth or max_nodes (the message names the offending bound)."
+        },
+        {
+          "status": 404,
+          "description": "Root execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it), and for a classic DAG run, which is not on the execution path."
+        },
+        {
+          "status": 503,
+          "description": "The root's own shard could not be queried, so existence is undetermined (retriable): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node — the normal state mid a shard-add rollout — or that shard's pool connection could not be acquired. Deliberately not a 404: answering 'not found' would be a false negative for a run that may exist on its own shard. Note this applies only to the ROOT lookup; an unreachable shard encountered during the DESCENDANT walk degrades to 200 with status=partial and the shard named in unavailable_shards."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only. A point-in-time snapshot assembled per-shard."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/stack",
       "category": "workflow",
       "read_only": true,
@@ -627,6 +705,183 @@
         {
           "status": 400,
           "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/logs",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Durable per-execution author log lines (issue #790): the lines a workflow emitted through ctx.logger()/ctx.log_info/log_warn/log_error, persisted to harvest_workflow_logs when the opt-in durable sink is enabled via HarvestBuilder::workflow_log_persistence. Admin-gated: a log message is free-form author text that routinely carries business detail, so this read takes the stricter posture of the sibling per-execution diagnostics (/awaitables) rather than the plain execution-row one. Lines are returned in EMISSION order (the deterministic seq logical-position key), never occurred_at, which is wall clock and can be non-monotonic across workers; seq is also the pagination cursor. Each element of lines[] carries seq (i64), level (info|warn|error), message (string, capped at write time), occurred_at (RFC 3339), and truncation_marker (bool, present only when true). When an execution exceeds its configured per-execution line cap, the newest lines are dropped and a single synthetic marker row is appended (drop-newest); the response-level truncated flag is filter-independent, so a ?level=error page still reports it. Logs are OBSERVATIONAL ONLY: they are not part of the event history, carry no determinism guarantee, and are never read back into workflow logic. With the sink disabled this endpoint returns an empty lines[] for every execution. Log rows are removed by the same ON DELETE CASCADE that removes the execution, so they can never outlive workflow-history retention, and targeted PII erasure (issue #495) deletes them too. Shard routing fails closed (no default-shard fallback): an empty list is a legitimate answer for a run that never logged, so a mis-routed read would be indistinguishable from \"no logs\" and returns 503 instead.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Page size; default 200. Values above 1000 are clamped down; a value \u003c= 0 is rejected with 400 rather than clamped up."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Exclusive keyset cursor: the previous page's last seq. `after` is accepted as an alias."
+        },
+        {
+          "name": "level",
+          "in": "query",
+          "required": false,
+          "description": "Repeatable, or comma-separated. One of info, warn, error. An unknown value returns 400 rather than silently matching nothing \u2014 a typo would otherwise answer \"no lines\" for a run that has plenty. Omitted means all levels."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 exclusive lower bound on occurred_at. A convenience bound only \u2014 paginate with cursor, since occurred_at is not monotonic across workers."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "lines",
+          "next_cursor",
+          "total_lines",
+          "truncated"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID, limit, cursor, level, or since."
+        },
+        {
+          "status": 401,
+          "description": "Caller lacks Harvest admin access."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The shard that owns this execution has no configured storage pool on this node, so existence cannot be determined without risking a false 404."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/awaitables",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Open-awaitables diagnostic (issue #615): names every open awaitable the execution is currently parked on, across six categories — pending activities (regular/local/external), unfired durable timers, awaited-but-unfulfilled signals (by name), pending child workflows (name + child exec id), unresolved await_condition parks, and pending updates — plus mutex acquires (#691) and external-workflow operations (#757) when present. The wait-set is derived by replaying recorded history read-only to the current suspension point (the #612 drive machinery), so it sees awaited-but-ABSENT inputs the side tables cannot (an unsent signal, a never-true condition). Each awaitable carries kind, name/identifier, a since timestamp derived from recorded history, and a deadline where one applies (timer fire time, signal/child race deadline, external schedule-to-close, activity schedule-to-close/start-to-close from the task row). Payload-free: names, ids, and timestamps only — never inputs/payloads/update args — so read-path payload decoding (issue #608) is deliberately skipped. Admin-gated (the eligibility endpoints' posture). Terminal executions return 200 with an empty awaitables list and wait_set = \"terminal\". Each category is bounded to the first category_cap entries with overflow reported in truncated/truncated_kinds. When the replay drive is unavailable (handler not registered on this node, classic DAG, encrypted history without decode, replay timeout/panic, a detected replay divergence, or a replay that reaches terminal on a non-terminal run), wait_set degrades to \"history_only\" with wait_set_reason naming why — activities/timers/children/updates still report from the event-log scan, but awaited-unsent signals and await_condition parks are not observable in that mode. Read path is shard-local (routed via the exec id's embedded shard); no cross-shard fan-out. Appends no events, performs no writes, adds no new WorkflowEvent variant.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "is_terminal",
+          "wait_set",
+          "wait_set_reason",
+          "awaitables",
+          "truncated",
+          "truncated_kinds",
+          "category_cap"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Admin credentials required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/diagnose",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Per-execution stall diagnosis (issue #809): answers \"is this run healthily waiting or pathologically stuck, and what is the actionable root cause?\" in one call, replacing the 4+ endpoint correlation an operator does by hand today. Returns a one-word triage `health` (`healthy` | `stalled` | `blocked_external` | `terminal`), a discriminated `blocked_on` object, and `last_event_age_seconds`. `blocked_on` is internally tagged on `type` (snake_case) and closed over: `healthy_in_progress`; `awaiting_signal` {signal_name, since?}; `sleeping_timer` {fires_at}; `pending_child` {child_exec_id, child_state}; `activity_retrying` {activity_name, attempt, last_error?, next_attempt_at?}; `activity_deferred` {activity_name?, next_attempt_at}; `activity_no_worker` {queue, activity_name?}; `activity_circuit_open` {activity_name, phase, cooldown_until?} (`phase` is `open` | `half_open`: a half-open breaker admits a probe right now and closes on success, whereas an operator-forced open one needs an explicit force-close -- both report no `cooldown_until`, so the phase is the only discriminator; because a half-open breaker clears with no operator action its `health` is `healthy`, not `stalled`); `activity_rate_limited` {key, activity_name?}; `activity_rate_limit_bucket_missing` {key, activity_name?} (the bucket row does not exist, so the claim gate's `EXISTS` refuses it forever -- `stalled`, unlike the refilling `activity_rate_limited`); `activity_concurrency_deferred` {key, activity_name?}; `activity_queue_paused` {queue, activity_name?}; `activity_paused` {activity_name} (an operator paused the activity TYPE (#807), so claim_task's paused_activities anti-join holds it on every queue on the shard -- distinct from the queue-wide activity_queue_paused, and ranked just under it because the queue pause is the broader lever); `awaiting_external_handoff` {token, activity_name?}; `paused` {actor?, since?}; `non_determinism_blocked` {since, reason?, block_count}; `awaiting_replay_wait` {wait_kind, name?, since?}; `workflow_no_worker` {queue}; `workflow_queue_paused` {queue}; `timer_overdue{fires_at,overdue_by_seconds}`, `no_pending_work`. Optional members are omitted, never null. Correlates, in a single shard-local read: the pending stack, per-queue worker liveness (the canonical #774 worker_covers_queue predicate, so it cannot drift from /admin/queue-coverage) -- a PENDING row asks whether any worker can claim it right now (Active only, since a Draining worker claims nothing new), while a HELD row asks whether its own recorded claimant is still alive (Active OR Draining, because a worker that has begun a graceful shutdown still runs its held work to completion) plus the row's own claim gates -- required build (#171/#604), required capabilities (#804) and session pin (#606), each evaluated against the SAME worker; an activity row with NO required_capabilities snapshot (a legacy or manual enqueue) is still gated by its REGISTERED handler's requires, mirroring claim_task's ineligible-activities gate, so an un-snapshotted row no worker can claim is reported as a stall rather than as healthy progress, the in-process circuit registry (#369, consulted via list() only -- never on_dispatch/force_* -- so diagnosing can never advance a breaker's phase; and because that registry is per worker PROCESS, its phase is reported only when this API replica's own co-located worker is the SOLE worker that could claim the row, since a peer replica whose breaker is closed can still dispatch it -- a fleet-wide outage is therefore deliberately under-reported rather than risking a false stall, and /admin/circuits per replica remains the authoritative per-breaker surface), rate-limit bucket and per-key concurrency saturation (shaped exactly like claim_task's own gates), the operator queue-pause table (#619), and the task row's own attempt/error/scheduled_at retry timing. Every activity row is classified and the WORST by a fixed cross-task precedence ladder wins (queue_paused, then activity_paused, no_worker, rate_limit_bucket_missing, circuit_open, concurrency_deferred, rate_limited, retrying, deferred, healthy), so one wedged slot in a wide fan-out is never masked by healthy siblings. Within a single row the three non-self-healing gates (queue_paused, no_worker, circuit_open) are checked first, then the not-yet-due branch, then the two self-healing gates: a task that is not yet due has not reached the claim gates at all, so reporting a momentarily-saturated bucket would drop the attempt/last_error/next_attempt_at an operator needs. A future scheduled_at alone does NOT mean failed-and-retrying -- the dispatcher also pushes a task forward with no failure at all (dispatch-time rate-limit deferral, which even decrements the claim-time attempt back down, plus session-capacity and capability-miss redelivery), so the not-yet-due branch reports activity_retrying only when there is failure evidence (a recorded error, which a later deferral never clears) and activity_deferred otherwise. A claimed (RUNNING) row is healthy only while a live worker still polls its queue -- a claimed row whose fleet is gone is a poison-pill orphan (#367), not progress. health is derived from the verdict class alone and never from event age, so a long durable sleep reports healthy no matter how old its last event is. contributing_reason_codes is the UNION of every claim-time impediment across ALL of the execution's activity rows -- not just the row blocked_on names -- so a lower-ranked cause is never hidden behind a higher-ranked sibling in a fan-out; it is sourced verbatim from the eligibility explainer's own pure task_intrinsic_impediment_reasons (#611) so the single-verdict and multi-reason surfaces cannot drift in how a cause is named. Worker liveness is the one reason that is NOT a claim-time gate, so it is reported for a HELD row too -- but keyed on the same question the verdict asks: a PENDING row on claim eligibility (an Active worker could claim it), a HELD row on its own recorded claimant's liveness (Active OR Draining). Without that split the codes contradict the verdict in both directions -- a row held by a live draining claimant would report healthy yet carry no_live_worker, and an orphan held by a dead claimant would OMIT it whenever a live Active peer happens to cover the queue. An awaited-but-unsent signal is visible only to the #615 replay drive, which is comparatively expensive and ranks below activities/handoffs/children, so it is consulted ONLY when the database-observable categories would otherwise resolve to sleeping_timer or no_pending_work -- wait_set reports replayed, history_only (with wait_set_reason: an upstream reason such as handler_not_registered passed through verbatim, else wait_set_unavailable when the replay errors, wait_set_timed_out when it exceeds the query timeout, or execution_went_terminal on a TOCTOU race) or not_consulted accordingly; the replay is bounded by the server's query timeout; the verdict is identical either way and the common wedged-activity path never pays for a replay. Every OTHER awaitable kind replay can name -- a command-less ctx.await_condition park, a durable mutex acquire (#691), an admitted update awaiting its handler, a parked external-workflow operation (#492/#757/#751) -- leaves no row in any side table this endpoint reads, so replay is the only source that can see it; those report awaiting_replay_wait (blocked_external) naming the kind. They are consulted BELOW every side-table cause, so they can only ever replace what would otherwise be a false no_pending_work and can never mask a more precise verdict such as sleeping_timer. Below every category above sits the run's OWN workflow task row (task_type = 'workflow'), consulted purely as a fallback so it can never mask a real cause: a held claim means the handler is executing this instant (healthy_in_progress -- the shape a long local activity holds while scheduling no queue row at all) but ONLY while a live worker still polls its queue, since a claim left behind by a crashed worker is a poison-pill orphan (#367) and reports workflow_no_worker; a PENDING row means the decision cycle is awaiting dispatch and is classified by the same hard-impediment-first ladder an activity row uses -- workflow_queue_paused when an operator holds that queue, then workflow_no_worker (the workflow-task analogue of the no-live-worker stall) when nothing polls it, which outranks a not-yet-due dispatcher deferral on purpose because, unlike a timed sleep, a deferral only self-heals if something claims the row when the timestamp arrives, then healthy_in_progress; and a parked row (RUNNING with a NULL worker, which advances on a wake rather than a claim) is left to the lost-task verdict unchanged. A terminal execution returns health = terminal with terminal_outcome and NO blocked_on. Payload-free apart from the task row's own error text: names, ids, timestamps and queue/bucket keys only -- never an activity input, signal payload or output. That one error string IS routed through read-path payload decoding (#608), exactly as /stack routes the same column for its own last_failure, so an admin never reads plaintext there and a ciphertext envelope here. Admin-gated (the eligibility endpoints' posture: the body names queue, rate-limit and concurrency keys plus fleet coverage state). Shard-local: routed O(1) from the exec id's embedded shard, no cross-shard fan-out. An unfired durable timer more than 60s past its deadline reports timer_overdue (stalled) rather than a healthy sleep -- but ONLY when that timer actually owns the workflow's wake. Timers fire when a worker claims the owning workflow task, and only persist_started_timer reschedules that task to the deadline; every *_park path (signal wait, mutex acquire, activity wait, scheduled activities, child workflows, external handoff) discards the armed deadline and parks the task on the thing being awaited, so a timer armed alongside one of those goes overdue as a matter of course and fires on that wait's completion wake. The verdict is therefore gated on the task row itself -- a claimed or parked row means some other wake owns the run, so the more precise handoff/child/signal cause is reported instead, and only a PENDING row long past its own scheduled_at is a genuinely missed timer wake. Conversely, a durable side-table wait does not advance on its own either: a timer fires only when a worker claims the owning workflow task, so a HARD impediment on that task -- an operator queue pause (#619) or no live poller -- outranks every timer verdict and reports workflow_queue_paused / workflow_no_worker, naming the queue an operator must fix rather than a sleep that can never end. Only the hard impediments are hoisted; the task row's ordinary healthy-dispatch result stays a fallback so it never masks the more specific sleeping_timer. It is checked BELOW the activity bucket on purpose (a wedged activity names the specific thing to fix); ranking it above the handoff/child/signal categories is harmless by construction, because every one of those parks the workflow task and a parked row is not awaiting a claim. When replay diverges, the engine BLOCKS the run (#603) rather than failing it: the execution stays RUNNING and its workflow task is re-pended at a capped-exponential backoff INDEFINITELY, which by row shape alone is identical to an ordinary dispatcher deferral -- so a permanently wedged run would otherwise report healthy_in_progress. The execution row's own nd_blocked_at is authoritative and reports non_determinism_blocked (stalled) carrying the recorded divergence, the block instant and the re-fire count. It is ranked directly under paused because it is the same class of fact -- an explicit state the engine stamped on the execution row, not an inference from a liveness proxy -- and it outranks every side-table cause because the block re-fires on EVERY decision cycle regardless of what those rows are doing; nothing is lost, since a pending activity's own impediments still reach the operator through contributing_reason_codes, which is a union across rows rather than the winner's reasons. paused stays above it, mirroring the engine: a pause observed under the row lock supersedes the block and re-parks instead. Appends no WorkflowEvent, performs no task-queue mutation, adds no migration -- safe to call repeatedly.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "health",
+          "blocked_on",
+          "summary",
+          "last_event_age_seconds",
+          "last_event_at",
+          "terminal_outcome",
+          "contributing_reason_codes",
+          "wait_set",
+          "wait_set_reason"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Admin credentials required."
         },
         {
           "status": 404,
@@ -870,12 +1125,22 @@
             "name": "idempotency_key",
             "required": false,
             "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
+          },
+          {
+            "name": "shard_id",
+            "required": false,
+            "description": "Pin this workflow to a concrete shard for data-residency or tenant-isolation placement (issue #697). Mutually exclusive with residency_key. Omitting both keeps today's rendezvous routing byte-for-byte. Returns 400 when the shard is outside the deployment's readable_shards, has been drained out of writable_shards, is negative, or is the reserved routing sentinel \u2014 never a silent fallback to the default shard. The pinned shard is inherited by child workflows, continue-as-new successors, workflow-level retries, and reset forks, so residency is transitive across the whole workflow tree. Consistency caveat: for a given workflow_id, pin consistently across every start \u2014 an unpinned start of the same workflow_id routes by hash to a different shard and cannot see the pinned run, so the shard-local (workflow_name, workflow_id) uniqueness invariant would not catch it. A retry of a keyed start must likewise repeat the same placement, since the placement determines which shard holds the idempotency claim."
+          },
+          {
+            "name": "residency_key",
+            "required": false,
+            "description": "Pin this workflow via an operator-declared residency key, e.g. 'eu' (issue #697). Mutually exclusive with shard_id. Resolved through the router's declared residency map (ShardRouter::with_residency_map), which is stable across process restarts and across any widening of the readable/writable shard sets. An undeclared or blank key returns 400 rather than falling back to the rendezvous hash."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy. When the request supplies an explicit shard_id or residency_key (issue #697), the response echoes the resolved shard_id so an operator can audit placement without decoding the execution_id UUID; unpinned starts omit the field.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -890,13 +1155,14 @@
           "batch_key",
           "max_size",
           "started_fresh",
-          "deduplicated"
+          "deduplicated",
+          "shard_id"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, or when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685)."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685), when shard_id and residency_key are both supplied, when shard_id is negative / the reserved routing sentinel / outside readable_shards / drained out of writable_shards, or when residency_key is blank or undeclared (issue #697)."
         },
         {
           "status": 401,
@@ -905,6 +1171,10 @@
         {
           "status": 409,
           "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
+        },
+        {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."
         },
         {
           "status": 503,
@@ -1015,6 +1285,10 @@
         {
           "status": 409,
           "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate."
+        },
+        {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
         },
         {
           "status": 500,
@@ -1148,6 +1422,10 @@
           "description": "Update validator rejected the update_args."
         },
         {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and admitting the update against it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
+        },
+        {
           "status": 500,
           "description": "Database or scheduling error."
         }
@@ -1180,6 +1458,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually cancelled, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -1232,6 +1511,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually sealed, which may differ from the addressed id.",
         "status": 202,
         "fields": [
           "ok",
@@ -1246,6 +1526,85 @@
         {
           "status": 404,
           "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/rerun",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Re-run a terminal workflow execution: start a BRAND-NEW execution from the source run's recorded start parameters. When the re-run reuses the source's business key (the default), the source row is SEALED to CONTINUED_AS_NEW so the business key is free for the new run — its recorded prior state is returned as source_prior_state, and its output/error/completed_at are preserved untouched. Admin-only. Provenance on the new run is start_source='rerun', start_source_ref=<source execution id>, started_by=<actor>. Cloned verbatim from the source row: input (unless overridden), queue, memo, search attributes (minus the six replay-non-determinism diagnostic keys), execution timeout, chain timeout, SLA, owner/runbook_url/severity, context headers, workflow retry policy, and completion callbacks. NOT preserved: priority (it is not stored on the execution row), and schedule provenance (schedule_id / scheduled_for / origin are cleared, matching the reset-fork precedent — an operator intervention is deliberately excluded from scheduled carryover). The new run always begins a fresh continue-as-new chain and a fresh retry chain (attempt 1).",
+      "idempotency": "NOT idempotent. A second identical re-run returns 409: the first re-run sealed the source to CONTINUED_AS_NEW, which is no longer a re-runnable state — re-run the new run instead. (A re-run under an explicit workflow_id override does not seal the source, so the source stays re-runnable under a different key.)",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID of the terminal source run to re-run."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "input",
+            "required": false,
+            "description": "Optional replacement input for the new run. Omitted = clone the source's stored input VERBATIM — it is never decoded, so an encrypted or codec-encoded input re-runs byte-identically. A JSON null IS a valid override (it replaces the clone with null); omit the field entirely to clone. Required when the source's input has been erased (issue #495)."
+          },
+          {
+            "name": "workflow_id",
+            "required": false,
+            "description": "Optional business-key override for the new run. Omitted = reuse the source's workflow_id (which seals the source to CONTINUED_AS_NEW). When supplied and free, the new run starts under that key and the source is left untouched in its original terminal state."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "ok",
+          "execution_id",
+          "workflow_name",
+          "workflow_id",
+          "state",
+          "reran_from",
+          "source_prior_state"
+        ],
+        "notes": "The response never echoes the input payload. reran_from is the source execution id; source_prior_state is the source's terminal state as observed BEFORE any sealing (e.g. \"FAILED\"), which is otherwise lost once the row is sealed to CONTINUED_AS_NEW."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body (only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable); or the source's stored `completion_callbacks` value cannot be parsed as JSON (issue #605) — a standard RFC 7807 {detail: <message>} body naming the source execution."
+        },
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found, or its workflow type is no longer registered."
+        },
+        {
+          "status": 409,
+          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source already has an automatic workflow-level retry successor (issue #523 — re-run the chain's latest attempt instead); source input has been erased (issue #495) and no explicit input was supplied; the source's shard has been drained out of writable_shards (this entire operation is pinned to the source's physical shard — a re-run can only ever land there, so an operator draining that shard blocks new re-runs of its work just like any other new admission); a workflow_id override routes to a DIFFERENT shard than the source (cross-shard workflow_id overrides are not supported — re-run without an override, or start a fresh execution directly under the target workflow_id); source is schedule-attributed and sealing it would break the schedule's carryover and run-history lineage (issues #488 / #534 — re-run with an explicit workflow_id override instead, which never seals the source); the target business key is currently held by a different live execution (including a workflow_id override that is already in use); or a stored context_headers / workflow_retry_policy value on the source cannot be parsed as JSON (a faithful clone must never silently drop a field)."
+        },
+        {
+          "status": 413,
+          "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and — notably — can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
+        },
+        {
+          "status": 422,
+          "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy — e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
+        },
+        {
+          "status": 503,
+          "description": "An admission gate blocked the new start — same body shape as any gated start (error, gate_id, reason)."
         },
         {
           "status": 500,
@@ -1280,6 +1639,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually paused, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -1331,6 +1691,7 @@
         "fields": []
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually resumed, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -1345,6 +1706,76 @@
         {
           "status": 404,
           "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/workflows/{id}/triage",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Set, update, or clear an execution's operator-mutable triage tags: owner, severity, and a free-text note (issue #759). A plain metadata update on harvest_workflow_executions -- appends no WorkflowEvent, is never read by the workflow function, and has zero replay-determinism impact; distinct from author-controlled search_attrs. owner and severity set this way are immediately reflected in GET /workflows?owner=...&severity=... (issue #372's filters). Works on any non-purged execution regardless of lifecycle state (RUNNING, PAUSED, FAILED, COMPLETED, ...) -- triage annotation is orthogonal to lifecycle state.",
+      "idempotency": "Idempotent: applying the same patch twice yields the same final row (changed_fields is empty on the second call). An empty patch (every field omitted) performs no write and reports no changed fields.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "owner",
+            "required": false,
+            "description": "New owner (e.g. a team or on-call handle). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+            "name": "severity",
+            "required": false,
+            "description": "New severity/priority label (freeform, e.g. 'P1'). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+            "name": "note",
+            "required": false,
+            "description": "New free-text triage note. Tri-state: omit = unchanged, explicit null = clear."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "owner",
+          "severity",
+          "note",
+          "changed_fields"
+        ],
+        "description": "owner, severity, and note are omitted from the response when null (skip_serializing_if). changed_fields lists the field names this call actually changed (empty on a true no-op)."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id, or the request body contains an unknown field or fails to parse."
+        },
+        {
+          "status": 401,
+          "description": "Not authorized (admin-only route)."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it)."
+        },
+        {
+          "status": 503,
+          "description": "The execution's owning shard could not be queried, so it is unknown whether it exists or was mutated (retriable -- this endpoint is idempotent, see the idempotency note above): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node -- the normal state mid a shard-add rollout -- or that shard's pool connection could not be acquired. Deliberately not a 404 (a false negative for an execution that may exist on its own shard) and never a silent write to the wrong database via the default-shard fallback other single-execution routes still use."
         },
         {
           "status": 500,
@@ -1385,7 +1816,11 @@
           "events_scrubbed",
           "fields_tombstoned",
           "execution_row_scrubbed",
+          "summary_scrubbed",
           "signals_scrubbed",
+          "logs_deleted",
+          "completion_deliveries_scrubbed",
+          "dead_letters_scrubbed",
           "children",
           "skipped_children",
           "failures"
@@ -1865,8 +2300,10 @@
         "status": 202,
         "fields": [
           "ok",
-          "signal_delivered"
-        ]
+          "signal_delivered",
+          "routed_execution_id"
+        ],
+        "notes": "routed_execution_id (issue #843) is present only when the addressed execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted when the signal landed on the addressed execution itself."
       },
       "error_responses": [
         {
@@ -2110,6 +2547,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. This read resolves the chain the same way admit_update does, so the update_id returned by a wait=admitted 202 (which carries no execution id) keeps working against the addressed id.",
         "status": 200,
         "free_form": true
       },
@@ -3393,7 +3831,7 @@
       "category": "discovery",
       "read_only": true,
       "idempotency": "Safe",
-      "description": "List all registered workflow types with their optional JSON Schema, description, and schema fields. Returns a sorted JSON array of RegisteredWorkflowRecord objects. Workflows without a published schema have null input_schema/output_schema/error_schema fields (issue #373).",
+      "description": "List all registered workflow types with their optional JSON Schema, description, and schema fields. Returns a sorted JSON array of RegisteredWorkflowRecord objects. Workflows without a published schema have null input_schema/output_schema/error_schema fields (issue #373). Each record also carries the workflow's opt-in declared dependencies as declared_activities/declared_children string arrays; both keys are OMITTED (not null) for a workflow that did not opt in, and an empty array is a meaningful, distinct 'declares no dependencies' assertion (issue #802).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -3408,7 +3846,7 @@
       "category": "discovery",
       "read_only": true,
       "idempotency": "Safe",
-      "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name. Returns 404 when the name is unknown (issue #373).",
+      "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name, including its opt-in declared_activities/declared_children dependency declaration when present (issue #802). Returns 404 when the name is unknown (issue #373).",
       "params": [
         {
           "name": "name",
@@ -3621,7 +4059,7 @@
       "path": "/admin/rate-limits",
       "category": "admin",
       "read_only": true,
-      "description": "List all active rate limit token buckets and current token levels.",
+      "description": "List all active rate limit token buckets and current token levels. In a sharded deployment each key's row on EVERY reachable shard is collected and merged into one entry -- never flattened to a single shard's row picked by raw token count alone, which could silently hide a live override on another shard (issue #945 review, round 5, P2). Each entry surfaces the declared baseline (refill_rate, burst), the raw override columns (override_refill_rate, override_burst, override_expires_at) if one was ever set, and four computed fields resolving what is actually enforced right now: override_active (true iff a live override exists on ANY reachable shard for this key), effective_refill_rate, effective_burst (both from the representative row: an active shard's row when any shard has one, else whichever row was found), and shard_disagreement (true when reachable shards disagree on override state or on resolved effective values -- see the /admin/start-throttle/{workflow_name}/override notes for the exact comparison rule) (issue #945).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -3680,6 +4118,311 @@
         {
           "status": 500,
           "description": "Database write error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/rate-limits/{activity_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared per-activity rate limit (issue #945). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (rate-limit buckets are shard-local); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "refill_rate",
+            "required": false,
+            "description": "Overridden token refill rate per second. At least one of refill_rate/burst must be set."
+          },
+          {
+            "name": "burst",
+            "required": false,
+            "description": "Overridden token bucket burst capacity. At least one of refill_rate/burst must be set."
+          },
+          {
+            "name": "ttl_secs",
+            "required": true,
+            "description": "Seconds until the override self-expires and the declared baseline resumes. Must be greater than zero and not exceed the server-side cap (24h)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a subsequent read/dispatch there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim -- the separate, permanent POST /admin/rate-limits/{key} route (issue #332) can independently change a bucket's declared refill_rate/burst per shard, so the two may already disagree across shards even before this call. A fully applied request returns plain 200 and omits shard_errors."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Non-finite/non-positive refill_rate or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "activity_name is not registered, or is registered but declares no rate limit."
+        },
+        {
+          "status": 409,
+          "description": "activity_name uses a dynamic per-key rate limit (issue #699); a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to override."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket write succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every write succeeded but the resulting audit record could not be written (in which case the override write may still have partially or fully taken effect despite the 503 -- read GET /admin/rate-limits to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/rate-limits/{activity_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Clear a TTL'd runtime pacing override before its TTL elapses, immediately reverting to the declared baseline with no worker restart (issue #945). The clear is fanned out to the bucket row on EVERY readable shard; a clear reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: clearing an activity with no active override still returns 200 reporting the declared baseline (override_active: false).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a subsequent read/dispatch there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "activity_name is not registered, or is registered but declares no rate limit."
+        },
+        {
+          "status": 409,
+          "description": "activity_name uses a dynamic per-key rate limit (issue #699)."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket clear succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every clear succeeded but the resulting audit record could not be written (in which case the clear may still have partially or fully taken effect despite the 503 -- read GET /admin/rate-limits to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared workflow-start throttle (issue #945, extends issue #607). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (start-throttle buckets are shard-local, like activity rate-limit buckets); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "refill_per_sec",
+            "required": false,
+            "description": "Overridden token refill rate per second. At least one of refill_per_sec/burst must be set."
+          },
+          {
+            "name": "burst",
+            "required": false,
+            "description": "Overridden token bucket burst capacity. At least one of refill_per_sec/burst must be set."
+          },
+          {
+            "name": "ttl_secs",
+            "required": true,
+            "description": "Seconds until the override self-expires and the declared baseline resumes. Must be greater than zero and not exceed the server-side cap (24h)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a deferred-start row already queued there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim. A fully applied request returns plain 200 and omits shard_errors."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Non-finite/non-positive refill_per_sec or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle; a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to override."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket write succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every write succeeded but the resulting audit record could not be written (in which case the override write may still have partially or fully taken effect despite the 503 -- read GET /admin/start-throttle/{workflow_name}/override to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Clear a TTL'd runtime pacing override before its TTL elapses, immediately reverting to the declared baseline with no worker restart (issue #945). The clear is fanned out to the bucket row on EVERY readable shard; a clear reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: clearing a workflow with no active override still returns 200 reporting the declared baseline (override_active: false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a deferred-start row already queued there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket clear succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every clear succeeded but the resulting audit record could not be written (in which case the clear may still have partially or fully taken effect despite the 503 -- read GET /admin/start-throttle/{workflow_name}/override to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": true,
+      "description": "Read-only companion to the SET/DELETE routes above (issue #945): resolves and reports a workflow's TTL'd pacing-override state directly against the bucket the token-consumption path actually reads, independent of whether the workflow currently has any deferred-start backlog. GET /admin/start-throttle only surfaces override state for a workflow while it has pending backlog rows; this route answers reliably even when the backlog has fully drained but the override is still running for the rest of its TTL, or before any pressure has occurred at all. Buckets are shard-local (issue #607/#247); the top-level 200/207 body reports whichever reachable shard has a LIVE override whenever any shard does -- never the mere fewest-remaining-tokens row, since raw token count says nothing about whether an operator override is active (issue #945 review, round 4, P2). A read reaching only SOME shards, OR one where reachable shards genuinely disagree on override state, is reported as 207, not 200 -- see the success-response notes.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A read reaching only SOME readable shards, OR a read of shards that disagree on override state, returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...], \"shard_disagreement\": <bool>, \"shards\": { \"<shard_id>\": <per-shard body, same fields as the 200 body>, ... } }. `override` (the flattened top-level view) prefers a LIVE override on ANY reachable shard -- it never silently reports override_active:false merely because a different (inactive) shard happens to have fewer raw tokens. `shard_disagreement` compares each shard's RESOLVED EFFECTIVE (refill_rate, burst) -- not the raw override_refill_rate/override_burst columns -- so it is true both when reachable shards disagree on the active/inactive boolean, and when byte-identical override columns nonetheless resolve to different effective values because a partial legacy POST /admin/rate-limits/{key} (issue #332) left the shards with divergent persisted BASELINES and an omitted override field falls back to each shard's own (diverged) baseline (issue #945 review, round 5, P2). Millisecond clock skew on override_expires_at alone across a normal successful multi-shard SET does not count as disagreement. `shards` is present whenever the response is 207 (both the shard-outage and the disagreement case) and lists every REACHABLE shard's own view (shard IDs named only in shard_errors are omitted, since their row could not be read). A fully reachable, fully agreeing read returns plain 200 and omits shard_errors/shard_disagreement/shards."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle; a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to read."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: not a single readable shard could be reached (body { \"errors\": [\"shard {id}: {error}\", ...] }). This is deliberately distinct from a healthy \"no override configured\" 200 -- a total outage must never be silently reported as if nothing were overridden."
         }
       ]
     },
@@ -3852,6 +4595,41 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queue-coverage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "query",
+          "required": false,
+          "description": "Narrow the report to a single queue name. Any *decoded* string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error. A malformed percent-encoding (e.g. an invalid UTF-8 byte sequence like %FF) is rejected with a 400 before decoding is even attempted -- see the 400 error_responses entry."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filter",
+          "uncovered",
+          "total_uncovered_queues",
+          "items",
+          "shards",
+          "excluded_paused_queues"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/status",
       "category": "admin",
       "read_only": true,
@@ -3879,7 +4657,7 @@
       "path": "/admin/config",
       "category": "admin",
       "read_only": true,
-      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards plus the declared residency_key \u2192 shard map, issue #697 \u2014 diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4171,7 +4949,7 @@
       "path": "/admin/concurrency",
       "category": "admin",
       "read_only": true,
-      "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
+      "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4262,7 +5040,7 @@
       "path": "/admin/start-throttle",
       "category": "admin",
       "read_only": true,
-      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
+      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Each group is also joined against that key's shared token bucket, surfacing declared_refill_rate, declared_burst, override_refill_rate, override_burst, override_active, effective_refill_rate, effective_burst, and expires_at, so an operator can see whether a runtime pacing override is in effect for the throttle backing this key (issue #945; bucket-derived fields are null when no matching bucket row exists). Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4273,6 +5051,31 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/quotas",
+      "category": "admin",
+      "read_only": true,
+      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "quotas",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the workflow type's CURRENTLY registered QuotaPolicy caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all) -- resolved live against the registry, not persisted with the usage rows, so an edited policy is reflected immediately rather than against a stale snapshot. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
         }
       ]
     },
@@ -4407,6 +5210,92 @@
         {
           "status": 400,
           "description": "Invalid filter values."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/history/export-sample",
+      "category": "admin",
+      "read_only": true,
+      "description": "Stratified in-flight history sample for the replay-drift gate (issue #798). Returns at most per_workflow non-terminal executions PER registered workflow type, across every shard, alongside a portable manifest reporting how many were sampled versus the in-flight population so truncation is never silent. Admin-only. Read-only: SELECT-only, no state transition and no event appended. An unreachable shard degrades the manifest to partial and names the shard rather than failing the request.",
+      "params": [
+        {
+          "name": "per_workflow",
+          "in": "query",
+          "required": false,
+          "description": "Maximum executions to sample per workflow type (default 50, clamped to 500). The effective value is echoed in filters.per_workflow."
+        },
+        {
+          "name": "states",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated non-terminal states to sample (default RUNNING,PAUSED). SUSPENDED is accepted as an alias for RUNNING. A terminal or unknown state returns 400 rather than a silently-empty sample."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Alias for states."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Restrict the sample to a single workflow type."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Which end of each type's in-flight population to sample: oldest (default) or newest."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        },
+        {
+          "name": "payload_policy",
+          "in": "query",
+          "required": false,
+          "description": "Payload inclusion: full, redacted (default), or omit. full additionally applies the admin-gated read-path decode (issue #608)."
+        },
+        {
+          "name": "max_bytes",
+          "in": "query",
+          "required": false,
+          "description": "Per-execution export size ceiling; an over-size history is reported in failures and omitted from exports."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "payload_policy",
+          "filters",
+          "manifest",
+          "exports",
+          "failures",
+          "shard_coverage"
+        ],
+        "notes": "manifest is the portable coverage record the CLI writes verbatim into the bundle as harvest-sample-manifest.json; it carries status, states, per_workflow[] (workflow_name/sampled/in_flight_total), sampled_total, in_flight_total, inspected_shards and unavailable_shards. A workflow type whose entire sample failed the size ceiling still appears with sampled 0 and its real in_flight_total, so an operator can never mistake an empty export for an empty in-flight population. Each entry in exports is a replay HistorySnapshot, byte-compatible with WorkflowReplayer::replay_bundle."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter value: a terminal or unknown state, a non-numeric per_workflow or shard_id, or an unknown order."
+        },
+        {
+          "status": 401,
+          "description": "Caller is not a Harvest admin."
         },
         {
           "status": 500,
@@ -4630,7 +5519,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), last_catchup_at (timestamp of most recent recovery tick), overdue (issue #696: true when an active schedule is past its own cadence grace = cadence step + jitter + scheduler tick; false for paused/auto-paused/manual/exhausted/at-capacity schedules), and overdue_by_secs (now - next_run_at in whole seconds when overdue, else null). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), last_catchup_at (timestamp of most recent recovery tick), overdue (issue #696: true when an active schedule is past its own cadence grace = cadence step + jitter + scheduler tick; false for paused/auto-paused/manual/exhausted/at-capacity schedules), overdue_by_secs (now - next_run_at in whole seconds when overdue, else null), execution_timeout_secs (issue #743: the effective hard execution-timeout deadline a run this schedule fires will get, resolved from the registered workflow or DAG's execution_timeout, in whole seconds; null when none is declared or the registry is unavailable), and sla_secs (issue #743: the effective soft SLA a run this schedule fires will get, resolved from the registered workflow or DAG's sla and clamped down to execution_timeout_secs when declared larger, in whole seconds; null when none is declared or the registry is unavailable). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
       },
       "error_responses": [
         {
@@ -4676,7 +5565,9 @@
           "catchup_dropped_last_recovery",
           "last_catchup_at",
           "overdue",
-          "overdue_by_secs"
+          "overdue_by_secs",
+          "execution_timeout_secs",
+          "sla_secs"
         ]
       },
       "error_responses": [
@@ -4781,7 +5672,9 @@
           "catchup_dropped_last_recovery",
           "last_catchup_at",
           "overdue",
-          "overdue_by_secs"
+          "overdue_by_secs",
+          "execution_timeout_secs",
+          "sla_secs"
         ]
       },
       "error_responses": [
@@ -4923,7 +5816,9 @@
           "catchup_dropped_last_recovery",
           "last_catchup_at",
           "overdue",
-          "overdue_by_secs"
+          "overdue_by_secs",
+          "execution_timeout_secs",
+          "sla_secs"
         ]
       },
       "error_responses": [
@@ -6574,6 +7469,362 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queues/paused",
+      "category": "admin",
+      "read_only": true,
+      "description": "List every currently-paused task queue (issue #619), with the reason for the hold, the operator who placed it, when it was placed, and how many PENDING tasks it is holding. Cross-shard: a shard-scoped pause lists with its `scope_shard_id`, and an unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "paused_queues",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry in paused_queues carries queue_name, held_task_count (summed across shards), provenance_uniform, effective_scope, and a shards array of per-shard objects {shard_id, reason, paused_by, paused_at, scope_shard_id, held_task_count}. The top-level reason/paused_by/paused_at/scope_shard_id summarise the EARLIEST hold. Because pause is idempotent and preserves the original provenance on a re-pause, a fleet-wide hold landing over a pre-existing shard-scoped hold (or two independent scoped holds) can leave shards disagreeing; provenance_uniform is false in that case and the shards array carries each shard's own story. Uniformity compares reason/paused_by/scope_shard_id and deliberately not paused_at, since each shard stamps its own NOW(). effective_scope (\"fleet\" | \"partial_fleet\" | \"shard\") reports what the hold ACTUALLY covers, derived from the shards that hold the queue versus the expected shard set (every pool plus every shard the router knows about) -- distinct from scope_shard_id, which records only the INTENT of the request that wrote each row. A fleet-wide pause that reached only some shards persists scope_shard_id = NULL on the shards it reached and no row at all on the ones it missed, so intent alone cannot distinguish it from a complete hold while the missed shards keep dispatching; effective_scope is \"partial_fleet\" in that case (re-issue the pause). An unreachable shard counts as expected-but-not-holding -- the safe direction, since it may still be dispatching -- so a partial read also reports \"partial_fleet\"."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/queues/{queue_name}/pause",
+      "category": "admin",
+      "read_only": false,
+      "description": "Hold dispatch on a named task queue during a scoped downstream outage (issue #619). While paused, no worker claims NEW tasks from the queue; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING task finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one \u2014 a pause is not an SLA extension. Idempotent: re-pausing an already-paused queue is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). The operator `reason` is truncated to 500 characters at the API boundary. A partially-applied fleet-wide hold is reported as 207, not 200 \u2014 see the success-response notes. Admin only; audited as `queue.pause`, including rejected attempts.",
+      "idempotency": "Re-pausing an already-paused queue returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, not the request: re-pausing a shard-scoped hold with a fleet-wide request reports the preserved `scope_shard_id`, never `null`.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "The task queue to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: queue names are stored verbatim at enqueue time, so `\"payments \"` and `\"payments\"` are two genuinely distinct, independently reachable queues and trimming would silently hold the wrong one while reporting success. Send the exact name. Interior whitespace is allowed."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable reason for the hold, surfaced on the read API and in the Vantage UI. Truncated to 500 characters."
+          },
+          {
+            "name": "shard_id",
+            "required": false,
+            "description": "Omit (default) for a fleet-wide hold applied on every shard; set to scope the hold to a single shard."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "queue_name",
+          "newly_paused",
+          "reason",
+          "paused_by",
+          "paused_at",
+          "scope_shard_id",
+          "held_task_count",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case \u2014 the missed shards keep dispatching \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id \u2014 the same rule `GET /admin/queues/paused` and the Vantage banner use, so the three surfaces never disagree). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a fleet-wide request landing over pre-existing scoped holds leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW()."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, blank reason, malformed body, or an unknown shard_id."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every target shard failed; no hold is in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, or the named shard_id is known to the router but has no pool in this process (mid a shard-add rollout)."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/queues/{queue_name}/resume",
+      "category": "admin",
+      "read_only": false,
+      "description": "Release an operator queue pause (issue #619). Held tasks become immediately claimable again, and the time each task spent held is credited back to its `scheduled_at` so the thaw does not retroactively schedule-to-start-time-out the whole backlog. Body is optional; a bare POST resumes fleet-wide. `released_reason`/`released_paused_by` echo the provenance of the hold that was released \u2014 the pause row is deleted by the resume, so this is the last moment the *why* is recoverable. Idempotent: resuming a queue that is not paused is a 200 no-op (`newly_resumed: false`). A partially-applied resume is reported as 207, not 200. Admin only; audited as `queue.resume`, including rejected attempts.",
+      "idempotency": "Resuming a queue that is not paused returns 200 with `newly_resumed: false`.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "The task queue to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route — see its description for why. Send the exact name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "shard_id",
+            "required": false,
+            "description": "Omit (default) to release the hold on every shard; set to release only one shard."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "queue_name",
+          "newly_resumed",
+          "released_task_count",
+          "paused_duration_secs",
+          "released_reason",
+          "released_paused_by",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached \u2014 the safe direction, but not a completed thaw \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response is the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}` so independently-paused shards lose nothing, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, malformed body, or an unknown shard_id."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every target shard failed; the hold may still be in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, or the named shard_id is known to the router but has no pool in this process (mid a shard-add rollout)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/activities",
+      "category": "admin",
+      "read_only": true,
+      "description": "List every REGISTERED activity type with its current pause state (issue #807). The list is driven by the registered activity catalogue, not the pause table, so a healthy activity appears with `paused: false` -- the read is a fleet inventory an operator scans during an incident, and one that only listed the already-broken things could not answer \"is charge_card held?\". An activity that is paused but NOT registered in this process is still listed, flagged `registered: false`, so a mistyped hold can never become invisible on the one surface used to find it. Cross-shard: an unreachable shard is named in `unavailable_shards` and drops `status` to \"partial\" rather than failing the read. Admin only.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activities",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry carries activity_name, registered, queue_name, is_local, paused, paused_at, paused_reason, paused_actor, scope_shard_id, held_task_count (summed across shards), provenance_uniform, effective_scope, and a shards array of per-shard objects {shard_id, reason, paused_by, paused_at, scope_shard_id, held_task_count}. For an unpaused activity, paused is false and paused_at/paused_reason/paused_actor/scope_shard_id/effective_scope are null, held_task_count is 0 and shards is empty. queue_name and is_local are null for a paused-but-unregistered activity (this process has no catalogue entry to read them from); is_local matters because a local activity runs inline on the workflow worker and never takes a task-queue row, so a hold on one holds nothing. The top-level paused_reason/paused_actor/paused_at/scope_shard_id summarise the EARLIEST hold (tie-broken by shard id -- the same rule the pause mutation response uses, so the two surfaces never disagree). Because pause is idempotent and preserves the original provenance on a re-pause, a request landing over a pre-existing hold can leave shards disagreeing; provenance_uniform is false in that case and the shards array carries each shard's own story. Uniformity compares reason/paused_by/scope_shard_id and deliberately not paused_at, since each shard stamps its own NOW(). effective_scope (\"fleet\" | \"partial_fleet\" | \"shard\") reports what the hold ACTUALLY covers, derived from the shards that hold the activity versus the expected shard set (every pool plus every shard the router knows about) -- distinct from scope_shard_id, which records only the INTENT of the request that wrote each row. A fleet-wide pause that reached only some shards persists scope_shard_id = NULL on the shards it reached and no row at all on the ones it missed, so intent alone cannot distinguish it from a complete hold while the missed shards keep dispatching the activity; effective_scope is \"partial_fleet\" in that case (re-issue the pause). An unreachable shard counts as expected-but-not-holding -- the safe direction, since it may still be dispatching -- so a partial read also reports \"partial_fleet\". IMPORTANT: on a partial read, `paused: false` means only \"not paused on the shards that could be reached\" -- always check `status` before trusting a negative."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (the registered activity catalogue is unavailable)."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/activities/{activity_name}",
+      "category": "admin",
+      "read_only": true,
+      "description": "Get one activity type's pause state (issue #807). Returns 404 when the name is neither registered in this process NOR currently paused anywhere the read could reach. The pause arm of that rule is deliberate: an activity that is actively holding work is a real thing an operator must be able to inspect and then resume, so 404-ing it merely because this process does not have its handler registered would be a lie told during exactly the incident the endpoint exists for. Admin only.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to inspect, matched EXACTLY (no trimming) against both the registered catalogue and the pause table."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activity",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "`activity` is a single entry with the same shape as one element of `GET /activities` (see its notes). `status`/`unavailable_shards` are reported here too, and for the same reason: on a partial read `paused: false` means only \"not paused on the shards that could be reached\". A 404 is only returned when EVERY expected shard was inspected: the routes deliberately accept unregistered names, so \"not in this process's catalogue and no pause row on the shards that answered\" is reachable with a live hold sitting on a shard that did not answer, and asserting nonexistence there would deny a hold that is actively holding work. While any shard is unaccounted for the read fails closed with 503 naming those shards -- the same rule the (workflow_name, workflow_id) resolver applies."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 404,
+          "description": "The activity is neither registered in this process nor currently paused, AND every expected shard was inspected. A miss on an incomplete read is reported as 503 instead, so a 404 always means a fully-observed absence."
+        },
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (the registered activity catalogue is unavailable)."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, OR the activity was not found while at least one expected shard could not be inspected -- the read fails closed rather than returning a 404 that could deny a live hold on the unreachable shard. The message names the shard(s) to re-check."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/{activity_name}/pause",
+      "category": "admin",
+      "read_only": false,
+      "description": "Hold dispatch for ONE activity type, fleet-wide, during a scoped downstream outage (issue #807). This is the surgical sibling of the queue pause (issue #619): use it when many activity types share a queue and holding the whole queue would also stop healthy work. While paused, no worker claims NEW tasks of that activity type; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING attempt finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one -- a pause is not an SLA extension. The hold is applied on EVERY shard: it is fleet-wide by construction and there is no shard-scoped variant on this route. Idempotent: re-pausing an already-paused type is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). Body and both of its fields are optional -- during an incident, containment must not wait on paperwork. A partially-applied hold is reported as 207, not 200 -- see the success-response notes. Admin only; audited as `activity.pause`, including rejected attempts. A pause is REFUSED with a 400 when the named activity is registered on this node as a LOCAL activity (`#[activity(local = true)]`): a local activity runs inline on the workflow worker and never takes a task-queue row, so the claim-path gate cannot hold it -- reporting a successful hold there would be a false green at exactly the moment an operator relies on it. Contain a local activity by pausing the queue its calling workflows dispatch on (issue #619), or via its circuit breaker if one is declared (issue #369).",
+      "idempotency": "Re-pausing an already-paused activity returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, never the request.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: the hold is matched on exact equality, so a stray space would either hold nothing or hold a different activity while reporting success. Registration is NOT required -- a management process need not register every activity the fleet runs, so an unregistered name is accepted and surfaces on the read endpoints with `registered: false`. A registered name whose activity is LOCAL is rejected with a 400 (see the route description); an unregistered name is still accepted, since it may be a genuinely remote activity this node does not register."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable reason for the hold, surfaced on the read API and carried into the audit trail (the pause row is deleted on resume, so the audit row is the reason's only permanent home). Truncated to 500 characters. Defaults to \"operator pause (no reason given)\"."
+          },
+          {
+            "name": "actor",
+            "required": false,
+            "description": "Operator identity to record as `paused_by`. This is a LABEL, not authentication: it lets an automation attribute a hold to the human it acted for. The audit row always carries the AUTHENTICATED actor derived from the request headers and records the on-behalf-of relationship when the two differ, so this field can never rewrite the security trail. Defaults to the authenticated actor."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "activity_name",
+          "newly_paused",
+          "reason",
+          "paused_by",
+          "paused_at",
+          "scope_shard_id",
+          "held_task_count",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A hold applied to only SOME shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case -- the missed shards keep dispatching -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id -- the same rule the read endpoints use). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a request landing over a pre-existing hold leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW(). `scope_shard_id` is always null for a hold placed by this route (fleet-wide); it is reported because the underlying column records the INTENT of whichever surface wrote each row."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank, whitespace-padded, or oversized activity name; or a malformed request body (unknown fields are rejected, so a typo cannot become a silently-ignored setting)."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed; no hold is in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/{activity_name}/resume",
+      "category": "admin",
+      "read_only": false,
+      "description": "Release a per-activity-type hold, fleet-wide (issue #807). Held tasks become immediately claimable again, and the time each task spent held is credited back to its `scheduled_at` so the thaw does not retroactively schedule-to-start-time-out the whole backlog. `released_reason`/`released_paused_by` echo the provenance of the hold that was released -- the pause row is deleted by the resume, so this is the last moment the *why* is recoverable. Body is optional and carries no fields; a bare POST resumes fleet-wide. Idempotent: resuming an activity that is not paused is a 200 no-op (`newly_resumed: false`). A partially-applied resume is reported as 207, not 200. Admin only; audited as `activity.resume`, including rejected attempts.",
+      "idempotency": "Resuming an activity that is not paused returns 200 with `newly_resumed: false`.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route -- see its description for why."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "activity_name",
+          "newly_resumed",
+          "released_task_count",
+          "paused_duration_secs",
+          "released_reason",
+          "released_paused_by",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A resume applied to only SOME shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached -- the safe direction, but not a completed thaw -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response and the audit row are the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}`, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank, whitespace-padded, or oversized activity name; or a request body that is not empty or `{}` (the route accepts no fields, so anything else is a typo)."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed; the hold may still be in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/queues/{queue_name}/eligibility",
       "category": "queue",
       "read_only": true,
@@ -6601,7 +7852,7 @@
           "shards",
           "shard_errors"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), queue_paused (an operator holds the task's whole queue \u2014 issue #619), activity_paused (an operator holds the task's activity type fleet-wide \u2014 issue #807; reported only for task_type='activity' rows, matching the claim gate, so a workflow task carrying the 'mixed_signal_suspension' sentinel in activity_name is never reported held), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed. The deliberate operator holds (activity_paused, queue_paused) lead the array \u2014 a pause reorders the reasons, it never suppresses a co-occurring impediment \u2014 and the remainder is alphabetical so the array is stable across polls."
       },
       "error_responses": [
         {
@@ -6644,7 +7895,7 @@
           "ineligible_workers",
           "summary"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), queue_paused (an operator holds the task's whole queue \u2014 issue #619), activity_paused (an operator holds the task's activity type fleet-wide \u2014 issue #807; reported only for task_type='activity' rows, matching the claim gate, so a workflow task carrying the 'mixed_signal_suspension' sentinel in activity_name is never reported held), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed. The deliberate operator holds (activity_paused, queue_paused) lead the array \u2014 a pause reorders the reasons, it never suppresses a co-occurring impediment \u2014 and the remainder is alphabetical so the array is stable across polls."
       },
       "error_responses": [
         {
@@ -6982,8 +8233,10 @@
         "fields": [
           "execution_id",
           "ok",
-          "signal_delivered"
-        ]
+          "signal_delivered",
+          "routed_execution_id"
+        ],
+        "notes": "routed_execution_id (issue #843) is present only when the resolved execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted otherwise."
       },
       "error_responses": [
         {

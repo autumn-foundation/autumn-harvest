@@ -79,6 +79,9 @@ fn dummy_workflow<'a>(
 
 fn plain_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "tests",

@@ -168,7 +168,33 @@ pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 /// `From<String>` produces a retryable `ActivityFailure` with
 /// `error_type = "Error"`, so every activity that today returns
 /// `Err(String)` continues to compile and behave identically.
+///
+/// `#[non_exhaustive]` (added alongside the `retry_after` field, issue #744,
+/// Codex review on PR #1140): every field is `pub` for read access (the
+/// worker and downstream consumers pattern-read `error_type`/`message`/
+/// `details`/`non_retryable`/`retry_after` freely from within this crate),
+/// but external construction must go through [`Self::retryable`] /
+/// [`Self::non_retryable`] plus the builder methods
+/// (e.g. [`Self::with_retry_after`]) rather than a bare struct literal.
+///
+/// **This is a deliberate, disclosed one-time breaking change, not a silent
+/// compatibility fix.** `#[non_exhaustive]` does not "grandfather" a struct
+/// literal written before the attribute existed -- Rust categorically
+/// forbids external struct-literal construction of a `#[non_exhaustive]`
+/// type, even when every current field is supplied. A downstream crate
+/// constructing the previous four-field struct via `ActivityFailure { .. }`
+/// would already have broken on `retry_after`'s addition (a missing-field
+/// error); adding `#[non_exhaustive]` does not restore that literal -- it
+/// still fails to compile, now for a different reason (E0639). No
+/// caller anywhere in this workspace uses struct-literal construction (every
+/// site goes through the constructors above), so nothing in-repo is
+/// affected, but an external 0.x consumer relying on the literal form would
+/// need to migrate to the constructors on this release. In exchange, this is
+/// a *one-time* cost: every field added from here on is genuinely additive
+/// for external callers, since literal construction is already disallowed
+/// and cannot regress further.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ActivityFailure {
     /// A stable, low-cardinality error-type name used for metrics and policy
     /// matching (e.g. `"InvalidInput"`, `"RateLimitExceeded"`).
@@ -181,6 +207,27 @@ pub struct ActivityFailure {
     /// When `true` the worker skips all remaining retry attempts and routes
     /// the task directly to the DLQ.
     pub non_retryable: bool,
+    /// Author-supplied next-retry delay hint (issue #744), e.g. parsed from a
+    /// downstream `Retry-After` response header.
+    ///
+    /// When set on a *retryable* failure, the worker schedules the next
+    /// attempt at `now + retry_after` instead of the activity's
+    /// [`RetryPolicy`]-computed backoff curve, **for this attempt only** — the
+    /// policy's attempt counter and `max_attempts` cap are unaffected. The
+    /// value is clamped to a builder-configured ceiling
+    /// (`WorkerConfig::with_retry_after_ceiling`, default 15 minutes); a value
+    /// of `Duration::ZERO` (the only way `<= 0` can occur, since `Duration`
+    /// cannot be negative) is treated as "no hint" and falls through to the
+    /// normal policy delay. Ignored entirely when `non_retryable` is `true` —
+    /// a non-retryable failure always routes to the DLQ regardless of any
+    /// delay hint.
+    ///
+    /// Distinct from the `retry_after_secs` embedded in
+    /// [`Self::circuit_open`]'s `details` JSON, which is informational only
+    /// (that failure is always non-retryable and never re-consulted for
+    /// requeue scheduling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ActivityFailure {
@@ -191,6 +238,7 @@ impl ActivityFailure {
             message: message.into(),
             details: None,
             non_retryable: false,
+            retry_after: None,
         }
     }
 
@@ -201,6 +249,7 @@ impl ActivityFailure {
             message: message.into(),
             details: None,
             non_retryable: true,
+            retry_after: None,
         }
     }
 
@@ -208,6 +257,16 @@ impl ActivityFailure {
     #[must_use]
     pub fn with_details(mut self, value: serde_json::Value) -> Self {
         self.details = Some(value);
+        self
+    }
+
+    /// Attach a next-retry delay hint (issue #744), e.g. parsed by the caller
+    /// from a downstream `Retry-After` response header. See
+    /// [`Self::retry_after`] for the full semantics and interaction with
+    /// `non_retryable` / the retry policy's attempt cap.
+    #[must_use]
+    pub const fn with_retry_after(mut self, delay: std::time::Duration) -> Self {
+        self.retry_after = Some(delay);
         self
     }
 
@@ -492,6 +551,7 @@ pub fn parse_error_payload_full(payload: &str) -> ActivityFailure {
             message: payload.to_string(),
             details: None,
             non_retryable: false,
+            retry_after: None,
         }
     }
 }
@@ -530,6 +590,7 @@ pub(crate) fn classify_activity_error(
         message: error.to_string(),
         details: None,
         non_retryable: false,
+        retry_after: None,
     });
     (failure, non_retryable)
 }
@@ -786,6 +847,87 @@ mod tests {
         let f = ActivityFailure::non_retryable("X", "msg")
             .with_details(serde_json::json!({"code": 404}));
         assert_eq!(f.details, Some(serde_json::json!({"code": 404})));
+    }
+
+    // ── retry_after / Retry-After hint (issue #744) ────────────────────────
+    //
+    // RED PHASE: `ActivityFailure::retry_after` and `with_retry_after` do not
+    // exist yet — this module fails to COMPILE against the missing symbols
+    // until the green phase adds them.
+
+    #[test]
+    fn retryable_defaults_retry_after_to_none() {
+        let f = ActivityFailure::retryable("RateLimited", "too many requests");
+        assert_eq!(
+            f.retry_after, None,
+            "existing constructors must default retry_after to None (AC1)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_defaults_retry_after_to_none() {
+        let f = ActivityFailure::non_retryable("InvalidInput", "bad request");
+        assert_eq!(f.retry_after, None);
+    }
+
+    #[test]
+    fn with_retry_after_sets_the_field() {
+        let f = ActivityFailure::retryable("RateLimited", "too many requests")
+            .with_retry_after(std::time::Duration::from_secs(30));
+        assert_eq!(f.retry_after, Some(std::time::Duration::from_secs(30)));
+        // Every other field is untouched by the builder call.
+        assert_eq!(f.error_type, "RateLimited");
+        assert!(!f.non_retryable);
+    }
+
+    #[test]
+    fn with_retry_after_composes_with_with_details() {
+        let f = ActivityFailure::retryable("RateLimited", "too many requests")
+            .with_retry_after(std::time::Duration::from_secs(30))
+            .with_details(serde_json::json!({"header": "Retry-After: 30"}));
+        assert_eq!(f.retry_after, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            f.details,
+            Some(serde_json::json!({"header": "Retry-After: 30"}))
+        );
+    }
+
+    #[test]
+    fn retry_after_serde_round_trip() {
+        let original = ActivityFailure::retryable("RateLimited", "slow down")
+            .with_retry_after(std::time::Duration::from_millis(1500));
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ActivityFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn retry_after_absent_from_wire_json_when_unset() {
+        // `#[serde(skip_serializing_if = "Option::is_none")]` -- a failure with
+        // no hint produces byte-for-byte the same wire payload as before this
+        // field existed (no new required key an older reader must tolerate).
+        let f = ActivityFailure::retryable("UpstreamTimeout", "gateway timed out");
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(
+            !json.contains("retry_after"),
+            "unset retry_after must not appear in the serialized payload: {json}"
+        );
+    }
+
+    #[test]
+    fn retry_after_deserializes_from_legacy_json_missing_the_field() {
+        // A pre-#744 stored payload has no `retry_after` key at all --
+        // `#[serde(default)]` must make this deserialize cleanly to `None`
+        // rather than erroring, since a queued task row can carry a
+        // legacy-shaped error string.
+        let legacy = serde_json::json!({
+            "error_type": "Error",
+            "message": "boom",
+            "non_retryable": false
+        })
+        .to_string();
+        let f: ActivityFailure = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(f.retry_after, None);
     }
 
     #[test]

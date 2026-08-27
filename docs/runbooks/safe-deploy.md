@@ -153,6 +153,422 @@ and `request_id`.
 
 ---
 
+## Queue-coverage check — confirm every queue has a live poller (issue #774)
+
+Draining removes a worker's capacity for every queue it served. If it was
+the *last* worker polling one of those queues, pending work on that queue is
+now stranded with nothing to claim it — silently, since a successful drain
+call does not fail just because it happened to orphan a queue. The same
+failure shape shows up **before** a drain too: a workflow that schedules
+activities onto a brand-new queue whose worker deployment hasn't shipped
+yet (or a typo'd queue name) produces `PENDING` rows no live worker will
+ever claim — and that queue never appears in `fleet_health.by_queue` at
+all, since it counts workers *per queue* and has nothing to count for a
+queue with zero subscribers.
+
+Cover both directions — before any work is scheduled onto a new queue, and
+after every drain or deploy:
+
+- **Post-drain / post-deploy smoke check** — after every drain **has
+  actually finished** (either `harvest worker drain --wait`, or poll
+  `GET /workers/{id}` until `status: "Stopped"`), and again once a rolling
+  deploy's replacement workers are up, to confirm nothing was left orphaned.
+  Running the check the instant `harvest worker drain` returns (without
+  `--wait`) is not enough on its own: a `Draining` worker still counts as
+  covering every queue it was assigned, so the report can read "covered"
+  right up until the worker finishes its in-flight work and transitions to
+  `Stopped` — check after that transition, not before it.
+- **Pre-cutover check when adding a queue** — before routing traffic (or
+  flipping a workflow's `queue` attribute) onto a queue name that didn't
+  exist before, confirm at least one **live** worker is already subscribed
+  with `harvest worker list --queue <name> --status Active --health healthy`
+  (or `GET /workers?queue=<name>&status=Active&health=healthy`), not
+  `harvest queue coverage`. Filter on both `--status` and `--health` — an
+  unqualified `harvest worker list --queue <name>` still returns a worker row
+  that registered, crashed, and stopped heartbeating (still `Active` but
+  `stale`), or one that has fully transitioned to `Stopped`, so it can't
+  distinguish "a live poller is subscribed" from "a subscription used to
+  exist." The coverage report is built entirely from *pending*
+  `harvest_task_queue` rows, so a brand-new queue with no scheduled work yet
+  has nothing to compare workers against and always reports
+  `uncovered: false` — a vacuous "fine" regardless of whether any worker is
+  actually subscribed. Once traffic is flowing,
+  `harvest queue coverage --queue <name>` is the right tool to confirm
+  nothing is left stranding.
+
+  **On a multi-shard deployment, scope the pre-cutover check to every shard
+  that could own the new work, not just the fleet as a whole.** A queue name
+  carries no fixed shard affinity — the new work's `PENDING` rows can land on
+  any shard in `writable_shards` (spread by the rendezvous hash over each new
+  execution's `(workflow_name, workflow_id)`, or landing on one specific
+  shard if the workflow uses explicit residency placement, see
+  `docs/sharding.md`) — so an unscoped `harvest worker list --queue <name>
+  --status Active --health healthy` can find a healthy worker that is only
+  assigned to shard 0 and read as "covered" even though the new work will
+  route to shard 1, which has zero pollers. Repeat the check with
+  `--shard-id <N>` (or `GET /workers?queue=<name>&status=Active&health=
+  healthy&shard_id=<N>`) for every shard in your deployment's
+  `writable_shards`, and require a hit on each one before cutover — a
+  single-shard deployment has nothing extra to do here, since its only
+  writable shard is `0`. If any response carries a non-empty
+  `unavailable_shards` (the `partial`/`unavailable` cross-shard degradation,
+  issue #756), treat the check as **inconclusive**, not a pass — retry once
+  every shard is reachable.
+
+```bash
+harvest queue coverage --json
+# or: GET /api/harvest/admin/queue-coverage
+```
+
+`uncovered: true` (equivalently, a nonzero `total_uncovered_queues`) means at
+least one queue has `PENDING` tasks and zero live pollers assigned to it on
+the shard that owns the pending work — `Active` **or** `Draining` workers
+both count as covering (a draining worker still finishes work already in
+flight), only `Stopped` and stale (heartbeat-expired) workers do not, and
+coverage means *a poller exists*, not that capacity is free — a queue whose
+workers are all saturated at `max_concurrency` is still covered (that's
+#531/#742's job). Each uncovered queue's report entry carries bounded sample
+`task_ids`/`execution_ids` (capped at 5) so you can open a specific stranded
+task directly:
+
+```bash
+harvest workflow stack <execution_id>
+```
+
+`?queue_name=<name>` (`--queue <name>` on the CLI) narrows the check to one
+queue. `harvest queue coverage` exits non-zero (exit code 2 — the same
+"deploy hazard" convention `harvest workflow-types reachability` uses)
+whenever `uncovered: true` **or** the cross-shard `status` is `partial`/
+`unavailable` — an incomplete answer is treated as unsafe, never silently
+downgraded to "looks fine" just because the shards it *did* reach happened
+to be clean.
+
+**A queue currently paused via the queue-pause primitive is deliberately
+excluded** from `items`/`uncovered` (that intent is already surfaced by the
+separate `harvest_queue_paused_too_long` alert), but a paused queue that
+also has real pending work and zero live pollers is still named in
+`excluded_paused_queues` — the moment it's unpaused without a worker being
+added, it becomes uncovered, and `harvest_queue_paused_too_long` alone can
+miss that combination for its full grace window. Treat a non-empty
+`excluded_paused_queues` as a pre-unpause TODO, not a false negative.
+
+**This is a distinct question from build-id reachability (#171) and the
+pre-cutover handler-coverage gate immediately below (#520/#700).** Build-id
+routing asks *"can a worker running this build safely resume this
+execution's history?"*; the handler-coverage gate asks *"does a registered
+handler still exist for this workflow type?"*; queue coverage asks a
+narrower, worker-fleet-topology question that is orthogonal to both: *"is
+any live worker even polling the queue this pending task sits on, regardless
+of which build or handler it's running?"* A queue can be reported uncovered
+even when every worker in the fleet is fully build-compatible and
+handler-complete — it simply isn't subscribed to that queue name (a typo'd
+`--queues` flag, a config that dropped a queue during a rolling deploy, or a
+drain that removed the last subscriber). Fix by adding or re-subscribing a
+worker to the named queue, not by adjusting build policy or removing
+handlers. An unreachable shard is never silently dropped from the report —
+it is named in `shards[]` with `status: "unavailable"` and degrades the
+top-level `status` to `partial`/`unavailable`, so a partial report is never
+mistaken for "fully covered".
+
+---
+
+## Worker-fleet handler contract — capability misses are released, not failed (issue #804)
+
+**The contract: all workers polling a queue should register the same handler
+set.** Harvest's task queue has no claim-time capability filter, and — by
+construction — cannot have one: a worker can enumerate the handlers it *has*
+registered, but not the ones it has *not*. `SKIP LOCKED` therefore hands any
+eligible worker any eligible task, including a task for a handler that worker
+has never heard of.
+
+A rolling deploy breaks that contract *by design*, for the length of the
+rollout: while old and new pods coexist, a workflow or activity introduced in
+the new build is enqueued by a new pod and can be claimed by an old one.
+
+**What happens now.** A worker that claims a task whose handler it does not
+register **releases the claim** back to `PENDING` for a capable peer, with
+capped-exponential backoff (1s, 2s, 4s, 8s, 16s, then a 30s cap — the default
+budget of 5 reaches 16s). The release itself touches only `harvest_task_queue`
+and the execution stays `RUNNING` — the old pod is healthy, it simply is not
+the right pod for this task.
+
+> A workflow task woken by a **due timer or a pending signal** has already
+> durably ingested that `TimerFired`/`SignalReceived` before the handler lookup
+> runs, so a release is not always a literal no-op on `harvest_events`. Those
+> are genuine wake facts any worker would have appended, and a capable peer
+> replays them normally: no new event variant is introduced, the event JSON
+> contract is unchanged, and replay determinism is unaffected (AC7).
+
+**The release is bounded — per distinct worker.** Each release records the
+releasing worker in the task's distinct-miss set and backs the task off. Both
+the set and the total counter are reset by every path that proves the claiming
+worker *was* capable (an activity requeue, a clean continuation, and the
+workflow park), so they measure *consecutive* misses. Once a claim would grow
+that set beyond `WorkerConfig::capability_miss_max_redeliveries` (default **5**)
+the task **escalates** through the ordinary terminal-failure path — a `WorkflowFailed`
+event and a `FAILED` execution row, **not** a dead-letter entry — with a
+greppable reason:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries across 5 distinct worker(s); capability_miss_max_redeliveries = 5; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
+```
+
+The release count and the distinct-worker count are the **real** persisted ones,
+reported separately from the configured knob. They coincide only when each
+worker missed exactly once; if the registry could not confirm the fleet, repeat
+misses are free (they back off but consume no budget), so the release count can
+run well past `capability_miss_max_redeliveries` before a fresh distinct worker
+finally exhausts it.
+
+Counting *distinct* workers rather than total releases is what stops a single
+incapable pod from exhausting the shared budget by repeatedly winning the claim
+race on its own released row — otherwise a capable peer could sit live and idle
+while the run was failed underneath it. A repeat miss by a worker already in the
+set backs off but consumes no budget.
+
+A distinct-worker count alone cannot bound a fleet **smaller** than the budget:
+one incapable pod pins the set at 1 forever, and `1 > 5` never holds. So once
+the registry confirms every live eligible worker on the queue has already missed
+the task — the set can no longer grow from the fleet as it stands — the same
+`capability_miss_max_redeliveries` value bounds *total* releases too. That is
+what keeps the knob a real maximum for the common small deployment: a
+single-worker fleet escalates after 5 releases (~31 s), not 50.
+
+That total bound requires **confirmed** coverage, not merely the absence of an
+objection. If the worker registry cannot be read, `budget` total releases may all
+have been won by the same pod, which is precisely the case the distinct count
+exists to reject. A third, deliberately generous **absolute ceiling** of `10 ×`
+the budget therefore remains as the backstop for the two states where coverage
+is unprovable — a live worker that has never missed the task, or an unreadable
+registry — so the release is always bounded even when nothing can be concluded
+about the fleet.
+
+**The budget is gated on the live fleet, not just on its own count.** A fixed
+number of distinct workers still has no relationship to how many workers are
+actually up: a rollout with `budget + 1` old pods plus one new capable pod could
+hand `budget + 1` distinct incapable ids to the budget while the capable pod was
+live and polling. So before the budget may terminate a task, the workers
+recorded as having missed it must **cover the live fleet for its queue** —
+`harvest_workers` rows with a fresh heartbeat advertising that queue. While any
+live worker there has never missed the task, the budget is withheld and the
+task keeps being offered around.
+
+That freshness window is **not** the one the poison-pill reclaimer (#367) and
+the broken-session scanner (#606) use. Those judge rows they own, with a window
+derived from their own configured cadence; this query judges *peers*, whose
+cadence nothing in `harvest_workers` records — so it uses
+`2 × worker_heartbeat_interval` **floored at 120 s**. At the default 5 s
+cadence that is 120 s here against 10 s there, and dropping
+`worker_heartbeat_interval` below 60 s does not shorten it.
+
+Predict the timing accordingly: for up to 120 s after a pod dies, its row still
+reads as "a capable peer may exist", and in that interval **both** evidence-derived
+bounds are withheld — this fleet-covering one *and* the distinct-worker one. The
+absolute release ceiling (`10 ×` the budget) is what still fires, so the task is
+still bounded, but it waits on that ceiling rather than on your configured
+`max_redeliveries`. The delay costs extra redeliveries, never the run.
+
+This is the mechanism behind the guarantee: **as long as at least one capable
+worker is live on the queue, the budget cannot fail the run.** Two consequences
+worth knowing before you tune anything:
+
+- The bound is `max(budget, live fleet size)` redeliveries, not exactly
+  `budget` — you cannot prove "no worker here has the handler" in fewer
+  redeliveries than there are workers to ask.
+- A worker that is *not* registered in `harvest_workers` (heartbeats disabled,
+  or advertising a different queue name) makes the registry unusable, and the
+  budget falls back to bounding on its own. The escalation reason says so
+  explicitly rather than claiming a fleet conclusion it never established —
+  see row 1b in
+  [`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker).
+
+A small fleet that exhausts the budget on *total* releases reports the same
+budget-exhausted reason as a distinct-worker sweep, because the registry
+confirmed the same fact — every live worker here has now missed it:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries across 1 distinct worker(s); capability_miss_max_redeliveries = 5; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
+```
+
+Note the `1` — a single-pod fleet exhausts the budget on *total* releases, so the
+distinct count stays at one throughout. That is the tell for this sub-case, and
+it is why the two counts are reported separately.
+
+The **absolute ceiling** escalates with a different reason string, because it
+supports a weaker conclusion — it is reached only when the fleet could not be
+concluded about at all, so the queue was never provably swept. It still fires
+the page-severity alert: the executions are failing either way, and under-paging
+a genuinely missing handler is the worse error. Check the named
+`distinct_incapable_workers` count against `GET /api/harvest/workers` before
+concluding the whole queue lacks the handler.
+
+The commonest way to reach it is a live worker on the queue that never missed
+the task, which gets its own wording pointing at the peer rather than at the
+deploy:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 50 releases (10x capability_miss_max_redeliveries (5)); a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, advertising a stale queue list, or ineligible for this activity's registered capability requirements before concluding the handler is missing)
+```
+
+The ceiling is printed as the **computed product** (`50`), with the multiplier
+and the knob shown alongside it so the arithmetic is checkable. Do not size the
+knob off the multiplier alone: raising `capability_miss_max_redeliveries` moves
+this ceiling by `10 ×` the change.
+
+The counts in every reason string are the **persisted** ones: redeliveries that
+actually completed, and workers that actually released. The claim that escalated
+never ran a release, so it is not counted — the string describes the durable
+record you can go and read.
+
+That bound is what keeps a genuinely-missing handler — a workflow type deleted
+or renamed in the new build with runs still in flight — from bouncing around
+the fleet forever. It is a *deploy-skew absorber*, not a substitute for
+shipping the handler.
+
+**Prior behaviour (before #804):** the claiming worker failed the execution
+terminally on the spot. Mid-deploy that was a self-inflicted outage — healthy
+old pods failing perfectly good new-build work.
+
+### What to watch during a rollout
+
+| Signal | Meaning | Action |
+|---|---|---|
+| `harvest.task.capability_miss{outcome="released"}` rising, then falling to zero | Normal deploy skew, self-healing | None. Confirm it returns to zero once the rollout completes. |
+| `harvest.task.capability_miss{outcome="released"}` sustained past the rollout | Some pods are stuck on the old build, or the new handler never shipped to part of the fleet | Finish/roll back the deploy; check the fleet's build IDs. |
+| `harvest.task.capability_miss{outcome="escalated"}` non-zero | The task was offered around the queue and nobody took it. Executions are now failing. Two sub-cases, told apart by the reason string: the configured budget was exhausted with the registry confirming every live worker here has missed it (**no live worker on that queue registers the handler**), or the absolute release ceiling tripped because coverage could not be confirmed at all — a peer that never missed it, or an unreadable registry. Check those workers first in the second case. | Page. Ship the handler, or accept the failures deliberately. |
+| `harvest.task.capability_miss{outcome="escalated_never_offered"}` non-zero | Executions are failing, but the task was failed on its **first** claim after **zero** releases — either `capability_miss_max_redeliveries = 0`, or a worker-session pin (#606) whose host lacks the handler. **This is not evidence the fleet lacks the handler**; a capable worker may be live and idle the whole time. | Ticket. Read the `no_capable_worker:` reason on a failed execution — its parenthetical names which of the two causes applies. |
+
+The two escalation outcomes are deliberately separate label values because they
+carry **opposite** conclusions. `escalated` is fleet evidence and fires the
+page-severity `harvest_no_capable_worker`; `escalated_never_offered` is evidence
+about one config knob or one task's pin and fires the ticket-severity
+`harvest_capability_miss_never_offered`. See
+[`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker) and
+[`harvest_capability_miss_never_offered`](harvest-alerts.md#harvest_capability_miss_never_offered)
+for the full triage.
+
+### Sizing the budget
+
+`capability_miss_max_redeliveries` (default 5) is a *redelivery* budget, not a
+time budget, but the backoff makes it dwell. A budget of `N` grants exactly `N`
+releases and escalates on the `N + 1`th claim, so the default allows five
+releases whose backoffs sum to **31 s** (1 + 2 + 4 + 8 + 16) of queue dwell
+before escalation — that is the *minimum* window a capable peer has to appear,
+measured **on a single worker**, and it is what a single-worker fleet actually
+gets: the budget bounds total releases once the registry confirms the whole live
+fleet has missed the task. In a wider fleet, releases are consumed by whichever
+worker claims next, so a wide fleet of incapable workers burns the budget in
+fewer seconds of wall clock.
+
+**Size it against your rollout, not against a single pod restart.** Escalation is
+the loud signal that nobody can run the work, and it now arrives at the
+configured budget on *every* fleet size rather than being stretched to `10 ×` on
+small ones. If your replacement pods routinely take longer than the dwell above
+to come up, raise the knob — 31 s is not much of a rollout window.
+
+Escalation is also **probabilistic, not exhaustive**: a release carries no
+affinity, so in an `M`-incapable / `1`-capable fleet a task can in principle
+exhaust its budget without the capable worker ever winning a claim. Raise the
+budget if your rollouts are slow, your fleet is wide, or you replace the first
+pod of a large fleet (the widest skew ratio, and exactly when a newly-added
+workflow type is first enqueued):
+
+```rust
+WorkerConfig::default().with_capability_miss_max_redeliveries(20)
+```
+
+Setting it to `0` escalates on the first miss — i.e. opts back into the
+pre-#804 fail-fast behaviour. A run failed that way says so explicitly
+(`capability-miss redelivery is disabled …; a capable worker may exist on this
+queue`) rather than claiming the fleet lacks the handler, because with a budget
+of `0` exactly one worker demonstrated it lacks the handler and no peer was
+ever asked. That matters if you reach for `0` as a rollback switch *during* an
+incident: the resulting terminal error names the knob, not a missing deploy.
+
+**The budget is per *frontier*, not per task.** A workflow can be stuck on a
+different handler on each dispatch — it advances through local activities
+inline, it parks and is woken by a signal, a durable timer fires. Each of those
+is a new question for the fleet ("who has handler *Y*?"), so it gets its own
+budget rather than inheriting the spend of a question that has already been
+answered. Harvest records which handler the counters are about
+(`harvest_task_queue.capability_miss_handler`) and applies them only to that
+one; a miss on a handler the row was not recorded against starts at 1. Without
+this, a run that had spent its budget looking for *X*, then moved on and got
+stuck on *Y*, would be failed on the **first** worker to miss *Y* — while a peer
+that could have run *Y* was live and never asked. This is invisible in the
+reason string, which always names the handler the run was actually stuck on;
+the observable effect is simply that a long-lived workflow does not accumulate
+budget pressure across unrelated deploys.
+
+This does not weaken the bound AC3 asks for. A frontier is a pure function of
+the recorded history, so consecutive dispatches with no new events land on the
+same handler and cannot oscillate; the frontier only moves when history grows,
+and every such event is appended once and consumed once. The number of
+frontiers one task can present is therefore bounded by the history hard cap,
+and no single frontier can release forever.
+
+### Interactions and carve-outs
+
+- **Not a poison pill (#367).** A capability miss is a clean "wrong pod", not a
+  crash. It never increments `crash_strikes`, never consumes an activity's retry
+  budget (`attempt` is restored whenever the handler was never reached, which is
+  every activity-task miss), and never produces a `PoisonPill`
+  dead-letter row — escalation writes no dead-letter row at all. The `harvest.task.quarantined` metric and the
+  `harvest_no_capable_worker` alert
+  are therefore mutually exclusive diagnoses. It also does not *erase* a
+  poison task's history: a release only clears `crash_strikes` when the miss
+  was found **after** the workflow body ran to a conclusion (persisting its
+  commands hit an unregistered activity or child type). A miss found before or
+  during the body ran nothing, so it leaves the counter alone — otherwise, in a
+  mixed fleet, an incapable claim landing between two capable crashes would
+  reset the streak every time and `poison_pill_threshold` would never be
+  reached.
+- **Not a hung body (#494).** The workflow-task timeout strike counter follows
+  the same rule for the same reason: a released task that never ran a handler
+  is not evidence the body stopped hanging.
+- **Not a panicking body (#782).** The consecutive-workflow-handler-panic strike
+  follows the same rule again. A pre-/mid-handler miss is *non-terminal* — the
+  task is released, not failed — so it must not reset the streak; otherwise a
+  worker that alternates between panicking on the body and missing an
+  unregistered local activity would keep `workflow_panic_max_attempts` out of
+  reach indefinitely. All three counters derive their answer from one question:
+  *did this dispatch watch the handler reach a conclusion?*
+- **Session-pinned tasks (#606) escalate immediately.** A session task is
+  hard-pinned to its acquiring host, so "release for a capable peer" is false
+  by construction: no other worker can ever claim it. Such a task escalates on
+  the first miss regardless of the budget.
+- **Orthogonal to build-id routing (#171), below.** Build routing asks *"is
+  this worker's build allowed to resume this history?"*; a capability miss
+  asks *"does this worker have the handler at all?"* A fleet using build
+  policies still benefits: routing narrows who *may* claim, but a worker that
+  passes the build gate can still lack a brand-new handler. The budget's
+  fleet check reads `harvest_build_compat` so a cross-build peer counts as a
+  possible claimant; if that read fails it **keeps** cross-build peers rather
+  than concluding they are ineligible, so a blip in the declaration table can
+  only delay escalation, never cause one.
+- **Keep `worker_heartbeat_interval` at or under 60 s.** The fleet check that
+  decides whether "no live worker here has the handler" is *true* reads
+  `harvest_workers.last_heartbeat_at`, and nothing in that table records the
+  cadence each worker chose — so one fleet-wide freshness window is applied to
+  every row. Harvest floors that window at **120 s** (`2 ×` the supported 60 s
+  cadence) rather than deriving it from the *reading* worker's own interval,
+  precisely so a pod configured to heartbeat every second cannot decide a peer
+  on the default 5 s cadence is dead and escalate a task that peer could have
+  run. A worker configured past 60 s logs a warning at startup naming this; it
+  still boots, and only the configured-total bound is affected (the
+  distinct-worker bound and the absolute ceiling are unaffected), but it can be
+  escalated against early by a faster peer. The floor errs the other way — a
+  worker that is genuinely gone lingers in the fleet view for up to two minutes,
+  which *delays* an escalation rather than fabricating one.
+- **Orthogonal to the handler-coverage gate (#520/#700), below.** That gate is
+  a *pre-cutover* check for handlers you are about to **remove**; this is a
+  *runtime* absorber for handlers not yet **added**.
+- **No replay impact.** Release and redelivery are task-queue state, not
+  event-log state: no new `WorkflowEvent` variant, nothing appended on a
+  release, and the adjacently-tagged event JSON contract is unchanged.
+
+---
+
 # Runbook: Build-Id Routing for Safe Rolling Deploys
 
 Use Harvest's build-id routing to gate which workers may resume specific
@@ -538,7 +954,9 @@ Response fields:
 
 Before cutting a **default (non-build-routed)** deployment over to code that has **deleted or renamed a `#[workflow]` handler**, confirm no in-flight run still needs that handler. A non-terminal execution's `workflow_name` names the handler its next replay requires — removing it strands those runs in permanent `HandlerNotFound` replay failure, surfacing only later as a timeout/DLQ entry.
 
-**Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely.
+**Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774) (#774) → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely. Queue coverage is a sibling gate, not a stricter/looser version of this one — it asks a worker-fleet-topology question (*is anyone polling this queue at all?*) that is orthogonal to handler coverage's code-compatibility question, so run both.
+
+This gate answers *"does a registered handler still exist for this workflow type?"* — a code-compatibility question. It is deliberately distinct from the [queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774) above, which answers a worker-fleet-topology question instead — *"is any live worker even polling the queue this pending task sits on?"* A run can fail either check independently: a fully covered queue can still be `orphaned` if its handler was removed, and a fully handler-complete deployment can still leave a queue `uncovered` if no worker subscribes to it.
 
 ## CI/CD gate — one field asserts "zero orphans"
 
@@ -590,9 +1008,64 @@ This is the **type-level** reachability question. It is distinct from **build-id
 
 ---
 
+# Runbook: Pre-cutover in-flight replay-drift gate (issue #798)
+
+Run this **before** cutting over — it is the CI-side counterpart to the
+post-deploy replay canary below.
+
+The canary runs *server-side against the deployment*, so by the time it can
+speak the build is already reachable. The drift gate runs *in CI, against the
+candidate build*, so a determinism regression is caught before the artifact is
+promoted at all:
+
+```bash
+# In CI, against staging (read-only credential is sufficient).
+# --payload-policy full is REQUIRED: the CLI defaults to `redacted`, and the
+# gate REFUSES a redacted bundle (redaction rewrites the very activity inputs
+# replay compares against), so omitting it exits 2 on every fixture. Treat the
+# bundle as production data.
+harvest history export-sample \
+  --payload-policy full \
+  --per-workflow 50 \
+  --output-dir ./fixtures/in-flight
+
+# Then, in your own ~15-line gate binary linked against the candidate build:
+cargo run --release --bin replay-drift-gate -- ./fixtures/in-flight
+```
+
+Exit `0` = promote. Exit `1` = an in-flight execution would diverge — gate the
+change with `ctx.patched(...)` and re-run. Exit `2` = the gate could not fully
+run (a redacted bundle, a fixture that failed to replay, or an export that
+delivered fewer fixtures than it selected) — fix the export, never override.
+Exit `3` = the bundle was empty (a gate that verified nothing is never a pass;
+opt out with `allow_empty_bundle(true)` only for a genuinely idle fleet).
+
+The export is `SELECT`-only and safe against production. The per-type
+stratification (`--per-workflow`) means a noisy workflow type cannot crowd every
+other type out of the sample, and the emitted `harvest-sample-manifest.json`
+states `sampled` versus `in_flight_total` per type so a clean gate is never
+mistaken for a fleet-wide guarantee.
+
+Full recipe, exit-code table, coverage semantics, and the payload-policy
+trade-off: [`docs/replay-drift-gate.md`](../replay-drift-gate.md).
+
+**Where this sits in the deploy ladder:** worker drain (#386) → [pre-cutover
+handler-coverage gate](#runbook-pre-cutover-handler-coverage-gate) (#520) →
+[queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774)
+(#774) → schema contract gate (#794) → **this in-flight drift gate (#798)** →
+[Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) →
+non-determinism block (#480/#603).
+
+---
+
 # Runbook: Pre-Deploy Replay Canary
 
 Use the deploy-time replay canary to verify that a candidate build is compatible with currently running executions before advancing the build policy or declaring compatibility.
+
+> **Complement, not substitute.** The [in-flight replay-drift gate](#runbook-pre-cutover-in-flight-replay-drift-gate-issue-798)
+> (#798) runs the same class of check in CI *before* promotion; this canary runs
+> server-side *at* deploy time. Run both — the gate blocks a bad artifact, the
+> canary catches anything the sample missed.
 
 **When to use:** before rolling out any new worker deployment where you expect the new code to handle existing in-flight workflow executions (i.e. Scenario A).
 

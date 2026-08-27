@@ -259,6 +259,9 @@ fn build_pool(url: &str) -> DbPool {
 
 fn canary_wf_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         name: CANARY_WF,
         module: "canary_tests",
         handler: canary_probe_handler,
@@ -284,6 +287,9 @@ fn canary_wf_info() -> WorkflowInfo {
 
 fn normal_wf_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         name: NORMAL_WF,
         module: "canary_tests",
         handler: normal_handler,
@@ -366,6 +372,7 @@ fn make_worker(
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(30),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -415,6 +422,7 @@ async fn start_workflow(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

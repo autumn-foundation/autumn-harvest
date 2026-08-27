@@ -156,6 +156,9 @@ fn build_three_shard_pool(shard0_url: &str, shard1_url: &str, shard2_url: &str) 
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "echo_workflow",
         module: "tests",

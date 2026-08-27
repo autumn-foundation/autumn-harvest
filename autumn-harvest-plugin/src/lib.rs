@@ -10,12 +10,21 @@ pub mod api_token;
 pub mod callback_deliverer;
 pub mod canary;
 pub mod config;
+/// Broker event-source connectors for workflow triggers (issue #944).
+///
+/// The core `autumn-harvest` crate gains **zero** broker dependencies: every
+/// broker client lives behind this plugin's `kafka` / `sqs` features.
+#[cfg(feature = "connectors")]
+pub mod connector;
 pub mod dag_graph;
 pub mod dag_retry;
+pub mod lineage;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
+/// Fleet-wide task-queue coverage read model (issue #774).
+pub mod queue_coverage;
 pub mod replay_diagnosis;
 pub mod runner;
 pub mod schedule_runs;

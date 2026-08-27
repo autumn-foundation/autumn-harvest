@@ -23,6 +23,10 @@ Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
 harvest's own gaps, not just its strengths.
 
+Moving an existing Temporal deployment? See the
+[Temporal migration guide](docs/migrating-from-temporal.md) — a concept
+map, a workflow-porting checklist, and a dual-run cutover playbook.
+
 ## Quick example
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
@@ -365,6 +369,19 @@ volume, downstream SLAs, shard count, queue topology, and schedule cadence. The
 Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
 operators without Prometheus can run the equivalent CLI/API checks documented
 in [`docs/alerts/README.md`](docs/alerts/README.md).
+
+### Measured performance baselines
+
+[`docs/performance.md`](docs/performance.md) publishes measured task-claim and
+enqueue baselines: how claim latency scales with pending-backlog depth (the
+number that answers *"when do I add a shard?"*), what five representative
+claim-path predicates cost (five more are in the query on every claim but are
+left on their cheapest null/empty path, so they are evaluated rather than
+measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
+behind both. Like the
+alert pack, these are starter reference numbers from one machine — reproduce
+them on your own hardware before designing against them. A CI gate defends the
+headline scenario so a change that collapses the claim path fails the build.
 
 ### Controlling duplicate workflow starts
 
@@ -912,8 +929,9 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.5.0 wraps the Phase 4 surface plus additive management API contract
-coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
+Version 0.6.0 builds on the Phase 4 surface (see
+[`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
+surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
 workflow result waiting, dead-letter list/replay/aggregation endpoints,
 pause/resume controls, DAG retry from failed nodes, timezone-aware cron

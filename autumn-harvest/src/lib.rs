@@ -24,6 +24,80 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
+/// Await a chaos injection point (statement position). See [`chaos`].
+///
+/// `#[allow(unused_macros)]`: every call site lives in a `#[cfg(feature =
+/// "db")]` module (`queue`, `worker`, `scheduler`, ...), so a no-`db` build
+/// (e.g. `--no-default-features --features testing`) compiles the macro but
+/// none of its invocations — an unused-macro warning that CI's `-D warnings`
+/// would fail on. Mirrors `chaos_fallible!`.
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_point {
+    ($name:ident) => {
+        $crate::chaos::hit($crate::chaos::points::$name).await
+    };
+}
+
+/// Await a chaos injection point (compiled out; const-checks the point name).
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_point {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+    }};
+}
+
+/// Await a fallible chaos injection point at a `?` site; propagates an injected
+/// error via `From` into the enclosing function's error type. See [`chaos`].
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_fallible {
+    ($name:ident) => {
+        $crate::chaos::hit_fallible($crate::chaos::points::$name).await?
+    };
+}
+
+/// Fallible chaos injection point (compiled out; const-checks the point name).
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_fallible {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+    }};
+}
+
+/// Ask a `LISTEN`/`NOTIFY` send site whether its wake should be dropped
+/// (expression position, evaluates to `bool`). Synchronous — no `.await`. See
+/// [`chaos`].
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_drop_notify {
+    ($name:ident) => {
+        $crate::chaos::should_drop_notify($crate::chaos::points::$name)
+    };
+}
+
+/// Drop-notify query (compiled out; const-checks the point name, always
+/// `false`). The `false` is a compile-time constant, so the guarded `NOTIFY`
+/// branch is dead-code-eliminated in a non-chaos build — zero hot-path cost.
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_drop_notify {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+        false
+    }};
+}
+
+// Re-export the crate-internal chaos macros by path so injection sites can call
+// `crate::chaos_point!(NAME)` regardless of module-declaration order (a plain
+// `macro_rules!` is only visible by bare name to code textually after it). Each
+// `use` resolves to whichever cfg arm compiled, so it is config-agnostic. Not
+// `#[macro_export]`: these are test-harness internals, never public API.
+#[allow(unused_imports)]
+pub(crate) use {chaos_drop_notify, chaos_fallible, chaos_point};
+
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
@@ -62,6 +136,8 @@ pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))
 }
 
+/// Per-activity-type pause/resume for surgical outage containment (issue #807).
+pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// History analyzer and linter.
@@ -71,6 +147,10 @@ pub mod api_token;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Open-awaitables diagnostic projection (issue #615).
+pub mod awaitables;
+/// Post-restore resumability verification for backup/PITR drills (issue #943).
+pub mod backup_verify;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 /// Batch workflow start types: caps and per-item request/result structs (issue #357).
@@ -88,6 +168,13 @@ pub mod calendar;
 /// Reserved names + predicates for the throwaway workflow that probes the live
 /// execution path. Distinct from the #512 replay canary.
 pub mod canary;
+/// Deterministic chaos/fault-injection test harness (issue #940).
+///
+/// [`chaos::points`] is unconditional (a zero-cost const catalogue of named
+/// injection points); the controller (`arm`, `hit`, `ChaosPlan`, ...) is
+/// `#[cfg(feature = "chaos")]` and never part of a production binary.
+#[doc(hidden)]
+pub mod chaos;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
@@ -111,6 +198,13 @@ pub mod dag_profiler;
 pub mod dag_simulator;
 /// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
 pub mod debounce;
+/// Time-travel replay debugger for recorded workflow histories (issue #949).
+///
+/// Read-only by construction: no new [`WorkflowEvent`](crate::event::WorkflowEvent)
+/// variant, no migration, no engine-runtime change. Gated behind the `debugger`
+/// feature (which enables `testing`).
+#[cfg(feature = "debugger")]
+pub mod debugger;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
@@ -177,13 +271,36 @@ pub mod prelude;
 pub mod query;
 #[doc(hidden)] // internal implementation detail; no stability guarantee
 pub mod queue_fairness;
+pub mod queue_pause;
+/// Per-tenant resource quotas on executions, history, and DLQ (issue #946).
+///
+/// Pure types ([`quota::QuotaPolicy`], [`quota::QuotaResource`],
+/// [`quota::resolve_quota_key`], [`quota::check_quota`]) compile without the
+/// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
+/// DB-gated.
+pub mod quota;
 pub mod replay;
+/// Stratified in-flight history sampling for the replay-drift gate (issue #798).
+///
+/// Carries the pure, database-free vocabulary shared by the sample export
+/// (`GET /admin/history/export-sample`), the `harvest history export-sample`
+/// CLI bundle writer, and [`testing::ReplayVerifier::replay_bundle`], so the
+/// bundle wire shape cannot drift between producer and consumer.
+pub mod replay_sample;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
+/// Background control-loop liveness heartbeats (issue #797).
+pub mod scanner_health;
+/// Workflow payload-schema contract baseline and replay-compatibility diffing (issue #794).
+///
+/// Deliberately ungated: the CLI links `autumn-harvest` with
+/// `default-features = false`, so the gate must be reachable without `db` or
+/// `schema`.
+pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
@@ -192,6 +309,8 @@ pub mod signal_handler;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
+/// Per-execution stall diagnosis — the root-cause classifier (issue #809).
+pub mod stall_diagnosis;
 /// Request-scoped idempotency keys for plain workflow starts (issue #808).
 pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.
@@ -288,7 +407,9 @@ pub use calendar::{
     replace_calendar_exclusions,
 };
 pub use calendar::{
-    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+    BusinessCalendars, BusinessDayRejection, BusinessDayResolution, Calendar, MAX_BUSINESS_DAYS,
+    ScheduleFirePreview, add_business_days, add_business_days_bounded, apply_skip_policy,
+    calendar_excludes_weekends, is_business_day, is_excluded_date, next_business_day_at_or_after,
 };
 pub use canary::{
     CANARY_ACTIVITY_NAME, CANARY_WORKFLOW_NAME_PREFIX, is_canary_workflow, is_reserved_canary_name,
@@ -298,11 +419,13 @@ pub use completion_trigger::{
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
 };
 pub use context::{
-    ActivityContext, AutoHeartbeatGuard, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
-    DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard,
-    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
-    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
-    is_reserved_session_activity_name,
+    ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
+    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_SESSION_ACQUISITION_TIMEOUT, DEFAULT_WORKFLOW_LOG_MAX_LINES,
+    DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard, MutexHandle, RaceBuilder, RaceWinner,
+    Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext,
+    WorkflowExecutionInfo, WorkflowHistoryPolicy, WorkflowLogLevel, WorkflowLogPolicy,
+    WorkflowLogger, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -325,22 +448,25 @@ pub use det_check::{
     check_paths, check_source,
 };
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
-pub use error::{HarvestError, HarvestResult, TimeoutType};
+pub use error::{CapabilityMissPhase, HarvestError, HarvestResult, TimeoutType};
 pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, IdempotentStartOutcome, ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER,
-    ORIGIN_SCHEDULED, PausedWorkflowExecution, ResolvedRun, ResumedWorkflowExecution,
-    ScheduleRunQuery, ScheduleRunRow, ScheduleRunStateCount, SignalWithStartOutcome,
-    SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution, UpdateWithStartOutcome,
-    UpdateWithStartParams, WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow,
-    WorkflowTypeNonTerminalCount, auto_resume_expired_pauses, cancel_workflow_execution,
-    count_workflow_executions_grouped, list_schedule_runs, non_terminal_counts_by_workflow_name,
-    pause_workflow_execution, resolve_execution_id_by_workflow_id, resume_workflow_execution,
+    ORIGIN_SCHEDULED, PausedWorkflowExecution, RETRY_CHAIN_MAX_DEPTH, RETRY_CHAIN_MAX_REDRIVES,
+    ResolvedRun, ResumedWorkflowExecution, ScheduleRunQuery, ScheduleRunRow, ScheduleRunStateCount,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
+    TriageFieldChange, TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
+    WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, WorkflowTypeNonTerminalCount,
+    annotate_workflow_execution, auto_resume_expired_pauses, cancel_live_attempt,
+    cancel_workflow_execution, count_workflow_executions_grouped, list_schedule_runs,
+    non_terminal_counts_by_workflow_name, pause_live_attempt, pause_workflow_execution,
+    redrive_target, resolve_execution_id_by_workflow_id, resolve_live_attempt,
+    resolve_live_attempt_id, resume_live_attempt, resume_workflow_execution,
     schedule_run_state_summary, select_resolved_run, signal_with_start_workflow_execution,
     signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
     start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
-    terminate_workflow_execution, update_with_start_workflow_execution,
+    terminate_live_attempt, terminate_workflow_execution, update_with_start_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
@@ -350,8 +476,9 @@ pub use guardrail::{
 };
 #[cfg(feature = "db")]
 pub use handle::{
-    StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
-    WorkflowResultState, start_or_load_workflow_execution_with_handle,
+    StartedWorkflowHandle, TransactionalStartOptions, TransactionalStartOutcome, WorkflowHandle,
+    WorkflowHandleClient, WorkflowResult, WorkflowResultState,
+    start_or_load_workflow_execution_with_handle,
 };
 #[cfg(feature = "db")]
 pub use handle_typed::{
@@ -421,24 +548,39 @@ pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
-pub use shard::ShardRouter;
+pub use schema_contract::{
+    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
+    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
+    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
+};
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
+pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
+pub use stall_diagnosis::{
+    AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
+    ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
+    ReplayWaitFacts, TIMER_OVERDUE_GRACE_SECONDS, WorkflowTaskFacts, activity_precedence,
+    classify_execution, classify_pending_activity, classify_workflow_task, summarize,
+    workflow_task_hard_impediment, workflow_wake_was_missed,
+};
 #[cfg(feature = "db")]
 pub use store::AwaitMode;
 pub use telemetry::{
-    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
-    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, USER_METRIC_PREFIX,
-    UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus, validate_user_metric,
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, SCANNER_SHARD_LABEL_NONE,
+    TelemetryConfig, TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator,
+    USER_METRIC_PREFIX, UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus,
+    validate_user_metric,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
 #[cfg(feature = "testing")]
 pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
-    ReplayVerifier, ReportFormat, TestRunOutcome, WorkflowTestEnv,
+    ReplayBlocked, ReplayDrift, ReplayDriftReport, ReplayVerifier, ReportFormat, TestRunOutcome,
+    WorkflowTestEnv,
 };
 #[cfg(all(feature = "db", any(test, feature = "testing")))]
 pub use testing::{
@@ -456,8 +598,8 @@ pub use timeline::{
 pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalAwaitId,
-    ExternalCancelId, ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId,
-    StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
+    ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy, Priority, SessionId,
+    ShardId, StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;

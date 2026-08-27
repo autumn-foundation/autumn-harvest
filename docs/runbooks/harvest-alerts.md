@@ -195,6 +195,11 @@ count. Override them per environment with
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
+  One exception, added by issue #797: its `scanner_liveness` check is a *live*
+  signal about the answering process's background control loops, so it is also
+  the fastest way to identify a wedged loop during an incident — but only for
+  the process you point it at (the registry is in-process). See
+  [`harvest_scanner_stalled`](#harvest_scanner_stalled).
 - **`/api/harvest/admin/config`** is the **effective-config introspection**
   surface (issue #695): what config is this fleet actually running with, right
   now? Pull the resolved effective runtime configuration (secret-free,
@@ -217,6 +222,13 @@ count. Override them per environment with
 Missing migrations, unreachable shard, no worker for a required queue, stale
 workers, disabled scheduler path for registered schedules, DLQ read failure, or
 an admin API mounted without the expected auth boundary.
+
+A `catalog_consistency` failure means the registration itself is inconsistent —
+a DAG or an opted-in workflow references an activity or child workflow that is
+not registered in this process. Read the named references out of
+`details.failures`; the fix is to add the handler to `activities![…]` /
+`workflows![…]`, or to delete the now-stale declaration. See
+[Chapter 10 — Operating the service](../getting-started/10-operations.md#catching-a-forgotten-registration-before-rollout).
 
 ### False positives
 
@@ -265,6 +277,77 @@ queue. Avoid bulk replay until coverage is fresh.
 
 Escalate if coverage is absent for more than two heartbeat windows after a
 worker restart, or if multiple shards report the same missing queue.
+
+## harvest_queue_uncovered
+
+**Data-driven queue coverage gap** (issue #774). A queue has real pending
+work but zero live workers are polling it right now. Unlike
+`harvest_no_active_workers` above — which checks *static, declared*
+required-queue coverage (derived from registered workflow/activity default
+queues and schedules) regardless of whether any work is currently
+pending — this alert is *data-driven*: it fires only when there is actual
+stranded work, so it also catches ad-hoc or dynamically-named queues that
+were never declared as required. It is distinct from build-id reachability
+(#171) and the pre-cutover handler-coverage gate (#520/#700, see
+`docs/runbooks/safe-deploy.md`): a queue can be reported uncovered even when
+every worker in the fleet is fully build-compatible and handler-complete —
+it simply is not subscribed to that queue name.
+
+### Triage steps
+
+1. Run `harvest queue coverage --json` (or `GET /api/harvest/admin/queue-coverage`).
+2. Read `uncovered` / `total_uncovered_queues` for the single-field CI-gate
+   answer, then walk `items[]` for the specific queue name(s), each carrying
+   `pending_count` and a `shard_breakdown`.
+3. Each uncovered item's `sample_task_ids` / `sample_execution_ids` (capped
+   at 5) name real stranded rows — open one directly with
+   `harvest workflow stack <execution_id>`.
+4. Run `harvest worker health --output json` (or `harvest worker list --queue <queue>`)
+   to confirm no worker is currently subscribed to the named queue.
+5. Check `status` in the report: `partial`/`unavailable` means at least one
+   shard could not be inspected — walk `shards[]` for the entry carrying
+   `status: "unavailable"` to identify it; that shard's pending demand is
+   **not** reflected in the report, so do not read a `partial` result as
+   "fully covered".
+
+### Likely causes
+
+A worker deployment dropped a queue from its `--queues`/`with_queues(...)`
+configuration (typo, config drift during a rolling deploy), the last worker
+subscribed to the queue was drained or crashed with no replacement, a
+schedule or webhook started routing work to a new/ad-hoc queue name that no
+worker was ever configured to poll, or the queue was paused and then had its
+pause lifted without a worker being re-added.
+
+### False positives
+
+None from staleness — the report is computed live from the current pending
+set and the live worker registry on every call, not sampled. A queue that
+is intentionally paused (`GET /admin/queues/paused`) is excluded from the
+uncovered list by design (paused work is expected to sit idle, not
+stranded) — confirm the queue is not paused before treating a report as a
+false positive. Don't stop there, though: a paused queue with pending work
+and no live poller is still surfaced, separately, in the report's
+`excluded_paused_queues` array — a non-empty entry there is not a false
+positive, it's a pre-unpause TODO (unpausing that queue today would make it
+uncovered immediately). A `partial`/`unavailable` `status` can under-report
+(an unreachable shard's pending demand is invisible), never over-report.
+
+### Safe actions
+
+Add or re-subscribe a worker to the named queue (`with_queues([...])` /
+`--queues`), or resume routing if the queue was meant to be a synonym for
+one an existing worker already polls. Do not adjust build policy or remove
+workflow handlers to fix this — coverage is orthogonal to both (see the
+["Queue-coverage check" section](safe-deploy.md#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774)
+of `docs/runbooks/safe-deploy.md`).
+
+### Escalation criteria
+
+Escalate if a required (previously-covered) queue stays uncovered for more
+than two heartbeat windows after a worker restart or deploy, or if
+`total_uncovered_queues` grows across successive polls rather than
+shrinking once replacement workers come up.
 
 ## harvest_worker_saturation
 
@@ -740,6 +823,90 @@ move existing executions across shards; Harvest does not rebalance them.
 Escalate if a writable shard is unavailable, if multiple shards are partial, or
 if readiness cannot be proven during a rollout.
 
+## harvest_shard_undrained
+
+A writable shard has claimable pending work but **no live worker is polling it**,
+so every workflow rendezvous-hashed onto that shard is permanently undispatched.
+
+This is the **shard-dimension** analogue of
+[`harvest_queue_uncovered`](#harvest_queue_uncovered), which detects the same
+condition per *queue*. Both can be true at once (a queue with no poller on a
+shard with no poller), and each names a different fix: widen a worker's
+**queues** vs. widen a worker's **shards**.
+
+### Triage steps
+
+1. Run `harvest shard health --output json` and note which shard ids are
+   affected and whether they are writable.
+2. Ask whether the shard has **no poller at all** or a poller that is merely
+   behind:
+
+   ```promql
+   # stranded work with NO dispatch on that shard  →  genuinely no poller
+   max by (shard) (harvest_shard_stranded_pending) > 0
+     unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)
+   ```
+
+   `unless`, not `and ... == 0`: a shard that has **never** had a covering
+   poller has no `harvest_shard_dispatched_total{shard}` series at all, so an
+   `== 0` comparison produces no element for it and the vector match would
+   return empty — sending you down the "poller present but behind" branch for a
+   shard with no poller whatsoever. `unless` keeps the left-hand element when
+   the right-hand side has none.
+
+   A non-zero dispatch rate alongside stranded work means a worker *is*
+   covering the shard but cannot claim the specific pending rows — fall through
+   to `harvest queue coverage --json` (queue mismatch) or
+   `harvest workflow stack <execution_id>` (build-id/capability mismatch).
+3. Read the worker's **effective** shard coverage:
+
+   ```bash
+   curl -s .../api/harvest/admin/config | jq '.worker.shard_assignments'
+   ```
+
+   Since issue #961 an **empty** `shard_assignments` means *auto*: the worker
+   covers every shard in its pool. `GET /admin/config` reports the *resolved*
+   list, so the shard ids printed here are exactly the ones the worker polls.
+4. Confirm at least one live worker reports the shard:
+   `harvest worker health --output json`.
+
+### Likely causes
+
+A shard was added to `writable_shards` without starting (or widening) a worker
+that covers it; the only worker covering a shard died or was drained; a worker
+was explicitly narrowed with `WorkerConfig::with_shard_assignments([...])` and
+never widened when the shard set grew; or that shard is in the router but has no
+`ShardedDbPool` entry in the process at all — in which case startup is refused;
+check the logs for `ShardRouter references shards ... that have no pool entry`.
+(The sibling `shard_assignments are missing from the sharded_pool` rejection can
+only fire for an **explicitly narrowed** worker: auto-derived assignments come
+*from* the pool, so they can never name a shard the pool lacks.)
+
+### False positives
+
+A brief spike during a **rolling worker restart** is expected: the sampler can
+observe a shard between the old worker's deregistration and the new worker's
+registration. Size the alert's `for` window above your restart window; 2m is a
+conservative starting point. The starter pack ships PromQL expressions only, so
+the `for` window is yours to set. A shard being deliberately
+drained (readable-but-not-writable) may also hold pending work legitimately
+while it finishes — cross-check `harvest shard health` for its writable flag.
+
+### Safe actions
+
+Start or widen a worker that covers the shard — either remove the explicit
+`with_shard_assignments` narrowing so auto-coverage applies, or add the shard to
+the list. Both take effect on worker restart. Do **not** move existing
+executions across shards; Harvest does not rebalance them, and their execution
+ids encode the original shard.
+
+### Escalation criteria
+
+Escalate if a writable shard stays undrained beyond one restart window, if
+multiple shards are simultaneously undrained (suggesting a pool/router
+misconfiguration rather than a single dead worker), or if `GET /admin/config`
+shows a shard the router considers writable but no worker resolves.
+
 ## harvest_no_compatible_worker
 
 ### Triage steps
@@ -1024,10 +1191,15 @@ workflow failures become visible.
 3. Inspect recent failures directly: `harvest workflow list --state FAILED
    --workflow-name <name> | head -20` (or `GET /api/harvest/workflows?state=FAILED`)
    and read the `error` field for the original step error.
-4. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
+4. If the saga spawns child workflows, the failing step may be several levels
+   down: `harvest workflow tree <exec_id> --summary` gives a per-state
+   descendant roll-up in one call, and `harvest workflow tree <exec_id>`
+   renders the whole family so you can find *which* descendant failed. See
+   [trace-execution-lineage.md](trace-execution-lineage.md).
+5. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
    plus failed compensations means dangling state is accumulating; treat as
    the page, not the ticket.
-5. Check the downstream dependency the failing step calls (status page,
+6. Check the downstream dependency the failing step calls (status page,
    circuit breaker state via `GET /api/harvest/admin/circuits`).
 
 ### Likely causes
@@ -1350,3 +1522,1052 @@ Ticket the workflow owner with the type name and the current active count.
 Escalate to page if the population growth is unbounded and accelerating, the
 worker fleet is already at capacity, and business-critical runs are visibly
 stalled (their `stack` shows no forward progress across successive checks).
+
+## harvest_workflow_history_bloat
+
+**What to do when a still-running workflow's history is approaching the hard
+cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
+**early-warning**, distinct from the terminal outcome it precedes. Harvest can
+optionally enforce a hard cap on the number of recorded `harvest_events` an
+in-flight execution may accumulate (`WorkflowHistoryPolicy::event_hard_cap`,
+set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
+construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
+parameter, so every workflow type registered on that worker shares the
+identical cap and warn fraction; there is no per-type override, and raising or
+lowering either value affects every workflow type that worker serves. Distinct
+from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
+ceiling from issue #493, which is sampled by a separate periodic scanner and
+reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
+is configured,
+the same still-`RUNNING` execution that would eventually hit it is instead
+warned once — the first time its recorded history crosses a configurable
+fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
+`0` disables the signal entirely). The counter increments once per crossing
+per execution (delivery is at-least-once — see the last triage step below);
+the run itself is completely unaffected and keeps executing normally. A
+single decision cycle can also grow history from below the soft threshold
+straight past the hard cap in one shot (e.g. a batched local-activity or
+external-signal append); in that case the same crossing is caught and
+emitted right before the execution is terminally force-failed, so the
+warning still fires even for a run that never spends a cycle "just barely
+over the soft line." If nothing intervenes, continued growth will eventually
+reach the hard cap, at which point the execution is terminally force-failed
+and moved to the dead-letter queue — this alert exists to give an operator a
+window to act *before* that happens.
+
+### Triage steps
+
+1. Read the `workflow` label to identify which workflow type crossed the soft
+   threshold.
+2. Discover and rank the specific offending execution(s) with the dedicated
+   discovery filter, sorted largest-first with each row's current
+   `history_event_count`:
+   `harvest workflow list --history-bloat-min-events <threshold>` (or
+   `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
+   with a threshold near the configured hard cap's 75% soft mark and lower it
+   if you need to see the full ranked population; every returned row is
+   guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
+   descending. This is a DIFFERENT query parameter from the unrelated,
+   pre-existing general-purpose `min_history_events` filter (issue #493,
+   `docs/runbooks/history-ceiling.md`), which composes with `state=`/
+   pagination and does not restrict to live executions or sort by size.
+3. For the largest offender(s), inspect `GET /api/harvest/workflows/{execution_id}/stack`
+   and `GET /api/harvest/workflows/{execution_id}/history` to understand what
+   is driving the growth — a tight retry/poll loop, an unbounded fan-out, or a
+   long-lived entity workflow that has simply been running for a long time
+   without ever checkpointing.
+4. Check whether the execution has already been warned before
+   (`history_bloat_warned_at` on the execution row, surfaced by the describe
+   endpoint) — the guard field is set once and only once per execution
+   (idempotent across replays/retries), so a repeat page naming the *same*
+   execution means it kept growing past the first warning and is now closer
+   to the hard cap. The counter itself is delivered at-least-once: it is
+   emitted just before the guard is durably persisted, so a worker crash in
+   that narrow window can rarely cause one extra increment on a retry —
+   treat a lone duplicate-looking page for an execution whose
+   `history_bloat_warned_at` is already set as this benign case, not a
+   second distinct crossing.
+
+### Likely causes
+
+- A workflow that polls or loops without ever calling `continue_as_new` (issue
+  #772's `should_continue_as_new()` exists precisely to recommend this
+  checkpoint; a workflow that ignores the recommendation, or has no such
+  check at all, keeps accumulating history indefinitely).
+- An unexpectedly wide activity or child-workflow fan-out (issues #359/#601)
+  recording far more events per decision cycle than the workflow author
+  anticipated.
+- A long-lived entity workflow (a subscription, a cart, a device) that is
+  behaving correctly but was never given a deadline-aware checkpoint
+  strategy (issue #772).
+- The configured `event_hard_cap` (or its `history_bloat_warn_fraction`) is
+  simply too tight for the crossing workflow type's normal, healthy history
+  footprint — since the cap/fraction is registry-wide (not per-type), raising
+  either affects every other workflow type sharing the same worker process;
+  confirm the new value is still appropriate for them before tuning, or run
+  the outlier workflow type on a separate worker/`HandlerRegistry` with its
+  own cap if their footprints genuinely diverge.
+
+### False positives
+
+A single crossing for a workflow type known to run long and record many
+events by design (e.g. a long-lived entity workflow deliberately operating
+close to its configured cap) is expected, not an incident — the alert fires
+once per execution and does not repeat unless the execution keeps growing
+past the point already investigated. A worker whose `HandlerRegistry` has no
+`event_hard_cap` configured will show a permanently flat, never-incrementing
+series; that is the disabled/no-op state, not a health signal to chase.
+
+### Safe actions
+
+1. If the workflow is a candidate for `continue_as_new`, trigger it (either by
+   waiting for the workflow's own `should_continue_as_new()` check to fire on
+   its next decision cycle, or — for a workflow with no such check — by
+   deploying a code change that adds one; in-flight executions replay
+   deterministically against the recorded history).
+2. If the growth is an unbounded fan-out, inspect and fix the workflow code
+   and let the fix apply on the next deploy (existing in-flight executions
+   are unaffected by the code change until they reach a fresh decision
+   cycle).
+3. If the cap/fraction is simply mistuned for the crossing workflow type's
+   expected footprint, raise `event_hard_cap` or `history_bloat_warn_fraction`
+   via `HarvestBuilder` on the next deploy — this is registry-wide (every
+   workflow type sharing that worker gets the new value; there is no
+   per-type override) and never requires touching in-flight executions.
+4. If the execution is at real risk of hitting the hard cap before any of the
+   above can land, and it is safe to interrupt, cancel or terminate it
+   (`POST /api/harvest/workflows/{execution_id}/cancel` or `/terminate`)
+   rather than let it dead-letter on the hard cap.
+
+### Escalation criteria
+
+Ticket the workflow owner with the type name and the ranked list from
+`history_bloat_min_events`. Escalate if a specific execution keeps re-crossing
+(growth continuing well past the first warning) and is on a clear trajectory
+to reach the hard cap within the next alerting window, or if the growth is
+concentrated across many concurrent executions of the same type rather than
+one outlier — the latter usually means the workflow's checkpoint strategy
+itself needs to change, not just the one instance.
+
+## harvest_queue_paused_too_long
+
+**What to do when a task queue has been held by an operator for too long:** the
+`harvest.queue.paused` gauge (issue #619) reports `1` for every queue whose
+dispatch is currently held and `0` otherwise. A pause is *safe* — nothing fails,
+retries, or dead-letters, and already-`RUNNING` tasks finish naturally — but it
+is also *silent*: work accumulates as `PENDING`, no other alert fires, and a
+forgotten pause is indistinguishable from a healthy idle queue until the backlog
+breaches an SLA. This alert exists to make a forgotten freeze loud.
+
+> **"Nothing fails" has one exception: `schedule_to_close`.** A pause suspends
+> only the *relative* `schedule_to_start` timer. An activity carrying an
+> **absolute** `schedule_to_close` deadline (issue #378) is still timed out
+> while the queue is held — a pause is not an SLA extension. The longer the
+> hold, the more of the held backlog can cross its own absolute deadline, so
+> treat this alert's `for` window as a real budget, not a formality. Crediting
+> held time back to `schedule_to_close` is explicitly out of scope for issue
+> #619.
+
+Because the gauge is binary, the **`for` duration is the threshold**, not the
+value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
+(ticket) or `for: 4h` (page).
+
+### Triage steps
+
+1. **See what is held and why.** The read endpoint returns the reason, the
+   operator who placed the hold, when it was placed, and how much work is
+   waiting behind it:
+
+   ```bash
+   harvest queue list-paused
+   # or: curl -s .../api/harvest/admin/queues/paused | jq
+   ```
+
+   The Vantage **Workers** page shows the same thing as a banner — the fleet
+   page an operator lands on when investigating idle workers.
+
+   Check `effective_scope` on each entry (the banner's **Scope** column shows
+   the same thing). It reports what the hold *actually* covers, derived from the
+   shards that hold the queue versus the expected shard set — not the
+   `scope_shard_id` intent recorded when the row was written:
+
+   - `fleet` — every expected shard holds it.
+   - `partial_fleet` — **some shards are still dispatching.** A fleet-wide pause
+     that only reached part of the fleet writes `scope_shard_id: null` on the
+     shards it reached and *no row* on the ones it missed, so intent alone cannot
+     tell this apart from a complete hold. Re-issue the pause (it is idempotent);
+     the original reason and operator are preserved. An unreachable shard also
+     reports `partial_fleet` — it may still be dispatching, so that is the safe
+     reading.
+   - `shard` — a deliberately shard-scoped hold.
+
+2. **Confirm the downstream is actually back.** The reason field records why the
+   hold was placed (`"SMTP provider outage"`). Verify that dependency is healthy
+   before thawing, or the backlog will simply fail on release.
+
+3. **Check how much is held.** `held_task_count` on the read endpoint is the
+   number of `PENDING` tasks on the queue. A large number means the thaw will
+   produce a burst — see *False positives* below for why that burst is safe.
+
+4. **Resume.**
+
+   ```bash
+   harvest queue resume email-workers
+   ```
+
+   Held tasks become immediately claimable. The response echoes the
+   `released_reason` and `released_paused_by` of the hold you just released —
+   the pause row is deleted on resume, so this is the last moment the *why* is
+   recoverable *from that row*.
+
+   For a **post-incident** review after the row is gone, read the audit log
+   instead — who/why/when survives the resume permanently there:
+
+   ```bash
+   harvest audit list --operation queue.pause --target-id email-workers
+   harvest audit list --operation queue.resume --target-id email-workers
+   ```
+
+   The reason is carried in the record's **`error_summary`** field, which is the
+   only free-text column on `harvest_audit_log` (there is no metadata column) —
+   so it is populated on `succeeded` rows too, not just failures. It reads:
+
+   - `reason: <why>` on a `queue.pause` row;
+   - `reason: released hold by <actor>: <why>` on the matching `queue.resume`
+     row;
+   - when independently-paused shards carried **different** holds, the resume row
+     instead lists every one of them, longest first, so no shard's *why* is lost
+     once its pause row is deleted:
+     `reason: released 2 holds (longest first); shards 0,2 by alice: stripe
+     outage (held 900s); shard 1 by bob: pg failover (held 60s)`. Shards sharing
+     one incident collapse into a single entry, so this grows with the number of
+     distinct holds, not the shard count;
+   - `... | failures: <detail>` appended on either when the operation only
+     partially applied, naming the shards it did not reach.
+
+5. **Confirm the thaw.** `harvest queue list-paused` should now be empty and the
+   `harvest_queue_depth` / `harvest_queue_oldest_pending_age` panels should
+   start falling.
+
+### Likely causes
+
+- **A genuine, still-ongoing downstream outage.** The hold is doing its job; the
+  alert is telling you the outage has outlasted its expected window.
+- **A forgotten hold.** The incident was resolved but nobody resumed the queue.
+  This is the failure mode the alert exists for.
+- **A pause placed on the wrong queue name.** Check `list-paused` against the
+  queue you meant to freeze; a typo produces a hold on a queue nobody is
+  watching. (A name with *surrounding whitespace* is rejected with a `400`
+  rather than accepted: queue names are matched exactly, so a stray space would
+  hold a different queue than the one intended.)
+- **A shard-scoped pause left behind** after a fleet-wide one was released
+  (`shard_id` is surfaced on the read endpoint).
+- **A fleet-wide pause that only partially applied** — `effective_scope:
+  "partial_fleet"`. The shards it missed never stopped dispatching; re-issue it.
+
+### False positives
+
+- **A short, deliberate freeze during a planned dependency migration.** Expected —
+  this is why the rule uses a `for` duration rather than firing immediately.
+  Tune `for` to the longest freeze your team plans for.
+- **A pause on a genuinely idle queue.** The hold is harmless because there is
+  nothing to hold. Use the sharper alert variant in the pack
+  (`harvest_queue_paused > 0 and harvest_queue_depth > 1000`) to only fire when
+  the hold is actually accumulating a backlog.
+- **A rising `harvest_queue_depth` while this gauge is `1` is NOT a capacity
+  incident.** It is the deliberate hold working as designed. This pairing is the
+  single most common false page during an outage freeze — check this gauge
+  before escalating a backlog alert.
+- **`harvest_queue_schedule_to_start` does not spike on a thaw.** Resume credits
+  the held time back to each task's `scheduled_at`, so a queue held for six
+  hours does not report six hours of schedule-to-start latency on release. The
+  credit is measured against the live clock at release, so the time the resume
+  itself takes — waiting on its queue lock and shifting a large backlog — is
+  credited too, and does not count against any task's `schedule_to_start`. A
+  task *enqueued while the resume is running* is credited as well: the hold is in
+  force until the resume commits, so a second pass picks up those late arrivals.
+  The one residual is sub-millisecond (a row committed during that final pass's
+  own execution), far below any usable `schedule_to_start`.
+
+### Safe actions
+
+- `harvest queue list-paused` — read-only.
+- `harvest queue resume <queue>` — releases the hold. Idempotent: resuming a
+  queue that is not paused is a success no-op, so a retry after a lost response
+  is safe.
+- `harvest queue pause <queue> --reason "<why>"` — re-freezing is idempotent and
+  **preserves the original reason and operator**, so a re-pause never overwrites
+  the provenance of an existing hold.
+- Both mutating commands **exit non-zero when a fleet-wide hold only partially
+  applied** (HTTP `207`): the shards the request missed keep dispatching into the
+  outage, so a scripted `harvest queue pause` step fails loudly rather than
+  reporting success. Re-issue it — both operations are idempotent — and confirm
+  with `harvest queue list-paused` that `effective_scope` reads `fleet` rather
+  than `partial_fleet`.
+- Inspecting a held task with `harvest workflow stack <id>` or the eligibility
+  explainer (`GET /admin/queues/{queue}/eligibility`), which reports
+  `queue_paused` as the first impediment.
+
+### Escalation criteria
+
+Escalate to the team that owns the downstream dependency named in the pause
+reason. Page if the held backlog is breaching a business SLA and the dependency
+has no ETA — at that point the decision is a business one (keep holding and
+accumulate, or resume and let the work fail into the DLQ where it can be
+redriven later).
+
+---
+
+## harvest_scanner_stalled
+
+**What to do when a background control loop stops ticking:** Harvest's
+correctness in production depends on a fleet of control loops that run as
+bare spawned Tokio tasks *inside the embedder's process* — timeout
+enforcement, the soft-SLA scanner, poison-pill orphan reclaim, the external
+signal/cancel/await outboxes, the retention janitor, the schedule ticker, and
+the bounded-pause auto-resumer. If one panics, deadlocks on a poisoned
+connection, or stalls on a never-returning query, it fails **silently**: the
+work it owns simply stops happening, and every other part of the process keeps
+running normally.
+
+`harvest.scanner.tick` (issue #797) closes that blind spot. It is incremented
+**unconditionally at the end of every iteration** — including iterations that
+found no work and iterations whose pass returned an error — under a bounded
+`scanner` label. That is what makes it different from every other loop metric
+in the catalogue (`harvest.retention.deleted`,
+`harvest.schedule.fire_attempts`, the timeout/SLA/quarantine counters): those
+only emit when there *is* work, so a healthy idle loop and a dead one both read
+zero. Here, **a flat-lined series is the wedge signal.**
+
+There are seven `scanner` label values but **five** spawned loops: `sla` and
+`external_outbox` are enforcement responsibilities *inside* the `timeout` loop,
+not tasks of their own. All three are ticked together by that loop, so they
+**share one liveness fate and cannot diverge** — `timeout` healthy implies `sla`
+and `external_outbox` healthy. They keep distinct labels because they name
+distinct responsibilities, not because a divergence between them is observable.
+To attribute a *partial* pass failure to a specific sub-pass, use that pass's
+own work counters and its `tracing::error!`, not this heartbeat.
+
+| `scanner` | Loop | What silently stops |
+| --- | --- | --- |
+| `timeout` | `spawn_timeout_checker` | Activity/workflow timeouts, plus every sub-pass below |
+| `sla` | `enforce_workflow_sla_breaches` (sub-pass) | Soft-SLA breach signals (#487) |
+| `external_outbox` | external signal/cancel/await outboxes (sub-pass) | Cross-shard signal, cancel, and await delivery |
+| `poison_pill` | `spawn_poison_pill_reclaimer` | Orphaned-task reclaim after a worker crash (#367) |
+| `retention` | `RetentionRuntime::spawn` | History/audit/summary GC (#737, #752) |
+| `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
+| `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
+
+### Triage steps
+
+1. Identify the stale loop(s) without a metrics pipeline:
+   `harvest preflight --output json | jq '.checks[] | select(.name == "scanner_liveness")'`.
+   The `details.stale_scanners` array names them; `details.scanners[]` carries
+   per-loop `verdict`, `age_secs`, `tick_count`, and the
+   `staleness_threshold_secs` it was judged against.
+
+   **Point it at the right process.** The registry is in-process, so this check
+   only ever describes the process that answers it. In a split API/worker
+   topology, an API-only replica reports `scanners_registered: 0` and `pass` —
+   which is correct for *that* process and says nothing about the worker. Use
+   the metric (step 2) to find which replica went quiet, then run the check
+   there.
+2. With Prometheus, find the replica:
+   `rate(harvest_scanner_tick_total{scanner!="retention"}[5m])` — the wedged
+   loop reads `0` on the affected `instance` while its siblings and the other
+   replicas keep incrementing. Deliberately **not** `sum by (scanner)`: every
+   replica runs its own copy of all seven loops, so summing lets a healthy
+   replica mask a wedged one. Use a wider window for `retention`
+   (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`), which
+   polls hourly by default.
+3. Read the worker process logs around the time the series flat-lined. A
+   panicked loop leaves a panic backtrace; a stalled one leaves nothing at all,
+   which is itself diagnostic.
+4. Confirm the downstream symptom the loop owns, using the table above. For
+   `timeout`, look for `RUNNING` executions past their `deadline_at`; for
+   `schedule`, check `GET /admin/schedules` for overdue rows
+   (`harvest_schedule_missed_runs` usually fires alongside).
+
+### Likely causes
+
+- A panic inside the loop body that killed the spawned task while the process
+  survived.
+- A query that never returns (a lock wait with no `statement_timeout`, a
+  pathological plan on a large `harvest_events` table).
+- Deadpool connection exhaustion where the loop's `pool.get()` blocks
+  indefinitely — check the pool sizing (`harvest.pool` config) and whether a
+  hot-path caller is holding connections across an `.await`.
+- A `db` blip that poisoned the loop's connection in a way it does not recover
+  from.
+
+### False positives
+
+- **An API-only replica.** A process that runs no worker spawns no scanners.
+  It exports no `harvest_scanner_tick` series at all and its `scanner_liveness`
+  check reports `pass` with `scanners_registered: 0`. Alert on the *rate* of an
+  existing series; do **not** use `absent()`, which would fire on every
+  API-only pod.
+- **A loop polling slower than the alert window.** The loops do *not* share a
+  cadence: `timeout`/`sla`/`external_outbox` poll every 500 ms, `schedule`
+  every 1 s, `poison_pill`/`pause_auto_resume` every 5 s — but `retention`
+  polls **hourly** by default. That is why the shipped rule carries two
+  expressions with different windows; a single 5-minute window would page
+  continuously on a perfectly healthy retention janitor. Retune both if you
+  have changed `WorkerConfig::poll_interval` or the retention tick interval.
+  The preflight check needs no retuning — it derives its own threshold from
+  each loop's registered interval (`max(2 × poll_interval, 60s)`).
+- **The first minute after boot.** Most loops sleep one interval before their
+  first iteration (the schedule ticker is the exception: it runs a pass first,
+  then sleeps). The preflight check accounts for this with a grace window keyed
+  to registration time — note that for the hourly retention janitor that grace
+  is 2 hours, so a freshly booted process legitimately reports it as healthy
+  long before its first tick. A rate-based alert evaluated during startup can
+  transiently read zero. The tick series is created at **registration** time
+  (see the next bullet), so it exists from process start rather than appearing
+  only at the first tick — the boot window for a slow loop is therefore its
+  first poll interval after start, and the hourly retention expression reads
+  zero throughout hour 0–1 of a fresh process. Give the rule a `for:` of at
+  least one poll interval to ride that out.
+- **Not a false positive: a restart mid-window.** A container restart that
+  preserves the label set resets the counter to zero, but `increase()` is
+  reset-**aware** — it computes `last - first + correction`, adding the
+  pre-reset value back at each reset. A healthy retention janitor that ticked
+  at least once before the restart therefore reads `increase > 0`
+  (`3,4,5,reset,0,0 → 0 - 3 + 5 = 2`), the `== 0` side fails, and the rule cannot
+  fire; the startup gate is never even consulted. The only post-restart shape
+  that fires is one whose pre-restart samples were **flat**
+  (`5,5,5,reset,0,0 → 0 - 5 + 5 = 0`) — i.e. the janitor had already been stalled
+  for the whole window and the rule was already correctly firing. It simply
+  keeps firing, for at most one more hour, until the new process's first pass
+  proves liveness. Do **not** "fix" this with `unless resets(...[3h]) > 0`:
+  that blinds the alert for a full window after **every** deploy, hiding a
+  genuine post-restart wedge — strictly worse than prolonging a page that was
+  already true.
+- **A missing series is not an alert.** `== 0` never fires on a series that
+  does not exist. Two distinct cases:
+  - *A wedge on the very first iteration.* This is **covered**: each loop
+    initializes its own tick series at zero when it **registers**, at spawn
+    time, before the loop body runs. So a loop that panics or hangs before it
+    ever completes a pass still exports a flat series that `rate(...) == 0`
+    matches, instead of exporting nothing and staying silent forever. (The
+    `scanner_liveness` preflight check covered this case from the start —
+    registration precedes the first iteration, so the loop ages into
+    `stale`/`wedged` with `has_ticked: false`.)
+  - *The wrong metrics backend.* This is **not** covered. If your metrics come
+    from the plugin's built-in `with_metrics_scrape()` endpoint rather than the
+    `metrics-rs` adapter, no `harvest_scanner_tick` series is exported at all
+    (that endpoint bridges a deliberately narrow subset and does not back the
+    full starter pack), so the alert is silently inert. Use the `metrics-rs`
+    recorder, or rely on the preflight check.
+  `absent()` is deliberately **not** used to paper over either case: a process
+  that runs none of these loops (an API-only replica) legitimately exports no
+  series, and would page falsely forever.
+- **Graceful shutdown — the one case that needs a gate.** A draining worker
+  stops its loops on purpose. The `scanner_liveness` check is not fooled — a
+  clean stop deregisters each loop, so a process that drains its worker while
+  continuing to serve HTTP reports `pass` with `scanners_registered: 0` rather
+  than seven phantom wedged scanners. (A loop that *panics* deliberately does
+  **not** deregister, so it still ages into `wedged` — that is the signal.)
+
+  The rate-based alert has no such context. Deregistration is in-process only:
+  Prometheus counters cannot be un-exported, so a drained loop's series stays
+  in the exporter at its final value and reads `rate() == 0` forever. If the
+  process **exits** after draining, the scrape target disappears and the alert
+  resolves on its own; if it **keeps serving HTTP** after draining (a real
+  shape — `stop_harvest_runtime` leaves the API up), the alert pages
+  indefinitely for a loop that was stopped on purpose. Gate it on the process
+  still owning worker duties. The worker slot gauges are the natural signal:
+  they are sampled by the worker's own monitoring task, so they go stale and
+  then absent once it drains, while a *wedged* loop leaves them reporting
+  normally:
+
+  ```promql
+  (rate(harvest_scanner_tick_total{scanner!="retention"}[5m]) == 0)
+    and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
+  ```
+
+  Since the tick series is created at registration (see below), this also
+  covers the narrow case of a process that registers its loops and drains
+  before any of them completes a first iteration. Adapt `instance` to whatever
+  target label your scrape config uses. If your topology runs `retention` or
+  `schedule` on a process with no worker, gate those two on that process's own
+  identifying label instead — or rely on the `scanner_liveness` check, which
+  needs no gate because it knows what is registered.
+- **Not a false positive: one wedged shard.** A multi-shard worker spawns a
+  `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
+  all under one `scanner` label. Both surfaces handle this, and both have to:
+  the counter carries a bounded **`shard`** label (the shard id, or `none` for
+  the process-wide `retention`/`schedule` loops and single-shard deployments),
+  so each instance lives on its own series and `rate(...) == 0` evaluates the
+  wedged shard on its own. Without that label the instances would share one
+  series on one scrape target and a healthy shard's ticks would hold the rate
+  above zero while a sibling's loop was dead — the wedge would be **masked**,
+  not merely unlocalised. If you write your own grouping, keep `shard` for the
+  same reason you keep `instance`. A repeated entry in `shard_assignments` is
+  deduplicated at the config boundary, so a duplicate can neither spawn a
+  second set of loops against one database nor collapse two instances onto a
+  single series.
+
+  The preflight check tracks each instance separately, reports the **worst**,
+  and **names the shard** in both the summary and the per-scanner entry — plus
+  **every** stale shard in `affected_shards`, so a two-shard wedge shows both
+  rather than sending you to one database while the other stays unprotected:
+
+  ```console
+  $ harvest preflight --output json | jq '.checks[] | select(.name == "scanner_liveness")'
+  {
+    "name": "scanner_liveness",
+    "status": "fail",
+    "summary": "1 of 5 background control loops are stale: timeout (shard 1)",
+    "affected_shards": [1],
+    "details": {
+      "scanners": [
+        { "scanner": "timeout", "shard": 1, "verdict": "wedged", "age_secs": 214, ... }
+      ]
+    }
+  }
+  ```
+
+  `affected_shards` is the standard localization field every preflight check
+  shares, so the plain table view carries it too -- `harvest preflight` renders
+  it in the SCOPE column:
+
+  ```console
+  $ harvest preflight
+  STATUS  CHECK              SCOPE     SUMMARY
+  fail    scanner_liveness   shards=1  1 of 5 background control loops are stale: timeout (shard 1)
+  ```
+
+  When more than one shard is wedged, `affected_shards` carries **all** of
+  them (`shards=1,2`) while the `shard` field names the single worst instance —
+  the fold that decides the verdict picks one owner, but the blast radius must
+  not be understated. It lists only the **stale** instances, so a healthy
+  sibling shard is never reported as affected. `shard` / `affected_shards` are empty for the
+  process-wide loops (`retention`, `schedule`) and on single-shard deployments,
+  where there is no fan-out to disambiguate; the SCOPE column then reads `-`.
+
+- **Known blind spot: two runtimes on one shard in one process.** The alert
+  separates instances by `(instance, scanner, shard)`, which covers every
+  deployment shape Harvest supports — one worker process per shard, or one
+  multi-shard worker. It does **not** separate two *independently constructed*
+  runtimes (two `Worker`s, or two `RetentionRuntime`s) polling the **same**
+  shard inside one process: their ticks land on one series, so a healthy one
+  holds the rate above zero after its peer wedges and this alert stays quiet.
+
+  A per-owner metric label was rejected rather than overlooked — the registry's
+  owner ids are monotonic and never reused, so labelling by them would grow
+  without bound in any process that restarts a runtime, which is a worse bug
+  (unbounded cardinality) than the one it would fix.
+
+  The capability is not missing, only on the other surface: the registry tracks
+  those owners **separately**, so `harvest preflight` still reports the worst
+  of them and names the affected shard. If you run two runtimes of the same
+  kind in one process, treat the `scanner_liveness` check — not this alert —
+  as the authority for those scanners.
+
+### Safe actions
+
+- Restart the worker process. This is the primary remediation: the loops are
+  spawned at worker start, and Harvest's durable state means a restart re-runs
+  the enforcement that was missed with no data loss. Every pass is idempotent
+  and driven off DB state.
+- While a `timeout`/`sla` loop is wedged, nothing is lost — the deadlines are
+  persisted columns (`deadline_at`, `sla_deadline_at`) and are enforced
+  whenever the loop next runs. The same is true for the outboxes and the
+  auto-resumer.
+- A wedged `schedule` loop **does** skip firings; after restart, use
+  `POST /admin/schedules/{id}/backfill` to replay the missed window if the
+  schedule's catchup policy did not already cover it.
+- Do **not** disable the alert to silence it. Detection here is the entire
+  point: the alternative is discovering the outage through a missed SLA. If it
+  is firing on a *healthy* loop, the window is mistuned for that loop's
+  cadence — retune the window (see *False positives*), do not delete the rule.
+
+**This check gates deploys.** `scanner_liveness` participates in the overall
+`harvest preflight` verdict, and the CLI exits `2` on `warn` and `1` on `fail`.
+A stale scanner will therefore **block a pipeline** that runs `harvest preflight`
+as a gate — which is intended (deploying onto a process whose enforcement loops
+are wedged is exactly what a preflight gate is for), but is worth knowing before
+you wire the gate. See `docs/runbooks/safe-deploy.md`.
+
+### Escalation criteria
+
+Page immediately: a wedged enforcement loop is an active, ongoing correctness
+outage for the work it owns, and its blast radius grows for as long as it lasts.
+Escalate to the team owning the embedding service if a restart does not restore
+ticking, or if the loop re-wedges after restart — that indicates a
+reproducible stall (a pathological query or a connection-pool deadlock) rather
+than a one-off panic, and needs a fix rather than a bounce.
+
+## harvest_no_capable_worker
+
+**What to do when tasks are being claimed by workers that cannot run them:** any
+worker polling a queue can claim any task on it — the `SKIP LOCKED` claim query
+has no capability filter, and cannot have one (a worker can enumerate the
+handlers it *has* registered, never the ones it has not). When the claiming
+worker has no handler for that task's workflow or activity type, the engine
+**releases the claim back to `PENDING`** for a capable peer instead of terminally
+failing the execution (issue #804).
+
+That release is the benign, self-healing case and is what you will see during a
+routine rolling deploy that introduces a new workflow or activity type: for a
+window, some pods have the handler and some do not, and tasks bounce until they
+land on a new pod. Nothing is lost, and the counter reports
+`outcome="released"`.
+
+The page is `outcome="escalated"`. Each release backs the task off (capped
+exponential, 1 s doubling to 30 s) and records the releasing worker in the
+task's **distinct-miss set**; once that set would exceed
+`WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task falls
+through to the normal terminal-failure path with a stable, greppable
+`no_capable_worker:` reason. Escalation means **executions are being failed**,
+and the reason string on the execution row names *why* — read it before drawing
+any conclusion about the fleet. Only one of the two bounds that reach this
+outcome supports "no live worker here has the handler"; the other trips when
+coverage could not be confirmed at all, and a live, untried worker may well be
+capable. The cause table in triage step 4 below tells them apart. No dead-letter
+row is written on this path — the reason lives on the failed execution, so
+diagnose from `GET /api/harvest/workflows?state=FAILED`, not from the DLQ.
+
+The budget counts *distinct* workers, not total releases, precisely so that one
+incapable pod repeatedly winning the claim race cannot page you while a capable
+peer is live: a repeat miss by a worker already in the set backs off but
+consumes no budget. Reaching this page via that bound therefore means `N + 1`
+**different** workers each failed to resolve the handler.
+
+A distinct-worker count alone cannot bound a fleet **smaller** than the budget —
+one incapable pod pins the set at 1 forever. So once the registry confirms every
+live eligible worker on the queue has already missed the task, the same budget
+value bounds *total* releases too, and a single-worker fleet escalates after `N`
+releases (~31 s) rather than `10 × N`. It reports the same budget-exhausted
+reason, because the registry confirmed the same fact.
+
+That total bound requires **confirmed** coverage. If the registry cannot be read,
+`N` total releases may all have been won by the same pod — the case the distinct
+count exists to reject — so a third, deliberately generous **absolute ceiling**
+of `10 ×` the budget remains as the backstop for the two states where coverage is
+unprovable: a live worker that never missed the task, or an unreadable registry.
+It escalates with the same `escalated` outcome, and its reason string names the
+real release count and the distinct count (`spread across only D distinct
+worker(s)`) rather than the budget, so it is distinguishable in triage; see the
+four-way table in step 4.
+
+Those conclusions are sound because the task was *offered around the queue*
+first. Two escalation causes fail an execution on its **first** claim after
+**zero** releases — a `capability_miss_max_redeliveries = 0` config, and a task
+pinned to a worker session (#606) whose host lacks the handler — and for those, a
+capable worker may be live and idle the entire time. They report a **different**
+outcome value, `escalated_never_offered`, and fire the ticket-severity
+[`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
+instead. This page selects `outcome="escalated"` with an exact matcher, so if
+you are holding it, the task genuinely bounced around the queue first.
+
+**Worker-fleet contract.** All workers polling a given queue should register the
+same handler set. Harvest no longer punishes a *transient* mismatch (it is
+released and retried), but a *durable* one is still fatal, only later and with a
+much clearer reason. If you intentionally run a heterogeneous pool, give each
+handler subset its own queue rather than relying on the redelivery budget to
+route work.
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| `outcome="released"`, brief burst during a deploy | Capability skew mid-rollout | None — self-heals as the rollout completes |
+| `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Ticket — see [`harvest_capability_miss_release_sustained`](#harvest_capability_miss_release_sustained) |
+| `outcome="escalated"`, any | Budget exhausted: no capable worker exists; executions failing | Page — see *Triage steps* |
+| `outcome="escalated_never_offered"`, any | Executions failing, but released **zero** times: a `0` budget, or a session pin. Draw **no** fleet-wide conclusion | Ticket — see [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered) |
+
+Distinct from two adjacent signals, deliberately:
+
+- `harvest.task.quarantined` (issue #367, a metric — there is no quarantine
+  alert in the starter pack) counts a worker **process crash**
+  (panic/OOM/segfault). A clean "handler not registered" miss is not a crash and
+  **never** increments `crash_strikes`, so a capability miss can never trip
+  poison-pill quarantine.
+- `harvest_no_compatible_worker` (issue #171) is **build-id routing**: the
+  handler exists, but no worker with a *compatible build* is live. Capability
+  miss is the coarser condition — the handler is not registered at all.
+
+### Triage steps
+
+1. Confirm which types are affected:
+   `GET /api/harvest/admin/workflow-types/reachability` (issue #520). A verdict
+   of `orphaned` means that type has live non-terminal executions but **no**
+   registered handler anywhere in the fleet — the exact condition escalation
+   reports.
+2. Confirm the queue has any live worker at all:
+   `GET /api/harvest/admin/queue-coverage` (issue #774). An uncovered queue is
+   a different (and simpler) failure — see `harvest_queue_uncovered`.
+3. Identify which builds are actually polling the affected queue:
+   `GET /api/harvest/workers`. Compare `build_id` / `deployment_name` against
+   the build you expect to carry the new handler.
+4. Read the escalated executions:
+   `GET /api/harvest/workflows?state=FAILED` — the `error` of an escalated run
+   begins with `no_capable_worker:` and names the missing workflow/activity
+   type. **Escalation does not write a dead-letter row**: it routes through the
+   ordinary terminal-failure path (`WorkflowFailed` + the execution row's
+   `error`), which is not the DLQ. Do not look in `GET /dead-letters` for these
+   — it will be empty, and that emptiness is not evidence the alert is spurious.
+
+   **What this alert already rules out.** The redelivery budget cannot escalate
+   while the worker registry still lists a live worker on the queue that has
+   never missed this task. Before the budget may terminate a task, the workers
+   recorded as having missed it must *cover* the live fleet for its queue
+   (`harvest_workers`, using `2 × worker_heartbeat_interval` **floored at
+   120 s** — deliberately wider than the poison-pill reclaimer's window, since
+   this query judges peers whose heartbeat cadence it cannot read; at the
+   default 5 s cadence that is 120 s here against 10 s there). So "a capable pod
+   was up the whole time and simply kept losing the claim race" is not a way to
+   reach rows 1a/1b below — the only bound that can fire in that situation is
+   the absolute ceiling, which says so explicitly (row 2b).
+
+   That floor also sets how long the alert stays quiet after a pod genuinely
+   dies: for up to 120 s its row still reads as "a capable peer may exist", and
+   in that interval **both** evidence-derived bounds are withheld — the
+   fleet-covering one *and* the distinct-worker one. Only the absolute release
+   ceiling (`10 ×` the budget) can still escalate, so a task in that window
+   waits on the ceiling rather than on the configured `max_redeliveries`.
+
+   The `error` distinguishes the **four** escalation causes, which have
+   different fixes; two of them additionally state what the registry could or
+   could not confirm. **Only the first two causes reach this alert.** The other
+   two report `outcome="escalated_never_offered"` and fire the ticket-severity
+   [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
+   instead — they are listed here so that, if you arrive at a `no_capable_worker:`
+   error from a log or a support ticket rather than from this page, you can tell
+   which alert should have fired and which triage to follow:
+
+   | # | `error` says | Cause | Alert | Fix |
+   | --- | --- | --- | --- | --- |
+   | 1a | `escalated after R capability-miss redeliveries across D distinct worker(s); capability_miss_max_redeliveries = N; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler` | The budget was exhausted **and** the registry confirmed the missers cover the live fleet. The queue really was swept. `D > N` means `N + 1` distinct workers each missed it; `D ≤ N` means a fleet smaller than the budget exhausted it on total releases. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | 1b | `escalated after R capability-miss redeliveries across D distinct worker(s); capability_miss_max_redeliveries = N; the worker registry could not be used to confirm the live fleet …` | The budget was exhausted, but the claiming worker was **not listed** against this queue in `harvest_workers`, so no fleet conclusion was available. `R` can exceed `N` here — with no registry evidence a repeat miss backs off but consumes no budget, so releases accumulate until a fresh distinct worker finally exhausts it. | **This page** | Fix the registry first: check worker heartbeats (`GET /api/harvest/workers`) and that workers advertise this queue name. The handler may be fine. |
+   | 2a | `escalated after R capability-miss redeliveries spread across only D distinct worker(s), hitting the absolute release ceiling of C releases (10x capability_miss_max_redeliveries (N)) …; fewer distinct workers missed this task than the budget allows …` | The task bounced `R` times across **fewer** distinct workers than the budget allows **and fleet coverage was never established**, so neither gated bound could fire and only the ceiling was left. (A *registered* small fleet does not land here: once the registry confirms coverage, the configured-total bound escalates it at `N` — that is row 1a with `D ≤ N`.) `C` is the computed ceiling (`10 × N`), not `N`. This does **not** mean the queue was swept. | **This page** | Check those `D` workers first (step 3), *then* the fleet. See the note below. |
+   | 2b | `… hitting the absolute release ceiling …; a live worker on this queue never missed this task …` | A live worker on the queue **never missed it**, so the fleet gate withheld the budget and only the ceiling could fire. That worker may well be capable. | **This page** | Go to that worker, not the deploy: is it saturated, draining, advertising a stale queue list, or ineligible for the activity's registered `requires` labels (a legacy row with no `required_capabilities` snapshot is gated on the peer's own registry, which the fleet read cannot see)? |
+   | 3 | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Ticket: `harvest_capability_miss_never_offered` | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
+   | 4 | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Ticket: `harvest_capability_miss_never_offered` | Go to the pinned host, not the fleet. Raising the budget is a **guaranteed no-op** here. |
+
+   The matching worker log carries a `session_pinned` boolean, a
+   `distinct_incapable_workers` count, a `completed_releases` count, a
+   `fleet_evidence` field (`AllLiveWorkersMissed` / `CapablePeerMayExist` /
+   `Unavailable` — the same three states rows 1a/1b/2b are drawn from), an
+   `outcome` field holding the same value as the metric label, and (when pinned)
+   a `session_id`, so the same split is greppable in logs as well as in the
+   execution's `error`.
+
+   **Counts in the `error` are what actually happened.** `R` and `D` report the
+   *persisted* record — redeliveries that completed and workers that released.
+   The claim that escalated is not counted: it never released, so including it
+   would have you looking for a redelivery that does not exist.
+
+   **Row 2a has a second reading.** It fires when the *absolute* bound (`10 ×`
+   the budget in total releases) trips while the distinct-misser set stayed
+   within budget and the registry gave no usable answer — a worker not listed
+   against this queue, so coverage could not be confirmed. The likely cause is a
+   missing handler on the workers that actually claimed it, but it can also mean
+   a capable peer kept losing the claim race while being absent from the
+   registry. It pages anyway because the executions are failing either way and
+   under-paging a genuinely missing handler is the worse error. Losing
+   `10 × budget` consecutive races across ~25 minutes of backoff is not a
+   realistic steady state, so treat row 2a as a real handler outage first, and
+   check `distinct_incapable_workers` against `GET /api/harvest/workers` to rule
+   out the race reading. Fix the registry gap too — with a readable registry this
+   shape would have escalated at the configured budget with a much clearer
+   reason. (Row 2b is the case where the registry *did* see the peer — there,
+   start with the peer.)
+
+   If this page is firing, you are in row 1 or 2 by construction: the alert
+   selects `outcome="escalated"` with an exact matcher. Rows 3–4 are here for
+   cross-reference only.
+
+### Likely causes
+
+- A rolling deploy that introduces a new workflow or activity type is **stalled
+  or was rolled back halfway**, so the pods carrying the handler never became a
+  majority (or were removed).
+- A handler was **deleted or renamed** while in-flight executions of that type
+  still existed. `GET /admin/workflow-types/reachability` before removing a
+  handler is the pre-flight for exactly this (see
+  `docs/runbooks/safe-handler-removal.md`).
+- A **heterogeneous worker pool** shares one queue but registers different
+  handler subsets, and the capable subset is too small (or scaled to zero) for
+  the redelivery budget to find it.
+- The task's owning **worker session** (issue #606) is hard-pinned to a host
+  that lacks the handler. A session-pinned task cannot be released for a peer —
+  the pin is the point — so it escalates immediately rather than bouncing.
+  **This case is self-identifying**: its `error` says `pinned to worker session
+  {id}` and reports `0 redeliveries`, instead of naming the budget. It is the
+  one escalation where *step 1 is expected to disagree with you* —
+  `reachability` may correctly report `in_use` because a capable worker does
+  exist elsewhere in the fleet; the task simply cannot reach it. Go straight to
+  the pinned host (`GET /api/harvest/workers`, match the session's host) and ask
+  why *it* lacks the handler. Do not chase a missing deploy on the strength of
+  the `no_capable_worker:` prefix alone.
+
+### False positives
+
+- **A brief `released` burst during any deploy that adds a type is expected and
+  benign.** This paging rule therefore selects `outcome="escalated"` only. The
+  sustained-release signal is a separate, ticket-severity rule
+  ([`harvest_capability_miss_release_sustained`](#harvest_capability_miss_release_sustained))
+  that exists to catch a rollout which never finished, not one in progress.
+- A single-worker development fleet restarting mid-task will show one or two
+  `released` samples as the task is re-claimed. Harmless.
+- Escalation is **probabilistic, not exhaustive**: because releases have no
+  affinity, a task can in principle exhaust its budget on incapable workers while
+  a capable peer exists but never happened to claim it. Backoff makes this
+  progressively unlikely — each redelivery waits longer than the last (1s, 2s,
+  4s, 8s, 16s at the default budget of 5, ~31 s of total dwell; the curve caps
+  at 30 s per redelivery for larger budgets) — but if you see escalation on a
+  queue that `reachability` reports as `in_use`, that is the cause — raise
+  `capability_miss_max_redeliveries` rather than treating it as a lost handler.
+
+  This is the *only* false positive for this alert. The two other causes of an
+  escalation on an `in_use` queue — a **session-pinned** task and a **zero
+  budget**, both of which raising the budget cannot fix — no longer reach this
+  rule at all: they report `outcome="escalated_never_offered"` and fire the
+  ticket-severity
+  [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered).
+  If this page is firing, the `error` names a non-zero redelivery count, so
+  probabilistic exhaustion is the right diagnosis and raising the budget is the
+  right fix.
+
+### Safe actions
+
+- **Complete or roll back the deploy.** This is the fix in the overwhelming
+  majority of cases; the alert clears on its own once every pod polling the
+  queue registers the handler.
+- **Scale up the capable pod set** so a released task is more likely to land on
+  it within the budget.
+- **Raise the budget** (`WorkerConfig::with_capability_miss_max_redeliveries`) if
+  your rollouts legitimately take longer than the default dwell window. This
+  trades a longer time-to-detect for fewer spurious escalations; it does not
+  make a genuinely missing handler survivable.
+- **Re-run escalated executions after the fix lands.** Escalation seals the run
+  through the ordinary terminal-failure path — a `WorkflowFailed` event and a
+  `FAILED` execution row — and writes **no** dead-letter entry, so the DLQ
+  redrive routes do not apply. Recover an escalated run the way you would any
+  other terminal failure: re-start it, or fork it from history with
+  `POST /api/harvest/workflows/{id}/reset` (issue #148). Find them with
+  `GET /api/harvest/workflows?state=FAILED` and match the `no_capable_worker:`
+  prefix on `error`.
+- Do **not** set `capability_miss_max_redeliveries` to `0` to "turn the feature
+  off". `0` means *escalate on the first miss* — the pre-#804 behavior, which is
+  strictly worse during a deploy.
+
+### Escalation criteria
+
+Page immediately on any `outcome="escalated"`: executions are being terminally
+failed for a reason that is a fleet-configuration error, not a workload error,
+and every further task of that type will fail the same way until a capable
+worker appears. Escalate to the team owning the deploy if
+`GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
+supposed to be live — that indicates a handler was removed while in-flight work
+still needed it, and the executions cannot make progress until the handler is
+redeployed.
+
+## harvest_capability_miss_never_offered
+
+**A capability miss failed an execution on its FIRST claim, without ever
+offering it to a peer.** This is the ticket-severity sibling of
+[`harvest_no_capable_worker`](#harvest_no_capable_worker) for the escalations
+that carry the *opposite* conclusion. Read that section first for the mechanism.
+
+Normally a capability miss is released back to `PENDING` for a capable peer, and
+escalation only happens after the per-task redelivery budget is spent — which,
+*when the registry confirmed the missers cover the live fleet*, is real evidence
+that no live worker on that queue registers the handler. **This rule fires when
+the task was released zero times**, so not even that much is available: a capable
+worker may be live and idle on the queue the entire time.
+
+Two causes reach it, and the `no_capable_worker:` reason on the execution row
+names which:
+
+| Reason contains | Cause | Fix |
+|---|---|---|
+| `capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0)` | Redelivery is switched off, so any capability skew fails executions immediately. `0` is the documented pre-#804 fail-fast behaviour. | Raise `WorkerConfig::with_capability_miss_max_redeliveries` off `0` (default `5`). |
+| `pinned to worker session {id}` | The task is pinned to a worker session (issue #606) whose host does not register the handler. The claim gate (`session_id IS NULL OR sticky_worker_id`) means no other worker can *ever* claim it, so releasing it "for a capable peer" would be false. | Deploy the handler to the host holding that session. Raising the budget **cannot** help — the pin outranks it. |
+
+Ticket, not a page: the cause is one config knob or one task's pin, not a
+fleet-wide capability gap, and one of the two is a switch an operator
+deliberately flipped. Executions *are* failing, though, so it is not silent
+either.
+
+### Triage steps
+
+1. **Read the reason, not the fleet.** `GET /api/harvest/workflows?state=FAILED`
+   and grep `no_capable_worker:`. The parenthetical names the cause — match it
+   against the table above. These runs are **not** dead-lettered; the reason is
+   on the execution row.
+2. **Do not start from reachability here.** Unlike
+   [`harvest_no_capable_worker`](#harvest_no_capable_worker), a verdict of
+   `in_use` from `GET /api/harvest/admin/workflow-types/reachability` is the
+   **expected** answer and does not contradict this alert — the handler exists
+   somewhere, the task simply never got offered to whoever has it.
+3. For the **disabled-redelivery** cause, confirm the effective setting:
+   `GET /api/harvest/admin/config` (issue #695). If it is `0`, that is the whole
+   explanation.
+4. For the **session-pinned** cause, take the `session_id` from the reason
+   string and find its host, then check what build that host runs:
+   `GET /api/harvest/workers`.
+5. Check whether the fleet-exhaustion page is *also* firing
+   (`harvest_no_capable_worker`). If both are firing, treat that one first — it
+   is the stronger signal and the recovery is a superset.
+
+### Likely causes
+
+- **`capability_miss_max_redeliveries` was set to `0`**, usually as a rollback
+  switch during an incident where #804's release behaviour was itself suspected.
+  Every capability miss then fails an execution immediately, which is exactly
+  the pre-#804 behaviour this feature exists to remove.
+- **A worker session (#606) outlived a deploy**: the session was acquired on a
+  host that has since been left behind by a rollout, and the pinned activities
+  reference a handler that host does not have.
+- **A session was acquired on a heterogeneous pool** where only some pods
+  register the session's activity handlers.
+
+### False positives
+
+- **A deliberate `0` budget during a controlled rollback.** If an operator has
+  intentionally disabled redelivery, this alert is reporting the accepted cost
+  of that decision, not a new fault. Silence it for the duration of the rollback
+  rather than reacting to it.
+- **A single stale session at the tail of a deploy.** One pinned task failing as
+  the last old pod drains is a bounded, self-limiting event; the executions are
+  recoverable by reset and the rule clears when the session ends.
+- This rule says **nothing** about whether the queue has a capable worker. Do
+  not conclude a handler is missing fleet-wide from it — that is
+  [`harvest_no_capable_worker`](#harvest_no_capable_worker), which pages.
+
+### Safe actions
+
+- **Raise the budget off `0`** (`WorkerConfig::with_capability_miss_max_redeliveries`,
+  default `5`) once the reason for disabling it has passed. This fixes the
+  disabled-redelivery cause outright and cannot make anything worse: a task that
+  a capable peer claims is a task that never fails.
+- **Deploy the handler to the session's host** for the pinned cause, or drain
+  that host so no new sessions are acquired on it.
+- **Reset the failed executions** once a capable worker (or the pinned host) has
+  the handler: `POST /api/harvest/workflows/{id}/reset`. Escalation writes no
+  dead-letter entry, so reset — not DLQ replay — is the recovery.
+- Do **not** raise the budget expecting it to fix the *session-pinned* cause. It
+  is a provable no-op: a pinned task escalates on its first miss at any budget.
+
+### Escalation criteria
+
+Escalate to a page if `harvest_no_capable_worker` starts firing for the same
+`queue` / `task_type` — that is genuine fleet exhaustion and a different, larger
+problem. Escalate to the team owning the workflow if session-pinned escalations
+persist after the responsible host has been redeployed: a session that outlives
+its host's build indicates the session lease (issue #606) is outlasting the
+deploy cadence, which is a topology problem rather than a capability one.
+
+## harvest_capability_miss_release_sustained
+
+**What to do when capability-miss releases will not settle.** This is the
+ticket-severity sibling of [`harvest_no_capable_worker`](#harvest_no_capable_worker).
+Read that section first for the mechanism — this one covers only the
+`outcome="released"` half.
+
+A *release* is the benign outcome: a worker claimed a task whose workflow or
+activity type it has no handler for, and handed the claim straight back to
+`PENDING` for a capable peer (issue #804). No execution is failed, no event is
+appended, nothing is lost. A short burst of releases is the **expected**
+signature of a rolling deploy that introduces a new type.
+
+This rule fires only when releases are **sustained**: the released rate was
+non-zero at every step across a 15-minute window. That means the skew is not
+resolving on its own. Nothing has failed yet — but each released task pays a
+backoff interval of added latency (1 s, 2 s, 4 s, 8 s, 16 s at the default
+budget), and its per-task redelivery budget is being spent. Left alone, this
+becomes `harvest_no_capable_worker`, which pages.
+
+Ticket, not a page: work is still making progress and the fix is a deploy
+action, not an incident action.
+
+### Triage steps
+
+1. Compare builds actually polling the queue: `GET /api/harvest/workers`. Group
+   by `build_id` / `deployment_name`. The pods that lack the handler are the
+   ones to finish rolling forward or roll back.
+2. Confirm the handler exists *somewhere*:
+   `GET /api/harvest/admin/workflow-types/reachability` (issue #520). A verdict
+   of `in_use` means at least one live worker registers it, so this is genuinely
+   partial skew and not a removed handler. A verdict of `orphaned` means no
+   worker registers it at all — treat that as
+   [`harvest_no_capable_worker`](#harvest_no_capable_worker) and expect
+   escalation shortly.
+3. Confirm the queue is covered at all:
+   `GET /api/harvest/admin/queue-coverage` (issue #774). An uncovered queue is a
+   different (and simpler) failure — see `harvest_queue_uncovered`.
+4. Check the escalation counter is still flat:
+   `sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome="escalated"}[5m]))`.
+   Any non-zero value means budgets are now being exhausted and this has already
+   graduated to a page. **A zero here is not proof of zero escalations**: a
+   `(queue, task_type)` series that has never escalated is created by its first
+   escalation *already at 1*, and `increase` reports last-minus-first, so that
+   first sample reads as 0. Cross-check with the set-difference arm the alert
+   itself carries —
+   `sum by (queue, task_type) (max_over_time(harvest_task_capability_miss_total{outcome="escalated"}[5m]) unless max_over_time(harvest_task_capability_miss_total{outcome="escalated"}[1h] offset 5m))`
+   — or, authoritatively, with `GET /api/harvest/workflows?state=FAILED` filtered
+   on the `no_capable_worker:` reason, which does not depend on scrape timing at
+   all. The right-hand side is a **range**, not a bare `offset 5m`, so that a
+   scrape or remote-write outage cannot be mistaken for a newly created series:
+   it asks whether *any* sample existed in the preceding hour. A gap longer than
+   that hour will still read as new — inhibit it with an Alertmanager
+   `inhibit_rule` keyed on your own scrape-health alert (`up == 0` /
+   `TargetDown`), which is deployment-specific and therefore not in the starter
+   pack.
+
+### Likely causes
+
+- A rolling deploy that introduces a new workflow or activity type is **stalled
+  mid-rollout** — paused, blocked on a failing readiness probe, or waiting on a
+  manual promotion gate.
+- A deploy was **rolled back halfway**, leaving a mixed fleet where the capable
+  pods were removed but the tasks they created remain.
+- A **heterogeneous worker pool** shares one queue but registers different
+  handler subsets. This is a standing misconfiguration, not a transient one:
+  give each handler subset its own queue instead of relying on redelivery to
+  route work.
+- The **capable pod set is too small** relative to the incapable one, so a
+  released task usually lands on another incapable worker. Releases stay
+  non-zero even though the fleet is technically capable.
+
+### False positives
+
+- **A deploy that legitimately takes longer than 15 minutes** — a large fleet, a
+  slow canary soak, or a deliberately staged rollout — will hold this rule true
+  for the duration and clear on its own. Correlate against the rollout's own
+  progress before acting.
+- A **queue that is intentionally heterogeneous** and whose owners have accepted
+  the latency cost will keep this rule permanently true. That is a real standing
+  cost, not a false alarm — split the queue or silence the rule for it
+  deliberately.
+- This rule says nothing about failure. If it is firing and
+  `harvest_no_capable_worker` is not, **no execution has been failed**.
+
+### Safe actions
+
+- **Complete or roll back the deploy.** This is the fix in the overwhelming
+  majority of cases; the rule clears once every pod polling the queue registers
+  the handler.
+- **Scale up the capable pod set** so a released task is more likely to land on
+  it before its budget runs out.
+- **Split the queue** if the pool is intentionally heterogeneous: give each
+  handler subset its own queue. This removes the class of problem rather than
+  tuning around it.
+- **Raise the budget** (`WorkerConfig::with_capability_miss_max_redeliveries`) if
+  your rollouts legitimately outlast the default dwell window. This buys time
+  before escalation; it does not reduce the release rate this rule measures.
+- Do **not** silence this by removing the released outcome from the metric — it
+  is the only signal that distinguishes "deploying" from "broken" before
+  executions start failing.
+
+### Escalation criteria
+
+Escalate to a page if `harvest_no_capable_worker` starts firing for the same
+`queue` / `task_type`: budgets are now being exhausted and executions are being
+terminally failed. Escalate to the team owning the deploy if
+`GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
+supposed to be live — a handler was removed while in-flight work still needed
+it, and those executions cannot make progress until it is redeployed.

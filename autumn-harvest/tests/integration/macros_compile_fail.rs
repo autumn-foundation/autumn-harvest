@@ -35,5 +35,17 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/rate_limit_missing_rps.rs");
     t.compile_fail("tests/compile_fail/rate_limit_flat_and_nested.rs");
     t.compile_fail("tests/compile_fail/rate_limit_key_reserved_prefix.rs");
+    t.compile_fail("tests/compile_fail/dag_invalid_execution_timeout.rs");
+    t.compile_fail("tests/compile_fail/dag_invalid_sla.rs");
+    t.compile_fail("tests/compile_fail/dag_unsupported_attribute.rs");
+    t.compile_fail("tests/compile_fail/concurrency_invalid_on_conflict.rs");
+    t.compile_fail("tests/compile_fail/workflow_blank_dependency_name.rs");
+    t.compile_fail("tests/compile_fail/workflow_invalid_dependency_entry.rs");
+    t.compile_fail("tests/compile_fail/workflow_dependency_string_container.rs");
+    t.compile_fail("tests/compile_fail/workflow_dependency_paren_container.rs");
+    t.compile_fail("tests/compile_fail/workflow_duplicate_dependency_attr.rs");
+    t.compile_fail("tests/compile_fail/workflow_unsupported_attribute.rs");
+    // Issue #940 AC2: an unknown chaos injection-point name is a compile error.
+    t.compile_fail("tests/compile_fail/chaos_unknown_point_is_compile_error.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

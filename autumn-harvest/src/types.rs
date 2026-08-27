@@ -274,6 +274,107 @@ impl FromStr for ExecutionId {
     }
 }
 
+/// A target for an in-workflow external-signal/cancel request (issue #751).
+///
+/// Two addressing modes:
+///
+/// - [`ExternalTarget::ExecutionId`] — a specific, immutable execution. Once
+///   that execution reaches a terminal state, it stays terminal forever; this
+///   is the pre-#751 addressing mode (`ctx.signal_external_workflow`,
+///   `ctx.request_cancel_external_workflow`, issue #492).
+/// - [`ExternalTarget::WorkflowId`] — a stable `(workflow_name, workflow_id)`
+///   business key, resolved to whichever run is *current* **at delivery
+///   time** (not at request time), so a continuation started between request
+///   and delivery is the one that receives the signal/cancel.
+///
+/// ## Wire format
+///
+/// Serialized with `#[serde(untagged)]` so a bare `ExecutionId` target
+/// round-trips as a plain UUID string — byte-for-byte identical to every
+/// `ExternalSignalRequested`/`ExternalCancelRequested` event stored before
+/// this feature shipped. A `WorkflowId` target serializes as a JSON object
+/// (`{"workflow_name": ..., "workflow_id": ...}`), which can never be
+/// confused with a bare UUID string, so there is no deserialization
+/// ambiguity between the two variants regardless of declaration order.
+///
+/// ## Extending this enum
+///
+/// `#[serde(untagged)]` tries each variant's `Deserialize` impl in
+/// declaration order until one succeeds, with no discriminator field to
+/// disambiguate. The current two variants are safe because their wire shapes
+/// are structurally disjoint (bare string vs. JSON object). **A future third
+/// addressing mode must preserve that disjointness** — its wire shape must
+/// not be satisfiable by a bare UUID string *or* by an object carrying
+/// exactly `workflow_name`/`workflow_id` string fields (a superset/subset
+/// overlap would either mis-route to the wrong variant or fail
+/// deserialization with a misleading "expected type" error naming the wrong
+/// variant). Any new variant must ship with a round-trip test proving no
+/// collision with the existing two, not just a variant-local test.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::{ExecutionId, ExternalTarget};
+///
+/// let by_exec: ExternalTarget = ExecutionId::new().into();
+/// let by_id = ExternalTarget::from_workflow_id("order_flow", "order-42");
+/// assert_ne!(by_exec, by_id);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExternalTarget {
+    /// A specific, immutable execution.
+    ExecutionId(ExecutionId),
+    /// A stable business key, resolved to the current run at delivery time.
+    WorkflowId {
+        /// The registered workflow type name.
+        workflow_name: String,
+        /// The caller-supplied business identifier.
+        workflow_id: String,
+    },
+}
+
+impl ExternalTarget {
+    /// Builds a business-key target from a workflow type name and business
+    /// identifier.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::types::ExternalTarget;
+    ///
+    /// let target = ExternalTarget::from_workflow_id("order_flow", "order-42");
+    /// ```
+    #[must_use]
+    pub fn from_workflow_id(
+        workflow_name: impl Into<String>,
+        workflow_id: impl Into<String>,
+    ) -> Self {
+        Self::WorkflowId {
+            workflow_name: workflow_name.into(),
+            workflow_id: workflow_id.into(),
+        }
+    }
+}
+
+impl From<ExecutionId> for ExternalTarget {
+    fn from(id: ExecutionId) -> Self {
+        Self::ExecutionId(id)
+    }
+}
+
+impl fmt::Display for ExternalTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExecutionId(id) => write!(f, "{id}"),
+            Self::WorkflowId {
+                workflow_name,
+                workflow_id,
+            } => write!(f, "{workflow_name}:{workflow_id}"),
+        }
+    }
+}
+
 /// Unique identifier for a single activity execution attempt.
 ///
 /// ## Examples
@@ -901,6 +1002,10 @@ pub enum StartSource {
     CompletionTrigger,
     /// Started by an inbound webhook delivery.
     Webhook,
+    /// Started by a broker event-source connector consuming a message from a
+    /// topic/queue (issue #944) — Kafka, SQS, or any adapter built on the
+    /// same broker-agnostic binding layer.
+    Broker,
     /// Spawned as a child workflow (awaited or detached).
     Child,
     /// Started via the batch-start API.
@@ -909,8 +1014,17 @@ pub enum StartSource {
     ContinueAsNew,
     /// A reset-fork run.
     Reset,
+    /// An operator re-run of a terminal run from its recorded start
+    /// parameters (issue #777). Distinct from [`Self::Reset`], which forks an
+    /// execution mid-history; a re-run starts the whole workflow over.
+    Rerun,
     /// Started by the cross-shard outbox dispatcher.
     Outbox,
+    /// Started atomically on a caller-owned Diesel connection/transaction via
+    /// [`crate::handle::WorkflowHandleClient::start_workflow_transactional`]
+    /// (issue #763), so the run commits or rolls back together with the
+    /// caller's own domain write.
+    Transactional,
     /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
     /// stored value). This is the default.
     #[default]
@@ -932,11 +1046,14 @@ impl StartSource {
             Self::UpdateWithStart => "update_with_start",
             Self::CompletionTrigger => "completion_trigger",
             Self::Webhook => "webhook",
+            Self::Broker => "broker",
             Self::Child => "child",
             Self::Batch => "batch",
             Self::ContinueAsNew => "continue_as_new",
             Self::Reset => "reset",
+            Self::Rerun => "rerun",
             Self::Outbox => "outbox",
+            Self::Transactional => "transactional",
             Self::Unknown => "unknown",
         }
     }
@@ -956,11 +1073,14 @@ impl StartSource {
             "update_with_start" => Self::UpdateWithStart,
             "completion_trigger" => Self::CompletionTrigger,
             "webhook" => Self::Webhook,
+            "broker" => Self::Broker,
             "child" => Self::Child,
             "batch" => Self::Batch,
             "continue_as_new" => Self::ContinueAsNew,
             "reset" => Self::Reset,
+            "rerun" => Self::Rerun,
             "outbox" => Self::Outbox,
+            "transactional" => Self::Transactional,
             _ => Self::Unknown,
         }
     }
@@ -1406,6 +1526,87 @@ mod tests {
         assert_eq!(ShardId::new(7).to_string(), "7");
     }
 
+    // ── ExternalTarget (issue #751) ───────────────────────────────────
+
+    #[test]
+    fn external_target_from_execution_id_round_trips_json_as_bare_uuid() {
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(3));
+        let target = ExternalTarget::ExecutionId(exec_id);
+        let json = serde_json::to_value(&target).unwrap();
+        // Backward compatibility: this MUST serialize identically to a bare
+        // `ExecutionId` (a plain UUID string), matching every pre-#751
+        // stored `ExternalSignalRequested`/`ExternalCancelRequested` event.
+        assert_eq!(json, serde_json::to_value(exec_id).unwrap());
+        assert!(json.is_string());
+        let round_tripped: ExternalTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, target);
+    }
+
+    #[test]
+    fn external_target_deserializes_pre_751_bare_uuid_json_as_execution_id() {
+        // Simulates a stored event from before this feature shipped: the
+        // `target` field was a bare UUID string.
+        let exec_id = ExecutionId::new();
+        let stored_json = serde_json::Value::String(exec_id.to_string());
+        let target: ExternalTarget = serde_json::from_value(stored_json).unwrap();
+        assert_eq!(target, ExternalTarget::ExecutionId(exec_id));
+    }
+
+    #[test]
+    fn external_target_workflow_id_round_trips_json_as_object() {
+        let target = ExternalTarget::from_workflow_id("order_flow", "order-42");
+        let json = serde_json::to_value(&target).unwrap();
+        assert!(
+            json.is_object(),
+            "WorkflowId target must serialize as a JSON object, got {json}"
+        );
+        assert_eq!(json["workflow_name"], "order_flow");
+        assert_eq!(json["workflow_id"], "order-42");
+        let round_tripped: ExternalTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, target);
+    }
+
+    #[test]
+    fn external_target_from_execution_id_conversion() {
+        let exec_id = ExecutionId::new();
+        let target: ExternalTarget = exec_id.into();
+        assert_eq!(target, ExternalTarget::ExecutionId(exec_id));
+    }
+
+    #[test]
+    fn external_target_display_distinguishes_variants() {
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(1));
+        let by_exec = ExternalTarget::ExecutionId(exec_id);
+        assert_eq!(by_exec.to_string(), exec_id.to_string());
+
+        let by_id = ExternalTarget::from_workflow_id("order_flow", "order-42");
+        let display = by_id.to_string();
+        assert!(display.contains("order_flow"));
+        assert!(display.contains("order-42"));
+    }
+
+    #[test]
+    fn external_target_equality_distinguishes_addressing_modes() {
+        let exec_id = ExecutionId::new();
+        let by_exec = ExternalTarget::ExecutionId(exec_id);
+        let by_id = ExternalTarget::from_workflow_id("wf", exec_id.to_string());
+        assert_ne!(
+            by_exec, by_id,
+            "an ExecutionId target must never equal a WorkflowId target even if their string forms overlap"
+        );
+    }
+
+    #[test]
+    fn external_target_workflow_id_equality_is_by_name_and_id() {
+        let a = ExternalTarget::from_workflow_id("order_flow", "order-42");
+        let b = ExternalTarget::from_workflow_id("order_flow", "order-42");
+        let different_name = ExternalTarget::from_workflow_id("other_flow", "order-42");
+        let different_id = ExternalTarget::from_workflow_id("order_flow", "order-99");
+        assert_eq!(a, b);
+        assert_ne!(a, different_name);
+        assert_ne!(a, different_id);
+    }
+
     #[test]
     fn execution_id_from_uuid_preserves_shard_bits() {
         let source = ExecutionId::new_for_shard(ShardId::new(9));
@@ -1578,7 +1779,9 @@ mod tests {
             StartSource::Batch,
             StartSource::ContinueAsNew,
             StartSource::Reset,
+            StartSource::Rerun,
             StartSource::Outbox,
+            StartSource::Transactional,
             StartSource::Unknown,
         ];
         for src in all {
@@ -1611,6 +1814,7 @@ mod tests {
             StartSource::SignalWithStart,
             StartSource::CompletionTrigger,
             StartSource::ContinueAsNew,
+            StartSource::Transactional,
             StartSource::Unknown,
         ];
         for src in cases {

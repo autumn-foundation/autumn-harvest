@@ -1224,7 +1224,7 @@ fn is_ident_preceded_by_fn(bytes: &[u8], start: usize) -> bool {
 /// returns the byte index just past the matching balanced `>` (accounting for
 /// nested generics like `::<Vec<u8>>`), or `None` if unbalanced. Used to skip an
 /// optional turbofish between an ident and its call `(` (#778, Codex P2).
-fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
+const fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut k = open_lt;
     while k < bytes.len() {
@@ -1359,7 +1359,7 @@ fn collect_body_let_binding_lines(
 /// is the point at which the binding enters scope, so a same-line call before it
 /// (the `let`'s own RHS, incl. a self-referencing `let x = x();`) is not
 /// suppressed, while a same-line call after it is.
-fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
+const fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
     let bytes = code.as_bytes();
     let mut depth: i32 = 0;
     let mut k = let_pos;
@@ -2090,7 +2090,7 @@ fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Opt
 /// Recognized shapes (all → `true`):
 /// `name(`, `name (`, `name::<T>(`, `name::<_, _> (`, `name::<Vec<Box<T>>>(`.
 /// Anything else after the name (`.`, `::foo`, `,`, end of segment) → `false`.
-fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
+const fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
     let mut i = after_name;
     // Optional whitespace before an (optional) turbofish.
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -2623,17 +2623,11 @@ fn det010_loop_body_has_command(
 
 // ── Lexer helpers ─────────────────────────────────────────────────────────────
 
-/// Returns the portion of `line` that precedes the first `//` (if any).
-/// This avoids flagging patterns that appear only inside comments.
-fn strip_line_comment(line: &str) -> &str {
-    line_comment_start(line).map_or(line, |pos| &line[..pos])
-}
-
 /// Returns the byte position immediately after the closing `*/` of a block
 /// comment, scanning from `start` (the position right after the opening `/*`).
 /// Returns `line.len()` if the comment is not closed on this line.
 /// Nested block comments are not supported.
-fn block_comment_end(line: &str, start: usize) -> usize {
+const fn block_comment_end(line: &str, start: usize) -> usize {
     let bytes = line.as_bytes();
     let mut pos = start;
     while pos < bytes.len() {
@@ -2841,26 +2835,52 @@ fn raw_string_end(line: &str, start: usize) -> Option<usize> {
 /// Returns a copy of `line` with string literal and char literal content removed
 /// and everything from the first `//` comment stripped.
 /// This prevents pattern matches inside string data or comments.
+///
+/// Fused single pass: this used to be `strip_line_comment(line)` (which itself
+/// scans the whole line via `line_comment_start`, skipping over string/char/
+/// raw-string/block-comment regions to find the first bare `//`) followed by a
+/// *second*, separate character-by-character walk over that already-truncated
+/// text to strip string/char-literal content and block comments. Both walks
+/// classify every character with the exact same skip-region logic
+/// (`raw_string_end` / `normal_string_end` / `char_literal_end` /
+/// `block_comment_end`), so scanning twice was pure duplicated work -- and
+/// this function is the innermost per-line hot path of `extract_all_functions`
+/// (called on essentially every module-scaffolding line of a scanned source
+/// tree). Equivalence: `line_comment_start`'s skip-region decisions for a
+/// prefix `line[..p]` are identical to this loop's decisions over that same
+/// prefix (both start scanning at position 0 and use the same classifiers), so
+/// stopping this loop the instant a bare `//` is found reproduces exactly what
+/// two-pass `strip_line_comment(line)` then re-scan would have produced. See
+/// `docs/performance-det-check.md`.
 fn strip_unparseable_content(line: &str) -> String {
-    let code = strip_line_comment(line);
-    let mut result = String::with_capacity(code.len());
+    // `result.len()` can never exceed `line.len()` (every push consumes one
+    // char of `line`; every skip region only removes bytes), so this is a
+    // tight-enough upper bound that guarantees zero reallocation during the
+    // loop below, without re-deriving the (now-removed) comment-truncated
+    // length via a second scan.
+    let mut result = String::with_capacity(line.len());
     let mut pos = 0;
 
-    while pos < code.len() {
-        if let Some(end) = raw_string_end(code, pos) {
+    while pos < line.len() {
+        if let Some(end) = raw_string_end(line, pos) {
             pos = end;
             continue;
         }
 
-        let Some((ch, next_pos)) = next_char(code, pos) else {
+        let Some((ch, next_pos)) = next_char(line, pos) else {
             break;
         };
 
         match ch {
-            '"' => pos = normal_string_end(code, pos),
-            '\'' => pos = char_literal_end(code, pos).unwrap_or(next_pos),
-            '/' if code[next_pos..].starts_with('*') => {
-                pos = block_comment_end(code, next_pos + 1);
+            '"' => pos = normal_string_end(line, pos),
+            '\'' => pos = char_literal_end(line, pos).unwrap_or(next_pos),
+            // A bare `//` (not inside a string/char/raw-string literal, which
+            // are all handled above before this match is even reached) ends
+            // the line -- nothing after it is ever part of the result, so stop
+            // rather than keep scanning content that would be discarded anyway.
+            '/' if line[next_pos..].starts_with('/') => break,
+            '/' if line[next_pos..].starts_with('*') => {
+                pos = block_comment_end(line, next_pos + 1);
             }
             _ => {
                 result.push(ch);

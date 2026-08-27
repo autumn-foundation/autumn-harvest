@@ -137,6 +137,23 @@ diesel::table! {
         /// Optional human/operator attribution for the start (issue #740).
         /// NULL when absent.
         started_by -> Nullable<Text>,
+        /// Wall-clock the operator early-warning soft threshold was first
+        /// crossed for this execution's recorded history size (issue #704).
+        /// NULL = not yet warned. Guarded exactly-once via
+        /// `UPDATE ... WHERE history_bloat_warned_at IS NULL`. Never read on
+        /// replay; never set at insert time (always starts NULL).
+        history_bloat_warned_at -> Nullable<Timestamptz>,
+        /// Operator-mutable free-text triage note (issue #759). Set/updated/
+        /// cleared at any point in an execution's life via
+        /// `PATCH /workflows/{id}/triage`. NULL = no note. Metadata only --
+        /// never read on replay, never appends a `WorkflowEvent`.
+        triage_note -> Nullable<Text>,
+        /// Resolved per-tenant quota key (issue #946). Set at INSERT time from
+        /// `QuotaPolicy::key_expr` resolved against the start input; NULL when
+        /// the workflow type has no declared `QuotaPolicy` or the key could not
+        /// be resolved from the input. Never read on replay -- purely an
+        /// admission-time bookkeeping column backing the quota usage counts.
+        quota_key -> Nullable<Text>,
     }
 }
 
@@ -218,6 +235,26 @@ diesel::table! {
         /// expires, since the session's local state only exists on that one
         /// worker.
         session_id -> Nullable<Uuid>,
+        /// Consecutive claims by workers with no handler registered for this
+        /// task's type (issue #804). Incremented by
+        /// `queue::release_task_for_capability_miss` when a worker releases a
+        /// task it cannot run so a capable peer can claim it; reset to 0 by
+        /// every path that proves the claiming worker WAS capable. Bounds the
+        /// bounce: at `WorkerConfig::capability_miss_max_redeliveries` the task
+        /// escalates to the terminal-failure path with a `no_capable_worker:`
+        /// reason. Deliberately separate from `attempt` (retry budget) and
+        /// `crash_strikes` (poison-pill quarantine).
+        capability_misses -> Int4,
+        /// Issue #804: the DISTINCT worker ids that have missed this task. The
+        /// redelivery budget is consumed per entry, so one incapable worker
+        /// repeatedly winning the claim race cannot exhaust it.
+        capability_miss_workers -> Array<Text>,
+        /// Issue #804 (round 46): WHICH handler the two counters above are
+        /// about, as `{kind}:{name}`. The counters describe one frontier, and
+        /// a frontier is identified by the single handler that would move it;
+        /// a mismatch means the evidence belongs to a frontier now behind us.
+        /// `NULL` = none recorded yet, which reads as a mismatch.
+        capability_miss_handler -> Nullable<Text>,
     }
 }
 
@@ -376,6 +413,13 @@ diesel::table! {
         failed_at -> Timestamptz,
         owner -> Nullable<Text>,
         severity -> Nullable<Text>,
+        /// Denormalized workflow type name (issue #946), mirroring the
+        /// owner/severity precedent so quota accounting never depends on the
+        /// originating execution row still existing.
+        workflow_name -> Nullable<Text>,
+        /// Denormalized resolved quota key (issue #946). NULL when the
+        /// originating workflow type had no declared `QuotaPolicy`.
+        quota_key -> Nullable<Text>,
     }
 }
 
@@ -565,6 +609,17 @@ diesel::table! {
         last_refilled_at -> Timestamptz,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// TTL'd operator override (issue #945). `NULL` = no override refill
+        /// rate declared; falls back to `refill_rate` while an override is
+        /// active.
+        override_refill_rate -> Nullable<Double>,
+        /// TTL'd operator override (issue #945). `NULL` = no override burst
+        /// declared; falls back to `burst` while an override is active.
+        override_burst -> Nullable<Double>,
+        /// The override is active while this is set and in the future; once
+        /// it elapses every consumer reverts to the declared baseline with no
+        /// operator action or background sweeper needed (issue #945).
+        override_expires_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -907,6 +962,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable per-execution workflow log lines (issue #790). One row per
+    /// author-emitted `ctx.logger()` / `ctx.log_*` line, written only during
+    /// LIVE execution (the logger no-ops on replay) by the opt-in durable sink.
+    ///
+    /// Observational only: these rows are NOT part of `harvest_events`, carry no
+    /// determinism guarantee, and are never read back into workflow logic.
+    /// `seq` is the deterministic logical-position identity that both orders the
+    /// lines and dedups a re-driven decision cycle.
+    harvest_workflow_logs (id) {
+        id               -> Int8,
+        workflow_exec_id -> Uuid,
+        seq              -> Int8,
+        level            -> Text,
+        message          -> Text,
+        occurred_at      -> Timestamptz,
+    }
+}
+
+diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -941,4 +1019,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_wasm_modules,
     harvest_mutex_locks,
     harvest_mutex_waiters,
+    harvest_workflow_logs,
 );

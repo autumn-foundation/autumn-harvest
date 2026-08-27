@@ -169,6 +169,9 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .view-toggle a{color:#93c5fd;text-decoration:none}
 .view-toggle a:hover{background:#1e293b}
 .view-toggle span.active{background:#2563eb;color:#fff;font-weight:600}
+.log-filters a{color:#93c5fd;text-decoration:none;padding:2px 8px;border-radius:4px}
+.log-filters a:hover{background:#1e293b}
+.log-filters a.active{background:#2563eb;color:#fff;font-weight:600}
 .summary-stats{display:flex;gap:18px;flex-wrap:wrap;margin:0 0 16px;font-size:13px;color:#94a3b8}
 .summary-stats strong{color:#e2e8f0}
 .summary-stats .note{color:#fbbf24}
@@ -267,6 +270,10 @@ pub(crate) struct WorkflowDetailParams {
     /// Jump to the page containing this 1-based event number.
     #[serde(default)]
     jump_event: Option<i64>,
+    /// Level filter for the durable workflow-logs panel (issue #790):
+    /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
+    #[serde(default)]
+    log_level: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +328,15 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
+    /// The replay-derived open-awaitables report (issue #615) — the SAME
+    /// report `GET /workflows/{id}/awaitables` serves (built by
+    /// `crate::api::build_awaitables_report`), so the UI panel and the API can
+    /// never disagree about what the run is parked on. Unlike the side-table
+    /// lists above it also names awaited-but-UNSENT signals, pending child
+    /// workflows, and `await_condition` parks. `None` for terminal executions
+    /// or when the report could not be built (best-effort — the page still
+    /// renders the side-table inventory).
+    awaitables: Option<crate::api::WorkflowAwaitablesResponse>,
     /// Default response-side byte cap applied to a pending activity's heartbeat
     /// checkpoint payload before rendering (global #252 activity-result cap,
     /// #503). `0` = uncapped. Used when no per-activity override applies.
@@ -778,6 +794,23 @@ async fn dag_detail_ui(
         let timestamped = autumn_harvest::store::load_history_with_timestamps(&mut conn, exec_id)
             .await
             .map_err(map_error)?;
+        // No further DB reads: release the pool slot before any payload-store
+        // fetch, then decode so the issue #780 compensation filter inside
+        // `build_run_graph` sees real payloads rather than opaque codec /
+        // offload envelopes. Shared with the #690 API handler so the two
+        // surfaces can never disagree. See `api::decode_graph_history`.
+        drop(conn);
+        let runtime = api_state.runtime().map_err(map_error)?;
+        let codecs = api_state.payload_codecs();
+        let offloader = runtime.registry().payload_offloader();
+        let timestamped = crate::api::decode_graph_history(
+            timestamped,
+            exec_id,
+            &codecs,
+            offloader,
+            "dag detail UI",
+        )
+        .await;
         let nodes = build_run_graph(&dag.definition, &timestamped, &execution.state);
         Some((nodes, execution.state))
     } else {
@@ -1300,17 +1333,120 @@ async fn workflow_detail_ui(
     // since those panels never render payload fields (PR #936 review).
     let mut execution = execution;
     let mut page_events = page_events;
+    let session = extension_session(maybe_session);
     decode_and_audit_workflow_detail(
         &api_state,
         &mut conn,
         &headers,
-        extension_session(maybe_session),
+        session.clone(),
         exec_id,
         &mut execution,
         &mut page_events,
         &mut blocked_on,
     )
     .await;
+
+    // Open-awaitables diagnostic (issue #615): re-source the blocked-on panel
+    // from the SAME replay-derived report `GET /workflows/{id}/awaitables`
+    // serves, so the UI and the API can never disagree about why a run is
+    // parked. Gated on harvest-admin access to mirror the API route's
+    // `require_admin` posture (the #608 `read_path_decoder` pattern in this
+    // same handler) — a non-admin principal sees the side-table panels only,
+    // never the replay-derived report the API would deny them. Best-effort: a
+    // failure degrades to the side-table panels rather than failing the page,
+    // with a warn so a persistent failure is diagnosable. The pooled
+    // connection is dropped first so the report's own connection checkout
+    // never overlaps ours (pool-size-1 safety).
+    // Durable per-execution author log lines (issue #790, AC5). Admin-gated to
+    // mirror `GET /workflows/{id}/logs`'s `require_admin` posture — a non-admin
+    // principal must not read through the UI what the API would deny them.
+    // Loaded on the page's own connection before it is dropped. Best-effort: a
+    // failure hides the panel rather than failing the page (logs are
+    // observational, AC7), with a warn so a persistent failure is diagnosable.
+    let logs_admin = crate::api::has_harvest_admin_access(&api_state, session.clone()).await;
+    let log_level_filter =
+        autumn_harvest::WorkflowLogLevel::from_wire(params.log_level.as_deref().unwrap_or(""));
+    let mut log_read_failed = false;
+    let mut log_truncated = false;
+    let log_lines: Vec<autumn_harvest::models::HarvestWorkflowLog> = if logs_admin {
+        let level_refs: Vec<&str> = log_level_filter
+            .map(autumn_harvest::WorkflowLogLevel::as_str)
+            .into_iter()
+            .collect();
+        // Probe for the cap marker DIRECTLY rather than scanning the page. The
+        // marker sits at `seq = i64::MAX` so it sorts last, and this panel loads
+        // only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- under the default
+        // 1,000-line cap a truncated run's marker can never land in a 200-row
+        // page, so a scan would report "not truncated" for exactly the runs that
+        // dropped the most. Mirrors the API route's own filter-independent probe.
+        match autumn_harvest::store::load_workflow_logs(
+            &mut conn,
+            exec_id,
+            &autumn_harvest::store::WorkflowLogQuery {
+                after_seq: Some(autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(rows) => log_truncated = !rows.is_empty(),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: durable log truncation probe failed"
+                );
+                log_read_failed = true;
+            }
+        }
+        match autumn_harvest::store::load_workflow_logs(
+            &mut conn,
+            exec_id,
+            &autumn_harvest::store::WorkflowLogQuery {
+                levels: &level_refs,
+                limit: WORKFLOW_LOG_PANEL_LIMIT,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                // Best-effort: never fail the page over an observational read.
+                // But surface it AS a failure -- the empty state otherwise
+                // affirmatively claims the sink is disabled, which during an
+                // incident is the opposite of what happened.
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: durable log read failed"
+                );
+                log_read_failed = true;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    drop(conn);
+    if !is_terminal_workflow_state(&execution.state)
+        && crate::api::has_harvest_admin_access(&api_state, session).await
+    {
+        blocked_on.awaitables = match crate::api::build_awaitables_report(&api_state, exec_id).await
+        {
+            Ok(report) => Some(report),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: awaitables report failed; falling back to side tables"
+                );
+                None
+            }
+        };
+    }
 
     Ok(render_workflow_detail(
         &execution,
@@ -1324,6 +1460,13 @@ async fn workflow_detail_ui(
         &blocked_on,
         params.flash.as_deref(),
         continue_as_new_threshold,
+        &WorkflowLogsPanelData {
+            lines: &log_lines,
+            level_filter: log_level_filter,
+            admin: logs_admin,
+            truncated: log_truncated,
+            read_failed: log_read_failed,
+        },
     ))
 }
 
@@ -1419,6 +1562,7 @@ async fn load_blocked_on_data(
             signals: vec![],
             heartbeat_details_cap,
             heartbeat_caps: std::collections::HashMap::new(),
+            awaitables: None,
         });
     }
 
@@ -1486,6 +1630,7 @@ async fn load_blocked_on_data(
         signals,
         heartbeat_details_cap,
         heartbeat_caps: std::collections::HashMap::new(),
+        awaitables: None,
     })
 }
 
@@ -1870,6 +2015,7 @@ async fn reset_workflow_ui(
         operator_id: actor.clone(),
         signal_reapply: ResetSignalReapplyPolicy::default(),
         allow_terminal_source: false,
+        refuse_erased_source: false,
     };
 
     let runtime = api_state.runtime().ok();
@@ -2364,6 +2510,10 @@ async fn list_workers_ui(
     // state regardless of the active UI filter.
     let shard_results = load_workers_from_shards(&pool, None, stale_threshold).await;
 
+    // Issue #619: paused queues are the most likely explanation for idle
+    // workers alongside a full queue, so surface them on the fleet page.
+    let paused_queues = load_paused_queues_from_shards(&api_state).await;
+
     let stats = compute_fleet_stats(&shard_results);
     let banner_state = determine_banner_state(&stats);
     let is_multi_shard = shard_results.len() > 1;
@@ -2432,6 +2582,7 @@ async fn list_workers_ui(
     Ok(render_workers_page(
         &stats,
         banner_state,
+        &paused_queues,
         &grouped,
         &shard_errors,
         is_multi_shard,
@@ -2472,6 +2623,324 @@ fn parse_worker_ui_filters(
         }
     };
     Ok((status_filter, stale_only))
+}
+
+/// A paused queue as rendered on the Workers page, merged across shards.
+///
+/// Issue #619: an operator queue pause is the single most likely explanation
+/// for "workers are idle but the queue is full", so it is surfaced on the
+/// fleet page an operator lands on during exactly that incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PausedQueueBannerRow {
+    pub queue_name: String,
+    pub reason: String,
+    pub paused_by: String,
+    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub scope_shard_id: Option<i32>,
+    pub held_task_count: i64,
+    /// False when the shards holding this queue disagree on
+    /// `(reason, paused_by, scope_shard_id)` — the displayed provenance then
+    /// describes only part of the fleet and the banner says so.
+    pub provenance_uniform: bool,
+    /// What the hold **actually** covers, derived from the shards that hold it
+    /// versus the expected shard set — not from the stored `scope_shard_id`,
+    /// which records only the intent of the request that wrote each row.
+    pub coverage: autumn_harvest::queue_pause::PauseCoverage,
+}
+
+/// Outcome of the Workers-page paused-queue scan: the merged banner rows plus
+/// the shards whose pause state could not be read at all.
+///
+/// Issue #619 review: a shard whose connection or pause read fails contributes
+/// **no rows**, which is indistinguishable from "that shard is not holding
+/// anything". For *coverage classification* that is the safe reading (a
+/// not-holding shard makes the hold `partial_fleet`, i.e. possibly still
+/// dispatching). For *presence* it is not safe at all: a hold that exists
+/// **only** on an unread shard vanishes from the banner entirely, so an
+/// operator investigating idle workers sees a clean page and looks elsewhere
+/// while dispatch is in fact held. The failed shard ids are therefore carried
+/// alongside the rows and rendered as a warning even when `rows` is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PausedQueueScan {
+    pub rows: Vec<PausedQueueBannerRow>,
+    /// Shards whose pause state is **unknown**, not "not paused". Sorted.
+    pub unreadable_shards: Vec<i32>,
+}
+
+/// Merge per-shard paused-queue rows into one banner row per queue name.
+///
+/// Held counts are summed across shards. The top-level provenance is the
+/// **earliest** hold (the one an operator reasons about — "how long has this
+/// been held?"), tie-broken by shard id so the choice never depends on
+/// fan-out order. Rows are sorted by queue name so the banner is stable
+/// across refreshes.
+///
+/// The shards' rows are **not** guaranteed to agree: `pause_queue` is
+/// idempotent and preserves the *original* reason and operator on a re-pause,
+/// and the `shard_id` parameter explicitly supports holding the same queue on
+/// two shards separately. Summing every shard's held tasks under a single
+/// shard's reason would then tell the operator a story that is simply not true
+/// for part of the fleet, so `provenance_uniform` records the disagreement and
+/// `render_paused_queues_banner` marks it visibly.
+///
+/// The uniformity rule is identical to the one `GET /admin/queues/paused` uses
+/// (`api::merge_paused_queue_rows`) — including comparing
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`,
+/// since each shard stamps its own `NOW()` — so the two surfaces can never
+/// disagree about whether a hold is uniform.
+///
+/// The rendered **scope** is likewise derived from real coverage rather than the
+/// stored `scope_shard_id`, via the shared
+/// [`autumn_harvest::queue_pause::classify_pause_coverage`]: a fleet-wide pause
+/// that only reached some shards persists `scope_shard_id = NULL` on the shards
+/// it reached and no row on the ones it missed, so labelling it "fleet-wide"
+/// would tell an operator the fleet is held while part of it keeps dispatching
+/// (issue #619 review).
+pub(crate) fn merge_paused_queue_banner_rows(
+    per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
+    expected_shards: &[i32],
+) -> Vec<PausedQueueBannerRow> {
+    let mut by_queue: std::collections::BTreeMap<
+        String,
+        Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in per_shard {
+        by_queue
+            .entry(row.queue_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_queue
+        .into_values()
+        .map(|shard_rows| {
+            let earliest = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+                .map(|(_, row)| row)
+                .expect("group is non-empty by construction");
+            let provenance_uniform = shard_rows.iter().all(|(_, row)| {
+                row.reason == earliest.reason
+                    && row.paused_by == earliest.paused_by
+                    && row.scope_shard_id == earliest.scope_shard_id
+            });
+            let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+            let scopes: Vec<Option<i32>> = shard_rows
+                .iter()
+                .map(|(_, row)| row.scope_shard_id)
+                .collect();
+            PausedQueueBannerRow {
+                queue_name: earliest.queue_name.clone(),
+                reason: earliest.reason.clone(),
+                paused_by: earliest.paused_by.clone(),
+                paused_at: earliest.paused_at,
+                scope_shard_id: earliest.scope_shard_id,
+                held_task_count: shard_rows.iter().map(|(_, row)| row.held_task_count).sum(),
+                provenance_uniform,
+                coverage: autumn_harvest::queue_pause::classify_pause_coverage(
+                    &holding,
+                    &scopes,
+                    expected_shards,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Render the paused-queues banner (issue #619). Empty when nothing is paused
+/// **and** every shard's pause state was readable, so a healthy fleet page is
+/// byte-identical to before.
+///
+/// A row whose shards disagree on provenance is marked "mixed across shards"
+/// rather than silently attributing the fleet-wide held total to one shard's
+/// reason and operator — see [`merge_paused_queue_banner_rows`].
+///
+/// `unreadable_shards` renders its own warning **even when `rows` is empty**:
+/// an unread shard's pause state is unknown, so an absent banner would otherwise
+/// read as "nothing is held" on exactly the page an operator lands on when
+/// investigating idle workers — see [`PausedQueueScan`].
+pub(crate) fn render_paused_queues_banner(
+    rows: &[PausedQueueBannerRow],
+    unreadable_shards: &[i32],
+) -> Markup {
+    if rows.is_empty() && unreadable_shards.is_empty() {
+        return html! {};
+    }
+    let unreadable_list = unreadable_shards
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
+    let mixed = rows.iter().filter(|r| !r.provenance_uniform).count();
+    // A fleet-wide hold that did not reach every shard leaves part of the fleet
+    // dispatching into the outage the operator is trying to hold back -- the
+    // single most important thing to say on this banner (issue #619 review).
+    let incomplete = rows
+        .iter()
+        .filter(|r| r.coverage.is_incomplete_fleet())
+        .count();
+    html! {
+        // Rendered FIRST and unconditionally on a read failure: if this is the
+        // only thing on the banner, the honest answer is "we do not know whether
+        // dispatch is held", not the silent clean page an absent banner implies.
+        @if !unreadable_shards.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue pause state incomplete" }
+                " — could not read shard(s) " (unreadable_list) ". "
+                "A hold that exists only on an unread shard is MISSING from this \
+                 banner, and a hold shown below may cover more shards than its \
+                 Scope column says. Check GET /admin/queues/paused before \
+                 concluding dispatch is flowing."
+            }
+        }
+        @if !rows.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue dispatch paused" }
+                " — "
+                (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
+                @if incomplete > 0 {
+                    " | " (incomplete) " only PARTIALLY applied — some shards are \
+                           still dispatching; re-issue the pause"
+                }
+                @if mixed > 0 {
+                    " | " (mixed) " with mixed provenance across shards \
+                           (see GET /admin/queues/paused for the per-shard holds)"
+                }
+            }
+            table {
+                thead {
+                    tr {
+                        th { "Queue" }
+                        th { "Scope" }
+                        th { "Held tasks" }
+                        th { "Paused at" }
+                        th { "By" }
+                        th { "Reason" }
+                    }
+                }
+                tbody {
+                    @for row in rows {
+                        tr {
+                            td { code { (row.queue_name) } }
+                            td {
+                                // Real coverage, not the stored intent: a
+                                // fleet-wide request that missed a shard must not
+                                // read "fleet-wide".
+                                (row.coverage.label())
+                                @if let Some(shard) = row.scope_shard_id {
+                                    " (shard " (shard) ")"
+                                }
+                            }
+                            td { (row.held_task_count) }
+                            td { (row.paused_at.to_rfc3339()) }
+                            td {
+                                (row.paused_by)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
+                            td {
+                                (row.reason)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load paused queues across every shard for the Workers-page banner.
+///
+/// Best-effort: an unreachable shard never fails the page — the banner is a
+/// diagnostic aid, never a gate on rendering the fleet. It is **not** silent
+/// about it either: the failed shard ids come back in
+/// [`PausedQueueScan::unreadable_shards`] and are rendered as their own warning,
+/// because a hold that exists only on an unread shard is otherwise invisible
+/// here (issue #619 review).
+///
+/// The **expected** shard set (pools plus every shard the router knows about) is
+/// resolved from `api_state`, identical to `GET /admin/queues/paused`, so a
+/// partially-applied fleet-wide hold is labelled the same way on both surfaces.
+/// An unread shard counts as not-holding for *coverage*, which is the safe
+/// direction (it may still be dispatching) — the warning is what tells the
+/// operator the shown `Scope` could understate the real coverage.
+async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQueueScan {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected_set = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    // Fan out over the EXPECTED shard set, not just `pool.iter_shards()`.
+    //
+    // `expected_shards` deliberately includes a shard the router advertises but
+    // this process has no pool for yet (mid a shard-add rollout). Iterating only
+    // the pools would give such a shard no future at all, so it could never
+    // enter `unreadable_shards` — and if it is the ONLY shard holding a queue,
+    // the Workers page would again render no pause warning whatsoever. That is
+    // the same presence-vs-coverage gap the unreadable-shard warning exists to
+    // close, reached through a missing pool instead of a failing read.
+    //
+    // Resolution goes through the API's own `resolve_expected_shard_pools` (one
+    // shared function, not a second copy of the rule) so a poolless shard maps
+    // to `None` and is reported, never silently resolved through
+    // `ShardedDbPool::pool_for`'s default-shard fallback — which would query the
+    // DEFAULT shard's database in its place and let coverage read `fleet`.
+    let expected: Vec<i32> = expected_set.iter().copied().collect();
+    let resolved = crate::api::resolve_expected_shard_pools(&expected_set, &pools);
+    scan_paused_queues(resolved, &expected).await
+}
+
+/// Read the pause table on each resolved shard and fold the outcomes into a
+/// [`PausedQueueScan`].
+///
+/// Split out from [`load_paused_queues_from_shards`] so the reporting half is
+/// directly testable: reaching a poolless-but-expected shard through
+/// `api_state` requires an installed runtime with a widened router, but the
+/// rule under test — *a `None` pool is reported, never dropped* — needs
+/// neither. Its counterpart, that a router-known poolless shard resolves to
+/// `None` rather than a default-fallback pool, is guarded on the API side by
+/// `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+///
+/// `expected` is the same shard set `resolved` was built from, threaded through
+/// for the coverage calculation in [`merge_paused_queue_banner_rows`].
+async fn scan_paused_queues(
+    resolved: Vec<(i32, Option<&autumn_harvest::worker::DbPool>)>,
+    expected: &[i32],
+) -> PausedQueueScan {
+    let futs: Vec<_> = resolved
+        .into_iter()
+        .map(|(shard, maybe_pool)| async move {
+            // No pool for a shard the router advertises: unread, not "holding
+            // nothing". Dropping it here is exactly the invisible-hold bug.
+            let Some(shard_pool) = maybe_pool else {
+                return Err(shard);
+            };
+            let read = async {
+                let mut conn = acquire_conn(shard_pool).await.ok()?;
+                autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+                    .await
+                    .ok()
+            }
+            .await;
+            // Err(shard) carries WHICH shard failed, so the banner can say so
+            // instead of silently reporting it as holding nothing.
+            read.map_or(Err(shard), |rows| {
+                Ok(rows.into_iter().map(|row| (shard, row)).collect::<Vec<_>>())
+            })
+        })
+        .collect();
+    let mut per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)> = Vec::new();
+    let mut unreadable_shards: Vec<i32> = Vec::new();
+    for outcome in futures::future::join_all(futs).await {
+        match outcome {
+            Ok(rows) => per_shard.extend(rows),
+            Err(shard) => unreadable_shards.push(shard),
+        }
+    }
+    unreadable_shards.sort_unstable();
+    PausedQueueScan {
+        rows: merge_paused_queue_banner_rows(per_shard, expected),
+        unreadable_shards,
+    }
 }
 
 async fn load_workers_from_shards(
@@ -3346,6 +3815,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
 fn render_workers_page(
     stats: &WorkerFleetStats,
     banner_state: Option<BannerState>,
+    paused_queues: &PausedQueueScan,
     grouped: &[(ShardId, Vec<WorkerRow>)],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
@@ -3365,6 +3835,9 @@ fn render_workers_page(
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
+
+        // Paused-queue banner (issue #619) -- empty when nothing is held.
+        (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
         (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
@@ -3906,6 +4379,11 @@ const SIGNAL_UPDATE_TYPES: &[&str] = &[
     "UpdateFailed",
 ];
 const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
+/// Maximum durable workflow-log lines rendered on the detail page (issue #790).
+/// The API route (`GET /workflows/{id}/logs`) paginates the full set; the panel
+/// shows the FIRST window (oldest-first, matching the store's `seq` order) and
+/// links out for the rest.
+const WORKFLOW_LOG_PANEL_LIMIT: i64 = 200;
 const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
     "ActivityScheduled",
     "ActivityStarted",
@@ -4098,6 +4576,7 @@ fn render_workflow_detail(
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
     continue_as_new_threshold: Option<u64>,
+    logs: &WorkflowLogsPanelData<'_>,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -4129,6 +4608,11 @@ fn render_workflow_detail(
     // Pagination arithmetic based on the DB-level total.
     let total_events_usize = usize::try_from(total_events).unwrap_or(usize::MAX);
     let page_size = usize::try_from(DETAIL_EVENT_PAGE_SIZE).unwrap_or(100);
+    // Preserved across every event-pagination link so paging the timeline does
+    // not silently reset the log-level filter (and vice-versa).
+    let selected_log_level = logs
+        .level_filter
+        .map(autumn_harvest::WorkflowLogLevel::as_str);
     let event_page_idx = usize::try_from(event_page).unwrap_or(0);
     let page_start = event_page_idx
         .saturating_mul(page_size)
@@ -4425,6 +4909,11 @@ fn render_workflow_detail(
             }
         }
 
+        // Durable workflow logs panel (issue #790, AC5)
+        @if logs.admin {
+            (render_workflow_logs_panel(&exec_id_str, logs, event_page))
+        }
+
         // Event timeline
         div.card {
             h3 { "Event history (" (total_events) " events)" }
@@ -4435,7 +4924,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
-                            a href={ "?event_page=" (event_page - 1) } {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -4443,13 +4932,13 @@ fn render_workflow_detail(
                         }
                         span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
                         @if has_next_page {
-                            a href={ "?event_page=" (event_page + 1) } {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                     }
                 }
                 table {
@@ -4489,7 +4978,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
-                            a href={ "?event_page=" (event_page - 1) } {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -4497,13 +4986,13 @@ fn render_workflow_detail(
                         }
                         span { "Page " (event_page + 1) }
                         @if has_next_page {
-                            a href={ "?event_page=" (event_page + 1) } {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                         form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
                             label style="font-size:12px;color:#94a3b8" { "Jump to event:" }
                             input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
@@ -4614,6 +5103,159 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
 /// Render the "Pending activities" table, including each activity's latest
 /// heartbeat checkpoint judged against its effective (per-activity) cap and the
 /// cumulative per-page checkpoint budget (#503).
+/// Build a workflow-detail URL that preserves BOTH view dimensions.
+///
+/// The detail page now has two independent filters -- the event-history page
+/// and the log-level filter (issue #790) -- and a bare `?log_level=` /
+/// `?event_page=` link silently resets the other one. Every link that changes
+/// one dimension goes through here so it carries the other.
+///
+/// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
+/// event N" action that `event_page` already resolves to a concrete page, so
+/// carrying it would re-trigger the jump on every subsequent click.
+fn workflow_detail_href(event_page: i64, log_level: Option<&str>) -> String {
+    let mut url = format!("?event_page={event_page}");
+    if let Some(level) = log_level {
+        url.push_str("&log_level=");
+        url.push_str(level);
+    }
+    url
+}
+
+/// Inputs for the durable workflow-logs panel (issue #790, AC5).
+///
+/// Bundled rather than passed as three more positional parameters:
+/// `render_workflow_detail` already takes eleven.
+#[derive(Debug, Default)]
+pub(crate) struct WorkflowLogsPanelData<'a> {
+    /// The page of log lines, in emission order (`seq`).
+    pub lines: &'a [autumn_harvest::models::HarvestWorkflowLog],
+    /// The active `?log_level=` filter; `None` means "all levels".
+    pub level_filter: Option<autumn_harvest::WorkflowLogLevel>,
+    /// Whether the viewing principal has harvest-admin access. The panel is
+    /// rendered only when `true`, mirroring the API route's `require_admin`.
+    pub admin: bool,
+    /// Whether this execution hit its per-execution log cap.
+    ///
+    /// Resolved by the caller with a direct probe for the marker row, NOT by
+    /// scanning `lines`: the marker sits at `seq = i64::MAX` so it sorts last,
+    /// and the panel only loads the FIRST `WORKFLOW_LOG_PANEL_LIMIT` rows. With
+    /// the default cap (1,000) a truncated run's marker can never appear in a
+    /// 200-row page, so a scan-based check would render `false` for exactly the
+    /// runs that dropped the most -- silently, which is the one failure mode
+    /// the marker exists to prevent.
+    pub truncated: bool,
+    /// Whether the log read itself failed (as opposed to returning no rows).
+    ///
+    /// Without this the empty state affirmatively tells the operator "the sink
+    /// is disabled" during an incident where the read actually errored -- e.g.
+    /// a node that has not yet run the migration, where every detail page would
+    /// claim every run logged nothing.
+    pub read_failed: bool,
+}
+
+/// Renders the durable per-execution author-log panel (issue #790, AC5).
+///
+/// Sourced from the SAME `harvest_workflow_logs` rows `GET /workflows/{id}/logs`
+/// serves, in the same emission order (`seq`), so the UI and the API can never
+/// disagree about what a run logged. Level filtering is a plain link-based
+/// filter (`?log_level=`) — no JS, matching the Workers/DLQ page precedent.
+///
+/// The panel is rendered only for a harvest-admin principal (the caller gates
+/// it), mirroring the API route's `require_admin`.
+///
+/// Logs are observational only (AC7): a run that never logged, or a deployment
+/// with the durable sink disabled, shows the empty state rather than an error —
+/// there is nothing wrong with either.
+fn render_workflow_logs_panel(
+    exec_id_str: &str,
+    logs: &WorkflowLogsPanelData<'_>,
+    event_page: i64,
+) -> Markup {
+    use autumn_harvest::WorkflowLogLevel;
+
+    let WorkflowLogsPanelData {
+        lines,
+        level_filter,
+        admin: _,
+        truncated,
+        read_failed,
+    } = *logs;
+
+    let capped = i64::try_from(lines.len()).unwrap_or(i64::MAX) >= WORKFLOW_LOG_PANEL_LIMIT;
+    let selected = level_filter.map(WorkflowLogLevel::as_str);
+
+    html! {
+        div.card {
+            h3 { "Logs" }
+            div.log-filters style="margin-bottom:12px" {
+                @let all_class = if selected.is_none() { "active" } else { "" };
+                a class=(all_class) href=(workflow_detail_href(event_page, None)) { "All" }
+                @for level in [WorkflowLogLevel::Info, WorkflowLogLevel::Warn, WorkflowLogLevel::Error] {
+                    @let wire = level.as_str();
+                    @let class = if selected == Some(wire) { "active" } else { "" };
+                    " "
+                    a class=(class) href=(workflow_detail_href(event_page, Some(wire))) { (wire) }
+                }
+            }
+            @if truncated {
+                div.empty {
+                    "This execution reached its per-execution log cap; later lines were dropped."
+                }
+            }
+            @if read_failed {
+                div.empty {
+                    "Could not read this execution's durable log lines. This is a read "
+                    "failure, not an empty log \u{2014} see the server logs. If this node has "
+                    "not yet run the "
+                    code { "20260719000000_harvest_workflow_logs" }
+                    " migration, apply it."
+                }
+            } @else if lines.is_empty() {
+                div.empty {
+                    @if selected.is_some() {
+                        "No log lines at this level."
+                    } @else {
+                        "No durable log lines recorded. "
+                        "Author lines are persisted only when the opt-in sink is enabled "
+                        "(HarvestPlugin/HarvestBuilder::workflow_log_persistence)."
+                    }
+                }
+            } @else {
+                table {
+                    thead {
+                        tr {
+                            th { "Level" }
+                            th { "Time" }
+                            th { "Message" }
+                        }
+                    }
+                    tbody {
+                        @for line in lines {
+                            tr {
+                                td { code { (&line.level) } }
+                                td { (format_timestamp(Some(line.occurred_at))) }
+                                td { (&line.message) }
+                            }
+                        }
+                    }
+                }
+                @if capped {
+                    div.empty style="margin-top:8px" {
+                        "Showing the first " (WORKFLOW_LOG_PANEL_LIMIT) " lines. "
+                        "Page the rest via "
+                        code {
+                            "GET /api/harvest/workflows/" (exec_id_str) "/logs"
+                            @if let Some(wire) = selected { "?level=" (wire) }
+                        }
+                        "."
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
     let cell_states = plan_checkpoint_cells(blocked_on);
     html! {
@@ -4644,11 +5286,79 @@ fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
     }
 }
 
+/// Renders the replay-derived open-awaitables section of the blocked-on panel
+/// (issue #615). This surfaces the categories the side-table panels below
+/// cannot see: awaited-but-unsent signals, pending child workflows, and
+/// `await_condition` parks. Sourced from the SAME report the
+/// `GET /workflows/{id}/awaitables` endpoint serves.
+fn render_awaitables_table(report: &crate::api::WorkflowAwaitablesResponse) -> Markup {
+    html! {
+        h3 style="margin-top:8px" { "Waiting on (replay-derived)" }
+        @if report.wait_set == "history_only" {
+            div.empty {
+                "Best-effort view from the event log"
+                @if let Some(reason) = report.wait_set_reason.as_deref() {
+                    " (" code { (reason) } ")"
+                }
+                "."
+            }
+        }
+        table {
+            thead {
+                tr {
+                    th { "Kind" }
+                    th { "Name" }
+                    th { "ID" }
+                    th { "Since" }
+                    th { "Deadline" }
+                }
+            }
+            tbody {
+                @for item in &report.awaitables {
+                    tr {
+                        td {
+                            code { (item.kind.as_str()) }
+                            @if item.local { " (local)" }
+                            @if item.external { " (external)" }
+                        }
+                        td { (item.name.as_deref().unwrap_or("—")) }
+                        td {
+                            @if let Some(id) = item.id.as_deref() {
+                                code { (id) }
+                            } @else {
+                                "—"
+                            }
+                        }
+                        td { (format_timestamp(item.since)) }
+                        td { (format_timestamp(item.deadline)) }
+                    }
+                }
+            }
+        }
+        @if report.truncated {
+            div.empty {
+                "Truncated to the first " (report.category_cap)
+                " per category ("
+                @for (i, kind) in report.truncated_kinds.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code { (kind.as_str()) }
+                }
+                ")."
+            }
+        }
+    }
+}
+
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
+    let has_awaitables = blocked_on
+        .awaitables
+        .as_ref()
+        .is_some_and(|r| !r.awaitables.is_empty());
     let has_anything = !blocked_on.activities.is_empty()
         || !blocked_on.external_tasks.is_empty()
         || !blocked_on.timers.is_empty()
-        || !blocked_on.signals.is_empty();
+        || !blocked_on.signals.is_empty()
+        || has_awaitables;
 
     html! {
         div.card {
@@ -4656,6 +5366,11 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
             @if !has_anything {
                 div.empty { "No pending work items." }
             } @else {
+                @if let Some(report) = blocked_on.awaitables.as_ref() {
+                    @if !report.awaitables.is_empty() {
+                        (render_awaitables_table(report))
+                    }
+                }
                 @if !blocked_on.activities.is_empty() {
                     h3 style="margin-top:8px" { "Pending activities" }
                     (render_pending_activities_table(blocked_on))
@@ -7104,6 +7819,7 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
 
 /// Find a schedule by id across all shards. Returns the row, the shard it lives
 /// on, and a conn to that shard on success.
+#[allow(clippy::result_large_err)]
 async fn find_schedule_row(
     api_state: &HarvestApiState,
     id_str: &str,
@@ -7435,18 +8151,32 @@ async fn execute_schedule_trigger_ui(
             (None, None) => (None, None, None),
         }
     };
-    // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let (sla, wf_default_retry_policy) =
-        runtime
-            .registry()
-            .workflows
-            .get(workflow_name)
-            .map_or((None, None), |info| {
-                (
-                    crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                    info.retry_policy.clone(),
-                )
-            });
+    // `workflow_name` here is either a registered workflow's own name, or --
+    // for a DAG-backed schedule, per `resolve_trigger_params` above -- the
+    // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
+    // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
+    // So this ONE lookup already resolves both a workflow's AND a DAG's
+    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
+    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
+    // DAG-level `sla`/`execution_timeout` support and only ever described the
+    // caller's mental model, not an actual code gap; `execution_timeout`
+    // itself was genuinely never resolved here, unlike `sla`.
+    let (sla, wf_default_retry_policy, execution_timeout) = runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .map_or((None, None, None), |info| {
+            (
+                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
+                info.retry_policy.clone(),
+                info.execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+            )
+        });
+    let max_execution_timeout_ceiling = runtime
+        .registry()
+        .max_workflow_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
@@ -7466,18 +8196,19 @@ async fn execute_schedule_trigger_ui(
             input,
             parent_id: None,
             queue_name: queue,
-            execution_timeout: None,
+            execution_timeout,
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
-            max_execution_timeout_ceiling: None,
+            max_execution_timeout_ceiling,
             chain_execution_timeout: None,
             max_workflow_chain_timeout_ceiling: None,
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -8408,6 +9139,394 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
 mod tests {
     use super::*;
 
+    /// Issue #619: with nothing paused **and** every shard readable, the banner
+    /// must render nothing at all, so a healthy Workers page is byte-identical to
+    /// before the feature.
+    #[test]
+    fn paused_queues_banner_is_empty_when_nothing_is_paused() {
+        assert_eq!(render_paused_queues_banner(&[], &[]).into_string(), "");
+    }
+
+    /// A pool that is never connected to; `.build()` is lazy, so constructing it
+    /// performs no I/O and `acquire_conn` on it fails fast.
+    fn never_connecting_pool() -> autumn_harvest::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://harvest:harvest@127.0.0.1:1/never");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool builds without connecting")
+    }
+
+    /// Issue #619 review (round 11): mid a shard-add rollout the router
+    /// advertises a shard this process has no pool for. Fanning out over the
+    /// pools alone would give that shard no future at all, so it could never
+    /// reach `unreadable_shards` — and if it is the only shard holding a queue,
+    /// the Workers page renders no pause warning whatsoever, the exact
+    /// invisible-hold bug the warning exists to prevent.
+    ///
+    /// This guards the *reporting* half (a `None` pool is reported, never
+    /// dropped). Its counterpart — that a router-known poolless shard resolves
+    /// to `None` rather than a default-fallback pool — is guarded on the API
+    /// side by `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+    #[tokio::test]
+    async fn scan_reports_an_expected_shard_that_has_no_local_pool() {
+        let live = never_connecting_pool();
+        // Shard 0 has a pool (whose read will fail); shard 1 is the poolless,
+        // router-known shard. Both must be reported.
+        let scan = scan_paused_queues(vec![(0, Some(&live)), (1, None)], &[0, 1]).await;
+        assert!(
+            scan.unreadable_shards.contains(&1),
+            "a poolless expected shard must be reported unreadable, not dropped: {:?}",
+            scan.unreadable_shards
+        );
+        assert_eq!(
+            scan.unreadable_shards,
+            vec![0, 1],
+            "both an unreadable pool and a missing pool are reported, sorted"
+        );
+        assert!(
+            scan.rows.is_empty(),
+            "no shard was read, so there are no rows to show"
+        );
+        // And the banner is therefore non-empty: silence here is the lie.
+        assert!(
+            !render_paused_queues_banner(&scan.rows, &scan.unreadable_shards)
+                .into_string()
+                .is_empty(),
+            "an unread/poolless shard must never render as a clean page"
+        );
+    }
+
+    /// The poolless shard is reported even when it is the ONLY expected shard —
+    /// i.e. the fold does not depend on some other shard producing a future.
+    #[tokio::test]
+    async fn scan_reports_a_lone_poolless_shard() {
+        let scan = scan_paused_queues(vec![(7, None)], &[7]).await;
+        assert_eq!(scan.unreadable_shards, vec![7]);
+    }
+
+    /// Issue #619 review: a shard whose pause state could not be read makes the
+    /// banner's silence a lie — a hold that exists ONLY on that shard is absent
+    /// from `rows` entirely. The warning must therefore render even with zero
+    /// rows, because that is exactly the case an operator misreads as "dispatch
+    /// is flowing, look elsewhere".
+    #[test]
+    fn unreadable_shard_warns_even_with_no_visible_holds() {
+        let html = render_paused_queues_banner(&[], &[1, 3]).into_string();
+        assert!(
+            !html.is_empty(),
+            "an unread shard must never render as a clean page"
+        );
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "must name the condition: {html}"
+        );
+        assert!(html.contains("1, 3"), "must name the failed shards: {html}");
+        assert!(
+            html.contains("MISSING"),
+            "must say a hold could be missing entirely: {html}"
+        );
+        assert!(
+            html.contains("/admin/queues/paused"),
+            "must point at the authoritative per-shard read: {html}"
+        );
+        // No hold is visible, so there is nothing to tabulate.
+        assert!(
+            !html.contains("Queue dispatch paused") && !html.contains("<table"),
+            "with zero rows there must be no hold banner or table: {html}"
+        );
+    }
+
+    /// The two warnings are independent: a visible hold PLUS an unread shard must
+    /// show both, because the shown `Scope` can understate the real coverage.
+    #[test]
+    fn unreadable_shard_warning_composes_with_a_visible_hold() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
+            held_task_count: 7,
+            provenance_uniform: true,
+            coverage: autumn_harvest::queue_pause::PauseCoverage::PartialFleet,
+        }];
+        let html = render_paused_queues_banner(&rows, &[2]).into_string();
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "read-failure warning: {html}"
+        );
+        assert!(
+            html.contains("Queue dispatch paused"),
+            "hold banner still rendered: {html}"
+        );
+        assert!(
+            html.contains("email-workers"),
+            "table still rendered: {html}"
+        );
+        // The incomplete-read warning must come FIRST: "we do not know" outranks
+        // the partial-coverage detail it may itself explain.
+        let read_at = html.find("Queue pause state incomplete").unwrap();
+        let hold_at = html.find("Queue dispatch paused").unwrap();
+        assert!(
+            read_at < hold_at,
+            "the unknown-state warning must precede the hold banner: {html}"
+        );
+    }
+
+    /// AC6: the banner surfaces the queue name, held count, actor and reason so
+    /// an operator can see WHO paused WHAT and WHY without leaving the page.
+    #[test]
+    fn paused_queues_banner_surfaces_reason_actor_and_held_count() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
+            held_task_count: 42,
+            provenance_uniform: true,
+            coverage: autumn_harvest::queue_pause::PauseCoverage::Fleet,
+        }];
+        let html = render_paused_queues_banner(&rows, &[]).into_string();
+        assert!(html.contains("email-workers"), "queue name: {html}");
+        assert!(html.contains("SMTP provider outage"), "reason: {html}");
+        assert!(html.contains("alice"), "actor: {html}");
+        assert!(html.contains("42"), "held count: {html}");
+        assert!(html.contains("fleet-wide"), "scope: {html}");
+        assert!(
+            !html.contains("mixed across shards"),
+            "a uniform hold must NOT be marked mixed: {html}"
+        );
+    }
+
+    /// AC7: pause is fleet-wide by default, so the same queue paused on two
+    /// shards is ONE banner row whose held count is the fleet-wide sum.
+    #[test]
+    fn paused_queue_rows_merge_across_shards_summing_held_counts() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "email-workers".to_string(),
+                        reason: "later shard".to_string(),
+                        paused_by: "bob".to_string(),
+                        paused_at: later,
+                        scope_shard_id: Some(1),
+                        held_task_count: 3,
+                    },
+                ),
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "email-workers".to_string(),
+                        reason: "earliest pause wins".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: earlier,
+                        scope_shard_id: Some(0),
+                        held_task_count: 4,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1, "one row per queue name");
+        assert_eq!(
+            merged[0].held_task_count, 7,
+            "held counts sum across shards"
+        );
+        assert_eq!(
+            merged[0].paused_at, earlier,
+            "the earliest pause instant is the one an operator reasons about"
+        );
+        assert_eq!(
+            merged[0].reason, "earliest pause wins",
+            "provenance travels with the earliest pause, not a mix"
+        );
+        assert_eq!(merged[0].paused_by, "alice");
+    }
+
+    /// Issue #619 review: two shards holding the same queue with *different*
+    /// reasons/actors is a supported case (`shard_id` scoping, plus the
+    /// idempotent re-pause that preserves the original provenance). The banner
+    /// sums both shards' held tasks, so labelling that fleet-wide total with
+    /// only one shard's story would tell the operator something untrue about
+    /// the rest of the fleet. It must be flagged instead.
+    #[test]
+    fn divergent_shard_provenance_is_flagged_and_visibly_marked() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "shard-0 provider degraded".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: earlier,
+                        scope_shard_id: Some(0),
+                        held_task_count: 4,
+                    },
+                ),
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "shard-1 unrelated incident".to_string(),
+                        paused_by: "bob".to_string(),
+                        paused_at: later,
+                        scope_shard_id: Some(1),
+                        held_task_count: 9,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].held_task_count, 13, "the total is fleet-wide");
+        assert!(
+            !merged[0].provenance_uniform,
+            "the shards disagree on reason, actor AND scope"
+        );
+
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
+        assert!(
+            html.contains("mixed across shards"),
+            "divergent provenance must be visible, not silently attributed to \
+             one shard: {html}"
+        );
+        assert!(
+            html.contains("mixed provenance across shards"),
+            "the banner summary must count the divergent queue(s): {html}"
+        );
+    }
+
+    /// The uniformity rule must match `api::merge_paused_queue_rows` exactly,
+    /// including comparing `(reason, paused_by, scope_shard_id)` and NOT
+    /// `paused_at` — each shard stamps its own `NOW()`, so a fleet-wide hold
+    /// whose shards agree on the story must never be flagged as mixed.
+    #[test]
+    fn differing_paused_at_alone_does_not_flag_divergence() {
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "provider outage".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: chrono::Utc::now() - chrono::Duration::seconds(3),
+                        scope_shard_id: None,
+                        held_task_count: 2,
+                    },
+                ),
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "provider outage".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: chrono::Utc::now(),
+                        scope_shard_id: None,
+                        held_task_count: 5,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert!(
+            merged[0].provenance_uniform,
+            "a fleet-wide hold's per-shard NOW() skew is not a divergence"
+        );
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
+        assert!(!html.contains("mixed across shards"), "{html}");
+    }
+
+    /// Issue #619 review: a fleet-wide pause that only reached SOME shards must
+    /// not read as "fleet-wide".
+    ///
+    /// The shards it reached persist `scope_shard_id = NULL` and the ones it
+    /// missed persist **no row at all**, so the stored intent is indistinguishable
+    /// from a complete hold — while the missed shards keep dispatching into the
+    /// very outage the operator is trying to hold back. Scope is therefore derived
+    /// from real coverage against the expected shard set.
+    #[test]
+    fn a_partially_applied_fleet_pause_is_not_rendered_as_fleet_wide() {
+        let row = |shard: i32| {
+            (
+                shard,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "stripe outage".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: chrono::Utc::now(),
+                    // Fleet-wide INTENT -- what a fleet-wide request writes.
+                    scope_shard_id: None,
+                    held_task_count: 3,
+                },
+            )
+        };
+
+        // Shard 1 was missed: it has no row and is still dispatching.
+        let partial = merge_paused_queue_banner_rows(vec![row(0)], &[0, 1]);
+        assert_eq!(
+            partial[0].coverage,
+            autumn_harvest::queue_pause::PauseCoverage::PartialFleet,
+            "one of two expected shards holds the queue -- intent says \
+             fleet-wide, reality does not"
+        );
+        let html = render_paused_queues_banner(&partial, &[]).into_string();
+        assert!(
+            html.contains("partially applied"),
+            "the Scope cell must not claim fleet-wide coverage: {html}"
+        );
+        assert!(
+            html.contains("still dispatching"),
+            "the banner summary must tell the operator to re-issue the pause: \
+             {html}"
+        );
+
+        // Both shards held: the same stored intent now really is fleet-wide.
+        let complete = merge_paused_queue_banner_rows(vec![row(0), row(1)], &[0, 1]);
+        assert_eq!(
+            complete[0].coverage,
+            autumn_harvest::queue_pause::PauseCoverage::Fleet
+        );
+        let html = render_paused_queues_banner(&complete, &[]).into_string();
+        assert!(html.contains("fleet-wide"), "{html}");
+        assert!(
+            !html.contains("partially applied") && !html.contains("still dispatching"),
+            "a complete hold must not be marked partial: {html}"
+        );
+    }
+
+    /// Merged rows are sorted by queue name so the banner is stable across
+    /// refreshes (shard iteration order must not shuffle it).
+    #[test]
+    fn paused_queue_rows_are_sorted_by_queue_name() {
+        let now = chrono::Utc::now();
+        let mk = |name: &str| autumn_harvest::queue_pause::PausedQueue {
+            queue_name: name.to_string(),
+            reason: "r".to_string(),
+            paused_by: "a".to_string(),
+            paused_at: now,
+            scope_shard_id: None,
+            held_task_count: 1,
+        };
+        let merged = merge_paused_queue_banner_rows(
+            vec![(0, mk("zeta")), (0, mk("alpha")), (0, mk("mid"))],
+            &[0],
+        );
+        let names: Vec<&str> = merged.iter().map(|r| r.queue_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
     #[test]
     fn url_encode_preserves_unreserved_and_encodes_space() {
         assert_eq!(url_encode("foo-bar.BAZ_1~"), "foo-bar.BAZ_1~");
@@ -9170,6 +10289,9 @@ mod tests {
             created_at: Some(now),
             wake_requested: false,
             session_id: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+            capability_miss_handler: None,
         }
     }
 
@@ -9228,6 +10350,7 @@ mod tests {
         use chrono::Utc;
         use uuid::Uuid;
         autumn_harvest::models::WorkflowExecution {
+            quota_key: None,
             id: Uuid::new_v4(),
             workflow_name: "test_workflow".to_string(),
             workflow_id: "wf-1".to_string(),
@@ -9282,6 +10405,8 @@ mod tests {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            history_bloat_warned_at: None,
+            triage_note: None,
         }
     }
 
@@ -9293,6 +10418,7 @@ mod tests {
             signals: vec![],
             heartbeat_details_cap: 0,
             heartbeat_caps: std::collections::HashMap::new(),
+            awaitables: None,
         }
     }
 
@@ -9476,6 +10602,7 @@ mod tests {
             &blocked,
             None,
             Some(10_000),
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -9509,6 +10636,7 @@ mod tests {
             &blocked,
             None,
             None,
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -9538,6 +10666,7 @@ mod tests {
             &blocked,
             None,
             Some(500),
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -10975,6 +12104,242 @@ mod tests {
         assert!(
             html[anchor..anchor + group_end].contains("BIGGEST"),
             "the #slowest anchor wraps the actual slowest (child) step"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable workflow-logs panel (issue #790, AC5)
+    // -----------------------------------------------------------------------
+
+    fn stub_log_line(
+        seq: i64,
+        level: &str,
+        message: &str,
+    ) -> autumn_harvest::models::HarvestWorkflowLog {
+        autumn_harvest::models::HarvestWorkflowLog {
+            id: seq,
+            workflow_exec_id: uuid::Uuid::nil(),
+            seq,
+            level: level.to_string(),
+            message: message.to_string(),
+            occurred_at: chrono::Utc::now(),
+        }
+    }
+
+    fn render_logs_detail(logs: &WorkflowLogsPanelData<'_>) -> String {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            logs,
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn logs_panel_is_not_rendered_for_a_non_admin() {
+        // Mirrors the API route's `require_admin`: a log message is free-form
+        // author text, so a non-admin must not read through the UI what the
+        // API would deny. `admin: false` is the `Default`, which is also what
+        // every non-log detail test passes.
+        let lines = [stub_log_line(0, "info", "SENSITIVE-BUSINESS-DETAIL")];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: false,
+            ..Default::default()
+        });
+        assert!(!html.contains("SENSITIVE-BUSINESS-DETAIL"));
+        assert!(
+            !html.contains(">Logs<"),
+            "the panel heading must not render for a non-admin"
+        );
+    }
+
+    #[test]
+    fn logs_panel_renders_lines_in_order_for_an_admin() {
+        let lines = [
+            stub_log_line(0, "info", "first-line"),
+            stub_log_line(1, "warn", "second-line"),
+            stub_log_line(2, "error", "third-line"),
+        ];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            ..Default::default()
+        });
+        assert!(html.contains(">Logs<"), "the panel heading must render");
+        let first = html.find("first-line").expect("first line rendered");
+        let second = html.find("second-line").expect("second line rendered");
+        let third = html.find("third-line").expect("third line rendered");
+        assert!(
+            first < second && second < third,
+            "lines must render in emission (seq) order"
+        );
+        for level in ["info", "warn", "error"] {
+            assert!(html.contains(level), "level {level} must be shown");
+        }
+    }
+
+    #[test]
+    fn logs_panel_escapes_a_hostile_author_message() {
+        // A log message is arbitrary author text and can embed anything a
+        // workflow formats into it -- including attacker-controlled input.
+        let lines = [stub_log_line(0, "info", "<script>alert('xss')</script>")];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            !html.contains("<script>alert"),
+            "a log message must never render as live markup"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "the message must still be visible, escaped"
+        );
+    }
+
+    #[test]
+    fn logs_panel_marks_the_active_level_filter() {
+        // AC5's "with level filtering". The active link must be visually
+        // distinguishable -- `class="active"` under a rule that actually
+        // matches, or the operator has no feedback about what is applied.
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            level_filter: Some(autumn_harvest::WorkflowLogLevel::Warn),
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("log-filters"),
+            "the filter row must carry the scoped class its CSS rule targets"
+        );
+        assert!(
+            html.contains(".log-filters a.active"),
+            "a scoped stylesheet rule must exist for the active filter link, \
+             or `class=\"active\"` renders identically to the others"
+        );
+        let warn_link = html
+            .find("log_level=warn")
+            .expect("the warn filter link must render");
+        let link_start = html[..warn_link].rfind("<a").expect("anchor open tag");
+        assert!(
+            html[link_start..warn_link].contains("active"),
+            "the selected level's link must be marked active"
+        );
+    }
+
+    #[test]
+    fn logs_panel_filter_links_preserve_the_event_page() {
+        // The detail page has two independent view dimensions; a bare
+        // `?log_level=` link would silently reset the event pager.
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            3, // event_page
+            &blocked,
+            None,
+            None,
+            &WorkflowLogsPanelData {
+                lines: &[],
+                admin: true,
+                ..Default::default()
+            },
+        )
+        .into_string();
+        // maud escapes `&` inside an attribute value, which is the correct
+        // HTML -- assert the escaped form rather than weakening the check.
+        assert!(
+            html.contains("?event_page=3&amp;log_level=warn"),
+            "a level-filter link must carry the current event page"
+        );
+    }
+
+    #[test]
+    fn logs_panel_shows_the_truncation_banner_from_the_caller_probe() {
+        // The marker sits at `seq = i64::MAX` and sorts LAST, while the panel
+        // loads only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- so under the
+        // default 1,000-line cap it can never appear in the page. The flag must
+        // therefore come from the caller's direct probe, not from scanning
+        // `lines`; this fixture has a full page with NO marker in it.
+        let lines: Vec<_> = (0..3).map(|i| stub_log_line(i, "info", "l")).collect();
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            truncated: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("reached its per-execution log cap"),
+            "a truncated run must show the banner even though the marker row is \
+             not in this page"
+        );
+    }
+
+    #[test]
+    fn logs_panel_distinguishes_a_read_failure_from_an_empty_log() {
+        // During an incident -- e.g. a node that has not run the migration --
+        // the empty state would otherwise affirmatively claim the sink is
+        // disabled, which is the opposite of what happened.
+        let failed = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            admin: true,
+            read_failed: true,
+            ..Default::default()
+        });
+        assert!(failed.contains("read failure, not an empty log"));
+        assert!(
+            !failed.contains("opt-in sink is enabled"),
+            "a read failure must not be reported as a disabled sink"
+        );
+
+        let empty = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            admin: true,
+            ..Default::default()
+        });
+        assert!(empty.contains("opt-in sink is enabled"));
+        assert!(!empty.contains("read failure, not an empty log"));
+    }
+
+    #[test]
+    fn logs_panel_empty_state_names_the_active_filter() {
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            level_filter: Some(autumn_harvest::WorkflowLogLevel::Error),
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("No log lines at this level."),
+            "an empty FILTERED view must not claim the run logged nothing"
+        );
+    }
+
+    #[test]
+    fn workflow_detail_href_preserves_both_dimensions() {
+        assert_eq!(workflow_detail_href(0, None), "?event_page=0");
+        assert_eq!(
+            workflow_detail_href(2, Some("error")),
+            "?event_page=2&log_level=error"
         );
     }
 }

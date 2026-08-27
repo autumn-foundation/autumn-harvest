@@ -1,0 +1,42 @@
+-- Covering index for the queue-coverage sample query's LIMIT (issue #774
+-- review, sixth finding).
+--
+-- `pending_queue_demand_query` samples up to `QUEUE_COVERAGE_SAMPLE_CAP`
+-- (5) representative task/execution ids per queue via a
+-- `LEFT JOIN LATERAL ( ... ORDER BY scheduled_at ASC, id ASC LIMIT 5 )`,
+-- specifically chosen over an `ARRAY_AGG(...)[1:5]` slice so Postgres can
+-- stop scanning after the first 5 matching rows instead of materializing an
+-- array covering the whole queue backlog before truncating it.
+--
+-- That LIMIT-bounded plan only works when Postgres can walk an index in
+-- exactly the query's requested order. The only existing index over
+-- `harvest_task_queue`'s pending rows, `idx_harvest_tq_poll` (the
+-- `20260409000000_harvest_initial` migration), is
+-- `(queue_name, state, priority DESC, scheduled_at) WHERE state = 'PENDING'`
+-- -- the intervening `priority DESC` column groups rows by priority bucket
+-- first, so it cannot satisfy a query that ignores priority and wants a
+-- single ascending `scheduled_at, id` order across the whole queue. Without
+-- a matching index, the planner falls back to scanning and top-N-sorting
+-- every PENDING row for the queue on every sample -- the exact
+-- backlog-proportional cost the LATERAL/LIMIT rewrite was meant to avoid,
+-- for a queue with a large stranded backlog (precisely the failure mode
+-- this operational gate exists to surface).
+--
+-- This adds a second, purpose-built partial index carrying no priority
+-- column, so both LATERAL subqueries in `pending_queue_demand_query` can
+-- walk it in exactly their requested order and stop after 5 rows:
+-- `sample_task_ids`'s subquery filters only `(queue_name, state)`, an exact
+-- prefix match; `sample_execution_ids`'s subquery additionally filters
+-- `workflow_exec_id IS NOT NULL`, which is not itself index-satisfied but
+-- is evaluated per candidate row during the same ordered walk, so the scan
+-- still stops once 5 qualifying (non-null-exec) rows are found rather than
+-- needing to touch the whole backlog -- true for every queue except the
+-- pathological case where a large majority of the queue's oldest-scheduled
+-- rows all carry a NULL `workflow_exec_id`.
+--
+-- `idx_harvest_tq_poll` is left untouched -- it remains the correct index
+-- for every priority-aware claim/poll path (`claim_task`,
+-- `claimable_pending_demand_by_queue`); this is additive, sample-query-only.
+CREATE INDEX IF NOT EXISTS idx_harvest_tq_coverage_sample
+    ON harvest_task_queue (queue_name, scheduled_at, id)
+    WHERE state = 'PENDING';

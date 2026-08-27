@@ -99,6 +99,7 @@ async fn handle_webhook_after(
             max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             signal_name: "stripe.subscription_created",
             signal_payload: payload,
             // Stripe-Idempotency-Key dedupes upstream retries: two webhook
@@ -124,6 +125,7 @@ async fn handle_webhook_after(
             // Fresh-start provenance (issue #740); default records
             // StartSource::SignalWithStart.
             start_source_override: None,
+            start_source_ref_override: None,
         },
     )
     .await?;

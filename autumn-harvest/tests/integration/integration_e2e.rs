@@ -75,6 +75,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
+    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
+    // strict XOR kind_check from the migration above must be relaxed to an OR.
+    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
@@ -177,7 +181,71 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #617: chain_execution_timeout/chain_deadline_at columns on
     // harvest_workflow_executions.
-    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql")
+    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql"),
+    "\n",
+    // issue #619: harvest_queue_pauses. REQUIRED, not optional — `claim_task`'s
+    // pause anti-join references this table on every claim, so without it every
+    // claim in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `relation "harvest_queue_pauses" does not exist`.
+    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql"),
+    "\n",
+    // issue #704: history_bloat_warned_at column on harvest_workflow_executions.
+    // REQUIRED, not optional — `WorkflowExecution::as_select()`/`as_returning()`
+    // reference this column on every full-row read/insert-returning, so without
+    // it every such call in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column harvest_workflow_executions.history_bloat_warned_at does not exist`.
+    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"),
+    "\n",
+    // issue #759: triage_note column on harvest_workflow_executions. REQUIRED,
+    // not optional — `WorkflowExecution::as_select()`/`as_returning()` reference
+    // this column on every full-row read/insert-returning, so without it every
+    // such call in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column harvest_workflow_executions.triage_note does not exist`.
+    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql"),
+    "\n",
+    // issue #804: capability_misses column on harvest_task_queue. REQUIRED, not
+    // optional -- `TaskQueueItem` (which `claim_task`'s `RETURNING
+    // harvest_task_queue.*` deserializes into) references this column on every
+    // claim, so without it every claim in this suite (and in every suite that
+    // borrows `setup_test_database_url_or_env` from here) fails with
+    // `column "capability_misses" does not exist`.
+    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql"),
+    "\n",
+    // issue #807: harvest_activity_pauses. REQUIRED, not optional -- the
+    // `paused_activities` MATERIALIZED CTE in `claim_task_query()` selects from
+    // this table on every claim, so without it every claim in this suite (and in
+    // every suite that borrows `setup_test_database_url_or_env` from here) fails
+    // with `relation "harvest_activity_pauses" does not exist`. The same
+    // migration also adds the partial `idx_harvest_tq_activity_pause` index on
+    // `harvest_task_queue`; that index is a performance aid rather than a
+    // correctness requirement, but it ships in the same file.
+    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql"),
+    "\n",
+    // issue #843: idx_harvest_wfx_retry_of. Performance-only (CREATE INDEX,
+    // no column added, no correctness dependency), included for schema
+    // fidelity with the latest migration set.
+    include_str!("../../migrations/20260723000000_harvest_retry_chain_index/up.sql"),
+    "\n",
+    // issue #945: override_refill_rate/override_burst/override_expires_at
+    // columns on harvest_rate_limit_buckets. REQUIRED, not optional --
+    // `claim_task_query()`'s rate-limit token-availability expression
+    // references `b.override_expires_at`/`b.override_refill_rate`/
+    // `b.override_burst` unconditionally (Postgres resolves every column
+    // reference in a query at parse time, regardless of whether that branch
+    // is reached for a given row), so without these columns EVERY claim in
+    // this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column b.override_expires_at does not exist` -- even for tasks with
+    // no rate limit configured at all.
+    include_str!("../../migrations/20260724000000_harvest_pacing_overrides/up.sql"),
+    "\n",
+    // issue #946: quota_key column on harvest_workflow_executions, referenced
+    // by every WorkflowExecution::as_select() read-back in this suite (and in
+    // every suite that borrows `setup_test_database_url_or_env` from here).
+    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -276,7 +344,27 @@ const LEGACY_INIT_SQL: &str = concat!(
     // full-row insert touch the chain-scoped lifetime cap columns even for a
     // workflow with no chain cap configured.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
+    // issue #704: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the history-bloat early-warning guard column even
+    // for a fresh (never-warned) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
+    // issue #759: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the operator-mutable triage note column even for
+    // a fresh (never-annotated) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n",
+    // issue #804: `TaskQueueItem` (what `claim_task`'s `RETURNING
+    // harvest_task_queue.*` deserializes into) references capability_misses on
+    // every claim, so the legacy start path's enqueue+claim needs it too.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
+    // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
+    // set on the same claim, so omitting it fails the legacy path's claim exactly
+    // as omitting `capability_misses` would.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
+    // issue #946: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the quota_key column even for a fresh (no quota
+    // policy configured) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -567,7 +655,10 @@ pub(crate) fn build_test_pool(database_url: &str) -> DbPool {
         .expect("failed to build test pool")
 }
 
-async fn load_execution_from_url(database_url: &str, exec_id: ExecutionId) -> WorkflowExecution {
+pub(crate) async fn load_execution_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for execution query");
@@ -655,6 +746,7 @@ pub(crate) async fn load_child_executions_from_url(
 pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -703,6 +795,66 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
     exec_id
 }
 
+/// Insert a RUNNING execution pinned to `shard` -- both in the encoded
+/// `ExecutionId` and in the row's `shard_id` column, exactly as the shard-pinned
+/// start path (issue #697) writes it. Used to prove residency is transitive
+/// across the workflow tree.
+pub(crate) async fn insert_workflow_execution_on_shard(
+    conn: &mut AsyncPgConnection,
+    shard: autumn_harvest::types::ShardId,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    // Unique per call so repeated runs against the same (non-throwaway)
+    // database never collide on the partial `UNIQUE(workflow_name, workflow_id)`
+    // active index.
+    let workflow_id = format!("e2e-wf-pinned-{}", Uuid::new_v4().simple());
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_test_workflow",
+        workflow_id: &workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: shard.as_i32(),
+        input: serde_json::json!({"test": true}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert shard-pinned workflow execution");
+
+    exec_id
+}
+
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
 /// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
 /// inserts more than one live execution: they would otherwise collide on the
@@ -714,6 +866,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -802,6 +955,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -972,6 +1126,33 @@ fn build_runtime_worker_with_task_timeout(
     )
 }
 
+/// Same as [`build_runtime_worker`], but with a caller-supplied
+/// `capability_miss_max_redeliveries` instead of the default 5.
+///
+/// The issue #804 release budget is spent against a capped exponential backoff
+/// (`1s * 2^n`, capped at 30s), so the default budget of 5 costs
+/// `1 + 2 + 4 + 8 + 16 = 31s` of dwell before the task escalates -- well past
+/// the 10s default [`wait_for_execution_state`] bound. A test that asserts the
+/// *escalation* (rather than an individual release) should therefore set a
+/// small budget so the terminal verdict lands promptly, instead of widening its
+/// wait and paying the dwell for real.
+pub(crate) fn build_runtime_worker_with_capability_miss_budget(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    registry: Arc<HandlerRegistry>,
+    capability_miss_max_redeliveries: u32,
+) -> Arc<Worker> {
+    let mut config = runtime_config(
+        worker_id,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        Duration::from_secs(10),
+    );
+    config.capability_miss_max_redeliveries = capability_miss_max_redeliveries;
+    Arc::new(Worker::new(config, registry).expect("worker should build"))
+}
+
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
 /// Extracted so tests that need to inspect `Worker::new`'s `Result` (e.g. the
@@ -1002,6 +1183,7 @@ pub(crate) fn runtime_config(
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
+        capability_miss_max_redeliveries: 5,
 
         workflow_task_timeout,
         workflow_panic_max_attempts: 3,
@@ -1064,6 +1246,9 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -1088,6 +1273,9 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "child_echo_workflow",
                 module: "integration_e2e",
@@ -1120,6 +1308,9 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -1144,6 +1335,9 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
@@ -1386,6 +1580,94 @@ fn parent_workflow_with_child<'a>(
     })
 }
 
+/// Issue #697 (AC4 + success metric): spawns a child and THEN continues-as-new,
+/// so a single run produces both descendant kinds and one test can assert the
+/// metric's "remain on across children/CAN" clause end to end. Branches on
+/// `phase`: `"init"` spawns the child then forks; the continuation returns.
+fn child_then_continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let phase = input
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if phase == "init" {
+            let child_output = ctx
+                .spawn_child_workflow_raw(
+                    "child_echo_workflow",
+                    serde_json::json!({"value": "pinned"}),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"phase": "next", "child": child_output}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
+    })
+}
+
+fn child_then_continue_as_new_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: child_then_continue_as_new_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "child_echo_workflow",
+                module: "integration_e2e",
+                handler: child_echo_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
 fn child_echo_workflow<'a>(
     _ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -1472,6 +1754,9 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -1494,6 +1779,9 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "typed_failing_child_workflow",
                 module: "integration_e2e",
@@ -1756,6 +2044,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -1785,6 +2074,9 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "deadline_echo",
             module: "integration_e2e",
@@ -1831,6 +2123,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -1961,6 +2254,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -2014,6 +2308,9 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "deadline_echo",
             module: "integration_e2e",
@@ -2058,6 +2355,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -2174,6 +2472,9 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -2220,6 +2521,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2308,6 +2610,9 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -2354,6 +2659,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2455,6 +2761,9 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -2522,6 +2831,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2621,6 +2931,9 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
     let stats = Arc::new(HeartbeatResumeStats::default());
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -2755,6 +3068,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -3014,6 +3328,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -3028,6 +3343,9 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
@@ -3183,6 +3501,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -3197,6 +3516,9 @@ async fn worker_completes_workflow_with_timer_round_trip() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
@@ -3269,6 +3591,169 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
     assert_eq!(timers.len(), 1, "a durable timer row should be created");
     assert!(timers[0].fired, "timer should be marked fired once resumed");
+}
+
+/// Issue #697 AC4 (DB, real worker loop): a child spawned by a shard-pinned
+/// parent stays on the parent's shard -- **both** in the encoded `ExecutionId`
+/// (what every id-based lookup routes on) and in the row's `shard_id` column.
+/// The context-level unit tests prove the id is minted correctly; this proves
+/// the whole worker persistence path preserves it end to end, so residency is
+/// transitive across the workflow tree rather than implicitly assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_child_of_a_shard_pinned_parent_inherits_the_parents_shard() {
+    use autumn_harvest::types::ShardId;
+
+    let pinned = ShardId::new(5);
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution_on_shard(&mut conn, pinned).await;
+    assert_eq!(
+        parent_exec_id.shard(),
+        pinned,
+        "precondition: the parent must actually be pinned"
+    );
+    enqueue_started_workflow_task(
+        &mut conn,
+        parent_exec_id,
+        serde_json::json!({"value": "from-pinned-parent"}),
+    )
+    .await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-child-shard-inheritance",
+        2,
+        1,
+        child_round_trip_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(child_execs.len(), 1, "exactly one child should be created");
+    let child = &child_execs[0];
+
+    // The encoded shard is the load-bearing half: an `ExecutionId::new()` child
+    // would carry the UNENCODED sentinel and every id-based lookup would route
+    // it to the deployment's *default* shard, breaking residency even though
+    // the row itself landed on the parent's shard.
+    let child_exec_id: ExecutionId = child
+        .id
+        .to_string()
+        .parse()
+        .expect("child execution id should parse");
+    assert_eq!(
+        child_exec_id.shard(),
+        pinned,
+        "the child's ExecutionId must encode the parent's shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        child.shard_id,
+        pinned.as_i32(),
+        "the child's row must live on the parent's shard (issue #697 AC4)"
+    );
+}
+
+/// Issue #697 AC4 + the issue's **success metric** (DB, real worker loop):
+/// a shard-pinned run, the child it spawns, AND the continue-as-new successor
+/// it forks all stay on the pinned shard -- the metric's literal
+/// "land on (and remain on across children/CAN) the intended shard" clause,
+/// measured in one run rather than assumed from reading the mint sites.
+///
+/// Deliberately pinned to a **non-default** shard (5) so a regression that
+/// hardcodes `ShardId::new(0)` / `default_shard` is caught, not just one that
+/// mints the `UNENCODED` sentinel. Each assertion checks BOTH halves: the
+/// encoded `ExecutionId` (what every later id-based lookup routes on) and the
+/// row's `shard_id` column (where the data physically lives).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_pinned_child_and_continue_as_new_successor_stay_on_the_pinned_shard() {
+    use autumn_harvest::types::ShardId;
+
+    let pinned = ShardId::new(5);
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution_on_shard(&mut conn, pinned).await;
+    assert_eq!(
+        parent_exec_id.shard(),
+        pinned,
+        "precondition: the parent must actually be pinned"
+    );
+    enqueue_started_workflow_task(
+        &mut conn,
+        parent_exec_id,
+        serde_json::json!({"phase": "init"}),
+    )
+    .await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-pinned-descendants",
+        2,
+        1,
+        child_then_continue_as_new_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // The pinned run seals CONTINUED_AS_NEW once it has spawned its child and
+    // forked its successor.
+    let _sealed = wait_for_execution_state(&database_url, parent_exec_id, "CONTINUED_AS_NEW").await;
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let successor_exec_id = parent_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("pinned history should contain a WorkflowContinuedAsNew event");
+    let successor = wait_for_execution_state(&database_url, successor_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // --- descendant 1: the spawned child ---
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(child_execs.len(), 1, "exactly one child should be created");
+    let child_exec_id: ExecutionId = child_execs[0]
+        .id
+        .to_string()
+        .parse()
+        .expect("child execution id should parse");
+    assert_eq!(
+        child_exec_id.shard(),
+        pinned,
+        "the child's ExecutionId must encode the pinned shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        child_execs[0].shard_id,
+        pinned.as_i32(),
+        "the child's row must live on the pinned shard (issue #697 AC4)"
+    );
+
+    // --- descendant 2: the continue-as-new successor ---
+    assert_eq!(
+        successor_exec_id.shard(),
+        pinned,
+        "the continue-as-new successor's ExecutionId must encode the pinned \
+         shard -- an `ExecutionId::new()` or default-shard successor would \
+         silently move a residency-bound chain off its shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        successor.shard_id,
+        pinned.as_i32(),
+        "the continue-as-new successor's row must live on the pinned shard \
+         (issue #697 AC4)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3589,6 +4074,9 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -3613,6 +4101,9 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "child_alpha",
                 module: "integration_e2e",
@@ -3637,6 +4128,9 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "child_beta",
                 module: "integration_e2e",
@@ -3777,6 +4271,9 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -3801,6 +4298,9 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "fan_child",
                 module: "integration_e2e",
@@ -3984,6 +4484,9 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
@@ -4008,6 +4511,9 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "slow_fan_child",
                 module: "integration_e2e",
@@ -4307,6 +4813,9 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -4825,6 +5334,9 @@ async fn worker_completes_workflow_after_signal_delivery() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -4905,6 +5417,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
 /// while the workflow task is queued but not yet running.  The replay engine
 /// must skip those early signals when looking for `ActivityScheduled` and
 /// then deliver them when the workflow later calls `wait_for_signal`.
+#[allow(clippy::too_many_lines)] // issue #802 added declared-dependency fields to the WorkflowInfo literal
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_handles_early_ingested_signal_before_activity() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4955,6 +5468,9 @@ async fn worker_handles_early_ingested_signal_before_activity() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -5092,6 +5608,7 @@ async fn insert_named_workflow_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -5516,6 +6033,9 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -5658,6 +6178,9 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -5783,6 +6306,9 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -5926,6 +6452,7 @@ mod reuse_policy_helpers {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -7278,6 +7805,9 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let wf_name = "scheduled_instant_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -7343,6 +7873,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7408,6 +7939,9 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let wf_name = "scheduled_slow_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -7472,6 +8006,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7525,6 +8060,9 @@ async fn workflow_schedule_pause_and_resume() {
     let wf_name = "scheduled_pause_resume_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -7590,6 +8128,7 @@ async fn workflow_schedule_pause_and_resume() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7803,6 +8342,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -7835,6 +8375,9 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "approval_search_attrs_workflow",
             module: "integration_e2e",
@@ -7983,6 +8526,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -8015,6 +8559,9 @@ async fn search_attrs_survive_worker_crash_and_resume() {
     let make_registry = || {
         Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "approval_search_attrs_workflow",
                 module: "integration_e2e",
@@ -8121,6 +8668,9 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
 
     let result = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "some_other_workflow",
             module: "integration_e2e",
@@ -8491,6 +9041,9 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -8649,6 +9202,9 @@ async fn circuit_breaker_short_circuits_after_tripping() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -8789,6 +9345,9 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -8945,6 +9504,9 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
     let wf_name = "overlap_skip_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9023,6 +9585,9 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
     let wf_name = "overlap_buffer_one_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9110,6 +9675,9 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
     let wf_name = "overlap_buffer_all_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9201,6 +9769,9 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
     let wf_name = "overlap_cancel_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9287,6 +9858,9 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let wf_name = "overlap_terminate_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9377,6 +9951,9 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
     let wf_name = "overlap_restart_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "integration_e2e",
@@ -9522,6 +10099,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     let started_at = Utc::now();
     let deadline_at = started_at + execution_timeout;
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -10004,6 +10582,9 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
 
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -10337,6 +10918,7 @@ fn saga_activity_info(
 /// AC3 e2e — the compensated counter fires exactly once across the many
 /// genuine decision cycles a real worker takes through an activity-backed
 /// unwind, and each compensation activity executes exactly once.
+#[allow(clippy::too_many_lines)] // #946: required quota field tips this pre-existing literal-heavy test to 101 lines
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decision_cycles() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -10358,6 +10940,9 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
@@ -10530,6 +11115,9 @@ fn slow_double_activity<'a>(
 fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
     let make_wf =
         |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "integration_e2e",
@@ -10590,6 +11178,7 @@ async fn insert_named_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -10772,4 +11361,71 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         .filter(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")))
         .count();
     assert_eq!(markers, 1, "exactly one fan_out marker recorded");
+}
+
+/// Guard: `INIT_SQL` must create every `harvest_*` table the claim path
+/// references.
+///
+/// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
+/// workflow-start-uniqueness migration on purpose), so it is one of the few
+/// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
+/// it a standing drift hazard: `queue::claim_task` runs on essentially every
+/// test in this suite — and in every suite that borrows
+/// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
+/// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
+/// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
+/// `workflow_retry_tests`) — so a migration that adds a table to the claim query
+/// and forgets this bundle takes out eight suites at once with
+/// `relation "..." does not exist`.
+///
+/// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
+/// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
+/// as a pure string comparison, so this pins it as a fast no-DB check instead.
+///
+/// The rule is mechanical: every `harvest_*` identifier named in the real
+/// `claim_task_query()` SQL must appear in `INIT_SQL`. Deriving the table set
+/// from the live query rather than a hardcoded list means a future claim-path
+/// table is caught automatically, with no second list to maintain.
+#[test]
+fn init_sql_creates_every_table_the_claim_path_references() {
+    let claim_sql = autumn_harvest::queue::claim_task_query();
+
+    let mut tables: Vec<String> = Vec::new();
+    let bytes = claim_sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &claim_sql[start..i];
+            if word.starts_with("harvest_") && !tables.contains(&word.to_string()) {
+                tables.push(word.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    assert!(
+        !tables.is_empty(),
+        "expected to find harvest_* identifiers in claim_task_query(); the token scan is broken"
+    );
+
+    let missing: Vec<&String> = tables
+        .iter()
+        .filter(|table| !INIT_SQL.contains(table.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "INIT_SQL is missing table(s) the claim path references: {missing:?}\n\
+         Add the migration that creates them to the INIT_SQL concat! in this file. \
+         Without it every claim in this suite -- and in chain_timeout_tests, \
+         child_timeout_tests, cross_type_continue_as_new_tests, ctx_info_tests, \
+         dag_execution_timeout_tests, rate_limit_key_tests and \
+         workflow_retry_tests, which reuse setup_test_database_url_or_env from \
+         here -- fails with `relation \"...\" does not exist` (issues #619, #807)."
+    );
 }

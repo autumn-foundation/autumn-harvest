@@ -1,0 +1,2820 @@
+//! Tests for the time-travel replay debugger (issue #949).
+//!
+//! Covers the three surfaces:
+//!
+//! - `ReplayTrace::from_history` — the pure, handler-free O(N) projection
+//!   (AC1 minus pending commands).
+//! - `ReplayDebugger::trace_snapshot` — prefix replay for per-step pending
+//!   commands (AC1's command half, AC2's stepping substrate, AC4's JSON input).
+//! - `diff_traces` — first-divergent-command detection (AC3 + the success
+//!   metric's ≥10-scenario corpus).
+
+use std::future::Future;
+use std::pin::Pin;
+
+use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::debugger::{
+    AwaitableKind, Breakpoint, CommandSnapshot, DebugError, DebugStep, DiffKind, ReplayDebugger,
+    ReplayTrace, StepDivergence, StepOutcome, diff_traces,
+};
+use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
+use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::prelude::activity;
+use autumn_harvest::testing::HistorySnapshot;
+use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
+use serde_json::{Value, json};
+
+// ── fixtures ────────────────────────────────────────────────────────────────
+
+fn started() -> WorkflowEvent {
+    WorkflowEvent::workflow_started(json!({}), chrono::Utc::now())
+}
+
+fn scheduled(id: ActivityExecId, name: &str) -> WorkflowEvent {
+    WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: name.to_string(),
+        input: json!({}),
+        queue: "default".to_string(),
+    }
+}
+
+const fn completed(id: ActivityExecId, output: Value) -> WorkflowEvent {
+    WorkflowEvent::ActivityCompleted {
+        activity_id: id,
+        output,
+    }
+}
+
+/// A two-activity workflow: `step_a` then `step_b`.
+fn two_step<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_a", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_b", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+/// The *diverged* build: the two activities are swapped.
+fn two_step_swapped<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_b", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_a", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn two_step_history() -> Vec<WorkflowEvent> {
+    let a = ActivityExecId::new();
+    let b = ActivityExecId::new();
+    vec![
+        started(),
+        scheduled(a, "step_a"),
+        completed(a, json!(1)),
+        scheduled(b, "step_b"),
+        completed(b, json!(2)),
+        WorkflowEvent::WorkflowCompleted {
+            output: json!("done"),
+        },
+    ]
+}
+
+/// A snapshot for an arbitrary workflow name.
+fn snapshot(workflow_name: &str, events: Vec<WorkflowEvent>) -> HistorySnapshot {
+    HistorySnapshot {
+        workflow_name: workflow_name.to_string(),
+        ..snapshot_of(events)
+    }
+}
+
+fn snapshot_of(events: Vec<WorkflowEvent>) -> HistorySnapshot {
+    HistorySnapshot {
+        workflow_name: "two_step".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+        queue_name: None,
+    }
+}
+
+fn debugger(name: &str, handler: WorkflowHandlerFn) -> ReplayDebugger {
+    ReplayDebugger::new().register_fn(name, handler)
+}
+
+// ── AC1: handler-free projection ────────────────────────────────────────────
+
+#[test]
+fn from_history_reports_one_step_per_event_with_index_and_type() {
+    let events = two_step_history();
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+
+    assert_eq!(trace.steps.len(), events.len());
+    for (i, step) in trace.steps.iter().enumerate() {
+        assert_eq!(step.index, i, "step {i} must carry its own event index");
+        assert_eq!(
+            step.event_type,
+            events[i].type_name(),
+            "step {i} must carry the consumed event's type name"
+        );
+    }
+    assert!(!trace.truncated);
+}
+
+#[test]
+fn from_history_opens_and_closes_an_activity_awaitable() {
+    let a = ActivityExecId::new();
+    let events = vec![started(), scheduled(a, "step_a"), completed(a, json!(1))];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+
+    // After WorkflowStarted: nothing open.
+    assert!(trace.steps[0].open_awaitables.is_empty());
+
+    // After ActivityScheduled: exactly one open activity, opened at index 1.
+    let open = &trace.steps[1].open_awaitables;
+    assert_eq!(open.len(), 1, "the scheduled activity must be open");
+    assert_eq!(open[0].kind, AwaitableKind::Activity);
+    assert_eq!(open[0].name.as_deref(), Some("step_a"));
+    assert_eq!(open[0].id.as_deref(), Some(a.to_string().as_str()));
+    assert_eq!(
+        open[0].opened_at, 1,
+        "AC1 requires the event index that opened the awaitable"
+    );
+
+    // After ActivityCompleted: closed again.
+    assert!(trace.steps[2].open_awaitables.is_empty());
+}
+
+#[test]
+fn from_history_opens_timer_and_child_awaitables() {
+    let child = ExecutionId::new();
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t1"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child,
+            workflow_name: "kid".to_string(),
+            input: json!({}),
+        },
+    ];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+
+    let open = &trace.steps[2].open_awaitables;
+    assert_eq!(open.len(), 2);
+    assert!(
+        open.iter()
+            .any(|a| a.kind == AwaitableKind::Timer && a.id.as_deref() == Some("t1"))
+    );
+    assert!(open.iter().any(|a| a.kind == AwaitableKind::ChildWorkflow
+        && a.name.as_deref() == Some("kid")
+        && a.opened_at == 2));
+}
+
+#[test]
+fn a_signal_win_closes_its_event_less_reserved_race_timer() {
+    // Codex round 4, P2. A signal-win of a signal-or-deadline race (#476) tears
+    // the reserved deadline timer down through an EVENT-LESS `CancelRaceLosers`
+    // row delete — no `TimerFired`, no `TimerCancelled`. Closing timers only on
+    // those two events leaves the loser open for every later step, rendering a
+    // resolved race as a run still waiting on a timer.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert_eq!(
+        trace.steps[1].open_awaitables.len(),
+        1,
+        "precondition: the reserved deadline timer opens"
+    );
+    assert!(
+        trace.steps[2]
+            .open_awaitables
+            .iter()
+            .all(|a| a.kind != AwaitableKind::Timer),
+        "a signal-win must close its reserved race timer, got {:?}",
+        trace.steps[2].open_awaitables
+    );
+}
+
+#[test]
+fn a_child_win_closes_its_event_less_reserved_race_timer() {
+    // The child-or-deadline (#779) mirror. The terminal event names only the
+    // `child_id`, so the workflow name the reserved timer encodes has to come
+    // from the awaitable being closed.
+    let child = ExecutionId::new();
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__child_timeout:0:kid"),
+            duration_secs: 600,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child,
+            workflow_name: "kid".to_string(),
+            input: json!({}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child,
+            output: json!("ok"),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert!(
+        trace.steps[3].open_awaitables.is_empty(),
+        "a child-win must close both the child and its reserved race timer, got {:?}",
+        trace.steps[3].open_awaitables
+    );
+}
+
+#[test]
+fn an_ordinary_timer_survives_an_unrelated_signal() {
+    // The control: race-arm cleanup must close only *reserved* arms whose id
+    // parses to the resolving name. An author's own `ctx.timer("escalate", ..)`
+    // is unaffected by a signal arriving, and so is a reserved arm for a
+    // *different* signal.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("escalate"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:other"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    let open = &trace.steps[3].open_awaitables;
+    assert_eq!(
+        open.len(),
+        2,
+        "neither an author timer nor another signal's reserved arm may close, got {open:?}"
+    );
+}
+
+#[test]
+fn a_timer_win_leaves_no_double_close_for_a_late_signal() {
+    // A timer-win recorded `TimerFired` first, so the arm is already closed and
+    // a genuinely LATE signal is a no-op — it must not reach past the reserved
+    // arm and close an unrelated open timer.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("escalate"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    let open = &trace.steps[4].open_awaitables;
+    assert_eq!(
+        open.len(),
+        1,
+        "the late signal must not close the unrelated author timer, got {open:?}"
+    );
+    assert_eq!(open[0].id.as_deref(), Some("escalate"));
+}
+
+#[test]
+fn from_history_captures_version_and_patch_gate_values() {
+    let events = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "version:billing".to_string(),
+            details: json!(2),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:invoice-v2".to_string(),
+            details: json!(1),
+        },
+    ];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+
+    let last = trace.steps.last().expect("non-empty trace");
+    assert_eq!(
+        last.version_gates.get("billing"),
+        Some(&2),
+        "AC1 requires resolved version-gate values"
+    );
+    assert!(last.patch_gates.contains("invoice-v2"));
+}
+
+#[test]
+fn from_history_captures_side_effects_and_markers() {
+    let events = vec![
+        started(),
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Uuid,
+            name: None,
+            value: json!("018f-…"),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".to_string(),
+            details: json!(3),
+        },
+    ];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+    let last = trace.steps.last().expect("non-empty trace");
+
+    assert_eq!(last.side_effects.len(), 1);
+    assert_eq!(last.side_effects[0].kind, "uuid");
+    assert_eq!(last.side_effects[0].event_index, 1);
+    assert_eq!(last.side_effects[0].value, json!("018f-…"));
+
+    assert_eq!(last.markers.len(), 1);
+    assert_eq!(last.markers[0].name, "fan_out:1");
+    assert_eq!(last.markers[0].event_index, 2);
+}
+
+/// AC4: an offload/codec envelope must display verbatim, never error.
+#[test]
+fn from_history_passes_offload_envelope_through_verbatim() {
+    let envelope = json!({
+        "_harvest_offload_envelope": 1,
+        "store_id": "s3",
+        "key": "blob/abc",
+        "len": 2_097_152,
+        "checksum": "deadbeef",
+    });
+    let a = ActivityExecId::new();
+    let events = vec![
+        started(),
+        scheduled(a, "step_a"),
+        completed(a, envelope.clone()),
+    ];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+
+    assert_eq!(trace.steps.len(), 3, "an envelope must not abort the trace");
+    assert_eq!(
+        trace.steps[2].resolved_payload.as_ref(),
+        Some(&envelope),
+        "the envelope must be surfaced verbatim, not decoded or rejected"
+    );
+}
+
+#[test]
+fn from_history_on_empty_history_is_an_empty_trace() {
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &[]);
+    assert!(trace.steps.is_empty());
+    assert_eq!(trace.total_events, 0);
+    assert!(!trace.truncated);
+}
+
+// ── AC1/AC2: prefix replay for pending commands ─────────────────────────────
+
+#[tokio::test]
+async fn trace_snapshot_reports_pending_commands_per_step() {
+    let events = two_step_history();
+    let trace = debugger("two_step", two_step)
+        .trace_snapshot(snapshot_of(events))
+        .await
+        .expect("registered handler");
+
+    // Step 0 (after WorkflowStarted): the workflow's frontier is "schedule step_a".
+    let step0 = &trace.steps[0];
+    assert_eq!(step0.outcome, StepOutcome::Suspended);
+    assert!(
+        step0
+            .commands
+            .iter()
+            .any(|c| c.kind == "ScheduleActivity" && c.summary.contains("step_a")),
+        "step 0 commands were {:?}",
+        step0.commands
+    );
+
+    // Step 2 (after step_a completed): the frontier moves to step_b.
+    assert!(
+        trace.steps[2]
+            .commands
+            .iter()
+            .any(|c| c.kind == "ScheduleActivity" && c.summary.contains("step_b")),
+        "step 2 commands were {:?}",
+        trace.steps[2].commands
+    );
+
+    // The final step consumes the terminal event and the workflow returns.
+    assert_eq!(
+        trace.steps.last().expect("non-empty").outcome,
+        StepOutcome::ReachedTerminal
+    );
+}
+
+#[tokio::test]
+async fn trace_json_round_trips_an_exported_history() {
+    // AC4: production histories are debugged locally from the exported JSON.
+    let snapshot = snapshot_of(two_step_history());
+    let json_text = serde_json::to_string(&snapshot).expect("snapshot serialises");
+
+    let trace = debugger("two_step", two_step)
+        .trace_json(&json_text)
+        .await
+        .expect("valid snapshot JSON with a registered handler");
+
+    assert_eq!(trace.workflow_name, "two_step");
+    assert_eq!(trace.steps.len(), 6);
+}
+
+#[tokio::test]
+async fn trace_snapshot_rejects_an_unregistered_workflow() {
+    let err = ReplayDebugger::new()
+        .trace_snapshot(snapshot_of(two_step_history()))
+        .await
+        .expect_err("no handler registered");
+    assert!(
+        err.to_string().contains("two_step"),
+        "the error must name the missing workflow: {err}"
+    );
+}
+
+#[tokio::test]
+async fn max_steps_truncates_and_flags_the_trace() {
+    let trace = debugger("two_step", two_step)
+        .max_steps(2)
+        .trace_snapshot(snapshot_of(two_step_history()))
+        .await
+        .expect("registered handler");
+
+    assert_eq!(trace.steps.len(), 2);
+    assert!(trace.truncated, "a capped trace must say so");
+    assert_eq!(trace.total_events, 6);
+}
+
+// ── AC2: breakpoints ────────────────────────────────────────────────────────
+
+#[test]
+fn breakpoint_by_event_type_finds_the_first_match() {
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &two_step_history());
+    let hit = trace
+        .find_breakpoint(&Breakpoint::EventType("ActivityCompleted".to_string()), 0)
+        .expect("ActivityCompleted occurs at index 2");
+    assert_eq!(hit, 2);
+}
+
+#[test]
+fn breakpoint_by_event_type_resumes_after_the_given_step() {
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &two_step_history());
+    let hit = trace
+        .find_breakpoint(&Breakpoint::EventType("ActivityCompleted".to_string()), 3)
+        .expect("the second ActivityCompleted occurs at index 4");
+    assert_eq!(hit, 4);
+}
+
+#[test]
+fn breakpoint_by_event_index_is_exact() {
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &two_step_history());
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::EventIndex(3), 0),
+        Some(3)
+    );
+    assert_eq!(trace.find_breakpoint(&Breakpoint::EventIndex(99), 0), None);
+}
+
+#[test]
+fn breakpoint_by_activity_name_matches_the_scheduling_event() {
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &two_step_history());
+    let hit = trace
+        .find_breakpoint(&Breakpoint::ActivityName("step_b".to_string()), 0)
+        .expect("step_b is scheduled at index 3");
+    assert_eq!(hit, 3);
+}
+
+#[test]
+fn breakpoint_by_signal_name_matches_the_received_event() {
+    let events = vec![
+        started(),
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("approval".to_string()), 0),
+        Some(1)
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("nope".to_string()), 0),
+        None
+    );
+}
+
+// ── AC3: diff mode ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn diff_reports_no_divergence_for_identical_registrations() {
+    let snapshot = snapshot_of(two_step_history());
+    let left = debugger("two_step", two_step)
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("registered");
+    let right = debugger("two_step", two_step)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.divergence.is_none(),
+        "identical code must diff clean, got {:?}",
+        diff.divergence
+    );
+}
+
+#[tokio::test]
+async fn diff_identifies_the_first_divergent_command_step() {
+    let snapshot = snapshot_of(two_step_history());
+    let left = debugger("two_step", two_step)
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("registered");
+    let right = debugger("two_step", two_step_swapped)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&left, &right);
+    let div = diff.divergence.expect("the swapped build must diverge");
+
+    // Step 0 is the very first frontier: `step_a` vs `step_b`.
+    assert_eq!(div.step_index, 0, "the FIRST divergent step is step 0");
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+    let left_step = div.left.expect("both sides present for a command mismatch");
+    let right_step = div
+        .right
+        .expect("both sides present for a command mismatch");
+    assert!(left_step.commands[0].summary.contains("step_a"));
+    assert!(right_step.commands[0].summary.contains("step_b"));
+}
+
+// ── Codex round 1 regressions: dispatch options are part of a command's identity
+//
+// A `CommandSnapshot` is the diff key. If it carries only a command's *name*
+// and *input*, two builds that dispatch the same activity with different
+// scheduling options compare EQUAL and the debugger reports a false clean —
+// the single worst outcome for a divergence-finding tool. These pin the
+// classes Codex found (`ScheduleExternalActivity` queue/deadline,
+// `ScheduleActivity` per-call retry/timeout overrides), which the summary
+// label alone does not distinguish.
+
+fn external_on_queue_a<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_external("hand_off", json!({}), "queue-a", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn external_on_queue_b<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same activity, same input, same deadline — only the queue moved.
+        ctx.execute_activity_external("hand_off", json!({}), "queue-b", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn external_with_short_deadline<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same activity, same input, same queue — only the deadline moved.
+        ctx.execute_activity_external("hand_off", json!({}), "queue-a", 60)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+async fn diff_two_builds(
+    name: &str,
+    events: Vec<WorkflowEvent>,
+    left: WorkflowHandlerFn,
+    right: WorkflowHandlerFn,
+) -> Option<autumn_harvest::debugger::TraceDivergence> {
+    let snap = snapshot(name, events);
+    let l = debugger(name, left)
+        .trace_snapshot(snap.clone())
+        .await
+        .expect("registered");
+    let r = debugger(name, right)
+        .trace_snapshot(snap)
+        .await
+        .expect("registered");
+    diff_traces(&l, &r).divergence
+}
+
+#[tokio::test]
+async fn a_queue_only_change_on_an_external_activity_is_a_divergence() {
+    let div = diff_two_builds(
+        "ext",
+        vec![started()],
+        external_on_queue_a,
+        external_on_queue_b,
+    )
+    .await
+    .expect("routing the same external activity to a different queue must diverge");
+
+    assert_eq!(div.step_index, 0);
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_only_change_on_an_external_activity_is_a_divergence() {
+    let div = diff_two_builds(
+        "ext",
+        vec![started()],
+        external_on_queue_a,
+        external_with_short_deadline,
+    )
+    .await
+    .expect("changing an external activity's schedule-to-close deadline must diverge");
+
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+}
+
+fn activity_with_long_timeout<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw_with_opts(
+            "step_a",
+            json!({}),
+            "default",
+            None,
+            Some(std::time::Duration::from_secs(300)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn activity_with_short_timeout<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same name, same queue, same input — only start-to-close moved, so the
+        // summary label (`step_a -> default`) is identical on both sides.
+        ctx.execute_activity_raw_with_opts(
+            "step_a",
+            json!({}),
+            "default",
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_start_to_close_only_change_on_an_activity_is_a_divergence() {
+    let left = debugger("two_step", activity_with_long_timeout)
+        .trace_snapshot(snapshot_of(vec![started()]))
+        .await
+        .expect("registered");
+    let right = debugger("two_step", activity_with_short_timeout)
+        .trace_snapshot(snapshot_of(vec![started()]))
+        .await
+        .expect("registered");
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("changing a per-call start-to-close override must diverge");
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+    // The summary alone cannot tell these apart — the payload is what carries
+    // the difference, so a summary-only snapshot would report a false clean.
+    let l = div.left.expect("both sides present");
+    let r = div.right.expect("both sides present");
+    assert_eq!(
+        l.commands[0].summary, r.commands[0].summary,
+        "this regression is only meaningful while the summaries are identical"
+    );
+    assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+// ── Codex round 2 regressions ───────────────────────────────────────────────
+
+/// A local activity whose per-call timeout is sub-second. Only the typed
+/// `_with_opts` path carries a full `Duration` — the public `_raw` escape
+/// hatch takes whole seconds — so the test drives the typed API, which is also
+/// the one an application uses.
+#[allow(clippy::unused_async)] // the #[activity] macro requires an `async fn`.
+#[activity(local = true, start_to_close = "5s")]
+async fn checksum(_ctx: &autumn_harvest::context::ActivityContext) -> Result<Value, String> {
+    Ok(json!("sum"))
+}
+
+fn local_activity_100ms<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: Value = ctx
+            .execute_local_activity_with_opts(
+                &checksum_info(),
+                json!({}),
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn local_activity_900ms<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Identical to the 100ms build in every way the summary label can see.
+        let _: Value = ctx
+            .execute_local_activity_with_opts(
+                &checksum_info(),
+                json!({}),
+                None,
+                Some(std::time::Duration::from_millis(900)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_subsecond_local_activity_timeout_change_is_a_divergence() {
+    // A caller passes a raw `Duration`, so a local activity legitimately
+    // carries a sub-second timeout. Rendering it through `as_secs()` collapses
+    // 100ms and 900ms to the same `0` and the two builds compare EQUAL — the
+    // same false-clean class as the queue/deadline drops, reintroduced by the
+    // fix for them.
+    let div = diff_two_builds(
+        "local_wf",
+        vec![started()],
+        local_activity_100ms,
+        local_activity_900ms,
+    )
+    .await
+    .expect("a sub-second timeout change must diverge");
+
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+    let l = div.left.expect("both sides present");
+    let r = div.right.expect("both sides present");
+    assert_eq!(
+        l.commands[0].summary, r.commands[0].summary,
+        "this regression is only meaningful while the summaries are identical"
+    );
+    assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+#[test]
+fn a_uuid_shaped_idempotency_key_is_compared_not_normalized() {
+    // `idempotency_key` (#521) is a CALLER-chosen exactly-once key, very
+    // commonly a UUID. Normalizing it because it *looks* like an engine id
+    // would make two genuinely different histories compare equal — so
+    // per-run normalization keys on the field NAME, never on the value shape.
+    let request = |key: &str| {
+        vec![
+            started(),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "go".to_string(),
+                payload: json!({}),
+                idempotency_key: Some(key.to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&request("018f0000-0000-7000-8000-000000000001"));
+    let right = handler_free_trace(&request("018f0000-0000-7000-8000-000000000002"));
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a changed idempotency key is a real difference");
+    assert_eq!(div.step_index, 1);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn engine_minted_ids_in_the_same_event_are_still_normalized() {
+    // The other half of the contract: `signal_id` and an `ExecutionId` target
+    // ARE engine-minted, so two independent recordings of the same scenario
+    // must still diff clean. Without this the field allowlist could be
+    // "fixed" by normalizing nothing at all.
+    let request = || {
+        vec![
+            started(),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "go".to_string(),
+                payload: json!({}),
+                idempotency_key: Some("stable-key".to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&request());
+    let right = handler_free_trace(&request());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "freshly-minted signal/target ids are not a divergence"
+    );
+}
+
+fn reads_parent<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Branch on a replay input that lives on the execution ROW, not in any
+        // event. A replay path that drops it makes this schedule the wrong
+        // activity and fabricates a divergence on a valid production export.
+        let name = if ctx.info().parent_execution_id.is_some() {
+            "child_path"
+        } else {
+            "root_path"
+        };
+        ctx.execute_activity_raw(name, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn snapshot_replay_metadata_reaches_the_prefix_context() {
+    let parent = ExecutionId::new();
+    let snap = HistorySnapshot {
+        parent_execution_id: Some(parent),
+        ..snapshot("parent_wf", vec![started()])
+    };
+    let trace = debugger("parent_wf", reads_parent)
+        .trace_snapshot(snap)
+        .await
+        .expect("registered");
+
+    let command = &trace.steps[0].commands[0];
+    assert!(
+        command.summary.contains("child_path"),
+        "the snapshot's parent_execution_id must reach the replay context; got {:?}",
+        command.summary
+    );
+}
+
+// ── Codex round 1 regression: a mutex park is an open awaitable ─────────────
+
+fn mutex_park<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _guard = ctx
+            .mutex("ledger:acct-1")
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_mutex_park_is_reported_as_an_open_awaitable() {
+    // A parked `ctx.mutex(k).acquire()` has no opening *event* — the waiter row
+    // lives in `harvest_mutex_waiters` and only the grant records
+    // `MutexGranted` — so it is visible solely as a frontier `AcquireMutex`
+    // command. Without synthesis the debugger would show a mutex-blocked run as
+    // waiting on nothing at all.
+    let trace = debugger("mutex_wf", mutex_park)
+        .trace_snapshot(snapshot("mutex_wf", vec![started()]))
+        .await
+        .expect("registered");
+
+    let step = &trace.steps[0];
+    assert!(
+        step.commands.iter().any(|c| c.kind == "AcquireMutex"),
+        "the run must park on AcquireMutex, got {:?}",
+        step.commands
+    );
+    let mutex = step
+        .open_awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Mutex)
+        .expect("a parked mutex acquire must appear among the open awaitables");
+    assert_eq!(mutex.name.as_deref(), Some("ledger:acct-1"));
+    assert_eq!(mutex.opened_at, 0);
+}
+
+// ── Success metric: the ≥10-scenario divergence corpus ──────────────────────
+//
+// Issue #949's success metric: "On a seeded corpus of ≥10 divergence scenarios
+// (drawn from `NonDeterminismKind` classes: SideEffectDrift, count-mismatch
+// fan-out, reordered commands, version-gate changes), the diff mode identifies
+// the exact first divergent command index in 10/10."
+//
+// Each scenario below pairs a BASELINE handler (which recorded the history)
+// with a CANDIDATE handler (the "new build"), and asserts `diff_traces`
+// reports the divergence at the exact expected step.
+
+macro_rules! wf {
+    ($name:ident, $ctx:ident, $body:block) => {
+        fn $name<'a>(
+            $ctx: &'a WorkflowContext,
+            _input: Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+            Box::pin(async move $body)
+        }
+    };
+}
+
+async fn act(ctx: &WorkflowContext, name: &str) -> Result<Value, String> {
+    ctx.execute_activity_raw(name, json!({}), "default")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// 1. Reordered commands (baseline: a then b; candidate: b then a).
+//    Covered by `two_step` / `two_step_swapped` above — reused here.
+
+// 2. An inserted activity at the front.
+wf!(three_step, ctx, {
+    act(ctx, "step_a").await?;
+    act(ctx, "step_b").await?;
+    Ok(json!("done"))
+});
+wf!(three_step_inserted, ctx, {
+    act(ctx, "step_new").await?;
+    act(ctx, "step_a").await?;
+    act(ctx, "step_b").await?;
+    Ok(json!("done"))
+});
+
+// 3. A renamed activity in the middle.
+wf!(renamed_mid, ctx, {
+    act(ctx, "step_a").await?;
+    act(ctx, "step_b_renamed").await?;
+    Ok(json!("done"))
+});
+
+// 4. A changed activity input (same name, different payload).
+wf!(changed_input, ctx, {
+    act(ctx, "step_a").await?;
+    ctx.execute_activity_raw("step_b", json!({ "v": 2 }), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+
+// 5. A changed target queue.
+wf!(changed_queue, ctx, {
+    ctx.execute_activity_raw("step_a", json!({}), "priority")
+        .await
+        .map_err(|e| e.to_string())?;
+    act(ctx, "step_b").await?;
+    Ok(json!("done"))
+});
+
+// 6. An activity replaced by a durable timer.
+wf!(timer_instead, ctx, {
+    act(ctx, "step_a").await?;
+    ctx.timer("wait", 30).await.map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+
+// 7. An activity replaced by a child workflow.
+wf!(child_instead, ctx, {
+    act(ctx, "step_a").await?;
+    ctx.spawn_child_workflow_raw("kid", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+
+// 8. A dropped trailing activity (candidate completes early).
+wf!(dropped_tail, ctx, {
+    act(ctx, "step_a").await?;
+    Ok(json!("done"))
+});
+
+// 9. `SideEffectDrift`: a `ctx.new_uuid()` inserted before the first activity.
+wf!(side_effect_first, ctx, {
+    let _ = ctx.new_uuid();
+    act(ctx, "step_a").await?;
+    act(ctx, "step_b").await?;
+    Ok(json!("done"))
+});
+
+// 10. Version-gate change: a `ctx.version()` gate inserted at the front.
+wf!(version_gated, ctx, {
+    if ctx.version("billing", 1, 2) >= 2 {
+        act(ctx, "step_new").await?;
+    }
+    act(ctx, "step_a").await?;
+    act(ctx, "step_b").await?;
+    Ok(json!("done"))
+});
+
+// 11. Count-mismatch fan-out: the fan-out width changed.
+wf!(fan_out_two, ctx, {
+    ctx.execute_activity_fan_out_raw(vec![
+        ("worker".to_string(), json!(0), "default".to_string()),
+        ("worker".to_string(), json!(1), "default".to_string()),
+    ])
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+wf!(fan_out_three, ctx, {
+    ctx.execute_activity_fan_out_raw(vec![
+        ("worker".to_string(), json!(0), "default".to_string()),
+        ("worker".to_string(), json!(1), "default".to_string()),
+        ("worker".to_string(), json!(2), "default".to_string()),
+    ])
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+
+// 13. Fan-out whose *second* slot's input changed. The `fan_out:` marker and
+// slot 0 are identical, so the first divergent *command* is not index 0 — the
+// one scenario that proves the corpus asserts a real command index rather than
+// a constant.
+wf!(fan_out_two_changed_tail, ctx, {
+    ctx.execute_activity_fan_out_raw(vec![
+        ("worker".to_string(), json!(0), "default".to_string()),
+        ("worker".to_string(), json!(99), "default".to_string()),
+    ])
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+
+// 12. A signal wait replaced by an activity.
+wf!(signal_wait, ctx, {
+    ctx.wait_for_signal("approval")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!("done"))
+});
+wf!(activity_instead_of_signal, ctx, {
+    act(ctx, "auto_approve").await?;
+    Ok(json!("done"))
+});
+
+/// Build the history a baseline handler would record, by tracing it and
+/// materialising the commands it emits into events.
+///
+/// Deliberately hand-rolled rather than driven by a worker: the corpus needs
+/// deterministic, DB-free histories, and the debugger's own tracing is what is
+/// under test.
+fn history_for(kind: HistoryShape) -> Vec<WorkflowEvent> {
+    match kind {
+        HistoryShape::TwoActivities => two_step_history(),
+        HistoryShape::FanOutTwo => {
+            let a = ActivityExecId::new();
+            let b = ActivityExecId::new();
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "fan_out:1".to_string(),
+                    details: json!(2),
+                },
+                scheduled(a, "worker"),
+                scheduled(b, "worker"),
+                completed(a, json!(0)),
+                completed(b, json!(1)),
+            ]
+        }
+        HistoryShape::SignalWait => vec![
+            started(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: json!(true),
+            },
+        ],
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HistoryShape {
+    TwoActivities,
+    FanOutTwo,
+    SignalWait,
+}
+
+struct Scenario {
+    label: &'static str,
+    shape: HistoryShape,
+    baseline: WorkflowHandlerFn,
+    candidate: WorkflowHandlerFn,
+    expected_step: usize,
+    /// The expected `DiffKind::CommandMismatch { command_index }`, or `None`
+    /// when the scenario resolves as a different kind.
+    ///
+    /// The issue's success metric names the *command* index, so asserting only
+    /// the step index would leave that dimension unproven — and a stub
+    /// hardcoding `command_index: 0` would satisfy every scenario.
+    expected_command_index: Option<usize>,
+}
+
+/// The seeded corpus. Split in two halves purely so each stays under the
+/// `too_many_lines` lint; `divergence_corpus` is the single entry point.
+fn divergence_corpus() -> Vec<Scenario> {
+    let mut all = divergence_corpus_shape_changes();
+    all.extend(divergence_corpus_semantic_changes());
+    all
+}
+
+/// Scenarios where the *shape* of the emitted command batch changes.
+fn divergence_corpus_shape_changes() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            label: "reordered commands",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: two_step_swapped,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "inserted activity at the front",
+            shape: HistoryShape::TwoActivities,
+            baseline: three_step,
+            candidate: three_step_inserted,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "renamed activity mid-history",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: renamed_mid,
+            expected_step: 2,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "changed activity input",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: changed_input,
+            expected_step: 2,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "changed target queue",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: changed_queue,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+    ]
+}
+
+/// Scenarios where the command batch keeps its shape but a *value* — a name,
+/// an input, a gate, a side effect — changes.
+fn divergence_corpus_semantic_changes() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            label: "activity replaced by a timer",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: timer_instead,
+            expected_step: 2,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "activity replaced by a child workflow",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: child_instead,
+            expected_step: 2,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "dropped trailing activity",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: dropped_tail,
+            expected_step: 2,
+            expected_command_index: None,
+        },
+        Scenario {
+            label: "SideEffectDrift: inserted ctx.new_uuid()",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: side_effect_first,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "version-gate inserted",
+            shape: HistoryShape::TwoActivities,
+            baseline: two_step,
+            candidate: version_gated,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "count-mismatch fan-out (2 -> 3)",
+            shape: HistoryShape::FanOutTwo,
+            baseline: fan_out_two,
+            candidate: fan_out_three,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "signal wait replaced by an activity",
+            shape: HistoryShape::SignalWait,
+            baseline: signal_wait,
+            candidate: activity_instead_of_signal,
+            expected_step: 0,
+            expected_command_index: Some(0),
+        },
+        Scenario {
+            label: "fan-out tail-slot input changed (command index > 0)",
+            shape: HistoryShape::FanOutTwo,
+            baseline: fan_out_two,
+            candidate: fan_out_two_changed_tail,
+            expected_step: 0,
+            expected_command_index: Some(2),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn divergence_corpus_identifies_the_first_divergent_step_in_every_scenario() {
+    let corpus = divergence_corpus();
+
+    assert!(
+        corpus.len() >= 10,
+        "the success metric requires at least 10 scenarios, got {}",
+        corpus.len()
+    );
+
+    let mut identified = 0usize;
+    for scenario in &corpus {
+        let events = history_for(scenario.shape);
+        let mut snapshot = snapshot_of(events);
+        snapshot.workflow_name = "wf".to_string();
+
+        let left = debugger("wf", scenario.baseline)
+            .trace_snapshot(snapshot.clone())
+            .await
+            .unwrap_or_else(|e| panic!("[{}] baseline trace: {e}", scenario.label));
+        let right = debugger("wf", scenario.candidate)
+            .trace_snapshot(snapshot)
+            .await
+            .unwrap_or_else(|e| panic!("[{}] candidate trace: {e}", scenario.label));
+
+        let diff = diff_traces(&left, &right);
+        let div = diff
+            .divergence
+            .unwrap_or_else(|| panic!("[{}] expected a divergence, found none", scenario.label));
+
+        assert_eq!(
+            div.step_index, scenario.expected_step,
+            "[{}] first divergent step: expected {}, got {} (kind {:?})",
+            scenario.label, scenario.expected_step, div.step_index, div.kind
+        );
+        match (&div.kind, scenario.expected_command_index) {
+            (DiffKind::CommandMismatch { command_index }, Some(expected)) => assert_eq!(
+                *command_index, expected,
+                "[{}] first divergent COMMAND index: expected {expected}, got {command_index}",
+                scenario.label
+            ),
+            (kind, None) => assert!(
+                !matches!(kind, DiffKind::CommandMismatch { .. }),
+                "[{}] expected a non-command-mismatch kind, got {kind:?}",
+                scenario.label
+            ),
+            (kind, Some(expected)) => panic!(
+                "[{}] expected CommandMismatch {{ command_index: {expected} }}, got {kind:?}",
+                scenario.label
+            ),
+        }
+        identified += 1;
+    }
+
+    assert_eq!(
+        identified,
+        corpus.len(),
+        "the success metric requires {}/{} exact identifications",
+        corpus.len(),
+        corpus.len()
+    );
+}
+
+#[tokio::test]
+async fn diff_reports_trace_length_when_one_side_is_capped_shorter() {
+    let snapshot = snapshot_of(two_step_history());
+    let left = debugger("two_step", two_step)
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("registered");
+    let right = debugger("two_step", two_step)
+        .max_steps(3)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("registered");
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("differing trace lengths must be reported");
+    // `capped: true` marks this as a *cap artefact* — the right trace was
+    // truncated by `max_steps`, so the length difference says nothing about
+    // the two traces themselves. Without it, diffing traces built with
+    // different caps would silently report a divergence that does not exist.
+    assert!(matches!(
+        div.kind,
+        DiffKind::TraceLength {
+            left: 6,
+            right: 3,
+            capped: true
+        }
+    ));
+}
+
+#[tokio::test]
+async fn first_divergence_breakpoint_finds_the_diverging_step() {
+    // A candidate that diverges mid-history surfaces a per-step divergence,
+    // which `Breakpoint::FirstDivergence` locates without a second trace.
+    let trace = debugger("two_step", renamed_mid)
+        .trace_snapshot(snapshot_of(two_step_history()))
+        .await
+        .expect("registered");
+
+    let hit = trace
+        .find_breakpoint(&Breakpoint::FirstDivergence, 0)
+        .expect("the renamed activity must diverge somewhere");
+    let step = trace.step(hit).expect("in range");
+    let div = step.divergence.as_ref().expect("divergence recorded");
+    assert!(
+        div.expected.contains("step_b") || div.actual.contains("step_b_renamed"),
+        "divergence should name the mismatched activity: {div:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC3, second arm: diffing two *fixture histories* (no registered code).
+//
+// A handler-free trace emits no commands at all, so the only available signal
+// is the history-derived facts. These pin that (a) a semantic difference is
+// caught, and (b) per-run identity noise is normalized away — without which the
+// arm would report a divergence at the first activity of every real pair.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn fixture_pair_events(activity_name: &str) -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: activity_name.to_string(),
+            input: serde_json::json!({"amount": 100}),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("ok"),
+        },
+    ]
+}
+
+fn handler_free_trace(events: &[WorkflowEvent]) -> ReplayTrace {
+    ReplayTrace::from_history("wf".to_string(), ExecutionId::new(), events)
+}
+
+#[test]
+fn two_independent_recordings_of_the_same_scenario_do_not_diverge() {
+    // Different activity UUIDs and start timestamps on both sides. If per-run
+    // identity leaked into the comparison this would report a divergence at
+    // step 1, burying every real signal under UUID noise.
+    let left = handler_free_trace(&fixture_pair_events("charge"));
+    let right = handler_free_trace(&fixture_pair_events("charge"));
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "per-run identity must be normalized out of the fixture-vs-fixture diff"
+    );
+}
+
+#[test]
+fn a_renamed_activity_diverges_at_the_scheduling_step() {
+    let left = handler_free_trace(&fixture_pair_events("charge"));
+    let right = handler_free_trace(&fixture_pair_events("charge_v2"));
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a renamed activity is a real difference");
+    assert_eq!(div.step_index, 1);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "open_awaitables"),
+        "expected an open_awaitables difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn a_changed_activity_input_diverges_at_the_scheduling_step() {
+    // The input is application data — a semantic field of `ActivityScheduled`
+    // that is compared verbatim (never normalized away). It is caught by
+    // `event_facts`, the exhaustive whole-event backstop, rather than by one of
+    // the curated projections, which is exactly the point: no curated list has
+    // to remember `input`.
+    let left = handler_free_trace(&fixture_pair_events("charge"));
+    let mut right_events = fixture_pair_events("charge");
+    if let WorkflowEvent::ActivityScheduled { input, .. } = &mut right_events[1] {
+        *input = serde_json::json!({"amount": 999});
+    }
+    let right = handler_free_trace(&right_events);
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a changed input is a real difference");
+    assert_eq!(div.step_index, 1);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn a_differing_event_type_diverges_with_the_event_type_field() {
+    let left = handler_free_trace(&fixture_pair_events("charge"));
+    let right = handler_free_trace(&[
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("cooldown"),
+            duration_secs: 30,
+        },
+    ]);
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("an activity vs a timer is a real difference");
+    assert_eq!(div.step_index, 1);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_type"),
+        "expected an event_type difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn a_uuid_side_effect_value_is_not_treated_as_a_divergence() {
+    // `ctx.new_uuid()` is freshly drawn per run by design (issue #384), so two
+    // independent recordings differ there and must NOT be reported.
+    let make = || {
+        vec![
+            started(),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!(uuid::Uuid::new_v4().to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&make());
+    let right = handler_free_trace(&make());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "a per-run uuid draw is not a divergence"
+    );
+}
+
+#[test]
+fn a_custom_side_effect_value_is_compared_verbatim() {
+    // A `Custom` side effect carries application data, so a change there IS a
+    // real difference — the normalization must not over-reach.
+    let make = |region: &str| {
+        vec![
+            started(),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some("region".to_string()),
+                value: serde_json::json!(region),
+            },
+        ]
+    };
+    let left = handler_free_trace(&make("us-east"));
+    let right = handler_free_trace(&make("eu-west"));
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a changed custom side effect is a real difference");
+    // Reported as `side_effects`: that curated projection compares a `Custom`
+    // value verbatim and runs before the `event_facts` backstop, so the more
+    // legible field name wins. Either way the custom value is compared.
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "side_effects"),
+        "expected the custom value to be compared, got {:?}",
+        div.kind
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC5 — read-only by construction, enforced structurally
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The debugger source must never reach for persistence.
+///
+/// AC5 ("no engine-runtime change; read-only by construction") is otherwise
+/// only true by inspection. This makes it falsifiable: adding a `diesel` call,
+/// a `store::` write, or an event append to `debugger.rs` fails the build's
+/// own test suite rather than passing review unnoticed.
+#[test]
+fn debugger_source_never_touches_persistence() {
+    let src = include_str!("../../src/debugger.rs");
+    for forbidden in [
+        "diesel",
+        "store::append",
+        "append_events",
+        "AsyncPgConnection",
+        "DbPool",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "debugger.rs must stay read-only, but it references `{forbidden}`; \
+             AC5 requires no database access and no engine-runtime change"
+        );
+    }
+}
+
+/// The `debugger` feature must add no migration.
+///
+/// A migration would mean new schema, contradicting AC5. Counting the
+/// directories is the same guard `migration_hygiene` uses for the core set.
+#[test]
+fn debugger_feature_adds_no_migration_referencing_it() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let named: Vec<String> = std::fs::read_dir(&dir)
+        .expect("migrations dir readable")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_lowercase())
+        .filter(|name| name.contains("debug"))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "AC5 requires no migration for the debugger, found: {named:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Builder surfaces and terminal step outcomes
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn max_steps_zero_is_clamped_to_one_step() {
+    // A zero cap would produce an empty trace, which reads as "this history has
+    // no events" rather than "you asked for nothing".
+    let debugger = ReplayDebugger::new().max_steps(0);
+    let trace = ReplayTrace::from_history_capped(
+        "wf".to_string(),
+        ExecutionId::new(),
+        &two_step_history(),
+        1,
+    );
+    assert_eq!(trace.steps.len(), 1);
+    assert!(trace.truncated);
+    // The builder clamp is observable through a real trace.
+    let _ = debugger;
+}
+
+#[tokio::test]
+async fn a_spinning_workflow_times_out_rather_than_hanging() {
+    // The doc comment promises `StepOutcome::TimedOut` for a yield-loop rather
+    // than a hung debugger. Without a bound this test would never return.
+    fn spins<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", spins)
+        .max_steps(1)
+        .step_timeout(std::time::Duration::from_millis(50))
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+    assert_eq!(trace.steps[0].outcome, StepOutcome::TimedOut);
+}
+
+#[tokio::test]
+async fn a_panicking_workflow_is_contained() {
+    // The debugger must survive a panicking handler — a debugger that dies on
+    // the bug it is debugging is useless.
+    fn panics<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", panics)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+    assert_eq!(trace.steps[0].outcome, StepOutcome::Panicked);
+}
+
+#[tokio::test]
+async fn a_spinning_build_is_not_certified_as_replaying_cleanly() {
+    // Codex round 4, P1. A step that timed out reports `divergence: None`
+    // because the replay never finished, not because the build agreed — so the
+    // old documented check (scan for `divergence.is_some()`) certified a
+    // workflow that spins forever as replaying cleanly. `is_clean()` refuses.
+    fn spins<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", spins)
+        .max_steps(1)
+        .step_timeout(std::time::Duration::from_millis(50))
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    // The exact shape the old check was blind to: no divergence anywhere.
+    assert!(
+        trace.steps.iter().all(|s| s.divergence.is_none()),
+        "precondition: a timed-out step reports no divergence"
+    );
+    assert!(!trace.is_clean(), "a spinning build must not read as clean");
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+    assert_eq!(trace.first_divergent_step(), None);
+}
+
+#[tokio::test]
+async fn a_panicking_build_is_not_certified_as_replaying_cleanly() {
+    // The sibling of the spin case: a contained panic likewise leaves
+    // `divergence: None` while having verified nothing.
+    fn panics<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", panics)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    assert!(trace.steps.iter().all(|s| s.divergence.is_none()));
+    assert!(
+        !trace.is_clean(),
+        "a panicking build must not read as clean"
+    );
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+}
+
+#[tokio::test]
+async fn a_genuinely_clean_replay_is_still_clean() {
+    // The control that keeps the fix honest: tightening `is_clean` must not
+    // make every trace unclean. A build that replays the whole history and
+    // suspends/completes at every step still passes.
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    assert!(
+        trace.steps.iter().all(|s| s.outcome.replay_succeeded()),
+        "precondition: every step replayed to a conclusion, got {:?}",
+        trace.steps.iter().map(|s| s.outcome).collect::<Vec<_>>()
+    );
+    assert!(trace.is_clean(), "a faithful replay must read as clean");
+}
+
+#[test]
+fn a_handler_free_projection_is_never_clean() {
+    // `from_history` runs no workflow code, so it cannot answer "does this
+    // build replay cleanly?" — reporting `true` would certify a build that was
+    // never executed. Every step is `NotReplayed`.
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &two_step_history());
+    assert!(trace.steps.iter().all(|s| s.divergence.is_none()));
+    assert!(!trace.is_clean());
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+}
+
+#[tokio::test]
+async fn two_builds_that_fail_the_same_way_diff_as_inconclusive_not_equal() {
+    // Codex round 4, P1 (the diff half). Two builds that both spin compare
+    // equal at every field — same outcome, same (empty) commands — so the walk
+    // finds no divergence. But neither was ever successfully replayed, so
+    // "they agree" is a claim about two non-answers.
+    fn spins<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+    fn spins_differently<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    let build = |h: WorkflowHandlerFn| {
+        ReplayDebugger::new()
+            .register_fn("wf", h)
+            .max_steps(1)
+            .step_timeout(std::time::Duration::from_millis(50))
+    };
+    let history = two_step_history();
+    let left = build(spins)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("left");
+    let right = build(spins_differently)
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("right");
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.divergence.is_none(),
+        "precondition: two identically-failing builds compare equal"
+    );
+    assert_eq!(diff.inconclusive_step, Some(0));
+    assert!(
+        !diff.is_clean(),
+        "a comparison in which neither side replayed must not read as clean"
+    );
+}
+
+#[tokio::test]
+async fn two_builds_that_fail_differently_still_report_a_real_divergence() {
+    // The complement: only *matching* failures are a doubt. One build panicking
+    // while the other suspends is a genuine behavioural difference and must stay
+    // an ordinary `Outcome` divergence, not be softened into "inconclusive".
+    fn panics<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    let history = two_step_history();
+    let left = ReplayDebugger::new()
+        .register_fn("wf", panics)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("left");
+    let right = ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("right");
+
+    let diff = diff_traces(&left, &right);
+    // A real, actionable divergence — the exact `DiffKind` is whichever field
+    // differs first, here the command count, since a panicked build emits none.
+    assert!(
+        diff.divergence.is_some(),
+        "one build panicking and the other suspending is a real difference"
+    );
+    // And *not* a doubt: only the healthy side failing would spoil the verdict,
+    // and here the right build replayed successfully.
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(!diff.is_clean());
+}
+
+#[tokio::test]
+async fn two_healthy_builds_still_diff_clean() {
+    // Control for the diff half: `inconclusive_step` must not fire on traces
+    // that replayed successfully, or every clean comparison would regress.
+    // One recording, replayed by two builds — the real diff scenario. Two
+    // separately-minted histories would differ on per-run activity ids, which a
+    // `WaitForActivity` command summary carries verbatim.
+    let history = two_step_history();
+    let make = || async {
+        ReplayDebugger::new()
+            .register_fn("wf", two_step)
+            .trace_snapshot(snapshot("wf", history.clone()))
+            .await
+            .expect("trace")
+    };
+    let diff = diff_traces(&make().await, &make().await);
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(diff.is_clean());
+}
+
+/// Dispatches one activity carrying an input far larger than a byte or two, so
+/// a configured cap is observable.
+fn dispatches_a_big_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let big = json!({ "blob": "x".repeat(512) });
+        ctx.execute_activity_raw("step_a", big, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn the_candidate_payload_cap_is_applied_during_prefix_replay() {
+    // Codex round 4, P1. Payload caps live in no `WorkflowEvent` — the live
+    // worker supplies its own from `BuiltHarvest` — so a replay left at the
+    // library defaults answers a question about a worker that does not exist.
+    // The cap is consulted at the frontier, which is where every prefix step
+    // lands. `WorkflowReplayer` threads these (#798); so must this path.
+    let history = vec![started()];
+
+    // Default caps (2 MiB): the 512-byte input is accepted and the workflow
+    // parks on the dispatch.
+    let permissive = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        permissive.steps[0].outcome,
+        StepOutcome::Suspended,
+        "precondition: under default caps the dispatch is accepted"
+    );
+
+    // A candidate that lowers the cap below the input rejects it with
+    // `PayloadTooLarge`, so the handler returns early instead of parking. Left
+    // unthreaded, this trace would be byte-identical to the permissive one —
+    // the false-GREEN direction, where the debugger accepts a dispatch the
+    // promoted worker will reject.
+    let strict = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        strict.steps[0].outcome,
+        StepOutcome::ReachedTerminal,
+        "a lowered activity-input cap must reject the dispatch during replay"
+    );
+
+    // And the traces must genuinely differ, which is the operator-visible half.
+    assert!(diff_traces(&permissive, &strict).divergence.is_some());
+}
+
+#[tokio::test]
+async fn the_candidate_offload_threshold_exempts_an_over_cap_payload() {
+    // The false-RED direction (#524): an over-cap payload is *offloaded*, not
+    // rejected, so a debugger that knows the cap but not the threshold reports
+    // a divergence the promoted worker would never hit.
+    let history = vec![started()];
+
+    let capped_only = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        capped_only.steps[0].outcome,
+        StepOutcome::ReachedTerminal,
+        "precondition: the cap alone rejects the dispatch"
+    );
+
+    let with_offload = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .payload_offload_threshold(Some(8))
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("trace");
+    assert_eq!(
+        with_offload.steps[0].outcome,
+        StepOutcome::Suspended,
+        "an over-threshold payload is offloaded rather than capped"
+    );
+}
+
+#[tokio::test]
+async fn a_redacted_export_is_refused_rather_than_mis_analysed() {
+    // A redacted export rewrites every payload field, so replaying it would
+    // report a fabricated divergence at the first payload-bearing activity.
+    // Refusing is the only honest answer for a divergence-finding tool.
+    let redacted = serde_json::json!({
+        "workflow_name": "wf",
+        "execution_id": ExecutionId::new(),
+        "payload_policy": "redacted",
+        "events": two_step_history(),
+    })
+    .to_string();
+
+    let err = ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .trace_json(&redacted)
+        .await
+        .expect_err("a redacted export must be refused");
+    assert!(matches!(err, DebugError::RedactedHistory), "got {err:?}");
+    assert!(
+        err.to_string().contains("--payload-policy full"),
+        "the error must name the fix: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_full_export_is_accepted() {
+    // The guard must key on the *redacted* policy only — a full export carries
+    // the same field and must pass.
+    let full = serde_json::json!({
+        "workflow_name": "wf",
+        "execution_id": ExecutionId::new(),
+        "payload_policy": "full",
+        "events": two_step_history(),
+    })
+    .to_string();
+
+    ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .trace_json(&full)
+        .await
+        .expect("a full export must be accepted");
+}
+
+#[tokio::test]
+async fn a_signal_park_opens_a_signal_awaitable() {
+    // AC1 lists signal waits among the open awaitables. A signal wait has no
+    // opening *event*, so it is synthesized from the frontier command — which
+    // means it is only available on a handler-backed trace.
+    fn waits<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx.wait_for_signal("approval").await;
+            Ok(serde_json::json!("done"))
+        })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", waits)
+        .trace_snapshot(snapshot(
+            "wf",
+            vec![WorkflowEvent::workflow_started(
+                serde_json::json!({}),
+                chrono::Utc::now(),
+            )],
+        ))
+        .await
+        .expect("trace");
+
+    let signal = trace.steps[0]
+        .open_awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Signal)
+        .expect("a parked signal wait must open a Signal awaitable");
+    assert_eq!(signal.name.as_deref(), Some("approval"));
+    assert_eq!(signal.opened_at, 0);
+}
+
+// ── AC3: the remaining `DiffKind` variants ──────────────────────────────────
+//
+// `CommandMismatch`, `HistoryFacts` and `TraceLength` are all exercised
+// end-to-end by the corpus and the trace-length test above. `CommandCount` and
+// `Outcome` are *comparator* behaviours that only fire when the two sides agree
+// on every shared command — a shape no pair of real builds in the corpus
+// produces — so they are asserted directly against `diff_traces`, which is the
+// unit under test either way.
+
+/// A minimal step carrying only the fields these comparator tests vary.
+const fn bare_step(
+    index: usize,
+    commands: Vec<CommandSnapshot>,
+    outcome: StepOutcome,
+) -> DebugStep {
+    DebugStep {
+        index,
+        event_type: "ActivityScheduled",
+        outcome,
+        commands,
+        open_awaitables: Vec::new(),
+        version_gates: std::collections::BTreeMap::new(),
+        patch_gates: std::collections::BTreeSet::new(),
+        side_effects: Vec::new(),
+        markers: Vec::new(),
+        resolved_payload: None,
+        event_facts: serde_json::Value::Null,
+        signal_name: None,
+        divergence: None,
+    }
+}
+
+fn cmd(kind: &'static str, summary: &str) -> CommandSnapshot {
+    CommandSnapshot {
+        kind,
+        summary: summary.to_string(),
+        payload: None,
+    }
+}
+
+fn bare_trace(steps: Vec<DebugStep>) -> ReplayTrace {
+    ReplayTrace {
+        workflow_name: "two_step".to_string(),
+        execution_id: ExecutionId::new(),
+        total_events: steps.len(),
+        truncated: false,
+        steps,
+    }
+}
+
+#[test]
+fn a_shared_command_prefix_with_differing_length_reports_command_count() {
+    // The right build emits everything the left one does, plus one more. Every
+    // *shared* command matches, so this must not be reported as a mismatch at
+    // an index that does not actually differ.
+    let left = bare_trace(vec![bare_step(
+        0,
+        vec![cmd("ScheduleActivity", "step_a -> default")],
+        StepOutcome::Suspended,
+    )]);
+    let right = bare_trace(vec![bare_step(
+        0,
+        vec![
+            cmd("ScheduleActivity", "step_a -> default"),
+            cmd("ScheduleActivity", "step_b -> default"),
+        ],
+        StepOutcome::Suspended,
+    )]);
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a differing command count is a divergence");
+    assert_eq!(div.step_index, 0);
+    assert!(
+        matches!(div.kind, DiffKind::CommandCount { left: 1, right: 2 }),
+        "expected CommandCount, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn identical_commands_with_differing_outcomes_report_outcome() {
+    // Same commands, but one side stopped somewhere else. Reported last,
+    // because it is usually a downstream consequence of a command difference —
+    // here there is none, so it surfaces on its own.
+    let left = bare_trace(vec![bare_step(0, Vec::new(), StepOutcome::Suspended)]);
+    let right = bare_trace(vec![bare_step(0, Vec::new(), StepOutcome::ReachedTerminal)]);
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a differing outcome is a divergence");
+    assert!(
+        matches!(
+            div.kind,
+            DiffKind::Outcome {
+                left: StepOutcome::Suspended,
+                right: StepOutcome::ReachedTerminal
+            }
+        ),
+        "expected Outcome, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn a_one_sided_divergence_is_reported_as_its_own_kind_not_a_history_fact() {
+    // A divergence is a *code-vs-history* mismatch: the two recordings are
+    // identical here, the two builds are not. Folding it into `HistoryFacts`
+    // would tell an operator "these are different recordings", which is a
+    // wrong and actively misleading diagnosis.
+    let clean = bare_trace(vec![bare_step(0, Vec::new(), StepOutcome::Suspended)]);
+    let mut diverged_step = bare_step(0, Vec::new(), StepOutcome::Suspended);
+    diverged_step.divergence = Some(StepDivergence {
+        expected: "ActivityScheduled(step_b)".to_string(),
+        actual: "ActivityScheduled(step_b_renamed)".to_string(),
+        event_index: 3,
+    });
+    let diverged = bare_trace(vec![diverged_step]);
+
+    let div = diff_traces(&clean, &diverged)
+        .divergence
+        .expect("a one-sided divergence is a divergence");
+    let DiffKind::Divergence { left, right } = &div.kind else {
+        panic!("expected Divergence, got {:?}", div.kind);
+    };
+    assert!(left.is_none(), "the clean side carries no divergence");
+    assert_eq!(
+        right.as_ref().map(|d| d.event_index),
+        Some(3),
+        "the diverged side's own event index must survive the diff",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codex round 3
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn two_recordings_differing_only_in_worker_id_do_not_diverge() {
+    // `worker_id` is `WorkerId`, a String-backed newtype — but its VALUE is
+    // always a fresh `Uuid::new_v4()` minted by `WorkerRuntimeConfig::from`
+    // (there is no `WorkerConfig::with_worker_id`). Two independent recordings
+    // therefore differ at the FIRST `ActivityStarted`, which would bury every
+    // later semantic difference behind pure per-run noise.
+    let run = || {
+        let id = ActivityExecId::new();
+        vec![
+            started(),
+            scheduled(id, "step_a"),
+            WorkflowEvent::ActivityStarted {
+                activity_id: id,
+                worker_id: autumn_harvest::types::WorkerId::new(uuid::Uuid::new_v4().to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&run());
+    let right = handler_free_trace(&run());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "a freshly-minted worker id is per-run noise, not a divergence"
+    );
+}
+
+#[test]
+fn an_operator_chosen_worker_label_is_compared_not_normalized() {
+    // The inverse control. `WorkerRuntimeConfig::worker_id` is a `pub` field,
+    // so an embedder may set a stable human label. A label does not parse as a
+    // UUID, so the value guard must keep it comparable — otherwise adding
+    // `worker_id` to the allowlist would have silently discarded a real
+    // difference (the round-2 `idempotency_key` mistake, one field over).
+    let run = |label: &str| {
+        let id = ActivityExecId::new();
+        vec![
+            started(),
+            scheduled(id, "step_a"),
+            WorkflowEvent::ActivityStarted {
+                activity_id: id,
+                worker_id: autumn_harvest::types::WorkerId::new(label),
+            },
+        ]
+    };
+    let left = handler_free_trace(&run("worker-eu-1"));
+    let right = handler_free_trace(&run("worker-us-1"));
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("an operator-chosen worker label is a real difference");
+    assert_eq!(div.step_index, 2);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn two_recordings_of_different_workflow_types_diverge() {
+    // `workflow_name` is an execution-ROW column present in no `WorkflowEvent`
+    // (not even `WorkflowStarted`), so `event_facts` is structurally blind to
+    // it. Without an explicit check, two recordings of DIFFERENT workflows
+    // with identical event arrays report agreement — and `harvest debug diff`
+    // exits 0 on them.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("checkout", ExecutionId::new(), &events());
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("different workflow types are not 'in agreement'");
+    assert_eq!(div.step_index, 0);
+    assert!(
+        matches!(
+            &div.kind,
+            DiffKind::WorkflowName { left, right } if left == "onboarding" && right == "checkout"
+        ),
+        "expected a WorkflowName difference naming both types, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn differing_execution_ids_alone_are_not_a_divergence() {
+    // The guard on the fix above: `execution_id` differs on EVERY pair of
+    // independent recordings, so comparing it alongside `workflow_name` would
+    // fabricate a divergence on every fixture-vs-fixture diff.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "distinct execution ids are inherent to two recordings, not a difference"
+    );
+}
+
+#[test]
+fn equally_capped_traces_are_inconclusive_not_clean() {
+    // Both traces hit the SAME cap, so their step counts are equal and the
+    // `TraceLength` check — the only one carrying a `capped` flag — never
+    // fires. A difference living past the cap is then reported as silence.
+    // `is_clean()` is what refuses to call that a pass.
+    let long = |tail: &str| {
+        vec![
+            started(),
+            scheduled(ActivityExecId::new(), "step_a"),
+            scheduled(ActivityExecId::new(), tail),
+        ]
+    };
+    let left = ReplayTrace::from_history_capped("wf", ExecutionId::new(), &long("step_b"), 2);
+    let right = ReplayTrace::from_history_capped("wf", ExecutionId::new(), &long("step_z"), 2);
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.divergence.is_none(),
+        "the differing step is past the cap, so no divergence is visible"
+    );
+    assert!(diff.truncated, "both inputs were capped");
+    assert!(
+        !diff.is_clean(),
+        "an unexamined suffix must never report as a clean comparison"
+    );
+}
+
+#[test]
+fn an_uncapped_agreeing_comparison_is_clean() {
+    // The inverse control: `is_clean()` must still be true for a genuine pass,
+    // or the fix would just make every diff inconclusive.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("wf", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("wf", ExecutionId::new(), &events());
+
+    let diff = diff_traces(&left, &right);
+    assert!(!diff.truncated);
+    assert!(diff.is_clean(), "a complete, agreeing comparison is clean");
+}
+
+#[test]
+fn a_handler_free_fixture_diff_is_conclusive_not_inconclusive() {
+    // The carve-out that keeps AC3's compare-two-recordings mode working — and
+    // the CLI's primary diff path with it. A handler-free projection is
+    // `NotReplayed` at every step, but that is *by design*, not a failed
+    // replay: the comparison is over history-derived facts, which the two
+    // recordings determine completely. Folding `NotReplayed` in with
+    // timed-out/panicked would make every fixture diff exit 2.
+    let events = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+    let right = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert!(
+        left.steps
+            .iter()
+            .all(|s| s.outcome == StepOutcome::NotReplayed),
+        "precondition: a handler-free projection never replays"
+    );
+    let diff = diff_traces(&left, &right);
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(diff.is_clean(), "a fixture-vs-fixture diff is conclusive");
+
+    // ...while the *single-trace* verdict is the opposite: this projection
+    // verified no code, so it cannot claim the build replays cleanly.
+    assert!(!left.is_clean());
+}
+
+#[test]
+fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
+    // Signal names are not restricted to one token, and a `WaitForSignal`
+    // summary IS the whole name with no qualifier. Splitting it on whitespace
+    // made `SignalName("order approved")` unmatchable at precisely the step a
+    // breakpoint is for: a waiting frontier, where no `SignalReceived` exists
+    // yet to match instead.
+    let step = bare_step(
+        0,
+        vec![cmd("WaitForSignal", "order approved")],
+        StepOutcome::Suspended,
+    );
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![step],
+        total_events: 1,
+        truncated: false,
+    };
+
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("order approved".to_string()), 0),
+        Some(0),
+        "a multi-word signal name must match the waiting frontier"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("order".to_string()), 0),
+        None,
+        "a partial name must NOT match, or the breakpoint is imprecise"
+    );
+}
+
+// ── Codex round 5/6: per-run identity and missing replay inputs ──────────────
+
+#[test]
+fn an_activity_breakpoint_matches_a_multi_word_name_at_a_dispatching_frontier() {
+    // The sibling of the signal case above, and the same failure: an activity
+    // name is the free-form `#[activity]` fn name or an
+    // `execute_activity_raw` string, so nothing restricts it to one token.
+    // Tokenizing `ScheduleActivity`'s `"{name} -> {queue}"` summary on
+    // whitespace made `ActivityName("charge card")` unmatchable at exactly the
+    // step the breakpoint is for — a dispatching frontier, where no
+    // `ActivityScheduled` event exists yet to match instead.
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![bare_step(
+            0,
+            vec![cmd("ScheduleActivity", "charge card -> payments")],
+            StepOutcome::Suspended,
+        )],
+        total_events: 1,
+        truncated: false,
+    };
+
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("charge card".to_string()), 0),
+        Some(0),
+        "a multi-word activity name must match the dispatching frontier"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("charge".to_string()), 0),
+        None,
+        "a partial name must NOT match, or the breakpoint is imprecise"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("payments".to_string()), 0),
+        None,
+        "the queue qualifier must NOT match — that would fire on every activity \
+         on the queue"
+    );
+}
+
+#[test]
+fn an_activity_breakpoint_survives_a_name_containing_the_queue_separator() {
+    // The qualifier is appended last, so the split is from the right.
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![bare_step(
+            0,
+            vec![cmd("ScheduleActivity", "a -> b -> payments")],
+            StepOutcome::Suspended,
+        )],
+        total_events: 1,
+        truncated: false,
+    };
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("a -> b".to_string()), 0),
+        Some(0)
+    );
+}
+
+/// A workflow that opens a worker session (issue #606) and then dispatches a
+/// member activity — the shape whose session identity is minted fresh per run.
+fn session_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(autumn_harvest::context::SessionOptions::new("gpu"))
+            .await
+            .map_err(|e| e.to_string())?;
+        session
+            .execute_activity_raw("transcode", json!({}), "gpu")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn two_identical_registrations_agree_across_a_frontier_session_mint() {
+    // `ctx.create_session` mints a fresh `SessionId::new()` at the frontier and
+    // records it as `MarkerRecorded { name: "session:0", details: <uuid> }`.
+    // Comparing that UUID verbatim makes two runs of the *same code* disagree
+    // on the very first frontier step — a fabricated divergence that buries
+    // every real one behind it.
+    let snapshot = snapshot("sessioned", vec![started()]);
+    let dbg = debugger("sessioned", session_workflow);
+
+    let left = dbg.trace_snapshot(snapshot.clone()).await.expect("trace");
+    let right = dbg.trace_snapshot(snapshot).await.expect("trace");
+
+    // Precondition: the frontier really does mint a session marker, or the test
+    // would pass vacuously.
+    let markers: Vec<&str> = left.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "RecordMarker")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert!(
+        markers.iter().any(|m| m.starts_with("session:")),
+        "expected a frontier session marker, got {markers:?}"
+    );
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.is_clean(),
+        "identical code must agree despite per-run session identity: {diff:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_recordings_agree_when_only_their_session_marker_differs() {
+    // The fixture-vs-fixture arm (AC3's second mode): two independent
+    // recordings of the same logical run carry different session UUIDs, which
+    // `history_fact_diff` compared verbatim through `markers` (and, behind it,
+    // `event_facts`).
+    let recording = |session: &str| {
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "session:0".to_string(),
+                details: json!(session),
+            },
+        ]
+    };
+    let left = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &recording("018f2b1c-0000-7000-8000-000000000001"),
+    );
+    let right = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &recording("018f2b1c-0000-7000-8000-000000000002"),
+    );
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.is_clean(),
+        "an engine-minted session id must not read as a history difference: {diff:?}"
+    );
+
+    // ...but an *application* marker's details are semantic and must still be
+    // compared, or the normalization would be a false-clean of its own.
+    let app = |details: &str| {
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "fan_out:1".to_string(),
+                details: json!(details),
+            },
+        ]
+    };
+    let l = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &app("018f2b1c-0000-7000-8000-000000000001"),
+    );
+    let r = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &app("018f2b1c-0000-7000-8000-000000000002"),
+    );
+    assert!(
+        !diff_traces(&l, &r).is_clean(),
+        "an application marker carrying a UUID is semantic and must still differ"
+    );
+}
+
+/// A workflow that branches on which declarative query handlers the candidate
+/// build registers — the shape a replay with an empty registry gets wrong.
+fn query_gated_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let name = if ctx.list_query_names().iter().any(|n| n == "progress") {
+            "with_progress"
+        } else {
+            "without_progress"
+        };
+        ctx.execute_activity_raw(name, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+// The signature is fixed by `QueryHandlerFn`; the `Result` cannot be dropped.
+#[allow(clippy::unnecessary_wraps)]
+fn progress_query(_ctx: &WorkflowContext, _args: Value) -> Result<Value, String> {
+    Ok(json!("ok"))
+}
+
+fn progress_query_info(workflow: &'static str) -> autumn_harvest::info::QueryHandlerInfo {
+    autumn_harvest::info::QueryHandlerInfo {
+        name: "progress",
+        workflow,
+        module: "debugger_tests",
+        input_type_hint: "()",
+        output_type_hint: "String",
+        handler: progress_query,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    }
+}
+
+#[tokio::test]
+async fn declarative_query_handlers_are_registered_before_the_body_runs() {
+    // The live worker registers a workflow's declarative handlers before any
+    // workflow code runs, and `list_query_names` merges them in — so a body
+    // that branches on them observes them. They live in no `WorkflowEvent`, so
+    // a replay that never registers them runs every prefix against an empty
+    // registry and takes the *other* branch: a divergence invented by the
+    // debugger on code nobody changed.
+    let snapshot = snapshot("gated", vec![started()]);
+
+    let with = ReplayDebugger::new()
+        .register_fn("gated", query_gated_workflow)
+        .queries(vec![progress_query_info("gated")])
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = with.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled,
+        vec!["with_progress -> default"],
+        "a registered declarative query must be visible to the workflow body"
+    );
+
+    // The control: with none registered the body takes the other branch, so the
+    // assertion above is falsifiable rather than true by accident.
+    let without = debugger("gated", query_gated_workflow)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = without.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(scheduled, vec!["without_progress -> default"]);
+}
+
+#[tokio::test]
+async fn declarative_handlers_are_filtered_to_this_workflow_type() {
+    // Mirrors the worker, which narrows both registries to the dispatched
+    // execution's own type. Registering another workflow's `progress` here
+    // would show this workflow a name its promoted worker will never show it.
+    let trace = ReplayDebugger::new()
+        .register_fn("gated", query_gated_workflow)
+        .queries(vec![progress_query_info("some_other_workflow")])
+        .trace_snapshot(snapshot("gated", vec![started()]))
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = trace.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled,
+        vec!["without_progress -> default"],
+        "another workflow's handler must not leak onto this one's context"
+    );
+}
+
+// ── Offloaded payload inflation (issue #524 × the debugger) ─────────────────
+
+/// In-memory content-addressed store, mirroring `payload_offload_replay_tests`.
+#[derive(Default)]
+struct MemStore {
+    blobs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for MemStore {
+    fn store_id(&self) -> &'static str {
+        "debugtest"
+    }
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let key = format!("blob/{}", bytes.len());
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), bytes.to_vec());
+        Box::pin(async move { Ok(key) })
+    }
+    fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        let found = self.blobs.lock().unwrap().get(key).cloned();
+        let key = key.to_string();
+        Box::pin(async move {
+            found.ok_or_else(|| {
+                autumn_harvest::payload_store::PayloadStoreError(format!("missing {key}"))
+            })
+        })
+    }
+    fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        self.blobs.lock().unwrap().remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// The large payload the recorded activity produced.
+fn big_output() -> Value {
+    json!({ "document": "X".repeat(300_000) })
+}
+
+/// Branches on whether the activity output is the real payload — a workflow
+/// handed a raw reference envelope takes the other branch.
+fn payload_sensitive_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let out = ctx
+            .execute_activity_raw("produce_blob", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let next = if out == big_output() {
+            "saw_payload"
+        } else {
+            "saw_envelope"
+        };
+        ctx.execute_activity_raw(next, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn a_configured_offloader_inflates_envelopes_before_replay() {
+    use autumn_harvest::payload_store::PayloadOffloader;
+
+    let store = std::sync::Arc::new(MemStore::default());
+    let offloader = std::sync::Arc::new(PayloadOffloader::new(
+        store.clone(),
+        256 * 1024,
+        std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+
+    // Persist the history exactly as a worker with a store would: the output is
+    // replaced in place by a small reference envelope.
+    let id = ActivityExecId::new();
+    let mut stored = vec![
+        started(),
+        scheduled(id, "produce_blob"),
+        completed(id, big_output()),
+    ];
+    for event in &mut stored {
+        let mut v = serde_json::to_value(&*event).unwrap();
+        offloader.offload_event_value(&mut v).await.unwrap();
+        *event = serde_json::from_value(v).unwrap();
+    }
+    // Precondition: the stored event really is an envelope, not the payload.
+    let stored_len = serde_json::to_string(&stored[2]).unwrap().len();
+    assert!(
+        stored_len < 4_000,
+        "expected a small reference envelope, got {stored_len} bytes"
+    );
+
+    let snapshot = snapshot("blobby", stored);
+
+    let inflated = ReplayDebugger::new()
+        .register_fn("blobby", payload_sensitive_workflow)
+        .payload_offloader(offloader)
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("trace");
+    let scheduled_next: Vec<&str> = inflated.steps[2]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled_next,
+        vec!["saw_payload -> default"],
+        "a configured offloader must hand the body the real payload, not the envelope"
+    );
+
+    // The control (and AC4's default): with no offloader the envelope is passed
+    // through verbatim rather than errored, so the assertion above is
+    // falsifiable.
+    let raw = debugger("blobby", payload_sensitive_workflow)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("an envelope must display, never error");
+    let scheduled_next: Vec<&str> = raw.steps[2]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(scheduled_next, vec!["saw_envelope -> default"]);
+}

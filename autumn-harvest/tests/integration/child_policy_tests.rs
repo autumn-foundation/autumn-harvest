@@ -85,6 +85,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -129,6 +130,7 @@ async fn start_workflow(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -220,6 +222,9 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "child_policy_tests",
@@ -250,6 +255,9 @@ fn wf_info_with_concurrency(
     concurrency: ConcurrencyPolicy,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "child_policy_tests",
@@ -339,6 +347,7 @@ async fn insert_detached_child_execution(
     let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),
@@ -638,10 +647,7 @@ async fn detached_child_workflow_uses_registered_concurrency_policy() {
             wf_info_with_concurrency(
                 "capped_detached_child",
                 capped_child_wf,
-                ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 2,
-                },
+                ConcurrencyPolicy::new("input.tenant_id", 2),
             ),
         ],
         vec![],
@@ -944,6 +950,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),
@@ -1206,6 +1213,7 @@ async fn workflow_reset_cascades_detached_children() {
             operator_id: "test-operator".to_string(),
             signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
+            refuse_erased_source: false,
         },
         None,
     )
@@ -1636,6 +1644,14 @@ async fn child_workflow_terminate_cascade_on_parent_failure() {
         "Terminate-policy child should have ParentClosed error; rows: {child_rows:?}"
     );
 }
+
+// Note: quota enforcement on a detached child spawn (issue #946, Codex
+// round-3 review) is exercised end-to-end through a real worker in
+// `quota_enforcement_tests.rs::detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`,
+// which uses that file's env-var-aware harness
+// (`crate::integration_e2e::setup_test_database_url_or_env`) so it can run
+// against a local Postgres instance rather than requiring Docker the way
+// this file's `setup_test_db_url()` does.
 
 // ── Unit test: ParentClosePolicy serde round-trip ─────────────────────────────
 

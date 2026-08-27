@@ -136,6 +136,9 @@ fn make_registry_for(
 ) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "scheduler_carryover_tests",
@@ -184,6 +187,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -367,6 +371,7 @@ async fn manual_start_has_no_carryover() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: autumn_harvest::types::Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

@@ -660,6 +660,7 @@ mod db_tests {
     ) {
         diesel::insert_into(harvest_workflow_executions::table)
             .values(NewWorkflowExecution {
+                quota_key: None,
                 continued_from_exec_id: None,
                 first_exec_id: None,
                 id: exec_id,
@@ -944,6 +945,7 @@ mod db_tests {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

@@ -14,6 +14,20 @@
 //!
 //! Run with:
 //!   cargo run --example schema_workflow --features schema
+//!
+//! # Emitting the schema contract (issue #794)
+//!
+//! Passing `--emit-contract` prints the checked-in baseline artifact instead of
+//! the demo output, so this example doubles as the *generator* the CI gate
+//! diffs against:
+//!
+//! ```text
+//! cargo run --example schema_workflow --features schema -- --emit-contract > current.json
+//! harvest schema check --current current.json
+//! ```
+//!
+//! Every embedder writes an equivalent 3-line generator in their own crate: it
+//! is the only place the live registry is in scope.
 
 #![allow(
     clippy::unused_async,
@@ -112,9 +126,38 @@ fn onboard_error_schema() -> serde_json::Value {
     serde_json::json!({"type": "string"})
 }
 
+// ── The registry, as the embedder's app would build it ───────────────────────
+
+/// Every workflow this "app" registers, with its published schemas attached.
+///
+/// This is the single source of truth for both the demo output below and the
+/// `--emit-contract` generator: the schema gate can only ever be as accurate as
+/// the registry it is handed, so they must not drift.
+fn registered_workflows() -> Vec<WorkflowInfo> {
+    vec![
+        onboarding_info()
+            .with_input_schema_fn(onboard_input_schema)
+            .with_output_schema_fn(onboard_output_schema)
+            .with_error_schema_fn(onboard_error_schema),
+        no_schema_workflow_info(),
+    ]
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // `--emit-contract` turns this example into the schema-contract generator
+    // the CI gate diffs against (issue #794). Kept deliberately tiny: three
+    // lines an embedder copies into their own binary.
+    if std::env::args().any(|a| a == "--emit-contract") {
+        let contract = autumn_harvest::WorkflowSchemaContract::from_infos(
+            env!("CARGO_PKG_VERSION"),
+            &registered_workflows(),
+        );
+        print!("{}", contract.to_json_pretty().expect("serialize contract"));
+        return;
+    }
+
     println!("=== Harvest JSON Schema opt-in demo (issue #373) ===\n");
 
     // ── Option A: manual schema via with_input_schema_fn ─────────────────────

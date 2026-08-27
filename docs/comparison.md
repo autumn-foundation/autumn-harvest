@@ -75,7 +75,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Components to deploy / upgrade |
 |---|---|
-| **autumn-harvest** | Embed `HarvestPlugin` in your Autumn app (or run standalone `HarvestRunner`) + point at a Postgres URL + run `diesel migration run`. No separate orchestrator cluster. Separate web/worker connection pools with a shared ceiling (`pool.rs`) keep worker bursts from starving HTTP handling; optional [sharding](sharding.md) is additive. |
+| **autumn-harvest** | Embed `HarvestPlugin` in your Autumn app (or run standalone `HarvestRunner`) + point at a Postgres URL. Migrations are registered with Autumn and applied by the framework (`autumn migrate`, or automatically under the `dev` profile); a standalone `HarvestRunner` applies them itself. No separate orchestrator cluster. Separate web/worker connection pools with a shared ceiling (`pool.rs`) keep worker bursts from starving HTTP handling; optional [sharding](sharding.md) is additive. |
 | Temporal | Separate server cluster of multiple services (Frontend, History, Matching, Worker) plus external DB(s); not a single production binary. Helm charts / docker-compose provided; your Workers are separate processes. ([docs](https://docs.temporal.io/self-hosted-guide/deployment)) |
 | DBOS | Lightweight — a **library embedded in your app process** + Postgres, "no additional infrastructure required." Optional Conductor control plane for recovery/visualization/HA. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Single `inngest` server binary/container + external Postgres/Redis for production (Helm chart available); your functions are HTTP handlers the engine calls. Self-hosting is comparatively new (GA'd ~2025). ([docs](https://www.inngest.com/docs/self-hosting)) |
@@ -351,9 +351,8 @@ Temporal-style Schedule object.
 
 - **[README](../README.md)** — project overview and quick start.
 - **[Getting started](getting-started/README.md)** — the chapter-by-chapter guide.
-- **Temporal migration guide** — _planned_
+- **[Temporal migration guide](migrating-from-temporal.md)**
   ([#947](https://github.com/autumn-foundation/autumn-harvest/issues/947)): a
-  move-from-Temporal / dual-run cutover playbook. That page does not exist yet;
-  when it ships it will link back here, making the cross-reference bidirectional.
-  This page answers _why / whether_ harvest; the migration guide will answer
+  concept map, a workflow-porting checklist, and a dual-run cutover playbook.
+  This page answers _why / whether_ harvest; the migration guide answers
   _how_ to move.

@@ -17,6 +17,153 @@ Exit codes are CI-friendly: `0 = pass`, `2 = warn`, `1 = fail`. The same
 endpoint is available as `GET /api/harvest/admin/preflight` for release
 scripts.
 
+### Catching a forgotten registration before rollout
+
+A `#[dag]` declares its activities structurally, so preflight already fails a
+DAG that names an unregistered one. An **imperative** `#[workflow]` has no such
+structure: `ctx.execute_activity(&send_email_info(), …)` compiles fine even when
+`send_email` was never added to `activities![…]`, and the miss only surfaces at
+runtime — one dispatch, one retry cycle, one dead letter later.
+
+Opt in to the same deploy-time check by declaring what the workflow dispatches:
+
+```rust
+#[workflow(activities = [send_email, charge_card], children = [generate_report])]
+async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
+    ctx.execute_activity(&send_email_info(), user_id).await?;
+    ctx.execute_activity(&charge_card_info(), user_id).await?;
+    let _: Report = ctx.spawn_child_workflow(&generate_report_info(), user_id).await?;
+    Ok(())
+}
+```
+
+Read it as a cross-check against your registration lists: every name in
+`activities = [..]` must appear in `activities![..]`, and every name in
+`children = [..]` in `workflows![..]`. **The attribute never registers anything
+— it only asserts.**
+
+Entries are bare identifiers (a path like `billing::charge_card` also works —
+only the last segment is used) or string literals for a name you dispatch
+dynamically via `ctx.execute_activity_raw("…", …)`. The identifier is taken
+literally and never name-resolved: an aliased import (`use send_email as
+email_act;` + `activities = [email_act]`) records `"email_act"` and fails
+preflight, and a typo stays a preflight failure rather than becoming a compile
+error — which is the point. `activities` resolves against the registered
+**activity** catalog, `children` against the registered **workflow** catalog;
+the two namespaces are separate.
+
+`children` is checked by name against the workflow catalog, so it also covers a
+cross-type `continue_as_new_as` target — the other imperative workflow-type
+reference preflight cannot otherwise see. Listing one turns "deleted a handler a
+live run was about to continue into" from a runtime failure into a deploy-time
+one. (The failure message still reads `child workflow`, matching the attribute
+you wrote.)
+
+Preflight then names every unresolved reference:
+
+```console
+$ harvest preflight
+overall_status: fail
+observed_at: 2026-08-14T09:12:00Z
+
+STATUS  CHECK                SCOPE  SUMMARY
+pass    database             -      database reachable
+fail    catalog_consistency  -      registered catalog contains unresolved workflow runtime references
+
+catalog_consistency (fail)
+  - workflow 'onboarding' references unregistered activity 'send_emial'
+  - workflow 'onboarding' references unregistered child workflow 'generate_reprot'
+  remediation: Register the named handler in activities![…] / workflows![…], or — if the workflow no longer references it — delete the stale entry from its declared dependencies.
+```
+
+The same payload is available structurally for scripting:
+
+```bash
+harvest --output json preflight \
+  | jq '.checks[] | select(.name == "catalog_consistency") | .details.failures'
+```
+
+The same builder is available without the macro, for a workflow registered by
+hand:
+
+```rust
+.workflows(vec![
+    onboarding_info()
+        .with_declared_activities(&["send_email", "charge_card"])
+        .with_declared_children(&["generate_report"]),
+])
+```
+
+**This is opt-in, and silence means "not declared", not "verified".** A workflow
+that never writes either attribute is never validated and can never fail
+preflight because of it — adopt it workflow by workflow, at whatever pace suits
+you. Declaring an empty list (`activities = []`) is different from declaring
+nothing: it is an explicit "this workflow dispatches no activities", and is
+checked (trivially) rather than skipped.
+
+Two things it deliberately does *not* do. It does not read the workflow body, so
+the declaration is a claim you maintain, not a fact the compiler derives — a
+dependency you removed from the code but left in the list will fail preflight
+until you delete it. And it checks only that the name is *registered somewhere
+in this process* — so if you split registration across processes (the API
+process registers workflows, a separate fleet registers the activity handlers),
+declare only what *this* process registers. Whether a worker polling the right
+queue is actually running is the separate `worker_health` / `queue_coverage`
+question.
+
+Declared dependencies are also surfaced per workflow type on
+`GET /api/harvest/workflows/registered`, so a service can publish its dependency
+graph without anyone reading Rust source.
+
+## Migrations
+
+In the default `embedded` mode, `HarvestPlugin` **registers** its migration sets
+with Autumn rather than applying them itself, so they follow the same rules as
+your app's own and every other plugin's. Autumn applies them during database
+setup, which runs before any startup hook — the Harvest runtime therefore boots
+against an already-migrated schema.
+
+- **`dev` profile** — pending migrations are applied automatically at startup.
+- **Every other profile** — pending migrations are *reported as warnings and not
+  applied*. Run a one-shot `autumn migrate` in your deploy pipeline **before**
+  rolling web replicas.
+
+Registering rather than applying is also what lets Autumn resolve version
+collisions between plugins: Diesel's `__diesel_schema_migrations` is keyed by
+version alone, so two independently authored migrations that reuse a version
+would otherwise silently skip one of them. Autumn sees every registered set at
+once, tracks the loser under a substitute version so both still apply, and logs
+it at `INFO`.
+
+Two cases need a separate migration procedure because Autumn has no handle on
+the target database:
+
+- **`harvest.mode = "split"` / `"external"`** — `autumn migrate` applies only
+  the application-database set (the workflow-start outbox). In non-`dev`
+  profiles, the plugin only checks the dedicated Harvest database and warns
+  about pending migrations; it does **not** apply them. Before rolling replicas,
+  run `autumn migrate`, then apply both Harvest sets to the URL configured as
+  `harvest.database.url`:
+
+  ```bash
+  autumn migrate
+
+  diesel migration run \
+    --database-url "$HARVEST_DATABASE_URL" \
+    --migration-dir autumn-harvest/migrations
+  diesel migration run \
+    --database-url "$HARVEST_DATABASE_URL" \
+    --migration-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  Set `HARVEST_DATABASE_URL` to the same value as `harvest.database.url`, and
+  run these commands from the workspace root (or adjust the migration paths to
+  the installed source tree). Do not roll replicas if any command fails. See
+  the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
+  for the ownership table and complete procedure.
+- **Multi-shard deployments** — each Harvest shard database needs the full set
+  applied. See [`sharding.md`](../sharding.md).
+
 ## Dashboard
 
 `http://localhost:3000/api/harvest/ui` shows live executions, event histories,

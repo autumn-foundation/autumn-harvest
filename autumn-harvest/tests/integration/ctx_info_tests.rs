@@ -67,6 +67,9 @@ fn ctx_info_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "e2e_test_workflow",
                 module: "ctx_info_tests",
@@ -89,6 +92,9 @@ fn ctx_info_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "child_info_workflow",
                 module: "ctx_info_tests",

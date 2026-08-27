@@ -154,6 +154,9 @@ fn build_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "telemetry_master_workflow",
                 module: "telemetry_span_tests",
@@ -178,6 +181,9 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "telem_child_wf",
                 module: "telemetry_span_tests",
@@ -323,6 +329,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     inherited_chain_deadline_at: None,
                     concurrency_key: None,
                     concurrency_limit: None,
+                    concurrency_on_conflict:
+                        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                     priority: Priority::default(),
                     max_workflow_input_bytes: 0,
                     start_at: None,
@@ -376,6 +384,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
+                        capability_miss_max_redeliveries: 5,
 
                         workflow_task_timeout: std::time::Duration::from_secs(10),
                         workflow_panic_max_attempts: 3,
@@ -560,7 +569,13 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     "telemetry_master_workflow".to_string(),
                     None,
                     // Issue #614: default history policy for this span test.
+                    // Issue #798: no task queue on this fixture.
+                    None,
+                    None, // issue #798: candidate build id (unset in this span test)
                     autumn_harvest::context::WorkflowHistoryPolicy::default(),
+                    // Issue #798: library-default payload limits for this span test.
+                    autumn_harvest::executor::ReplayPayloadLimits::default(),
+                    autumn_harvest::executor::ReplayDeclarativeHandlers::default(),
                 )
                 .await;
             });

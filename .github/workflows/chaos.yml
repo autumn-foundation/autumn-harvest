@@ -1,0 +1,63 @@
+# Deterministic chaos / fault-injection suite (issue #940).
+#
+# Runs the `chaos` feature test suite — the four historical-race reproducers plus
+# the seeded convergence sweep — against a real Postgres (testcontainers/Docker).
+# The sweep exercises N ≥ 5 distinct seeds per run; every failure prints its seed
+# for one-command local replay (see docs/testing/chaos.md).
+#
+# Not part of the required CI matrix: it runs on-demand (workflow_dispatch) and on
+# a nightly cron, so iterative PR pushes don't pay for it. The `chaos` feature is
+# off by default and never in `default`, so this job compiles the harness in.
+name: Chaos
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: >-
+          Optional space-separated u64 seeds for the convergence sweep (for
+          targeted replay of a printed failure). Leave empty to use the suite's
+          computed, non-vacuous default set (≥ 5 seeds).
+        required: false
+        default: ""
+  schedule:
+    # Nightly at 04:17 UTC (off the top of the hour to avoid scheduler pileups).
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Empty for the nightly cron → the sweep computes its own default seed set (the
+  # first N ≥ 5 seeds that drive a fault against the workload — non-vacuous *by
+  # construction*, so no magic list to keep in sync here). A manual dispatch can
+  # supply explicit seeds to replay a printed failure verbatim.
+  CHAOS_SEEDS: ${{ github.event.inputs.seeds || '' }}
+
+jobs:
+  chaos:
+    name: Chaos suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile chaos suite
+        run: cargo test -p autumn-harvest --features chaos --test integration --no-run
+      - name: Run chaos harness unit tests (no DB)
+        # The controller's own invariants — generation fencing, the entry-snapshot
+        # torn-read rejection (a straddling task can't adopt a newer plan), the
+        # scripted-cap validation, and seeded determinism — are no-DB lib tests.
+        # Run them here (fast, no container) so a regression in the harness
+        # *itself* is caught, not merely compiled by the always-on lint job.
+        run: cargo test -p autumn-harvest --features chaos --lib chaos:: -- --test-threads=1
+      - name: Run chaos reproducers + seeded convergence sweep
+        # `--test-threads=1`: the harness serialises armed plans on a process-wide
+        # mutex anyway, and each test spins its own Postgres container — running
+        # serially keeps container resource use bounded. The suite is scoped to the
+        # `chaos_tests` module so only the fault-injection tests run under `chaos`.
+        run: cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --nocapture --test-threads=1

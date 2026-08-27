@@ -251,6 +251,48 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Resolve the effective next-retry delay for an author-supplied `retry_after` hint (issue #744).
+///
+/// The hint —
+/// [`ActivityFailure::retry_after`](crate::failure::ActivityFailure::retry_after)
+/// — is clamped to a builder-configured ceiling:
+///
+/// - `retry_after = None` -> `None` (no hint; the caller falls through to the
+///   policy's own backoff curve for this attempt).
+/// - `retry_after = Some(Duration::ZERO)` -> `None`. `Duration` cannot
+///   represent a negative value, so "a value `<= 0` falls through to the
+///   normal policy delay" (issue #744, AC3) reduces to exactly this case.
+/// - `retry_after = Some(d)` where `d > ceiling` -> `Some(ceiling)` (clamped
+///   down, never rejected).
+/// - `retry_after = Some(d)` where `0 < d <= ceiling` -> `Some(d)` (honored
+///   verbatim).
+///
+/// **`ceiling = Duration::ZERO` is *not* a "disable `retry_after` honoring"
+/// switch.** For any positive hint `d`, `d.min(Duration::ZERO) ==
+/// Duration::ZERO`, so this resolves to `Some(Duration::ZERO)` — an
+/// IMMEDIATE retry — not `None` (fall through to the policy delay). This is
+/// the opposite of what an operator setting the ceiling to zero might
+/// reasonably expect. There is no separate switch to turn `retry_after`
+/// honoring off entirely today; an author who never calls
+/// [`ActivityFailure::with_retry_after`](crate::failure::ActivityFailure::with_retry_after)
+/// is the only way to opt an activity out.
+///
+/// This function does **not** consult `non_retryable` or the retry policy's
+/// `max_attempts` cap — callers must check those first (a non-retryable
+/// failure, or an attempt count that has already exhausted the policy, must
+/// never be resurrected by a delay hint).
+#[must_use]
+pub fn resolve_retry_after_hint(
+    retry_after: Option<Duration>,
+    ceiling: Duration,
+) -> Option<Duration> {
+    let hint = retry_after?;
+    if hint.is_zero() {
+        return None;
+    }
+    Some(hint.min(ceiling))
+}
+
 /// Per-activity circuit-breaker configuration (issue #369).
 ///
 /// When attached to an activity (via the `#[activity(circuit_breaker = ...)]`
@@ -310,7 +352,13 @@ impl CircuitBreakerPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MapFailurePolicy {
-    /// First instance failure fails the mapped node, and any in-flight instances are cancelled.
+    /// The first instance failure fails the mapped node; downstream levels are
+    /// never dispatched.
+    ///
+    /// The failing instance's outcome wins even when later instances succeed.
+    /// Sibling instances already dispatched are **not** durably cancelled — the
+    /// node settles every instance before the DAG terminates, so the recorded
+    /// history stays replay-clean (issue #780).
     #[default]
     FailFast,
     /// The collect node receives per-slot success/failure, making partial batch failures observable.
@@ -1401,6 +1449,119 @@ pub(crate) fn resolve_effective_start_to_close(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Retry-After hint clamp/resolve (issue #744) ────────────────────────────
+    //
+    // RED PHASE: `resolve_retry_after_hint` does not exist yet -- these tests
+    // fail to COMPILE against the missing `crate::policy` symbol until the
+    // green phase adds it.
+
+    #[test]
+    fn resolve_retry_after_hint_none_falls_through() {
+        assert_eq!(
+            resolve_retry_after_hint(None, Duration::from_secs(900)),
+            None,
+            "no hint present -> fall through to the policy's own delay"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_zero_falls_through() {
+        // Duration cannot be negative, so "<= 0" reduces to exactly ZERO.
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::ZERO), Duration::from_secs(900)),
+            None,
+            "a zero-duration hint must fall through to the policy delay (AC3)"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_zero_ceiling_clamps_a_positive_hint_to_zero_not_none() {
+        // Confirmed edge case (issue #744 review): `ceiling = ZERO` is NOT a
+        // "disable the feature" switch. A positive hint clamps down to
+        // Duration::ZERO (an immediate retry), it does NOT fall through to
+        // `None` (the policy delay) the way a genuinely absent/zero HINT
+        // would. Contrast with `resolve_retry_after_hint_zero_falls_through`
+        // above, which tests the opposite axis (hint == ZERO).
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::ZERO),
+            Some(Duration::ZERO),
+            "a zero ceiling clamps a positive hint down to zero, it does not disable honoring"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_under_ceiling_is_honored_verbatim() {
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::from_secs(900)),
+            Some(Duration::from_secs(30)),
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_at_ceiling_is_honored_verbatim() {
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_secs(900)), Duration::from_secs(900)),
+            Some(Duration::from_secs(900)),
+            "a hint exactly at the ceiling must not be treated as over-ceiling"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_over_ceiling_is_clamped_not_rejected() {
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_secs(3600)), Duration::from_secs(900)),
+            Some(Duration::from_secs(900)),
+            "an over-ceiling hint must clamp down, never error/reject (AC3)"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_one_nanosecond_is_honored() {
+        // The smallest possible positive Duration must not be treated as "zero".
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_nanos(1)), Duration::from_secs(900)),
+            Some(Duration::from_nanos(1)),
+        );
+    }
+
+    #[test]
+    fn resolve_retry_after_hint_100_randomized_hints_never_resolve_below_the_clamp() {
+        // Success-metric property test (issue #744): for 100 varied hint /
+        // ceiling combinations, the resolved delay is never less than
+        // `min(hint, ceiling)` when the hint is a positive duration -- i.e. a
+        // retry scheduled from this resolution can never fire earlier than
+        // the (possibly clamped) hinted time. Deterministic PRNG, no sleeping.
+        fn mix(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        let mut seed: u64 = 0x744_u64.wrapping_add(1);
+        for _ in 0..100 {
+            let hint_secs = mix(&mut seed) % 7200; // 0..2h
+            let ceiling_secs = 1 + (mix(&mut seed) % 1800); // 1s..30m, never zero
+            let hint = Duration::from_secs(hint_secs);
+            let ceiling = Duration::from_secs(ceiling_secs);
+
+            let resolved = resolve_retry_after_hint(Some(hint), ceiling);
+
+            if hint.is_zero() {
+                assert_eq!(resolved, None, "zero hint must fall through");
+            } else {
+                let expected = hint.min(ceiling);
+                assert_eq!(
+                    resolved,
+                    Some(expected),
+                    "hint={hint:?} ceiling={ceiling:?} must resolve to exactly min(hint, ceiling) \
+                     -- exact equality is a strictly stronger guarantee than \"resolved >= \
+                     min(hint, ceiling)\", which this exact-equality assertion already implies"
+                );
+            }
+        }
+    }
 
     // ── Builder-level activity default floor (issue #620) ─────────────────────
     //

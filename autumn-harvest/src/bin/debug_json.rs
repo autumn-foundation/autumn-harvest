@@ -10,7 +10,9 @@ fn main() {
 
     let event_req = WorkflowEvent::ExternalSignalRequested {
         signal_id,
-        target: autumn_harvest::types::ExecutionId::new(),
+        target: autumn_harvest::types::ExternalTarget::ExecutionId(
+            autumn_harvest::types::ExecutionId::new(),
+        ),
         signal_name: "test".to_string(),
         payload: serde_json::json!({"a": 1}),
         idempotency_key: None,

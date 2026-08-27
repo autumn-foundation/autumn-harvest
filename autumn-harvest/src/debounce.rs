@@ -148,6 +148,13 @@ pub struct DebounceStartOptions {
     pub concurrency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// Effective per-key overflow strategy (issue #811), captured at admission so a
+    /// debounced / throttled / batched start does NOT silently drop a declared
+    /// `on_conflict = "cancel_running"` policy. Absent (`None`) means the default
+    /// [`crate::concurrency::ConcurrencyOnConflict::Defer`], so a pre-#811 carrier
+    /// row deserialises to today's behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_on_conflict: Option<crate::concurrency::ConcurrencyOnConflict>,
     /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission
     /// time, so a debounced run carries the same operator metadata as a normal
     /// start (the fire path has no access to the plugin registry).
@@ -533,7 +540,7 @@ type FiredDebounce = (
     String,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
-    Vec<(String, String)>,
+    Vec<crate::execution::StartCancelledRun>,
 );
 
 /// Scan and fire due debounce rows on a single shard connection. Returns the
@@ -651,14 +658,7 @@ pub async fn fire_due_debounced_starts(
                 )
                 .await;
             }
-            for (wf_name, q_name) in cancel_metrics {
-                crate::telemetry::emit_workflow_terminal(
-                    metrics,
-                    &wf_name,
-                    &q_name,
-                    crate::telemetry::WorkflowStatus::Cancelled,
-                );
-            }
+            crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
             metrics.record_debounce_fired(&workflow_name, &queue_name);
             // issue #618, F1: the debounce scanner relays a start already
             // admitted through the gate at HTTP time; count the deferred fire as
@@ -717,6 +717,44 @@ async fn delete_debounce_row(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Re-defer backoff for a row blocked by an exhausted per-tenant quota
+/// (issue #946) at fire time. Mirrors `throttle.rs`'s identically-named,
+/// identically-valued constant — kept as a separate `const` per file purely
+/// for log/intent clarity; nothing depends on the two staying numerically
+/// equal.
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Push a quota-blocked debounce row's `effective_fire_at` forward by
+/// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
+/// re-attempted less often instead of thrashing the claim batch every
+/// scanner tick.
+///
+/// Clamped to never exceed the row's own `max_fire_at` (`LEAST($2,
+/// max_fire_at)`), preserving the pre-existing debounce `max_wait` contract:
+/// a quota block can delay a fire past its trailing-edge deadline, but never
+/// past the absolute cap the caller configured at admission. Runs inside the
+/// caller's fire transaction so the row-level `FOR UPDATE` lock is held
+/// through the update. Mirrors [`delete_debounce_row`]'s parameterized
+/// `sql_query` style.
+#[cfg(feature = "db")]
+async fn redefer_debounce_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row_id: uuid::Uuid,
+    new_effective_fire_at: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "UPDATE harvest_debounce SET effective_fire_at = LEAST($2, max_fire_at) WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(row_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -804,6 +842,7 @@ async fn fire_claimed_debounce_row(
         inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
+        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,
@@ -867,6 +906,44 @@ async fn fire_claimed_debounce_row(
                 debounce_key = %debounce_key,
                 workflow_id = %workflow_id,
                 "debounced start skipped: workflow_id already exists under reuse policy",
+            );
+            Ok(None)
+        }
+        // issue #946 (Task #7 hardening): a declared per-tenant quota is
+        // exhausted at fire time. Unlike `AlreadyExists` above this is
+        // TEMPORARY — the tenant's usage can free up as an existing
+        // execution completes or is deleted — so the row is RE-DEFERRED
+        // (left, `effective_fire_at` bumped with backoff, clamped at
+        // `max_fire_at`) rather than dropped, and rather than (via a bare
+        // `?`) aborting this whole scanner-tick's claim transaction. A debounce
+        // admission never itself runs the quota check (no execution row
+        // exists to check yet — see the module docs), so this fire-time path
+        // is the FIRST point a debounced start can observe the cap; an
+        // un-caught `?` here would roll back every OTHER already-started row
+        // in the same batch and propagate out through `enforce_timeouts_once`,
+        // starving every later scanner duty (history-ceiling enforcement,
+        // broken-session/mutex-lease reclaim, start-idempotency sweep, …) on
+        // every tick for as long as one quota-blocked tenant sits at the head
+        // of the claim queue.
+        Err(crate::error::HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let now = Utc::now();
+            redefer_debounce_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            tracing::debug!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                workflow_id = %workflow_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "debounced start blocked by a per-tenant quota at fire time; \
+                 re-deferred with backoff",
             );
             Ok(None)
         }

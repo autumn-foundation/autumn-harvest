@@ -59,6 +59,12 @@ pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 /// [`PayloadStore`](crate::payload_store::PayloadStore). Only takes effect when
 /// a store is registered.
 pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
+/// Default ceiling on an author-supplied `Retry-After` delay hint (issue #744): 15 minutes.
+///
+/// Bounds abuse from a misbehaving/malicious downstream without rejecting a
+/// legitimate hint outright — an over-ceiling value is clamped down, never
+/// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
+pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -122,6 +128,8 @@ pub struct HarvestBuilder {
     /// `ctx.set_current_details(...)` (issue #473).
     /// Default: 1 KiB.
     max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` = disabled.
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     max_workflow_start_delay: Option<Duration>,
@@ -192,6 +200,7 @@ impl Default for HarvestBuilder {
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            workflow_log_policy: None,
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
@@ -310,6 +319,8 @@ pub struct BuiltHarvest {
     /// Maximum byte length for `current_details` strings (issue #473).
     /// Default: 1 KiB.
     pub max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` = disabled.
+    pub workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -382,6 +393,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_current_details_bytes", &self.max_current_details_bytes)
+            .field("workflow_log_policy", &self.workflow_log_policy)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field(
                 "unknown_target_grace_window",
@@ -577,6 +589,25 @@ pub enum HarvestBuilderError {
         dag: String,
         /// The signal the gate waits on.
         signal: String,
+    },
+
+    /// A classic (non-unified) DAG declares a node compensator (issue #780).
+    /// Compensation lowers onto the unified workflow-handler execution path
+    /// (`run_unified_dag`'s terminal-failure `Saga` unwind); the classic DAG
+    /// executor has no unwind step, so the compensator would silently never
+    /// run. Enable the `unified-dag-execution` feature (on by default) so the
+    /// `#[dag]` macro emits the workflow handler that can run compensations.
+    #[error(
+        "classic DAG '{dag}' declares compensator '{compensate}' on task '{task}' but is not \
+         unified (workflow_handler is None); compensation requires the unified-dag-execution path"
+    )]
+    DagCompensationRequiresUnifiedExecution {
+        /// DAG containing the compensated node.
+        dag: String,
+        /// The node declaring the compensator.
+        task: String,
+        /// The declared compensator activity name.
+        compensate: String,
     },
 
     /// A workflow declares `ConcurrencyPolicy { limit: 0 }`, which makes the
@@ -1072,14 +1103,30 @@ impl BuiltHarvest {
             self.max_signal_payload_bytes,
         )
         .with_current_details_cap(self.max_current_details_bytes)
+        .with_workflow_log_policy(self.workflow_log_policy)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
+        // Issue #743 review (PR #1141, Finding #3): thread the fleet-wide
+        // execution_timeout ceiling into the registry so the scheduler tick,
+        // buffered-drain, and manual DAG trigger paths -- which have no
+        // `api_state` -- apply the SAME ceiling manual/HTTP starts already do.
+        .with_max_workflow_execution_timeout(self.max_workflow_execution_timeout)
+        // Issue #803: name the auto-registered unified DAGs so the core
+        // continue-as-new path can reject a cross-type continuation into one
+        // (the plugin's `is_registered_dag` is unavailable to the worker).
+        .with_dag_workflow_names(
+            self.dags
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string()),
+        )
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
-        );
+        )
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1138,14 +1185,30 @@ impl BuiltHarvest {
             self.max_signal_payload_bytes,
         )
         .with_current_details_cap(self.max_current_details_bytes)
+        .with_workflow_log_policy(self.workflow_log_policy)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
+        // Issue #743 review (PR #1141, Finding #3): thread the fleet-wide
+        // execution_timeout ceiling into the registry so the scheduler tick,
+        // buffered-drain, and manual DAG trigger paths -- which have no
+        // `api_state` -- apply the SAME ceiling manual/HTTP starts already do.
+        .with_max_workflow_execution_timeout(self.max_workflow_execution_timeout)
+        // Issue #803: name the auto-registered unified DAGs so the core
+        // continue-as-new path can reject a cross-type continuation into one
+        // (the plugin's `is_registered_dag` is unavailable to the worker).
+        .with_dag_workflow_names(
+            self.dags
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string()),
+        )
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
-        );
+        )
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1557,6 +1620,7 @@ impl HarvestBuilder {
             queue,
             Some(registration.retry.clone()),
             registration.start_to_close,
+            registration.schedule_to_close,
         ));
         self.wasm_bindings
             .insert(registration.name.clone(), registration.binding());
@@ -1696,6 +1760,24 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
+    /// Override the fraction of [`history_event_hard_cap`](Self::history_event_hard_cap)
+    /// at which the operator early-warning soft threshold fires (issue #704).
+    /// Clamped into `[0.0, 1.0]`; `0.0` disables the signal entirely (AC4).
+    ///
+    /// Has no effect unless a hard cap is also configured -- with no hard
+    /// cap there is nothing to warn about approaching.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
+    /// (`0.75`).
+    #[must_use]
+    pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_history_bloat_warn_fraction(fraction);
         self
     }
 
@@ -1871,6 +1953,42 @@ impl HarvestBuilder {
         self
     }
 
+    /// Enable the **opt-in** durable per-execution workflow-log sink (issue #790).
+    ///
+    /// With a policy installed, the lines a workflow emits through the existing
+    /// [`ctx.logger()`](crate::context::WorkflowContext::logger) /
+    /// `ctx.log_info` / `ctx.log_warn` / `ctx.log_error` entry points (issue
+    /// #379) are additionally persisted to the per-execution
+    /// `harvest_workflow_logs` table and readable via
+    /// `GET /api/harvest/workflows/{id}/logs` and the Vantage UI Logs panel —
+    /// so triaging a failed run no longer requires pivoting to external log
+    /// aggregation and correlating by execution id.
+    ///
+    /// **Off by default, and additive.** Without this call `ctx.logger()`
+    /// behaves exactly as before: `tracing`-only, no command pushed, no write.
+    /// The `tracing` sink is unchanged either way — this *adds* a sink, it does
+    /// not replace one.
+    ///
+    /// Log lines are **observational only**: they are not part of the event
+    /// history, carry no determinism guarantee, and must never be read back
+    /// into workflow logic.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::builder::HarvestBuilder;
+    /// # use autumn_harvest::context::WorkflowLogPolicy;
+    /// # let builder = HarvestBuilder::new();
+    /// // Defaults: 1,000 lines per execution, 4 KiB per line.
+    /// let builder = builder.workflow_log_persistence(WorkflowLogPolicy::new());
+    /// ```
+    #[must_use]
+    pub const fn workflow_log_persistence(
+        mut self,
+        policy: crate::context::WorkflowLogPolicy,
+    ) -> Self {
+        self.workflow_log_policy = Some(policy);
+        self
+    }
+
     /// Set the global maximum allowed start delay for a workflow (issue #322).
     ///
     /// Default: 365 days.
@@ -1960,6 +2078,11 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
+        // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
+        // capability-miss liveness window cannot vouch for. Never rejects — an
+        // already-deployed slow fleet must keep booting.
+        #[cfg(feature = "db")]
+        warn_if_heartbeat_outruns_fleet_liveness(self.worker_config.worker_heartbeat_interval);
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
@@ -1984,6 +2107,7 @@ impl HarvestBuilder {
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
+        validate_classic_dags_have_no_compensators(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
         validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
@@ -2053,6 +2177,7 @@ impl HarvestBuilder {
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
             max_current_details_bytes: self.max_current_details_bytes,
+            workflow_log_policy: self.workflow_log_policy,
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
@@ -2108,6 +2233,18 @@ fn validate_dags_do_not_use_local_activities(
                     activity: task.activity_name.clone(),
                 });
             }
+            // A compensator (issue #780) is dispatched through the same DAG
+            // activity-queue lowering as a forward node, so a local activity is
+            // just as invalid there. The error names the COMPENSATOR, not the
+            // forward node that declares it.
+            if let Some(compensate) = &task.compensate
+                && local_activities.contains(compensate.as_str())
+            {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: compensate.clone(),
+                });
+            }
         }
     }
 
@@ -2135,6 +2272,37 @@ fn validate_classic_dags_have_no_signal_gates(dags: &[DagInfo]) -> Result<(), Ha
                     dag: dag.name.to_string(),
                     signal: gate.signal_name.clone(),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a node compensator on a **classic** (non-unified) DAG
+/// (`workflow_handler.is_none()`) — issue #780.
+///
+/// Compensation lowers onto the unified workflow-handler path
+/// (`run_unified_dag`'s terminal-failure `Saga` unwind); the classic DAG
+/// executor has no unwind step, so the compensator would silently never run —
+/// the worst possible failure mode for an undo. A compensator on a unified DAG
+/// (`workflow_handler.is_some()`, the default `#[dag]` output) is allowed.
+fn validate_classic_dags_have_no_compensators(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        if dag.workflow_handler.is_some() {
+            continue;
+        }
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if let Some(compensate) = &task.compensate {
+                return Err(
+                    HarvestBuilderError::DagCompensationRequiresUnifiedExecution {
+                        dag: dag.name.to_string(),
+                        task: task.activity_name.clone(),
+                        compensate: compensate.clone(),
+                    },
+                );
             }
         }
     }
@@ -2218,6 +2386,43 @@ fn validate_completion_triggers(
         }
     }
     Ok(())
+}
+
+/// Warn when this worker heartbeats more slowly than the fleet-wide liveness
+/// window its peers judge it by (issue #804, Codex round-19 P1).
+///
+/// Nothing in `harvest_workers` records a worker's cadence, so a peer running
+/// the capability-miss fleet lookup cannot ask "is this row fresh *for the
+/// worker that wrote it*" — it applies one fleet-wide window
+/// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]) to every row. A
+/// worker configured past
+/// [`crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`] can
+/// therefore look dead to a peer while it is perfectly healthy, and be omitted
+/// from the fleet that decides whether "no capable worker is live" is true.
+///
+/// A warning rather than a rejection: an existing deployment already running a
+/// slow cadence must keep booting (the same warn-never-error posture the
+/// degenerate slot-tuner band and `queue_weights` take), and the consequence is
+/// confined to one escalation bound — the distinct-worker bound and the absolute
+/// ceiling are unaffected.
+///
+/// Returns whether the warning fired so the decision is testable without a
+/// tracing subscriber.
+#[cfg(feature = "db")]
+fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
+    let ceiling = crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS;
+    if interval <= ceiling {
+        return false;
+    }
+    tracing::warn!(
+        worker_heartbeat_interval_secs = interval.as_secs(),
+        supported_ceiling_secs = ceiling.as_secs(),
+        "harvest: worker_heartbeat_interval exceeds the cadence the capability-miss fleet \
+         lookup can vouch for (issue #804); a peer may treat this worker as dead while it is \
+         healthy and escalate a task this worker could have run. Lower the interval, or accept \
+         that the configured-total redelivery bound may fire early for this fleet."
+    );
+    true
 }
 
 /// Validates that every per-workflow-type retention override (issue #737)
@@ -2814,11 +3019,18 @@ pub struct WorkerConfig {
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
-    /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
-    /// shape. Multi-shard operators typically run one worker process per
-    /// shard with `shard_assignments = vec![that_shard]`, but the field is
-    /// a `Vec` so future per-process multi-shard workers can list all shards
-    /// they should poll without changing the config surface.
+    /// Defaults to **empty**, which means *auto*: the worker covers every
+    /// shard this process has a pool for (issue #961, AC1). With **no** sharded
+    /// pool it stays empty — there is no shard identity to resolve, and every
+    /// read-side consumer already reads the empty array as "covers whatever
+    /// shard this row was read from" (see
+    /// [`crate::workers::shard_assignments_cover`] and issue #1150). Do **not**
+    /// rely on a pool-less worker advertising shard `0`: it advertises no shard
+    /// at all. Set an explicit list to narrow a worker to a subset — typically
+    /// the one-worker-process-per-shard shape,
+    /// `shard_assignments = vec![that_shard]`. See
+    /// [`resolve_shard_assignments`] for the resolution rules; the effective
+    /// (resolved) list is what `GET /admin/config` reports.
     pub shard_assignments: Vec<ShardId>,
     /// Hard cap on `start_to_close` for local activities.
     ///
@@ -2844,9 +3056,29 @@ pub struct WorkerConfig {
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
     pub default_activity_start_to_close: Option<Duration>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint (issue #744).
+    ///
+    /// `ActivityFailure::retry_after` lets an activity author override the
+    /// policy-computed backoff for a single attempt (e.g. to honor a
+    /// downstream's `Retry-After` response header). This ceiling bounds that
+    /// hint so a misbehaving/malicious downstream cannot park a task for an
+    /// unbounded duration — an over-ceiling hint is clamped down, never
+    /// rejected. Unlike the two builder-default floors above this is **not**
+    /// opt-in: it always applies, with the sane default
+    /// [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
+    /// [`WorkerConfig::with_retry_after_ceiling`].
+    pub retry_after_ceiling: Duration,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
+    ///
+    /// Not every subsystem derives the same window from this knob. The
+    /// poison-pill reclaimer (#367) and the broken-session scanner (#606) use
+    /// the bare `2 ×` value, but the capability-miss fleet lookup (#804) floors
+    /// it at 120 s — see [`Self::capability_miss_max_redeliveries`] — because it
+    /// judges *peers* whose cadence it cannot read. Lowering this interval
+    /// therefore speeds the first two up and leaves the third unchanged for any
+    /// value at or under 60 s.
     pub worker_heartbeat_interval: Duration,
     /// Immutable build identifier for this worker binary (issue #171).
     ///
@@ -2891,6 +3123,108 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum number of **distinct workers** that may release a task back to
+    /// `PENDING` because they had no handler registered for its
+    /// workflow/activity type, before it is escalated to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    ///
+    /// **No dead-letter row is written.** The escalation routes through
+    /// `fail_task_and_execution_with_history`, which fails the task and the
+    /// execution without inserting into `harvest_dead_letters` — the reason
+    /// lives on the failed execution row, so an operator diagnosing an
+    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
+    /// this path would also be indistinguishable from a poison-pill
+    /// quarantine, [`poison_pill_threshold`], which a capability miss
+    /// deliberately is not.)
+    ///
+    /// Any worker polling a queue can claim any task on it — the queue's
+    /// non-blocking claim query has no capability filter, and cannot have one
+    /// (a worker can enumerate the handlers it *has* registered, never the
+    /// ones it has not).
+    /// A claim by an incapable worker is therefore released for a capable peer
+    /// rather than terminally failing the execution, which makes the routine
+    /// mid-rolling-deploy window blameless.
+    ///
+    /// Each release defers the task by a capped exponential backoff (1 s
+    /// doubling to 30 s), so the budget buys a dwell window comfortably longer
+    /// than a pod flip.
+    ///
+    /// # The budget is per distinct worker
+    ///
+    /// The backoff makes a released task eligible to *every* worker again — the
+    /// one that just released it included. If the budget counted total
+    /// releases, one incapable worker winning the claim race `N + 1` times in a
+    /// row would terminally fail a run while a capable peer sat live and idle,
+    /// which is the very outage this setting exists to prevent. So the task
+    /// records the **set** of workers that have missed it
+    /// (`capability_miss_workers`), and a repeat miss by a worker already in
+    /// that set is free: it still backs off, but consumes no budget.
+    ///
+    /// # The budget is gated on the live fleet
+    ///
+    /// A distinct count still has no relationship to how many workers are
+    /// actually up: a rollout with `N + 1` old pods plus one new capable pod
+    /// can hand `N + 1` distinct incapable ids to the budget while the capable
+    /// pod is live and polling. So this budget may only terminate a task once
+    /// the recorded miss set **covers the live fleet for the task's queue**
+    /// (`harvest_workers` rows with a fresh heartbeat advertising it). That
+    /// liveness window is **not** the poison-pill one: it is
+    /// [`crate::worker::capability_miss_fleet_stale_secs`], which is
+    /// `2 × worker_heartbeat_interval` **floored at 120 s**
+    /// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]). The reclaimer
+    /// and the broken-session scanner judge rows they own with a window they
+    /// chose; this query judges *peers*, whose cadence nothing in
+    /// `harvest_workers` records — so a fast-heartbeating claimant must not
+    /// declare a healthy peer on a slower cadence dead. At the default 5 s
+    /// cadence the two windows are 120 s and 10 s.
+    ///
+    /// The timing consequence worth predicting: after a pod dies, its row keeps
+    /// holding the evidence at "a capable peer may exist" for up to 120 s, and
+    /// in that interval **both** evidence-derived bounds are withheld — this
+    /// fleet-covering one *and* the distinct-worker one. The absolute release
+    /// ceiling (`10 ×` the budget) is what still fires, so AC3 holds, but a task
+    /// whose fleet cannot be shown covered waits on that ceiling rather than on
+    /// `max_redeliveries`. The delay costs redeliveries, never the run. Tuning
+    /// `worker_heartbeat_interval` *below* 60 s does not shorten it.
+    /// While any live worker there has never missed the task, this bound is
+    /// withheld.
+    ///
+    /// Two consequences: the effective bound is `max(N, live fleet size)`
+    /// redeliveries — you cannot prove "no worker here has the handler" in
+    /// fewer redeliveries than there are workers to ask — and a fleet whose
+    /// workers are not registered at all (heartbeats disabled, or a different
+    /// queue name advertised) falls back to bounding on `N` alone, with the
+    /// escalation reason saying so rather than claiming a fleet conclusion.
+    ///
+    /// A *second* bound on **total** releases keeps `N` a real maximum for the
+    /// common small deployment. Once the registry confirms every live worker on
+    /// the queue has already missed the task, the distinct set cannot grow, so
+    /// with a fleet smaller than the budget the distinct bound is unreachable —
+    /// one incapable worker pins `distinct_after` at 1 forever. This bound
+    /// therefore escalates at `N` total releases, but only on that same
+    /// fleet-covering evidence: on evidence the registry cannot supply it would
+    /// let a single worker exhaust the budget by winning the claim race
+    /// repeatedly, which is exactly what the distinct count exists to prevent.
+    ///
+    /// Only a third, **ungated** absolute ceiling of `10 ×` this value remains
+    /// for the cases neither gated bound can reach: a fleet the registry cannot
+    /// describe at all, and a live worker that never claims (which keeps the
+    /// evidence at "a capable peer may exist" and withholds *both* gated
+    /// bounds). It reports the counts it actually observed rather than a
+    /// fleet-wide conclusion, and the sustained-release alert fires long before
+    /// it.
+    ///
+    /// Both the set and the total are reset by every path that proves the
+    /// claiming worker *was* capable, so they measure **consecutive** misses —
+    /// the same semantics [`poison_pill_threshold`] has for crashes.
+    ///
+    /// Defaults to **5**. Set to `0` to escalate on the **first** miss (the
+    /// pre-#804 fail-fast behaviour) — note this is *not* an "unlimited
+    /// releases" switch; releasing forever would let a genuinely-unregistered
+    /// type bounce indefinitely, which is exactly what the budget bounds.
+    ///
+    /// [`poison_pill_threshold`]: Self::poison_pill_threshold
+    pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).
     ///
@@ -2996,6 +3330,108 @@ pub struct WorkerConfig {
     pub max_concurrent_sessions: i32,
 }
 
+/// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
+///
+/// A duplicate entry in [`WorkerConfig::shard_assignments`] is never useful and
+/// is actively harmful: the worker fans its per-shard control loops out over
+/// the assignment list one-to-one, so `[0, 0]` spawns **two** timeout checkers,
+/// **two** poison-pill reclaimers, and **two** pause auto-resumers against the
+/// *same* database — doubling enforcement passes, connection pressure, and DB
+/// load for no added coverage, since each pair scans identical rows.
+///
+/// It also collapses those instances onto one `harvest.scanner.tick` series
+/// (they share both the `scanner` and `shard` label values), so a healthy
+/// duplicate would keep `rate(...) > 0` and mask its wedged twin from the
+/// `harvest_scanner_stalled` alert. Deduplicating at the config boundary fixes
+/// the root cause rather than papering over the symptom with an unbounded
+/// owner-id metric label — the registry's owner ids are monotonic and never
+/// reused, so labelling by them would violate the ADR-0001 §7 bounded-label
+/// rule in any process that restarts a runtime.
+///
+/// First-occurrence order is preserved rather than sorting, so a deliberate
+/// polling order stays intact.
+#[must_use]
+pub(crate) fn dedup_shard_assignments(shards: Vec<ShardId>) -> Vec<ShardId> {
+    let mut seen = std::collections::BTreeSet::new();
+    shards
+        .into_iter()
+        .filter(|shard| seen.insert(*shard))
+        .collect()
+}
+
+/// Resolve a worker's **effective** shard assignments (issue #961, AC1).
+///
+/// An **empty** [`WorkerConfig::shard_assignments`] means *auto*: cover every
+/// shard this process actually has a pool for. Before issue #961 the default
+/// was a literal `[ShardId::new(0)]`, so a multi-shard deployment that never
+/// called [`WorkerConfig::with_shard_assignments`] silently drained only shard
+/// 0 while workflows routed to every other shard sat permanently undispatched
+/// — the exact silent failure #961 exists to close.
+///
+/// Resolution rules:
+/// - **Non-empty explicit** → [`dedup_shard_assignments`] of the operator's
+///   list, verbatim order. An explicit assignment is a deliberate decision (the
+///   one-worker-process-per-shard shape) and is never widened.
+/// - **Empty + a sharded pool** → every shard id in the pool, ascending, so the
+///   round-robin poll order is deterministic across restarts.
+/// - **Empty + no pool** → **empty**, preserved verbatim. There is no shard
+///   identity to resolve, so fabricating a `[ShardId::new(0)]` would assert a
+///   shard number this process never established — the write-side twin of
+///   issue #1150, whose read-side consumers all normalize the empty array as
+///   "covers whatever shard the row was read from". [`crate::shard::ShardRouter`]
+///   also accepts an arbitrary default shard, so `0` is not a safe stand-in
+///   even for a genuinely single-shard deployment. Single-shard stays
+///   byte-for-byte unchanged (AC7) because the poll loop's shard is an
+///   `Option` and `harvest.shard.dispatched` is emitted only when the worker
+///   has a shard identity.
+///
+/// Deriving from the **pool** rather than the router's writable set is
+/// deliberate: the pool is what this process can physically reach, so an
+/// auto-resolved assignment can never trip
+/// `worker::missing_assigned_shard_pools`. `runner.rs`'s `missing_router_shards`
+/// check already refuses startup when a router shard has no pool, making the
+/// pool a superset of the writable set in any startable deployment — and the
+/// pool additionally covers *draining* (readable-but-not-writable) shards,
+/// which still hold in-flight work that must be drained.
+#[must_use]
+pub(crate) fn resolve_shard_assignments(
+    explicit: Vec<ShardId>,
+    pool_shards: &[ShardId],
+) -> Vec<ShardId> {
+    let explicit = dedup_shard_assignments(explicit);
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    if pool_shards.is_empty() {
+        // No pool => no shard identity to resolve. PRESERVE the empty list
+        // rather than fabricating `[ShardId::new(0)]` (issue #961 review,
+        // Codex P2).
+        //
+        // A plain `DbPool` carries no shard number, so a worker here genuinely
+        // does not know which logical shard its database is. Registering `[0]`
+        // would *claim* shard 0 specifically, which is false whenever the
+        // deployment's single/default shard is numbered anything else --
+        // `ShardRouter::new` accepts an arbitrary `default_shard`. Shard health
+        // and queue coverage would then report no worker for the shard this
+        // process is actually draining. That is the write-side twin of the
+        // read-side bug issue #1150 fixed, and
+        // `shard_fanout::worker_covers_shard` already normalizes an empty
+        // registration as "covers whatever shard this database is" precisely so
+        // this case reads correctly.
+        //
+        // Empty is also the shape the rest of the worker already expects for a
+        // legacy single-shard worker: it yields an empty `shard_targets`, whose
+        // `[] => pool` arms in the claim path, the listener path and the WASM
+        // seed path (issue #965 review, Finding 24) all resolve to the caller's
+        // default pool.
+        return Vec::new();
+    }
+    let mut auto: Vec<ShardId> = pool_shards.to_vec();
+    auto.sort_unstable();
+    auto.dedup();
+    auto
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -3009,10 +3445,11 @@ impl Default for WorkerConfig {
             workflow_cache_size: 1000,
             sticky_timeout: Duration::ZERO,
             cancellation_grace_period: Duration::from_secs(5),
-            shard_assignments: vec![ShardId::new(0)],
+            shard_assignments: Vec::new(),
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -3021,6 +3458,7 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
@@ -3118,16 +3556,14 @@ impl WorkerConfig {
 
     /// Assign which shards this worker is responsible for.
     ///
-    /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
-    /// single-shard behaviour.
+    /// An **empty** list means *auto*: cover every shard this process has a
+    /// pool for (issue #961). It is **not** coerced to `[ShardId::new(0)]` —
+    /// that coercion is what made a multi-shard worker silently single-shard.
+    /// See [`resolve_shard_assignments`] for the full resolution rules.
+    /// Duplicates are dropped — see [`dedup_shard_assignments`].
     #[must_use]
     pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
-        let shards: Vec<ShardId> = shards.into_iter().collect();
-        self.shard_assignments = if shards.is_empty() {
-            vec![ShardId::new(0)]
-        } else {
-            shards
-        };
+        self.shard_assignments = dedup_shard_assignments(shards.into_iter().collect());
         self
     }
 
@@ -3216,6 +3652,40 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
         self.poison_pill_threshold = threshold;
+        self
+    }
+
+    /// Override the capability-miss redelivery budget (default 5, issue #804).
+    ///
+    /// A task claimed by a worker with no handler registered for its
+    /// workflow/activity type is released back to `PENDING` for a capable peer,
+    /// with capped exponential backoff. A budget of `N` grants exactly `N`
+    /// releases; the `N + 1`th claim escalates to the ordinary terminal-failure
+    /// path with a `no_capable_worker:` reason on the execution row. (That path
+    /// writes no dead-letter entry.)
+    ///
+    /// Raise this if your rollouts legitimately take longer than the default
+    /// dwell window — the five backoffs the default grants sum to ~31 s
+    /// (1 + 2 + 4 + 8 + 16) on a single worker, and less in wall-clock terms on
+    /// a wide fleet, where incapable peers consume releases in parallel. This
+    /// trades a longer time-to-detect for fewer spurious escalations.
+    ///
+    /// `0` escalates on the **first** miss — the pre-#804 fail-fast behaviour.
+    /// It is not an "off" switch for the feature; there is deliberately no
+    /// unlimited-release mode, since that would let a genuinely-unregistered
+    /// workflow type bounce around the fleet forever.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_capability_miss_max_redeliveries(10);
+    /// assert_eq!(config.capability_miss_max_redeliveries, 10);
+    /// ```
+    #[must_use]
+    pub const fn with_capability_miss_max_redeliveries(mut self, budget: u32) -> Self {
+        self.capability_miss_max_redeliveries = budget;
         self
     }
 
@@ -3452,6 +3922,15 @@ impl WorkerConfig {
         self.default_activity_start_to_close = Some(timeout);
         self
     }
+
+    /// Set the ceiling on an author-supplied `Retry-After` delay hint (issue
+    /// #744). See [`WorkerConfig::retry_after_ceiling`] for the full
+    /// semantics. Default: [`DEFAULT_RETRY_AFTER_CEILING`] (15 minutes).
+    #[must_use]
+    pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
+        self.retry_after_ceiling = ceiling;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -3461,8 +3940,165 @@ mod tests {
     use crate::info::{DagInfo, WorkflowInfo};
     use crate::policy::Schedule;
 
+    /// A duplicate shard would fan the per-shard control loops out twice
+    /// against one database, and would collapse those two instances onto a
+    /// single `(scanner, shard)` tick series so a healthy duplicate masks its
+    /// wedged twin (issue #797).
+    #[test]
+    fn with_shard_assignments_drops_duplicate_shards() {
+        let cfg = WorkerConfig::default().with_shard_assignments([
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(0),
+        ]);
+        assert_eq!(
+            cfg.shard_assignments,
+            vec![ShardId::new(0), ShardId::new(1)],
+            "a repeated shard must not spawn a second set of control loops \
+             against the same database",
+        );
+    }
+
+    /// Ordering is a deliberate polling order, not an artifact — dedup must
+    /// not reorder the shards an operator listed.
+    #[test]
+    fn dedup_shard_assignments_preserves_first_occurrence_order() {
+        let deduped = dedup_shard_assignments(vec![
+            ShardId::new(2),
+            ShardId::new(0),
+            ShardId::new(2),
+            ShardId::new(1),
+            ShardId::new(0),
+        ]);
+        assert_eq!(
+            deduped,
+            vec![ShardId::new(2), ShardId::new(0), ShardId::new(1)],
+        );
+    }
+
+    /// AC1 (issue #961): a worker with **no explicit** shard assignments must
+    /// cover every shard the process actually has a pool for, not just shard 0.
+    ///
+    /// Before this, `WorkerConfig::default().shard_assignments` was
+    /// `[ShardId::new(0)]`, so a three-shard deployment that never called
+    /// `with_shard_assignments` silently drained only shard 0 while workflows
+    /// routed to shards 1 and 2 sat permanently undispatched — precisely the
+    /// silent failure issue #961 exists to close.
+    #[test]
+    fn resolve_shard_assignments_empty_covers_every_pool_shard() {
+        let resolved = resolve_shard_assignments(
+            Vec::new(),
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(
+            resolved,
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            "an unconfigured worker must auto-cover every shard it has a pool for",
+        );
+    }
+
+    /// An explicit assignment is an operator decision and always wins — auto
+    /// resolution must never widen a deliberately narrowed worker (the
+    /// one-worker-process-per-shard deployment shape).
+    #[test]
+    fn resolve_shard_assignments_explicit_wins_over_pool() {
+        let resolved = resolve_shard_assignments(
+            vec![ShardId::new(1)],
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(resolved, vec![ShardId::new(1)]);
+    }
+
+    /// Explicit assignments still go through dedup — a duplicate would fan the
+    /// per-shard control loops out twice against one database (issue #797).
+    #[test]
+    fn resolve_shard_assignments_dedups_explicit() {
+        let resolved = resolve_shard_assignments(
+            vec![ShardId::new(2), ShardId::new(0), ShardId::new(2)],
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(resolved, vec![ShardId::new(2), ShardId::new(0)]);
+    }
+
+    /// **Issue #961 review (Codex P2).** With no sharded pool the resolver
+    /// must PRESERVE the empty list, never fabricate `[ShardId::new(0)]`.
+    ///
+    /// A plain `DbPool` carries no shard number, so this worker genuinely does
+    /// not know which logical shard its database is. Claiming `[0]` is false
+    /// whenever the deployment's single/default shard is numbered anything else
+    /// (`ShardRouter::new` accepts an arbitrary `default_shard`), and shard
+    /// health / queue coverage would then report no worker for the shard the
+    /// process is actually draining -- the write-side twin of the read-side bug
+    /// issue #1150 fixed. Empty is the legacy representation
+    /// `shard_fanout::worker_covers_shard` normalizes as "covers whatever shard
+    /// this database is".
+    #[test]
+    fn resolve_shard_assignments_no_pool_preserves_the_empty_legacy_shape() {
+        assert_eq!(
+            resolve_shard_assignments(Vec::new(), &[]),
+            Vec::<ShardId>::new(),
+            "no pool means no shard identity; fabricating [0] would falsely \
+             claim shard 0 on a deployment whose single shard is numbered \
+             otherwise",
+        );
+    }
+
+    /// AC7: a single-shard `ShardedDbPool` resolves to the same `[0]` a
+    /// pool-less deployment gets, so wiring `ShardedDbPool::single` in changes
+    /// nothing.
+    #[test]
+    fn resolve_shard_assignments_single_shard_pool_is_unchanged() {
+        assert_eq!(
+            resolve_shard_assignments(Vec::new(), &[ShardId::new(0)]),
+            vec![ShardId::new(0)],
+        );
+    }
+
+    /// Pool-derived shards are emitted in ascending shard order so the
+    /// round-robin poll order is deterministic across restarts.
+    #[test]
+    fn resolve_shard_assignments_pool_order_is_ascending() {
+        let resolved = resolve_shard_assignments(Vec::new(), &[ShardId::new(5), ShardId::new(1)]);
+        assert_eq!(resolved, vec![ShardId::new(1), ShardId::new(5)]);
+    }
+
+    /// `with_shard_assignments([])` must record "auto" (empty) rather than
+    /// coercing to `[0]` — coercion is what made a multi-shard worker silently
+    /// single-shard.
+    #[test]
+    fn with_shard_assignments_empty_records_auto_not_shard_zero() {
+        let cfg = WorkerConfig::default().with_shard_assignments(Vec::<ShardId>::new());
+        assert!(
+            cfg.shard_assignments.is_empty(),
+            "an empty assignment list means 'auto: cover every pool shard', \
+             not 'shard 0 only'",
+        );
+    }
+
+    /// The default config must also mean "auto", so an embedder that never
+    /// touches `shard_assignments` gets full coverage.
+    #[test]
+    fn default_worker_config_shard_assignments_are_auto() {
+        assert!(WorkerConfig::default().shard_assignments.is_empty());
+    }
+
+    /// An all-duplicates list must still leave a usable assignment rather than
+    /// collapsing to empty and tripping the single-shard fallback.
+    #[test]
+    fn with_shard_assignments_keeps_one_entry_when_every_entry_is_the_same() {
+        let cfg = WorkerConfig::default().with_shard_assignments([
+            ShardId::new(3),
+            ShardId::new(3),
+            ShardId::new(3),
+        ]);
+        assert_eq!(cfg.shard_assignments, vec![ShardId::new(3)]);
+    }
+
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "test",
             module: "test",
@@ -3506,6 +4142,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -3529,6 +4167,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -3566,6 +4206,36 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
             "expected InvalidWorkerConfig but got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn slow_heartbeat_warns_but_never_blocks_the_build() {
+        // The default cadence -- and anything up to the supported ceiling --
+        // must stay silent, or the warning is noise operators learn to ignore.
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            WorkerConfig::default().worker_heartbeat_interval
+        ));
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+        ));
+        // One second past the ceiling is where a peer can start mistaking this
+        // worker for a dead one.
+        assert!(warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+                + Duration::from_secs(1)
+        ));
+        // Warn, never reject: an already-deployed slow fleet must keep booting.
+        assert!(
+            HarvestBuilder::new()
+                .worker(
+                    WorkerConfig::default()
+                        .with_worker_heartbeat_interval(Duration::from_secs(600))
+                )
+                .try_build()
+                .is_ok(),
+            "a slow heartbeat is a warning, not a build failure"
         );
     }
 
@@ -3659,6 +4329,115 @@ mod tests {
         assert_eq!(builder.dag_count(), 1);
     }
 
+    // ── Issue #780 — declarative DAG node compensation validations ──────────
+
+    /// T6 — a compensator that resolves to a **local** activity is rejected by
+    /// `validate_dags_do_not_use_local_activities`. A compensator is dispatched
+    /// through the ordinary DAG activity-queue lowering (`execute_activity_raw_with_opts`),
+    /// exactly like a forward node, so a local activity is just as invalid there.
+    /// The error must name the COMPENSATOR (not the forward node that declares it).
+    #[test]
+    fn local_activity_compensator_is_rejected_by_the_builder() {
+        fn forward() {}
+
+        let dag_with_local_compensator = DagInfo {
+            name: "etl_with_local_comp",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let _node = dag.activity(forward).compensate_named("undo_forward");
+            },
+            // Unified, so the classic-DAG compensation guard (T7) cannot fire
+            // first and mask the local-activity rejection under test.
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let result = HarvestBuilder::new()
+            .dags(vec![dag_with_local_compensator])
+            .activities(vec![make_local_activity("undo_forward", None)])
+            .try_build();
+
+        let err = result.expect_err("a local-activity compensator must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::LocalActivityInDag { ref activity, ref dag }
+                    if activity == "undo_forward" && dag == "etl_with_local_comp"
+            ),
+            "the rejection must name the compensator and its DAG, got: {err:?}"
+        );
+    }
+
+    /// T7 — a **classic** (non-unified) DAG (`workflow_handler: None`) that
+    /// declares a compensator is rejected at `try_build`. Compensation lowers
+    /// onto the unified workflow-handler path (`run_unified_dag`'s terminal
+    /// unwind via `Saga`); the classic DAG executor has no unwind step, so the
+    /// compensator would silently never run. Mirrors
+    /// `DagSignalGateRequiresUnifiedExecution` (issue #746).
+    #[test]
+    fn classic_dag_with_a_compensator_is_rejected() {
+        fn forward() {}
+
+        let classic_compensated_dag = DagInfo {
+            name: "classic_compensated_dag",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let _node = dag.activity(forward).compensate_named("undo_forward");
+            },
+            // The unified-vs-classic discriminator.
+            workflow_handler: None,
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let result = HarvestBuilder::new()
+            .dags(vec![classic_compensated_dag])
+            .try_build();
+
+        let err = result.expect_err("a classic DAG with a compensator must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::DagCompensationRequiresUnifiedExecution {
+                    ref dag,
+                    ref task,
+                    ref compensate,
+                } if dag == "classic_compensated_dag"
+                    && task == "forward"
+                    && compensate == "undo_forward"
+            ),
+            "the rejection must name the DAG, the node, and the compensator, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("classic_compensated_dag") && msg.contains("undo_forward"),
+            "the message must name the DAG and the compensator, got: {msg}"
+        );
+    }
+
     #[cfg(feature = "unified-dag-execution")]
     #[test]
     fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {
@@ -3738,6 +4517,51 @@ mod tests {
             .build();
         assert!(
             (clamped.history_policy().continue_as_new_deadline_fraction() - 1.0).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_bloat_warn_fraction_override() {
+        // Issue #704: the operator early-warning soft-threshold fraction is
+        // configurable and clamped into [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]
+        // -- strictly below 1.0, unlike the sibling deadline-fraction override
+        // above (PR #1139 review, P2: worker.rs's hard-cap force-fail check
+        // always wins the race against a warn threshold of exactly the cap,
+        // so a fraction of 1.0 must never be reachable through this API).
+        let built = HarvestBuilder::new()
+            .history_bloat_warn_fraction(0.5)
+            .build();
+        let policy = built.history_policy();
+        assert!((policy.history_bloat_warn_fraction() - 0.5).abs() < f64::EPSILON);
+
+        let clamped = HarvestBuilder::new()
+            .history_bloat_warn_fraction(2.0)
+            .build();
+        assert!(clamped.history_policy().history_bloat_warn_fraction() < 1.0);
+        assert!(
+            (clamped.history_policy().history_bloat_warn_fraction()
+                - crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Exactly 1.0 must ALSO clamp strictly below 1.0 -- it is the one
+        // value that would otherwise silently disable the signal.
+        let exactly_one = HarvestBuilder::new()
+            .history_bloat_warn_fraction(1.0)
+            .build();
+        assert!(exactly_one.history_policy().history_bloat_warn_fraction() < 1.0);
+
+        // 0.0 explicitly disables the signal (AC4).
+        let disabled = HarvestBuilder::new()
+            .history_bloat_warn_fraction(0.0)
+            .build();
+        assert!(
+            disabled
+                .history_policy()
+                .history_bloat_warn_fraction()
+                .abs()
                 < f64::EPSILON
         );
     }
@@ -3857,6 +4681,51 @@ mod tests {
         );
     }
 
+    // Issue #744: the two `into_worker_parts*` hunks must also copy the
+    // builder-level `retry_after_ceiling` out of `WorkerConfig` into the
+    // `HandlerRegistry` so the worker's next-retry-delay computation sees the
+    // operator-configured ceiling, not a hardcoded default.
+    //
+    // RED PHASE: `HandlerRegistry::retry_after_ceiling` does not exist yet —
+    // this test fails to COMPILE against the missing method until the green
+    // phase adds it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_retry_after_ceiling_into_worker_registry() {
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(123)))
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry.retry_after_ceiling,
+            Duration::from_secs(123),
+            "the builder-configured retry_after ceiling must be wired into the registry"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_retry_after_ceiling_into_worker_registry() {
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(77)))
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(registry.retry_after_ceiling, Duration::from_secs(77));
+    }
+
     #[test]
     fn harvest_builder_telemetry_override_is_propagated() {
         use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
@@ -3929,6 +4798,62 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
+    }
+
+    /// Both worker-parts hops must thread the configured durable-log policy
+    /// into the `HandlerRegistry` (issue #790).
+    ///
+    /// The registry's `workflow_log_policy` is the ONLY thing the executor
+    /// consults to decide whether `ctx.log_*` pushes a `RecordLog` command, so a
+    /// dropped hop turns the whole feature into a silent no-op for every
+    /// deployment that configured it — the worker would run, the workflow would
+    /// log to `tracing` exactly as before, and nothing would ever be persisted.
+    /// Deleting either `.with_workflow_log_policy(...)` line must fail here.
+    ///
+    /// `into_worker_parts_with_extra_state` is covered too because it is the hop
+    /// the plugin (and any app registering extra shared state) actually takes.
+    #[cfg(feature = "db")]
+    #[test]
+    fn both_worker_parts_hops_thread_the_workflow_log_policy() {
+        // Distinct from the defaults (1_000 / 4_096) so a hop that silently
+        // substitutes `WorkflowLogPolicy::default()` also fails.
+        let policy = crate::context::WorkflowLogPolicy::default()
+            .with_max_lines(7)
+            .with_max_message_bytes(64);
+
+        let built = HarvestBuilder::new()
+            .workflow_log_persistence(policy)
+            .build();
+        let (registry, _dags, _ws, _wc) = built.into_worker_parts();
+        let threaded = registry
+            .workflow_log_policy
+            .expect("into_worker_parts must thread the configured log policy");
+        assert_eq!(threaded.max_lines(), 7);
+        assert_eq!(threaded.max_message_bytes(), 64);
+
+        let built = HarvestBuilder::new()
+            .workflow_log_persistence(policy)
+            .build();
+        let (registry, _dags, _ws, _wc) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        let threaded = registry
+            .workflow_log_policy
+            .expect("into_worker_parts_with_extra_state must thread the configured log policy");
+        assert_eq!(threaded.max_lines(), 7);
+        assert_eq!(threaded.max_message_bytes(), 64);
+    }
+
+    /// AC6: with no policy configured the registry carries `None`, so the
+    /// executor never even constructs the durable sink and `ctx.logger()` is
+    /// byte-for-byte pre-#790.
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_parts_carry_no_log_policy_unless_it_is_configured() {
+        let (registry, _dags, _ws, _wc) = HarvestBuilder::new().build().into_worker_parts();
+        assert!(
+            registry.workflow_log_policy.is_none(),
+            "the durable log sink must be OFF unless explicitly configured"
+        );
     }
 
     /// The core worker build path (`into_worker_parts`) — which the standalone
@@ -4150,6 +5075,9 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "report_wf",
                 module: "test",
@@ -4157,10 +5085,7 @@ mod tests {
                 execution_timeout: None,
                 chain_execution_timeout: None,
                 sla: None,
-                concurrency: Some(ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 0,
-                }),
+                concurrency: Some(ConcurrencyPolicy::new("input.tenant_id", 0)),
 
                 debounce: None,
                 batch: None,
@@ -4192,6 +5117,9 @@ mod tests {
     /// for the `validate_workflow_throttle_policies` tests below.
     fn throttled_wf_info(throttle: crate::throttle::ThrottlePolicy) -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "report_wf",
             module: "test",
@@ -4303,6 +5231,9 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "report_wf",
                 module: "test",
@@ -4310,10 +5241,7 @@ mod tests {
                 execution_timeout: None,
                 chain_execution_timeout: None,
                 sla: None,
-                concurrency: Some(ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 5,
-                }),
+                concurrency: Some(ConcurrencyPolicy::new("input.tenant_id", 5)),
 
                 debounce: None,
                 batch: None,
@@ -4371,6 +5299,25 @@ mod tests {
         );
     }
 
+    // ── Retry-After ceiling (issue #744) ───────────────────────────────────
+    //
+    // RED PHASE: `WorkerConfig::retry_after_ceiling` / `with_retry_after_ceiling`
+    // do not exist yet -- this test fails to COMPILE against the missing
+    // symbols until the green phase adds them.
+
+    #[test]
+    fn worker_config_retry_after_ceiling_has_sane_default_and_is_configurable() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.retry_after_ceiling,
+            crate::builder::DEFAULT_RETRY_AFTER_CEILING,
+            "the ceiling must always be present with a sane default (AC3)"
+        );
+
+        let configured = WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
+        assert_eq!(configured.retry_after_ceiling, Duration::from_secs(90));
+    }
+
     // ── Local activity cap tests ──────────────────────────────────────────
 
     #[test]
@@ -4419,6 +5366,57 @@ mod tests {
     fn worker_config_poison_pill_threshold_zero_disables() {
         let config = WorkerConfig::default().with_poison_pill_threshold(0);
         assert_eq!(config.poison_pill_threshold, 0);
+    }
+
+    // ── Capability-miss redelivery budget tests (issue #804) ──────────────
+
+    #[test]
+    fn worker_config_capability_miss_max_redeliveries_defaults_to_5() {
+        // AC3 asks for a "configurable number ... (default small, e.g. 5)".
+        assert_eq!(
+            WorkerConfig::default().capability_miss_max_redeliveries,
+            5,
+            "the default redelivery budget must be small but large enough to \
+             outlast a rolling pod flip"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_capability_miss_max_redeliveries_overrides() {
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(12);
+        assert_eq!(config.capability_miss_max_redeliveries, 12);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_zero_escalates_immediately() {
+        // `0` is NOT an off-switch for the feature: it means "escalate on the
+        // first miss", i.e. the pre-#804 fail-fast behaviour. Pinned so nobody
+        // later reinterprets 0 as "release forever" (which would let a
+        // genuinely-unregistered type bounce indefinitely — the exact hazard
+        // the budget exists to bound).
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(0);
+        assert_eq!(config.capability_miss_max_redeliveries, 0);
+        assert_eq!(
+            crate::worker::capability_miss_decision(
+                1,
+                1,
+                config.capability_miss_max_redeliveries,
+                crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed,
+            ),
+            crate::worker::CapabilityMissAction::Escalate
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_budget_is_threaded_into_the_runtime_config() {
+        // The knob is inert unless it reaches WorkerRuntimeConfig — the struct
+        // the worker's dispatch path actually reads. This is the same threading
+        // contract `poison_pill_threshold` has.
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(9);
+        let runtime: crate::worker::WorkerRuntimeConfig = config.into();
+        assert_eq!(runtime.capability_miss_max_redeliveries, 9);
     }
 
     // ── Workflow panic-retry budget tests (issue #782) ────────────────────
@@ -4783,6 +5781,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -4816,6 +5816,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(

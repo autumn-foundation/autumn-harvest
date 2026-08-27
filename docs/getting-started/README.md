@@ -37,14 +37,16 @@ Stop at any chapter — each one ends in a runnable state.
 10. [Operating the service](10-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
 11. [Testing your workflow code](11-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
 12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
+13. [Broker connectors](13-broker-connectors.md) — Kafka and SQS topics/queues as workflow triggers: idempotent redelivery, ack ordering, poison isolation, backpressure.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
 
-- **Upgrading.** [`upgrading/0.5.0.md`](../upgrading/0.5.0.md) is the
-  0.4.0 → 0.5.0 upgrade guide — dependency bumps, additive migrations, and the
-  small set of source-breaking / behavior changes to verify against your code.
+- **Upgrading.** [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) is the current
+  0.5.0 → 0.6.0 upgrade guide — the `autumn-web` 0.7 bump and the move to
+  Autumn-owned plugin migrations. [`upgrading/0.5.0.md`](../upgrading/0.5.0.md)
+  covers the previous 0.4.0 → 0.5.0 hop.
 - **Reference example.** [`examples/billing-autumn-web/`](../../examples/billing-autumn-web/)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled
@@ -64,6 +66,16 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   [`version-gate-retirement.md`](../runbooks/version-gate-retirement.md).
 - **Telemetry.** [`telemetry.md`](../telemetry.md) covers the OpenTelemetry
   surface and the `metrics-rs` adapter recipe.
+- **Workflow logs.** [`workflow-logs.md`](../workflow-logs.md) is the opt-in
+  durable per-execution sink for `ctx.log_*` lines — read a run's own output
+  from one API call, CLI command, or Vantage panel instead of correlating by
+  `execution_id` in a log aggregator.
+- **Performance.** [`performance.md`](../performance.md) publishes measured
+  task-claim and enqueue baselines, attributes cost to five representative
+  claim-path predicates (five others are evaluated on every claim but left on
+  their cheapest null/empty path, so they are not measured — the page names
+  them), and explains the CI-gated budget — read it before deciding whether a
+  deep backlog means you need another shard.
 - **Search attributes.** [`search-attributes.md`](../search-attributes.md)
   explains how to index workflows for filtered queries.
 - **Architecture.**
@@ -72,3 +84,6 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Comparison.** [`comparison.md`](../comparison.md) positions harvest against
   Temporal, DBOS, Inngest, Hatchet, and Restate — every harvest claim linked to
   shipped evidence, with an honest section on where harvest is behind.
+- **Migrating from Temporal.** [`migrating-from-temporal.md`](../migrating-from-temporal.md)
+  is a concept map, a workflow-porting checklist, and a dual-run cutover
+  playbook, with a worked side-by-side example.

@@ -319,6 +319,16 @@ Every event emitted by `ctx.logger()` carries:
 
 These match the Temporal / Cadence / DBOS convention so existing log dashboards need no changes.
 
+#### Reading a run's lines back without a log aggregator
+
+`ctx.logger()` emits to the host app's `tracing` subscriber, so reading a
+specific run's lines back normally means correlating by `execution_id` in
+Loki/Elastic/OTel. Opt in to the **durable per-execution sink** (issue #790) and
+the same `ctx.log_*` calls are also persisted per execution, readable in one
+call — `GET /api/harvest/workflows/{id}/logs`, `harvest workflow logs <id>`, or
+the Vantage execution-detail **Logs** panel. The workflow body does not change;
+see [`docs/workflow-logs.md`](workflow-logs.md).
+
 #### Guardrail severity
 
 HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break determinism or corrupt workflow state — they only amplify log volume. The rule is surfaced so authors can fix it without CI being blocked by a false positive.
@@ -600,17 +610,55 @@ The shipped tree passes the check: a bare `harvest det-check` at the repo root r
 
 ---
 
+## Gating payload-schema changes in CI
+
+`det-check` covers non-deterministic **code**. The sibling hazard is a
+non-deterministic **payload**: renaming, retyping, or adding a required field to
+a workflow's input/output/error type compiles green but silently breaks every
+in-flight execution, whose recorded `harvest_events` JSON no longer deserializes.
+
+That is gated by **`harvest schema check`**
+([issue #794](https://github.com/autumn-foundation/autumn-harvest/issues/794)),
+which diffs the schemas your app publishes ([issue #373](https://github.com/autumn-foundation/autumn-harvest/issues/373))
+against the checked-in baseline `docs/workflow-schema-contract.json` and fails
+the build on any change that would break replay:
+
+```console
+$ cargo run --quiet --bin dump-schema-contract > /tmp/current.json
+$ harvest schema check --current /tmp/current.json
+```
+
+`dump-schema-contract` is a **three-line binary you add to your own crate** —
+Harvest is a library, so only your process can enumerate the workflow registry.
+[The schema-contract guide](workflow-schema-contract-guide.md#generating---current)
+has the snippet; `autumn-harvest/examples/schema_workflow.rs --emit-contract` is
+a working reference.
+
+Exit `0` when every delta is compatible, `1` when any is breaking. A deliberate
+migration is acknowledged — never suppressed — with `harvest schema update
+--acknowledge "<why this is safe>"`, which records the justification in the
+artifact so it lands in the same reviewable diff.
+
+Like `det-check`, it needs no database and no services, so it belongs in the
+same cheap lint job. See **[the schema-contract guide](workflow-schema-contract-guide.md)**
+for the full ruleset, the generator, the escape hatch, and CI/pre-commit recipes.
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:
 
 1. **Determinism check** (this catalog): catch obvious footguns before any workflow has history.
-2. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
-3. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
-4. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
-5. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
+2. **Schema-contract check** ([issue #794](https://github.com/autumn-foundation/autumn-harvest/issues/794)): catch backward-incompatible *payload* changes — the sibling hazard to non-deterministic code — before they DLQ in-flight runs. See [the guide](workflow-schema-contract-guide.md).
+3. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
+4. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence. Two flavours, for two different populations:
+   - **Curated *completed* fixtures**, replayed strictly — `ReplayVerifier::verify_dir`. See [`replay-verify.md`](replay-verify.md).
+   - **A live *in-flight* sample**, replayed frontier-tolerantly — `harvest history export-sample` + `WorkflowReplayer::replay_bundle` ([issue #798](https://github.com/autumn-foundation/autumn-harvest/issues/798)). This is the one that answers "will the executions running *right now* survive this deploy?", and it is the layer that catches a regression the curated fixtures happen not to cover. See [`replay-drift-gate.md`](replay-drift-gate.md).
+5. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
+6. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 
-Each layer catches a different class of problem. All five together provide defence-in-depth for safe rolling deploys.
+Each layer catches a different class of problem. All six together provide defence-in-depth for safe rolling deploys.
 
 ---
 

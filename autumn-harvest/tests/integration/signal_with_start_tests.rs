@@ -71,6 +71,7 @@ fn params<'a>(
         max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         signal_name,
         signal_payload,
         idempotency_key: None,
@@ -88,6 +89,7 @@ fn params<'a>(
         reject_fresh_if_debounced: false,
         workflow_info: None,
         start_source_override: None,
+        start_source_ref_override: None,
     }
 }
 
@@ -566,6 +568,9 @@ fn strict_schema() -> serde_json::Value {
 
 fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         name,
         module: "signal_with_start_tests",
         handler: dummy_handler,

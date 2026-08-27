@@ -167,7 +167,7 @@ impl<T> TypedWorkflowHandle<T> {
     where
         T: DeserializeOwned,
     {
-        let snap = self.inner.result_snapshot().await?;
+        let (resolved, snap) = self.inner.result_snapshot_resolved().await?;
         let output = match snap.output {
             Some(val) => Some(serde_json::from_value(val).map_err(HarvestError::Serialization)?),
             None => None,
@@ -180,17 +180,14 @@ impl<T> TypedWorkflowHandle<T> {
         // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
         // correct snapshot (state + human `error` message intact) into an `Err`.
         //
-        // `result_snapshot` reports the original handle's execution row (it does
-        // NOT follow the #523 retry chain — unlike `result_raw`), so the typed
-        // failure is loaded from `self.inner`'s own `exec_id` to stay consistent
-        // with the snapshot's `state`/`error`.
+        // `result_snapshot` FOLLOWS the #523 retry chain (issue #843), so the
+        // typed failure must be loaded from the execution the snapshot was
+        // actually read from — `resolved`, not `self.inner.exec_id()`. Loading
+        // it from the addressed id would mix `state`/`error` from the live
+        // attempt with `error_type`/`details` from a sealed predecessor.
         let (error_type, error_details, non_retryable) =
             if snap.state == WorkflowResultState::Failed {
-                if let Ok(Some(decoded)) = self
-                    .inner
-                    .terminal_typed_failure(self.inner.exec_id())
-                    .await
-                {
+                if let Ok(Some(decoded)) = self.inner.terminal_typed_failure(resolved).await {
                     (decoded.error_type, decoded.details, decoded.non_retryable)
                 } else {
                     (None, None, None)

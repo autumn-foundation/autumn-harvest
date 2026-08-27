@@ -152,6 +152,87 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with(pool, true, None)
 }
 
+/// Byte-reversal test codec, so `encode_event` produces the real
+/// `_harvest_codec_envelope` shape a codec-encrypting deployment stores.
+#[derive(Debug)]
+struct ReverseGraphCodec;
+
+impl autumn_harvest::payload_codec::PayloadCodec for ReverseGraphCodec {
+    fn codec_id(&self) -> &'static str {
+        "reverse"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = raw.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = encoded.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+}
+
+fn reversing_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let mut codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs.set_default(Arc::new(ReverseGraphCodec));
+    codecs
+}
+
+/// Same app as [`build_app`] but with a non-identity codec registered, so the
+/// handler must decode before deriving the run graph (issue #780 round 5).
+fn build_app_with_codec(pool: &DbPool) -> HarvestApiApp {
+    let catalog = compile_dag_catalog(dags![graph_linear_dag, graph_fanout_dag])
+        .expect("dag catalog compiles");
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.set_payload_codecs(reversing_codecs());
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry(),
+        Arc::new(catalog),
+        Arc::new(Vec::new()),
+        Some("dag-graph-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// A compensation dispatch (the shape `unwind_dag_compensations` records)
+/// whose `input` has been run through the reversing codec, i.e. exactly what a
+/// codec-encrypting deployment stores in `harvest_events.event_data`.
+///
+/// `store::append_events` encodes with the identity codec, whose
+/// `encode_payload` is a pass-through clone — so the already-enveloped `input`
+/// survives verbatim into storage.
+fn codec_encoded_compensation_dispatch(
+    compensator_name: &str,
+    compensates_node: &str,
+    id: ActivityExecId,
+) -> WorkflowEvent {
+    let plain = WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: compensator_name.to_string(),
+        input: json!({
+            "dag_compensate": compensates_node,
+            "input": Value::Null,
+            "output": Value::Null,
+        }),
+        queue: "default".to_string(),
+    };
+    let encoded = reversing_codecs()
+        .encode_event(&plain)
+        .expect("encode compensation dispatch");
+    assert_eq!(
+        encoded["data"]["input"]["_harvest_codec_envelope"], 1,
+        "fixture sanity: the stored dispatch must carry a codec envelope on `input`"
+    );
+    serde_json::from_value(encoded).expect("re-deserialize stored shape")
+}
+
 /// A hand-built classic (non-unified) `RegisteredDag`. `compile_dag_catalog`
 /// rejects classic DAGs, so the only way to register one is to construct it.
 fn classic_registered_dag(name: &str) -> RegisteredDag {
@@ -294,6 +375,7 @@ async fn seed_run(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -676,6 +758,97 @@ async fn dag_run_graph_skip_marker_with_opaque_codec_details_is_still_skipped() 
     // Skipped despite the opaque codec-envelope details.
     assert_eq!(node(&body, "step_b")["status"], json!("skipped"));
     assert_eq!(node(&body, "step_c")["status"], json!("pending"));
+}
+
+#[tokio::test]
+async fn dag_run_graph_excludes_a_codec_encoded_compensation_dispatch() {
+    // Issue #780 round 5 (Codex): the run-graph readers load RAW history
+    // (`load_history_with_timestamps` leaves payload fields undecoded), so on a
+    // codec-encrypting or payload-offloading deployment the round-4 compensation
+    // exclusion silently stopped working — `is_compensation_dispatch` saw an
+    // opaque envelope, returned false, and a never-executed forward node was
+    // reported with the old compensation's status/timings/attempts.
+    //
+    // Cross-version drift: history was produced by an older definition whose
+    // unwind dispatched a compensator named `step_b`; the CURRENT
+    // `graph_linear_dag` declares `step_b` as an ordinary forward node.
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_codec(&pool);
+    let mut conn = establish(&url).await;
+
+    let ia = ActivityExecId::new();
+    let events = vec![
+        sched("step_a", ia),
+        completed(ia),
+        // The old unwind's compensator for step_a, named like today's step_b.
+        codec_encoded_compensation_dispatch("step_b", "step_a", ActivityExecId::new()),
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-compensation-codec",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node(&body, "step_a")["status"], json!("succeeded"));
+
+    // The compensation dispatch must NOT be read as step_b's own dispatch.
+    // Pre-fix this reported the compensation's outcome instead of `pending`.
+    let b_node = node(&body, "step_b");
+    assert_eq!(
+        b_node["status"],
+        json!("pending"),
+        "a compensator dispatch named like a current forward node must be excluded \
+         even when its input is a codec envelope: {b_node}"
+    );
+    // And it must carry none of the compensation's timing/attempts, so status
+    // and timing can never describe different attempts.
+    assert!(
+        b_node.get("started_at").is_none() || b_node["started_at"].is_null(),
+        "an excluded compensation must leave no timing on the forward node: {b_node}"
+    );
+    assert_eq!(b_node["attempts"], json!(0), "node: {b_node}");
+}
+
+#[tokio::test]
+async fn dag_run_graph_still_reads_a_codec_encoded_forward_dispatch() {
+    // The guard for the fix above: decoding must not make an ORDINARY forward
+    // dispatch disappear. Its decoded input is plain user data, so
+    // `is_compensation_dispatch` stays false and the node reads normally.
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_codec(&pool);
+    let mut conn = establish(&url).await;
+
+    let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+    let events = vec![
+        sched("step_a", ia),
+        completed(ia),
+        sched("step_b", ib),
+        completed(ib),
+    ];
+    let exec_id = seed_run(
+        &mut conn,
+        "graph_linear_dag",
+        "graph-forward-codec",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/dags/graph_linear_dag/runs/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node(&body, "step_a")["status"], json!("succeeded"));
+    assert_eq!(
+        node(&body, "step_b")["status"],
+        json!("succeeded"),
+        "an ordinary forward dispatch must still be read on a codec deployment"
+    );
 }
 
 // ── (j) retried node: attempts counted from ActivityStarted (Codex CLAIM A) ──

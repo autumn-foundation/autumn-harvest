@@ -65,6 +65,7 @@ async fn insert_named_running(
     let exec_id = ExecutionId::new();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             chain_execution_timeout: None,
@@ -214,6 +215,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -491,6 +493,9 @@ fn chain_can_workflow<'a>(
 fn chain_can_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "chain_timeout_tests",
@@ -608,6 +613,9 @@ fn leaked_name(prefix: &str) -> &'static str {
 fn named_registry(name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "chain_timeout_tests",
@@ -801,6 +809,7 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
             operator_id: "test-operator".to_string(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
+            refuse_erased_source: false,
         },
         None,
     )
@@ -858,6 +867,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
             max_workflow_chain_timeout_ceiling: Some(ChronoDuration::days(3)),
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             signal_name: "kick",
             signal_payload: serde_json::json!({"v": 1}),
             idempotency_key: None,
@@ -873,6 +883,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
             max_workflow_attempts_ceiling: None,
             workflow_info: None,
             start_source_override: None,
+            start_source_ref_override: None,
         },
         None,
         None,
@@ -908,6 +919,9 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: wf_name,
                 module: "chain_timeout_tests",

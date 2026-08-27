@@ -1,0 +1,35 @@
+Timing is off.
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+        label         | heap_pages 
+----------------------+------------
+ no-caps-before-claim |        213
+(1 row)
+
+UPDATE 10000
+        label        | heap_pages 
+---------------------+------------
+ no-caps-after-claim |        463
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+       label       | heap_pages 
+-------------------+------------
+ caps-before-claim |        304
+(1 row)
+
+UPDATE 10000
+      label       | heap_pages 
+------------------+------------
+ caps-after-claim |        648
+(1 row)
+
+ no_caps_delta_pages | caps_delta_pages | extra_pages | extra_pct_more_growth_from_capability_labels 
+---------------------+------------------+-------------+----------------------------------------------
+                 250 |              344 |          94 |                                         37.6
+(1 row)
+
+TRUNCATE TABLE

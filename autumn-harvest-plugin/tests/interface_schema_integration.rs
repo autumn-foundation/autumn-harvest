@@ -108,6 +108,9 @@ fn iface_workflow<'a>(
 
 fn iface_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "iface_wf",
         module: "tests",
@@ -133,6 +136,9 @@ fn iface_info() -> WorkflowInfo {
 
 fn plain_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "plain_wf",
         module: "tests",
@@ -160,6 +166,9 @@ fn plain_info() -> WorkflowInfo {
 /// document must have all three arrays empty (FIX 4 / AC3).
 fn empty_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "empty_wf",
         module: "tests",
@@ -379,6 +388,15 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
+/// A workflow that opted in to declaring its dependencies (issue #802 AC5).
+fn declaring_info() -> WorkflowInfo {
+    let mut info = iface_info();
+    info.name = "declaring_wf";
+    info.declared_activities = Some(&["send_email", "charge_card"]);
+    info.declared_children = Some(&["generate_report"]);
+    info
+}
+
 fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with_state(pool).0
 }
@@ -390,8 +408,20 @@ fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let registry = HandlerRegistry::new(vec![iface_info(), plain_info(), empty_info()], vec![])
-        .with_handler_infos(query_handlers(), update_handlers(), signal_handlers());
+    let registry = HandlerRegistry::new(
+        vec![
+            iface_info(),
+            plain_info(),
+            empty_info(),
+            // Issue #802 AC5: an opted-in workflow, so `GET /workflows/registered`
+            // and `/{name}/schema` can be asserted to surface the declaration.
+            // `plain_wf` (registered above, declaring nothing) is the paired
+            // negative control for the omitted-not-null contract.
+            declaring_info(),
+        ],
+        vec![],
+    )
+    .with_handler_infos(query_handlers(), update_handlers(), signal_handlers());
     api_state.install(HarvestApiRuntime::new(
         Arc::new(registry),
         Arc::new(DagCatalog::default()),
@@ -693,6 +723,72 @@ async fn interface_is_deterministic_across_calls() {
         b1, b2,
         "interface response must be byte-identical across calls"
     );
+}
+
+// ── Issue #802 AC5: declared dependencies on the discovery routes ──────────
+//
+// These drive the two REAL routes rather than `RegisteredWorkflowRecord::from_info`
+// directly, because `GET /workflows/registered/{name}/schema` is a SEPARATE call
+// site from the list route and `docs/api-contract.json` now claims both carry the
+// fields. This suite is Docker-backed and RUNS in CI (`.github/ci/integration-suites.txt`).
+
+#[tokio::test]
+async fn registered_list_surfaces_declared_dependencies() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = get(&app, "/workflows/registered").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let records = body.as_array().expect("registered list is an array");
+    let declaring = records
+        .iter()
+        .find(|r| r["name"] == json!("declaring_wf"))
+        .expect("declaring_wf must be listed");
+    assert_eq!(
+        declaring["declared_activities"],
+        json!(["send_email", "charge_card"])
+    );
+    assert_eq!(declaring["declared_children"], json!(["generate_report"]));
+
+    // The negative control: a workflow that never opted in must OMIT both keys
+    // entirely — `null` would be indistinguishable from "declares nothing".
+    let plain = records
+        .iter()
+        .find(|r| r["name"] == json!("plain_wf"))
+        .expect("plain_wf must be listed")
+        .as_object()
+        .expect("record is an object");
+    assert!(
+        !plain.contains_key("declared_activities"),
+        "a non-opted-in workflow must omit the key, not emit null: {plain:?}"
+    );
+    assert!(
+        !plain.contains_key("declared_children"),
+        "a non-opted-in workflow must omit the key, not emit null: {plain:?}"
+    );
+}
+
+#[tokio::test]
+async fn registered_schema_route_surfaces_declared_dependencies() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = get(&app, "/workflows/registered/declaring_wf/schema").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["declared_activities"],
+        json!(["send_email", "charge_card"])
+    );
+    assert_eq!(body["declared_children"], json!(["generate_report"]));
+
+    let (status, body) = get(&app, "/workflows/registered/plain_wf/schema").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let object = body.as_object().expect("record is an object");
+    assert!(!object.contains_key("declared_activities"), "body: {body}");
+    assert!(!object.contains_key("declared_children"), "body: {body}");
 }
 
 #[tokio::test]

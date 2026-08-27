@@ -63,6 +63,9 @@ const INIT_SQL: &str = concat!(
     // issue #617: chain-scoped lifetime cap columns (read back by WorkflowExecution::as_select()).
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
+    // issue #704: history-bloat early-warning guard column (read back by
+    // WorkflowExecution::as_select()).
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -81,6 +84,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
     ),
+    "\n",
+    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
+    // strict XOR kind_check from the migration above must be relaxed to an OR.
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
@@ -191,6 +198,25 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
     ),
+    // issue #704: history_bloat_warned_at column on harvest_workflow_executions,
+    // referenced by every WorkflowExecution::as_select() read-back in this suite.
+    include_str!(
+        "../../autumn-harvest/migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"
+    ),
+    // issue #759: triage_note column on harvest_workflow_executions, referenced
+    // by every WorkflowExecution::as_select() read-back in this suite.
+    include_str!(
+        "../../autumn-harvest/migrations/20260717000000_harvest_workflow_triage_note/up.sql"
+    ),
+    // issue #804: capability_misses column on harvest_task_queue, referenced by
+    // every TaskQueueItem read (claim_task's `RETURNING harvest_task_queue.*`)
+    // in this suite.
+    include_str!(
+        "../../autumn-harvest/migrations/20260720000000_harvest_task_capability_misses/up.sql"
+    ),
+    // issue #946: quota_key column on harvest_workflow_executions, referenced
+    // by every WorkflowExecution::as_select() read-back in this suite.
+    include_str!("../../autumn-harvest/migrations/20260725000000_harvest_workflow_quotas/up.sql"),
 );
 
 type HarvestApiApp = axum::Router;
@@ -282,6 +308,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

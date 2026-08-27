@@ -17,43 +17,7 @@ use crate::parse_byte_size_macro;
 /// build error rather than panicking at registration via the emitted `.expect`.
 /// Kept intentionally permissive/identical to the runtime parser; the runtime
 /// `.expect` remains as a defensive backstop.
-fn is_valid_task_duration(s: &str) -> bool {
-    let mut total_secs = 0u64;
-    let mut current_num = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            if current_num == "0" {
-                current_num.clear();
-            }
-            if current_num.len() > 20 {
-                return false;
-            }
-            current_num.push(ch);
-        } else if ch.is_ascii_alphabetic() {
-            let Ok(num) = current_num.parse::<u64>() else {
-                return false;
-            };
-            current_num.clear();
-            let mult = match ch {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86400,
-                _ => return false,
-            };
-            match num
-                .checked_mul(mult)
-                .and_then(|v| total_secs.checked_add(v))
-            {
-                Some(v) => total_secs = v,
-                None => return false,
-            }
-        } else if ch != ' ' {
-            return false;
-        }
-    }
-    current_num.is_empty() && total_secs != 0
-}
+use crate::attr_util::is_valid_task_duration;
 
 // ---------------------------------------------------------------------------
 // Attribute parsing
@@ -62,6 +26,8 @@ fn is_valid_task_duration(s: &str) -> bool {
 struct ConcurrencyArgs {
     key_expr: String,
     limit: u32,
+    /// Overflow strategy (issue #811). `None` = the default `Defer`.
+    on_conflict: Option<String>,
 }
 
 struct DebounceArgs {
@@ -81,6 +47,20 @@ struct ThrottleArgs {
     burst: Option<f64>,
     key: Option<String>,
     schedule_to_start: Option<String>,
+}
+
+/// Per-tenant resource quota (issue #946). `key` is required; each of the
+/// three caps is independently optional -- a policy may declare just one,
+/// two, or all three (mirroring `QuotaPolicy`'s own `with_*` builder chain).
+struct QuotaArgs {
+    key_expr: String,
+    max_active_executions: Option<u32>,
+    /// Already parsed at attribute-parse time via [`parse_byte_size_macro`]
+    /// (e.g. `"10MiB"` -> `10_485_760`), mirroring `#[workflow(max_input_bytes
+    /// = "8MiB")]`'s own compile-time byte-size validation -- a typo is a
+    /// build error, not a registration-time panic.
+    max_history_bytes: Option<u64>,
+    max_dead_letters: Option<u32>,
 }
 
 /// Validate a rate string like `"100/m"` at macro-expansion time so a typo is a
@@ -129,6 +109,11 @@ struct WorkflowAttrs {
     /// Start-throttle policy (issue #607). Parsed from
     /// `#[workflow(throttle(rate = "100/m", burst = 20, key = "input.tenant_id", schedule_to_start = "5m"))]`.
     throttle: Option<ThrottleArgs>,
+    /// Per-tenant resource quota (issue #946). Parsed from
+    /// `#[workflow(quota(key = "input.tenant_id", max_active_executions = 100,
+    /// max_history_bytes = "10MiB", max_dead_letters = 50))]`. `key` is
+    /// required; the three caps are each independently optional.
+    quota: Option<QuotaArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -146,6 +131,183 @@ struct WorkflowAttrs {
     /// or `#[workflow(mcp = true)]`. Only sets `WorkflowInfo::mcp` — the
     /// macro never emits `::autumn_web::` paths.
     mcp: bool,
+    /// Opt-in declared activity dependencies (issue #802). Parsed from
+    /// `#[workflow(activities = [send_email, charge_card])]` and stored as
+    /// `WorkflowInfo::declared_activities`, which deploy-time preflight
+    /// resolves against the registered activity catalog.
+    ///
+    /// `None` = the attribute was absent (did not opt in); `Some(vec![])` = an
+    /// explicitly empty declaration. The distinction is load-bearing: only the
+    /// former is skipped by preflight.
+    declared_activities: Option<Vec<String>>,
+    /// Opt-in declared child-workflow dependencies (issue #802). Parsed from
+    /// `#[workflow(children = [generate_report])]`; same three-state semantics
+    /// as `declared_activities`, resolved against the workflow catalog.
+    declared_children: Option<Vec<String>>,
+}
+
+/// Parse a bracketed dependency list — `[send_email, billing::charge_card, "raw_name"]`.
+///
+/// Each element is either a path (its **last segment** is the registered name —
+/// neither `#[workflow]` nor `#[activity]` has a `name = "..."` rename
+/// attribute, so the fn ident always *is* the name) or a string literal (for a
+/// name dispatched by `ctx.execute_activity_raw("...", …)` that is not an
+/// identifier in scope). The two forms are equivalent; a path is not
+/// name-resolved by the compiler, so a typo stays a *preflight* failure — the
+/// exact deploy-time failure mode issue #802 specifies — rather than becoming a
+/// compile error that would also force the author to import every dependency.
+fn parse_dependency_list(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    attr_name: &str,
+) -> syn::Result<Vec<String>> {
+    // Catch `activities(send_email)` before `meta.value()` turns it into a bare
+    // "expected `=`" that names neither the attribute nor the correct shape.
+    if meta.input.peek(syn::token::Paren) {
+        return Err(meta.error(dependency_list_shape_hint(attr_name)));
+    }
+    let value = meta.value()?;
+    // Catch `activities = "send_email"` before `bracketed!` turns it into a bare
+    // "expected square brackets".
+    if !value.peek(syn::token::Bracket) {
+        return Err(value.error(dependency_list_shape_hint(attr_name)));
+    }
+    let parsed: DependencyList = value.parse()?;
+
+    let mut names = Vec::with_capacity(parsed.items.len());
+    for item in parsed.items {
+        let (name, span) = match item {
+            DependencyItem::Path(path) => {
+                let segment = path.segments.last().ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &path,
+                        format!("`{attr_name}` entry has no path segment"),
+                    )
+                })?;
+                (segment.ident.to_string(), segment.ident.span())
+            }
+            DependencyItem::Literal(lit) => (lit.value(), lit.span()),
+        };
+        if name.trim().is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!("`{attr_name}` entry must be a non-empty name"),
+            ));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Lower a parsed dependency list to the `Option<&'static [&'static str]>` the
+/// `WorkflowInfo` field holds (issue #802).
+///
+/// `None` (the attribute was never written) lowers to `Option::None`; `Some([])`
+/// (an explicitly empty `activities = []`) lowers to `Some(&[])`, so the
+/// three-state semantics survive the macro boundary. The emitted array of string
+/// literals is a constant expression, so rvalue static promotion gives it
+/// `'static` with no allocation — keeping `WorkflowInfo` clone-cheap.
+fn declaration_expr(declared: Option<&[String]>) -> proc_macro2::TokenStream {
+    declared.map_or_else(
+        || quote! { ::std::option::Option::None },
+        |names| {
+            let names = names.iter().map(String::as_str);
+            quote! { ::std::option::Option::Some(&[#(#names),*]) }
+        },
+    )
+}
+
+/// The bracketed body of an `activities = [...]` / `children = [...]` list.
+///
+/// Parsed through a dedicated [`syn::parse::Parse`] impl so the `bracketed!`
+/// macro receives a real `ParseStream` binding, matching the repo's
+/// `meta.value()?.parse()?` idiom.
+/// Reject a repeated `activities` / `children` key.
+///
+/// Every other `#[workflow]` attribute is last-wins, which is merely surprising
+/// for a scalar. Here it would silently **weaken a safety check**:
+/// `activities = [missing_handler], activities = []` records only the empty
+/// list, so preflight passes even though the first declaration named an
+/// unregistered handler — the exact deploy-time miss this attribute exists to
+/// catch. Fail loud instead. Rejecting rather than merging is deliberate: a
+/// repeated key is a mistake (a copy-paste, or a badly resolved merge), and
+/// silently concatenating would accept two lists the author believed were one.
+fn reject_duplicate_dependency_attr<T>(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    existing: Option<&T>,
+    attr_name: &str,
+) -> syn::Result<()> {
+    if existing.is_some() {
+        return Err(meta.error(format!(
+            "`{attr_name}` is declared more than once — merge the entries into a single \
+             `{attr_name} = [...]` list; a repeated key would silently discard the earlier \
+             declaration and weaken the deploy-time preflight check"
+        )));
+    }
+    Ok(())
+}
+
+/// Human-facing hint for the two most likely wrong-container mistakes.
+///
+/// `#[workflow]`'s existing vocabulary has exactly two container idioms:
+/// `key = "string"` (`owner`, `runbook`, `severity`, `description`) and
+/// `key(a = .., b = ..)` (`concurrency`, `debounce`, `batch`, `throttle`).
+/// `activities`/`children` introduce a third, `key = [..]`, so an author who
+/// pattern-matched off either existing form lands on a raw `syn` error
+/// ("expected square brackets" / "expected `=`") that names neither the
+/// attribute nor the correct shape. Both wrong-container forms are caught
+/// explicitly and answered with this message instead.
+fn dependency_list_shape_hint(attr_name: &str) -> String {
+    let example = if attr_name == "children" {
+        "generate_report"
+    } else {
+        "send_email, charge_card"
+    };
+    format!(
+        "`{attr_name}` takes a bracketed list of names, e.g. `{attr_name} = [{example}]` — \
+         unlike `owner`/`runbook`/`severity`/`description` it is a list, not a string, and \
+         unlike `concurrency(..)`/`throttle(..)` it uses `=`, not parentheses"
+    )
+}
+
+struct DependencyList {
+    items: syn::punctuated::Punctuated<DependencyItem, syn::Token![,]>,
+}
+
+impl syn::parse::Parse for DependencyList {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let content;
+        syn::bracketed!(content in input);
+        Ok(Self {
+            items: content.parse_terminated(DependencyItem::parse, syn::Token![,])?,
+        })
+    }
+}
+
+/// One element of an `activities = [...]` / `children = [...]` list.
+enum DependencyItem {
+    Path(syn::Path),
+    Literal(syn::LitStr),
+}
+
+impl syn::parse::Parse for DependencyItem {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        if input.peek(syn::LitStr) {
+            return input.parse().map(Self::Literal);
+        }
+        // Anything else must be a path. Probe with a fork rather than peeking
+        // for `Ident`: a qualifier like `crate::` / `self::` / `super::` is a
+        // KEYWORD, not an `Ident`, so a peek-based guard would reject
+        // `crate::billing::charge_card` before `syn::Path` ever saw it. Forking
+        // keeps the real stream unadvanced so the fallback error points at the
+        // offending token rather than wherever a partial parse stopped.
+        if input.fork().parse::<syn::Path>().is_ok() {
+            return input.parse().map(Self::Path);
+        }
+        Err(input.error(
+            "expected an activity/workflow name — a bare identifier (`send_email`), a path \
+             (`billing::charge_card`), or a string literal (`\"send_email\"`)",
+        ))
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -158,6 +320,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         debounce: None,
         batch: None,
         throttle: None,
+        quota: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -166,6 +329,8 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         allow_nondeterministic_apis: false,
         retry: None,
         mcp: false,
+        declared_activities: None,
+        declared_children: None,
     };
 
     syn::meta::parser(|meta| {
@@ -184,6 +349,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         } else if meta.path.is_ident("concurrency") {
             let mut key_expr: Option<String> = None;
             let mut limit: Option<u32> = None;
+            let mut on_conflict: Option<String> = None;
             meta.parse_nested_meta(|inner| {
                 if inner.path.is_ident("key") {
                     let value: LitStr = inner.value()?.parse()?;
@@ -197,8 +363,19 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     }
                     limit = Some(n);
                     Ok(())
+                } else if inner.path.is_ident("on_conflict") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    let raw = value.value();
+                    if !matches!(raw.as_str(), "defer" | "cancel_running") {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            "concurrency on_conflict must be \"defer\" or \"cancel_running\"",
+                        ));
+                    }
+                    on_conflict = Some(raw);
+                    Ok(())
                 } else {
-                    Err(inner.error("expected `key` or `limit`"))
+                    Err(inner.error("expected `key`, `limit`, or `on_conflict`"))
                 }
             })?;
             let key_expr = key_expr.ok_or_else(|| {
@@ -213,7 +390,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     "concurrency requires `limit = N`",
                 )
             })?;
-            result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
+            result.concurrency = Some(ConcurrencyArgs {
+                key_expr,
+                limit,
+                on_conflict,
+            });
             Ok(())
         } else if meta.path.is_ident("debounce") {
             let mut key_expr: Option<String> = None;
@@ -402,6 +583,64 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                 schedule_to_start,
             });
             Ok(())
+        } else if meta.path.is_ident("quota") {
+            let mut key_expr: Option<String> = None;
+            let mut max_active_executions: Option<u32> = None;
+            let mut max_history_bytes: Option<u64> = None;
+            let mut max_dead_letters: Option<u32> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("max_active_executions") {
+                    // Unlike `concurrency`'s `limit`, zero is a deliberately
+                    // supported value (`QuotaPolicy::has_any_cap`'s own test
+                    // suite covers it) -- it means "block every start for this
+                    // key", not an author mistake, so it is not rejected here.
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    max_active_executions = Some(n);
+                    Ok(())
+                } else if inner.path.is_ident("max_history_bytes") {
+                    // Byte-size string (e.g. "10MiB"), validated at compile
+                    // time via the same helper `#[workflow(max_input_bytes =
+                    // "8MiB")]` uses, so a typo is a build error rather than a
+                    // registration-time panic.
+                    let value: LitStr = inner.value()?.parse()?;
+                    let s = value.value();
+                    let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            &value,
+                            format!(
+                                "invalid quota `max_history_bytes` byte size '{s}'; \
+                                 expected format like \"10MiB\", \"512KiB\", \"4MB\""
+                            ),
+                        )
+                    })?;
+                    max_history_bytes = Some(bytes);
+                    Ok(())
+                } else if inner.path.is_ident("max_dead_letters") {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    max_dead_letters = Some(n);
+                    Ok(())
+                } else {
+                    Err(inner.error(
+                        "expected `key`, `max_active_executions`, `max_history_bytes`, or `max_dead_letters`",
+                    ))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(proc_macro2::Span::call_site(), "quota requires `key = \"...\"`")
+            })?;
+            result.quota = Some(QuotaArgs {
+                key_expr,
+                max_active_executions,
+                max_history_bytes,
+                max_dead_letters,
+            });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             result.allow_nondeterministic_apis = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
@@ -444,9 +683,17 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         } else if meta.path.is_ident("mcp") {
             result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
+        } else if meta.path.is_ident("activities") {
+            reject_duplicate_dependency_attr(&meta, result.declared_activities.as_ref(), "activities")?;
+            result.declared_activities = Some(parse_dependency_list(&meta, "activities")?);
+            Ok(())
+        } else if meta.path.is_ident("children") {
+            reject_duplicate_dependency_attr(&meta, result.declared_children.as_ref(), "children")?;
+            result.declared_children = Some(parse_dependency_list(&meta, "children")?);
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `quota`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, `activities`, `children`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -668,15 +915,25 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Emit concurrency as Option<ConcurrencyPolicy>.
     let concurrency_expr = match attrs.concurrency {
         None => quote! { ::std::option::Option::None },
-        Some(ConcurrencyArgs { key_expr, limit }) => {
-            quote! {
-                ::std::option::Option::Some(
-                    ::autumn_harvest::concurrency::ConcurrencyPolicy {
-                        key_expr: #key_expr,
-                        limit: #limit,
-                    }
-                )
-            }
+        Some(ConcurrencyArgs {
+            key_expr,
+            limit,
+            on_conflict,
+        }) => {
+            let policy = quote! {
+                ::autumn_harvest::concurrency::ConcurrencyPolicy::new(#key_expr, #limit)
+            };
+            // Only emit `.with_on_conflict(..)` when the author asked for a
+            // non-default strategy, so the omitted case stays byte-identical.
+            let policy = match on_conflict.as_deref() {
+                Some("cancel_running") => quote! {
+                    #policy.with_on_conflict(
+                        ::autumn_harvest::concurrency::ConcurrencyOnConflict::CancelRunning,
+                    )
+                },
+                _ => policy,
+            };
+            quote! { ::std::option::Option::Some(#policy) }
         }
     };
 
@@ -774,6 +1031,35 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit quota as Option<QuotaPolicy> (issue #946). `max_history_bytes` is
+    // already a compile-time-validated `u64` (parsed above via
+    // `parse_byte_size_macro`), so no runtime `.expect(...)` is needed here --
+    // unlike `throttle`/`debounce`, which defer duration-string parsing to
+    // `::autumn_harvest::task_duration` at registration time.
+    let quota_expr = match attrs.quota {
+        None => quote! { ::std::option::Option::None },
+        Some(QuotaArgs {
+            key_expr,
+            max_active_executions,
+            max_history_bytes,
+            max_dead_letters,
+        }) => {
+            let mut policy = quote! {
+                ::autumn_harvest::quota::QuotaPolicy::new(#key_expr)
+            };
+            if let Some(n) = max_active_executions {
+                policy = quote! { #policy.with_max_active_executions(#n) };
+            }
+            if let Some(b) = max_history_bytes {
+                policy = quote! { #policy.with_max_history_bytes(#b) };
+            }
+            if let Some(n) = max_dead_letters {
+                policy = quote! { #policy.with_max_dead_letters(#n) };
+            }
+            quote! { ::std::option::Option::Some(#policy) }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -818,6 +1104,13 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mcp = attrs.mcp;
     let mcp_expr = quote! { #mcp };
 
+    // Issue #802: lower each declaration to a promoted `&'static [&'static str]`.
+    // The array of string literals is a constant expression, so rvalue static
+    // promotion gives it `'static` without an allocation — keeping `WorkflowInfo`
+    // clone-cheap.
+    let declared_activities_expr = declaration_expr(attrs.declared_activities.as_deref());
+    let declared_children_expr = declaration_expr(attrs.declared_children.as_deref());
+
     quote! {
         #warnings_tokens
         #input_fn
@@ -839,6 +1132,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 debounce: #debounce_expr,
                 batch: #batch_expr,
                 throttle: #throttle_expr,
+                quota: #quota_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
@@ -849,6 +1143,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 error_schema: ::std::option::Option::None,
                 retry_policy: #retry_policy_expr,
                 mcp: #mcp_expr,
+                declared_activities: #declared_activities_expr,
+                declared_children: #declared_children_expr,
             }
         }
 
@@ -989,11 +1285,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     } else {
-                        (None, None)
+                        (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
                     let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
@@ -1066,6 +1362,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
+                        concurrency_on_conflict,
                         priority: opts.priority.unwrap_or_default(),
                         max_workflow_input_bytes: client.max_workflow_input_bytes(info.max_input_bytes),
                         start_at: opts.start_at,
@@ -1177,11 +1474,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     } else {
-                        (None, None)
+                        (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
                     let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
@@ -1237,6 +1534,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
+                        concurrency_on_conflict,
                         signal_name: &signal_name.into(),
                         signal_payload: payload,
                         idempotency_key: opts.idempotency_key,
@@ -1261,6 +1559,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // `validate_input` call site being in the HTTP handlers.
                         workflow_info: None,
                         start_source_override: None,
+                        start_source_ref_override: None,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

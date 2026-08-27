@@ -178,6 +178,7 @@ fn start_params<'a>(
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: autumn_harvest::types::Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -273,6 +274,7 @@ async fn signal_with_start_records_signal_with_start_source() {
             max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             signal_name: "go",
             signal_payload: json!({"ping": true}),
             idempotency_key: None,
@@ -288,6 +290,7 @@ async fn signal_with_start_records_signal_with_start_source() {
             reject_fresh_if_debounced: false,
             workflow_info: None,
             start_source_override: None,
+            start_source_ref_override: None,
         },
         None,
         None,
@@ -336,6 +339,7 @@ async fn update_with_start_records_update_with_start_source() {
             max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             update_id: UpdateId::new(),
             update_name: "bump".to_string(),
             update_args: json!({"n": 1}),
@@ -620,6 +624,7 @@ async fn reset_records_reset_source_referencing_source_execution() {
             operator_id: "op-1".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
+            refuse_erased_source: false,
         },
         None,
     )
@@ -662,6 +667,9 @@ fn noop_schedule_handler<'a>(
 fn schedule_registry(wf_name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "start_source_tests",

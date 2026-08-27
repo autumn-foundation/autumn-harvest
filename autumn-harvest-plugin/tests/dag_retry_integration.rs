@@ -167,6 +167,7 @@ fn build_worker() -> Arc<Worker> {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -266,6 +267,7 @@ async fn seed_run(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -637,6 +639,186 @@ async fn retry_running_run_is_conflict() {
             .contains("cancel"),
         "message should hint to cancel first: {body}"
     );
+}
+
+// ── (e2) retry of a PII-erased run -> 409 ───────────────────────────────────
+
+/// A source run whose payloads were erased (issue #495) must be refused.
+///
+/// Erasure tombstones every payload field, so the issue #780 compensated-run
+/// guard can go blind: `ActivityScheduled.input` is `{"_harvest_erased": true}`
+/// rather than the compensation envelope (signal 2), and a run that unwound at a
+/// drained signal frontier (issue #801) recorded no marker for signal 1 to
+/// anchor on. On that intersection an already-rolled-back run would look
+/// retryable — the double-spend `CompensatedRun` exists to prevent.
+///
+/// The refusal is correct independently of compensation, too: the #148 fork
+/// carries over upstream events whose `output` is now a tombstone, so a
+/// re-executing downstream node with an `input_from` binding would be handed
+/// `{"_harvest_erased": true}` as its input.
+#[tokio::test]
+async fn retry_erased_run_is_conflict() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    let (events, _ia, _ib) = linear_failed_events();
+    let exec_id = seed_run(
+        &mut conn,
+        "linear_retry_dag",
+        "lin-erased",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    // Erase the run's payloads, exactly as the operator endpoint does.
+    let outcome =
+        autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr subject request")
+            .await
+            .expect("erase payloads");
+    assert!(
+        outcome.fields_tombstoned > 0,
+        "fixture must actually erase something: {outcome:?}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/dags/linear_retry_dag/runs/{exec_id}/retry"),
+        json!({ "from_nodes": ["step_c"], "reason": "x", "operator_id": "oncall" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("erased"),
+        "message must name erasure as the blocker: {body}"
+    );
+    assert!(
+        message.contains("fresh"),
+        "message must point at a fresh run as the remedy: {body}"
+    );
+
+    // Fails closed BEFORE resolving/forking: no new execution was created.
+    let forks: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("linear_retry_dag"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count runs");
+    assert_eq!(forks, 1, "the refused retry must not fork a new run");
+}
+
+/// The pre-flight erasure guard is a fast path, not the guarantee: the fork
+/// itself must refuse an erased source **under its own row lock**.
+///
+/// The retry handler reads the execution row WITHOUT a lock, then drops its
+/// connection to inflate blobs off the pool, and only afterwards opens the reset
+/// transaction. `POST /workflows/&#123;id&#125;/erase-payloads` takes its own `FOR UPDATE`
+/// lock, so it can commit tombstones anywhere in that window — the pre-flight
+/// check would have already passed on the intact row.
+///
+/// This drives `reset_workflow_execution` directly against an already-erased
+/// run, which is exactly the state the race leaves behind by the time the fork
+/// takes its lock. The pre-flight guard is bypassed by construction here, so a
+/// refusal can only come from the locked re-check.
+#[tokio::test]
+async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
+    use autumn_harvest::reset::{
+        WorkflowResetError, WorkflowResetRequest, reset_workflow_execution,
+    };
+
+    let (url, _container) = setup_database().await;
+    let mut conn = establish(&url).await;
+
+    let (events, _ia, _ib) = linear_failed_events();
+    let exec_id = seed_run(
+        &mut conn,
+        "linear_retry_dag",
+        "lin-erased-race",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    // The erasure "wins the race": it commits before the fork takes its lock.
+    let outcome =
+        autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr subject request")
+            .await
+            .expect("erase payloads");
+    assert!(
+        outcome.fields_tombstoned > 0,
+        "fixture must actually erase something: {outcome:?}"
+    );
+
+    let request = WorkflowResetRequest {
+        reset_to_event_id: Some(1),
+        reset_point: None,
+        reason: "dag_retry: nodes=[step_c]".to_string(),
+        operator_id: "oncall".to_string(),
+        signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
+        allow_terminal_source: true,
+        refuse_erased_source: true,
+    };
+
+    let error = reset_workflow_execution(&mut conn, exec_id, request, None)
+        .await
+        .expect_err("a fork over an erased source must be refused under the row lock");
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { .. }),
+        "expected ErasedSource, got: {error:?}"
+    );
+
+    // Refused before copying a single event: no fork exists.
+    let forks: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("linear_retry_dag"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count runs");
+    assert_eq!(forks, 1, "the refused fork must not create a new run");
+}
+
+/// The flag is opt-in: with it off, an erased source resets exactly as before.
+///
+/// This is what keeps the public `POST /workflows/&#123;id&#125;/reset` endpoint — which
+/// cannot set the flag from the wire — byte-for-byte unchanged by the fix.
+#[tokio::test]
+async fn reset_without_the_flag_still_forks_an_erased_source() {
+    use autumn_harvest::reset::{WorkflowResetRequest, reset_workflow_execution};
+
+    let (url, _container) = setup_database().await;
+    let mut conn = establish(&url).await;
+
+    let (events, _ia, _ib) = linear_failed_events();
+    let exec_id = seed_run(
+        &mut conn,
+        "linear_retry_dag",
+        "lin-erased-allowed",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr subject request")
+        .await
+        .expect("erase payloads");
+
+    let request = WorkflowResetRequest {
+        reset_to_event_id: Some(1),
+        reset_point: None,
+        reason: "plain reset".to_string(),
+        operator_id: "oncall".to_string(),
+        signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
+        allow_terminal_source: true,
+        refuse_erased_source: false,
+    };
+
+    reset_workflow_execution(&mut conn, exec_id, request, None)
+        .await
+        .expect("with the flag off the reset must behave exactly as it did pre-fix");
 }
 
 // ── (f) non-existent node -> 400 with declared list ─────────────────────────

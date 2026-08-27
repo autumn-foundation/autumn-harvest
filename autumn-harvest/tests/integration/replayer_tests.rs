@@ -19,7 +19,9 @@ use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId};
+use autumn_harvest::types::{
+    ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy, TimerId, UpdateId, WorkerId,
+};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -1225,6 +1227,55 @@ fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
+/// Issue #1126 replay-neutrality fixture: race two activities (branch 0 wins),
+/// then run a follow-on activity. Proves the recorded post-fix history — winner
+/// marker + follow-on schedule + the synthetic loser `ActivityFailed` — replays
+/// with 100% fidelity. Must pass both before AND after the same-cycle fix.
+fn race_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        // Defensive: the recorded history resolved branch 0; a divergent index
+        // would surface as a workflow error rather than a silent mismatch. In a
+        // faithful replay this guard never fires.
+        if winner.index != 0 {
+            return Err(format!("expected branch 0 to win, got {}", winner.index));
+        }
+        let follow = ctx
+            .execute_activity_raw("next_step", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"winner": winner.value, "follow": follow}))
+    })
+}
+
+/// Issue #1126 replay-neutrality fixture: race two activities (branch 0 wins)
+/// and end at the race with no follow-on command — the exact history shape old
+/// code could record. Must pass both before AND after the same-cycle fix.
+fn race_only_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(winner.value)
+    })
+}
+
 #[allow(clippy::too_many_lines)] // merge of trunk + branch register_fn lists
 fn build_replayer() -> WorkflowReplayer {
     WorkflowReplayer::new()
@@ -1368,6 +1419,8 @@ fn build_replayer() -> WorkflowReplayer {
             "mutex_self_deadlock_caught_workflow",
             mutex_self_deadlock_caught_workflow,
         )
+        .register_fn("race_then_activity_workflow", race_then_activity_workflow)
+        .register_fn("race_only_workflow", race_only_workflow)
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1488,6 +1541,7 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     }
 }
 
@@ -2414,6 +2468,177 @@ async fn mutex_self_deadlock_is_checked_before_positional_match() {
     );
 }
 
+// ── ctx.race() replay-neutrality fixtures (issue #1126) ─────────────────────
+// These prove the same-cycle fix does NOT change replay of RECORDED histories.
+// They must pass BOTH before and after the fix — they are replay-neutrality
+// coverage, NOT the RED reproducer (the RED case lives in context.rs and
+// exercises the LIVE resolving cycle).
+
+#[tokio::test]
+async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
+    // A recorded post-fix history: an activity race (2 branches, branch 0
+    // "fetch_a" wins) followed by a follow-on activity ("next_step"). The loser
+    // ("fetch_b") was scheduled AND started but never got a terminal live; its
+    // synthetic `ActivityFailed` ("lost race to a sibling branch") is appended
+    // by the winner cycle. This full-fidelity history must replay cleanly.
+    let exec_id = ExecutionId::new();
+    let winner_id = ActivityExecId::new();
+    let loser_id = ActivityExecId::new();
+    let next_id = ActivityExecId::new();
+    let winner_output = serde_json::json!({"p": "a"});
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: winner_id,
+            name: "fetch_a".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: loser_id,
+            name: "fetch_b".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: loser_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: winner_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: winner_id,
+            output: winner_output.clone(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race_winner:1".to_string(),
+            details: Value::from(0u64),
+        },
+        // The follow-on activity, scheduled by the winner cycle.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: next_id,
+            name: "next_step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        // The synthetic loser terminal, appended last by the winner cycle
+        // (`apply_race_loser_cancellations`), interleaved before the follow-on
+        // activity's own terminal.
+        WorkflowEvent::ActivityFailed {
+            activity_id: loser_id,
+            error: "lost race to a sibling branch".to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: next_id,
+            output: serde_json::json!("done"),
+        },
+    ];
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "race_then_activity_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1126: a recorded race (in-flight loser) followed by a follow-on \
+         activity must replay with 100% fidelity, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replay_race_ending_at_race_no_follow_on_succeeds() {
+    // A pre-fix-shaped history where the workflow ENDS at the race (no follow-on
+    // command). Branch 0 ("fetch_a") wins; the loser's synthetic `ActivityFailed`
+    // is recorded BEFORE the winner marker (mirroring the existing
+    // `race_activity_verifies_previously_recorded_winner_without_new_commands`
+    // ordering) to prove that ordering also replays clean.
+    let exec_id = ExecutionId::new();
+    let winner_id = ActivityExecId::new();
+    let loser_id = ActivityExecId::new();
+    let winner_output = serde_json::json!({"p": "a"});
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: winner_id,
+            name: "fetch_a".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: loser_id,
+            name: "fetch_b".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: loser_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: winner_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: winner_id,
+            output: winner_output.clone(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: loser_id,
+            error: "lost race to a sibling branch".to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race_winner:1".to_string(),
+            details: Value::from(0u64),
+        },
+    ];
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("race_only_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1126: a race with an in-flight loser that ends at the race (no \
+         follow-on command) must replay with 100% fidelity, got: {report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (b) Activities reordered → NonDeterminismDetected { ActivityScheduleMismatch }
 // ---------------------------------------------------------------------------
@@ -2700,6 +2925,7 @@ fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
         input: serde_json::json!({ "cycle": 1 }),
+        new_workflow_type: None,
     });
     events
 }
@@ -2859,6 +3085,7 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     // The exported JSON must carry the deadline budget at the top level so it
@@ -2901,6 +3128,7 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     assert!(
@@ -4189,6 +4417,7 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -4218,6 +4447,7 @@ async fn replay_from_json_detects_non_determinism() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -4412,6 +4642,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5252,7 +5483,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
             idempotency_key: None,
@@ -5280,7 +5511,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: Value::Null,
             idempotency_key: None,
@@ -5338,7 +5569,11 @@ async fn replayer_replays_external_signal_delivered_successfully() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5378,7 +5613,11 @@ async fn replayer_detects_external_signal_name_mismatch() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5427,7 +5666,11 @@ async fn replayer_replays_external_signal_failed_history() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5461,6 +5704,193 @@ async fn replayer_replays_external_signal_failed_history() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "external signal failed history should replay successfully when error is handled: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External signal/cancel BY WORKFLOW_ID replay tests (issue #751)
+//
+// AC7 ("replay determinism preserved") for the by-id primitives: the
+// mechanism reuses `match_external_signal`/`match_external_cancel`, which
+// compare the whole `ExternalTarget` value (never the concrete resolved
+// `ExecutionId`) via `PartialEq` -- these fixtures exercise the
+// `ExternalTarget::WorkflowId { .. }` variant specifically, which the
+// pre-existing `external_signal_*_history` fixtures above never do (they
+// only cover `ExternalTarget::ExecutionId`).
+// ---------------------------------------------------------------------------
+
+/// Build a history with a `WorkflowId`-targeted `ExternalSignalRequested` +
+/// `ExternalSignalDelivered`.
+fn external_signal_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let signal_id = autumn_harvest::types::ExternalSignalId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: ExternalTarget::WorkflowId {
+                workflow_name: "job_pool".into(),
+                workflow_id: "job-42".into(),
+            },
+            signal_name: "drain".into(),
+            payload: serde_json::json!({"reason": "rebalance"}),
+            idempotency_key: None,
+        },
+        WorkflowEvent::ExternalSignalDelivered { signal_id },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Workflow that signals an external workflow BY `workflow_id`, then returns Ok.
+fn external_signal_by_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _result = ctx
+            .signal_external_workflow_by_id(
+                "job_pool",
+                "job-42",
+                "drain",
+                serde_json::json!({"reason": "rebalance"}),
+            )
+            .await;
+        Ok(Value::Null)
+    })
+}
+
+/// Same as [`external_signal_by_id_workflow`] but targets a DIFFERENT
+/// `workflow_id` than what history recorded -- must diverge on replay.
+fn external_signal_by_id_wrong_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.signal_external_workflow_by_id(
+            "job_pool",
+            "job-99", // recorded history says "job-42"
+            "drain",
+            serde_json::json!({"reason": "rebalance"}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn replayer_replays_external_signal_by_id_delivered_successfully() {
+    let (_exec_id, events) = external_signal_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_signal_by_id_workflow",
+            external_signal_by_id_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "workflow_id-targeted external signal delivered history must replay cleanly: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_detects_external_signal_by_id_target_mismatch() {
+    let (_exec_id, events) = external_signal_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_signal_by_id_wrong_target_workflow",
+            external_signal_by_id_wrong_target_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ExternalSignalMismatch,
+                ..
+            }
+        ),
+        "a workflow_id-targeted signal whose recorded ExternalTarget differs \
+         from the replaying code's target must trigger ExternalSignalMismatch, \
+         proving match_external_signal compares the whole ExternalTarget value \
+         on replay rather than silently accepting any target: {report}"
+    );
+}
+
+/// Build a history with a `WorkflowId`-targeted `ExternalCancelRequested` +
+/// `ExternalCancelDelivered`. There is no pre-existing `ExecutionId`-targeted
+/// analogue of this fixture anywhere in this file (the cancel primitive,
+/// issue #492, had no `WorkflowReplayer`-level replay test at all before
+/// issue #751) -- this closes that gap for both addressing modes at once.
+fn external_cancel_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: ExternalTarget::WorkflowId {
+                workflow_name: "job_pool".into(),
+                workflow_id: "job-42".into(),
+            },
+        },
+        WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Workflow that cancels an external workflow BY `workflow_id`, then returns Ok.
+fn external_cancel_by_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _result = ctx
+            .request_cancel_external_workflow_by_id("job_pool", "job-42")
+            .await;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn replayer_replays_external_cancel_by_id_delivered_successfully() {
+    let (_exec_id, events) = external_cancel_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_cancel_by_id_workflow",
+            external_cancel_by_id_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "workflow_id-targeted external cancel delivered history must replay cleanly: {report}"
     );
 }
 
@@ -5596,6 +6026,7 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5630,6 +6061,7 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5657,6 +6089,7 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5686,6 +6119,7 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5732,6 +6166,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5798,6 +6233,7 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5877,6 +6313,7 @@ async fn replay_succeeds_for_recorded_side_effect() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -5925,6 +6362,7 @@ async fn replay_detects_side_effect_drift() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -8050,6 +8488,7 @@ async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
         deadline_at: None,
         parent_execution_id: Some(parent),
         workflow_id: None,
+        queue_name: None,
     })
     .expect("full export should fit under the limit");
     let json = serde_json::to_string(&document).expect("export serialises");
@@ -8095,6 +8534,7 @@ async fn parent_aware_child_diverges_through_export_document_without_parent() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     })
     .expect("full export should fit under the limit");
     let json = serde_json::to_string(&document).expect("export serialises");
@@ -8212,6 +8652,7 @@ async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() 
         workflow_name: "identity_wf".to_string(),
         // Issue #698: the business id rides the export document (mechanism 2).
         workflow_id: Some("cart-42".to_string()),
+        queue_name: None,
         execution_id: exec_id,
         shard_id: 0,
         state: "COMPLETED".to_string(),
@@ -8260,6 +8701,7 @@ async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
         // Deliberately drop the business id: the recorded input still says
         // "cart-42", so replay must diverge.
         workflow_id: None,
+        queue_name: None,
         execution_id: exec_id,
         shard_id: 0,
         state: "COMPLETED".to_string(),
@@ -9614,4 +10056,294 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
         }
         other => panic!("expected WorkflowFailed (clean reproduction), got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-type continue-as-new (issue #803)
+//
+// An entity that changes workflow type across lifecycle phases must replay to
+// the *identical* successor type every time, and a code change that redirects
+// the transition must surface as non-determinism rather than silently forking
+// the chain into a different phase.
+// ---------------------------------------------------------------------------
+
+/// Phase 1 of a two-phase entity: does one unit of work, then graduates the run
+/// into the `paid_subscription` type under the same `workflow_id`.
+fn trial_subscription_phase<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("paid_subscription", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// The same phase 1 body, redirected to a *different* target type — models the
+/// code change that must be rejected against a recorded history.
+fn trial_subscription_phase_redirected<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("churned", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// The same phase 1 body targeting a third type, so the success-metric sweep
+/// below can vary the recorded target instead of replaying one fixture 100×.
+fn trial_subscription_phase_to_dunning<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("dunning", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// Recorded history of a run that graduated `trial_subscription` → `target`.
+fn cross_type_can_history_targeting(target: &str) -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "collect_card".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"plan": "pro"}),
+            new_workflow_type: Some(target.to_string()),
+        },
+    ]
+}
+
+/// Recorded history of a run that graduated `trial_subscription` →
+/// `paid_subscription`.
+fn cross_type_can_history() -> Vec<WorkflowEvent> {
+    cross_type_can_history_targeting("paid_subscription")
+}
+
+/// **Success metric (issue #803).** A type-changing history round-trips to the
+/// **identical** successor type on 100% of runs.
+///
+/// "Identical" is asserted by *exclusion*, which is the strongest available
+/// formulation: on replay the successor type is not readable off the report
+/// (the context re-emits it from the caller), so instead each run pairs the
+/// recorded target with its two alternatives and requires that **exactly one**
+/// of the three handlers replays clean while both others are rejected as
+/// non-determinism. A guard that ignored the recorded type would let all three
+/// pass and fail this test immediately.
+///
+/// The sweep also *varies* the recorded target across the three types rather
+/// than replaying one fixture 100 times, so the runs carry independent signal.
+#[tokio::test]
+async fn cross_type_continue_as_new_replays_to_the_same_successor_type_every_run() {
+    const TARGETS: [(&str, WorkflowHandlerFn); 3] = [
+        ("paid_subscription", trial_subscription_phase),
+        ("churned", trial_subscription_phase_redirected),
+        ("dunning", trial_subscription_phase_to_dunning),
+    ];
+
+    for run in 0..100 {
+        let (recorded_target, matching_handler) = TARGETS[run % TARGETS.len()];
+        let history = cross_type_can_history_targeting(recorded_target);
+
+        // Positive: the handler naming the recorded target replays clean.
+        let report = WorkflowReplayer::new()
+            .register_fn("trial_subscription", matching_handler)
+            .replay_from_snapshot(make_snapshot(
+                "trial_subscription",
+                ExecutionId::new(),
+                history.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "run {run}: the recorded target {recorded_target} must replay clean: {report}"
+        );
+
+        // Negative: EVERY other target is rejected. This is what pins the
+        // successor type to history rather than to live code.
+        for (other_target, other_handler) in TARGETS {
+            if other_target == recorded_target {
+                continue;
+            }
+            let report = WorkflowReplayer::new()
+                .register_fn("trial_subscription", other_handler)
+                .replay_from_snapshot(make_snapshot(
+                    "trial_subscription",
+                    ExecutionId::new(),
+                    history.clone(),
+                ))
+                .await;
+            assert!(
+                matches!(
+                    report.status,
+                    ReplayStatus::NonDeterminismDetected {
+                        kind: NonDeterminismKind::ContinueAsNewMismatch,
+                        ..
+                    }
+                ),
+                "run {run}: a {recorded_target} history must reject a {other_target} \
+                 handler, got: {report}"
+            );
+        }
+    }
+}
+
+/// The successor type is genuinely pinned by history: the *same* fixture
+/// replayed against a handler that redirects the transition elsewhere is
+/// rejected as non-determinism (this is what makes the 100-run test above
+/// non-vacuous).
+#[tokio::test]
+async fn cross_type_continue_as_new_redirect_is_detected_as_nondeterminism() {
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", trial_subscription_phase_redirected)
+        .replay_from_snapshot(make_snapshot(
+            "trial_subscription",
+            ExecutionId::new(),
+            cross_type_can_history(),
+        ))
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                *kind,
+                NonDeterminismKind::ContinueAsNewMismatch,
+                "a redirected continuation must classify as a continue-as-new \
+                 mismatch, got: {report}"
+            );
+        }
+        other => panic!("expected non-determinism, got {other:?}: {report}"),
+    }
+}
+
+/// Removing the cross-type call (reverting to a same-type continuation) over a
+/// recorded cross-type history is likewise a detected divergence — `None` and
+/// `Some(t)` are distinct recorded intents.
+#[tokio::test]
+async fn reverting_to_same_type_over_a_cross_type_history_is_nondeterminism() {
+    fn same_type_phase<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.execute_activity_raw("collect_card", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.continue_as_new(serde_json::json!({"plan": "pro"}))
+                .await
+                .map_err(|e| e.to_string())?;
+            unreachable!("continue_as_new never resolves")
+        })
+    }
+
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", same_type_phase)
+        .replay_from_snapshot(make_snapshot(
+            "trial_subscription",
+            ExecutionId::new(),
+            cross_type_can_history(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "dropping the target type must diverge, got: {report}"
+    );
+}
+
+/// AC3 (append-only): the JSON snapshot path carries the additive field, so an
+/// exported fixture of a type-changing run replays through
+/// `replay_from_json` unchanged.
+#[tokio::test]
+async fn cross_type_continue_as_new_round_trips_through_json() -> Result<(), serde_json::Error> {
+    let snapshot = make_snapshot(
+        "trial_subscription",
+        ExecutionId::new(),
+        cross_type_can_history(),
+    );
+    let json = serde_json::to_string(&snapshot)?;
+    assert!(
+        json.contains("paid_subscription"),
+        "the exported fixture must carry the target type, got {json}"
+    );
+
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", trial_subscription_phase)
+        .replay_from_json(&json)
+        .await?;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a JSON-exported type-changing history must replay, got: {report}"
+    );
+    Ok(())
+}
+
+/// AC3 (append-only): a history written by a **pre-#803** build carries no
+/// `new_workflow_type` key at all and must still replay identically against a
+/// same-type handler, so in-flight executions survive the upgrade.
+#[tokio::test]
+async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json::Error> {
+    fn same_type_only<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.continue_as_new(serde_json::json!({"cycle": 2}))
+                .await
+                .map_err(|e| e.to_string())?;
+            unreachable!("continue_as_new never resolves")
+        })
+    }
+
+    // Hand-authored the way a pre-#803 exporter would have written it.
+    let exec = ExecutionId::new();
+    let json = format!(
+        r#"{{"workflow_name":"legacy_loop","execution_id":"{exec}","events":[
+            {{"type":"WorkflowStarted","data":{{"input":null,"timestamp":"2026-01-01T00:00:00Z"}}}},
+            {{"type":"WorkflowContinuedAsNew","data":{{"new_exec_id":"{exec}","input":{{"cycle":2}}}}}}
+        ]}}"#
+    );
+    assert!(!json.contains("new_workflow_type"));
+
+    let report = WorkflowReplayer::new()
+        .register_fn("legacy_loop", same_type_only)
+        .replay_from_json(&json)
+        .await?;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-#803 history must replay unchanged, got: {report}"
+    );
+    Ok(())
 }

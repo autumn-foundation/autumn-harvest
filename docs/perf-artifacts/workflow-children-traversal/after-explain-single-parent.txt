@@ -1,0 +1,15 @@
+-- after: single-parent lookup (one iteration of the pre-fix loop) --
+Sort  (cost=8.30..8.31 rows=1 width=250) (actual rows=2 loops=1)
+  Output: id, workflow_name, state, started_at, completed_at, error, shard_id, parent_close_policy
+  Sort Key: harvest_workflow_executions.started_at DESC, harvest_workflow_executions.id DESC
+  Sort Method: quicksort  Memory: 25kB
+  Buffers: shared hit=9
+  ->  Index Scan using idx_harvest_we_parent_id on public.harvest_workflow_executions  (cost=0.27..8.29 rows=1 width=250) (actual rows=2 loops=1)
+        Output: id, workflow_name, state, started_at, completed_at, error, shard_id, parent_close_policy
+        Index Cond: (harvest_workflow_executions.parent_id = '0000ceb5-b89b-4148-81b1-d65292691c5f'::uuid)
+        Buffers: shared hit=3
+Query Identifier: 2469269690525874491
+Planning:
+  Buffers: shared hit=51
+Planning Time: 0.315 ms
+Execution Time: 0.054 ms

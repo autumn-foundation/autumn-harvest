@@ -52,6 +52,12 @@ Don't forget to register the child:
 .workflows(workflows![checkout, issue_invoice])
 ```
 
+Missing that line only fails at runtime, when the parent tries to spawn. To
+catch it at deploy time instead, declare the child on the parent —
+`#[workflow(children = [issue_invoice])]` — and preflight will fail while the
+name is unregistered; see [catching a forgotten registration before
+rollout](10-operations.md#catching-a-forgotten-registration-before-rollout).
+
 The dashboard will show `checkout` as the parent with a clickable link to the
 child execution. `harvest workflow children <execution-id>` lists them on the
 CLI.

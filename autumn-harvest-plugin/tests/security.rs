@@ -344,6 +344,107 @@ async fn eris_unauthenticated_fail_activity_now_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Issue #619 AC1/AC6: pausing or resuming a task queue is an operator action
+/// that must be admin-gated and audited — never reachable unauthenticated.
+#[tokio::test]
+async fn eris_unauthenticated_queue_pause_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/queues/email-workers/pause",
+            r#"{"reason": "SMTP outage"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_queue_resume_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/queues/email-workers/resume", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Issue #807: pausing dispatch for an activity TYPE is a fleet-wide kill
+/// switch for that downstream — the most surgical, and therefore the most
+/// reachable-for, of the hold controls. It must be admin-gated and audited,
+/// never reachable unauthenticated.
+///
+/// The body is deliberately optional on this route (containment must not wait
+/// on paperwork), which makes it the easiest of the mutations to fire
+/// accidentally — a bare POST is a valid hold — so the gate matters more here,
+/// not less. Both cases below send a body-free POST for exactly that reason.
+#[tokio::test]
+async fn eris_unauthenticated_activity_pause_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/activities/charge_card/pause", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_activity_resume_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/activities/charge_card/resume", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Issue #807: unlike the queue-pause sibling, whose paused-queue list is an
+/// ungated read, BOTH activity reads are admin-gated — they surface
+/// operator-authored hold reasons (free text written mid-incident) and the full
+/// shape of the registered activity catalogue, which is a map of the fleet's
+/// downstream dependencies. Pinned so the gate cannot be dropped by someone
+/// pattern-matching on the queue sibling.
+#[tokio::test]
+async fn eris_unauthenticated_activity_list_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/activities")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_activity_get_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/activities/charge_card")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_workflow_logs_is_blocked() {
+    // Durable per-execution author log lines (issue #790): admin-only read —
+    // a log message is free-form author text that routinely carries business
+    // detail, so it takes the /awaitables posture, not the execution-row one.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get("/workflows/00000000-0000-0000-0000-000000000001/logs"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_awaitables_is_blocked() {
+    // Open-awaitables diagnostic (issue #615): admin-only read (the
+    // eligibility endpoints' posture).
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get(
+            "/workflows/00000000-0000-0000-0000-000000000001/awaitables",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn eris_unauthenticated_replay_diagnosis_is_blocked() {
     // Single-execution replay diagnosis (issue #614): admin-only read.
@@ -352,6 +453,21 @@ async fn eris_unauthenticated_replay_diagnosis_is_blocked() {
         .oneshot(post_json(
             "/workflows/00000000-0000-0000-0000-000000000001/replay-diagnosis",
             "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_rerun_is_blocked() {
+    // Operator re-run of a terminal workflow (issue #777): starts a brand-new
+    // execution from a source's recorded start params — admin-only mutation.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/rerun",
+            r"{}",
         ))
         .await
         .unwrap();
@@ -984,6 +1100,73 @@ async fn eris_require_auth_blocks_trigger_schedule() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ── TTL'd runtime pacing overrides (issue #945) — admin-gated ────────────────
+//
+// All five pacing-override routes (2 rate-limit, 2 start-throttle, plus the
+// read-only start-throttle-override lookup) carry `require_admin` at the
+// route-registration site (`api.rs`'s `harvest_api_router`). Mirroring every
+// other admin route in this file, an unauthenticated request never even
+// reaches that per-route gate — `RequireAuth`, wrapping the whole router,
+// already rejects it with 401 first. This proves the pacing-override routes
+// are wired into the SAME auth chain as every other admin-gated route, not
+// silently left unauthenticated.
+
+#[tokio::test]
+async fn eris_require_auth_blocks_set_rate_limit_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/rate-limits/send_email/override",
+            r#"{"refill_rate": 100.0, "ttl_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_clear_rate_limit_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(delete("/admin/rate-limits/send_email/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_set_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/start-throttle/onboard_user/override",
+            r#"{"refill_per_sec": 100.0, "ttl_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_clear_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(delete("/admin/start-throttle/onboard_user/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_get_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(get("/admin/start-throttle/onboard_user/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ── Read-only operator role (issue #776) ──────────────────────────────────────
 //
 // Headline success-metric test (AC1/AC2, no DB): a synthetic router mounts a
@@ -1570,4 +1753,76 @@ async fn embedder_only_router_has_no_token_layer() {
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
     assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Issue #944 review: the connector's derived idempotency keys must be
+/// unclaimable from outside.
+///
+/// A `SignalsWithStart` binding derives its key into the same
+/// `(workflow_exec_id, idempotency_key)` scope on `harvest_signals` that this
+/// route writes, and derived keys are *predictable* — Kafka coordinates are
+/// `{topic}:{partition}:{offset}`. A caller who landed one first would make
+/// the broker's own delivery read as an idempotent replay and be acknowledged
+/// without ever dispatching its payload: silent loss.
+///
+/// Driven through the real router with no storage configured, which is exactly
+/// what proves the guard runs at the request boundary rather than somewhere
+/// behind a database read. The body is asserted, not just the status, so this
+/// cannot pass for an unrelated 400.
+#[tokio::test]
+async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_route() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/workflows/00000000-0000-0000-0000-000000000001/signal/order_event")
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", "conn:L6:orders:L0::L10:orders:0:7")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = autumn_web::reexports::axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("reserved"),
+        "the refusal must name the reservation, not some other 400: {text}"
+    );
+}
+
+/// The guard must not over-reject: a key that merely resembles the reserved
+/// prefix cannot alias a derived one, so it has to get past the boundary.
+/// `CONN:` differs from `conn:` under the Postgres text comparison backing the
+/// uniqueness scope, so refusing it would reject a legitimate caller key.
+#[tokio::test]
+async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
+    for key in ["CONN:x", "conn", "connector-key", "xconn:y"] {
+        let app = unauthenticated_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workflows/00000000-0000-0000-0000-000000000001/signal/order_event")
+                    .header("Content-Type", "application/json")
+                    .header("Idempotency-Key", key)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = autumn_web::reexports::axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("reserved"),
+            "{key} must not be refused as reserved (status {status}): {text}"
+        );
+    }
 }

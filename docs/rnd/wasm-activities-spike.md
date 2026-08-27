@@ -574,7 +574,7 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
 
 Recounted precisely (do not extrapolate):
 
-- **`src/wasm_activities.rs`** (runtime unit tests): **34** `#[test]` fns —
+- **`src/wasm_activities.rs`** (runtime unit tests): **45** `#[test]` fns —
   `deadline_ticks` rounding/clamping/saturation, hash/cache, echo round-trip, the
   three sandbox-deny categories (fs/net/env), the three capability grant paths
   (clock/random/env) + in-band env denial + the huge-`key_len` and value-length
@@ -590,19 +590,35 @@ Recounted precisely (do not extrapolate):
   cache** (`compiled_module_cache_is_bounded_and_evicts_lru`), and **table resource
   bounding** (`huge_table_declaration_is_bounded_resource_exhausted`,
   `table_grow_past_cap_is_bounded_resource_exhausted`).
-- **`src/wasm_store.rs`** (storage unit tests): **4** `#[test]` fns — registration
-  defaults, fluent setters, binding projection, module-size-cap constant.
+  Plus the round-10 review additions: **`wall_clock_ceiling_bounds_elapsed_time_not_callback_count`**
+  (the ceiling is anchored to a real `Instant`, not a countdown of epoch-callback
+  invocations), **`sandbox_denial_outranks_a_concurrent_cancellation`** (a
+  permanent capability denial is not downgraded to a retryable "cancelled" by a
+  racing token), and **`rng_seed_stream_is_not_a_fixed_process_constant`**.
+- **`src/wasm_store.rs`** (storage unit tests): **15** `#[test]` fns — registration
+  defaults, fluent setters, binding projection, module-size-cap constant, the
+  `effective_invoke_deadline` budget suite, and the round-10
+  **`schedule_to_close`** threading pair (registration → `ActivityInfo`, and the
+  `None` back-compat default).
 - **`tests/integration/wasm_activities_tests.rs`** (DB + worker-seam integration):
-  **20** tests — **19 run in CI** via the `linux  autumn-harvest  integration
+  **26** tests — **25 run in CI** via the `linux  autumn-harvest  integration
   wasm-activities  wasm_activities_tests` manifest row (storage round-trips,
   hot-swap + single-active + composite-PK independence, the concurrent-publish
   race, oversized-module reject, startup-seed, `resolve_wasm_dispatch`
   unavailable/invoke, the **deferred-compile-on-miss** and
   **invalid-surfaces-at-invoke** cases, the two **startup-seed activate-only-if-
   absent** cases, the worker-e2e echo, the sandbox-denial terminal, the
-  in-flight-pin, the fuel-retry, and the **1-native + 1-WASM success-metric e2e**),
-  plus **1 `#[ignore]`d** dispatch-overhead microbenchmark (`--ignored`, not a CI
-  gate).
+  in-flight-pin, the fuel-retry — which also asserts the AC5 clause that a runaway
+  guest accrues **no poison-pill crash strike and no DLQ row** — the **1-native +
+  1-WASM success-metric e2e**, the round-10 **live-worker hot-swap** test
+  (`hot_swap_reaches_the_next_attempt_on_a_live_worker_without_restart`: one
+  worker started once, a publish mid-flight, the next attempt observes v2, and the
+  measured publish→completion propagation asserted **< 5 s**), and the round-10
+  **AssemblyScript** e2e (`worker_runs_an_assemblyscript_compiled_guest_to_completion`
+  — a guest built by a real non-Rust toolchain, run through the standard dispatch
+  path)), plus **1 `#[ignore]`d** dispatch-overhead microbenchmark (`--ignored`,
+  not a CI gate, but it now **asserts** the < 10 ms p99 target rather than only
+  printing MET/NOT MET; measured p99 overhead **469 µs**).
 
 All integration tests ran **green against a local Postgres 16** during this
 milestone via `HARVEST_TEST_DATABASE_URL`; CI runs them Docker-backed via the

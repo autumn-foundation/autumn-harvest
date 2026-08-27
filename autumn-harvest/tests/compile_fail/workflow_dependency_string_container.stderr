@@ -1,0 +1,5 @@
+error: `activities` takes a bracketed list of names, e.g. `activities = [send_email, charge_card]` — unlike `owner`/`runbook`/`severity`/`description` it is a list, not a string, and unlike `concurrency(..)`/`throttle(..)` it uses `=`, not parentheses
+ --> tests/compile_fail/workflow_dependency_string_container.rs:7:25
+  |
+7 | #[workflow(activities = "send_email, charge_card")]
+  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^

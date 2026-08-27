@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,21 +34,25 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
-    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT,
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR,
-    OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
-    OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
-    OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
-    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ,
+    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
+    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
+    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
+    OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
     OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
     OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
-    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR, OP_START_THROTTLE_PACING_OVERRIDE_SET,
+    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
     deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
@@ -105,7 +109,7 @@ use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardPlacement, ShardRouter};
 use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
@@ -121,14 +125,17 @@ use autumn_harvest::workers::{
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
-    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
-    UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
-    pause_workflow_execution, resume_workflow_execution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
+    TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
+    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution,
     signal_with_start_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
+    start_or_load_workflow_execution_with_metrics,
     update_with_start_workflow_execution_with_metrics,
 };
 
+use crate::lineage::{
+    LineageLimits, LineageTreeReport, LineageWalk, lineage_root_node, root_row_from_execution,
+};
 use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::schedule_runs;
 use crate::shard_fanout::{
@@ -1481,6 +1488,18 @@ pub struct StalledWorkflowRow {
     pub last_event_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stall_reason: Option<StallReason>,
+    /// The execution's current recorded `harvest_events` count, computed on
+    /// read (issue #704, AC2). Populated only when the request set the
+    /// dedicated `history_bloat_min_events` discovery parameter (served by
+    /// `load_history_bloat_workflows`) — omitted (never `null`) on every
+    /// other list response, INCLUDING the general-purpose, pre-existing
+    /// `min_history_events` filter (issue #493, served by
+    /// `load_stalled_workflows`/`load_workflows`), so this stays additive
+    /// and byte-for-byte backward compatible. See `docs/api-contract.json`
+    /// and PR #1139's review for the two parameters' deliberately distinct
+    /// contracts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_event_count: Option<i64>,
 }
 
 impl From<WorkflowExecution> for StalledWorkflowRow {
@@ -1490,6 +1509,7 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
             last_event_at: None,
             last_event_age_seconds: None,
             stall_reason: None,
+            history_event_count: None,
         }
     }
 }
@@ -1961,6 +1981,16 @@ pub(crate) struct StartWorkflowResponse {
     /// via a matching `idempotency_key` (issue #808). Omitted on the no-key path.
     #[serde(skip_serializing_if = "Option::is_none")]
     deduplicated: Option<bool>,
+    /// The shard this execution was placed on (issue #697).
+    ///
+    /// Populated only when the request supplied an explicit `shard_id` or
+    /// `residency_key`, so an operator can audit that a residency-pinned start
+    /// actually landed where it was pinned without decoding the `execution_id`
+    /// UUID by hand. Omitted for unpinned starts, keeping their response
+    /// byte-identical to a pre-#697 build. The same value is durably visible on
+    /// the execution row's `shard_id` column and via `GET /workflows/{id}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1987,6 +2017,24 @@ pub(crate) struct SignalQuery {
 pub(crate) struct SignalAck {
     ok: bool,
     signal_delivered: bool,
+    /// The execution the signal was actually queued for, when it differs from
+    /// the requested id because the workflow-level retry chain (#523) had
+    /// advanced and the request was routed to the live attempt (issue #843).
+    ///
+    /// Omitted entirely when no routing occurred, so an unretried workflow's
+    /// response stays byte-identical to a pre-#843 build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routed_execution_id: Option<String>,
+}
+
+/// The routed live attempt, reported only when routing actually moved the
+/// target (issue #843). `None` keeps a non-routed response byte-identical to
+/// its pre-#843 shape.
+fn routed_execution_id(
+    requested: autumn_harvest::ExecutionId,
+    routed: autumn_harvest::ExecutionId,
+) -> Option<String> {
+    (requested != routed).then(|| routed.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -2041,6 +2089,24 @@ struct TerminateWorkflowResponse {
     reason: String,
     newly_terminated: bool,
     failed_task_count: usize,
+}
+
+/// Response for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// Deliberately carries NO `input` field: the payload may be sensitive, and a
+/// re-run response has no reason to echo it back.
+#[derive(Debug, Serialize)]
+struct RerunWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    /// The source execution this run was re-run from.
+    reran_from: String,
+    /// The source's terminal state observed BEFORE any sealing — the only
+    /// surviving record once the source is sealed to `CONTINUED_AS_NEW`.
+    source_prior_state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2287,10 +2353,39 @@ pub(crate) struct StartWorkflowRequest {
     /// Mutually exclusive with a throttle / debounce / batch policy.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Pin this workflow to a concrete shard (issue #697).
+    ///
+    /// Mutually exclusive with [`Self::residency_key`]. Omitting both keeps
+    /// today's rendezvous routing byte-for-byte. A shard outside the
+    /// deployment's `readable_shards`, one drained out of `writable_shards`,
+    /// a negative value, or the reserved routing sentinel all return `400` —
+    /// never a silent fallback to the default shard.
+    #[serde(default)]
+    shard_id: Option<i32>,
+    /// Pin this workflow via an operator-declared residency key (issue #697),
+    /// e.g. `"eu"`.
+    ///
+    /// Mutually exclusive with [`Self::shard_id`]. Resolved through the
+    /// router's declared residency map; an undeclared key returns `400` rather
+    /// than falling back to the hash. The key→shard mapping is stable across
+    /// process restarts and across any widening of the shard set.
+    #[serde(default)]
+    residency_key: Option<String>,
     /// Internal workflow-start provenance override (issue #740). Set by
     /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
     /// provenance instead of the default `api`. `#[serde(skip)]` so it is
     /// never part of the public JSON request body.
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944 review).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this very handler, so the guard that
+    /// stops a *caller* squatting that key would otherwise refuse the
+    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
+    /// public JSON request body — a caller cannot claim the exemption, which is
+    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
     /// Internal provenance correlation ref override (issue #740), paired with
@@ -2328,6 +2423,9 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            shard_id: None,
+            residency_key: None,
+            engine_derived_idempotency_key: false,
             start_source_override: None,
             start_source_ref_override: None,
         }
@@ -2370,9 +2468,68 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            shard_id: None,
+            residency_key: None,
             // Webhook-delegated starts record `webhook` provenance (#740/#344).
+            engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             start_source_ref_override: None,
+        }
+    }
+
+    /// Request carrying the deterministic `workflow_id` a broker connector's
+    /// mapping function returned (issue #944).
+    ///
+    /// Differs from [`Self::from_webhook`] in one way: the connector may also
+    /// supply an explicit start `idempotency_key` (issue #808) derived from the
+    /// message's broker coordinates, so a redelivery converges on exactly one
+    /// execution even when the mapper's `workflow_id` is not itself a stable
+    /// event identity. It is `None` when the binding resolved to
+    /// `IdempotencyMode::WorkflowId` — a keyed start is mutually exclusive with
+    /// a throttle / debounce / batch admission policy (`400`), so a target with
+    /// deferred admission dedupes on the mapper's `workflow_id` instead.
+    ///
+    /// `start_source_ref_override` carries the rendered broker coordinates
+    /// (`orders:3:91`), so an operator can trace an execution back to the exact
+    /// message that produced it.
+    ///
+    /// Only called from `connector/dispatch.rs`, which is entirely excluded
+    /// from the build without the `connectors` cargo feature; without this,
+    /// a default build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "connectors"), allow(dead_code))]
+    pub(crate) const fn from_broker(
+        workflow_id: String,
+        input: Value,
+        queue: Option<String>,
+        idempotency_key: Option<String>,
+        coordinates: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id: Some(workflow_id),
+            input: Some(input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
+            reuse_policy: None,
+            conflict_policy: None,
+            start_at: None,
+            delay: None,
+            batch_key: None,
+            batch_max_size: None,
+            batch_max_wait: None,
+            completion_callbacks: None,
+            context_headers: None,
+            priority: None,
+            idempotency_key,
+            shard_id: None,
+            residency_key: None,
+            // Broker-delegated starts record `broker` provenance (#740/#944).
+            engine_derived_idempotency_key: true,
+            start_source_override: Some(autumn_harvest::StartSource::Broker),
+            start_source_ref_override: coordinates,
         }
     }
 }
@@ -2415,8 +2572,28 @@ pub(crate) struct SignalWithStartRequest {
     /// [`Self::from_webhook`] so a webhook-delegated `SignalsWithStart` fresh
     /// run records `webhook` instead of the default `signal_with_start`.
     /// `#[serde(skip)]` so it is never part of the public JSON body.
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944 review).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this very handler, so the guard that
+    /// stops a *caller* squatting that key would otherwise refuse the
+    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
+    /// public JSON request body — a caller cannot claim the exemption, which is
+    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
+    /// Internal workflow-start provenance *reference* override (issue #740).
+    /// Set by [`Self::from_broker`] to the rendered broker coordinates so a
+    /// broker-triggered fresh run records the same `start_source_ref` shape
+    /// whichever binding kind produced it (issue #944); without it the
+    /// signal-with-start path defaults to the connector's derived, bounded
+    /// idempotency key. `#[serde(skip)]` so it is never part of the public
+    /// JSON body.
+    #[serde(default, skip)]
+    start_source_ref_override: Option<String>,
 }
 
 impl SignalWithStartRequest {
@@ -2450,7 +2627,54 @@ impl SignalWithStartRequest {
             idempotency_key,
             // Webhook-delegated signal-with-start records `webhook` provenance
             // on a fresh run (#740/#344).
+            engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
+            // Unchanged for webhooks: the core's default (the idempotency key,
+            // i.e. the verified delivery id) is already the right reference.
+            start_source_ref_override: None,
+        }
+    }
+
+    /// Request built by a broker connector's `SignalsWithStart` binding
+    /// (issue #944).
+    ///
+    /// The `idempotency_key` is the connector's derived key, namespaced by the
+    /// binding and signal name exactly as the webhook receiver namespaces
+    /// `{path}:{signal_name}:{delivery_id}` — so a redelivery of the same
+    /// broker message delivers the signal exactly once, and two bindings that
+    /// happen to target the same `(workflow_name, workflow_id)` never collide.
+    ///
+    /// Only called from `connector/dispatch.rs`, which is entirely excluded
+    /// from the build without the `connectors` cargo feature.
+    #[cfg_attr(not(feature = "connectors"), allow(dead_code))]
+    pub(crate) fn from_broker(
+        workflow_id: String,
+        signal_input: Value,
+        signal_name: String,
+        idempotency_key: Option<String>,
+        queue: Option<String>,
+        coordinates: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id,
+            start_input: Some(signal_input.clone()),
+            signal_name,
+            signal_payload: Some(signal_input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            id_reuse_policy: None,
+            idempotency_key,
+            // Broker-delegated signal-with-start records `broker` provenance on
+            // a fresh run (#740/#944).
+            engine_derived_idempotency_key: true,
+            start_source_override: Some(autumn_harvest::StartSource::Broker),
+            // ...and the rendered coordinates, so the documented provenance
+            // query returns the same shape for BOTH binding kinds. Without
+            // this the core defaults to the connector's derived, bounded
+            // idempotency key, which reads nothing like `topic:partition:offset`.
+            start_source_ref_override: coordinates,
         }
     }
 }
@@ -2568,6 +2792,35 @@ struct CancelWorkflowRequest {
 #[derive(Debug, Default, Deserialize)]
 struct TerminateWorkflowRequest {
     reason: Option<String>,
+}
+
+/// Optional body for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// `input` is a serde TRI-STATE (`Option<Option<Value>>` via
+/// [`deserialize_tristate`]) because the three cases are genuinely distinct
+/// and a plain `Option<Value>` cannot express them: an ABSENT field means
+/// "clone the source's stored input verbatim", while an explicit JSON `null`
+/// IS a real override that replaces the clone with `null`. Serde's stock
+/// `Option<Value>` deserializes JSON `null` to `None` — indistinguishable
+/// from absent — which would silently clone instead of overriding.
+#[derive(Debug, Default, Deserialize)]
+struct RerunWorkflowRequest {
+    #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    input: Option<Option<serde_json::Value>>,
+    #[serde(default)]
+    workflow_id: Option<String>,
+}
+
+impl RerunWorkflowRequest {
+    /// Collapse the tri-state `input` into the core primitive's override:
+    /// absent → `None` (clone the source), explicit `null` → `Some(Null)`,
+    /// a value → `Some(value)`.
+    fn input_override(&self) -> Option<serde_json::Value> {
+        self.input
+            .as_ref()
+            .map(|inner| inner.clone().unwrap_or(serde_json::Value::Null))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2723,6 +2976,18 @@ struct ScheduleEntry {
     /// How long past its scheduled fire this schedule is (`now − next_run_at`)
     /// in whole seconds, or `null` when it is not overdue (issue #696).
     overdue_by_secs: Option<i64>,
+    /// Effective hard execution-timeout deadline (issue #743) that a run this
+    /// schedule fires will get, resolved from the registered workflow (or the
+    /// DAG's shadow `WorkflowInfo`, for `kind: "dag"`) `execution_timeout`,
+    /// in whole seconds. `null` when the workflow/DAG declares none or the
+    /// registry is unavailable.
+    execution_timeout_secs: Option<i64>,
+    /// Effective soft SLA (issue #743) a run this schedule fires will get,
+    /// resolved from the registered workflow (or the DAG's shadow
+    /// `WorkflowInfo`) `sla`, clamped down to `execution_timeout_secs` when
+    /// declared larger than it (issue #743 AC5). In whole seconds; `null`
+    /// when the workflow/DAG declares none or the registry is unavailable.
+    sla_secs: Option<i64>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -3025,7 +3290,19 @@ pub(crate) struct WorkflowFilters {
     /// the literal `"unknown"`, which matches NULL / pre-upgrade rows via `IS NULL`).
     pub(crate) start_source: Option<String>,
     /// Only return executions with at least this many recorded events (issue #493).
+    /// General-purpose: composes freely with `state=`/`order=`/pagination and
+    /// sorts in the caller's chosen order. Distinct from `history_bloat_min_events`
+    /// below (issue #704) — the two must never share a query-parameter name, or a
+    /// caller combining `state=COMPLETED&min_history_events=N` (or pagination)
+    /// would silently get the wrong results instead of the documented ones.
     pub(crate) min_history_events: Option<u64>,
+    /// Operator early-warning discovery for workflow history bloat (issue
+    /// #704, AC1): a dedicated, non-composable path returning only live
+    /// (non-terminal) executions with at least this many recorded events,
+    /// sorted by current history size descending. Deliberately a SEPARATE
+    /// field/query-param from `min_history_events` above — see its doc
+    /// comment for why reusing that name would be a regression.
+    pub(crate) history_bloat_min_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
     pub(crate) order: WorkflowSortOrder,
     /// Keyset cursor decoded from the `cursor` query param (issue #498).
@@ -3069,6 +3346,46 @@ struct HistoryBatchExportResponse {
     exports: Vec<HistoryExportDocument>,
     failures: Vec<HistoryExportFailure>,
     shard_coverage: ExternalHandoffShardCoverage,
+}
+
+/// Parsed `GET /admin/history/export-sample` query (issue #798).
+#[derive(Debug, Clone)]
+struct HistorySampleExportQuery {
+    payload_policy: HistoryPayloadPolicy,
+    max_bytes: usize,
+    workflow_name: Option<String>,
+    /// Already normalized to a non-terminal set by
+    /// [`autumn_harvest::replay_sample::normalize_sample_states`].
+    states: Vec<String>,
+    per_workflow: usize,
+    order: autumn_harvest::replay_sample::SampleOrder,
+    shard_id: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistorySampleExportResponse {
+    status: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    payload_policy: HistoryPayloadPolicy,
+    filters: HistorySampleExportFiltersResponse,
+    /// The portable coverage record written verbatim into the bundle as
+    /// `harvest-sample-manifest.json` (issue #798, AC2).
+    manifest: autumn_harvest::replay_sample::SampleManifest,
+    exports: Vec<HistoryExportDocument>,
+    failures: Vec<HistoryExportFailure>,
+    shard_coverage: ExternalHandoffShardCoverage,
+}
+
+#[derive(Debug, Serialize)]
+struct HistorySampleExportFiltersResponse {
+    workflow_name: Option<String>,
+    states: Vec<String>,
+    /// The **effective** (clamped) per-type cap, so an over-large request is
+    /// visibly bounded rather than silently honoured.
+    per_workflow: usize,
+    order: &'static str,
+    shard_id: Option<i32>,
+    max_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -3122,6 +3439,97 @@ struct HistoryExportCandidate {
     // single-execution export). `parent_id` lives in no `WorkflowEvent`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     parent_id: Option<uuid::Uuid>,
+    // Issue #798: the per-execution `context_headers`, carried into the export
+    // document so a header-branching workflow replays against the SAME ambient
+    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
+    // this a replayed run sees an empty map and a workflow that branches on
+    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // divergence. Parity with the single-execution export and the DB canary.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
+    // Issue #798: the execution's task queue, carried into the export document so
+    // a workflow that branches on `ctx.queue_name()` replays against the queue it
+    // really ran on. The live worker sets it from the claimed task row, so it
+    // lives in no `WorkflowEvent` — same family as `context_headers` above.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+}
+
+/// One in-flight execution selected by the stratified sample query (issue #798).
+///
+/// Deliberately *not* the batch-export candidate: the sample query omits the
+/// `harvest_events` join that `HISTORY_EXPORT_CANDIDATES_SQL` needs for
+/// `last_history_event_at` (a per-execution `MAX()` over the whole event log),
+/// keeping the sample cheap enough to run against a large in-flight fleet. It
+/// instead carries `started_at` (the stratification key) and `in_flight_total`
+/// (the per-shard population of this workflow type, for AC2 coverage).
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct HistorySampleCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_id: String,
+    #[diesel(sql_type = diesel::sql_types::Int4)]
+    shard_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
+    execution_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    parent_id: Option<uuid::Uuid>,
+    // Issue #798: the per-execution `context_headers`, carried into the export
+    // document so a header-branching workflow replays against the SAME ambient
+    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
+    // this a replayed run sees an empty map and a workflow that branches on
+    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // divergence. Parity with the single-execution export and the DB canary.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
+    // Issue #798: the execution's task queue — same rationale as
+    // `context_headers`: it lives in no `WorkflowEvent`, so without it a
+    // `ctx.queue_name()`-branching workflow replays under "" and the gate reports
+    // a FALSE divergence.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
+    /// of this workflow type **on this shard**. Summed across shards to give
+    /// the AC2 coverage denominator.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    in_flight_total: i64,
+}
+
+impl HistorySampleCandidate {
+    /// Reuse the whole batch-export pipeline (payload policy, #608 decoding,
+    /// `max_bytes`, failure reporting) rather than forking it.
+    ///
+    /// `last_history_event_at` is only ever a sort/filter key in the batch
+    /// export — it is never carried into the export document — so populating it
+    /// from `started_at` costs nothing and keeps one export path.
+    fn into_export_candidate(self) -> HistoryExportCandidate {
+        HistoryExportCandidate {
+            id: self.id,
+            workflow_name: self.workflow_name,
+            workflow_id: self.workflow_id,
+            shard_id: self.shard_id,
+            state: self.state,
+            last_history_event_at: self.started_at,
+            execution_timeout: self.execution_timeout,
+            deadline_at: self.deadline_at,
+            parent_id: self.parent_id,
+            // Issue #798: the ambient headers the live run saw. Without these a
+            // header-branching workflow replays against an empty map and the
+            // gate reports a divergence the candidate build did not cause.
+            context_headers: self.context_headers,
+            // Issue #798: likewise the queue the live run was claimed on.
+            queue_name: self.queue_name,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3139,6 +3547,35 @@ impl HistoryBatchExportWork {
     fn note_unavailable(&mut self, shard_id: i32, reason: String) {
         self.unavailable_shards
             .push(UnavailableShard { shard_id, reason });
+    }
+
+    /// Record a candidate that discovery already **selected** but the export
+    /// could not produce a document for because its shard became unreachable
+    /// in between (Codex round-11 P1).
+    ///
+    /// Deliberately records *both* signals, because they answer different
+    /// questions and only one of them is load-bearing for the replay gate:
+    /// - `unavailable_shards` — "this shard is unhealthy", which flips the
+    ///   response `status` to `partial`. The #798 gate honours that only under
+    ///   the opt-in `require_complete_coverage`.
+    /// - `failures` — "the bundle is missing a row it was meant to hold", which
+    ///   the manifest surfaces as `export_failures > 0` and the gate blocks on
+    ///   *unconditionally* (exit 2).
+    ///
+    /// Recording only the first lets a bundle with at least one survivor exit 0
+    /// while silently dropping selected candidates — a biased subset presented
+    /// as a clean gate, the worst outcome this feature can produce. Every other
+    /// `note_unavailable` call site fails *before* selection, so this is the one
+    /// place both are owed.
+    fn note_dropped_candidate(&mut self, shard_id: i32, exec_id: &ExecutionId, reason: &str) {
+        self.note_unavailable(shard_id, reason.to_string());
+        self.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
+            shard_id,
+            reason: format!("shard connection unavailable after selection: {reason}"),
+            actual_bytes: None,
+            max_bytes: None,
+        });
     }
 
     fn normalize_coverage(&mut self) {
@@ -3982,7 +4419,7 @@ async fn signal_workflow_by_id(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "execution_id": exec_id.to_string(),
             "ok": ack.get("ok").cloned().unwrap_or(Value::Bool(true)),
             "signal_delivered": ack
@@ -3990,6 +4427,20 @@ async fn signal_workflow_by_id(
                 .cloned()
                 .unwrap_or(Value::Bool(false)),
         });
+        // Forward the #843 routed-live-attempt marker when the inner handler
+        // set it, so a by-id caller can also see that the retry chain moved.
+        //
+        // The two ids are deliberately distinct and both correct:
+        // `execution_id` (and the `X-Harvest-Execution-Id` header) is what the
+        // BUSINESS KEY resolved to — the #805 contract, unchanged — while
+        // `routed_execution_id` is the live attempt the signal actually landed
+        // on. Rewriting the #805 id to the routed one would make a by-id
+        // caller's recorded handle drift to an inner attempt.
+        if let Some(routed) = ack.get("routed_execution_id").cloned()
+            && let Some(map) = out.as_object_mut()
+        {
+            map.insert("routed_execution_id".to_string(), routed);
+        }
         let mut resp = (parts.status, Json(out)).into_response();
         insert_exec_id_header(&mut resp, exec_id);
         resp
@@ -4309,8 +4760,33 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
+        // Recursive cross-shard lineage tree (issue #621). Deliberately NOT
+        // admin-gated: it returns the same class of execution-row data as
+        // `/children` (which already traverses depth across shards), so gating
+        // it would be an inconsistency rather than a hardening.
+        .route("/workflows/{id}/tree", get(get_workflow_tree))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
+        // Durable per-execution author log lines (issue #790): admin-gated
+        // (log messages are free-form author text), read-only.
+        .route(
+            "/workflows/{id}/logs",
+            get(get_workflow_logs).route_layer(require_admin.clone()),
+        )
+        // Open-awaitables diagnostic (issue #615): admin-gated (the eligibility
+        // endpoints' posture), read-only replay projection of what the
+        // execution is currently parked on.
+        .route(
+            "/workflows/{id}/awaitables",
+            get(get_workflow_awaitables).route_layer(require_admin.clone()),
+        )
+        // Per-execution stall diagnosis (issue #809): admin-gated, same posture
+        // as the eligibility and awaitables triage endpoints — the response
+        // names queue / rate-limit / concurrency keys and fleet coverage state.
+        .route(
+            "/workflows/{id}/diagnose",
+            get(get_workflow_diagnose).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/run-chain", get(get_run_chain))
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
         // POST (not GET) because it drives a replay of the workflow handler, but
@@ -4341,6 +4817,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/{id}/terminate",
             post(terminate_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/rerun",
+            post(rerun_workflow).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/erase-payloads",
@@ -4377,6 +4857,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/{id}/resume",
             post(resume_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/triage",
+            patch(annotate_workflow_handler).route_layer(require_admin.clone()),
         )
         .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
@@ -4454,6 +4938,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(shards_health).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/queue-coverage",
+            get(queue_coverage).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/status",
             get(admin_status).route_layer(require_admin.clone()),
         )
@@ -4518,12 +5006,48 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(start_throttle_status).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/quotas",
+            // Admin-gated: the response includes raw quota_key values, which
+            // resolve from user/tenant-derived fields (issue #946). Parity with
+            // /admin/concurrency, /admin/debounce, and /admin/start-throttle.
+            get(list_quotas_handler).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/rate-limits",
             get(list_rate_limits).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/rate-limits/{key}",
             post(set_rate_limit).route_layer(require_admin.clone()),
+        )
+        // TTL'd runtime pacing overrides (issue #945): distinct from the
+        // permanent `/admin/rate-limits/{key}` route above — these overlay a
+        // *declared* per-activity rate limit / workflow-start throttle with a
+        // temporary quota change that self-expires, so a downstream-outage
+        // mitigation can never be forgotten.
+        .route(
+            "/admin/rate-limits/{activity_name}/override",
+            post(set_rate_limit_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/rate-limits/{activity_name}/override",
+            delete(clear_rate_limit_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            post(set_start_throttle_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            delete(clear_start_throttle_pacing_override).route_layer(require_admin.clone()),
+        )
+        // Read-only companion to the SET/DELETE routes above: surfaces an
+        // active override even when the workflow has no current deferred-
+        // start backlog, closing a visibility gap the backlog-driven
+        // `/admin/start-throttle` listing has by construction (issue #945).
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            get(get_start_throttle_pacing_override).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/circuits",
@@ -4542,8 +5066,51 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(force_close_circuit).route_layer(require_admin.clone()),
         )
         .route("/admin/queues/scaling", get(queues_scaling_signal))
+        // Task-queue pause/resume (issue #619): hold dispatch on a named queue
+        // during a scoped downstream outage. GET is read-only; the two
+        // mutations are admin-gated (they change what the whole fleet claims).
+        .route("/admin/queues/paused", get(list_paused_queues_handler))
+        .route(
+            "/admin/queues/{queue_name}/pause",
+            post(pause_queue_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/queues/{queue_name}/resume",
+            post(resume_queue_handler).route_layer(require_admin.clone()),
+        )
+        // Per-activity-type pause/resume (issue #807): the surgical sibling of
+        // the queue hold above — stop dispatching ONE broken activity without
+        // touching the healthy work sharing its queue. All four are admin-gated:
+        // the two mutations are a fleet-wide dispatch kill switch, and the two
+        // reads expose operator-authored hold reasons and the shape of the
+        // registered activity catalogue.
+        .route(
+            "/activities",
+            get(list_activities_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}",
+            get(get_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/pause",
+            post(pause_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/resume",
+            post(resume_activity_handler).route_layer(require_admin.clone()),
+        )
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
+        // Stratified in-flight sample export for the replay-drift gate
+        // (issue #798). Admin-gated: it returns workflow histories in bulk,
+        // including payloads under `payload_policy=full`. (The older
+        // `/admin/history/exports` sibling predates this posture and is left
+        // as-is; tightening an existing route's auth is out of scope here.)
+        .route(
+            "/admin/history/export-sample",
+            get(export_workflow_history_sample).route_layer(require_admin.clone()),
+        )
         .route("/admin/external-handoffs", get(list_external_handoffs))
         .route(
             "/admin/external-handoffs/{token}",
@@ -5131,6 +5698,162 @@ pub(crate) async fn read_path_decoder(
     Some(api_state.payload_codecs())
 }
 
+/// `true` when a payload-bearing field holds a stored envelope this process
+/// has not yet inflated / decoded — either the payload-offload reference
+/// envelope (issue #524) or a codec envelope (issue #608).
+///
+/// Both predicates are the crates' own authoritative shape checks, so this can
+/// never drift from what the inflater / decoder actually recognises.
+fn payload_field_is_opaque(value: &Value) -> bool {
+    autumn_harvest::payload_store::extract_offload_ref(value).is_some()
+        || autumn_harvest::payload_codec::is_codec_envelope(value)
+}
+
+/// Does this history need an inflate/decode pass before the DAG run-graph
+/// derivation reads it?
+///
+/// The run graph derives two things from payload-bearing fields:
+///
+/// * `ActivityScheduled.input` — the issue #780 compensation-dispatch filter
+///   (`dag_retry::is_compensation_dispatch`), which excludes a compensator's
+///   dispatch from a same-named forward node. Handed an opaque envelope the
+///   predicate returns `false`, so on a codec-encrypting or payload-offloading
+///   deployment the exclusion silently stops working and a never-executed node
+///   is reported with the old compensation's status, timings and attempts.
+/// * `MarkerRecorded.details` — the `dag_skip:{idx}` task fingerprint. That one
+///   already degrades gracefully to index-only matching when the field is
+///   opaque, so decoding merely restores its reorder-safety.
+///
+/// Answering `false` (the default deployment: identity codecs, no payload
+/// store) lets the caller skip the pass entirely, so no history is
+/// re-serialized and the pre-#780 read path is byte-for-byte unchanged. The
+/// scan itself is one `get` per payload field, never a deep walk.
+fn graph_history_needs_inflation(events: &[WorkflowEvent]) -> bool {
+    events.iter().any(|event| match event {
+        WorkflowEvent::ActivityScheduled { input, .. } => payload_field_is_opaque(input),
+        WorkflowEvent::MarkerRecorded { details, .. } => payload_field_is_opaque(details),
+        _ => false,
+    })
+}
+
+/// Inflate offloaded payloads (issue #524) and decode codec envelopes (issue
+/// #608) for a history that was loaded RAW, **after** its pooled DB connection
+/// has been released.
+///
+/// This is the `api.rs` awaitables discipline (see the `drop(conn)` there)
+/// factored out: blob inflation is network I/O, so a slow or unavailable
+/// payload store must never hold a database pool slot. `store::load_history_inflated`
+/// deliberately does the opposite — it fetches every blob sequentially while
+/// still holding the connection it loaded the rows with — so a caller that
+/// cares about pool pressure loads raw, drops, and calls this.
+///
+/// Callers choose their own failure posture:
+///
+/// * The DAG **retry** endpoint must fail CLOSED. Its issue #780 guard reads
+///   `ActivityScheduled.input` to recognise a compensation envelope; a decode
+///   failure that degraded to the raw history would hide the envelope and let
+///   an already-rolled-back run be retried onto rolled-back state.
+/// * The DAG **run graph** (API + UI) degrades to the raw history with a
+///   warning: it is a read-only observability surface, and failing the whole
+///   page is worse than the narrow cross-version display inaccuracy.
+///
+/// No payload is ever surfaced by either caller — the retry plan carries only
+/// node names and an event id, and the run graph carries node names, statuses,
+/// timings, attempts, and a truncated `error` (which is not a payload-bearing
+/// field). So this needs no issue #608 read-decode opt-in or audit row, exactly
+/// like the awaitables endpoint's replay drive.
+///
+/// # Residual offload references are an error, not a pass-through
+///
+/// A payload store is *optional*, so `offloader` is `None` on the default
+/// deployment — and on a deployment that used to have one. In the latter case
+/// the stored history still carries `_harvest_offload_envelope` references, the
+/// inflate pass is skipped entirely, and [`PayloadCodecs::decode_event`] returns
+/// the reference verbatim (it is not a codec envelope, so nothing rejects it).
+/// Every payload-reading guard downstream would then be looking at an opaque
+/// blob pointer while believing it had the real value.
+///
+/// Any reference that survives the pass is therefore an error. When an offloader
+/// *is* configured this is unreachable — `inflate_event_value` either resolves
+/// the reference or rejects a foreign `store_id` — so the check only ever fires
+/// on the configuration-removal case, and costs a handful of key lookups per
+/// event otherwise.
+async fn inflate_and_decode_events(
+    events: &[WorkflowEvent],
+    codecs: &PayloadCodecs,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+) -> autumn_harvest::error::HarvestResult<Vec<WorkflowEvent>> {
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let mut value = serde_json::to_value(event)?;
+        if let Some(offloader) = offloader {
+            offloader.inflate_event_value(&mut value).await?;
+        }
+        // `.into_iter().next()` rather than `.first()`: `diesel::prelude::*` is
+        // in scope here and its `RunQueryDsl::first` shadows `slice::first`.
+        if let Some(residual) = autumn_harvest::payload_store::refs_in_event_value(&value)
+            .into_iter()
+            .next()
+        {
+            return Err(autumn_harvest::error::HarvestError::PayloadOffload(
+                format!(
+                    "history still carries an offloaded payload reference (key '{}', store '{}') \
+                 after the inflate pass; no payload store is configured for that store id, so \
+                 the real payload cannot be read — register the payload store this deployment \
+                 wrote with",
+                    residual.blob_key, residual.store_id
+                ),
+            ));
+        }
+        out.push(codecs.decode_event(value)?);
+    }
+    Ok(out)
+}
+
+/// Decode a timestamped run-graph history in place, degrading to the raw rows
+/// on any failure.
+///
+/// Shared by the two DAG run-graph readers — the issue #690 API handler and the
+/// issue #957 Vantage UI page — so they can never disagree about whether the
+/// issue #780 compensation filter is looking at real payloads. Both load raw
+/// (`store::load_history_with_timestamps`, whose contract explicitly leaves
+/// payload fields undecoded) and must therefore decode before deriving.
+///
+/// Skips the pass entirely when nothing in the history is opaque, so the
+/// default deployment does no extra work. Degrades — never errors — because
+/// this is a read-only observability surface: the worst case is the narrow
+/// cross-version display inaccuracy the filter exists to fix, which is strictly
+/// better than failing the page.
+pub(crate) async fn decode_graph_history(
+    rows: Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>,
+    exec_id: ExecutionId,
+    codecs: &PayloadCodecs,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+    surface: &'static str,
+) -> Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)> {
+    let events: Vec<WorkflowEvent> = rows.iter().map(|(_, e)| e.clone()).collect();
+    if !graph_history_needs_inflation(&events) {
+        return rows;
+    }
+    match inflate_and_decode_events(&events, codecs, offloader).await {
+        Ok(decoded) => rows
+            .into_iter()
+            .zip(decoded)
+            .map(|((ts, _), event)| (ts, event))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %exec_id,
+                error = %err,
+                surface,
+                "payload inflate/decode failed; rendering the run graph from the raw history \
+                 (a compensator dispatch may be read as a same-named forward node)"
+            );
+            rows
+        }
+    }
+}
+
 /// Unwrap the optional `Session` extension extractor that handlers feed into
 /// [`read_path_decoder`]. An absent extension (no session middleware
 /// installed) resolves to `None`, which the admin predicate treats as
@@ -5297,8 +6020,16 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
+        ("GET", "/workflows/{id}/tree"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
+        // Durable per-execution author log lines (issue #790). Admin-gated,
+        // read-only. See docs/api-contract.json.
+        ("GET", "/workflows/{id}/logs"),
+        ("GET", "/workflows/{id}/awaitables"),
+        // Per-execution stall diagnosis (issue #809): admin-gated, read-only.
+        // See docs/api-contract.json.
+        ("GET", "/workflows/{id}/diagnose"),
         ("GET", "/workflows/{id}/run-chain"),
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only
         // POST (post_for_body_only). See docs/api-contract.json.
@@ -5311,8 +6042,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/terminate"),
+        ("POST", "/workflows/{id}/rerun"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
+        ("PATCH", "/workflows/{id}/triage"),
         ("POST", "/workflows/{id}/erase-payloads"),
         ("POST", "/workflows/{id}/legal-hold"),
         ("POST", "/workflows/{id}/legal-hold/release"),
@@ -5419,6 +6152,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/health"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
+        ("GET", "/admin/queue-coverage"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
         ("GET", "/admin/canary"),
@@ -5432,15 +6166,32 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/usage"),
         ("GET", "/admin/debounce"),
         ("GET", "/admin/start-throttle"),
+        ("GET", "/admin/quotas"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────
+        ("POST", "/admin/rate-limits/{activity_name}/override"),
+        ("DELETE", "/admin/rate-limits/{activity_name}/override"),
+        ("POST", "/admin/start-throttle/{workflow_name}/override"),
+        ("DELETE", "/admin/start-throttle/{workflow_name}/override"),
+        ("GET", "/admin/start-throttle/{workflow_name}/override"),
         ("GET", "/admin/circuits"),
         ("GET", "/admin/circuits/{activity_name}"),
         ("POST", "/admin/circuits/{activity_name}/force-open"),
         ("POST", "/admin/circuits/{activity_name}/force-close"),
         ("GET", "/admin/queues/scaling"),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        ("GET", "/admin/queues/paused"),
+        ("POST", "/admin/queues/{queue_name}/pause"),
+        ("POST", "/admin/queues/{queue_name}/resume"),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        ("GET", "/activities"),
+        ("GET", "/activities/{activity_name}"),
+        ("POST", "/activities/{activity_name}/pause"),
+        ("POST", "/activities/{activity_name}/resume"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
+        ("GET", "/admin/history/export-sample"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
         // ── completion triggers (issue #517) ──────────────────────────────────
@@ -5530,6 +6281,8 @@ pub const fn management_api_request_fields()
                 "batch_max_wait",
                 "completion_callbacks",
                 "idempotency_key",
+                "shard_id",
+                "residency_key",
             ]),
         ),
         (
@@ -5583,8 +6336,18 @@ pub const fn management_api_request_fields()
         ),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/rerun",
+            Some(&["input", "workflow_id"]),
+        ),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
+        (
+            "PATCH",
+            "/workflows/{id}/triage",
+            Some(&["owner", "severity", "note"]),
+        ),
         // Issue #614: bodyless POST (the execution id is the path param). Listed
         // with an empty field set, matching the resume/retry-now precedent.
         ("POST", "/workflows/{id}/replay-diagnosis", Some(&[])),
@@ -5771,6 +6534,27 @@ pub const fn management_api_request_fields()
             "/admin/rate-limits/{key}",
             Some(&["refill_rate", "burst"]),
         ),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        (
+            "POST",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&["refill_rate", "burst", "ttl_secs"]),
+        ),
+        (
+            "DELETE",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[]),
+        ),
+        (
+            "POST",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&["refill_per_sec", "burst", "ttl_secs"]),
+        ),
+        (
+            "DELETE",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[]),
+        ),
         (
             "POST",
             "/admin/schedules/workflow",
@@ -5890,6 +6674,26 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&[])),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        (
+            "POST",
+            "/admin/queues/{queue_name}/pause",
+            Some(&["reason", "shard_id"]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/resume",
+            Some(&["shard_id"]),
+        ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        // Both bodies are optional; resume carries no fields at all (it deletes
+        // the pause row, so there is no provenance for a field to set).
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&["reason", "actor"]),
+        ),
+        ("POST", "/activities/{activity_name}/resume", Some(&[])),
         // ── scoped API tokens (issue #942) ────────────────────────────────────
         (
             "POST",
@@ -5998,6 +6802,92 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/workflows/{id}/tree",
+            // Issue #621. The body is polymorphic: the default is the nested
+            // tree (`root` carries `children`), `?summary=true` is the
+            // per-state descendant roll-up (`root` is a compact ref, plus
+            // `counts`/`total_descendants`). Both shapes' top-level fields are
+            // enumerated here so the registry ↔ contract cross-check covers
+            // the union. `truncation_reason` is omitted when absent
+            // (skip_serializing_if) but declared for the same reason.
+            Some(&[
+                "root",
+                "node_count",
+                "max_depth_reached",
+                "truncated",
+                "truncation_reason",
+                "truncated_parent_ids",
+                "truncated_parents_capped",
+                "limits",
+                "status",
+                "unavailable_shards",
+                "counts",
+                "total_descendants",
+                "retained_summary_parent_ids",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/logs",
+            // Issue #790. Nested `lines[]` fields (`seq`, `level`, `message`,
+            // `occurred_at`, `truncation_marker`) are documented in the route's
+            // contract description, following the `/stack` precedent.
+            Some(&[
+                "execution_id",
+                "lines",
+                "next_cursor",
+                "total_lines",
+                "truncated",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/diagnose",
+            // Issue #809. `blocked_on` is an internally-tagged, snake_case
+            // discriminated object whose per-variant fields are documented in
+            // the route's contract description (the `/stack` precedent for
+            // nested shapes). `blocked_on`, `last_event_at`, `terminal_outcome`
+            // and `wait_set_reason` are omitted when absent
+            // (skip_serializing_if) but declared here so the registry <->
+            // contract cross-check covers them.
+            Some(&[
+                "execution_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "health",
+                "blocked_on",
+                "summary",
+                "last_event_age_seconds",
+                "last_event_at",
+                "terminal_outcome",
+                "contributing_reason_codes",
+                "wait_set",
+                "wait_set_reason",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/awaitables",
+            // Issue #615. `wait_set_reason` is omitted when absent
+            // (skip_serializing_if) but declared here so the registry ↔
+            // contract cross-check covers it.
+            Some(&[
+                "execution_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "is_terminal",
+                "wait_set",
+                "wait_set_reason",
+                "awaitables",
+                "truncated",
+                "truncated_kinds",
+                "category_cap",
+            ]),
+        ),
+        (
+            "GET",
             "/workflows/{id}/run-chain",
             Some(&["head_unknown", "workflow_id", "runs"]),
         ),
@@ -6046,6 +6936,7 @@ pub const fn management_api_response_fields()
                 "max_size",
                 "started_fresh",
                 "deduplicated",
+                "shard_id",
             ]),
         ),
         (
@@ -6099,6 +6990,19 @@ pub const fn management_api_response_fields()
         ),
         (
             "POST",
+            "/workflows/{id}/rerun",
+            Some(&[
+                "ok",
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "reran_from",
+                "source_prior_state",
+            ]),
+        ),
+        (
+            "POST",
             "/workflows/{id}/pause",
             Some(&[
                 "ok",
@@ -6123,6 +7027,17 @@ pub const fn management_api_response_fields()
             ]),
         ),
         (
+            "PATCH",
+            "/workflows/{id}/triage",
+            Some(&[
+                "execution_id",
+                "owner",
+                "severity",
+                "note",
+                "changed_fields",
+            ]),
+        ),
+        (
             "POST",
             "/workflows/{id}/erase-payloads",
             Some(&[
@@ -6130,7 +7045,11 @@ pub const fn management_api_response_fields()
                 "events_scrubbed",
                 "fields_tombstoned",
                 "execution_row_scrubbed",
+                "summary_scrubbed",
                 "signals_scrubbed",
+                "logs_deleted",
+                "completion_deliveries_scrubbed",
+                "dead_letters_scrubbed",
                 "children",
                 "skipped_children",
                 "failures",
@@ -6237,7 +7156,10 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{id}/signal/{signal_name}",
-            Some(&["ok", "signal_delivered"]),
+            // `routed_execution_id` (issue #843) is present only when the
+            // request's execution id differed from the live retry attempt the
+            // signal actually landed on; omitted otherwise.
+            Some(&["ok", "signal_delivered", "routed_execution_id"]),
         ),
         ("GET", "/workflows/{id}/queries", None), // Vec<String> query names
         ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
@@ -6274,7 +7196,12 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
-            Some(&["execution_id", "ok", "signal_delivered"]),
+            Some(&[
+                "execution_id",
+                "ok",
+                "signal_delivered",
+                "routed_execution_id",
+            ]),
         ),
         (
             "GET",
@@ -6533,6 +7460,24 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/queue-coverage",
+            // `sample_task_ids`/`sample_execution_ids`/`shard_breakdown` (issue
+            // #774 AC3) are nested inside items[] and are documented in the
+            // contract description, not listed here — this list is top-level
+            // fields only (precedent: /admin/workflow-types/reachability).
+            Some(&[
+                "status",
+                "observed_at",
+                "filter",
+                "uncovered",
+                "total_uncovered_queues",
+                "items",
+                "shards",
+                "excluded_paused_queues",
+            ]),
+        ),
+        (
+            "GET",
             "/admin/status",
             Some(&["status", "as_of", "subsystems", "unavailable_shards"]),
         ),
@@ -6626,9 +7571,98 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/batches/pending", None),
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
-        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
-        ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
+        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (declared baseline + effective/override state, issue #945)
+        (
+            "GET",
+            "/admin/quotas",
+            Some(&["quotas", "status", "unavailable_shards"]),
+        ),
+        ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        // Every route below returns the identical PacingOverrideResponse shape
+        // on the happy 200 path; a partial-shard SET/CLEAR write instead
+        // returns 207 with {"override": ..., "shard_errors": [...]}. The
+        // read-only GET companion for the start-throttle override never
+        // writes, so it never returns 207.
+        (
+            "POST",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        // Read-only companion to the SET/DELETE routes above (issue #945):
+        // surfaces an active override even when the workflow has no current
+        // deferred-start backlog. Same PacingOverrideResponse shape.
+        (
+            "GET",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
         (
             "GET",
@@ -6676,6 +7710,93 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/admin/queues/scaling", None),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        (
+            "GET",
+            "/admin/queues/paused",
+            Some(&["paused_queues", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/pause",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "newly_paused",
+                "reason",
+                "paused_by",
+                "paused_at",
+                "scope_shard_id",
+                "held_task_count",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/resume",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "newly_resumed",
+                "released_task_count",
+                "paused_duration_secs",
+                "released_reason",
+                "released_paused_by",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        (
+            "GET",
+            "/activities",
+            Some(&["activities", "status", "unavailable_shards"]),
+        ),
+        (
+            "GET",
+            "/activities/{activity_name}",
+            Some(&["activity", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
+                "newly_paused",
+                "reason",
+                "paused_by",
+                "paused_at",
+                "scope_shard_id",
+                "held_task_count",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/resume",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
+                "newly_resumed",
+                "released_task_count",
+                "paused_duration_secs",
+                "released_reason",
+                "released_paused_by",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
         ("GET", "/admin/metrics", None),
         (
             "GET",
@@ -6685,6 +7806,20 @@ pub const fn management_api_response_fields()
                 "observed_at",
                 "payload_policy",
                 "filters",
+                "exports",
+                "failures",
+                "shard_coverage",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/history/export-sample",
+            Some(&[
+                "status",
+                "observed_at",
+                "payload_policy",
+                "filters",
+                "manifest",
                 "exports",
                 "failures",
                 "shard_coverage",
@@ -6743,6 +7878,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         (
@@ -6769,6 +7906,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         (
@@ -6795,6 +7934,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),
@@ -7058,6 +8199,49 @@ async fn shards_health(
     Query(query): Query<ShardHealthQuery>,
 ) -> Json<ShardHealthReport> {
     Json(build_shard_health_report(&api_state, query.candidate_shard).await)
+}
+
+/// `GET /admin/queue-coverage` — report task queues with pending work but
+/// zero live workers polling them (issue #774).
+///
+/// Read-only, admin-gated, and infallible with respect to shard reachability:
+/// fans out across every readable shard and folds a per-shard failure into
+/// that shard's inspection error rather than failing the request wholesale
+/// (see [`crate::queue_coverage`]'s module docs for the coverage definition,
+/// paused-queue exclusion, and the distinction from build-id reachability
+/// (#171) and shard health (#522)).
+///
+/// The one thing this endpoint *does* reject outright is a malformed query
+/// string: the raw query is parsed via
+/// [`crate::queue_coverage::parse_raw_query_pairs_strict`] rather than
+/// axum's built-in `Query<Vec<(String, String)>>` extractor, so an invalid
+/// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
+/// documented `400` JSON error instead of silently substituting `U+FFFD`
+/// and reporting a false-clean result for a scoped deploy gate (issue #774
+/// review).
+async fn queue_coverage(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let pairs = match raw_query
+        .as_deref()
+        .map(crate::queue_coverage::parse_raw_query_pairs_strict)
+    {
+        None => Vec::new(),
+        Some(Ok(pairs)) => pairs,
+        Some(Err(crate::queue_coverage::InvalidQueryEncoding)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "malformed query string: invalid percent-encoded UTF-8"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
+    Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
+        .into_response()
 }
 
 /// `GET /admin/status` — rolled-up management health summary (issue #679).
@@ -7785,6 +8969,59 @@ mod operator_reason_tests {
         assert_eq!(truncated.chars().count(), OPERATOR_REASON_MAX_CHARS);
         assert!(truncated.chars().all(|c| c == '\u{2603}'));
     }
+
+    /// Issue #619: truncating a reason that was validated *before* normalization
+    /// can produce a whitespace-only value, which the core then rejects on every
+    /// shard — an opaque 500 with the queue still dispatching, where the route
+    /// promises an audited 400.
+    ///
+    /// `parse_pause_request` closes this by trimming at the point of validation.
+    /// This pins the composition it relies on: once trimmed, no non-empty prefix
+    /// can be whitespace-only, because the first character is not whitespace.
+    #[test]
+    fn trimming_before_truncation_can_never_yield_a_whitespace_only_reason() {
+        for raw in [
+            // The reported case: leading whitespace longer than the whole cap.
+            &format!("{}Stripe outage", " ".repeat(600)) as &str,
+            // Exactly at the cap boundary, either side.
+            &format!("{}x", " ".repeat(OPERATOR_REASON_MAX_CHARS)),
+            &format!("{}x", " ".repeat(OPERATOR_REASON_MAX_CHARS - 1)),
+            // Mixed Unicode whitespace, and trailing padding.
+            "\u{2003}\u{00a0}\t\n  INC-42  \n",
+            "INC-42",
+        ] {
+            // Precondition the route enforces before normalizing.
+            assert!(
+                !raw.trim().is_empty(),
+                "fixture must pass validation: {raw:?}"
+            );
+
+            let stored = truncate_operator_reason(raw.trim());
+
+            assert!(
+                !stored.trim().is_empty(),
+                "trim-then-truncate must stay non-empty, or the core rejects it \
+                 and the audited 400 becomes a 500; raw={raw:?} stored={stored:?}"
+            );
+            assert!(stored.chars().count() <= OPERATOR_REASON_MAX_CHARS);
+        }
+
+        // And the bug is real without the trim: this is what the pre-fix
+        // ordering produced for the reported input.
+        let reported = format!("{}Stripe outage", " ".repeat(600));
+        assert!(
+            truncate_operator_reason(&reported).trim().is_empty(),
+            "the pre-fix ordering must be demonstrably broken, or this guard is vacuous"
+        );
+    }
+
+    /// The operator's actual words must survive the cap, not be evicted by
+    /// padding that carries no information.
+    #[test]
+    fn trimming_keeps_the_operator_words_inside_the_budget() {
+        let raw = format!("{}Stripe outage", " ".repeat(490));
+        assert_eq!(truncate_operator_reason(raw.trim()), "Stripe outage");
+    }
 }
 
 #[cfg(test)]
@@ -7809,12 +9046,54 @@ async fn list_workflows(
 ) -> Result<axum::response::Response, AutumnError> {
     use axum::response::IntoResponse as _;
     let filters = parse_workflow_filters(&pairs)?;
+    // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
+    // issue #486) and `history_bloat_min_events` (history-bloat discovery,
+    // issue #704) are two dedicated, mutually-exclusive discovery paths —
+    // each computes and sorts by a *different* value (staleness vs. current
+    // history size) that the other loader neither computes nor honors.
+    // Silently letting one win (whichever branch is checked first) would
+    // drop the other filter without telling the caller. Reject the
+    // combination up front with a clear `400`, matching the existing
+    // pagination-combo precedent below (AC7: never a silent, mis-filtered
+    // page).
+    if filters.no_progress_minutes.is_some() && filters.history_bloat_min_events.is_some() {
+        return Err(AutumnError::bad_request_msg(
+            "no_progress_minutes and history_bloat_min_events are two separate discovery paths \
+             (stalled-workflow vs. history-bloat) and cannot be combined in one request",
+        ));
+    }
     if filters.no_progress_minutes.is_some() {
         // Stalled-workflow discovery (issue #486). On the happy path this is a
         // bare array (cursor pagination is not supported here); when a shard is
         // unreachable (issue #756) it degrades to the `{ workflows, status,
         // unavailable_shards }` envelope instead of a `500`.
         let page = load_stalled_workflows_from_shards(&api_state, &filters).await?;
+        return Ok(fanout_list_json(
+            "workflows",
+            page.rows,
+            page.status,
+            &page.unavailable_shards,
+        )?
+        .into_response());
+    }
+    if filters.history_bloat_min_events.is_some() {
+        // Operator early-warning discovery for workflow history bloat (issue
+        // #704, AC1). A dedicated non-terminal-only, sorted-by-size path — see
+        // the `load_history_bloat_workflows` doc comment. This is a SEPARATE
+        // query param from the general-purpose `min_history_events` (issue
+        // #493) precisely so that filter keeps composing with `state=`/
+        // pagination unchanged — see `WorkflowFilters::min_history_events`.
+        // Sorting is by a *computed* value (no stored keyset column), so
+        // combining with cursor pagination is rejected up front (AC7: never a
+        // silent, wrongly-ordered page — always a clear `400`).
+        if filters.paginated {
+            return Err(AutumnError::bad_request_msg(
+                "history_bloat_min_events is not supported together with cursor/page_size/order \
+                 pagination; results are sorted by current history size, which has no keyset \
+                 cursor",
+            ));
+        }
+        let page = load_history_bloat_workflows_from_shards(&api_state, &filters).await?;
         return Ok(fanout_list_json(
             "workflows",
             page.rows,
@@ -8580,6 +9859,17 @@ pub(crate) fn parse_workflow_filters(
                 })?;
                 filters.min_history_events = Some(parsed);
             }
+            "history_bloat_min_events" => {
+                // Issue #704, AC1/AC7: deliberately a distinct query param from
+                // `min_history_events` above (issue #493) — see the field doc
+                // comment on `WorkflowFilters::history_bloat_min_events`.
+                let parsed = value.trim().parse::<u64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid history_bloat_min_events '{value}'; expected a non-negative integer"
+                    ))
+                })?;
+                filters.history_bloat_min_events = Some(parsed);
+            }
             // ── Issue #498: time-range, prefix, and pagination params ────────
             "started_after" => {
                 let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
@@ -8747,6 +10037,112 @@ fn parse_history_batch_export_query(
     Ok(query)
 }
 
+/// Parse `GET /admin/history/export-sample` (issue #798).
+///
+/// Every rejection is a `400` with a reason — never a silently-dropped filter
+/// that would produce a smaller-than-requested sample and a falsely-green gate.
+fn parse_history_sample_export_query(
+    pairs: &[(String, String)],
+) -> Result<HistorySampleExportQuery, AutumnError> {
+    use autumn_harvest::replay_sample::{SampleOrder, clamp_per_workflow, normalize_sample_states};
+
+    let mut payload_policy = HistoryPayloadPolicy::Redacted;
+    let mut max_bytes = DEFAULT_HISTORY_EXPORT_MAX_BYTES;
+    let mut workflow_name = None;
+    let mut raw_states: Vec<String> = Vec::new();
+    let mut per_workflow = autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE;
+    let mut order = SampleOrder::default();
+    let mut shard_id = None;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "payload_policy" | "payload-policy" => {
+                payload_policy = value.parse().map_err(AutumnError::bad_request_msg)?;
+            }
+            "max_bytes" | "max-bytes" => {
+                max_bytes = parse_sample_max_bytes(value)?;
+            }
+            "workflow_name" | "workflow-name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "state" | "states" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        raw_states.push(trimmed.to_string());
+                    }
+                }
+            }
+            "per_workflow" | "per-workflow" => {
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid per_workflow '{value}'"))
+                })?;
+                per_workflow = clamp_per_workflow(parsed);
+            }
+            "order" => {
+                order = SampleOrder::parse(value).map_err(AutumnError::bad_request_msg)?;
+            }
+            "shard_id" | "shard-id" | "shard" => {
+                shard_id = Some(value.parse::<i32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid shard_id '{value}'"))
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    // A terminal or unknown state is rejected here rather than silently
+    // dropped: the gate replays *in-flight* histories, so a request for
+    // `COMPLETED` is a caller error, not an empty result set.
+    let states = normalize_sample_states(&raw_states).map_err(AutumnError::bad_request_msg)?;
+
+    Ok(HistorySampleExportQuery {
+        payload_policy,
+        max_bytes,
+        workflow_name,
+        states,
+        per_workflow,
+        order,
+        shard_id,
+    })
+}
+
+/// Parse `max_bytes` for the **sample** route, bounded by the aggregate budget.
+///
+/// The sample export checks
+/// [`MAX_SAMPLE_RESPONSE_BYTES`](autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES)
+/// *before* each fetch, because a document's size is not knowable until it is
+/// loaded — so peak retained bytes are the budget plus at most one document.
+/// That is a bound only if one document is itself bounded, and `max_bytes` is
+/// caller-supplied. With no ceiling the budget starts at zero, so the first
+/// candidate is always fetched and retained however large it is, and a single
+/// multi-gigabyte history exhausts the management API despite the aggregate cap.
+///
+/// Rejected rather than silently clamped: asking for one document larger than
+/// the entire response budget is incoherent (it can never be returned within
+/// that budget), and quietly shrinking the caller's limit would surface later as
+/// a mystifying per-candidate size failure naming a number they never set.
+///
+/// Scoped to this route deliberately. The single-execution and batch export
+/// routes predate #798, return a different shape, and carry no aggregate budget
+/// for a per-document limit to be coherent against; changing their contract is
+/// not this change's business.
+fn parse_sample_max_bytes(value: &str) -> Result<usize, AutumnError> {
+    let parsed = parse_history_max_bytes(value)?;
+    let ceiling = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+    if parsed > ceiling {
+        return Err(AutumnError::bad_request_msg(format!(
+            "max_bytes {parsed} exceeds the sample response budget of {ceiling} bytes; \
+             a single history larger than the whole response cannot be sampled — \
+             export it individually with GET /admin/history/export instead"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
     let parsed = value
         .parse::<usize>()
@@ -8908,6 +10304,55 @@ async fn export_workflow_histories(
                     TARGET_WORKFLOW,
                     None,
                     "GET /admin/history/exports",
+                    None,
+                    outcome,
+                    None,
+                )
+                .await;
+            }
+            Json(response).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /admin/history/export-sample` — stratified in-flight sample export for
+/// the replay-drift gate (issue #798).
+///
+/// Read-only: SELECT-only over `harvest_workflow_executions` / `harvest_events`,
+/// no state transition, no event appended, no task claimed.
+async fn export_workflow_history_sample(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    let query = match parse_history_sample_export_query(&pairs) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    // Read-path payload decoding (issue #608): Full policy only, one audit row
+    // per request — identical treatment to the batch export (AC3).
+    let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
+        read_path_decoder(&api_state, extension_session(maybe_session)).await
+    } else {
+        None
+    };
+    let mut outcome = LossyDecodeOutcome::default();
+    match load_history_sample_from_shards(&api_state, &query, decoder.as_ref(), &mut outcome).await
+    {
+        Ok(response) => {
+            if decoder.is_some() {
+                // No live connection is held here: the per-shard loads are
+                // scoped inside `load_history_sample_from_shards`, so the
+                // pool-acquiring audit branch is safe (PR #936 review).
+                audit_decoded_read(
+                    &api_state,
+                    None,
+                    &headers,
+                    TARGET_WORKFLOW,
+                    None,
+                    "GET /admin/history/export-sample",
                     None,
                     outcome,
                     None,
@@ -9403,6 +10848,11 @@ async fn workflow_result_snapshot_following_can(
 /// retry chain (issue #523): while the current row is `FAILED` and a successor
 /// with `retry_of_exec_id = id` exists, advance to that successor. Returns the
 /// deepest (most recent) execution. Uses only DB reads — no listener required.
+///
+/// Delegates to the single canonical walker
+/// [`autumn_harvest::execution::resolve_live_attempt`] so the management API and
+/// the core `WorkflowHandle` cannot drift on what "the live attempt" means
+/// (issue #843).
 async fn load_execution_following_retries(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -9410,29 +10860,7 @@ async fn load_execution_following_retries(
     let mut conn = db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))?;
-    let mut execution = load_execution(&mut conn, exec_id).await?;
-    // Bounded by max_attempts; self-referential cycles are impossible (each
-    // retry gets a fresh exec_id).
-    for _ in 0..256 {
-        if execution.state != "FAILED" {
-            return Ok(execution);
-        }
-        let next: Option<uuid::Uuid> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
-            .select(harvest_workflow_executions::id)
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(database_error)?;
-        match next {
-            Some(next_uuid) => {
-                let next_id = ExecutionId::from_uuid(next_uuid);
-                execution = load_execution(&mut conn, next_id).await?;
-            }
-            None => return Ok(execution),
-        }
-    }
-    Ok(execution)
+    autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
@@ -9595,25 +11023,37 @@ async fn load_workflow_children_tree_from_shards(
             break;
         }
 
+        // Batch the WHOLE frontier into one `parent_id = ANY($1)` query per
+        // shard per depth level, instead of one query per *parent* per shard
+        // per depth level -- `O(depth × shards)` round trips instead of
+        // `O(nodes × shards)`, mirroring `load_workflow_children_batch`
+        // (the same batching `GET /workflows/{id}/tree`, issue #621, already
+        // does for this exact traversal shape). Which specific parent in the
+        // frontier produced a given child is never needed here: the next
+        // frontier is just the union of everyone's children, deduped by
+        // `seen`, and result filters only ever inspect the row itself.
+        let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
-        for parent in &frontier {
-            for (_shard, shard_pool) in pool.iter_shards() {
-                let mut conn = acquire_conn(shard_pool).await?;
-                let shard_rows =
-                    store::load_workflow_children(&mut conn, *parent, &traversal_filters, depth)
-                        .await
-                        .map_err(map_error)?;
-                for row in shard_rows {
-                    if !seen.insert(row.exec_id.as_uuid()) {
-                        continue;
-                    }
+        for (_shard, shard_pool) in pool.iter_shards() {
+            let mut conn = acquire_conn(shard_pool).await?;
+            let shard_rows = store::load_workflow_children_multi(
+                &mut conn,
+                &parent_uuids,
+                &traversal_filters,
+                depth,
+            )
+            .await
+            .map_err(map_error)?;
+            for row in shard_rows {
+                if !seen.insert(row.exec_id.as_uuid()) {
+                    continue;
+                }
 
-                    next_frontier.push(row.exec_id);
-                    if workflow_child_matches_filters(&row, filters)
-                        && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
-                    {
-                        rows.push(row);
-                    }
+                next_frontier.push(row.exec_id);
+                if workflow_child_matches_filters(&row, filters)
+                    && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
+                {
+                    rows.push(row);
                 }
             }
         }
@@ -9622,6 +11062,367 @@ async fn load_workflow_children_tree_from_shards(
     }
 
     Ok(rows)
+}
+
+// ── Recursive cross-shard lineage tree (issue #621) ───────────────────────────
+
+/// `GET /workflows/{id}/tree` — the full recursive descendant tree rooted at
+/// `id`, across all readable shards.
+///
+/// The bounded, cycle-safe walk itself is
+/// [`crate::lineage::LineageWalk`] (pure, unit-tested); this handler owns the
+/// HTTP contract: root resolution (`404`/`400`), bound validation (`400`), and
+/// the tree-vs-summary response selection.
+///
+/// **Not admin-gated**, matching its closest siblings `GET
+/// /workflows/{id}/children` (which already performs a cross-shard depth
+/// traversal over the same rows) and `GET /workflows/{id}/run-chain`. This
+/// route exposes strictly the same class of data — execution rows' identity,
+/// state, and topology — with no payloads, so gating it while `/children`
+/// stays open would be an inconsistency, not a hardening.
+async fn get_workflow_tree(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<axum::response::Response, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let params = parse_lineage_query(&pairs)?;
+
+    // Root lookup is O(1) shard-routed off the id's embedded shard — only the
+    // *descendant* walk needs a fan-out. Deliberately the **exact** variant:
+    // the lenient `db_conn_for_execution` would fall back to the default shard
+    // when the owning shard has no pool on this node, turning "I cannot see
+    // that shard" into a confident `404`. That would contradict this very
+    // response, whose `unavailable_shards` reports exactly such a shard as
+    // unreachable for the descendant walk.
+    let root_execution = {
+        let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        };
+        match load_execution(&mut conn, exec_id).await {
+            Ok(execution) => execution,
+            Err(HarvestError::NotFound(_)) => {
+                return Err(AutumnError::not_found_msg(format!(
+                    "workflow execution {exec_id} not found \
+                     (classic DAG runs are not on the execution path)"
+                )));
+            }
+            Err(err) => return Err(map_error(err)),
+        }
+    };
+
+    let report = build_lineage_report(
+        &api_state,
+        &root_row_from_execution(&root_execution),
+        params.limits,
+    )
+    .await;
+
+    Ok(if params.summary {
+        Json(report.into_summary()).into_response()
+    } else {
+        Json(report).into_response()
+    })
+}
+
+/// Parsed `GET /workflows/{id}/tree` query string.
+struct LineageQueryParams {
+    limits: LineageLimits,
+    summary: bool,
+}
+
+/// Parse and validate `?max_depth=`, `?max_nodes=`, `?summary=`.
+///
+/// An out-of-range or non-numeric bound is a `400` naming the offending
+/// parameter rather than a silent clamp — the response echoes the `limits` it
+/// applied, so clamping would make that echo lie.
+fn parse_lineage_query(pairs: &[(String, String)]) -> Result<LineageQueryParams, AutumnError> {
+    let mut max_depth = None;
+    let mut max_nodes = None;
+    let mut summary = false;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "max_depth" => {
+                max_depth = Some(value.trim().parse::<u32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid max_depth '{value}'"))
+                })?);
+            }
+            "max_nodes" => {
+                max_nodes = Some(value.trim().parse::<u32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid max_nodes '{value}'"))
+                })?);
+            }
+            "summary" => {
+                // Rejected rather than defaulted to `false`: a caller who
+                // typos the value and silently receives a full tree with a
+                // 200 has no way to notice, and every other bound on this
+                // route is a hard 400 on an invalid value.
+                let v = value.trim();
+                summary = match v {
+                    _ if v.eq_ignore_ascii_case("true") || v == "1" => true,
+                    _ if v.eq_ignore_ascii_case("false") || v == "0" => false,
+                    _ => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid summary '{value}' (expected true or false)"
+                        )));
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let limits =
+        LineageLimits::parse(max_depth, max_nodes).map_err(AutumnError::bad_request_msg)?;
+    Ok(LineageQueryParams { limits, summary })
+}
+
+/// Drive the bounded lineage walk level by level across every expected shard.
+///
+/// Two batched queries per level (children of the whole frontier, then — once —
+/// an existence probe over the unexpanded leaves) rather than one query per
+/// parent per shard: that is what keeps a ~200-node/8-shard tree inside the
+/// issue's p95 < 500 ms budget.
+///
+/// Never fails wholesale on an unreachable shard (issue #756): the reachable
+/// shards' rows still flow, the shard is named in `unavailable_shards`, and
+/// `status` degrades to `partial`/`unavailable` — a cross-shard triage read
+/// must not 500 during exactly the incident it exists to diagnose.
+///
+/// **Consistency:** shards are read independently, so a deep tree may be
+/// marginally time-skewed across shards. That is acceptable for triage and is
+/// documented on the endpoint.
+async fn build_lineage_report(
+    api_state: &HarvestApiState,
+    root_row: &store::LineageChildRow,
+    limits: LineageLimits,
+) -> LineageTreeReport {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    let mut walk = LineageWalk::new(root_row.exec_id, limits);
+    let mut frontier = vec![root_row.exec_id.as_uuid()];
+    let mut shard_errors: BTreeMap<i32, String> = BTreeMap::new();
+    // Evidence, not arithmetic: a shard is only "inspected" once it has
+    // actually answered. Deriving this as `expected - errors` would claim a
+    // complete read on a path where zero shards were queried (a budget that
+    // only fits the root breaks the loop before the first round).
+    let mut observed: BTreeSet<i32> = BTreeSet::new();
+
+    for depth in 1..=limits.max_depth {
+        if frontier.is_empty() || walk.is_exhausted() {
+            break;
+        }
+        // Fetch one past the remaining budget so an overflow is *observed*
+        // (and its parent named) instead of silently fitting.
+        let fetch_limit =
+            i64::try_from(walk.remaining_budget().saturating_add(1)).unwrap_or(i64::MAX);
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_children_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                frontier.clone(),
+                fetch_limit,
+            )
+        }))
+        .await;
+
+        // A shard whose window came back full may have had rows cut by the
+        // SQL LIMIT that the budget sentinel never got to observe.
+        let saturated = observations
+            .iter()
+            .any(|o| i64::try_from(o.rows.len()).unwrap_or(i64::MAX) >= fetch_limit);
+        let rows = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        frontier = walk.admit_level(depth, rows);
+        if saturated {
+            walk.note_saturated_fetch_window();
+        }
+    }
+
+    // Existence probe: name ONLY the unexpanded leaves that provably have
+    // children, so a childless leaf is never reported as a dropped subtree.
+    //
+    // The live `frontier` is the authoritative unexpanded set on every exit
+    // path — empty when the tree completed naturally, the deepest admitted
+    // level on a depth exit, and `[root]` when the budget was spent before a
+    // single round ran.
+    let probe_targets = frontier;
+    if !probe_targets.is_empty() {
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_probe_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                probe_targets.clone(),
+            )
+        }))
+        .await;
+
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        walk.record_probe_result(&parents);
+    }
+
+    // Retained-summary probe (issue #752). A terminal child can be demoted into
+    // `harvest_execution_summaries` and have its execution row collected while
+    // its parent is still live, so it is invisible to the walk above. Probing
+    // EVERY admitted id (not just the unexpanded frontier) is required: such a
+    // child can hang off any node in the tree, not only a leaf.
+    let summary_targets = walk.admitted_ids();
+    if !summary_targets.is_empty() {
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_summary_probe_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                summary_targets.clone(),
+            )
+        }))
+        .await;
+
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        walk.record_retained_summary_parents(&parents);
+    }
+
+    let mut report = walk.finish(lineage_root_node(root_row));
+    let inspected = observed.len();
+    report.status = FanoutStatus::from_counts(inspected, shard_errors.len());
+    report.unavailable_shards = shard_errors
+        .into_iter()
+        .map(|(shard_id, reason)| UnavailableShard { shard_id, reason })
+        .collect();
+    report
+}
+
+/// Why a shard could not contribute to the lineage walk.
+///
+/// Folding every failure mode (no pool for a router-known shard, connection
+/// acquire, query) into a `ShardObservation` error rather than propagating is
+/// what lets an unreachable shard degrade the report to `partial` instead of
+/// failing the whole call (#756).
+const fn lineage_shard_unavailable<R>(shard_id: i32, reason: String) -> ShardObservation<R> {
+    ShardObservation {
+        shard_id,
+        rows: Vec::new(),
+        error: Some(reason),
+    }
+}
+
+/// One shard's contribution to a lineage level: the children of every frontier
+/// parent that lives on this shard.
+async fn lineage_children_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    frontier: Vec<uuid::Uuid>,
+    limit: i64,
+) -> ShardObservation<store::LineageChildRow> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_workflow_children_batch(&mut conn, &frontier, limit).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// One shard's contribution to the existence probe: which of the unexpanded
+/// leaves have at least one child here?
+async fn lineage_probe_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    parents: Vec<uuid::Uuid>,
+) -> ShardObservation<uuid::Uuid> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_parents_with_children(&mut conn, &parents).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// One shard's contribution to the **retained-summary** probe (issue #752):
+/// which of the given nodes have a child that was demoted into
+/// `harvest_execution_summaries` and so is absent from the tree.
+///
+/// Structurally identical to [`lineage_probe_on_shard`] — same degrade-to-
+/// `partial` failure handling — but against the summaries table, so a shard
+/// that predates the summaries migration degrades rather than 500s.
+async fn lineage_summary_probe_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    parents: Vec<uuid::Uuid>,
+) -> ShardObservation<uuid::Uuid> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_parents_with_summary_children(&mut conn, &parents).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// Fold one level's (or the probe's) per-shard observations into a flat row set,
+/// recording the first error seen per shard and which shards actually answered.
+///
+/// First-error-per-shard is deliberate: a shard that is down stays down for
+/// every level, so this collapses to one `unavailable_shards` entry rather than
+/// one per level.
+fn absorb_lineage_observations<R>(
+    observations: Vec<ShardObservation<R>>,
+    shard_errors: &mut BTreeMap<i32, String>,
+    observed: &mut BTreeSet<i32>,
+) -> Vec<R> {
+    let mut rows = Vec::new();
+    for observation in observations {
+        if let Some(error) = observation.error {
+            shard_errors.entry(observation.shard_id).or_insert(error);
+        } else {
+            observed.insert(observation.shard_id);
+        }
+        rows.extend(observation.rows);
+    }
+    rows
 }
 
 fn workflow_children_store_filters(
@@ -10184,6 +11985,2207 @@ async fn get_workflow_timeline(
     Ok(Json(timeline))
 }
 
+// ── Durable per-execution workflow logs (issue #790) ──────────────────────
+
+const DEFAULT_WORKFLOW_LOG_PAGE: i64 = 200;
+const MAX_WORKFLOW_LOG_PAGE: i64 = 1000;
+
+/// One durable log line as served by `GET /workflows/{id}/logs`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowLogLineResponse {
+    /// Deterministic emission-order key; also the pagination cursor.
+    pub seq: i64,
+    /// `info` | `warn` | `error`.
+    pub level: String,
+    /// The author-emitted message (capped at write time).
+    pub message: String,
+    /// Wall-clock instant the line was persisted.
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    /// `true` for the synthetic per-execution cap marker (issue #790, AC4).
+    /// Omitted for ordinary lines.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncation_marker: bool,
+}
+
+/// Response of `GET /workflows/{id}/logs`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowLogsResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The log lines for this page, in emission order.
+    pub lines: Vec<WorkflowLogLineResponse>,
+    /// Opaque cursor; pass as `?cursor=` for the next page. `null` = last page.
+    pub next_cursor: Option<i64>,
+    /// Total persisted line count for this execution, unaffected by filters.
+    pub total_lines: i64,
+    /// `true` when this execution hit its per-execution cap and later lines
+    /// were dropped (issue #790, AC4). Independent of the current page's
+    /// filters, so a `?level=error` page still reports it.
+    pub truncated: bool,
+}
+
+/// Parsed `GET /workflows/{id}/logs` query: `(limit, cursor, levels, since)`.
+type WorkflowLogsQueryParams = (
+    i64,
+    Option<i64>,
+    Vec<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// Parse query parameters for `GET /workflows/{id}/logs`.
+///
+/// An unknown `level=` value is rejected rather than silently ignored: a typo
+/// would otherwise answer "no lines" for a run that has plenty, which is the
+/// worst possible outcome for a triage endpoint.
+fn parse_workflow_logs_query(
+    pairs: &[(String, String)],
+) -> Result<WorkflowLogsQueryParams, AutumnError> {
+    let mut limit = DEFAULT_WORKFLOW_LOG_PAGE;
+    let mut cursor: Option<i64> = None;
+    let mut levels: Vec<String> = Vec::new();
+    let mut since: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    for (k, v) in pairs {
+        match k.as_str() {
+            "limit" => {
+                let parsed = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid limit {v:?}: must be a positive integer"
+                    ))
+                })?;
+                if parsed <= 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid limit {parsed}: must be a positive integer"
+                    )));
+                }
+                limit = parsed.clamp(1, MAX_WORKFLOW_LOG_PAGE);
+            }
+            // `after` is accepted as an alias for parity with
+            // `GET /workflows/{id}/history`.
+            "cursor" | "after" => {
+                let parsed = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid cursor {v:?}: must be a non-negative integer"
+                    ))
+                })?;
+                if parsed < 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid cursor {parsed}: must be non-negative"
+                    )));
+                }
+                cursor = Some(parsed);
+            }
+            "level" => {
+                for part in v.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let level =
+                        autumn_harvest::WorkflowLogLevel::from_wire(part).ok_or_else(|| {
+                            AutumnError::bad_request_msg(format!(
+                                "invalid level {part:?}: expected one of info, warn, error"
+                            ))
+                        })?;
+                    let wire = level.as_str().to_string();
+                    if !levels.contains(&wire) {
+                        levels.push(wire);
+                    }
+                }
+            }
+            "since" => {
+                since = Some(parse_audit_datetime(v.trim())?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((limit, cursor, levels, since))
+}
+
+/// `GET /workflows/{id}/logs` — durable per-execution author log lines.
+///
+/// Read-only projection of `harvest_workflow_logs` (issue #790). Lines are
+/// returned in **emission order** (`seq`, the deterministic logical-position
+/// key), never `occurred_at` — which is wall clock and can be non-monotonic
+/// across workers.
+///
+/// Admin-gated, matching the sibling per-execution diagnostic reads
+/// (`/awaitables`, the eligibility endpoints): a log message is free-form
+/// author text that routinely carries business detail, so it gets the stricter
+/// posture rather than the plain-execution-row one.
+///
+/// Shard routing uses the **exact** (no default-shard fallback) resolver: an
+/// empty log list is a legitimate answer for a run that simply never logged, so
+/// a mis-routed read would be indistinguishable from "this run has no logs".
+/// Failing closed with a 503 keeps the answer honest.
+///
+/// Logs are observational only (AC7): they are not part of the event history,
+/// carry no determinism guarantee, and are never read back into workflow logic.
+async fn get_workflow_logs(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<WorkflowLogsResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let (limit, cursor, levels, since) = parse_workflow_logs_query(&pairs)?;
+
+    let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id} not found"
+        )));
+    };
+
+    // Existence check first, so an unknown id is a 404 rather than an empty page.
+    match load_execution(&mut conn, exec_id).await {
+        Ok(_) => {}
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    }
+
+    let level_refs: Vec<&str> = levels.iter().map(String::as_str).collect();
+    // Fetch `limit + 1` and compare, the repo's pagination idiom (see the
+    // schedule-runs / audit / dead-letter loaders). Emitting a cursor purely
+    // because the page came back full would hand the caller a non-null
+    // `next_cursor` whose follow-up page is empty whenever the remaining line
+    // count is an exact multiple of `limit` -- and, on a capped run, that
+    // spurious cursor is the `i64::MAX` marker slot.
+    let mut rows = autumn_harvest::store::load_workflow_logs(
+        &mut conn,
+        exec_id,
+        &autumn_harvest::store::WorkflowLogQuery {
+            after_seq: cursor,
+            since,
+            levels: &level_refs,
+            limit: limit.saturating_add(1),
+        },
+    )
+    .await
+    .map_err(map_error)?;
+    let has_more = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+    if has_more {
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+
+    let total_lines = autumn_harvest::store::count_workflow_logs(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    // The cap marker is a single sentinel row at `seq = i64::MAX`; probe for it
+    // directly so `truncated` is filter-independent.
+    let truncated = !autumn_harvest::store::load_workflow_logs(
+        &mut conn,
+        exec_id,
+        &autumn_harvest::store::WorkflowLogQuery {
+            after_seq: Some(autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(map_error)?
+    .is_empty();
+
+    drop(conn);
+
+    let next_cursor = if has_more {
+        rows.last().map(|r| r.seq)
+    } else {
+        None
+    };
+
+    let lines = rows
+        .into_iter()
+        .map(|r| WorkflowLogLineResponse {
+            truncation_marker: r.seq == autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ,
+            seq: r.seq,
+            level: r.level,
+            message: r.message,
+            occurred_at: r.occurred_at,
+        })
+        .collect();
+
+    Ok(Json(WorkflowLogsResponse {
+        execution_id: exec_id.to_string(),
+        lines,
+        next_cursor,
+        total_lines,
+        truncated,
+    }))
+}
+
+// ── Open-awaitables diagnostic (issue #615) ───────────────────────────────
+
+/// Response of `GET /workflows/{id}/awaitables`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowAwaitablesResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The business workflow id.
+    pub workflow_id: String,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The execution's current state (echoed for terminal runs too).
+    pub state: String,
+    /// `true` when the execution is in a terminal state (empty awaitables).
+    pub is_terminal: bool,
+    /// How the wait-set was derived: `"replayed"` (all six categories
+    /// observable), `"history_only"` (best-effort event-log scan — see
+    /// `wait_set_reason`), or `"terminal"` (nothing to derive).
+    pub wait_set: String,
+    /// Why the wait-set degraded to `history_only`, when it did:
+    /// `handler_not_registered`, `classic_dag`, `payload_decode_required`,
+    /// `replay_reached_terminal`, `replay_timed_out`, `replay_panicked`, or
+    /// `replay_diverged`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_set_reason: Option<String>,
+    /// The open awaitables, bounded per category (see `category_cap`).
+    pub awaitables: Vec<autumn_harvest::awaitables::Awaitable>,
+    /// `true` when any category overflowed `category_cap`.
+    pub truncated: bool,
+    /// The categories that overflowed (first-N kept per category).
+    pub truncated_kinds: Vec<autumn_harvest::awaitables::AwaitableKind>,
+    /// The per-category bound that was applied.
+    pub category_cap: usize,
+}
+
+/// Builds the open-awaitables report for one execution (issue #615): loads the
+/// recorded history from the owning shard, replays it read-only to the current
+/// suspension point (the #612 `drive_query_replay` machinery), and projects the
+/// drained pending-command buffer — the authoritative "what is this run parked
+/// on" set, including awaited-but-unsent signals and `await_condition` parks
+/// that no side table can see — into a bounded, payload-free awaitables list.
+///
+/// Shared by the HTTP handler and the Vantage UI blocked-on panel so the two
+/// can never disagree.
+///
+/// Degradation contract (this is a triage endpoint — it degrades, it does not
+/// error): an unregistered handler, a classic DAG run, an encrypted history
+/// (identity-codec `UnknownPayloadCodec`), or a replay that times out /
+/// panics / reaches terminal on a non-terminal run falls back to a best-effort
+/// history-only scan with `wait_set_reason` naming why.
+///
+/// Read-only by construction: no events appended, no state mutated, no audit
+/// row (classified `RouteClass::ReadOnly`). Shard-local via
+/// `db_conn_for_execution` — no cross-shard fan-out. The connection is dropped
+/// before user code is driven (the #612 pool-slot discipline).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_awaitables_report(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowAwaitablesResponse, AutumnError> {
+    use autumn_harvest::awaitables::{
+        AWAITABLE_CATEGORY_CAP, AwaitableKind, WaitSetInput, project_awaitables,
+    };
+
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let mut execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // AC (issue #615): a terminal execution returns an EMPTY awaitables list
+    // with the terminal state echoed — HTTP 200, never an error. Nothing is
+    // loaded or replayed.
+    if is_terminal_state(&execution.state) {
+        return Ok(WorkflowAwaitablesResponse {
+            execution_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id,
+            workflow_name: execution.workflow_name,
+            state: execution.state,
+            is_terminal: true,
+            wait_set: "terminal".to_string(),
+            wait_set_reason: None,
+            awaitables: Vec::new(),
+            truncated: false,
+            truncated_kinds: Vec::new(),
+            category_cap: AWAITABLE_CATEGORY_CAP,
+        });
+    }
+
+    // Raw timestamped rows: the SINGLE full-history load. They feed both the
+    // projection's `since`/`deadline` metadata index and — re-derived in
+    // memory below — the replay drive's event history, so the endpoint never
+    // reads `harvest_events` twice (PR review). Raw deserialization — payload
+    // fields ride along as opaque Values (codec envelopes included) and are
+    // never read here, so this load cannot fail on an encrypted deployment.
+    let rows = store::load_history_with_timestamps(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    // Task-row deadline enrichment for open activity awaitables: the earliest
+    // of the cross-retry `schedule_to_close_at` (#378) and the current
+    // attempt's start-to-close deadline (`started_at + start_to_close`).
+    // Best-effort: this query exists only to *enrich* activity awaitables
+    // with a deadline, so its failure degrades to no-deadline rather than
+    // failing the whole triage report (PR review).
+    let activity_deadlines: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::task_type.eq("activity"))
+            // Open task-row states: backoff is PENDING with a future
+            // scheduled_at, and claimed work is RUNNING — there are no other
+            // non-terminal states in the task-queue vocabulary.
+            .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = %err,
+                    "awaitables: task-row deadline enrichment failed; serving without deadlines"
+                );
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|task| {
+                let activity_id = task.activity_id?;
+                let start_to_close_deadline = match (task.started_at, task.start_to_close) {
+                    (Some(started), Some(stc)) => started.checked_add_signed(stc),
+                    _ => None,
+                };
+                let deadline = match (task.schedule_to_close_at, start_to_close_deadline) {
+                    (Some(cross_retry), Some(attempt)) => Some(cross_retry.min(attempt)),
+                    (cross_retry, attempt) => cross_retry.or(attempt),
+                };
+                deadline.map(|deadline| (activity_id.to_string(), deadline))
+            })
+            .collect();
+
+    // Live unfired timer ids for the history-only fire-eligibility filter: a
+    // history-only scan reports every unclosed `TimerStarted`, but a cancellable
+    // `ctx.start_timer` arm (issue #768, `ArmTimer { for_await: false }`)
+    // records a `TimerStarted` with NO `harvest_timers` row and cannot fire
+    // until `await_fire()`. The live table is the authoritative fire-eligibility
+    // signal, threaded into the projection via
+    // `WaitSetInput::HistoryOnly { fire_eligible_timers }` below so dormant arms
+    // are dropped BEFORE the per-category cap (a fire-eligible timer beyond the
+    // cap position is never crowded out by dormant arms ahead of it). Unused by
+    // the replayed projection, which excludes dormant arms by construction.
+    // Best-effort: on failure the filter is skipped (`None`, a dormant arm may
+    // be over-reported) rather than failing the whole triage report (PR review).
+    let fire_eligible_timer_ids: Option<std::collections::HashSet<String>> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::timer_id)
+        .load::<String>(&mut conn)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                execution_id = %exec_id,
+                error = %err,
+                "awaitables: live-timer read failed; not filtering dormant timer arms"
+            );
+        })
+        .ok()
+        .map(|ids| ids.into_iter().collect());
+
+    // No further DB reads: release the pool slot before any payload-store
+    // fetch or user-code drive below (the #612 pool-slot discipline, widened —
+    // offload inflation is network I/O too).
+    drop(conn);
+
+    let workflow = runtime.registry.workflows.get(&execution.workflow_name);
+    let (wait_set, wait_set_reason, mut projection) = if let Some(workflow) = workflow {
+        // Derive the replay-fidelity event history IN MEMORY from the rows
+        // already loaded: re-serialize each event (lossless — payload fields
+        // are opaque Values), inflate offloaded payloads (#524), and decode
+        // codec envelopes with the runtime-mirrored registry (#608) so an
+        // encrypted deployment still gets the full replayed wait-set. Using
+        // the real codecs here is deliberate and needs no #608 read-decode
+        // opt-in or audit row: decoded plaintext only feeds the replay drive
+        // (exactly as every live worker cycle does) and the response is
+        // payload-free by construction, so nothing decoded is ever surfaced.
+        // ANY failure in this pass — an unknown codec id, a blob-store outage,
+        // a checksum mismatch — degrades to the history-only scan (which needs
+        // no payloads) rather than erroring: this is a triage endpoint.
+        let offloader = runtime.registry.payload_offloader();
+        let codecs = api_state.payload_codecs();
+        let mut events = Vec::with_capacity(rows.len());
+        let mut decode_failed = false;
+        for (_, event) in &rows {
+            let inflated = match serde_json::to_value(event) {
+                Ok(mut value) => {
+                    if let Some(offloader) = offloader {
+                        match offloader.inflate_event_value(&mut value).await {
+                            Ok(()) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    execution_id = %exec_id,
+                                    error = %err,
+                                    "awaitables: payload inflate failed; degrading to history-only"
+                                );
+                                decode_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    codecs.decode_event(value)
+                }
+                Err(err) => Err(HarvestError::from(err)),
+            };
+            match inflated {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %exec_id,
+                        error = %err,
+                        "awaitables: payload decode failed; degrading to history-only"
+                    );
+                    decode_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if decode_failed {
+            (
+                "history_only",
+                Some("payload_decode_required"),
+                project_awaitables(
+                    &rows,
+                    WaitSetInput::HistoryOnly {
+                        fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                    },
+                    AWAITABLE_CATEGORY_CAP,
+                ),
+            )
+        } else {
+            // Thread the same execution-row values hydrate_ctx_for_query
+            // threads (issues #772/#698/#481) so a deadline-aware /
+            // parent-aware / identity-reading / header-branching workflow
+            // replays cleanly instead of spuriously degrading.
+            let context_headers = execution
+                .context_headers
+                .as_ref()
+                .and_then(|v| {
+                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
+                        .ok()
+                })
+                .unwrap_or_default();
+            let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+                exec_id,
+                events,
+                runtime.registry.shared_state(),
+                runtime.registry.history_policy(),
+            )
+            .with_execution_timeout(execution.execution_timeout)
+            .with_deadline(execution.deadline_at)
+            .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+            .with_workflow_name(execution.workflow_name.clone())
+            .with_workflow_id(execution.workflow_id.clone())
+            .with_context_headers(context_headers);
+            // Worker-fidelity (replay review): register declarative
+            // query/update handlers BEFORE the drive, exactly as the live
+            // worker does (worker.rs `dq`/`du` filter → executor
+            // registration). Without the update handlers, replaying an
+            // admitted-but-unresolved update pushes a synthetic
+            // `RecordUpdateResult(Err(handler not found))`, which would make
+            // the projection drop the pending update from the wait-set.
+            for h in runtime
+                .registry
+                .query_handlers
+                .iter()
+                .filter(|h| h.workflow == execution.workflow_name)
+            {
+                ctx.register_declarative_query_handler(h);
+            }
+            for h in runtime
+                .registry
+                .update_handlers
+                .iter()
+                .filter(|h| h.workflow == execution.workflow_name)
+            {
+                ctx.register_declarative_update_handler(h);
+            }
+            let input = std::mem::take(&mut execution.input);
+            let outcome =
+                drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
+                    .await;
+            match outcome {
+                // A deferred non-determinism error (an infallible primitive —
+                // `system_now`/`new_uuid`/`random_*` — absorbed a divergence
+                // and parked anyway) means the suspension point and its
+                // drained commands are NOT trustworthy: degrade to the
+                // history-only scan rather than serving a wait-set derived
+                // from diverged code (replay review). A broader
+                // unconsumed-history drift check is deliberately NOT applied:
+                // a delivered-but-not-yet-awaited signal legitimately leaves
+                // unconsumed history on a healthy parked run.
+                QueryReplayOutcome::Suspended if ctx.take_deferred_nd_error().is_some() => (
+                    "history_only",
+                    Some("replay_diverged"),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
+                ),
+                QueryReplayOutcome::Suspended => {
+                    // The drained command buffer at the suspension point IS
+                    // the open wait-set — the six #615 categories.
+                    let commands = ctx.drain_commands();
+                    (
+                        "replayed",
+                        None,
+                        project_awaitables(
+                            &rows,
+                            WaitSetInput::Replayed {
+                                commands: &commands,
+                            },
+                            AWAITABLE_CATEGORY_CAP,
+                        ),
+                    )
+                }
+                // A NON-terminal execution whose replay reaches Poll::Ready
+                // is either about to complete (the worker has not persisted
+                // the terminal yet) or has diverged from its recorded
+                // history (code drift / nd-block). Either way the drained
+                // command set is not a trustworthy wait-set.
+                QueryReplayOutcome::ReachedTerminal => (
+                    "history_only",
+                    Some("replay_reached_terminal"),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
+                ),
+                QueryReplayOutcome::TimedOut => (
+                    "history_only",
+                    Some("replay_timed_out"),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
+                ),
+                QueryReplayOutcome::Panicked => (
+                    "history_only",
+                    Some("replay_panicked"),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
+                ),
+            }
+        }
+    } else {
+        let reason = if runtime.is_registered_dag(&execution.workflow_name) {
+            "classic_dag"
+        } else {
+            "handler_not_registered"
+        };
+        (
+            "history_only",
+            Some(reason),
+            project_awaitables(
+                &rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
+        )
+    };
+
+    // Enrich open activity awaitables with the task-row deadline where the
+    // projection derived none (timers/externals already carry theirs).
+    for awaitable in &mut projection.awaitables {
+        if awaitable.kind == AwaitableKind::Activity
+            && awaitable.deadline.is_none()
+            && let Some(deadline) = awaitable
+                .id
+                .as_ref()
+                .and_then(|id| activity_deadlines.get(id))
+        {
+            awaitable.deadline = Some(*deadline);
+        }
+    }
+
+    Ok(WorkflowAwaitablesResponse {
+        execution_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        is_terminal: false,
+        wait_set: wait_set.to_string(),
+        wait_set_reason: wait_set_reason.map(str::to_string),
+        awaitables: projection.awaitables,
+        truncated: projection.truncated,
+        truncated_kinds: projection.truncated_kinds,
+        category_cap: projection.category_cap,
+    })
+}
+
+/// `GET /workflows/{id}/awaitables` — enumerate what the execution is parked on.
+///
+/// Read-only open-awaitables diagnostic (issue #615): names every open
+/// awaitable across the six categories (pending activities, unfired timers,
+/// awaited-but-unfulfilled signals, pending child workflows, unresolved
+/// `await_condition` parks, pending updates) by replaying recorded history to
+/// the current suspension point. Admin-gated (`require_admin`), same posture as
+/// the eligibility endpoints. Payload-free: names/ids/timestamps only, so
+/// read-path payload decoding (issue #608) is deliberately skipped.
+async fn get_workflow_awaitables(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowAwaitablesResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let report = build_awaitables_report(&api_state, exec_id).await?;
+    Ok(Json(report))
+}
+
+// ── Per-execution stall diagnosis (issue #809) ────────────────────────────
+
+/// The terminal outcome echoed for an already-finished execution.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TerminalOutcomeResponse {
+    /// The terminal state (`COMPLETED`, `FAILED`, …).
+    pub state: String,
+    /// The recorded failure text, where the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the run reached its terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Response of `GET /workflows/{id}/diagnose`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowDiagnoseResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The business workflow id.
+    pub workflow_id: String,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The execution's current state.
+    pub state: String,
+    /// The one-word triage verdict.
+    pub health: autumn_harvest::stall_diagnosis::ExecutionHealth,
+    /// The discriminated root cause. Absent for a terminal execution — there is
+    /// nothing to diagnose, and `terminal_outcome` carries the answer instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<autumn_harvest::stall_diagnosis::BlockedOn>,
+    /// A one-sentence, human-readable rendering of the verdict.
+    pub summary: String,
+    /// Age of the most recent recorded event, in seconds. Informational only —
+    /// `health` is never derived from it, so a long durable sleep is never
+    /// reported as a stall (AC4). `null` when the execution has no events.
+    pub last_event_age_seconds: Option<f64>,
+    /// Timestamp of the most recent recorded event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Present only for a terminal execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<TerminalOutcomeResponse>,
+    /// Every claim-time impediment that applies to the diagnosed activity, not
+    /// just the single highest-precedence one carried by `blocked_on`.
+    ///
+    /// Sourced verbatim from the eligibility explainer's own pure
+    /// [`task_intrinsic_impediment_reasons`] (issue #611), so the single-verdict
+    /// and multi-reason surfaces can never drift apart. Empty for every
+    /// non-activity verdict.
+    pub contributing_reason_codes: Vec<String>,
+    /// How the awaited-signal set was derived: `"replayed"`, `"history_only"`,
+    /// or `"not_consulted"` when the verdict was already decided by a
+    /// higher-precedence category and the replay drive was deliberately skipped.
+    pub wait_set: String,
+    /// Why the wait-set degraded to `history_only`, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_set_reason: Option<String>,
+}
+
+/// Sentinel `wait_set` value for the fast path: the verdict was fully decided by
+/// a category that outranks an awaited signal, so the replay drive was skipped.
+const WAIT_SET_NOT_CONSULTED: &str = "not_consulted";
+
+/// Builds the stall-diagnosis report for one execution (issue #809).
+///
+/// Correlates, in a single shard-local read, the five signals an operator would
+/// otherwise gather from four separate endpoints: the pending work itself
+/// (`/stack`), per-queue worker liveness (`/workers/health`, `/admin/queue-coverage`),
+/// the in-process circuit registry (`/admin/circuits`), rate-limit and per-key
+/// concurrency saturation (`/admin/rate-limits`, `/admin/concurrency`), plus the
+/// operator queue-pause table and the task row's own retry timing. The pure
+/// [`autumn_harvest::stall_diagnosis::classify_execution`] collapses them into
+/// one verdict.
+///
+/// ## Read-only by construction
+///
+/// No events are appended, no task-queue row is touched, no state is
+/// recomputed, and no migration is involved. The circuit registry is consulted
+/// through `list()` only — never `on_dispatch` / `on_result` / `force_*` — so
+/// diagnosing cannot itself advance a breaker's phase. Safe to call repeatedly.
+///
+/// ## Shard-local
+///
+/// A single execution lives on a single shard, so the read routes O(1) from the
+/// `ExecutionId` via `db_conn_for_execution`. There is no cross-shard fan-out.
+///
+/// ## Replay is consulted only when it can change the answer
+///
+/// An awaited-but-unsent signal exists solely as a parked command inside the
+/// coroutine — no side table can see it — so observing one requires the #615
+/// replay drive. That drive is comparatively expensive, and an awaited signal
+/// ranks *below* pending activities, external handoffs and pending children in
+/// the category ladder. So the drive runs **only** when the database-observable
+/// categories could not already decide the verdict (i.e. the run would otherwise
+/// report `sleeping_timer` or `no_pending_work`, the two verdicts an awaited
+/// signal outranks). The final verdict is identical either way; the common
+/// triage path — a wedged pending activity — never pays for a replay.
+///
+/// ## Payload-free
+///
+/// Names, ids, timestamps, queue/bucket keys and the task row's own error text
+/// only — never an activity input, signal payload or activity output. The one
+/// exception is the task row's `error` text surfaced as
+/// `ActivityRetrying.last_error`, which IS routed through read-path payload
+/// decoding (issue #608) exactly as `/stack` routes the same column for its own
+/// `last_failure`; otherwise an admin would read plaintext there and a
+/// ciphertext envelope here for the same column of the same row.
+/// The column tuple [`build_diagnosis_report`]'s narrow task projection loads.
+type DiagnoseTaskRow = (
+    String,                        // state
+    Option<String>,                // activity_name
+    String,                        // queue_name
+    i32,                           // attempt
+    Option<String>,                // error
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // rate_limit_key
+    Option<String>,                // concurrency_key
+    Option<i32>,                   // concurrency_cap
+    String,                        // task_type
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
+    Option<String>,                // worker_id
+);
+
+/// The run's own workflow-task row, with the claim requirements its liveness
+/// answer depends on.
+type WorkflowTaskRow = (
+    String,                        // state
+    Option<String>,                // worker_id
+    String,                        // queue_name
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
+);
+
+/// The narrow task-queue projection [`build_diagnosis_report`] reads.
+///
+/// Deliberately not `TaskQueueItem`: that model carries five jsonb payload
+/// columns this report never touches, and loading them on a wide fan-out of
+/// large activity inputs would move hundreds of megabytes to answer a triage
+/// question.
+struct DiagnoseTask {
+    state: String,
+    activity_name: Option<String>,
+    queue_name: String,
+    attempt: i32,
+    error: Option<String>,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    rate_limit_key: Option<String>,
+    concurrency_key: Option<String>,
+    concurrency_cap: Option<i32>,
+    task_type: String,
+    /// Build routing (issue #171/#604) -- part of the claim predicate, so part
+    /// of whether any live worker can actually claim this row.
+    required_build_id: Option<String>,
+    /// Capability requirements (issue #804) -- likewise claim-time enforced.
+    required_capabilities: Option<serde_json::Value>,
+    /// Worker session membership (issue #606). A session member is claimable
+    /// ONLY by `sticky_worker_id`, and that pin never expires.
+    session_id: Option<uuid::Uuid>,
+    /// The pinned host recorded on the row.
+    sticky_worker_id: Option<String>,
+    /// The worker currently holding this row's claim, when it is held. Used to
+    /// answer the CLAIMANT's own liveness for a `RUNNING` row -- a distinct
+    /// question from whether the queue is claim-eligible right now.
+    worker_id: Option<String>,
+}
+
+/// The claim-time requirements of one task row.
+///
+/// Bundled so [`task_has_eligible_worker`] can mirror `claim_task`'s predicate
+/// dimension-for-dimension without an unreadable positional argument list.
+#[derive(Default, Clone, Copy)]
+struct TaskClaimRequirements<'a> {
+    queue_name: &'a str,
+    /// Build routing (issue #171/#604).
+    required_build_id: Option<&'a str>,
+    /// Capability requirements (issue #804).
+    required_capabilities: Option<&'a serde_json::Value>,
+    /// `true` when `required_capabilities` came from **this process's** registry
+    /// rather than the row's own snapshot, so it describes only workers running
+    /// this build. See [`registry_fallback_binds`].
+    capabilities_from_registry_fallback: bool,
+    /// Worker sessions (issue #606): the row belongs to a session, so it is
+    /// claimable ONLY by the host in `sticky_worker_id`, with no expiry.
+    is_session_member: bool,
+    /// The recorded pinned host. Load-bearing here only for a session member;
+    /// an ordinary sticky lease is deliberately not modelled (see below).
+    sticky_worker_id: Option<&'a str>,
+}
+
+impl TaskClaimRequirements<'_> {
+    /// The session clause of `claim_task_query`, verbatim:
+    /// `session_id IS NULL OR sticky_worker_id = $1`.
+    ///
+    /// A session member whose row carries no `sticky_worker_id` matches no
+    /// worker at all -- `sticky_worker_id = $1` can never hold against NULL.
+    fn session_admits(&self, worker_id: &str) -> bool {
+        !self.is_session_member || self.sticky_worker_id == Some(worker_id)
+    }
+}
+
+/// Can this worker claim a NEW task right now?
+///
+/// Deliberately stricter than [`crate::queue_coverage::worker_covers_queue`]:
+/// that predicate (issue #774) counts `Active` **or** `Draining`, which is the
+/// right, broader answer to the deploy-oriented "is anything still attached to
+/// this queue?" but the wrong answer to "can anything claim this row?".
+/// `Worker::run` leaves `run_poll_loop` **before** it transitions to
+/// `Draining` and then only waits for in-flight work, so a draining worker
+/// claims no new task for the whole drain window -- and a long drain would
+/// otherwise read as healthy progress on a queue nothing can pick up.
+///
+/// Queue/shard coverage itself still goes through the canonical #774 predicate
+/// so this surface and `GET /admin/queue-coverage` can never disagree about
+/// what a worker is attached to; only the liveness half is narrowed.
+/// Whether the worker currently HOLDING a task row is still alive.
+///
+/// A held row's progress question is not "can this queue be claimed right now?"
+/// but "is the claimant still running it?" -- and `Worker::run` transitions a
+/// worker to `Draining` BEFORE awaiting `drain_in_flight`, so an activity on a
+/// gracefully-shutting-down worker is still legitimately progressing.
+///
+/// This therefore reuses the canonical #774 predicate verbatim (which admits
+/// `Active` OR `Draining`), deliberately NOT the Active-only
+/// [`worker_can_claim_now`] that answers claim eligibility for PENDING rows.
+///
+/// Returns `None` when the row records no claimant, so the classifier can fall
+/// back to queue coverage rather than infer a stall from missing data.
+fn claimant_is_live(
+    workers: &[WorkerRow],
+    claimant: Option<&str>,
+    queue_name: &str,
+    shard_id: i32,
+) -> Option<bool> {
+    let claimant = claimant?;
+    Some(workers.iter().any(|w| {
+        w.worker.worker_id == claimant
+            && crate::queue_coverage::worker_covers_queue(w, queue_name, shard_id)
+    }))
+}
+
+fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+    crate::queue_coverage::worker_covers_queue(worker, queue_name, shard_id)
+        && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
+}
+
+/// The capability requirements `claim_task` will enforce for this row, plus
+/// where they came from.
+///
+/// The row's own `required_capabilities` snapshot is authoritative when present
+/// -- `claim_task_query` short-circuits its ineligible-activities gate on
+/// `required_capabilities IS NOT NULL`, so the snapshot is what gates the claim
+/// and the registry must never override it (the registry may have changed since
+/// the row was enqueued). A snapshotted requirement is enforced **row-side**, so
+/// it applies to every worker regardless of build.
+///
+/// When the snapshot is **absent** the gate is NOT skipped: `claim_task` rejects
+/// any worker whose `ineligible_activities` list contains this row's
+/// `activity_name`, and that list is computed **on each worker** from **that
+/// worker's own** registry (`Worker::new`). Reading an absent snapshot as "no
+/// requirements" would report `healthy_in_progress` for a task no live worker
+/// can claim (issue #809, round 11) -- but the local registry describes only
+/// *this* process's build, so the fallback is per-worker evidence and callers
+/// must consult [`registry_fallback_binds`] before rejecting anyone on it.
+///
+/// Mirrors `queue::apply_activity_requirements` (the shard-health coverage
+/// backfill) and the eligibility explainer's own resolution (issue #611), so
+/// all three surfaces answer the capability question identically.
+fn resolve_required_capabilities<'a>(
+    row_capabilities: Option<&'a serde_json::Value>,
+    activity_name: Option<&str>,
+    registered: &'a std::collections::HashMap<String, serde_json::Value>,
+) -> ResolvedCapabilities<'a> {
+    row_capabilities.map_or_else(
+        || ResolvedCapabilities {
+            requirements: activity_name.and_then(|name| registered.get(name)),
+            from_registry_fallback: activity_name.is_some_and(|name| registered.contains_key(name)),
+        },
+        |snapshot| ResolvedCapabilities {
+            requirements: Some(snapshot),
+            from_registry_fallback: false,
+        },
+    )
+}
+
+/// The outcome of [`resolve_required_capabilities`].
+#[derive(Debug, Clone, Copy)]
+struct ResolvedCapabilities<'a> {
+    /// The requirements to enforce, if any.
+    requirements: Option<&'a serde_json::Value>,
+    /// `true` when they came from **this process's** registry rather than the
+    /// row's own snapshot, so they describe only workers running this build.
+    from_registry_fallback: bool,
+}
+
+/// May a registry-derived capability requirement be used to REJECT this worker?
+///
+/// Only when the worker runs the same build this process does. `claim_task`'s
+/// NULL-snapshot gate is `NOT (activity_name = ANY($6))`, and `$6` is the
+/// claiming worker's **own** `ineligible_activities`, built in `Worker::new`
+/// from **its own** registry's `ActivityInfo::requires`. During a rolling
+/// deployment those requirements differ by build: an old-build worker whose
+/// handler declares nothing has an empty ineligible list and IS admitted, even
+/// though this replica's newer handler demands a label that worker lacks.
+/// Rejecting it on our requirement would produce a false `activity_no_worker`
+/// -- the flagship stall verdict, and the worst error a triage tool can make.
+///
+/// Build identity is the only fleet-visible evidence of a shared build, so
+/// equality of the advertised `build_id` is the discriminator. Two consequences
+/// are deliberate:
+///
+/// - A deployment that configures **no** build ids (the default -- build
+///   routing is opt-in, issue #171) has `""` everywhere, so every worker
+///   compares equal and the fallback binds exactly as it did before. Such a
+///   deployment has no build signal at all, which is a pre-existing consequence
+///   of not configuring one.
+/// - Where the local build is **unknown** (an API-only replica, or a co-located
+///   worker that has not registered its row yet) it resolves to `""`, so the
+///   fallback binds for workers that also advertise no build -- the
+///   no-build-routing case above -- and not for any worker that does. A
+///   deployment that advertises builds therefore never has an unidentified
+///   replica reject a worker on a requirement it cannot attribute.
+///
+/// The residual: a rolling deploy in a deployment that configures **no** build
+/// ids is invisible here, so the false positive this guards against can still
+/// occur there. Configuring `WorkerConfig::build_id` (issue #171) is what makes
+/// a build skew observable at all.
+fn registry_fallback_binds(worker_build_id: &str, local_build_id: &str) -> bool {
+    worker_build_id == local_build_id
+}
+
+/// This process's build identity, read from the co-located worker's own
+/// advertised row.
+///
+/// The local worker registered with `WorkerConfig::build_id`, i.e. the build
+/// running in this very process -- the same build whose registry backs
+/// [`resolve_required_capabilities`]'s fallback. Empty when there is no
+/// co-located worker (an API-only replica) or it has not registered yet, which
+/// [`registry_fallback_binds`] treats as "no build identity configured".
+fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&str>) -> String {
+    local_worker_id
+        .and_then(|local| workers.iter().find(|w| w.worker.worker_id == local))
+        .map(|w| w.worker.build_id.clone())
+        .unwrap_or_default()
+}
+
+/// Can ANY single live worker actually claim this task?
+///
+/// Queue coverage alone is not the claim predicate. `queue::claim_task` also
+/// enforces the task's `required_build_id` (exact, `harvest_build_compat`
+/// declared, or legacy empty-build worker), its `required_capabilities` (the
+/// same Exact/In label match), and its **session pin** -- so a task sitting on
+/// a well-covered queue can still be permanently unclaimable because no poller
+/// runs the right build, advertises the right labels, or *is* the session's
+/// pinned host. This endpoint must report that as a stall, not healthy
+/// progress.
+///
+/// Every dimension is checked against the **same** worker, exactly as the
+/// stranded-work sampler does (`worker.rs`): a task needing both a build and a
+/// label is not covered by two workers that each satisfy only one of them, and
+/// a session member is not covered by a peer that satisfies everything except
+/// being the pinned host.
+///
+/// # What is deliberately NOT modelled
+///
+/// An **ordinary sticky lease** (issue #235). Its claim clause is
+/// `sticky_worker_id IS NULL OR sticky_worker_id = $1 OR sticky_until IS NULL
+/// OR sticky_until <= NOW()`, so it releases to the whole fleet the moment
+/// `sticky_until` passes: a dead owner makes the row unclaimable only until
+/// that instant. Reporting a self-healing, seconds-long condition as
+/// `activity_no_worker`/`stalled` would be a false positive on the flagship
+/// verdict, which is the worst outcome for a triage tool -- so an unexpired
+/// lease is ignored and the transient over-optimism is accepted. A **session**
+/// pin has no such expiry, which is exactly why it IS modelled.
+/// `GET /admin/queues/{queue}/eligibility` (issue #611) remains the per-worker
+/// surface that reports `sticky_owned_by_other_worker`.
+///
+/// Unparseable `required_capabilities` fall back to the other dimensions rather
+/// than reporting a stall, so a value this endpoint cannot read can never
+/// fabricate a false `no_worker` verdict.
+fn task_has_eligible_worker(
+    workers: &[WorkerRow],
+    shard_id: i32,
+    reqs: TaskClaimRequirements<'_>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
+) -> bool {
+    !eligible_worker_ids(workers, shard_id, reqs, compat_set, local_build_id).is_empty()
+}
+
+/// WHICH workers could claim this task — the identities behind
+/// [`task_has_eligible_worker`]'s boolean.
+///
+/// Needed because the in-process circuit registry describes exactly one
+/// worker's breaker, so the endpoint must know whether that worker is the only
+/// one that could pick this row up before it treats the local phase as the
+/// answer (see [`local_circuit_snapshot_is_authoritative`]).
+fn eligible_worker_ids<'a>(
+    workers: &'a [WorkerRow],
+    shard_id: i32,
+    reqs: TaskClaimRequirements<'_>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
+) -> Vec<&'a str> {
+    let requirements = reqs.required_capabilities.and_then(|caps| {
+        serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
+    });
+
+    workers
+        .iter()
+        .filter(|w| {
+            if !reqs.session_admits(&w.worker.worker_id) {
+                return false;
+            }
+            if !worker_can_claim_now(w, reqs.queue_name, shard_id) {
+                return false;
+            }
+            if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
+                return false;
+            }
+            // A requirement recovered from THIS process's registry describes
+            // only workers running THIS build; `claim_task` asks each worker's
+            // own registry instead. Rejecting a different-build worker on it
+            // would fabricate `activity_no_worker` for a row that claim admits.
+            if reqs.capabilities_from_registry_fallback
+                && !registry_fallback_binds(&w.worker.build_id, local_build_id)
+            {
+                return true;
+            }
+            requirements.as_ref().is_none_or(|parsed| {
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                autumn_harvest::eligibility::matches_requirements(parsed, &labels)
+            })
+        })
+        .map(|w| w.worker.worker_id.as_str())
+        .collect()
+}
+
+/// May this process's circuit-breaker snapshot be reported as THE answer for a
+/// task whose eligible workers are `eligible_ids`?
+///
+/// The registry is deliberately **in-process and per-shard**
+/// (`circuit_breaker.rs`): every worker process constructs its own via
+/// `HandlerRegistry::new`, there is no table backing it, and the breaker that
+/// actually gates a dispatch is the one belonging to whichever worker ends up
+/// claiming the task (`process_activity_task`). A multi-replica fleet therefore
+/// has N independent breakers for one activity, and this API replica can only
+/// see its own.
+///
+/// So the local phase is authoritative only when the local worker is the
+/// **sole** worker that could claim the row. Otherwise a peer whose breaker is
+/// closed can still dispatch it, and reporting `activity_circuit_open` /
+/// `stalled` would be a false positive on the flagship stall verdict — the
+/// worst outcome for a triage tool, and the same principle that keeps a
+/// self-healing sticky lease out of `task_has_eligible_worker`.
+///
+/// The cost is a deliberate false *negative*: a genuinely fleet-wide outage
+/// (every replica open) is not reported as `activity_circuit_open`, and the run
+/// degrades to the next-ranked verdict instead. That is the safe direction for
+/// a stall verdict, and `GET /admin/circuits` remains the per-replica surface
+/// that shows each breaker's real phase.
+fn local_circuit_snapshot_is_authoritative(
+    eligible_ids: &[&str],
+    local_worker_id: Option<&str>,
+) -> bool {
+    match (eligible_ids, local_worker_id) {
+        ([only], Some(local)) => *only == local,
+        _ => false,
+    }
+}
+
+/// Decode the one activity error this response actually surfaces (issue #608).
+///
+/// `PendingActivityFacts::last_error` is carried RAW on purpose. The classifier
+/// only needs the error's *presence* — it is the failure-evidence discriminator
+/// that separates `activity_retrying` from `activity_deferred` — and at most one
+/// row's error ever reaches the caller, on the winning
+/// [`BlockedOn::ActivityRetrying`]. Decoding every row up front would decrypt a
+/// losing row's error and write a `payload.decode_read` audit record for data
+/// the caller never sees, breaking the #608 "decode exactly what is surfaced"
+/// contract.
+///
+/// Returns the outcome to merge into the request's decode accumulator; a
+/// non-retrying verdict, an absent error, or an inactive decoder all yield the
+/// empty outcome, leaving the audit row untouched.
+fn decode_surfaced_activity_error(
+    blocked_on: &mut autumn_harvest::stall_diagnosis::BlockedOn,
+    decoder: Option<&PayloadCodecs>,
+) -> LossyDecodeOutcome {
+    let (
+        Some(codecs),
+        autumn_harvest::stall_diagnosis::BlockedOn::ActivityRetrying {
+            last_error: Some(error),
+            ..
+        },
+    ) = (decoder, blocked_on)
+    else {
+        return LossyDecodeOutcome::default();
+    };
+    decode_error_field(codecs, error)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_diagnosis_report(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    decoder: Option<&PayloadCodecs>,
+    decode_outcome: &mut LossyDecodeOutcome,
+) -> Result<WorkflowDiagnoseResponse, AutumnError> {
+    use autumn_harvest::stall_diagnosis::{
+        AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
+        ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts,
+        PendingTimerFacts, ReplayWaitFacts, WorkflowTaskFacts, classify_execution, summarize,
+    };
+
+    let exec_uuid = exec_id.as_uuid();
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // Snapshot `now` once so every deadline, age and backoff comparison in this
+    // response is judged against one consistent instant.
+    let now = chrono::Utc::now();
+
+    let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .select(diesel::dsl::max(harvest_events::timestamp))
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let last_event_age_seconds =
+        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+
+    let is_terminal = is_terminal_state(&execution.state);
+    if is_terminal {
+        return Ok(WorkflowDiagnoseResponse {
+            execution_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id.clone(),
+            workflow_name: execution.workflow_name.clone(),
+            state: execution.state.clone(),
+            health: ExecutionHealth::Terminal,
+            blocked_on: None,
+            summary: format!(
+                "execution reached terminal state {} — nothing to diagnose",
+                execution.state
+            ),
+            last_event_age_seconds,
+            last_event_at,
+            terminal_outcome: Some(TerminalOutcomeResponse {
+                state: execution.state,
+                // Decode the TEXT `error` exactly as the pending-activity path
+                // below decodes a task row's `error` (issue #608): on a
+                // codec-encrypting deployment a failed execution's error is a
+                // serialized envelope, and returning it verbatim would hand an
+                // admin ciphertext while the decode audit recorded nothing.
+                error: execution.error.map(|mut error| {
+                    if let Some(codecs) = decoder {
+                        *decode_outcome =
+                            decode_outcome.merged(decode_error_field(codecs, &mut error));
+                    }
+                    error
+                }),
+                completed_at: execution.completed_at,
+            }),
+            contributing_reason_codes: Vec::new(),
+            wait_set: WAIT_SET_NOT_CONSULTED.to_string(),
+            wait_set_reason: None,
+        });
+    }
+
+    // ── Pending activity task rows ─────────────────────────────────────────
+    // Mirrors `/stack`'s own pending-task predicate and deterministic ordering,
+    // so the two surfaces always talk about the same rows in the same order
+    // (equal-precedence ties therefore resolve identically call to call).
+    // A NARROW projection on purpose. `TaskQueueItem::as_select()` would drag in
+    // five jsonb columns (`input`, `output`, `heartbeat_details`, `retry_policy`,
+    // `trace_context`) that this report never reads — on a wide fan-out of large
+    // activity inputs, exactly the stalled shape this endpoint exists to
+    // diagnose, that is hundreds of megabytes moved to answer a triage question.
+    // The ten scalars below are everything the classifier consumes.
+    //
+    // Deliberately UNBOUNDED: the worst-of fold must see every row or it can
+    // miss the one wedged slot behind a healthy majority, so a `LIMIT` would
+    // trade a correctness guarantee for a cost the narrow projection has
+    // already removed.
+    let task_rows: Vec<DiagnoseTaskRow> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::activity_name,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::attempt,
+            harvest_task_queue::error,
+            harvest_task_queue::scheduled_at,
+            harvest_task_queue::rate_limit_key,
+            harvest_task_queue::concurrency_key,
+            harvest_task_queue::concurrency_cap,
+            harvest_task_queue::task_type,
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
+            // Worker sessions (issue #606): the claim predicate admits a
+            // session member ONLY from `sticky_worker_id`, with no expiry, so
+            // a session whose host is gone is a permanent stall.
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
+            // The CLAIMANT of a held row. A worker that has begun a graceful
+            // shutdown claims nothing new but is still finishing held work, so
+            // a `RUNNING` row's liveness must be answered from its own
+            // claimant, not from queue-level claim eligibility.
+            harvest_task_queue::worker_id,
+        ))
+        .load::<DiagnoseTaskRow>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let tasks: Vec<DiagnoseTask> = task_rows
+        .into_iter()
+        .map(
+            |(
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+                required_build_id,
+                required_capabilities,
+                session_id,
+                sticky_worker_id,
+                worker_id,
+            )| DiagnoseTask {
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+                required_build_id,
+                required_capabilities,
+                session_id,
+                sticky_worker_id,
+                worker_id,
+            },
+        )
+        .collect();
+
+    // ── The run's OWN workflow task row ────────────────────────────────────
+    // A non-terminal run always has exactly one, and it is the only place three
+    // states are visible: the handler EXECUTING right now (`worker_id` held),
+    // the decision cycle AWAITING DISPATCH (`PENDING`), and the genuinely
+    // PARKED row that is the lost-task shape. Without it, a run whose handler is
+    // mid-flight — canonically one running a long local activity (issue #98),
+    // which schedules no queue row at all — falls through every category below
+    // and reports the alarming `no_pending_work`/`stalled`.
+    //
+    // A separate single-row indexed lookup rather than widening the query above:
+    // that query's projection, ordering, and PENDING/`queues_in_play`
+    // partitioning are all activity-shaped, and one more cheap round trip is far
+    // safer than threading a second task type through all of it.
+    let workflow_task_row: Option<WorkflowTaskRow> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order(harvest_task_queue::id.asc())
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::worker_id,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::scheduled_at,
+            // Build routing applies to workflow tasks too (the claim
+            // predicate's `required_build_id` clause has no task-type guard),
+            // so its liveness answer needs the same eligibility check an
+            // activity row gets.
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
+        ))
+        .first::<WorkflowTaskRow>(&mut conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
+    // ── Infra state for those rows (only what they actually reference) ──────
+    let pending_tasks: Vec<&DiagnoseTask> = tasks.iter().filter(|t| t.state == "PENDING").collect();
+
+    // Circuit-breaker phases. `list()` prunes each breaker's rolling window and
+    // reads its phase but NEVER transitions it (Open→HalfOpen is driven solely
+    // by dispatch), so consulting it here cannot perturb enforcement. A
+    // cooled-down breaker therefore still reads "open" until a real probe is
+    // admitted — a deliberate, documented read-only conservatism.
+    let (cb_phase, cb_tracked): (
+        std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
+        Vec<String>,
+    ) = api_state.runtime().ok().map_or_else(
+        || (std::collections::HashMap::new(), Vec::new()),
+        |runtime| {
+            let breakers = runtime.registry().circuit_breakers();
+            let tracked = breakers.tracked_activity_names().to_vec();
+            let phases = breakers
+                .list(std::time::Instant::now())
+                .into_iter()
+                .map(|snap| (snap.activity_name.clone(), snap))
+                .collect();
+            (phases, tracked)
+        },
+    );
+
+    // This process's own worker, when one is co-located. The breaker registry
+    // above belongs to exactly this worker, so its phase is only ever the
+    // answer for a task nothing else could claim -- see
+    // `local_circuit_snapshot_is_authoritative`. `None` on an API-only replica:
+    // nothing drives that registry, so it describes no dispatcher at all.
+    let local_worker_id: Option<String> = api_state
+        .runtime()
+        .ok()
+        .and_then(|runtime| runtime.worker_id);
+
+    // Registered capability requirements, keyed by activity name (issue #804).
+    // Needed because a legacy or manually enqueued row can carry NULL
+    // `required_capabilities` while `claim_task`'s ineligible-activities gate
+    // still enforces the registered handler's `requires` -- see
+    // `effective_required_capabilities`. Empty when no runtime is installed,
+    // which degrades to today's snapshot-only answer rather than fabricating a
+    // stall.
+    let activity_requirements: std::collections::HashMap<String, serde_json::Value> = api_state
+        .runtime()
+        .ok()
+        .map(|runtime| runtime.registry().activity_requirements_json())
+        .unwrap_or_default();
+
+    // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
+    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
+    // never a claim-time impediment and is deliberately not consulted — the
+    // breaker verdict is the accurate one. Matches the eligibility explainer.
+    let rate_limit_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter(|t| {
+            !t.activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name))
+        })
+        .filter_map(|t| t.rate_limit_key.clone())
+        // Deduped so a wide fan-out sharing one key binds a 1-element array
+        // rather than one entry per task row.
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rate_limit_gate = rate_limit_gate_status(&mut conn, &rate_limit_keys).await?;
+
+    // Per-key concurrency, counted exactly as `claim_task` counts it: scoped by
+    // (concurrency_key, task_type) over RUNNING rows with a worker.
+    let concurrency_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter_map(|t| t.concurrency_key.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let running_by_key = running_counts_for_concurrency_keys(&mut conn, &concurrency_keys).await?;
+
+    // Operator queue pauses (issue #619). Propagates on failure rather than
+    // defaulting to "nothing is held": this endpoint exists to answer "why is
+    // nothing happening?", and swallowing the read would answer it with a
+    // confident, wrong "nothing is holding this queue".
+    let paused_queues: std::collections::HashSet<String> =
+        autumn_harvest::queue_pause::paused_queue_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Operator ACTIVITY pauses (issue #807), the per-activity-type sibling of
+    // the read above. Load-bearing for the same reason: `claim_task`'s
+    // `paused_activities` anti-join rejects a held activity type on EVERY queue
+    // on the shard, so without this a paused activity on a well-covered queue
+    // would fall through to `healthy_in_progress` — a confident wrong answer.
+    // Deliberately unfiltered by queue, matching that CTE.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Worker eligibility inputs. Queue coverage goes through the SAME predicate
+    // `GET /admin/queue-coverage` uses (issue #774) so the two surfaces can
+    // never disagree about whether a queue has a live poller — the exact drift
+    // that bit `shard_health` in #1150 — but coverage alone is NOT the claim
+    // predicate: `task_has_eligible_worker` also applies each row's own
+    // `required_build_id` and `required_capabilities` against the SAME worker,
+    // so a task no live poller can actually claim is reported as a stall rather
+    // than as healthy progress.
+    //
+    // Evaluated for EVERY loaded row, not just the PENDING ones: a claimed
+    // (`RUNNING`) row also needs a truthful liveness answer, because a claimed
+    // row whose fleet is gone is an orphan rather than healthy work. Includes
+    // the workflow task's OWN row: its liveness answer is what separates "about
+    // to be claimed" from the workflow-task analogue of AC3's flagship
+    // no-live-worker stall.
+    let (live_workers, compat_set) = if tasks.is_empty() && workflow_task_row.is_none() {
+        (
+            Vec::new(),
+            autumn_harvest::build_routing::BuildCompatibilitySet::new(),
+        )
+    } else {
+        let stale_threshold = api_state.worker_stale_threshold();
+        let workers =
+            crate::queue_coverage::fetch_potentially_live_workers(&mut conn, stale_threshold)
+                .await
+                .map_err(map_error)?;
+        // Cross-build declarations, so a worker running a NEWER build that has
+        // declared itself compatible still counts as coverage for a task
+        // assigned an older build (issue #171). On load failure fall back to an
+        // empty set: exact-match and legacy-worker rules still apply, exactly
+        // as the stranded-work sampler degrades.
+        let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
+            .await
+            .unwrap_or_default();
+        (workers, compat)
+    };
+    // This process's build identity, read from the co-located worker's own
+    // advertised row. It scopes the registry capability fallback: a requirement
+    // recovered from THIS registry describes only workers running THIS build,
+    // and `claim_task` asks each worker's own registry instead (see
+    // [`registry_fallback_binds`]). `None` for an API-only replica.
+    let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
+    // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
+    // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
+    // (0xFFFF), which the router resolves to the default shard — but a worker
+    // registers `shard_assignments` with its real shard number, so comparing
+    // against the raw sentinel would match no worker and report a false
+    // `activity_no_worker` for a perfectly covered queue.
+    // `harvest_workflow_executions.shard_id` is the same value the worker
+    // itself is registered against, so the two always agree.
+    let shard_id = execution.shard_id;
+
+    let activities: Vec<PendingActivityFacts> = tasks
+        .iter()
+        .map(|t| {
+            let queue_paused = paused_queues.contains(&t.queue_name);
+            // Shares the eligibility explainer's own predicate (issue #807), so
+            // the two surfaces cannot drift on what "held" means.
+            let activity_paused = task_is_activity_paused(
+                &t.task_type,
+                t.activity_name.as_deref(),
+                &paused_activities,
+            );
+            let has_cb = t
+                .activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name));
+            // WHICH workers could claim this row. Computed once: it answers
+            // both "is anything alive for this task?" and "is our own
+            // in-process breaker the one that will actually gate its dispatch?".
+            let capabilities = resolve_required_capabilities(
+                t.required_capabilities.as_ref(),
+                t.activity_name.as_deref(),
+                &activity_requirements,
+            );
+            let eligible_ids = eligible_worker_ids(
+                &live_workers,
+                shard_id,
+                TaskClaimRequirements {
+                    queue_name: &t.queue_name,
+                    required_build_id: t.required_build_id.as_deref(),
+                    required_capabilities: capabilities.requirements,
+                    capabilities_from_registry_fallback: capabilities.from_registry_fallback,
+                    is_session_member: t.session_id.is_some(),
+                    sticky_worker_id: t.sticky_worker_id.as_deref(),
+                },
+                &compat_set,
+                &local_build_id,
+            );
+            // The breaker registry is in-process, so its phase describes only
+            // THIS replica. Treat it as the verdict only when our own worker is
+            // the sole worker that could claim the row -- otherwise a peer whose
+            // breaker is closed can still dispatch it and a fleet-wide
+            // `activity_circuit_open`/`stalled` would be a false positive.
+            let snapshot = if local_circuit_snapshot_is_authoritative(
+                &eligible_ids,
+                local_worker_id.as_deref(),
+            ) {
+                t.activity_name.as_ref().and_then(|name| cb_phase.get(name))
+            } else {
+                None
+            };
+            let (circuit_phase, circuit_cooldown_until) = match snapshot.map(|s| s.state) {
+                Some("open") => (
+                    Some(BlockingCircuitPhase::Open),
+                    snapshot
+                        .and_then(|s| s.time_until_probe_secs)
+                        .and_then(|secs| circuit_cooldown_until(now, secs)),
+                ),
+                Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
+                _ => (None, None),
+            };
+            let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
+                (Some(key), Some(cap)) => {
+                    running_by_key
+                        .get(&(key.clone(), t.task_type.clone()))
+                        .copied()
+                        .unwrap_or(0)
+                        >= i64::from(cap)
+                }
+                _ => false,
+            };
+            PendingActivityFacts {
+                activity_name: t.activity_name.clone(),
+                queue: t.queue_name.clone(),
+                task_state: t.state.clone(),
+                attempt: t.attempt,
+                // RAW on purpose (issue #608: decode exactly what is surfaced).
+                // Classification only needs the error's PRESENCE — it is the
+                // failure-evidence discriminator that separates
+                // `activity_retrying` from `activity_deferred` — and at most one
+                // row's error ever reaches the response, on the winning
+                // `ActivityRetrying`. Decoding here would decrypt every losing
+                // row's error and write a `payload.decode_read` audit row for
+                // data the caller never sees. The winner is decoded after
+                // `classify_execution` picks it.
+                last_error: t.error.clone(),
+                scheduled_at: t.scheduled_at,
+                rate_limit_key: t.rate_limit_key.clone(),
+                concurrency_key: t.concurrency_key.clone(),
+                queue_paused,
+                activity_paused,
+                has_live_worker: !eligible_ids.is_empty(),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    t.worker_id.as_deref(),
+                    &t.queue_name,
+                    shard_id,
+                ),
+                circuit_phase,
+                circuit_cooldown_until,
+                rate_limit_saturated: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| rate_limit_gate.saturated.contains(k)),
+                // A key with NO bucket row is refused by the gate's `EXISTS`
+                // forever, so it is a stall rather than a refilling deferral.
+                rate_limit_bucket_missing: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| rate_limit_gate.missing.contains(k)),
+                concurrency_saturated,
+            }
+        })
+        .collect();
+
+    // ── The remaining database-observable categories ───────────────────────
+    let handoff_filters = external_task::ExternalHandoffFilters {
+        states: vec!["PENDING".to_string()],
+        execution_id: Some(exec_id),
+        limit: MAX_EXTERNAL_HANDOFF_LIMIT,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let external_handoffs: Vec<ExternalHandoffFacts> =
+        external_task::list_external_handoffs(&mut conn, &handoff_filters)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|row| ExternalHandoffFacts {
+                token: row.token.to_string(),
+                activity_name: Some(row.activity_name),
+            })
+            .collect();
+
+    // AWAITED children only. A DETACHED child (issue #347) keeps `parent_id`
+    // but carries a non-null `parent_close_policy`, and the engine uses exactly
+    // that discriminator (`worker.rs`'s `is_detached_child`) to decide a child
+    // does NOT wake its parent on completion or failure. A fire-and-forget child
+    // is therefore never something the parent is waiting on, so counting it
+    // would report a healthy `pending_child` for a parent that is genuinely
+    // parked elsewhere -- masking an awaited signal or condition (which only the
+    // replay drive, ranked BELOW children, can see) and even masking a lost
+    // workflow task as healthy for as long as the detached child runs.
+    let children: Vec<PendingChildFacts> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .filter(harvest_workflow_executions::parent_close_policy.is_null())
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ]))
+        .order(harvest_workflow_executions::id.asc())
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+        ))
+        .load::<(uuid::Uuid, String)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|(child_exec_id, child_state)| PendingChildFacts {
+            child_exec_id: child_exec_id.to_string(),
+            child_state,
+        })
+        .collect();
+
+    let timers: Vec<PendingTimerFacts> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::fires_at)
+        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|fires_at| PendingTimerFacts { fires_at })
+        .collect();
+
+    let workflow_task = workflow_task_row.map(
+        |(
+            state,
+            worker_id,
+            queue_name,
+            scheduled_at,
+            required_build_id,
+            required_capabilities,
+            session_id,
+            sticky_worker_id,
+        )| {
+            WorkflowTaskFacts {
+                has_worker: worker_id.is_some(),
+                queue_paused: paused_queues.contains(&queue_name),
+                has_live_worker: task_has_eligible_worker(
+                    &live_workers,
+                    shard_id,
+                    TaskClaimRequirements {
+                        queue_name: &queue_name,
+                        required_build_id: required_build_id.as_deref(),
+                        // Deliberately NOT backfilled from the registry, unlike
+                        // the activity site: `claim_task`'s
+                        // ineligible-activities gate is guarded by
+                        // `task_type != 'activity'`, so a workflow task is only
+                        // ever gated by its own snapshot.
+                        required_capabilities: required_capabilities.as_ref(),
+                        capabilities_from_registry_fallback: false,
+                        is_session_member: session_id.is_some(),
+                        sticky_worker_id: sticky_worker_id.as_deref(),
+                    },
+                    &compat_set,
+                    &local_build_id,
+                ),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    worker_id.as_deref(),
+                    &queue_name,
+                    shard_id,
+                ),
+                state,
+                queue_name,
+                scheduled_at,
+            }
+        },
+    );
+
+    // The connection is released before any replay drive: user workflow code is
+    // never driven while a pool slot is held (the #612 discipline).
+    drop(conn);
+
+    let mut inputs = DiagnosisInputs {
+        is_terminal: false,
+        is_paused: execution.state == "PAUSED",
+        pause_actor: execution.pause_actor.clone(),
+        paused_since: execution.paused_at,
+        activities,
+        external_handoffs,
+        children,
+        awaited_signals: Vec::new(),
+        timers,
+        replay_waits: Vec::new(),
+        workflow_task,
+        // Issue #603: an nd-blocked run stays RUNNING with its workflow task
+        // re-pended at a backoff `scheduled_at`, indefinitely. That row shape is
+        // an ordinary deferral, so without this recorded fact a permanently
+        // wedged run reports `healthy_in_progress`. Terminal executions returned
+        // above, and a PAUSED one is answered by the higher-ranked `paused`
+        // verdict, so a stamped marker here is always a live block.
+        nd_block: execution.nd_blocked_at.map(|blocked_at| NdBlockFacts {
+            blocked_at,
+            reason: execution.nd_block_reason.clone(),
+            block_count: execution.nd_block_count,
+        }),
+    };
+
+    // ── Awaited-but-unsent signals, only when they could change the answer ──
+    let mut wait_set = WAIT_SET_NOT_CONSULTED.to_string();
+    let mut wait_set_reason = None;
+    let db_verdict = classify_execution(&inputs, now);
+    let replay_could_win = matches!(
+        db_verdict.as_ref().map(BlockedOn::kind),
+        Some("sleeping_timer" | "no_pending_work")
+    );
+    if replay_could_win {
+        // Deadline the whole replay. `build_awaitables_report` inflates offloaded
+        // payloads per event (issue #524) OUTSIDE the query timeout, so on a long
+        // history with a remote `PayloadStore` it can run for minutes. The
+        // degrade path below is exactly the right answer when it does.
+        let replay = tokio::time::timeout(
+            api_state.query_timeout(),
+            build_awaitables_report(api_state, exec_id),
+        )
+        .await;
+        match replay {
+            Ok(Ok(report)) => {
+                // `build_awaitables_report` can answer `terminal` if the run
+                // reached a terminal state between our own load and this replay.
+                // That is a real TOCTOU, but this response has already committed
+                // to a non-terminal verdict, so surface it as an unavailable
+                // wait set rather than leaking a fourth vocabulary value the
+                // contract does not document.
+                if report.wait_set == "terminal" {
+                    wait_set = "history_only".to_string();
+                    wait_set_reason = Some("execution_went_terminal".to_string());
+                } else {
+                    wait_set = report.wait_set;
+                    wait_set_reason = report.wait_set_reason;
+                }
+                inputs.awaited_signals = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind == autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .filter_map(|a| {
+                        a.name.clone().map(|signal_name| AwaitedSignalFacts {
+                            signal_name,
+                            since: a.since,
+                        })
+                    })
+                    .collect();
+                // Every OTHER kind replay can name. Signals have their own,
+                // more specific verdict above; the rest — a command-less
+                // `ctx.await_condition` park, a durable mutex acquire (#691),
+                // an admitted update awaiting its handler, a parked
+                // external-workflow operation (#492/#757/#751) — leave no row in
+                // any side table this endpoint reads, so replay is the ONLY
+                // source that can see them. Dropping them (as this filter once
+                // did) meant a run legitimately parked on any of them reported
+                // the alarming `no_pending_work`/`stalled`.
+                //
+                // Recorded/command order is deterministic, so taking them in
+                // order keeps the verdict stable call to call. The classifier
+                // consults them BELOW every side-table cause, so they can only
+                // ever replace a false lost-task verdict.
+                inputs.replay_waits = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind != autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .map(|a| ReplayWaitFacts {
+                        wait_kind: a.kind.as_str().to_string(),
+                        name: a.name.clone(),
+                        since: a.since,
+                    })
+                    .collect();
+            }
+            Ok(Err(error)) => {
+                // Degrade, never fail: this is a triage endpoint. Without the
+                // replay the verdict simply falls back to what the side tables
+                // can see, and the caller is told the wait set is unavailable.
+                tracing::warn!(
+                    %exec_id,
+                    ?error,
+                    "diagnose: awaited-signal replay unavailable; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_unavailable".to_string());
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %exec_id,
+                    "diagnose: awaited-signal replay exceeded the query timeout; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_timed_out".to_string());
+            }
+        }
+    }
+
+    let mut blocked_on = classify_execution(&inputs, now).unwrap_or(BlockedOn::NoPendingWork);
+    *decode_outcome =
+        decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
+    let health = blocked_on.health();
+    let summary = summarize(&blocked_on);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities);
+
+    Ok(WorkflowDiagnoseResponse {
+        execution_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        health,
+        blocked_on: Some(blocked_on),
+        summary,
+        last_event_age_seconds,
+        last_event_at,
+        terminal_outcome: None,
+        contributing_reason_codes,
+        wait_set,
+        wait_set_reason,
+    })
+}
+
+/// Every claim-time impediment holding ANY of this execution's activity rows.
+///
+/// Deliberately a UNION across all rows rather than the single row `blocked_on`
+/// names. `blocked_on` is one triage verdict chosen by precedence, so a
+/// higher-ranked sibling would otherwise HIDE a lower-ranked one — in a fan-out
+/// where slot A sits on a paused queue (rank 6) and slot B has no live poller
+/// (rank 5), the `no_live_worker` condition holds but would appear nowhere in
+/// the response. Unioning is what makes the endpoint's "surfaced 100% of the
+/// time it holds" guarantee true, and what makes the runbook's promise that a
+/// task both rate-limited AND on a paused queue "shows both" literally correct.
+///
+/// Delegates to the eligibility explainer's own pure
+/// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
+/// `blocked_on` can never drift apart in how an impediment is named.
+fn contributing_reasons_for(
+    activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
+) -> Vec<String> {
+    // Derived from the FACTS, never from the raw in-process snapshot: a phase
+    // reaches a fact only when the local breaker is authoritative for that row
+    // (`local_circuit_snapshot_is_authoritative`). Reading the raw map here
+    // would put `circuit_open` next to a `healthy` headline whenever a peer
+    // replica could still dispatch the task -- the same two-surfaces-disagree
+    // bug the held-row liveness split fixed below.
+    let phases: std::collections::HashMap<String, &'static str> = activities
+        .iter()
+        .filter_map(|f| {
+            let name = f.activity_name.clone()?;
+            let phase = match f.circuit_phase? {
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::Open => "open",
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::HalfOpen => "half_open",
+                _ => return None,
+            };
+            Some((name, phase))
+        })
+        .collect();
+    let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for facts in activities {
+        // Worker liveness is a property of the fleet, not a claim-time *task*
+        // gate, so the shared helper does not model it — but it is the one cause
+        // that never self-heals, and it is equally real for a claimed row whose
+        // fleet has gone (a poison-pill orphan, issue #367).
+        //
+        // WHICH liveness question applies depends on the row's state, and must
+        // match `classify_pending_activity` exactly or the reason codes
+        // contradict the headline verdict:
+        //   * a PENDING row asks "can any worker CLAIM this?" (Active only), and
+        //   * a HELD row asks "is its own recorded CLAIMANT alive?" (Active OR
+        //     Draining — a gracefully-shutting-down worker claims nothing new
+        //     but IS finishing exactly this row).
+        // Without the split, a row held by a live draining claimant reports
+        // `healthy` yet carries `no_live_worker`, and an orphan held by a dead
+        // claimant OMITS it whenever a live Active peer happens to cover the
+        // queue — the one case the reason exists to surface.
+        let held = facts.task_state != "PENDING";
+        let worker_alive = if held {
+            facts.claimant_is_live.unwrap_or(facts.has_live_worker)
+        } else {
+            facts.has_live_worker
+        };
+        if !worker_alive {
+            reasons.insert("no_live_worker".to_string());
+        }
+        // Every remaining reason is a CLAIM-time gate, so none of them applies
+        // to a row a worker already holds. Reporting them for a claimed row
+        // would put `queue_paused` next to `health: healthy` for work that is
+        // actively running.
+        if held {
+            continue;
+        }
+        // The classifier already resolved which impediments hold, so the
+        // saturation sets handed to the shared helper are this row's own
+        // answers.
+        // A MISSING bucket row is folded in here on purpose: the headline
+        // verdict distinguishes permanence, but the reason code names *which
+        // gate* refuses the row, and that gate is the rate-limit gate either
+        // way. Omitting it would leave a task blocked solely by a missing
+        // bucket with an empty reason set.
+        let mut saturated_rate_limits = std::collections::HashSet::new();
+        if (facts.rate_limit_saturated || facts.rate_limit_bucket_missing)
+            && let Some(key) = facts.rate_limit_key.as_ref()
+        {
+            saturated_rate_limits.insert(key.clone());
+        }
+        reasons.extend(task_intrinsic_impediment_reasons(
+            facts.activity_name.as_deref(),
+            facts.rate_limit_key.as_deref(),
+            // `rate_limit_saturated` is already false for a breaker-tracked
+            // activity (dispatch-time enforcement, issue #369), so the
+            // suppression flag is redundant here and passing `false` keeps the
+            // two paths consistent.
+            false,
+            &saturated_rate_limits,
+            facts.concurrency_saturated,
+            &phases,
+            OperatorPauseHolds {
+                queue: facts.queue_paused,
+                activity: facts.activity_paused,
+            },
+        ));
+    }
+    let mut reasons: Vec<String> = reasons.into_iter().collect();
+    sort_reason_codes(&mut reasons);
+    reasons
+}
+
+/// Which of `keys` currently have fewer than one token available.
+///
+/// Uses the canonical refill expression Postgres itself evaluates in
+/// Absolute `cooldown_until` instant for an open circuit breaker.
+///
+/// [`autumn_harvest::circuit_breaker::CircuitSnapshot`] reports the remaining
+/// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
+/// timestamp, so the endpoint derives one. Every failure mode resolves to
+/// `None` rather than a panic or a wrapped instant: a NaN / negative / absurdly
+/// large value (`try_from_secs_f64`), a duration outside `chrono`'s range
+/// (`from_std`), or an instant that would overflow (`checked_add_signed`). A
+/// missing `cooldown_until` is already the documented shape for a
+/// force-opened breaker, so degrading to `None` is never a lie.
+fn circuit_cooldown_until(
+    now: chrono::DateTime<chrono::Utc>,
+    secs: f64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let std_dur = std::time::Duration::try_from_secs_f64(secs).ok()?;
+    let delta = chrono::Duration::from_std(std_dur).ok()?;
+    now.checked_add_signed(delta)
+}
+
+/// The two distinct ways `claim_task`'s rate-limit gate can refuse a key.
+///
+/// The gate is `EXISTS(bucket WHERE ... >= 1.0)`, which refuses a drained
+/// bucket **and** a key with no bucket row at all. Those look identical to the
+/// gate but are opposites to an operator: a drained bucket refills on its own,
+/// a missing row never does. Collapsing them would put a permanent condition
+/// behind a verdict whose summary promises automatic refill.
+#[derive(Debug, Default)]
+struct RateLimitGateStatus {
+    /// Keys whose bucket row exists but is currently below one token.
+    /// Transient — it refills.
+    saturated: std::collections::HashSet<String>,
+    /// Keys with **no bucket row at all**: auto-registration failed, the row
+    /// was deleted, or startup skipped it as an invalid config. Permanent —
+    /// the gate's `EXISTS` refuses it forever.
+    missing: std::collections::HashSet<String>,
+}
+
+/// `claim_task`'s rate-limit gate, decomposed, so a key this reports as
+/// refused is exactly a key the claim query would refuse — and the *reason*
+/// is preserved rather than flattened.
+///
+/// One query: it asks which rows exist and, for each, whether the canonical
+/// refill expression currently admits it. A key absent from the result has no
+/// row (`missing`); a key present but not admissible is drained (`saturated`).
+async fn rate_limit_gate_status(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<RateLimitGateStatus, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct KeyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        admissible: bool,
+    }
+
+    if keys.is_empty() {
+        return Ok(RateLimitGateStatus::default());
+    }
+    // Mirrors the gate's own refill expression exactly, so the two can never
+    // disagree about whether a present bucket admits a claim. Reuses
+    // `queue::effective_available_tokens_expr` (issue #945) rather than a
+    // hand-copied literal, so a live TTL'd operator override is honored here
+    // too -- otherwise this diagnostic would keep reporting a key as
+    // rate-limited (or admissible) after an operator raised (or lowered) its
+    // limit via the pacing-override endpoints, exactly the class of
+    // diagnostic-vs-gate divergence this function's own doc comment exists to
+    // rule out.
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    let rows: Vec<KeyRow> = diesel::sql_query(format!(
+        "SELECT key, ({effective_tokens} >= 1.0) AS admissible \
+         FROM harvest_rate_limit_buckets \
+         WHERE key = ANY($1)"
+    ))
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut status = RateLimitGateStatus::default();
+    let present: std::collections::HashMap<String, bool> =
+        rows.into_iter().map(|r| (r.key, r.admissible)).collect();
+    for key in keys {
+        match present.get(key) {
+            // Present and admissible: not an impediment at all.
+            Some(true) => {}
+            Some(false) => {
+                status.saturated.insert(key.clone());
+            }
+            None => {
+                status.missing.insert(key.clone());
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// `RUNNING` task counts per `(concurrency_key, task_type)`.
+///
+/// Shaped exactly like `claim_task`'s own cap subquery — `state = 'RUNNING'` and
+/// `worker_id IS NOT NULL`, grouped by key *and* task type — so a key this
+/// reports as at-cap is exactly a key the claim query would defer.
+async fn running_counts_for_concurrency_keys(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<std::collections::HashMap<(String, String), i64>, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct ConcurrencyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        running_count: i64,
+    }
+
+    if keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<ConcurrencyRow> = diesel::sql_query(
+        "SELECT concurrency_key AS key, task_type, COUNT(*) AS running_count \
+         FROM harvest_task_queue \
+         WHERE state = 'RUNNING' \
+           AND concurrency_key = ANY($1) \
+           AND worker_id IS NOT NULL \
+         GROUP BY concurrency_key, task_type",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ((r.key, r.task_type), r.running_count))
+        .collect())
+}
+
+/// `GET /workflows/{id}/diagnose` — why is this execution not progressing?
+///
+/// Per-execution stall diagnosis (issue #809): the root-cause complement to
+/// issue #486's fleet-wide "which runs look stalled?" discovery. Returns one
+/// triage `health` verdict plus a discriminated `blocked_on` cause, correlating
+/// pending work with per-queue worker liveness, circuit-breaker phase,
+/// rate-limit and concurrency saturation, operator queue pauses, and task-queue
+/// retry timing — the four-endpoint correlation an operator does by hand today.
+///
+/// Admin-gated, matching the eligibility and `/awaitables` triage endpoints:
+/// the response names queue, bucket and concurrency keys (which can embed tenant
+/// identifiers) and the fleet's worker-coverage state.
+///
+/// Read-only: appends no events, mutates no task-queue row, adds no migration.
+async fn get_workflow_diagnose(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Json<WorkflowDiagnoseResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    // Read-path payload decoding (issue #608). This report is payload-free
+    // EXCEPT for the task row's `error` text, which `/stack` already decodes for
+    // its own `last_failure` — without this an admin would see plaintext there
+    // and a ciphertext envelope here, for the same column of the same row.
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let mut outcome = LossyDecodeOutcome::default();
+    let report =
+        build_diagnosis_report(&api_state, exec_id, decoder.as_ref(), &mut outcome).await?;
+    if decoder.is_some() {
+        // No live connection is held here — `build_diagnosis_report` drops its
+        // own before returning — so the pool-acquiring branch is safe.
+        audit_decoded_read(
+            &api_state,
+            None,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&exec_id.to_string()),
+            "GET /workflows/{id}/diagnose",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+    }
+    Ok(Json(report))
+}
+
 /// Upper bound on the number of legacy `WorkflowContinuedAsNew` event hops the
 /// run-chain gather will walk forward (issue #701). Bounds the best-effort
 /// legacy path so a corrupt or unusually long chain can never spin.
@@ -10607,11 +14609,16 @@ async fn get_workflow_stack(
             #[diesel(sql_type = diesel::sql_types::Text)]
             key: String,
         }
-        let rows: Vec<KeyRow> = diesel::sql_query(
+        // Honors a live TTL'd rate-limit override (issue #945) via
+        // `queue::effective_available_tokens_expr` -- otherwise a task the
+        // operator just unblocked by raising its limit would keep showing as
+        // `activity_rate_limited` here.
+        let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+        let rows: Vec<KeyRow> = diesel::sql_query(format!(
             "SELECT key FROM harvest_rate_limit_buckets \
              WHERE key = ANY($1) \
-               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) < 1.0"
-        )
+               AND {effective_tokens} < 1.0"
+        ))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
         .load(&mut conn)
         .await
@@ -11178,6 +15185,7 @@ const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 #[allow(clippy::result_large_err)]
 fn validate_start_idempotency_key(
     raw: Option<String>,
+    allow_engine_derived: bool,
 ) -> Result<Option<String>, axum::response::Response> {
     use axum::response::IntoResponse as _;
     match raw {
@@ -11203,10 +15211,43 @@ fn validate_start_idempotency_key(
                 )
                     .into_response());
             }
+            if !allow_engine_derived && let Some(resp) = reject_reserved_idempotency_key(trimmed) {
+                return Err(resp);
+            }
             Ok(Some(trimmed.to_string()))
         }
         None => Ok(None),
     }
+}
+
+/// Refuse an engine-reserved idempotency key from a caller (issue #944 review).
+///
+/// A broker connector derives its dedupe key from stable broker coordinates
+/// and needs that key to be unclaimable from outside: the derived keys share a
+/// durable uniqueness scope with caller-supplied ones — `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`, `(workflow_exec_id,
+/// idempotency_key)` on `harvest_signals` — and they are *predictable* (Kafka
+/// coordinates are `{topic}:{partition}:{offset}`). A caller who landed one
+/// first would make the broker's own delivery read as an idempotent replay,
+/// acknowledged without ever dispatching its payload.
+///
+/// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
+/// the core predicate and message so every path refuses identically.
+#[must_use]
+fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    if !autumn_harvest::start_idempotency::is_reserved_key(key) {
+        return None;
+    }
+    Some(
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": autumn_harvest::start_idempotency::reserved_key_message()
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// Extract the `Idempotency-Key` HEADER value (issue #808), applying the same
@@ -11234,7 +15275,9 @@ fn extract_start_idempotency_header_key(
         },
         None => None,
     };
-    validate_start_idempotency_key(raw)
+    // The HEADER is always caller-supplied: a connector strips it before
+    // delegating, so it can never carry an engine-derived key.
+    validate_start_idempotency_key(raw, false)
 }
 
 /// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
@@ -11257,10 +15300,27 @@ async fn probe_committed_start_replay(
     source: &str,
     request_id: Option<&str>,
     route: &'static str,
+    // `report_shard`: shard to echo on the replay response (issue #697). `Some`
+    // only when the *retry* carried an explicit placement, so an unpinned keyed
+    // replay keeps its pre-#697 response shape byte-for-byte.
+    report_shard: Option<i32>,
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
-    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    // A PINNED probe must never fall back to the default shard's pool. `pool_for`
+    // does exactly that when the requested shard has no pool of its own (a real
+    // state mid a shard-add rollout / removal), so a same-name/key claim living
+    // on the DEFAULT database would be returned as a successful replay and
+    // echoed as belonging to the requested residency shard -- the same silent
+    // breach `db_conn_for_pinned_shard` closes on the fresh-start path. Returning
+    // `None` here is a probe MISS, so the caller falls through to that fresh
+    // pinned path and fails closed with a `503` rather than inventing a replay.
+    let probe_pool = if report_shard.is_some() {
+        pool.exact_pool_for(shard)?
+    } else {
+        pool.pool_for(shard)
+    };
+    let mut probe_conn = acquire_conn(probe_pool).await.ok()?;
     let window_secs = api_state.start_idempotency_window().as_secs_f64();
     let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
         &mut probe_conn,
@@ -11313,6 +15373,7 @@ async fn probe_committed_start_replay(
                 state: dup_state,
                 started_fresh: Some(false),
                 deduplicated: Some(true),
+                shard_id: report_shard,
             }),
         )
             .into_response(),
@@ -11458,6 +15519,7 @@ async fn probe_committed_sws_replay(
 /// core invariant — a committed replay is never rejected by tightened validation —
 /// even under a transient owning-shard error; a keyed client retries 503
 /// idempotently.
+#[allow(clippy::result_large_err)]
 async fn probe_committed_uws_replay(
     api_state: &HarvestApiState,
     workflow_name: &str,
@@ -11591,6 +15653,8 @@ async fn handle_malformed_start_body(
         &source,
         request_id.as_deref(),
         route,
+        // The body did not parse, so no placement can be read from it.
+        None,
     )
     .await
     {
@@ -11774,7 +15838,10 @@ pub(crate) async fn start_workflow(
         // Header wins when present and valid.
         Ok(Some(k)) => Some(k),
         // Header absent → fall back to the body field, same validation.
-        Ok(None) => match validate_start_idempotency_key(request.idempotency_key.clone()) {
+        Ok(None) => match validate_start_idempotency_key(
+            request.idempotency_key.clone(),
+            request.engine_derived_idempotency_key,
+        ) {
             Err(resp) => return resp,
             Ok(k) => k,
         },
@@ -11823,15 +15890,101 @@ pub(crate) async fn start_workflow(
     // — a retry that changes its explicit `workflow_id` is not a retry of the
     // same delivery and can route to a different shard. The no-key path is
     // byte-for-byte unchanged.
-    let shard = if let Some(ref key) = idempotency_key
-        && !explicit_workflow_id
+    // issue #697: an explicit placement (`shard_id` or `residency_key`) OVERRIDES
+    // both hash routes below. Residency is a hard placement contract — a
+    // tenant's state must land on its designated database — so it outranks the
+    // keyed-dedup co-location heuristic, which is only an optimisation for
+    // finding the claim row. `Auto` (the default, and the only possibility when
+    // neither field is sent) leaves the two branches byte-for-byte unchanged.
+    //
+    // Resolution happens BEFORE the #808 committed-replay probe because the
+    // probe cannot run without knowing which shard to probe. Consequence,
+    // documented in `docs/sharding.md` and the api-contract: a retry must carry
+    // the SAME placement as the original delivery — exactly the existing #808
+    // consistency caveat for `workflow_id`, for the same reason (both determine
+    // where the claim row lives).
+    let placement = match parse_shard_placement(request.shard_id, request.residency_key.as_deref())
     {
-        runtime.router.pick_for_idempotency_key(&workflow_name, key)
-    } else {
-        runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id)
+        Ok(placement) => placement,
+        Err(e) => {
+            audit_start_failure(
+                &api_state,
+                &StartFailureAudit {
+                    actor: &actor,
+                    workflow_name: &workflow_name,
+                    route,
+                    request_id: request_id.as_deref(),
+                    source: &source,
+                    requested_shard_id: request.shard_id,
+                },
+                "invalid shard placement",
+            )
+            .await;
+            return e.into_response();
+        }
     };
+
+    let shard = if placement.is_auto() {
+        if let Some(ref key) = idempotency_key
+            && !explicit_workflow_id
+        {
+            runtime.router.pick_for_idempotency_key(&workflow_name, key)
+        } else {
+            runtime
+                .router
+                .pick_for_new_workflow(&workflow_name, &workflow_id)
+        }
+    } else {
+        // Resolve WITHOUT the writable check here: this shard is also what the
+        // #808 committed-replay probe below reads, and writability is a
+        // fresh-start-only concern. Enforcing it now would make a retry of an
+        // already-committed keyed start return `400` instead of its mandated
+        // `200` no-op merely because the operator started draining the pinned
+        // shard in between — rejecting work that creates nothing. The writable
+        // check is enforced further down, after the probe, on the genuine
+        // fresh-start path. Every other validation (unknown shard, undeclared
+        // residency key, blank key) still rejects here, so an unresolvable
+        // placement can never fall through to a silent re-hash.
+        match runtime
+            .router
+            .resolve_placement_for_lookup(&placement, &workflow_name, &workflow_id)
+        {
+            Ok(shard) => shard,
+            Err(e) => {
+                audit_start_failure(
+                    &api_state,
+                    &StartFailureAudit {
+                        actor: &actor,
+                        workflow_name: &workflow_name,
+                        route,
+                        request_id: request_id.as_deref(),
+                        source: &source,
+                        requested_shard_id: request.shard_id,
+                    },
+                    "unresolvable shard placement",
+                )
+                .await;
+                // An unknown shard or an undeclared residency key is a caller
+                // error, never a silent re-hash onto the default shard.
+                //
+                // The client gets the terse `client_message` -- naming what THEY
+                // got wrong -- while the enumerating form (shard topology, live
+                // drain state, every declared residency key) stays server-side.
+                // Residency keys are frequently tenant-identifying, so echoing
+                // the declared set would let one probe enumerate other tenants.
+                tracing::warn!(
+                    workflow_name = %workflow_name,
+                    error = %e,
+                    "rejected explicit shard placement"
+                );
+                return AutumnError::bad_request_msg(e.client_message()).into_response();
+            }
+        }
+    };
+
+    // Is the resolved pin actually placeable? Computed here (cheap, in-memory)
+    // but ENFORCED after the #808 probe -- see the two uses below.
+    let pin_is_writable = placement.is_auto() || runtime.router.is_writable(shard);
 
     // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
     // auto-generates it AND (per the routing rule above) routes the start by the
@@ -11853,7 +16006,33 @@ pub(crate) async fn start_workflow(
     // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
     // (routed by `workflow_id`, subject to the documented consistency caveat) and
     // the no-key path are UNCHANGED.
-    if idempotency_key.is_some() && !explicit_workflow_id {
+    //
+    // issue #697 extends the SAME rejection sampling to an explicitly PINNED
+    // start whose `workflow_id` was auto-generated, for the identical reason:
+    // a pin moves the run off its hash-derived shard, so a later request that
+    // reuses the RETURNED `workflow_id` without repeating the pin would route by
+    // hash to a different shard, miss the execution, and create a second active
+    // run under the same `workflow_id`. Minting the id onto the pinned shard
+    // closes that hole for every auto-generated id. The pinned shard is always
+    // in `writable_shards` (`resolve_placement` rejects a drained shard), so
+    // `pick_for_new_workflow` can return it and the loop converges.
+    //
+    // The hole CANNOT be closed for an EXPLICIT caller-chosen `workflow_id`,
+    // because the id is the caller's business identity and cannot be re-minted.
+    // For that case the caller must pin consistently across every start for a
+    // given `workflow_id` — the same consistency contract #808 already documents
+    // for keyed dedup. See `docs/sharding.md`.
+    //
+    // `pin_is_writable` gates the loop because `pick_for_new_workflow` applies
+    // the writable-subset redirect and therefore can NEVER return a drained
+    // shard: without this guard a pin at a drained shard would spin the full
+    // `MINT_CAP` and warn, only for the start to be rejected moments later on
+    // the fresh-start path anyway. A dedup hit never uses the minted id (it
+    // returns the original execution), so skipping the mint costs nothing.
+    if (idempotency_key.is_some() || !placement.is_auto())
+        && !explicit_workflow_id
+        && pin_is_writable
+    {
         const MINT_CAP: u32 = 10_000;
         let mut attempts = 0u32;
         while runtime
@@ -11866,13 +16045,19 @@ pub(crate) async fn start_workflow(
                 tracing::warn!(
                     workflow_name = %workflow_name,
                     shard = ?shard,
-                    "could not mint a workflow_id on the idempotency-key shard after {attempts} attempts; using last candidate"
+                    "could not mint a workflow_id on the target shard after {attempts} attempts; using last candidate"
                 );
                 break;
             }
             workflow_id = uuid::Uuid::new_v4().to_string();
         }
     }
+
+    // issue #697 (AC5): echo the resolved shard so an operator can audit that a
+    // residency-pinned start landed where it was pinned, without decoding the
+    // `execution_id` UUID by hand. Populated ONLY for a pinned request, so an
+    // unpinned start's response stays byte-identical to a pre-#697 build.
+    let pinned_shard_id: Option<i32> = (!placement.is_auto()).then(|| shard.as_i32());
 
     // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
     // precede ALL fresh-start-only rejections (reuse-policy parse,
@@ -11919,10 +16104,50 @@ pub(crate) async fn start_workflow(
             &source,
             request_id.as_deref(),
             route,
+            pinned_shard_id,
         )
         .await
     {
         return resp;
+    }
+
+    // issue #697: enforce writability HERE, not at resolution time. Placing new
+    // work on a shard the operator is draining contradicts the drain, so a
+    // fresh pinned start at a drained shard is a `400` — but this is a
+    // fresh-start-only concern, so it must sit after the #808 committed-replay
+    // probe above. Otherwise an at-least-once retry of a keyed start that
+    // already committed would flip from its mandated `200` no-op to a `400`
+    // the moment the operator began draining the pinned shard, rejecting a
+    // delivery that creates no new work.
+    //
+    // The check itself is delegated back to `resolve_placement` (the FULL
+    // readable+writable resolution) rather than hand-built here, so the router
+    // stays the single source of truth for what "placeable" means and the two
+    // call sites can never drift.
+    if !pin_is_writable
+        && let Err(err) = runtime
+            .router
+            .resolve_placement(&placement, &workflow_name, &workflow_id)
+    {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "shard placement at a non-writable shard",
+        )
+        .await;
+        tracing::warn!(
+            workflow_name = %workflow_name,
+            error = %err,
+            "rejected explicit shard placement at a drained shard"
+        );
+        return AutumnError::bad_request_msg(err.client_message()).into_response();
     }
 
     // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
@@ -12158,6 +16383,44 @@ pub(crate) async fn start_workflow(
                 "error": "conflict_policy is not supported for a throttled, debounced, or batched \
                           workflow; the start is deferred and has no active prior to resolve at \
                           request time"
+            })),
+        )
+            .into_response();
+    }
+
+    // issue #697: an explicit shard placement pins where the execution's data
+    // lands. Debounce (#499) and batch (#518) DEFER the start and derive their
+    // own shard from the debounce/batch KEY -- that co-location is load-bearing
+    // (the `UNIQUE (workflow_name, debounce_key)` upsert collapse only works if
+    // every admission for a key lands on the same shard), so honouring a
+    // per-request pin would break the collapse whenever two admissions for one
+    // key pinned different shards. Rejecting is therefore the correct outcome,
+    // and it is mandatory rather than cosmetic: silently accepting the request
+    // and re-hashing would place residency-bound data in the wrong database
+    // while returning `202` with no `shard_id` for the caller to check -- the
+    // exact silent-fallback failure mode this feature exists to remove.
+    // Throttle (#607) is NOT included: it threads the resolved `shard` through
+    // to `reserve_or_defer`, so a pinned throttled start is honoured.
+    if !placement.is_auto() && (is_debounced_start || has_batch_policy) {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "shard placement on a deferred start",
+        )
+        .await;
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "shard_id/residency_key is not supported for a debounced or batched \
+                          workflow; the start is deferred and its shard is derived from the \
+                          debounce/batch key so all admissions for that key collapse together"
             })),
         )
             .into_response();
@@ -12417,15 +16680,23 @@ pub(crate) async fn start_workflow(
         });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     // Capture trace context for debounced starts — must be before the debounce
     // branch returns 202 since the normal path captures it inside a later OTel span.
@@ -12712,6 +16983,7 @@ pub(crate) async fn start_workflow(
                     priority: request.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: info_owner.map(str::to_string),
                     runbook_url: info_runbook.map(str::to_string),
                     severity: info_severity.map(str::to_string),
@@ -13040,6 +17312,7 @@ pub(crate) async fn start_workflow(
                 priority: request.priority.map(Priority::as_i32),
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
+                concurrency_on_conflict: Some(concurrency_on_conflict),
                 owner: info_owner.map(str::to_string),
                 runbook_url: info_runbook.map(str::to_string),
                 severity: info_severity.map(str::to_string),
@@ -13149,7 +17422,16 @@ pub(crate) async fn start_workflow(
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = match db_conn_for_shard(&api_state, shard).await {
+    // An explicitly PINNED start must never fall back to the default shard's
+    // pool (issue #697) -- that would write residency-bound data to the wrong
+    // database while reporting the pinned shard. An unpinned start keeps the
+    // pre-#697 fallback behaviour byte-for-byte.
+    let conn_result = if placement.is_auto() {
+        db_conn_for_shard(&api_state, shard).await
+    } else {
+        db_conn_for_pinned_shard(&api_state, shard).await
+    };
+    let mut conn = match conn_result {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -13431,6 +17713,7 @@ pub(crate) async fn start_workflow(
             priority: request.priority.map(Priority::as_i32),
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -13503,17 +17786,28 @@ pub(crate) async fn start_workflow(
                     ))
                     .into_response();
                 }
-                return (
-                    axum::http::StatusCode::ACCEPTED,
-                    Json(serde_json::json!({
-                        "throttled": true,
-                        "workflow_name": workflow_name,
-                        "workflow_id": outcome.workflow_id,
-                        "throttle_key": outcome.throttle_key,
-                        "deferred_at": outcome.deferred_at,
-                    })),
-                )
-                    .into_response();
+                let mut body = serde_json::json!({
+                    "throttled": true,
+                    "workflow_name": workflow_name,
+                    "workflow_id": outcome.workflow_id,
+                    "throttle_key": outcome.throttle_key,
+                    "deferred_at": outcome.deferred_at,
+                });
+                // issue #697 (AC5): a throttled start HONOURS an explicit pin --
+                // the resolved shard is threaded into `reserve_or_defer` and the
+                // scanner fires there -- so the accepted placement must be
+                // echoed here too. Without it a caller has no way to audit a
+                // deferred pinned start (there is no `execution_id` to decode
+                // yet), contradicting the contract that every start response
+                // reports the resolved shard whenever placement was requested.
+                // Omitted for an unpinned start, keeping its body byte-identical
+                // to a pre-#697 build.
+                if let Some(pinned) = pinned_shard_id
+                    && let Some(obj) = body.as_object_mut()
+                {
+                    obj.insert("shard_id".to_string(), serde_json::json!(pinned));
+                }
+                return (axum::http::StatusCode::ACCEPTED, Json(body)).into_response();
             }
             Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                 throttle_reserved = Some(bucket_key);
@@ -13595,6 +17889,7 @@ pub(crate) async fn start_workflow(
                 inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
+                concurrency_on_conflict,
                 priority: request.priority.unwrap_or_default(),
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
@@ -13674,6 +17969,7 @@ pub(crate) async fn start_workflow(
                         state: start.state,
                         started_fresh: Some(start.created),
                         deduplicated: Some(false),
+                        shard_id: pinned_shard_id,
                     }),
                 )
                     .into_response()
@@ -13713,6 +18009,7 @@ pub(crate) async fn start_workflow(
                         state: dup_state,
                         started_fresh: Some(false),
                         deduplicated: Some(true),
+                        shard_id: pinned_shard_id,
                     }),
                 )
                     .into_response()
@@ -13823,6 +18120,7 @@ pub(crate) async fn start_workflow(
         inherited_chain_deadline_at: None,
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         priority: request.priority.unwrap_or_default(),
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
@@ -13934,6 +18232,55 @@ pub(crate) async fn start_workflow(
             )
                 .into_response()
         }
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            // A fresh admission rejected by a declared per-tenant resource
+            // quota (issue #946, AC4): a typed 429 naming the exhausted
+            // resource/key/limit/current — never a silent drop, never the
+            // generic 503 catch-all `map_error` would otherwise apply. The
+            // rejection was already counted on `harvest.quota.rejected`
+            // (AC6) inside `start_or_load_workflow_execution_collect`
+            // itself, so no metric emission is needed at this HTTP layer.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                // Codex round-5 review: routing has already resolved `shard`
+                // and this audit row is written on that shard's own
+                // connection, matching every other failure arm here (and the
+                // signal-with-start/update-with-start quota arms) -- record
+                // it so a quota incident is attributable by shard in the
+                // audit trail precisely where enforcement is shard-local.
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
+            )
+                .into_response()
+        }
         Err(e) => {
             // The start failed for an unrelated reason; no run was admitted, so
             // refund the reserved throttle token.
@@ -14010,6 +18357,7 @@ pub(crate) async fn start_workflow(
                     },
                     // No-key path never sets `deduplicated` (idempotency-key only).
                     deduplicated: None,
+                    shard_id: pinned_shard_id,
                 }),
             )
                 .into_response()
@@ -14618,18 +18966,25 @@ async fn batch_start_workflows(
                     per_wf.max(max_wf_input_bytes)
                 });
 
-            let (concurrency_key, concurrency_limit) = runtime
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
                 .and_then(|info| info.concurrency.as_ref())
-                .map_or((None, None), |policy| {
-                    let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                        policy.key_expr,
-                        &input,
-                    );
-                    (key, Some(policy.limit))
-                });
+                .map_or(
+                    (
+                        None,
+                        None,
+                        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                    ),
+                    |policy| {
+                        let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &input,
+                        );
+                        (key, Some(policy.limit), policy.on_conflict)
+                    },
+                );
 
             let exec_id = ExecutionId::new_for_shard(*shard);
 
@@ -14754,6 +19109,7 @@ async fn batch_start_workflows(
                     priority: item.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
@@ -14868,6 +19224,7 @@ async fn batch_start_workflows(
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: item.priority.unwrap_or_default(),
                     max_workflow_input_bytes: effective_wf_cap,
                     start_at: None,
@@ -14922,17 +19279,12 @@ async fn batch_start_workflows(
                         .await;
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
-                    for (wf_name, q_name) in cancel_metrics {
-                        // Route through the single choke point so a synthetic
-                        // liveness canary (issue #796, AC8) never leaks into
-                        // harvest.workflow.terminal via a batch cancel.
-                        autumn_harvest::telemetry::emit_workflow_terminal(
-                            m,
-                            &wf_name,
-                            &q_name,
-                            autumn_harvest::telemetry::WorkflowStatus::Cancelled,
-                        );
-                    }
+                    // Route through the single choke point so a synthetic
+                    // liveness canary (issue #796, AC8) never leaks into
+                    // harvest.workflow.terminal via a batch cancel, and so a
+                    // latest-wins supersede (issue #811) can never be emitted as
+                    // a plain cancel with its own counter dropped.
+                    autumn_harvest::execution::emit_start_cancel_metrics(m, &cancel_metrics);
                     Ok(started)
                 }
                 Err(e) => Err(e),
@@ -15394,6 +19746,11 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
+                        // Left `false` deliberately: this is the batch-reset
+                        // endpoint, not the issue #780 DAG retry, and refusing
+                        // an erased source here would be an unrelated behavior
+                        // change to an already-shipped surface.
+                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -15608,6 +19965,17 @@ pub(crate) async fn signal_with_start_workflow(
             "workflow '{workflow_name}' is a registered DAG; signal-with-start applies to plain workflows"
         ))
         .into_response();
+    }
+
+    // A connector's `SignalsWithStart` binding derives its key into this same
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
+    // caller must not be able to claim one (issue #944 review). Placed before
+    // the committed-replay probe below — the first thing that consumes the key.
+    if !request.engine_derived_idempotency_key
+        && let Some(key) = request.idempotency_key.as_deref()
+        && let Some(resp) = reject_reserved_idempotency_key(key)
+    {
+        return resp;
     }
 
     let reuse_policy = match parse_reuse_policy(request.id_reuse_policy.as_deref()) {
@@ -15877,16 +20245,25 @@ pub(crate) async fn signal_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -15945,6 +20322,7 @@ pub(crate) async fn signal_with_start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             signal_name: &request.signal_name,
             signal_payload,
             idempotency_key: request.idempotency_key.clone(),
@@ -15960,6 +20338,7 @@ pub(crate) async fn signal_with_start_workflow(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             workflow_info: runtime.registry.workflows.get(&workflow_name),
             start_source_override: request.start_source_override,
+            start_source_ref_override: request.start_source_ref_override.clone(),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -16053,6 +20432,46 @@ pub(crate) async fn signal_with_start_workflow(
                     "error": "input validation failed",
                     "violations": violations,
                 })),
+            )
+                .into_response()
+        }
+        // A genuine fresh admission rejected by a declared per-tenant
+        // resource quota (issue #946, AC4): a typed 429 naming the
+        // exhausted resource/key/limit/current, mirroring the plain start
+        // route's arm exactly. Never raised for an attach, since the quota
+        // check runs only on the fresh-insert branch inside
+        // `start_or_load_workflow_execution_collect`. Already counted on
+        // `harvest.quota.rejected` (AC6) inside the primitive itself.
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
             )
                 .into_response()
         }
@@ -16504,16 +20923,25 @@ async fn update_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -16640,6 +21068,7 @@ async fn update_with_start_workflow(
             .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         update_id,
         update_name: request.update_name.clone(),
         update_args,
@@ -16753,6 +21182,47 @@ async fn update_with_start_workflow(
                     "error": "workflow is paused",
                     "execution_id": paused_exec_id.to_string(),
                 })),
+            )
+                .into_response()
+        }
+        // A genuine fresh admission rejected by a declared per-tenant
+        // resource quota (issue #946, AC4): a typed 429 naming the
+        // exhausted resource/key/limit/current, mirroring the plain start
+        // and signal-with-start routes' arms exactly. Never raised for an
+        // attach, since the quota check runs only on the fresh-insert
+        // branch inside `start_or_load_workflow_execution_collect`.
+        // Already counted on `harvest.quota.rejected` (AC6) inside the
+        // primitive itself.
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
             )
                 .into_response()
         }
@@ -16942,13 +21412,20 @@ async fn cancel_workflow(
         .unwrap_or("workflow cancellation requested");
     let exec_id_str = exec_id.to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
-    let cancel_result =
-        cancel_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
+    // Issue #843: route to the LIVE attempt of the workflow-level retry chain
+    // (#523). Without this, a cancel issued against the id returned by `start`
+    // no-ops against the sealed `FAILED` predecessor while the retry keeps
+    // running — the sharpest correctness gap this routing closes. The response's
+    // `execution_id` reports the attempt actually cancelled. For a workflow with
+    // no retry policy this is exactly `cancel_workflow_execution`.
+    let cancel_result = autumn_harvest::execution::cancel_live_attempt(
+        &mut conn,
+        exec_id,
+        reason,
+        metrics_ref.as_ref(),
+    )
+    .await;
     match cancel_result {
         Err(e) => {
             let err_str = e.to_string();
@@ -16969,11 +21446,19 @@ async fn cancel_workflow(
             Err(map_error(e))
         }
         Ok(cancelled) => {
+            // Issue #843: the audit record's subject is the execution actually
+            // mutated, which after routing may be a retry successor rather than
+            // the addressed id. Keying on the mutated row is what lets an
+            // auditor asking "who terminated/cancelled A3?" find this row; the
+            // addressed id stays reconstructible either way, because the
+            // `retry_of_exec_id` chain is durable. The failure path above keeps
+            // the addressed id, since nothing was mutated.
+            let cancelled_id_str = cancelled.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_WORKFLOW_CANCEL,
                 target_type: TARGET_WORKFLOW,
-                target_id: Some(exec_id_str.as_str()),
+                target_id: Some(cancelled_id_str.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -17009,6 +21494,18 @@ async fn cancel_workflow(
 /// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
 /// an already-terminal execution (non-mutating no-op, `newly_terminated:
 /// false`).
+/// The runtime's metrics recorder, or a no-op when the runtime is not installed
+/// (the boot window). Shared by the cancel/terminate/pause/resume handlers so
+/// the fall-back is resolved identically everywhere.
+fn metrics_recorder_or_noop(
+    api_state: &HarvestApiState,
+) -> Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> {
+    api_state.runtime().map_or_else(
+        |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+        |rt| Arc::clone(&rt.registry.telemetry().metrics),
+    )
+}
+
 async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -17062,13 +21559,14 @@ async fn terminate_workflow(
         .unwrap_or("workflow termination requested");
     let exec_id_str = exec_id.to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
-    let terminate_result =
-        terminate_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
+    let terminate_result = autumn_harvest::execution::terminate_live_attempt(
+        &mut conn,
+        exec_id,
+        reason,
+        metrics_ref.as_ref(),
+    )
+    .await;
     match terminate_result {
         Err(e) => {
             let err_str = e.to_string();
@@ -17089,11 +21587,14 @@ async fn terminate_workflow(
             Err(map_error(e))
         }
         Ok(terminated) => {
+            // Issue #843: audit the execution actually sealed (see the cancel
+            // handler for the full rationale).
+            let terminated_id_str = terminated.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_WORKFLOW_TERMINATE,
                 target_type: TARGET_WORKFLOW,
-                target_id: Some(exec_id_str.as_str()),
+                target_id: Some(terminated_id_str.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -17116,6 +21617,534 @@ async fn terminate_workflow(
                     failed_task_count: terminated.failed_task_count,
                 }),
             ))
+        }
+    }
+}
+
+/// The invariant audit fields for one `POST /workflows/{id}/rerun` request,
+/// bundled so the failure helpers stay under the argument-count lint.
+struct RerunAuditCtx<'a> {
+    actor: &'a str,
+    source_kind: &'a str,
+    request_id: Option<&'a str>,
+    route: &'static str,
+}
+
+/// Build the failed-audit record for a rejected re-run.
+const fn rerun_failure_record<'a>(
+    ctx: &'a RerunAuditCtx<'a>,
+    target_id: Option<&'a str>,
+    error_summary: &'a str,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor: ctx.actor,
+        operation: OP_WORKFLOW_RERUN,
+        target_type: TARGET_WORKFLOW,
+        target_id,
+        route_or_command: ctx.route,
+        request_id: ctx.request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source: ctx.source_kind,
+    }
+}
+
+/// Best-effort failed-audit on the CALLER'S connection (issue #777).
+///
+/// Every rejection that happens after `db_conn_for_execution` succeeded must
+/// use this form: acquiring a second pool connection while the caller still
+/// holds one stalls a size-1 pool until the checkout times out (the audit then
+/// silently no-ops), and on a multi-shard deployment the pool-acquiring form
+/// lands the row on the DEFAULT shard instead of the execution's own. Mirrors
+/// the connection-threading `audit_decoded_read` adopted for the same reason
+/// (issue #608 round 2).
+async fn audit_rerun_failure_on(
+    conn: &mut AsyncPgConnection,
+    ctx: &RerunAuditCtx<'_>,
+    target_id: Option<&str>,
+    error_summary: &str,
+) {
+    let record = rerun_failure_record(ctx, target_id, error_summary);
+    let _ = audit::insert_audit(conn, &record).await;
+}
+
+/// Best-effort failed-audit for the rejections that happen BEFORE a connection
+/// exists (a malformed execution id or body). Acquires its own connection on
+/// the default shard, which is the only shard resolvable at that point.
+async fn audit_rerun_failure_via_pool(
+    api_state: &HarvestApiState,
+    ctx: &RerunAuditCtx<'_>,
+    target_id: Option<&str>,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    audit_rerun_failure_on(&mut conn, ctx, target_id, error_summary).await;
+}
+
+/// `POST /workflows/{id}/rerun` — operator re-run of a terminal workflow
+/// (issue #777).
+///
+/// Starts a BRAND-NEW execution from the source run's recorded start
+/// parameters. Admin-only, audited under [`OP_WORKFLOW_RERUN`] against the
+/// SOURCE execution id. The response never echoes the input payload.
+#[allow(clippy::too_many_lines)] // mirrors the start route's validation ladder
+async fn rerun_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    // Optional body (the contract marks it `required: false`). Raw `Bytes`
+    // rather than `Option<Json<…>>`: axum 0.8's optional-JSON extractor still
+    // rejects a zero-byte body sent with `Content-Type: application/json`, so a
+    // body-less re-run would 422 before the defaulted path runs.
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let (actor, source_kind, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/rerun";
+    let audit_ctx = RerunAuditCtx {
+        actor: &actor,
+        source_kind: &source_kind,
+        request_id: request_id.as_deref(),
+        route,
+    };
+
+    // Parse the execution id FIRST (issue #777 review, Codex): once a
+    // well-formed shard-encoded id is known, every later rejection — including
+    // a malformed body, below — can audit through the execution's OWNING shard
+    // via `db_conn_for_execution` rather than the pool-acquiring default-shard
+    // fallback, which is the only form usable before an id is known at all. A
+    // malformed id (or a request malformed in both ways) still audits via the
+    // pool, unchanged.
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            audit_rerun_failure_via_pool(
+                &api_state,
+                &audit_ctx,
+                Some(&id),
+                "malformed execution id",
+            )
+            .await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+
+    let request: RerunWorkflowRequest = if body.is_empty() {
+        RerunWorkflowRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                // The id is well-formed, so route this audit through the
+                // execution's own shard rather than the default-shard pool
+                // fallback (issue #777 review, Codex): in a multi-shard
+                // deployment where the source shard is healthy but the
+                // default shard is unavailable, the pool-acquiring form
+                // would silently drop this audit even though the owning
+                // connection could have recorded it. If the owning shard
+                // itself is unreachable there is genuinely no connection to
+                // audit through — skip, matching every other
+                // `db_conn_for_execution` failure in this handler (below).
+                if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
+                    audit_rerun_failure_on(
+                        &mut c,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed JSON body",
+                    )
+                    .await;
+                }
+                return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
+                    .into_response();
+            }
+        }
+    };
+
+    // From here on every failure audit rides the CALLER'S connection: acquiring
+    // a second pool connection while this one is held deadlocks a size-1 pool
+    // (the audit then silently no-ops), and on a multi-shard deployment the
+    // pool-acquiring form writes the row to the DEFAULT shard rather than the
+    // execution's own. Mirrors `audit_decoded_read`'s conn-threading (#608).
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let source = match load_execution(&mut conn, exec_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Not necessarily "not found": a DB failure surfaces here too and
+            // maps to 500, so record the real error rather than a fixed string.
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &e.to_string()).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // Fail closed if the runtime is not installed (the boot window). `conn`
+    // and `exec_id_str` are already in scope, so — like every other
+    // rejection path in this handler — this audits through the caller's own
+    // connection rather than silently dropping an observable mutation
+    // attempt from the trail (issue #605/#777 review, Codex).
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &e.to_string()).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // The workflow type must still be registered on this node — otherwise the
+    // fresh run would immediately wedge in HandlerNotFound replay failure.
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&source.workflow_name)
+    {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "workflow type not registered",
+        )
+        .await;
+        return AutumnError::not_found_msg(format!(
+            "workflow type '{}' is not registered on this node",
+            source.workflow_name
+        ))
+        .into_response();
+    }
+
+    if runtime.is_registered_dag(&source.workflow_name) {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "registered DAG cannot be re-run via workflow route",
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' is a registered DAG; use POST /dags/{}/trigger or the \
+             DAG retry route instead",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // The EFFECTIVE input decides key resolution for every policy below.
+    let input_override = request.input_override();
+
+    // issue #373: validate an explicitly supplied OVERRIDE against the target
+    // workflow's published input schema, at the edge, before anything is
+    // started. "Validate the override, not the clone": a VERBATIM clone is
+    // deliberately never re-validated, because a run started under an older or
+    // looser schema must stay re-runnable — re-validating the clone would
+    // silently strand every historical run of that workflow type the moment an
+    // author tightened the schema, which is exactly when re-running matters.
+    if let Some(ref override_input) = input_override
+        && let Some(info) = runtime.registry.workflows.get(&source.workflow_name)
+        && let Err(violations) = info.validate_input(override_input)
+    {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "input validation failed",
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
+
+    let effective_input = input_override
+        .clone()
+        .unwrap_or_else(|| source.input.clone());
+
+    // Deferred-start policies are incompatible with a re-run: they admit the
+    // start without creating an execution, so there is no execution_id to
+    // return and the 201 contract cannot be honoured.
+    let deferred_reason = if workflow_has_resolving_debounce(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    ) {
+        Some("debounce")
+    } else if workflow_resolving_throttle(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    )
+    .is_some()
+    {
+        Some("throttle")
+    } else if runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.batch.as_ref())
+        .is_some_and(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(&policy.key_expr, &effective_input)
+                .is_some()
+        })
+    {
+        Some("batch")
+    } else {
+        None
+    };
+    if let Some(kind) = deferred_reason {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            &format!("workflow carries a {kind} policy; re-run is unsupported"),
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' carries a {kind} policy, which defers the start and returns no \
+             execution id; re-run cannot honour its contract. Start it explicitly via \
+             POST /workflows/{}/start instead.",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // issue #605 review (Codex, PR #1152): a re-run clones the source's
+    // stored `completion_callbacks` VERBATIM (below), so a target that was
+    // admissible when the source started but has since been dropped from
+    // the SSRF allowlist must be re-validated here — otherwise the rerun
+    // silently succeeds (201, possibly sealing the source) while the actual
+    // delivery attempt is skipped without error at
+    // `enqueue_completion_deliveries`'s own live-policy re-validation (a
+    // `tracing::warn!` only, never surfaced to the caller). Both
+    // `api_state.completion_callback_ssrf_policy()` and the process-global
+    // `GLOBAL_CALLBACK_CONFIG` that scanner consults are installed from the
+    // SAME `built.completion_callback_config()` at plugin startup, so this
+    // check predicts the delivery-time outcome exactly.
+    //
+    // This is deliberately the OPPOSITE call from the input-schema decision
+    // above ("validate the override, not the clone"): a run started under a
+    // now-looser input schema is still perfectly re-runnable with its old,
+    // valid input — re-validating it would only strand a legitimate re-run
+    // for no safety benefit. A stale callback target has no such benign
+    // fallback: silently accepting it just defers a real failure to a place
+    // nobody is watching, so the clone IS re-validated here and the whole
+    // re-run is rejected (mirroring the normal start route's own
+    // all-or-nothing target validation) before anything is started or the
+    // source is touched.
+    if let Some(raw) = source.completion_callbacks.clone() {
+        let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+            match serde_json::from_value(raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    audit_rerun_failure_on(
+                        &mut conn,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed stored completion_callbacks",
+                    )
+                    .await;
+                    return AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                         completion_callbacks value ({e}); re-run cannot faithfully clone it"
+                    ))
+                    .into_response();
+                }
+            };
+        let policy = api_state.completion_callback_ssrf_policy();
+        for target in &targets {
+            if let Err(rejection) =
+                autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+            {
+                audit_rerun_failure_on(
+                    &mut conn,
+                    &audit_ctx,
+                    Some(&exec_id_str),
+                    "completion callback target no longer admissible",
+                )
+                .await;
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Effective input cap (issue #252): a per-workflow cap RAISES the global.
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
+
+    // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &effective_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
+
+    let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
+        Some(runtime.registry.telemetry().metrics.as_ref());
+
+    let rerun_request = autumn_harvest::execution::RerunRequest {
+        input_override: input_override.clone(),
+        workflow_id_override: request.workflow_id.as_deref(),
+        started_by: Some(actor.as_str()),
+        concurrency_key,
+        concurrency_limit,
+        concurrency_on_conflict,
+        max_workflow_input_bytes: effective_wf_cap,
+        max_execution_timeout_ceiling: api_state
+            .max_workflow_execution_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_chain_timeout_ceiling: api_state
+            .max_workflow_chain_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+        trace_context: runtime.registry.telemetry().capture_trace_context(),
+    };
+
+    let result = autumn_harvest::execution::rerun_workflow_execution(
+        &mut conn,
+        exec_id,
+        rerun_request,
+        metrics_ref,
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            // Propagate a success-audit write failure (issue #777 review,
+            // Codex — matches `cancel_workflow`/`terminate_workflow`, the
+            // adjacent single-execution admin mutations, both of which
+            // `.map_err(map_error)?` this same insert rather than swallowing
+            // it): the re-run is already durable by this point, but an
+            // unrecorded success is an admin mutation missing from the audit
+            // trail, and this row is the ONLY durable place
+            // `source_prior_state` survives once the source is sealed to
+            // CONTINUED_AS_NEW — losing the write silently would lose that
+            // detail for good. A client that sees this 500 and retries hits
+            // the state gate cleanly (the source is already sealed), so this
+            // can never double-start a run.
+            //
+            // `error_summary` is the free-text detail column on a succeeded
+            // row (precedent: the scheduler's `skipped_overlap` / `deferred`
+            // rows).
+            let prior_state_detail = format!("reran from state {}", outcome.source_prior_state);
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_RERUN,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: Some(prior_state_detail.as_str()),
+                shard_id: Some(source.shard_id),
+                source: &source_kind,
+            };
+            if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                return map_error(e).into_response();
+            }
+            (
+                axum::http::StatusCode::CREATED,
+                Json(RerunWorkflowResponse {
+                    ok: true,
+                    execution_id: outcome.exec_id.to_string(),
+                    workflow_name: outcome.workflow_name,
+                    workflow_id: outcome.workflow_id,
+                    state: outcome.state,
+                    reran_from: outcome.reran_from.to_string(),
+                    source_prior_state: outcome.source_prior_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            audit_rerun_failure_on(
+                &mut conn,
+                &audit_ctx,
+                Some(&exec_id_str),
+                &format!("admission blocked by gate {gate_id}"),
+            )
+            .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => {
+            audit_rerun_failure_on(
+                &mut conn,
+                &audit_ctx,
+                Some(&exec_id_str),
+                "target workflow_id already exists",
+            )
+            .await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(e @ HarvestError::Config(_)) => {
+            let msg = e.to_string();
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
+            conflict_from(e).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
+            map_error(e).into_response()
         }
     }
 }
@@ -17165,13 +22194,13 @@ async fn pause_workflow(
 
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
 
-    let result = pause_workflow_execution(
+    // Issue #843: route to the live attempt of the retry chain (#523). Pause
+    // only accepts a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried
+    // run 409s against its sealed `FAILED` predecessor — denying the operator
+    // the one reversible containment lever.
+    let result = autumn_harvest::execution::pause_live_attempt(
         &mut conn,
         exec_id,
         request.reason.as_deref(),
@@ -17184,11 +22213,15 @@ async fn pause_workflow(
         Ok(_) => (STATUS_SUCCEEDED, None),
         Err(e) => (STATUS_FAILED, Some(e.to_string())),
     };
+    // Issue #843: audit the execution actually paused (see `cancel_workflow`).
+    let audited_id = result
+        .as_ref()
+        .map_or_else(|_| exec_id_str.clone(), |p| p.exec_id.to_string());
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_PAUSE,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(audited_id.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
@@ -17233,23 +22266,33 @@ async fn resume_workflow(
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
 
-    let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
+    // Issue #843: route to the live attempt of the retry chain (#523). Resume is
+    // an idempotent success no-op against a non-paused row, so an unrouted
+    // resume of a retried run would report success while the paused live
+    // attempt stayed parked.
+    let result = autumn_harvest::execution::resume_live_attempt(
+        &mut conn,
+        exec_id,
+        &actor,
+        metrics_ref.as_ref(),
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
         Err(e) => (STATUS_FAILED, Some(e.to_string())),
     };
+    // Issue #843: audit the execution actually resumed (see `cancel_workflow`).
+    let audited_id = result
+        .as_ref()
+        .map_or_else(|_| exec_id_str.clone(), |r| r.exec_id.to_string());
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_RESUME,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(audited_id.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
@@ -17272,6 +22315,282 @@ async fn resume_workflow(
                 newly_resumed: resumed.newly_resumed,
             }),
         )),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+// ── Operator-mutable triage tags (issue #759) ─────────────────────────────────
+
+/// Request body for `PATCH /workflows/{id}/triage` (issue #759).
+///
+/// Each field is independently optional and tri-state, mirroring the
+/// `UpdateWorkflowScheduleRequest` (issue #771) PATCH contract: absent from
+/// the request = unchanged; explicit JSON `null` = clear; a value = set.
+///
+/// `deny_unknown_fields`: a typo'd field name (`"onwer"`) would otherwise
+/// silently deserialize to an all-`None` (no-op) body and 200-succeed with
+/// nothing changed — the rejection surfaces as a structured 400 instead (see
+/// [`annotate_workflow_handler`]).
+///
+/// A set (non-clear, non-absent) value is truncated to
+/// [`OPERATOR_REASON_MAX_CHARS`] at the `From<TriageWorkflowRequest> for
+/// TriagePatch` boundary before it reaches the core — these fields are now
+/// runtime, HTTP-caller-controlled strings (unlike the compile-time
+/// `&'static str` `owner`/`severity` defaults from issue #372) and are
+/// persisted durably and echoed into the audit log, so they get the same cap
+/// every other free-text operator field on this router already applies.
+///
+/// `owner`/`severity` are additionally trimmed and, if empty after
+/// trimming, folded into an explicit clear -- see [`normalize_triage_label`].
+/// `note` is deliberately left untrimmed: unlike the two label fields it has
+/// no filtering requirement (issue #759 scope), so there is no read-side
+/// trim contract it needs to stay symmetric with.
+#[allow(clippy::option_option)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriageWorkflowRequest {
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    owner: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    severity: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    note: Option<Option<String>>,
+}
+
+/// Trim and length-cap a triage `owner`/`severity` label before it is
+/// persisted (issue #759 review).
+///
+/// `GET /workflows?owner=...&severity=...` (`parse_workflow_filters`) trims
+/// the query value and treats an all-whitespace value as "no filter" — so an
+/// untrimmed or all-whitespace stored label would be permanently
+/// unaddressable via the advertised list filter. Trimming here keeps the
+/// write and read sides symmetric: a whitespace-only `Set` folds into an
+/// explicit `Clear` (`Some(None)`) rather than persisting a phantom,
+/// unfilterable value; an explicit `Clear` (`Some(None)`) or an absent field
+/// (`None`) both pass through the outer `Option` untouched via `and_then`.
+///
+/// `Option<Option<String>>` is the tri-state PATCH shape shared with
+/// `TriageWorkflowRequest` above (which already carries the same
+/// `#[allow(clippy::option_option)]`); this is a standalone helper (not
+/// inlined at its two call sites) because it is independently documented
+/// and exercised by
+/// `whitespace_padded_owner_and_severity_are_trimmed_and_filterable` and
+/// `all_whitespace_owner_set_is_folded_into_a_clear` in
+/// `triage_integration.rs`.
+#[allow(clippy::option_option, clippy::single_option_map)]
+fn normalize_triage_label(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|inner| {
+        inner.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_operator_reason(trimmed))
+            }
+        })
+    })
+}
+
+impl From<TriageWorkflowRequest> for TriagePatch {
+    fn from(request: TriageWorkflowRequest) -> Self {
+        // Bound each set value at the API boundary before it becomes a
+        // durable, unbounded-length Postgres TEXT column and an audit-log
+        // old->new summary -- the same `truncate_operator_reason` cap every
+        // other free-text operator field on this router already applies (pause's
+        // `reason`, legal-hold's `reason`, the queue-pause `reason`). A tri-
+        // state "clear" (`Some(None)`) is unaffected by the inner `.map`/
+        // `and_then`. `owner`/`severity` are additionally trimmed via
+        // `normalize_triage_label`; `note` keeps the plain length-only cap.
+        Self {
+            owner: normalize_triage_label(request.owner),
+            severity: normalize_triage_label(request.severity),
+            note: request
+                .note
+                .map(|v| v.map(|s| truncate_operator_reason(&s))),
+        }
+    }
+}
+
+/// Response body for `PATCH /workflows/{id}/triage` (issue #759) — the
+/// execution's current triage view after applying the patch (AC4/AC7).
+#[derive(Debug, Serialize)]
+struct TriageWorkflowResponse {
+    execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// Field names this call actually changed (empty on a true no-op /
+    /// idempotent repeat, e.g. re-setting an identical value or an empty
+    /// patch — issue #759 AC4).
+    changed_fields: Vec<&'static str>,
+}
+
+impl From<TriageOutcome> for TriageWorkflowResponse {
+    fn from(outcome: TriageOutcome) -> Self {
+        Self {
+            execution_id: outcome.execution_id,
+            owner: outcome.owner,
+            severity: outcome.severity,
+            note: outcome.triage_note,
+            changed_fields: outcome.changed_fields.iter().map(|c| c.field).collect(),
+        }
+    }
+}
+
+/// Render one triage field's old/new value for the audit diff summary
+/// (issue #759 review).
+///
+/// Every real value is double-quoted with `"` and `\` escaped; the unset
+/// sentinel renders as the bare, unquoted `(none)`. Two ambiguities this
+/// closes: (1) a free-text value containing `"; field: a -> b"` (most
+/// plausibly `note`) can no longer be mistaken for a second, bogus
+/// field-change entry once the whole value is wrapped in quotes; (2) a
+/// value that is literally the string `"(none)"` renders as the quoted
+/// `"(none)"`, visibly distinct from the unquoted `(none)` sentinel used
+/// for "unset".
+fn escape_triage_audit_value(value: Option<&str>) -> String {
+    value.map_or_else(
+        || "(none)".to_string(),
+        |s| {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        },
+    )
+}
+
+/// Build a compact `old -> new` diff summary for the triage audit row (issue
+/// #759, AC5). `None` when the call changed nothing (an idempotent repeat),
+/// matching the pause/resume "no `error_summary` on a no-op success" style.
+fn triage_diff_summary(changed: &[TriageFieldChange]) -> Option<String> {
+    if changed.is_empty() {
+        return None;
+    }
+    Some(
+        changed
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}: {} -> {}",
+                    c.field,
+                    escape_triage_audit_value(c.old.as_deref()),
+                    escape_triage_audit_value(c.new.as_deref())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// `PATCH /workflows/{id}/triage` — set, update, or clear an execution's
+/// operator-mutable triage tags: `owner`, `severity`, and a free-text `note`
+/// (issue #759).
+///
+/// A plain metadata update on `harvest_workflow_executions` — appends no
+/// `WorkflowEvent`, never read by the workflow function, zero
+/// replay-determinism impact (AC2). Works on any non-purged execution
+/// regardless of lifecycle state — RUNNING, PAUSED, FAILED, COMPLETED, … are
+/// all annotated identically (AC6). Admin-guarded, shard-routed via
+/// `exec_id.shard()`, idempotent (AC4). Returns 404 only for an unknown
+/// execution id (AC6); 400 for a malformed execution id or an unparseable /
+/// unknown-field request body.
+async fn annotate_workflow_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<TriageWorkflowRequest>, JsonRejection>,
+) -> Result<Json<TriageWorkflowResponse>, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "PATCH /workflows/{id}/triage";
+
+    let exec_id = parse_execution_id(&id)?;
+    // Deliberately the **exact** shard resolver, not the lenient
+    // `db_conn_for_execution` (issue #759 review): this route MUTATES, and
+    // the lenient resolver falls back to the default shard when the id's
+    // owning shard has no configured pool on this node -- the documented
+    // mid-shard-add rollout state. For a write that fallback is strictly
+    // worse than the false-404 a read would produce: it can either report a
+    // false 404 for an execution that genuinely exists on the unreachable
+    // shard, or -- if the default shard happens to hold an unrelated row
+    // sharing the same UUID -- silently mutate the wrong database. Mirrors
+    // `GET /workflows/{id}/tree` (see the `db_conn_for_execution_exact` doc
+    // comment): `Err` -> `503` when the owning shard is known but
+    // unreachable (propagated by `?`); `Ok(None)` when the id encodes a
+    // shard this deployment does not know about at all -- nothing here
+    // could ever host it, and there is no shard to audit the attempt
+    // against, so this returns the honest `404` directly rather than
+    // through the audited-failure path below.
+    let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id} not found"
+        )));
+    };
+    let exec_id_str = exec_id.to_string();
+
+    // Body deserialization is unwrapped in-handler (rather than by a bare
+    // `Json` extractor) so a rejected body -- most importantly an unknown
+    // field, rejected via `deny_unknown_fields` since every real field is
+    // optional and a typo'd name would otherwise silently no-op -- surfaces
+    // as this route's structured 400 JSON error with a failed audit row,
+    // never as axum's default plain-text 422 (mirrors
+    // `update_schedule_handler`, issue #771).
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_ANNOTATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(&err_summary),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
+
+    let patch: TriagePatch = request.into();
+    let result = annotate_workflow_execution(&mut conn, exec_id, patch).await;
+
+    let (status, error_summary) = match &result {
+        Ok(outcome) => (
+            STATUS_SUCCEEDED,
+            triage_diff_summary(&outcome.changed_fields),
+        ),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_ANNOTATE,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok(Json(outcome.into())),
+        // `conflict_from` (not the bare `map_error`) matches every sibling
+        // audited-mutation handler (pause/resume/legal-hold/terminate/cancel/
+        // reset): `annotate_workflow_execution` today only ever returns
+        // `NotFound`/`Database`, both of which flow through unchanged, but a
+        // future `Config` ("execution is redacted/purged") would then map to
+        // 409 automatically rather than the misleading `map_error` default.
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -18025,6 +23344,22 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard, so a caller cannot tell whether the erasure was
+        // already committed or landed in the race window — only that the
+        // source is unusable and a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         WorkflowResetError::Harvest(error) => map_error(error).into_response(),
     }
 }
@@ -18057,11 +23392,31 @@ struct DagRetryConflictResponse {
     remediation: String,
 }
 
+/// Operator-facing message for a retry of a run that already compensated
+/// (issue #780). Shared by the HTTP `409` body and the Vantage UI flash so the
+/// two surfaces cannot drift.
+const DAG_RETRY_COMPENSATED_RUN_MESSAGE: &str = "this run already executed its compensation unwind, so its succeeded nodes' side effects \
+     were rolled back; retrying would resume on rolled-back state — start a fresh DAG run instead";
+
 fn dag_retry_resolve_error_response(
     error: crate::dag_retry::DagRetryResolveError,
 ) -> axum::response::Response {
     use crate::dag_retry::DagRetryResolveError as E;
     use axum::response::IntoResponse as _;
+
+    // Issue #780: a run that already unwound its compensations is a STATE
+    // conflict about the run (its carried-over side effects were rolled back),
+    // not a malformed node request — so it is the one resolver rejection that
+    // maps to `409`, alongside the sibling COMPLETED/RUNNING state conflicts.
+    if matches!(error, E::CompensatedRun) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let body = match error {
         E::EmptyFromNodes => DagRetryNodeErrorResponse {
@@ -18098,6 +23453,12 @@ fn dag_retry_resolve_error_response(
         },
         E::NoSchedulePoint => DagRetryNodeErrorResponse {
             message: "could not resolve a reset point for the requested nodes".to_string(),
+            unknown_nodes: None,
+            declared_nodes: None,
+        },
+        // Handled above as a `409`; unreachable here.
+        E::CompensatedRun => DagRetryNodeErrorResponse {
+            message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             unknown_nodes: None,
             declared_nodes: None,
         },
@@ -18202,6 +23563,7 @@ impl DagRetryFailure {
                 R::NoSchedulePoint => {
                     "could not resolve a reset point for the requested nodes".to_string()
                 }
+                R::CompensatedRun => DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             },
             Self::Reset(e) => match e {
                 WorkflowResetError::InvalidPoint(invalid) => format!(
@@ -18374,6 +23736,36 @@ pub(crate) async fn retry_dag_run_inner(
         }
     }
 
+    // Refuse a source run whose payloads were PII-erased (issue #495).
+    //
+    // Two independent reasons, either sufficient:
+    //
+    //  1. The issue #780 compensated-run guard goes BLIND. Erasure tombstones
+    //     every payload field, so `ActivityScheduled.input` is
+    //     `{"_harvest_erased": true}` and the compensation envelope is gone
+    //     (signal 2). Signal 1 normally still holds — the marker's *name* is not
+    //     a payload field, and the positional "dispatch after the marker" check
+    //     needs no payload — but a DAG that unwound at a drained signal frontier
+    //     (issue #801) recorded no marker at all, so on that intersection BOTH
+    //     signals are blind and an already-rolled-back run would look retryable.
+    //     Nothing downstream can recover this: erasure is irreversible.
+    //  2. Independent of compensation, the retry itself would produce garbage.
+    //     The #148 fork CARRIES OVER the upstream events, whose `output` fields
+    //     are now tombstones, so a re-executing downstream node with an
+    //     `input_from` binding (issue #702) would be handed
+    //     `{"_harvest_erased": true}` as its input.
+    //
+    // O(1) row check, matching the issue #612 terminal-query precedent: erasure
+    // always tombstones the execution row's own `input` column first.
+    if erase::execution_input_is_erased(&execution.input) {
+        return Err(DagRetryFailure::StateConflict(
+            "DAG run's payloads were erased (issue #495), so whether it already compensated \
+             cannot be determined and its carried-over node outputs are tombstones; retrying \
+             would resume on unreadable state — start a fresh DAG run instead"
+                .to_string(),
+        ));
+    }
+
     // Walk the recorded history and resolve the node request to a reset point.
     //
     // NOTE (v1 limitation, issue #366): this resolves the cut and node sets from
@@ -18383,11 +23775,55 @@ pub(crate) async fn retry_dag_run_inner(
     // an incompatible deploy, the worker that replays the fork may run a
     // different definition than the one used to pick the cut. v1 does not gate on
     // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
-    let history = store::load_history(&mut conn, exec_id)
+    // Load INFLATED + codec-decoded history: `resolve_retry_plan`'s
+    // compensated-run guard (issue #780) reads `ActivityScheduled.input` to
+    // recognise a compensation envelope, and `input` is a payload-bearing field.
+    // Plain `store::load_history` would hand the resolver an
+    // `_harvest_offload_envelope` reference (issue #524) or a codec envelope
+    // (issue #608) instead of the real value, hiding the envelope signal — a
+    // silent fail-OPEN that lets an already-rolled-back run be retried onto
+    // rolled-back state. The resolver cannot compensate for this itself: an
+    // offloaded input is indistinguishable from a large ordinary forward input
+    // (see `dag_retry::tests::
+    // an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller`).
+    //
+    // With no `PayloadStore` registered the inflate pass is a pure in-memory
+    // codec decode, so the default deployment costs no blob fetch. Only
+    // oversized payloads do, and this is a low-frequency operator endpoint.
+    // Passing the runtime's real codecs (rather than the identity default
+    // `load_history` uses) additionally lets the guard see envelopes on a
+    // codec-encrypting deployment, where the endpoint previously failed closed
+    // with `UnknownPayloadCodec`. No payload is surfaced to the caller — the
+    // plan carries only node names and an event id.
+    //
+    // Deliberately NOT `store::load_history_inflated`: that fetches every blob
+    // sequentially while still holding the connection it loaded the rows with,
+    // so a slow or unavailable payload store (or a few concurrent retries over
+    // large histories) would pin database pool slots and stall unrelated API and
+    // worker work. Load raw, release the pool slot, inflate/decode in memory,
+    // then reacquire for the preview/reset below — the same discipline the
+    // awaitables endpoint established.
+    let codecs = api_state.payload_codecs();
+    let offloader = runtime.registry.payload_offloader();
+    let raw = store::load_history_undecoded(&mut conn, exec_id)
         .await
         .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
-    let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &history.events, &from_nodes)
+    drop(conn);
+
+    // Fails CLOSED on any inflate/decode error: the issue #780 compensated-run
+    // guard reads `ActivityScheduled.input`, so degrading to the raw history
+    // would hide a compensation envelope and let an already-rolled-back run be
+    // retried onto rolled-back state.
+    let events = inflate_and_decode_events(&raw.events, &codecs, offloader)
+        .await
+        .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
+    let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &events, &from_nodes)
         .map_err(DagRetryFailure::Resolve)?;
+
+    // Reacquire for the preview/reset writes below.
+    let mut conn = db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(DagRetryFailure::Other)?;
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
@@ -18403,6 +23839,13 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
+        // Recheck erasure under the fork's own row lock. The pre-flight guard
+        // above ran on an unlocked read, and the connection was dropped for blob
+        // inflation before this transaction opens — so `erase-payloads` can
+        // commit in that window. Without this, the fork would carry tombstoned
+        // outputs and the issue #780 compensated-run guard would have been
+        // decided on evidence that no longer exists.
+        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -18512,6 +23955,15 @@ pub(crate) async fn signal_workflow(
         query.idempotency_key.filter(|s| !s.is_empty())
     };
 
+    // A connector's `SignalsWithStart` binding derives its key into this same
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
+    // caller must not be able to claim one (issue #944 review).
+    if let Some(key) = idempotency_key.as_deref()
+        && let Some(resp) = reject_reserved_idempotency_key(key)
+    {
+        return resp;
+    }
+
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
@@ -18542,7 +23994,13 @@ pub(crate) async fn signal_workflow(
     };
     let exec_id_str = exec_id.to_string();
 
-    let execution = match load_execution(&mut conn, exec_id).await {
+    // Issue #843: a signal names the LOGICAL run, so it is routed to the live
+    // attempt of the workflow-level retry chain (#523). Without this, a signal
+    // sent after attempt 1 sealed `FAILED` was inserted against — and dropped
+    // with — the sealed predecessor while the retry ran on. For a workflow with
+    // no retry policy this resolves to `exec_id` and is a strict no-op.
+    let execution = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    {
         Ok(ex) => ex,
         Err(e) => {
             let err_str = e.to_string();
@@ -18564,6 +24022,10 @@ pub(crate) async fn signal_workflow(
         }
     };
 
+    // The routed live attempt — the execution the signal will actually be
+    // queued for. Equal to `exec_id` unless the retry chain has advanced.
+    let target = ExecutionId::from_uuid(execution.id);
+
     // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
     // whose `(exec_id, idempotency_key)` row already landed must return the
     // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
@@ -18579,15 +24041,17 @@ pub(crate) async fn signal_workflow(
     // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
     // so fresh + unkeyed deliveries are still fully validated before enqueue.
     if let Some(key) = idempotency_key.as_deref() {
-        match signal::signal_idempotency_key_exists(&mut conn, exec_id, key).await {
+        match signal::signal_idempotency_key_exists(&mut conn, target, key).await {
             Ok(true) => {
                 // Same success audit + response the normal on-conflict path
                 // writes when `send_signal_idempotent` returns `Ok(false)`.
+                // Issue #843: audit the routed attempt the key landed on.
+                let target_id_str = target.to_string();
                 let ar = NewAuditRecord {
                     actor: &actor,
                     operation: OP_WORKFLOW_SIGNAL,
                     target_type: TARGET_WORKFLOW,
-                    target_id: Some(exec_id_str.as_str()),
+                    target_id: Some(target_id_str.as_str()),
                     route_or_command: route,
                     request_id: request_id.as_deref(),
                     idempotency_key: idempotency_key.as_deref(),
@@ -18604,6 +24068,7 @@ pub(crate) async fn signal_workflow(
                     Json(SignalAck {
                         ok: true,
                         signal_delivered: false,
+                        routed_execution_id: routed_execution_id(exec_id, target),
                     }),
                 )
                     .into_response();
@@ -18665,17 +24130,22 @@ pub(crate) async fn signal_workflow(
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    let signal_result = signal::send_signal_idempotent(
+    // `target` was resolved above and is what the #610 schema check validated
+    // against, so hand it straight to the delivery rather than walking the chain
+    // a second time (one full row load per hop, on the highest-volume mutating
+    // route). A re-drive inside still re-resolves from `exec_id`.
+    let signal_result = signal::send_signal_from_resolved(
         &mut conn,
         exec_id,
+        target,
         &signal_name,
         payload,
         idempotency_key.as_deref(),
     )
     .await;
 
-    let signal_delivered = match signal_result {
-        Ok(delivered) => delivered,
+    let (signal_delivered, delivered_to) = match signal_result {
+        Ok(delivery) => (delivery.delivered, delivery.target),
         Err(e) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
@@ -18695,11 +24165,13 @@ pub(crate) async fn signal_workflow(
             return map_error(e).into_response();
         }
     };
+    // Issue #843: audit the routed attempt the signal was queued for.
+    let delivered_to_str = delivered_to.to_string();
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_SIGNAL,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(delivered_to_str.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: idempotency_key.as_deref(),
@@ -18716,6 +24188,7 @@ pub(crate) async fn signal_workflow(
         Json(SignalAck {
             ok: true,
             signal_delivered,
+            routed_execution_id: routed_execution_id(exec_id, delivered_to),
         }),
     )
         .into_response()
@@ -18730,9 +24203,14 @@ async fn hydrate_ctx_for_query(
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
-    let execution = load_execution(&mut conn, exec_id)
+    // Issue #843: a query addresses the LOGICAL run, so follow the
+    // workflow-level retry chain (#523/#842) to the live attempt. A retry
+    // successor is minted on the predecessor's shard, so the connection
+    // resolved from `exec_id` above already owns the whole chain.
+    let execution = autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+    let target = ExecutionId::from_uuid(execution.id);
 
     // Terminal executions are now queryable for post-mortem state inspection
     // (issue #612): the workflow function is driven through replay and the query
@@ -18754,7 +24232,7 @@ async fn hydrate_ctx_for_query(
     // takes precedence over the terminal-seal check below.
     if terminal && erase::execution_input_is_erased(&execution.input) {
         return Err(map_error(HarvestError::HistoryUnavailable {
-            exec_id,
+            exec_id: target,
             reason: "payloads erased".to_string(),
         }));
     }
@@ -18769,7 +24247,7 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history(&mut conn, exec_id)
+    let history = store::load_history(&mut conn, target)
         .await
         .map_err(map_error)?;
 
@@ -18788,7 +24266,7 @@ async fn hydrate_ctx_for_query(
     let sealed = terminal && history_reached_terminal_seal(&history.events);
 
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-        exec_id,
+        target,
         history.events,
         runtime.registry.shared_state(),
         runtime.registry.history_policy(),
@@ -18873,7 +24351,7 @@ async fn hydrate_ctx_for_query(
             // distinct 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
-                    exec_id,
+                    exec_id: target,
                     reason: "pruned by retention, released, or replay diverged from \
                              recorded history (workflow code changed)"
                         .to_string(),
@@ -18893,7 +24371,7 @@ async fn hydrate_ctx_for_query(
         // `Panicked` to an error via `classify_terminal_query`.
         if matches!(outcome, QueryReplayOutcome::Panicked) {
             return Err(map_error(HarvestError::QueryHandlerPanicked(format!(
-                "workflow handler panicked during query replay for execution {exec_id}"
+                "workflow handler panicked during query replay for execution {target}"
             ))));
         }
         Ok(ctx)
@@ -19212,6 +24690,16 @@ async fn get_dag_run_graph(
         Err(e) => return map_error(e).into_response(),
     };
 
+    // No further DB reads: release the pool slot before any payload-store fetch
+    // below (the awaitables pool-slot discipline — offload inflation is network
+    // I/O and must never hold a database connection).
+    drop(conn);
+
+    let codecs = api_state.payload_codecs();
+    let offloader = runtime.registry.payload_offloader();
+    let ts_events =
+        decode_graph_history(ts_events, exec_id, &codecs, offloader, "dag run graph").await;
+
     let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
 
     let response = crate::dag_graph::DagRunGraphResponse {
@@ -19334,6 +24822,7 @@ pub(crate) async fn trigger_dag_run_inner(
         dag.owner.as_deref(),
         dag.runbook_url.as_deref(),
         dag.severity.as_deref(),
+        &runtime.registry,
         // Manual DAG trigger is attributed to the schedule (issue #740),
         // mirroring trigger_schedule_now; carry the operator actor.
         autumn_harvest::StartSource::Schedule,
@@ -19392,6 +24881,9 @@ pub(crate) async fn trigger_dag_run_inner(
                     state: started.state,
                     started_fresh: None,
                     deduplicated: None,
+                    // Placement pinning is a workflow-start concern (issue
+                    // #697); DAG triggers route via `pick_for_dag`.
+                    shard_id: None,
                 }),
             ))
         }
@@ -19536,6 +25028,10 @@ async fn list_schedules(
     // issue #696 / Codex round 3), keyed by schedule id so the read agrees with
     // the gauge and the tick.
     let overdue_aux = load_schedule_overdue_aux_by_shard(&api_state).await;
+    // issue #743 AC9: resolved once (not per row) and threaded through so the
+    // list reflects the effective DAG/workflow execution_timeout/sla.
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|rt| rt.registry.as_ref());
 
     let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
@@ -19545,7 +25041,13 @@ async fn list_schedules(
                 .cloned()
                 .map(BackfillSummary::from);
             let aux = overdue_aux.get(&s.id).copied().unwrap_or_default();
-            schedule_entry_from_row(s, last_backfill, aux.at_capacity, aux.effective_fire_at)
+            schedule_entry_from_row(
+                s,
+                last_backfill,
+                aux.at_capacity,
+                aux.effective_fire_at,
+                registry,
+            )
         })
         .collect();
     fanout_list_json("schedules", entries, status, &unavailable_shards)
@@ -19641,11 +25143,16 @@ async fn get_schedule(
         .remove(&s.id)
         .map(BackfillSummary::from);
 
+    // issue #743 AC9: surface the effective DAG/workflow execution_timeout/sla.
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|rt| rt.registry.as_ref());
+
     Ok(Json(schedule_entry_from_row(
         s,
         last_backfill,
         at_capacity,
         effective_fire_at,
+        registry,
     )))
 }
 
@@ -20160,6 +25667,7 @@ async fn reject_unknown_workflow_schedule_target(
 async fn upsert_workflow_schedule_and_read_back(
     conn: &mut diesel_async::AsyncPgConnection,
     ws: &WorkflowSchedule,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
@@ -20208,6 +25716,7 @@ async fn upsert_workflow_schedule_and_read_back(
         None,
         at_capacity,
         effective_fire_at,
+        registry,
     ))
 }
 
@@ -20384,7 +25893,16 @@ async fn create_workflow_schedule(
         // built-in synthetic liveness canary registration, not via this route.
         all_writable_shards: false,
     };
-    let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
+    // issue #743 AC9: surface the effective workflow execution_timeout/sla on
+    // the create response. `runtime` is already validated non-`Err` above
+    // (`reject_unknown_workflow_schedule_target` requires it).
+    let entry = match upsert_workflow_schedule_and_read_back(
+        &mut conn,
+        &ws,
+        Some(runtime.registry.as_ref()),
+    )
+    .await
+    {
         Ok(e) => e,
         Err(e) => {
             let err_str = e.to_string();
@@ -20479,11 +25997,57 @@ fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
 }
 
 /// Build a [`ScheduleEntry`] from a raw `harvest_schedules` row.
+/// Resolve the effective hard `execution_timeout`/soft `sla` (issue #743,
+/// whole seconds) a run this schedule fires would get, from the registered
+/// `WorkflowInfo` for `name`. For `kind: Dag` this is the DAG's own shadow
+/// `WorkflowInfo` -- auto-registered under the DAG's name in
+/// `registry.workflows` when the `unified-dag-execution` feature is on, with
+/// `#[dag(execution_timeout = ...)]`/`#[dag(sla = ...)]` propagated onto it
+/// verbatim by `DagInfo::as_workflow_info()` -- so ONE lookup covers both
+/// schedule kinds identically (AC9); a classic (non-unified) DAG has no
+/// shadow entry and correctly resolves to `(None, None)`.
+///
+/// `sla` is clamped down to `execution_timeout` (AC5) via the SAME
+/// `clamp_info_default_sla` helper the start path applies, so the read-back
+/// value can never disagree with what a real fire would set on
+/// `deadline_at`/`sla_deadline_at`.
+///
+/// The fleet-wide `HandlerRegistry::max_workflow_execution_timeout` ceiling
+/// (issue #743 review, PR #1141 Finding #3) is applied BEFORE the sla clamp,
+/// exactly mirroring `start_or_load_workflow_execution`'s own
+/// `(Some(t), Some(ceiling)) => Some(t.min(ceiling))` rule -- so an
+/// operator-configured ceiling narrower than the declared `execution_timeout`
+/// is reflected in both the advertised `execution_timeout_secs` AND the
+/// `sla_secs` clamp, never the raw declared value.
+///
+/// `(None, None)` when the registry is unavailable (e.g. a scheduler-only
+/// process with no live runtime installed) or the workflow/DAG declares
+/// neither -- never a panic, never a stale/guessed value.
+fn resolve_schedule_deadline_secs(
+    registry: Option<&HandlerRegistry>,
+    name: &str,
+) -> (Option<i64>, Option<i64>) {
+    let Some(info) = registry.and_then(|r| r.workflows.get(name)) else {
+        return (None, None);
+    };
+    let ceiling = registry.and_then(|r| r.max_workflow_execution_timeout);
+    let effective_execution_timeout = match (info.execution_timeout, ceiling) {
+        (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
+        (other, _) => other,
+    };
+    let execution_timeout_secs =
+        effective_execution_timeout.and_then(|d| i64::try_from(d.as_secs()).ok());
+    let sla_secs =
+        clamp_info_default_sla(info.sla, effective_execution_timeout).map(|d| d.num_seconds());
+    (execution_timeout_secs, sla_secs)
+}
+
 fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
     at_capacity: bool,
     effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    registry: Option<&HandlerRegistry>,
 ) -> ScheduleEntry {
     // Overdue detection (issue #696): computed from the schedule's own
     // `next_run_at` + cadence, never an externally-supplied interval. Rides the
@@ -20535,6 +26099,7 @@ fn schedule_entry_from_row(
     let remaining_runs = s
         .max_runs
         .map(|max| remaining_runs_budget(max, s.runs_started));
+    let (execution_timeout_secs, sla_secs) = resolve_schedule_deadline_secs(registry, &name);
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         s.catchup_policy.as_deref(),
         s.catchup_window_secs,
@@ -20582,6 +26147,8 @@ fn schedule_entry_from_row(
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         overdue: overdue_verdict.overdue,
         overdue_by_secs: overdue_verdict.overdue_by_secs,
+        execution_timeout_secs,
+        sla_secs,
     }
 }
 
@@ -21031,11 +26598,17 @@ async fn update_schedule_handler(
                 .get(&row.id)
                 .copied()
                 .unwrap_or_default();
+            // issue #743 AC9: surface the effective DAG/workflow
+            // execution_timeout/sla, reflecting any workflow-name-independent
+            // patch (e.g. `input`) immediately.
+            let patch_runtime = api_state.runtime().ok();
+            let patch_registry = patch_runtime.as_ref().map(|rt| rt.registry.as_ref());
             Ok(Json(schedule_entry_from_row(
                 *row,
                 last_backfill,
                 aux.at_capacity,
                 aux.effective_fire_at,
+                patch_registry,
             )))
         }
         Ok(ScheduleUpdateOutcome::NotFound) => {
@@ -22132,15 +27705,23 @@ async fn trigger_schedule_now(
         .get(&workflow_name)
         .and_then(|info| info.chain_execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick and backfill paths (scheduler.rs).
     let manual_trigger_retry_policy = schedule
@@ -22260,6 +27841,7 @@ async fn trigger_schedule_now(
             priority: None,
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -22428,6 +28010,7 @@ async fn trigger_schedule_now(
             inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry
@@ -23534,6 +29117,20 @@ async fn schedule_backfill(
                     },
                 );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+                // Issue #743 review (PR #1141, Finding #5): a workflow backfill
+                // must ALSO thread the declared `execution_timeout` and the
+                // fleet-wide `max_workflow_execution_timeout` ceiling into the
+                // start below -- `info_execution_timeout` was already resolved
+                // above (it feeds the `sla` clamp) but was never applied to the
+                // execution row itself, leaving a backfilled run with no hard
+                // deadline even when the workflow type declares one. Mirrors the
+                // DAG branch's identical fix immediately below.
+                let workflow_execution_timeout =
+                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+                let workflow_max_execution_timeout_ceiling = runtime
+                    .registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -23680,7 +29277,13 @@ async fn schedule_backfill(
                         .and_then(|p| serde_json::to_value(&p).ok());
                     let start_options = autumn_harvest::debounce::DebounceStartOptions {
                         reuse_policy: Some("reject_duplicate".to_string()),
-                        execution_timeout_secs: None,
+                        // Issue #743 review (PR #1141, Finding #5): a throttled
+                        // (deferred) backfill fire must ALSO carry the declared
+                        // execution_timeout + fleet-wide ceiling -- parity with
+                        // the non-throttled backfill start path fixed above, and
+                        // with the `chain_execution_timeout_secs` field below,
+                        // which was already threaded correctly.
+                        execution_timeout_secs: workflow_execution_timeout.map(|d| d.num_seconds()),
                         memo: None,
                         search_attrs: None,
                         sla_secs: sla.map(|d| d.num_seconds()),
@@ -23688,10 +29291,12 @@ async fn schedule_backfill(
                         priority: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict: None,
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
-                        max_execution_timeout_ceiling_secs: None,
+                        max_execution_timeout_ceiling_secs: workflow_max_execution_timeout_ceiling
+                            .map(|d| d.num_seconds()),
                         // Chain-scoped lifetime cap (issue #617): workflow-type
                         // default + fleet-wide ceiling captured so a throttled
                         // backfill fire keeps the cap (parity with the non-throttled
@@ -23818,14 +29423,14 @@ async fn schedule_backfill(
                         input: input.clone(),
                         parent_id: None,
                         queue_name: dispatch_queue,
-                        execution_timeout: None,
+                        execution_timeout: workflow_execution_timeout,
                         memo: None,
                         search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         conflict_policy:
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
-                        max_execution_timeout_ceiling: None,
+                        max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): backfilled runs
                         // inherit the workflow-type default + fleet-wide
                         // ceiling-as-default so a whole scheduled chain is capped
@@ -23840,6 +29445,8 @@ async fn schedule_backfill(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: runtime
                             .registry
@@ -24068,6 +29675,33 @@ async fn schedule_backfill(
                             )
                         });
 
+                // Issue #743 review (PR #1141, Finding #5): a DAG backfill must
+                // thread the DAG's declared execution_timeout/sla, and the
+                // fleet-wide max_workflow_execution_timeout ceiling, the SAME
+                // way the scheduler tick's dispatch path and a manual/MCP
+                // trigger (`trigger_unified_dag`) already do -- resolved from the
+                // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
+                // `registry.workflows` by `DagInfo::as_workflow_info()`. Kept as a
+                // separate lookup from the `(owner, runbook_url, severity)` tuple
+                // above (sourced from `runtime.dags()`) so this fix stays scoped
+                // to the deadline fields and never touches classic-DAG behavior
+                // for those three unrelated fields. `chain_execution_timeout` is
+                // deliberately left `None` for a DAG start (issue #617: DAGs
+                // carry no chain-scoped lifetime cap), matching
+                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout:
+                // None`.
+                let dag_wf_info = runtime.registry.workflows.get(&dag_name);
+                let dag_execution_timeout = dag_wf_info
+                    .and_then(|info| info.execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                let dag_sla = dag_wf_info
+                    .and_then(|info| info.sla)
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                let dag_max_execution_timeout_ceiling = runtime
+                    .registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.
                 if let Some((gate_id, gate_reason, scope_kind)) =
@@ -24145,19 +29779,21 @@ async fn schedule_backfill(
                         input: serde_json::json!({"_harvest_run_source": "backfill"}),
                         parent_id: None,
                         queue_name: dag_queue,
-                        execution_timeout: None,
+                        execution_timeout: dag_execution_timeout,
                         memo: None,
                         search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
                         conflict_policy:
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
-                        max_execution_timeout_ceiling: None,
+                        max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
                         chain_execution_timeout: None,
                         max_workflow_chain_timeout_ceiling: None,
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: 0,
                         start_at: None,
@@ -24168,7 +29804,7 @@ async fn schedule_backfill(
                         severity,
                         context_headers: None,
 
-                        sla: None,
+                        sla: dag_sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
@@ -26152,6 +31788,37 @@ async fn retention_run_now(
     Ok(Json(BasicAck { ok: true }))
 }
 
+/// The build id **this process** is configured with, for the two in-process
+/// replay gates (issue #798).
+///
+/// Both the deploy replay canary and the replay-diagnosis endpoint run inside the
+/// deployed candidate and ask what *the currently deployed code* does with a
+/// recorded history — so the replay context must report the same
+/// [`WorkerConfig::build_id`] the live worker puts on span metadata. Sourcing it
+/// from the execution's recorded `assigned_build_id` instead would replay the
+/// branch the **old** build took, which is exactly the blind spot these gates
+/// exist to remove.
+///
+/// Returns `None` when no snapshot was captured (a runtime booted without the
+/// `with_effective_config` seam) or when the configured build id is empty (the
+/// default for a deployment that does not use build routing at all) — in both
+/// cases `ctx.build_id()` correctly reports `None`, matching the live worker.
+fn running_build_id(runtime: &HarvestApiRuntime) -> Option<String> {
+    normalize_running_build_id(runtime.effective_config().map(|view| view.worker.build_id))
+}
+
+/// The pure half of [`running_build_id`]: an absent snapshot **or** an empty
+/// configured build id both resolve to `None`.
+///
+/// Split out so the rule is unit-testable without constructing a full
+/// [`HarvestApiRuntime`] (which needs eight collaborators). Empty is the default
+/// for a deployment that does not use build routing at all, and the live worker
+/// reports no build in that case — so mapping it to `Some("")` would make the
+/// gate replay under a build id no worker ever reports.
+fn normalize_running_build_id(configured: Option<String>) -> Option<String> {
+    configured.filter(|build_id| !build_id.is_empty())
+}
+
 async fn run_replay_canary_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -26168,7 +31835,23 @@ async fn run_replay_canary_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
-    let mut replayer = WorkflowReplayer::new();
+    // Issue #806: thread the runtime's shared state, mirroring the single-execution
+    // replay-diagnosis route below. A workflow that reads typed shared state during
+    // replay — `ctx.state::<BusinessCalendars>()` is the motivating case — sees an
+    // empty map without this and fails a prologue guard, so the canary would report
+    // `workflow_failed` for code that replays cleanly on every real worker.
+    let mut replayer = WorkflowReplayer::new().with_shared_state(runtime.registry().shared_state());
+    // Issue #798: thread this process's own configured build id. The canary runs
+    // *inside* the deployed candidate, so `WorkerConfig::build_id` here IS the
+    // candidate build — and the live worker reports that same value through span
+    // metadata (never the execution's recorded `assigned_build_id`). Without it
+    // `ctx.build_id()` is `None` during the canary, so a candidate-only branch
+    // such as `if ctx.build_id() == Some("v2")` is unreachable, the historical
+    // path replays clean, and the canary reports success for code that diverges
+    // the moment it takes traffic.
+    if let Some(build_id) = running_build_id(&runtime) {
+        replayer = replayer.with_build_id(build_id);
+    }
     for (name, info) in &runtime.registry().workflows {
         replayer = replayer.register_fn(name.clone(), info.handler);
     }
@@ -26486,6 +32169,7 @@ async fn replay_diagnosis(
         deadline_at: execution.deadline_at,
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
+        queue_name: None,
     };
 
     // Register ONLY the target handler and replay in CANARY mode. Canary — not
@@ -26513,10 +32197,18 @@ async fn replay_diagnosis(
     // `workflow_failed` for deployments that configure a non-default policy —
     // even though the same execution replays cleanly on the worker (Codex review,
     // PR #1107).
-    let replayer = autumn_harvest::testing::WorkflowReplayer::new()
+    let mut replayer = autumn_harvest::testing::WorkflowReplayer::new()
         .with_shared_state(runtime.registry().shared_state())
         .with_history_policy(runtime.registry().history_policy())
         .register_fn(execution.workflow_name.clone(), handler);
+    // Issue #798: same reasoning as the replay canary — diagnosis asks "does this
+    // execution diverge under the code deployed *right now*", so the replay
+    // context must report the build id this process is configured with. Left
+    // unset, `ctx.build_id()` is `None` and a build-gated branch takes the wrong
+    // path, so the diagnosis verdict describes code that will not run.
+    if let Some(build_id) = running_build_id(&runtime) {
+        replayer = replayer.with_build_id(build_id);
+    }
     let report = match tokio::time::timeout(
         api_state.query_timeout(),
         replayer.replay_canary_snapshot(snapshot),
@@ -26576,6 +32268,7 @@ async fn concurrency_status(
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
+                    workflows: Vec::new(),
                 });
             // Take the highest cap seen across shards, matching what
             // concurrency_key_stats() does within a shard (MAX(concurrency_cap)).
@@ -26583,11 +32276,79 @@ async fn concurrency_status(
             entry.in_flight += stat.in_flight;
             entry.pending += stat.pending;
         }
+
+        // Attribute each key to the workflow type(s) on it, so the declared
+        // overflow strategy is visible next to the live counters (issue #811
+        // AC7). Resolved against the registry here rather than in the core
+        // stats query: the worker's sampler has no registry and must not pay
+        // for the join.
+        let attributions = queue::concurrency_key_workflows(&mut conn, &runtime.queues)
+            .await
+            .map_err(map_error)?;
+        for attribution in attributions {
+            let Some(entry) =
+                merged.get_mut(&(attribution.key.clone(), attribution.task_type.clone()))
+            else {
+                // A row that appeared between the two reads; the next poll
+                // picks it up. Never fabricate a stats row from an attribution.
+                continue;
+            };
+            if entry
+                .workflows
+                .iter()
+                .any(|w| w.workflow_name == attribution.workflow_name)
+            {
+                continue;
+            }
+            let declared = runtime
+                .registry
+                .workflows
+                .get(&attribution.workflow_name)
+                .and_then(|info| info.concurrency)
+                .map_or_else(
+                    autumn_harvest::concurrency::ConcurrencyOnConflict::default,
+                    |policy| policy.on_conflict,
+                );
+            // Activity concurrency groups always defer (issue #811, Codex round 1).
+            let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
+            entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
+                workflow_name: attribution.workflow_name,
+                on_conflict,
+            });
+        }
     }
 
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
+    for entry in &mut result {
+        entry
+            .workflows
+            .sort_by(|a, b| a.workflow_name.cmp(&b.workflow_name));
+    }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
+///
+/// Latest-wins is a **workflow-start admission control**: the supersede runs
+/// inside `start_or_load_workflow_execution_collect` and sheds workflow
+/// *executions*. An activity task can carry a `concurrency_key` too, but it is
+/// gated purely at claim time (issue #247) and always defers — nothing sheds an
+/// in-flight activity for a newcomer.
+///
+/// So a `task_type = "activity"` row reports `Defer` even when its owning
+/// workflow declares `cancel_running`, because reporting the workflow's
+/// strategy there would advertise behaviour the engine does not enforce for
+/// that group. Only a `task_type = "workflow"` row reports the declared policy.
+fn effective_admin_on_conflict(
+    task_type: &str,
+    declared: autumn_harvest::concurrency::ConcurrencyOnConflict,
+) -> autumn_harvest::concurrency::ConcurrencyOnConflict {
+    if task_type == "workflow" {
+        declared
+    } else {
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    }
 }
 
 // ── Debounce Management (issue #499) ──────────────────────────────────────
@@ -26647,6 +32408,668 @@ async fn start_throttle_status(
     Ok(Json(all))
 }
 
+/// `GET /admin/start-throttle/{workflow_name}/override` — read a workflow's
+/// TTL'd pacing-override state directly, independent of any current
+/// deferred-start backlog (issue #945).
+///
+/// `GET /admin/start-throttle` above is driven by `harvest_start_throttle`
+/// backlog rows and therefore only surfaces a workflow's override state
+/// *while it currently has pending backlog* -- an operator who sets a
+/// preemptive override before any pressure exists, or checks back once the
+/// backlog has already drained (the common case: the override is still
+/// running for the rest of its TTL, but nothing is deferred any more), would
+/// otherwise see no trace of a still-live override on ANY read surface. This
+/// route answers the narrower, always-reliable question directly: it
+/// resolves the exact same bucket key the SET/DELETE override routes use
+/// (`throttle::bucket_key(workflow_name, "")`) and reads
+/// `harvest_rate_limit_buckets` straight, with zero dependency on backlog
+/// state.
+///
+/// Aggregates across shards using the same "worst-case" (fewest remaining
+/// tokens) merge [`list_rate_limits`] uses -- buckets are shard-local (issue
+/// #607/#247, see `docs/sharding.md`), so a partial multi-shard write
+/// (surfaced as `207` by the SET/DELETE routes on a partial failure) can in
+/// principle leave shards disagreeing about the override; this route reports
+/// one representative view rather than one row per shard.
+///
+/// **A total shard outage returns `503`, and a partial outage returns `207`
+/// naming the unreachable shard(s) in `shard_errors`** -- an incident-
+/// response status read that silently degraded a real live override (or one
+/// living only on the unreachable shard) into a bare `200
+/// {"override_active": false}` would be worse than an explicit failure
+/// (issue #945 review, P2).
+///
+/// `declared_*` reflects the *persisted* bucket-row baseline
+/// (`refill_rate`/`burst`) when a row is found on any reachable shard -- the
+/// same value dispatch actually enforces, since the separate, permanent
+/// `POST /admin/rate-limits/{key}` route can change it independently of the
+/// registry (see [`PacingOverrideResponse`]) -- and falls back to the live
+/// registry declaration only when no bucket row exists yet on any reachable
+/// shard, matching a fresh bucket's seeded value.
+///
+/// `404`/`409` mirror [`set_start_throttle_pacing_override`]'s registry
+/// validation. A registered, statically-throttled workflow whose bucket row
+/// does not exist yet (never touched by an admission attempt or an
+/// override) reports the declared baseline with `override_active: false`
+/// rather than `404` -- "no override configured" is a valid, common answer,
+/// not an error.
+#[allow(clippy::too_many_lines)]
+async fn get_start_throttle_pacing_override(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::{
+        harvest_rate_limit_buckets, key as bucket_key_col,
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to read"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    // Issue #945 review (round 4, P2): the previous merge picked a single
+    // "representative" row across shards by raw `tokens` count alone --
+    // e.g. `existing.tokens <= b.tokens => existing`. That is the right
+    // heuristic for `list_rate_limits`'s worst-case-capacity diagnostic, but
+    // WRONG for reporting whether an OPERATOR OVERRIDE is active: after a
+    // documented partial SET/DELETE, shards can genuinely disagree about
+    // override state (one shard still under a live override, another
+    // cleared or never written), and picking by token count can silently
+    // surface the WRONG shard's `override_active` in either direction --
+    // reporting "no override" while one is still live elsewhere, or the
+    // reverse. Collect every reachable shard's row instead, and derive
+    // `override_active` from an explicit per-shard tally rather than a
+    // proxy metric that has nothing to do with override state.
+    let mut snapshots: Vec<(i32, Option<RateLimitBucket>)> = Vec::new();
+    let mut any_reachable = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match harvest_rate_limit_buckets
+            .filter(bucket_key_col.eq(&key))
+            .select(RateLimitBucket::as_select())
+            .first::<RateLimitBucket>(&mut conn)
+            .await
+            .optional()
+        {
+            Ok(found) => {
+                any_reachable = true;
+                snapshots.push((shard_id.as_i32(), found));
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // A total shard outage must not be misreported as "no override
+    // configured" (issue #945 review, P2) -- this is an incident-response
+    // status read, and a silent false negative here is worse than an
+    // explicit failure.
+    if !shard_errors.is_empty() && !any_reachable {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now();
+    let is_active = |row: &Option<RateLimitBucket>| {
+        row.as_ref()
+            .is_some_and(|b| b.override_expires_at > Some(now))
+    };
+
+    // Disagreement is deliberately NOT "do the raw `override_expires_at`
+    // timestamps match exactly" -- a normal, fully successful multi-shard
+    // SET writes each shard's TTL from that shard's own `NOW()`, so
+    // millisecond clock skew alone would make virtually every healthy
+    // multi-shard override report a false "disagreement". Instead defer to
+    // `queue::pacing_shards_disagree`, comparing each shard's *resolved
+    // effective* `(refill_rate, burst)` rather than the raw
+    // `override_refill_rate`/`override_burst` columns (issue #945 review,
+    // round 5): a partial legacy `POST /admin/rate-limits/{key}` fan-out
+    // (issue #332) can leave shards with divergent persisted BASELINES, so
+    // two shards can carry byte-identical override columns yet enforce
+    // genuinely different pacing once an omitted override field falls back
+    // to each shard's own (diverged) baseline -- comparing raw columns
+    // alone would miss exactly that case.
+    let active_rows: Vec<&RateLimitBucket> = snapshots
+        .iter()
+        .filter(|(_, row)| is_active(row))
+        .filter_map(|(_, row)| row.as_ref())
+        .collect();
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = snapshots
+        .iter()
+        .map(|(_, row)| {
+            row.as_ref().map_or_else(
+                // No row on this reachable shard yet: report the declared
+                // baseline with no override active -- consistent with
+                // `build_response`'s own None-row fallback below.
+                || {
+                    queue::resolve_effective_rate_limit(
+                        declared_refill_rate,
+                        declared_burst,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                },
+                |b| {
+                    queue::resolve_effective_rate_limit(
+                        b.refill_rate,
+                        b.burst,
+                        b.override_refill_rate,
+                        b.override_burst,
+                        b.override_expires_at,
+                        now,
+                    )
+                },
+            )
+        })
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
+
+    // Representative row for the top-level (flattened, 200/207-body)
+    // response: prefer an ACTIVE row whenever any shard has one -- an
+    // incident-response "is my override active?" check should never
+    // silently answer "no" while a live override still governs dispatch on
+    // ANY shard -- else fall back to whatever row was found (all inactive),
+    // else `None` (no row anywhere -- report the registry-declared
+    // baseline, matching a fresh bucket's seeded value).
+    //
+    // `.iter().next()` rather than `.first()`, with an explicit
+    // `#[allow(clippy::iter_next_slice)]`: diesel's `RunQueryDsl` is
+    // blanket-implemented for every type (including `Vec<&RateLimitBucket>`
+    // itself, before any deref-to-slice occurs), so a bare `.first()` call
+    // here is resolved to `RunQueryDsl::first` -- a DB query method -- not
+    // the slice method, and fails to compile against a plain in-memory Vec
+    // (confirmed: applying clippy's own suggested `.first()` fix reintroduces
+    // that exact compile error).
+    #[allow(clippy::iter_next_slice)]
+    let representative: Option<&RateLimitBucket> = active_rows
+        .iter()
+        .next()
+        .copied()
+        .or_else(|| snapshots.iter().find_map(|(_, row)| row.as_ref()));
+
+    let build_response = |b: Option<&RateLimitBucket>| {
+        b.map_or_else(
+            || {
+                // No row on any *reachable* shard: nothing has been
+                // persisted yet, so the registry's declared value is exactly
+                // what a fresh bucket would be seeded at.
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    declared_refill_rate,
+                    declared_burst,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            |b| {
+                // A row was found: report the *persisted* baseline, not the
+                // registry's -- the separate, permanent `POST
+                // /admin/rate-limits/{key}` route can have changed
+                // `refill_rate`/`burst` independently, and dispatch reads
+                // the row, not the registry (issue #945 review, P2).
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    b.refill_rate,
+                    b.burst,
+                    b.override_refill_rate,
+                    b.override_burst,
+                    b.override_expires_at,
+                )
+            },
+        )
+    };
+
+    let response = build_response(representative);
+
+    if shard_errors.is_empty() && !disagreement {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        // Surface the full per-shard breakdown whenever the flattened
+        // top-level view can't be fully trusted -- either an unreachable
+        // shard (pre-existing) or a genuine cross-shard override
+        // disagreement (issue #945 review, P2). `shard_disagreement`
+        // distinguishes the two causes; `shards` lets an operator see
+        // exactly which shard(s) diverge rather than trusting a single
+        // silently-picked value.
+        let shards_json: serde_json::Map<String, serde_json::Value> = snapshots
+            .iter()
+            .map(|(shard_id, row)| {
+                let per_shard = build_response(row.as_ref());
+                (
+                    shard_id.to_string(),
+                    serde_json::to_value(per_shard).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+                "shard_disagreement": disagreement,
+                "shards": shards_json,
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StartThrottlePacingOverrideRequest {
+    refill_per_sec: Option<f64>,
+    burst: Option<f64>,
+    ttl_secs: u64,
+}
+
+/// `POST /admin/start-throttle/{workflow_name}/override` — set (or replace) a
+/// TTL'd runtime pacing override on top of a *declared* workflow-start
+/// throttle (issue #945).
+///
+/// Mirrors `set_rate_limit_pacing_override` exactly (same replace-not-merge
+/// semantics, same TTL validation via [`pacing_override_expiry`], same
+/// shared upsert SQL against `harvest_rate_limit_buckets`), but resolves the
+/// declared baseline from `WorkflowInfo.throttle`
+/// (`#[workflow(throttle(...))]`, issue #607) and the shared bucket key via
+/// [`autumn_harvest::throttle::bucket_key`] rather than the activity-side
+/// `rate_limit_key` convention. An unkeyed/global throttle resolves its
+/// bucket key with an empty resolved-key component
+/// (`throttle::bucket_key(workflow_name, "")`), matching the resolution the
+/// throttle admission path itself uses for a policy with no `key_expr`.
+///
+/// `404` when `workflow_name` is not registered, or is registered but
+/// declares no throttle. `409` when the throttle is dynamically per-key
+/// (`throttle(key = ...)`, issue #607) — a pacing override targets one
+/// static bucket and cannot disambiguate which resolved tenant key's bucket
+/// to override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`,
+/// an omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or
+/// above the server cap.
+#[allow(clippy::too_many_lines)]
+async fn set_start_throttle_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    Json(request): Json<StartThrottlePacingOverrideRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Some(rate) = request.refill_per_sec
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        return AutumnError::bad_request_msg(
+            "refill_per_sec must be a finite number greater than zero",
+        )
+        .into_response();
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+            .into_response();
+    }
+    if request.refill_per_sec.is_none() && request.burst.is_none() {
+        return AutumnError::bad_request_msg(
+            "must override at least one of refill_per_sec or burst",
+        )
+        .into_response();
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/start-throttle/{workflow_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_upsert_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .bind::<diesel::sql_types::Double, _>(declared_refill_rate)
+            .bind::<diesel::sql_types::Double, _>(declared_burst)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(
+                request.refill_per_sec,
+            )
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_START_THROTTLE_PACING_OVERRIDE_SET,
+        target_type: TARGET_THROTTLE,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for start_throttle.pacing_override.set"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for start_throttle.pacing_override.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted baseline the write just confirmed (issue #945
+    // review, P2), falling back to the registry only in the pathological
+    // case where every reachable shard's write raced past the
+    // `!any_success` guard above without ever returning a row.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response = PacingOverrideResponse::build(
+        key,
+        baseline_refill_rate,
+        baseline_burst,
+        request.refill_per_sec,
+        request.burst,
+        Some(expires_at),
+    );
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/start-throttle/{workflow_name}/override` — clear a TTL'd
+/// runtime pacing override before its TTL elapses (issue #945).
+///
+/// Idempotent: clearing a workflow with no active override still returns
+/// `200` reporting the declared baseline (`override_active: false`). `404`/
+/// `409` mirror [`set_start_throttle_pacing_override`]'s registry-lookup
+/// validation.
+#[allow(clippy::too_many_lines)]
+async fn clear_start_throttle_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "DELETE /admin/start-throttle/{workflow_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_clear_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+        target_type: TARGET_THROTTLE,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for start_throttle.pacing_override.clear"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for start_throttle.pacing_override.clear"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted (now-reverted) baseline the clear just confirmed
+    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard -- the documented
+    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
+    // declaration is exactly correct, since a bucket that has never been
+    // written can only ever agree with it.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response =
+        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
 async fn pending_event_batches(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<autumn_harvest::event_batch::PendingEventBatchRecord>>, AutumnError> {
@@ -26676,16 +33099,19 @@ async fn pending_event_batches(
 
 async fn list_rate_limits(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<Vec<RateLimitBucket>>, AutumnError> {
+) -> Result<Json<Vec<RateLimitBucketView>>, AutumnError> {
     use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::harvest_rate_limit_buckets;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     // Aggregate across all shards so operators see every configured key.
-    // Rate-limit config is written to all shards by `set_rate_limit`; per-shard
-    // token counters diverge at runtime.  Deduplicate by key, keeping the entry
-    // with the fewest remaining tokens (worst-case view across the fleet).
-    let mut merged: std::collections::BTreeMap<String, RateLimitBucket> =
+    // Rate-limit config is written to all shards by `set_rate_limit`; a TTL'd
+    // pacing override (issue #945) can also diverge across shards after a
+    // partial write or an outage recovery. Collect EVERY shard's row per key
+    // -- not just a single "representative" pick -- so cross-shard override
+    // disagreement can be detected rather than silently hidden behind
+    // whichever shard's row happened to be kept (issue #945 review, round 5).
+    let mut per_key: std::collections::BTreeMap<String, Vec<RateLimitBucket>> =
         std::collections::BTreeMap::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -26697,23 +33123,70 @@ async fn list_rate_limits(
             .map_err(database_error)
             .map_err(map_error)?;
         for b in buckets {
-            use std::collections::btree_map::Entry;
-            match merged.entry(b.key.clone()) {
-                Entry::Vacant(e) => {
-                    e.insert(b);
-                }
-                Entry::Occupied(mut e) => {
-                    // Keep the most-depleted view (lowest tokens) so operators see
-                    // the worst-case shard rather than an optimistically full one.
-                    if b.tokens < e.get().tokens {
-                        e.insert(b);
-                    }
-                }
-            }
+            per_key.entry(b.key.clone()).or_default().push(b);
         }
     }
 
-    Ok(Json(merged.into_values().collect()))
+    let now = chrono::Utc::now();
+    Ok(Json(
+        per_key
+            .into_values()
+            .map(|rows| build_rate_limit_bucket_view(&rows, now))
+            .collect(),
+    ))
+}
+
+/// Merges one key's per-shard `RateLimitBucket` rows into a single
+/// [`RateLimitBucketView`], reporting cross-shard override disagreement
+/// (issue #945 review, round 5) alongside the pre-existing worst-case
+/// (lowest-tokens) representative-row selection.
+///
+/// # Panics
+///
+/// Never in practice: `rows` is always non-empty here, built from the
+/// `BTreeMap<String, Vec<RateLimitBucket>>` entries in [`list_rate_limits`],
+/// which only ever inserts a key alongside at least one row.
+fn build_rate_limit_bucket_view(
+    rows: &[RateLimitBucket],
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitBucketView {
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
+        .iter()
+        .map(|b| {
+            queue::resolve_effective_rate_limit(
+                b.refill_rate,
+                b.burst,
+                b.override_refill_rate,
+                b.override_burst,
+                b.override_expires_at,
+                now,
+            )
+        })
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
+
+    // Representative row: prefer an ACTIVE override row whenever any shard
+    // has one -- an operator scanning this list for "which keys are
+    // currently overridden right now?" must never silently miss one just
+    // because a *different*, non-overridden shard happened to have fewer
+    // tokens (issue #945 review, round 5; mirrors
+    // `get_start_throttle_pacing_override`'s round-4 fix). Among a
+    // homogeneous set (all active, or all inactive), keep the pre-existing
+    // worst-case (lowest tokens) heuristic so operators still see the most
+    // depleted shard rather than an optimistically full one.
+    let is_active =
+        |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
+    let representative = rows
+        .iter()
+        .filter(|b| is_active(b))
+        .min_by(|a, b| a.tokens.total_cmp(&b.tokens))
+        .or_else(|| rows.iter().min_by(|a, b| a.tokens.total_cmp(&b.tokens)))
+        .expect("rows is always non-empty (see fn docs)");
+
+    RateLimitBucketView {
+        shard_disagreement: disagreement,
+        ..RateLimitBucketView::from(representative.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -26809,6 +33282,709 @@ async fn set_rate_limit(
         )));
     }
     Ok(Json(BasicAck { ok: true }))
+}
+
+// ── TTL'd Pacing Overrides (rate limits + start throttles, issue #945) ─────
+//
+// A temporary, self-expiring layer on top of an already-*declared* rate
+// limit / start throttle. Distinct from the legacy `POST
+// /admin/rate-limits/{key}` above, which permanently rewrites a bucket's
+// baseline: these routes never touch `refill_rate`/`burst`, only the
+// additive `override_*` columns, and require no worker restart (the
+// effective-value SQL in `queue::effective_refill_rate_expr`/
+// `effective_burst_expr` is consulted fresh on every claim/dispatch) and no
+// operator action to revert (a plain `override_expires_at > NOW()` check).
+
+/// Validates a pacing-override TTL and computes its absolute expiry
+/// (issue #945).
+///
+/// `ttl_secs` must be non-zero — an override with no lifetime is meaningless
+/// (use the permanent `POST /admin/rate-limits/{key}` route for a durable
+/// change) — and must not exceed [`queue::MAX_PACING_OVERRIDE_TTL_SECS`], the
+/// server-side ceiling that guards against a forgotten override silently
+/// outliving the incident it was meant to mitigate.
+fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    if ttl_secs == 0 {
+        return Err(AutumnError::bad_request_msg(
+            "ttl_secs must be greater than zero",
+        ));
+    }
+    let max = u64::try_from(queue::MAX_PACING_OVERRIDE_TTL_SECS).unwrap_or(u64::MAX);
+    if ttl_secs > max {
+        return Err(AutumnError::bad_request_msg(format!(
+            "ttl_secs must not exceed the server cap of {max} seconds ({} hours)",
+            max / 3600
+        )));
+    }
+    let delta = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+    let now = chrono::Utc::now();
+    Ok(now.checked_add_signed(delta).unwrap_or(now))
+}
+
+/// Response body for the TTL'd pacing-override SET/CLEAR/GET routes (issue
+/// #945).
+///
+/// `declared_*` is the baseline `effective_*`/`override_active` are computed
+/// against. It MUST be the persisted bucket row's own `refill_rate`/`burst`
+/// columns whenever a row exists, never passed through unread from the
+/// registered `#[activity(rate_limit(...))]` / `#[workflow(throttle(...))]`
+/// policy — the two can diverge, because the separate, permanent
+/// `POST /admin/rate-limits/{key}` route (issue #332/#699) can change a
+/// bucket's baseline columns independently, and this override's upsert/clear
+/// SQL deliberately never touches `refill_rate`/`burst` itself. Reporting
+/// the registry value in that situation would compute an `effective_*`
+/// dispatch is not actually enforcing (issue #945 review, P2). Every SET/
+/// CLEAR call site therefore reads the row's baseline back via the shared
+/// SQL builders' `RETURNING refill_rate, burst` clause
+/// ([`PersistedBaseline`]) and passes *that* here, falling back to the live
+/// registry declaration only when no bucket row exists yet on any reachable
+/// shard — a fresh bucket is always seeded at the registry's declared value
+/// (see [`pacing_override_upsert_sql`]), so the two necessarily agree there.
+/// `override_*` reports the raw override state just written (`None` after a
+/// clear). `effective_*`/`override_active` mirror
+/// [`queue::resolve_effective_rate_limit`] — what dispatch is actually
+/// enforcing right now, computed without a second query round-trip.
+#[derive(Debug, Serialize)]
+struct PacingOverrideResponse {
+    key: String,
+    declared_refill_rate: f64,
+    declared_burst: f64,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_active: bool,
+    effective_refill_rate: f64,
+    effective_burst: f64,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PacingOverrideResponse {
+    fn build(
+        key: String,
+        declared_refill_rate: f64,
+        declared_burst: f64,
+        override_refill_rate: Option<f64>,
+        override_burst: Option<f64>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        let effective = queue::resolve_effective_rate_limit(
+            declared_refill_rate,
+            declared_burst,
+            override_refill_rate,
+            override_burst,
+            expires_at,
+            chrono::Utc::now(),
+        );
+        Self {
+            key,
+            declared_refill_rate,
+            declared_burst,
+            override_refill_rate,
+            override_burst,
+            override_active: effective.override_active,
+            effective_refill_rate: effective.refill_rate,
+            effective_burst: effective.burst,
+            expires_at,
+        }
+    }
+}
+
+/// Rate-limit bucket state surfaced by `GET /admin/rate-limits` (issue
+/// #945): every field the pre-#945 raw-model response already carried
+/// (`key`/`refill_rate`/`burst`/`tokens`/`last_refilled_at`/`created_at`/
+/// `updated_at`/`override_refill_rate`/`override_burst`/
+/// `override_expires_at`) is preserved **unchanged** -- an existing
+/// consumer parsing e.g. `entry["burst"]` keeps working -- plus four new
+/// computed fields: `override_active`, `effective_refill_rate`,
+/// `effective_burst` resolve what dispatch is actually enforcing right now;
+/// `shard_disagreement` (round 5) reports whether the fleet's shards
+/// disagree on that state.
+///
+/// This is purely additive on top of the raw `RateLimitBucket` shape;
+/// nothing is renamed or removed.
+#[derive(Debug, Clone, Serialize)]
+struct RateLimitBucketView {
+    key: String,
+    refill_rate: f64,
+    burst: f64,
+    tokens: f64,
+    last_refilled_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether `override_expires_at` is set and strictly in the future
+    /// (issue #945).
+    override_active: bool,
+    /// The refill rate actually enforced right now: the override's, when
+    /// `override_active`, else the declared baseline `refill_rate`.
+    effective_refill_rate: f64,
+    /// The burst actually enforced right now: the override's, when
+    /// `override_active`, else the declared baseline `burst`.
+    effective_burst: f64,
+    /// Whether the shards backing this key's rows disagree on override
+    /// state or resolved effective pacing (issue #945 review, round 5).
+    /// `false` for a single-shard row on its own -- this field is only ever
+    /// set `true` by [`build_rate_limit_bucket_view`], which has the
+    /// multi-shard context [`From<RateLimitBucket>`] lacks. When `true`,
+    /// the other fields above still reflect a best-effort representative
+    /// shard (preferring an active override), but an operator should not
+    /// treat them as authoritative for every shard.
+    shard_disagreement: bool,
+}
+
+impl From<RateLimitBucket> for RateLimitBucketView {
+    fn from(b: RateLimitBucket) -> Self {
+        let effective = queue::resolve_effective_rate_limit(
+            b.refill_rate,
+            b.burst,
+            b.override_refill_rate,
+            b.override_burst,
+            b.override_expires_at,
+            chrono::Utc::now(),
+        );
+        Self {
+            key: b.key,
+            refill_rate: b.refill_rate,
+            burst: b.burst,
+            tokens: b.tokens,
+            last_refilled_at: b.last_refilled_at,
+            created_at: b.created_at,
+            updated_at: b.updated_at,
+            override_refill_rate: b.override_refill_rate,
+            override_burst: b.override_burst,
+            override_expires_at: b.override_expires_at,
+            override_active: effective.override_active,
+            effective_refill_rate: effective.refill_rate,
+            effective_burst: effective.burst,
+            shard_disagreement: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_bucket_view_tests {
+    use super::{RateLimitBucket, RateLimitBucketView};
+    use chrono::{TimeZone as _, Utc};
+
+    fn bucket(
+        override_refill_rate: Option<f64>,
+        override_burst: Option<f64>,
+        override_expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> RateLimitBucket {
+        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        RateLimitBucket {
+            key: "send_email".to_string(),
+            refill_rate: 5.0,
+            burst: 10.0,
+            tokens: 3.0,
+            last_refilled_at: ts,
+            created_at: ts,
+            updated_at: ts,
+            override_refill_rate,
+            override_burst,
+            override_expires_at,
+        }
+    }
+
+    #[test]
+    fn no_override_reports_declared_as_effective() {
+        let view = RateLimitBucketView::from(bucket(None, None, None));
+        assert!(!view.override_active);
+        // Existing (pre-#945) field names are preserved unchanged for the
+        // list endpoint -- no rename, purely additive.
+        assert_eq!(view.key, "send_email");
+        assert!((view.refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.burst - 10.0).abs() < 1e-9);
+        assert!((view.tokens - 3.0).abs() < 1e-9);
+        assert_eq!(view.override_expires_at, None);
+        // New computed fields.
+        assert!((view.effective_refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.effective_burst - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn active_override_reports_override_as_effective() {
+        let expires = Utc::now() + chrono::Duration::seconds(300);
+        let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expires)));
+        assert!(view.override_active);
+        assert!((view.refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.burst - 10.0).abs() < 1e-9);
+        assert!((view.effective_refill_rate - 50.0).abs() < 1e-9);
+        assert!((view.effective_burst - 100.0).abs() < 1e-9);
+        assert_eq!(view.override_expires_at, Some(expires));
+    }
+
+    #[test]
+    fn expired_override_falls_back_to_declared_as_effective() {
+        let expired = Utc::now() - chrono::Duration::seconds(1);
+        let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expired)));
+        assert!(!view.override_active);
+        assert!((view.effective_refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.effective_burst - 10.0).abs() < 1e-9);
+        // The raw override columns are still surfaced even when expired --
+        // an operator can see what the last (now-lapsed) override was.
+        assert_eq!(view.override_refill_rate, Some(50.0));
+        assert_eq!(view.override_expires_at, Some(expired));
+    }
+}
+
+/// Builds the `INSERT ... ON CONFLICT (key) DO UPDATE` statement that sets
+/// (or replaces) a bucket's TTL'd pacing override (issue #945).
+///
+/// **Settles the token bucket in the same statement that rewrites the
+/// effective rate.** Neither `tokens` nor `last_refilled_at` may be left
+/// untouched here: [`queue::effective_available_tokens_expr`] re-rates the
+/// *entire* elapsed-since-last-refill window at whichever rate happens to be
+/// effective at the *next read* -- so a write that only flips the
+/// `override_*` columns would let a bucket that has been idle for hours
+/// suddenly "accrue" hours' worth of tokens under a brand-new, much higher
+/// override rate the instant it is set (an unbounded phantom credit bounded
+/// only by the newly-set burst). Settling first -- computing how many tokens
+/// had genuinely accrued under the OLD effective rate, capped at the NEW
+/// effective burst, and stamping `last_refilled_at = NOW()` -- closes that
+/// gap. This is safe as one atomic `UPDATE`/`INSERT ... ON CONFLICT`
+/// statement because Postgres evaluates every `SET`-clause expression
+/// against the row's pre-update values, so the settle expression (which
+/// still reads the OLD `override_*` columns) and the `override_*` columns
+/// being overwritten by this same statement cannot race each other.
+/// Mirrors the pre-existing `set_rate_limit` legacy handler's identical
+/// settle-on-rewrite pattern.
+///
+/// On first-ever bucket creation (the `VALUES` branch, no prior row to
+/// settle from), `tokens` seeds at `COALESCE($5, $3)` -- the just-set
+/// override burst if one was supplied in this same call, else the declared
+/// baseline burst -- so a bucket created with a simultaneous override starts
+/// fully topped up under the override's cap, not the (possibly lower or
+/// higher) declared one.
+fn pacing_override_upsert_sql() -> String {
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    format!(
+        "INSERT INTO harvest_rate_limit_buckets \
+         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+          override_refill_rate, override_burst, override_expires_at) \
+         VALUES ($1, $2, $3, COALESCE($5, $3), NOW(), NOW(), NOW(), $4, $5, $6) \
+         ON CONFLICT (key) DO UPDATE \
+         SET override_refill_rate = $4, \
+             override_burst = $5, \
+             override_expires_at = $6, \
+             tokens = LEAST(COALESCE($5, harvest_rate_limit_buckets.burst), {effective_tokens}), \
+             last_refilled_at = NOW(), \
+             updated_at = NOW() \
+         RETURNING refill_rate, burst"
+    )
+}
+
+/// Row returned by the `RETURNING refill_rate, burst` clause on
+/// [`pacing_override_upsert_sql`]/[`pacing_override_clear_sql`] -- the
+/// bucket's *persisted* baseline immediately after the write, which the
+/// SET/CLEAR handlers thread into [`PacingOverrideResponse::build`] instead
+/// of the registry-declared value (issue #945 review, P2: the separate,
+/// permanent `POST /admin/rate-limits/{key}` route can have changed these
+/// columns independently, and this override's `ON CONFLICT`/`UPDATE` never
+/// touches them).
+#[derive(diesel::QueryableByName)]
+struct PersistedBaseline {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    refill_rate: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    burst: f64,
+}
+
+/// Builds the `UPDATE ... WHERE key = $1` statement that clears a bucket's
+/// pacing override (issue #945).
+///
+/// Settles the bucket for the identical reason [`pacing_override_upsert_sql`]
+/// does, in the opposite direction: without settling, clearing a
+/// high-refill-rate override on a bucket that has been idle leaves the
+/// *pre-clear* elapsed window to be re-rated at the (usually much lower)
+/// declared baseline rate the instant it is cleared, discarding tokens the
+/// bucket had genuinely earned under the override that was in effect right
+/// up until this statement runs. The settle expression still reads the OLD
+/// (about-to-be-cleared) `override_*` columns -- Postgres evaluates every
+/// `SET`-clause expression against pre-update values -- then the outer
+/// `LEAST(harvest_rate_limit_buckets.burst, ...)` re-caps to the *post-clear*
+/// declared burst, since the override may have granted a higher cap than the
+/// baseline.
+fn pacing_override_clear_sql() -> String {
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    format!(
+        "UPDATE harvest_rate_limit_buckets \
+         SET override_refill_rate = NULL, override_burst = NULL, override_expires_at = NULL, \
+             tokens = LEAST(harvest_rate_limit_buckets.burst, {effective_tokens}), \
+             last_refilled_at = NOW(), \
+             updated_at = NOW() \
+         WHERE key = $1 \
+         RETURNING refill_rate, burst"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitPacingOverrideRequest {
+    refill_rate: Option<f64>,
+    burst: Option<f64>,
+    ttl_secs: u64,
+}
+
+/// `POST /admin/rate-limits/{activity_name}/override` — set (or replace) a
+/// TTL'd runtime pacing override on top of a *declared* per-activity rate
+/// limit (issue #945).
+///
+/// Each call **replaces** the whole override — a field omitted from this
+/// call reverts to the declared baseline even if a *previous* call had
+/// overridden it, rather than being merged forward with that earlier call.
+///
+/// `404` when `activity_name` is not a registered activity, or is registered
+/// but declares no rate limit. `409` when the activity's rate limit is
+/// dynamically per-key (`rate_limit(key = ...)`, issue #699) — a pacing
+/// override targets one static bucket and cannot disambiguate which
+/// resolved tenant key's bucket to override. `400` on a non-finite/
+/// non-positive `refill_rate`/`burst`, an omitted `refill_rate`/`burst`
+/// pair, or a `ttl_secs` of zero or above the server cap.
+#[allow(clippy::too_many_lines)]
+async fn set_rate_limit_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    Json(request): Json<RateLimitPacingOverrideRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Some(rate) = request.refill_rate
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        return AutumnError::bad_request_msg(
+            "refill_rate must be a finite number greater than zero",
+        )
+        .into_response();
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+            .into_response();
+    }
+    if request.refill_rate.is_none() && request.burst.is_none() {
+        return AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
+            .into_response();
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+            .into_response();
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' has no declared rate limit; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "activity '{activity_name}' uses a dynamic per-key rate limit \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/rate-limits/{activity_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_upsert_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .bind::<diesel::sql_types::Double, _>(declared_refill_rate)
+            .bind::<diesel::sql_types::Double, _>(declared_burst)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.refill_rate)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+        target_type: TARGET_RATE_LIMIT,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for rate_limit.pacing_override.set"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for rate_limit.pacing_override.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted baseline the write just confirmed (issue #945
+    // review, P2), falling back to the registry only in the pathological
+    // case where every reachable shard's write raced past the
+    // `!any_success` guard above without ever returning a row.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response = PacingOverrideResponse::build(
+        key,
+        baseline_refill_rate,
+        baseline_burst,
+        request.refill_rate,
+        request.burst,
+        Some(expires_at),
+    );
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/rate-limits/{activity_name}/override` — clear a TTL'd
+/// runtime pacing override before its TTL elapses (issue #945).
+///
+/// Idempotent: clearing an activity with no active override still returns
+/// `200` reporting the declared baseline (`override_active: false`). `404`/
+/// `409` mirror [`set_rate_limit_pacing_override`]'s registry-lookup
+/// validation.
+#[allow(clippy::too_many_lines)]
+async fn clear_rate_limit_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+            .into_response();
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' has no declared rate limit; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "activity '{activity_name}' uses a dynamic per-key rate limit \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "DELETE /admin/rate-limits/{activity_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_clear_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+        target_type: TARGET_RATE_LIMIT,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for rate_limit.pacing_override.clear"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for rate_limit.pacing_override.clear"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted (now-reverted) baseline the clear just confirmed
+    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard -- the documented
+    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
+    // declaration is exactly correct, since a bucket that has never been
+    // written can only ever agree with it.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response =
+        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
 }
 
 // ── Circuit Breaker Management (issue #369) ─────────────────────────────────
@@ -26958,6 +34134,2947 @@ async fn queues_scaling_signal(
     }
 
     Ok(Json(signals).into_response())
+}
+
+// ── Task-queue pause / resume (issue #619) ───────────────────────────────────
+
+/// Body of `POST /admin/queues/{queue_name}/pause`.
+///
+/// `deny_unknown_fields` because `shard_id`'s **absence** is meaningful here: it
+/// selects the fleet-wide default. Serde's default leniency would accept a typo
+/// like `{"reason": "…", "shard": 1}` as `shard_id: None`, silently widening a
+/// shard-scoped request to the whole fleet — and on the resume sibling that
+/// releases every hold mid-outage while reporting success (issue #619 review).
+/// The body is parsed with `serde_json::from_slice`, so the resulting error
+/// already flows through this route's audited `400`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PauseQueueRequest {
+    /// Human-readable reason for the hold, surfaced on the read API and in the
+    /// Vantage UI. Required — an unexplained hold is an incident-response
+    /// hazard for the next operator.
+    pub reason: String,
+    /// `None` (default) = fleet-wide: the hold is applied on every shard.
+    /// `Some(n)` scopes it to shard `n` only.
+    #[serde(default)]
+    pub shard_id: Option<i32>,
+}
+
+/// Body of `POST /admin/queues/{queue_name}/resume`.
+///
+/// `deny_unknown_fields` for the reason on [`PauseQueueRequest`], which bites
+/// harder here: this is the *destructive* direction. A typo'd `shard` field
+/// would release every shard's hold rather than the one named, so the blast
+/// radius of a one-character mistake is the entire fleet's dispatch resuming
+/// into an outage. An empty body is still accepted (fleet-wide by design) — it
+/// never reaches the deserializer.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeQueueRequest {
+    /// `None` (default) = release the hold on every shard. `Some(n)` releases
+    /// only shard `n`.
+    #[serde(default)]
+    pub shard_id: Option<i32>,
+}
+
+/// The shards a queue pause/resume will touch, and any shard the router knows
+/// about that this process has no pool for.
+type QueuePauseTargets = (Vec<(i32, ::autumn_harvest::worker::DbPool)>, Vec<i32>);
+
+/// Resolve the shard pools a pause/resume should touch, plus any shard the
+/// router knows about that this process has no pool for.
+///
+/// `None` → every shard (fleet-wide, the default). `Some(n)` → shard `n` only.
+///
+/// The expected-shard set comes from [`shard_fanout::expected_shards`], not
+/// from the local pool map, for the reason that helper documents: a shard the
+/// router knows but this process has no pool for yet (mid a shard-add rollout)
+/// must be *reported*, never silently omitted. Omitting it would let a
+/// fleet-wide pause return an unqualified success while that shard kept
+/// dispatching into the outage — with no diagnostic at all, which is strictly
+/// worse than the partial-failure signal.
+///
+/// A poolless-but-known shard named explicitly is a `503`, not a `400`: the
+/// shard id is real, this process just cannot reach it, and "unknown
+/// `shard_id`" would point the operator at a typo instead of the actual
+/// condition.
+fn queue_pause_target_pools(
+    api_state: &HarvestApiState,
+    shard_id: Option<i32>,
+) -> Result<QueuePauseTargets, AutumnError> {
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured",
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    match shard_id {
+        None => {
+            let mut targets = Vec::new();
+            let mut unreachable = Vec::new();
+            for shard in expected {
+                if let Some(pool) = pools.get(&shard) {
+                    targets.push((shard, pool.clone()));
+                } else {
+                    unreachable.push(shard);
+                }
+            }
+            Ok((targets, unreachable))
+        }
+        Some(target) => pools.get(&target).map_or_else(
+            || {
+                if expected.contains(&target) {
+                    Err(AutumnError::service_unavailable_msg(format!(
+                        "shard {target} is known to the router but has no pool in this process"
+                    )))
+                } else {
+                    Err(AutumnError::bad_request_msg(format!(
+                        "unknown shard_id {target}"
+                    )))
+                }
+            },
+            |pool| Ok((vec![(target, pool.clone())], Vec::new())),
+        ),
+    }
+}
+
+/// A hold that did not reach every target shard is NOT in effect fleet-wide:
+/// the shards it missed keep dispatching into exactly the outage the operator
+/// is trying to ride out. Reporting that as `200 {"ok": true}` (with the detail
+/// buried in a string field) is the one way this feature can silently fail an
+/// incident, so a partial application is `207` with `ok: false` and the same
+/// `status` / `partial_failures` vocabulary the read side already uses.
+/// Re-issuing is safe — both operations are idempotent.
+const fn queue_pause_partial_status(partial: Option<&str>) -> (StatusCode, bool, &'static str) {
+    if partial.is_some() {
+        (StatusCode::MULTI_STATUS, false, "partial")
+    } else {
+        (StatusCode::OK, true, "complete")
+    }
+}
+
+/// Fold a partial-failure summary into a pause/resume response payload.
+fn queue_pause_attach_partial(payload: &mut Value, partial: Option<String>) {
+    if let Some(partial) = partial
+        && let Some(map) = payload.as_object_mut()
+    {
+        map.insert("partial_failures".to_string(), Value::String(partial));
+    }
+}
+
+/// The `(actor, source, request_id)` triple every pause/resume audit row needs.
+type QueuePauseAuditCtx = (String, String, Option<String>);
+
+/// Audit a rejected pause/resume and turn the error into a response.
+///
+/// A rejected hold attempt on a fleet-wide dispatch kill switch is exactly what
+/// an incident review needs to see, so every rejection path is audited
+/// (symmetric with `fail_activity_now`'s malformed-id handling).
+async fn reject_queue_pause(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    operation: &'static str,
+    route: &'static str,
+    queue_name: &str,
+    status_error: AutumnError,
+    summary: &str,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit;
+    write_queue_pause_rejection_audit(
+        api_state,
+        actor,
+        source,
+        request_id.as_deref(),
+        operation,
+        route,
+        queue_name,
+        summary,
+    )
+    .await;
+    status_error.into_response()
+}
+
+/// Validate the queue name and resolve the target shards for a pause/resume.
+///
+/// On rejection the audit row is written here and a ready-to-send response is
+/// returned in `Err`, so both handlers share one rejection contract. The
+/// returned `Vec<String>` seeds the per-shard failure list with any shard the
+/// router knows about but this process cannot reach.
+#[allow(clippy::result_large_err)]
+async fn prepare_queue_pause_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    shard_id: Option<i32>,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let canonical_queue = match ::autumn_harvest::queue_pause::validate_queue_name(queue_name) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let summary = error.to_string();
+            return Err(reject_queue_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                queue_name,
+                map_error(error),
+                &summary,
+            )
+            .await);
+        }
+    };
+    let (targets, unreachable) = match queue_pause_target_pools(api_state, shard_id) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let summary = format!("{error:?}");
+            return Err(reject_queue_pause(
+                api_state, audit, operation, route, queue_name, error, &summary,
+            )
+            .await);
+        }
+    };
+    let failures = unreachable
+        .iter()
+        .map(|shard| format!("shard {shard}: known to the router but has no pool in this process"))
+        .collect();
+    Ok((canonical_queue, targets, failures))
+}
+
+/// Parse and validate a pause request body.
+///
+/// A hold with no stated reason is an incident-response hazard for the next
+/// operator, so an empty `reason` is rejected here rather than stored. On
+/// rejection the audit row is written and a ready-to-send response returned in
+/// `Err`, matching [`prepare_queue_pause_targets`]'s contract.
+#[allow(clippy::result_large_err)]
+async fn parse_pause_request(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    body: &axum::body::Bytes,
+    route: &'static str,
+) -> Result<PauseQueueRequest, axum::response::Response> {
+    let mut request: PauseQueueRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => {
+            let summary = format!("invalid request body: {error}");
+            return Err(reject_queue_pause(
+                api_state,
+                audit,
+                OP_QUEUE_PAUSE,
+                route,
+                queue_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await);
+        }
+    };
+    if request.reason.trim().is_empty() {
+        let summary = "a queue pause requires a non-empty reason";
+        return Err(reject_queue_pause(
+            api_state,
+            audit,
+            OP_QUEUE_PAUSE,
+            route,
+            queue_name,
+            AutumnError::bad_request_msg(summary),
+            summary,
+        )
+        .await);
+    }
+    // Normalize here, in the same place the non-empty rule is enforced, so the
+    // value we validated IS the value we store.
+    //
+    // The handler bounds this reason with `truncate_operator_reason` before the
+    // core sees it, and the core independently re-rejects a whitespace-only
+    // reason. Validating the raw string and then truncating a *different* one
+    // lets the two disagree: a reason of 500+ leading spaces followed by real
+    // text passes the check above (it trims to something), truncates to pure
+    // whitespace, and is then rejected by every shard — surfacing as an opaque
+    // 500 with the queue still dispatching, instead of the audited 400 this
+    // route promises. Trimming first makes that impossible by construction
+    // rather than by a second check: the trimmed string is non-empty and starts
+    // with a non-whitespace character, so any non-empty prefix of it still
+    // contains one. It also stops leading whitespace from eating the operator's
+    // actual words out of the 500-character budget.
+    request.reason = request.reason.trim().to_string();
+    Ok(request)
+}
+
+/// The fleet-wide roll-up of a pause applied shard by shard.
+struct PauseApplication {
+    /// True when at least one shard transitioned from dispatching to held.
+    newly_paused: bool,
+    /// Held tasks summed across every shard the hold reached.
+    held_task_count: i64,
+    /// Every shard that applied the hold, with its own effective row.
+    ///
+    /// Kept per-shard rather than collapsed to the first success: a re-pause
+    /// preserves each shard's ORIGINAL provenance, so a fleet-wide request
+    /// landing over pre-existing scoped holds leaves the shards disagreeing.
+    /// Labelling the fleet-wide `held_task_count` with one shard's reason,
+    /// actor, timestamp and scope would then be untrue for the rest of the
+    /// fleet (issue #619 review).
+    per_shard: Vec<(i32, ::autumn_harvest::queue_pause::PauseOutcome)>,
+}
+
+/// Apply the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting — one unreachable shard must not stop the
+/// others from being held.
+async fn apply_pause_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_queue: &str,
+    reason: &str,
+    actor: &str,
+    scope_shard_id: Option<i32>,
+    failures: &mut Vec<String>,
+) -> PauseApplication {
+    let mut applied = PauseApplication {
+        newly_paused: false,
+        held_task_count: 0,
+        per_shard: Vec::new(),
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::queue_pause::pause_queue(
+            &mut conn,
+            canonical_queue,
+            reason,
+            actor,
+            scope_shard_id,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                applied.newly_paused |= outcome.newly_paused;
+                applied.held_task_count += outcome.held_task_count;
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of a pause, plus each shard's own row.
+struct PauseProvenance<'a> {
+    /// The earliest hold — the deterministic top-level summary.
+    effective: &'a ::autumn_harvest::queue_pause::PauseOutcome,
+    /// False when the shards disagree on `(reason, paused_by, scope_shard_id)`.
+    uniform: bool,
+    /// Per-shard detail, so a divergent hold loses nothing.
+    shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first.
+    ///
+    /// [`Self::shards`] goes only to the transient HTTP response; this is what
+    /// the durable audit row carries, so an idempotent re-pause records the
+    /// provenance actually holding the fleet rather than the request's.
+    held_groups: Vec<HeldHoldGroup>,
+}
+
+/// Summarise a fleet-wide pause without discarding any shard's provenance.
+///
+/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
+/// same rule `merge_paused_queue_rows` and the Vantage banner use, so the
+/// mutation response, the read endpoint and the UI can never tell an operator
+/// three different stories about one hold. `uniform` compares
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`:
+/// each shard stamps its own `NOW()`, so including it would flag essentially
+/// every healthy fleet-wide hold as divergent.
+///
+/// Returns `None` only when every target shard failed.
+fn summarise_pause_provenance(
+    per_shard: &[(i32, ::autumn_harvest::queue_pause::PauseOutcome)],
+) -> Option<PauseProvenance<'_>> {
+    let (_, effective) = per_shard
+        .iter()
+        .min_by_key(|(shard_id, outcome)| (outcome.paused_at, *shard_id))?;
+    let uniform = per_shard.iter().all(|(_, outcome)| {
+        outcome.reason == effective.reason
+            && outcome.paused_by == effective.paused_by
+            && outcome.scope_shard_id == effective.scope_shard_id
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_paused": outcome.newly_paused,
+                "reason": outcome.reason,
+                "paused_by": outcome.paused_by,
+                "paused_at": outcome.paused_at,
+                "scope_shard_id": outcome.scope_shard_id,
+                "held_task_count": outcome.held_task_count,
+            })
+        })
+        .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
+    Some(PauseProvenance {
+        effective,
+        uniform,
+        shards,
+        held_groups,
+    })
+}
+
+/// The fleet-wide roll-up of a resume applied shard by shard.
+struct ResumeApplication {
+    /// True when at least one shard actually released a hold.
+    newly_resumed: bool,
+    /// Tasks credited their held time back, summed across shards.
+    released_task_count: i64,
+    /// The longest hold released, in seconds.
+    paused_duration_secs: i64,
+    /// Every shard that completed, with the provenance it released.
+    ///
+    /// Per-shard rather than first-success: the resume DELETES the pause rows,
+    /// so anything dropped here is gone for good. Independently-paused shards
+    /// legitimately carry different reasons and operators, and an operator
+    /// closing out an incident needs all of them (issue #619 review).
+    per_shard: Vec<(i32, ::autumn_harvest::queue_pause::ResumeOutcome)>,
+    /// True when at least one shard completed without error.
+    any_ok: bool,
+}
+
+/// Release the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting.
+async fn apply_resume_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_queue: &str,
+    actor: &str,
+    failures: &mut Vec<String>,
+) -> ResumeApplication {
+    let mut applied = ResumeApplication {
+        newly_resumed: false,
+        released_task_count: 0,
+        paused_duration_secs: 0,
+        per_shard: Vec::new(),
+        any_ok: false,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::queue_pause::resume_queue(&mut conn, canonical_queue, actor).await {
+            Ok(outcome) => {
+                applied.any_ok = true;
+                applied.newly_resumed |= outcome.newly_resumed;
+                applied.released_task_count += outcome.released_task_count;
+                applied.paused_duration_secs = applied
+                    .paused_duration_secs
+                    .max(outcome.paused_duration_secs);
+                // The pause row is deleted by the resume, so this is the last
+                // moment the *why* is recoverable — keep EVERY shard's, not
+                // just the first, so an operator closing out an incident sees
+                // all the holds they released.
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// Identity of one released hold: `(reason, operator)`.
+///
+/// A named alias rather than an inline tuple so the grouping map below stays
+/// under `clippy::type_complexity`.
+type ReleasedHoldKey = (String, Option<String>);
+
+/// Cross-shard accumulator for one [`ReleasedHoldKey`].
+///
+/// The hold's identity lives in the map key, so this carries only the parts that
+/// have to be folded across shards; [`ReleasedHoldGroup`] is assembled from the
+/// two together by [`Self::finish`].
+struct HoldGroupFold {
+    shard_ids: Vec<i32>,
+    anchor_secs: i64,
+    anchor_shard_id: i32,
+}
+
+impl HoldGroupFold {
+    /// Seeded below the range of any real hold (`paused_duration_secs` is never
+    /// negative) so the first shard observed always becomes the anchor.
+    const fn new() -> Self {
+        Self {
+            shard_ids: Vec::new(),
+            anchor_secs: i64::MIN,
+            anchor_shard_id: i32::MAX,
+        }
+    }
+
+    /// Fold in one shard's release, keeping the group's longest hold as the
+    /// anchor (lowest shard id on a tie, matching the single-anchor `max_by_key`
+    /// this replaced).
+    fn observe(&mut self, shard_id: i32, paused_duration_secs: i64) {
+        self.shard_ids.push(shard_id);
+        if (paused_duration_secs, std::cmp::Reverse(shard_id))
+            > (self.anchor_secs, std::cmp::Reverse(self.anchor_shard_id))
+        {
+            self.anchor_secs = paused_duration_secs;
+            self.anchor_shard_id = shard_id;
+        }
+    }
+
+    fn finish(mut self, (reason, paused_by): ReleasedHoldKey) -> ReleasedHoldGroup {
+        self.shard_ids.sort_unstable();
+        ReleasedHoldGroup {
+            reason,
+            paused_by,
+            shard_ids: self.shard_ids,
+            anchor_secs: self.anchor_secs,
+            anchor_shard_id: self.anchor_shard_id,
+        }
+    }
+}
+
+/// One distinct released hold — a `(reason, operator)` pair — and the shards it
+/// covered.
+///
+/// Shards paused independently for the *same* incident collapse into one entry,
+/// so the durable audit row grows with the number of genuinely distinct holds (a
+/// small, operator-authored quantity) rather than with the shard count, and the
+/// common fleet-wide case still renders as a single line.
+struct ReleasedHoldGroup {
+    /// Always `Some` at the source (the group is built only from outcomes that
+    /// released a hold), so this is unwrapped to a `String` here.
+    reason: String,
+    paused_by: Option<String>,
+    /// Ascending.
+    shard_ids: Vec<i32>,
+    /// This group's longest hold, and the shard that held it (lowest shard id on
+    /// an internal tie).
+    ///
+    /// Ordering groups by `(anchor_secs, Reverse(anchor_shard_id))` descending
+    /// reproduces exactly the single-anchor `max_by_key` the response's
+    /// top-level fields use, so `released_groups[0]` is always the shard
+    /// `paused_duration_secs` reports.
+    anchor_secs: i64,
+    anchor_shard_id: i32,
+}
+
+impl ReleasedHoldGroup {
+    /// A hold whose operator is unrecorded still has to contribute its reason,
+    /// so the missing name renders rather than dropping the entry.
+    fn operator_label(&self) -> &str {
+        self.paused_by.as_deref().unwrap_or("unknown")
+    }
+
+    /// `shards 0,2 by alice: stripe outage (held 900s)`
+    fn render(&self) -> String {
+        let ids = self
+            .shard_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = if self.shard_ids.len() == 1 {
+            "shard"
+        } else {
+            "shards"
+        };
+        format!(
+            "{label} {ids} by {}: {} (held {}s)",
+            self.operator_label(),
+            self.reason,
+            self.anchor_secs
+        )
+    }
+}
+
+/// A held `(reason, operator)` pair — the identity of one hold in effect.
+///
+/// The pause mirror of [`ReleasedHoldKey`]. `paused_by` is a plain `String`
+/// rather than an `Option`: a pause row always records an operator (the route
+/// falls back to the authenticated actor when the body supplies no label),
+/// whereas a *released* hold can come from a row written before that guarantee
+/// existed.
+type HeldHoldKey = (String, String);
+
+/// Cross-shard accumulator for one [`HeldHoldKey`].
+///
+/// The pause mirror of [`HoldGroupFold`], anchored on the EARLIEST stamp rather
+/// than the longest duration: at pause time nothing has been held for a
+/// measurable span yet, and the earliest hold is what the response's top-level
+/// provenance reports.
+struct HeldGroupFold {
+    shard_ids: Vec<i32>,
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldGroupFold {
+    /// Seeded above the range of any real stamp so the first shard observed
+    /// always becomes the anchor.
+    const fn new() -> Self {
+        Self {
+            shard_ids: Vec::new(),
+            anchor_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            anchor_shard_id: i32::MAX,
+        }
+    }
+
+    /// Fold in one shard's hold, keeping the group's EARLIEST stamp as the
+    /// anchor (lowest shard id on a tie, matching the `min_by_key` the
+    /// response's top-level provenance uses).
+    fn observe(&mut self, shard_id: i32, paused_at: chrono::DateTime<chrono::Utc>) {
+        self.shard_ids.push(shard_id);
+        if (paused_at, shard_id) < (self.anchor_at, self.anchor_shard_id) {
+            self.anchor_at = paused_at;
+            self.anchor_shard_id = shard_id;
+        }
+    }
+
+    fn finish(mut self, (reason, paused_by): HeldHoldKey) -> HeldHoldGroup {
+        self.shard_ids.sort_unstable();
+        HeldHoldGroup {
+            reason,
+            paused_by,
+            shard_ids: self.shard_ids,
+            anchor_at: self.anchor_at,
+            anchor_shard_id: self.anchor_shard_id,
+        }
+    }
+}
+
+/// One distinct hold in effect — a `(reason, operator)` pair — and the shards
+/// carrying it.
+///
+/// The pause mirror of [`ReleasedHoldGroup`]: shards holding for the *same*
+/// incident collapse into one entry, so the durable audit row grows with the
+/// number of genuinely distinct holds (a small, operator-authored quantity)
+/// rather than with the shard count, and the common fleet-wide case still
+/// renders as a single line.
+struct HeldHoldGroup {
+    reason: String,
+    paused_by: String,
+    /// Ascending.
+    shard_ids: Vec<i32>,
+    /// This group's earliest stamp, and the shard that carries it (lowest shard
+    /// id on an internal tie).
+    ///
+    /// Ordering groups by `(anchor_at, anchor_shard_id)` ascending reproduces
+    /// exactly the single-anchor `min_by_key` the response's top-level fields
+    /// use, so `held_groups[0]` is always the shard the response reports.
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldHoldGroup {
+    /// `shards 0,2 by alice: stripe outage`
+    ///
+    /// No duration suffix (the resume sibling renders `(held Ns)`): at pause
+    /// time nothing has been held for a measurable span, and the response
+    /// already reports `paused_at`.
+    fn render(&self) -> String {
+        let ids = self
+            .shard_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = if self.shard_ids.len() == 1 {
+            "shard"
+        } else {
+            "shards"
+        };
+        format!("{label} {ids} by {}: {}", self.paused_by, self.reason)
+    }
+}
+
+/// Group the shards carrying a hold by the `(reason, operator)` they actually
+/// hold it for, earliest hold first.
+///
+/// Feature-neutral (`&str`s and a timestamp) so the queue pause (#619) and the
+/// per-activity pause (#807) share one definition and can never drift on what
+/// their audit rows say about the same situation.
+fn group_held_holds<'a>(
+    per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, chrono::DateTime<chrono::Utc>)>,
+) -> Vec<HeldHoldGroup> {
+    // Keyed by the hold's identity so shards sharing one incident collapse;
+    // `BTreeMap` so groups that tie on the sort key below resolve
+    // deterministically.
+    let mut grouped: std::collections::BTreeMap<HeldHoldKey, HeldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, reason, paused_by, paused_at) in per_shard {
+        grouped
+            .entry((reason.to_string(), paused_by.to_string()))
+            .or_insert_with(HeldGroupFold::new)
+            .observe(shard_id, paused_at);
+    }
+    let mut groups: Vec<HeldHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    groups.sort_by_key(|group| (group.anchor_at, group.anchor_shard_id));
+    groups
+}
+
+/// Render the holds actually IN EFFECT for the durable audit trail.
+///
+/// The pause mirror of [`released_holds_audit_reason`], and the reason a pause
+/// audit row does not simply echo the request: `pause_queue` / `pause_activity`
+/// preserve each shard's ORIGINAL provenance on an idempotent re-pause, so the
+/// request's reason can be in effect on no shard at all — most starkly when the
+/// re-pause omits a reason and resolves to the default while every shard is
+/// still held for the original incident. The response body already reports the
+/// effective provenance for exactly this reason (issue #619 review); this keeps
+/// the durable row — which outlives the response, since the resume `DELETE`s
+/// the pause rows — from telling a different story (issue #807 review).
+///
+/// A single hold — the overwhelmingly common case, including a fleet-wide hold
+/// placed by one operator for one incident — keeps the plain single-line form.
+/// Its shard list is deliberately omitted there, for the same reason the resume
+/// sibling omits it: with one `(reason, operator)` group there is nothing
+/// distinguishing to attribute, and the response already reports the counts.
+fn held_holds_audit_reason(groups: &[HeldHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
+    if rest.is_empty() {
+        return Some(format!("hold by {}: {}", leading.paused_by, leading.reason));
+    }
+    let count = groups.len();
+    let detail = groups
+        .iter()
+        .map(HeldHoldGroup::render)
+        .collect::<Vec<_>>()
+        // `; ` and not ` | `: the latter separates this contribution from the
+        // partial-failure text in `queue_pause_audit_context`.
+        .join("; ");
+    Some(format!(
+        "{count} holds in effect (earliest first); {detail}"
+    ))
+}
+
+/// The cross-shard provenance summary of a resume, plus each shard's own row.
+struct ResumeProvenance {
+    /// Reason of the longest-held (i.e. earliest-placed) released hold.
+    released_reason: Option<String>,
+    /// Operator who placed that same hold.
+    released_paused_by: Option<String>,
+    /// Every released hold, deduplicated by `(reason, operator)` and ordered
+    /// longest-held first.
+    ///
+    /// The pause rows are already deleted by the time this exists, so this — not
+    /// the transient [`Self::shards`] response array — is what the durable audit
+    /// row must carry.
+    released_groups: Vec<ReleasedHoldGroup>,
+    /// Per-shard detail for the HTTP response. The pause rows are already
+    /// deleted, so this is the only surviving record of the other shards'
+    /// operational counters.
+    shards: Vec<Value>,
+}
+
+impl ResumeProvenance {
+    /// False when the shards that actually released disagree on
+    /// `(released_reason, released_paused_by)`.
+    ///
+    /// Derived from the grouping rather than computed separately, so the flag
+    /// and the audit rendering can never disagree about what "uniform" means.
+    /// A fleet-wide no-op releases nothing and is trivially uniform.
+    const fn uniform(&self) -> bool {
+        self.released_groups.len() <= 1
+    }
+}
+
+/// Summarise a fleet-wide resume without discarding any shard's provenance.
+///
+/// The top-level reason/operator come from the **longest** hold released,
+/// tie-broken by shard id. That is deliberately the same shard the existing
+/// `paused_duration_secs` maximum describes, so the summary is internally
+/// coherent — previously the duration could come from one shard while the
+/// reason came from another.
+///
+/// Only shards that actually released a hold carry provenance (a shard that
+/// was not paused returns `None`), so both the summary and the grouping consider
+/// just those.
+fn summarise_resume_provenance(
+    per_shard: &[(i32, ::autumn_harvest::queue_pause::ResumeOutcome)],
+) -> ResumeProvenance {
+    // Keyed by the hold's identity so shards sharing one incident collapse;
+    // `BTreeMap` so groups that tie on the sort key below resolve
+    // deterministically.
+    let mut grouped: std::collections::BTreeMap<ReleasedHoldKey, HoldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, outcome) in per_shard {
+        // A shard that was not paused releases no hold and must not drag the
+        // summary or falsely flag divergence.
+        let Some(reason) = outcome.released_reason.as_ref() else {
+            continue;
+        };
+        let fold = grouped
+            .entry((reason.clone(), outcome.released_paused_by.clone()))
+            .or_insert_with(HoldGroupFold::new);
+        fold.observe(*shard_id, outcome.paused_duration_secs);
+    }
+    let mut released_groups: Vec<ReleasedHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    released_groups
+        .sort_by_key(|group| (std::cmp::Reverse(group.anchor_secs), group.anchor_shard_id));
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_resumed": outcome.newly_resumed,
+                "released_task_count": outcome.released_task_count,
+                "paused_duration_secs": outcome.paused_duration_secs,
+                "released_reason": outcome.released_reason,
+                "released_paused_by": outcome.released_paused_by,
+            })
+        })
+        .collect();
+    ResumeProvenance {
+        // `.as_slice()` and not `Vec::first`: diesel's `QueryDsl::first` is in
+        // scope here and shadows the inherent slice method on `Vec`.
+        released_reason: released_groups
+            .as_slice()
+            .first()
+            .map(|group| group.reason.clone()),
+        released_paused_by: released_groups
+            .as_slice()
+            .first()
+            .and_then(|group| group.paused_by.clone()),
+        released_groups,
+        shards,
+    }
+}
+
+/// Build the durable audit `error_summary` for a queue pause/resume, carrying
+/// the effective **reason** alongside any partial-failure text.
+///
+/// `harvest_queue_pauses` holds the reason only while the hold is in effect —
+/// a resume `DELETE`s the row — so without this the audit trail could say who
+/// paused a queue but never *why*, which is precisely the question a
+/// post-incident review asks. `harvest_audit_log` has no metadata/details
+/// column, and adding one would touch all ~188 `NewAuditRecord` construction
+/// sites for a shared primitive (out of scope here), so the reason is carried
+/// in the one free-text field the record already has. It is labelled so the
+/// two contributions stay distinguishable, and the reason is already bounded by
+/// [`truncate_operator_reason`] at the request boundary.
+///
+/// `error_summary` is non-`None` on a fully successful pause as a result. That
+/// is deliberate: `status` (`STATUS_SUCCEEDED` / `STATUS_FAILED`) remains the
+/// outcome discriminator, and the labelled prefixes keep a `reason:` context
+/// row from reading as a failure.
+fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(partial) = partial.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push(format!("failures: {partial}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// Every hold released by a resume, rendered for the durable audit trail.
+///
+/// The resume `DELETE`s the pause rows, so once the HTTP response is gone this
+/// audit row is the *only* surviving record of the holds' provenance. It
+/// therefore carries **every** released `(reason, operator)` with the shards it
+/// covered, not just the longest hold plus a "shards disagreed" marker — the
+/// per-shard array in the response body is transient, so a later post-incident
+/// review could not otherwise recover why the other shards were held (issue
+/// #619 review).
+///
+/// The longest hold leads, so the row stays coherent with the response's
+/// top-level `released_reason` / `paused_duration_secs`.
+///
+/// A single released hold — the overwhelmingly common case, including a
+/// fleet-wide hold placed by one operator for one incident — keeps the plain
+/// single-line form. Its shard list is deliberately omitted there: with one
+/// `(reason, operator)` group there is nothing distinguishing to attribute, and
+/// the response already reports the counts.
+fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
+    released_holds_audit_reason(&provenance.released_groups)
+}
+
+/// Render a set of released holds for the durable audit trail.
+///
+/// Extracted from [`resume_released_audit_reason`] so the per-activity-type
+/// resume (issue #807) renders a byte-identical line for a byte-identical
+/// situation — the two features present the same information to the same
+/// operator, so they must never drift on how it reads.
+fn released_holds_audit_reason(groups: &[ReleasedHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
+    if rest.is_empty() {
+        return Some(format!(
+            "released hold by {}: {}",
+            leading.operator_label(),
+            leading.reason
+        ));
+    }
+    let count = groups.len();
+    let detail = groups
+        .iter()
+        .map(ReleasedHoldGroup::render)
+        .collect::<Vec<_>>()
+        // `; ` and not ` | `: the latter separates this contribution from the
+        // partial-failure text in `queue_pause_audit_context`.
+        .join("; ");
+    Some(format!("released {count} holds (longest first); {detail}"))
+}
+
+/// Best-effort audit row for a queue pause/resume.
+///
+/// Written on the first reachable target shard — the operation is a fleet-wide
+/// control, so one row per request (not per shard) is the honest record.
+#[allow(clippy::too_many_arguments)]
+async fn write_queue_pause_audit(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    queue_name: &str,
+    shard_id: Option<i32>,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    for (_, pool) in targets {
+        if let Ok(mut conn) = acquire_conn(pool).await {
+            let ar = NewAuditRecord {
+                actor,
+                operation,
+                target_type: TARGET_QUEUE,
+                target_id: Some(queue_name),
+                route_or_command: route,
+                request_id,
+                idempotency_key: None,
+                status,
+                error_summary,
+                shard_id,
+                source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return;
+        }
+    }
+}
+
+/// Best-effort `STATUS_FAILED` audit row for a *rejected* pause/resume.
+///
+/// A rejection happens before any shard target is resolved, so it cannot reuse
+/// [`write_queue_pause_audit`]'s target list — it writes to the first shard
+/// pool it can reach. Rejected attempts on a fleet-wide dispatch kill switch
+/// are exactly what an incident review needs, so a malformed body, a bad queue
+/// name, a missing reason, or an unroutable shard all leave a trail (symmetric
+/// with `fail_activity_now`'s malformed-id handling).
+///
+/// `queue_name` is the raw path segment, deliberately un-canonicalised: on the
+/// rejection path it may be the very thing that was invalid.
+#[allow(clippy::too_many_arguments)]
+async fn write_queue_pause_rejection_audit(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    queue_name: &str,
+    error_summary: &str,
+) {
+    let pools: Vec<_> = shard_fanout::pools_by_shard(api_state)
+        .into_iter()
+        .collect();
+    write_queue_pause_audit(
+        &pools,
+        actor,
+        source,
+        request_id,
+        operation,
+        route,
+        queue_name,
+        None,
+        STATUS_FAILED,
+        Some(error_summary),
+    )
+    .await;
+}
+
+/// `POST /admin/queues/{queue_name}/pause` — hold dispatch on a task queue.
+///
+/// Held tasks stay `PENDING`: a pause never fails, retries, or dead-letters
+/// work, and never aborts an already-`RUNNING` task (issue #619 AC2/AC3).
+/// Idempotent — re-pausing an already-paused queue is a `200` no-op that
+/// preserves the original reason and operator.
+async fn pause_queue_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/pause";
+    let audit = audit_context(&headers, &api_state);
+
+    let request = match parse_pause_request(&api_state, &audit, &queue_name, &body, ROUTE).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    // Bound the durable operator reason at the API boundary so the core never
+    // sees an arbitrarily long string — it is stored, re-serialized on every
+    // read poll, and rendered into the Vantage Workers page (the very page an
+    // operator lands on during a queue-pause incident). Same cap and rationale
+    // as every other operator reason on this router.
+    let reason = truncate_operator_reason(&request.reason);
+
+    let (canonical_queue, targets, mut failures) = match prepare_queue_pause_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        request.shard_id,
+        OP_QUEUE_PAUSE,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let PauseApplication {
+        newly_paused,
+        held_task_count,
+        per_shard,
+    } = apply_pause_across_shards(
+        &targets,
+        &canonical_queue,
+        &reason,
+        &actor,
+        request.shard_id,
+        &mut failures,
+    )
+    .await;
+
+    let Some(provenance) = summarise_pause_provenance(&per_shard) else {
+        // Every target shard failed: report it rather than claiming a hold that
+        // is not in effect anywhere.
+        let summary = failures.join("; ");
+        write_queue_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_QUEUE_PAUSE,
+            ROUTE,
+            &canonical_queue,
+            request.shard_id,
+            STATUS_FAILED,
+            queue_pause_audit_context(Some(&reason), Some(summary.as_str())).as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("queue pause failed: {summary}"))
+            .into_response();
+    };
+
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — an idempotent re-pause
+    // preserves each shard's original row, so echoing the request would record
+    // a reason in effect on no shard at all (issue #807 review).
+    let audit_context = queue_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        partial.as_deref(),
+    );
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_QUEUE_PAUSE,
+        ROUTE,
+        &canonical_queue,
+        request.shard_id,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": canonical_queue,
+        "newly_paused": newly_paused,
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
+        // rather than whichever shard the fan-out reached first. `pause_queue`
+        // preserves each shard's original row on an idempotent re-pause, so
+        // echoing the request (or a first-success pick) would pair one story
+        // with a fleet-wide `held_task_count` that is true for other shards
+        // (issue #619 review). `shards` keeps every shard's own row and
+        // `provenance_uniform` flags the divergence in one field.
+        "reason": provenance.effective.reason,
+        "paused_by": provenance.effective.paused_by,
+        "paused_at": provenance.effective.paused_at,
+        "scope_shard_id": provenance.effective.scope_shard_id,
+        "held_task_count": held_task_count,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `POST /admin/queues/{queue_name}/resume` — release the hold.
+///
+/// Held tasks become immediately claimable again, and the time they spent held
+/// is credited back to `scheduled_at` so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog (AC4/AC5). Idempotent —
+/// resuming a queue that is not paused is a `200` no-op.
+async fn resume_queue_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/resume";
+    let audit = audit_context(&headers, &api_state);
+
+    // The body is optional: a bare POST resumes fleet-wide.
+    let request: ResumeQueueRequest = if body.is_empty() {
+        ResumeQueueRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                let summary = format!("invalid request body: {error}");
+                return reject_queue_pause(
+                    &api_state,
+                    &audit,
+                    OP_QUEUE_RESUME,
+                    ROUTE,
+                    &queue_name,
+                    AutumnError::bad_request_msg(summary.clone()),
+                    &summary,
+                )
+                .await;
+            }
+        }
+    };
+
+    let (canonical_queue, targets, mut failures) = match prepare_queue_pause_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        request.shard_id,
+        OP_QUEUE_RESUME,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let applied =
+        apply_resume_across_shards(&targets, &canonical_queue, &actor, &mut failures).await;
+    let provenance = summarise_resume_provenance(&applied.per_shard);
+
+    if !applied.any_ok {
+        let summary = failures.join("; ");
+        write_queue_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_QUEUE_RESUME,
+            ROUTE,
+            &canonical_queue,
+            request.shard_id,
+            STATUS_FAILED,
+            queue_pause_audit_context(
+                resume_released_audit_reason(&provenance).as_deref(),
+                Some(summary.as_str()),
+            )
+            .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("queue resume failed: {summary}"))
+            .into_response();
+    }
+
+    // A resume that did not reach every target shard leaves work still held on
+    // the shards it missed. That is the safe direction, but reporting it as an
+    // unqualified success would leave an operator believing the thaw is
+    // complete while a backlog silently sits frozen, so it is surfaced with the
+    // same 207 / `status` vocabulary as a partial pause.
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // The resume DELETEs the pause row, so record what was released here: this
+    // audit row and the response body are the only surviving record of it.
+    let audit_context = queue_pause_audit_context(
+        resume_released_audit_reason(&provenance).as_deref(),
+        partial.as_deref(),
+    );
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_QUEUE_RESUME,
+        ROUTE,
+        &canonical_queue,
+        request.shard_id,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+
+    resume_queue_response(&canonical_queue, &applied, &provenance, partial)
+}
+
+/// Build the `POST /admin/queues/{queue_name}/resume` response body.
+///
+/// Split out of the handler so the (already long) handler stays under the
+/// line cap; the response shape is also the interesting part to read on its own.
+fn resume_queue_response(
+    canonical_queue: &str,
+    applied: &ResumeApplication,
+    provenance: &ResumeProvenance,
+    partial: Option<String>,
+) -> axum::response::Response {
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": canonical_queue,
+        "newly_resumed": applied.newly_resumed,
+        "released_task_count": applied.released_task_count,
+        "paused_duration_secs": applied.paused_duration_secs,
+        // The resume DELETES the pause rows, so this is the only surviving
+        // record of what was released. The summary describes the LONGEST hold
+        // (the same shard `paused_duration_secs` reports, so the two are
+        // coherent), `shards` keeps every shard's own released provenance, and
+        // `provenance_uniform` flags divergence (issue #619 review).
+        "released_reason": provenance.released_reason,
+        "released_paused_by": provenance.released_paused_by,
+        "provenance_uniform": provenance.uniform(),
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `GET /admin/queues/paused` — every currently-paused queue (AC7).
+///
+/// Cross-shard: a shard-scoped pause lists with its `scope_shard_id`, and an
+/// unreachable shard degrades the response to `partial` rather than failing the
+/// whole read.
+async fn list_paused_queues_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+
+    // A fleet-wide pause that only reached some shards persists
+    // `scope_shard_id = NULL` on the shards it reached and no row on the ones it
+    // missed, so real coverage is derived from the EXPECTED shard set rather
+    // than the stored intent (issue #619 review).
+    let expected = expected_shard_ids(&api_state);
+
+    Ok(Json(serde_json::json!({
+        "paused_queues": merge_paused_queue_rows(collected.rows, &expected),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// Merge per-shard pause rows into one entry per queue, preserving each shard's
+/// own provenance (issue #619 review).
+///
+/// A fleet-wide pause writes one row per shard, so the common case must read as
+/// "the payments queue is held", not N copies of it. But the shards' rows are
+/// **not** guaranteed to agree: `pause_queue` is idempotent and deliberately
+/// preserves the *original* reason and operator on a re-pause, so a fleet-wide
+/// hold landing over a pre-existing shard-scoped hold leaves that shard with
+/// the older story — as does pausing the same queue on two shards separately,
+/// which the `shard_id` parameter explicitly supports. Keeping whichever shard
+/// happened to be iterated first would then show the operator a reason and
+/// scope that are simply not true for part of the fleet.
+///
+/// So: the top-level provenance is the **earliest** hold (a deterministic rule,
+/// and the same one the Vantage banner uses, so the two surfaces never
+/// disagree), `shards` carries every shard's own provenance, and
+/// `provenance_uniform` is a single field a script can gate on.
+///
+/// Uniformity compares `(reason, paused_by, scope_shard_id)` and deliberately
+/// **not** `paused_at`: each shard stamps its own `NOW()`, so including it would
+/// report almost every healthy fleet-wide hold as divergent.
+///
+/// `effective_scope` is derived from `expected_shards` rather than from the
+/// stored `scope_shard_id`, because a fleet-wide pause that only reached some
+/// shards writes `scope_shard_id = NULL` on the shards it reached and **no row**
+/// on the ones it missed — so intent alone cannot distinguish a complete hold
+/// from a partially-applied one that leaves part of the fleet dispatching
+/// (issue #619 review). `scope_shard_id` is still reported verbatim as the
+/// recorded intent.
+fn merge_paused_queue_rows(
+    rows: Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
+    expected_shards: &[i32],
+) -> Vec<Value> {
+    let mut by_queue: std::collections::BTreeMap<
+        String,
+        Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        by_queue
+            .entry(row.queue_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_queue
+        .into_values()
+        .map(|mut shard_rows| {
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+
+            // Deterministic top-level summary: the hold that started first.
+            // Tie-broken by shard id so the choice never depends on fan-out order.
+            let earliest = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+                .map(|(_, row)| row)
+                .expect("group is non-empty by construction");
+
+            let uniform = shard_rows.iter().all(|(_, row)| {
+                row.reason == earliest.reason
+                    && row.paused_by == earliest.paused_by
+                    && row.scope_shard_id == earliest.scope_shard_id
+            });
+            let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+
+            let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+            let scopes: Vec<Option<i32>> = shard_rows
+                .iter()
+                .map(|(_, row)| row.scope_shard_id)
+                .collect();
+            let coverage = ::autumn_harvest::queue_pause::classify_pause_coverage(
+                &holding,
+                &scopes,
+                expected_shards,
+            );
+
+            serde_json::json!({
+                "queue_name": earliest.queue_name,
+                "reason": earliest.reason,
+                "paused_by": earliest.paused_by,
+                "paused_at": earliest.paused_at,
+                "scope_shard_id": earliest.scope_shard_id,
+                "effective_scope": coverage,
+                "held_task_count": held_total,
+                "provenance_uniform": uniform,
+                "shards": shard_rows
+                    .iter()
+                    .map(|(shard_id, row)| serde_json::json!({
+                        "shard_id": shard_id,
+                        "reason": row.reason,
+                        "paused_by": row.paused_by,
+                        "paused_at": row.paused_at,
+                        "scope_shard_id": row.scope_shard_id,
+                        "held_task_count": row.held_task_count,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// `GET /admin/quotas` — usage-vs-limit per resolved `(workflow_name,
+/// quota_key)` pair (issue #946 AC5).
+///
+/// Cross-shard, `shard_fanout`-based like every other sensitive per-key admin
+/// read (`/admin/concurrency`, `/admin/debounce`, `/admin/start-throttle`): an
+/// unreachable shard degrades the response to `partial`/`unavailable` rather
+/// than failing the whole read (never a `500`).
+///
+/// **Quota enforcement is shard-LOCAL by design (issue #946 AC8)** — unlike a
+/// fleet-wide pause, the SAME `(workflow_name, quota_key)` pair can carry
+/// genuinely independent usage on every shard a tenant's traffic happens to
+/// land on (shard routing hashes on `workflow_id`, not the quota key), so the
+/// effective cap across the whole fleet is `per-shard-limit × shards touched`.
+/// The response therefore does NOT collapse a key's shards into one count —
+/// it sums for a fleet-wide-total convenience field (mirroring
+/// `/admin/concurrency`'s cross-shard sum) but always also lists the full
+/// per-shard breakdown, so an operator can see exactly which shard(s) a
+/// tenant is actually capped on.
+async fn list_quotas_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::quota::list_quota_usage(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+
+    Ok(Json(serde_json::json!({
+        "quotas": merge_quota_rows(collected.rows, &runtime.registry),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// Merge per-shard quota usage rows into one entry per `(workflow_name,
+/// quota_key)` pair, summing for a fleet-wide total while preserving each
+/// shard's own count (issue #946 AC5).
+///
+/// The declared `limits` are resolved from the CURRENT registered
+/// `WorkflowInfo.quota` for `workflow_name` (never persisted with the usage
+/// rows themselves), so a policy edited after a key accrued usage is reported
+/// against the live policy, not a stale snapshot.
+fn merge_quota_rows(
+    rows: Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
+    registry: &HandlerRegistry,
+) -> Vec<Value> {
+    let mut by_key: std::collections::BTreeMap<
+        (String, String),
+        Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        by_key
+            .entry((row.workflow_name.clone(), row.quota_key.clone()))
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_key
+        .into_values()
+        .map(|mut shard_rows| {
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+            let (workflow_name, quota_key) = {
+                let first = &shard_rows[0].1;
+                (first.workflow_name.clone(), first.quota_key.clone())
+            };
+
+            let total_active: i64 = shard_rows.iter().map(|(_, r)| r.active_executions).sum();
+            let total_history_bytes: i64 = shard_rows.iter().map(|(_, r)| r.history_bytes).sum();
+            let total_dead_letters: i64 = shard_rows.iter().map(|(_, r)| r.dead_letters).sum();
+
+            let policy = registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|info| info.quota);
+
+            serde_json::json!({
+                "workflow_name": workflow_name,
+                "quota_key": quota_key,
+                "usage": {
+                    "active_executions": total_active,
+                    "history_bytes": total_history_bytes,
+                    "dead_letters": total_dead_letters,
+                },
+                "limits": {
+                    "max_active_executions": policy.and_then(|p| p.max_active_executions),
+                    "max_history_bytes": policy.and_then(|p| p.max_history_bytes),
+                    "max_dead_letters": policy.and_then(|p| p.max_dead_letters),
+                },
+                "shards": shard_rows
+                    .iter()
+                    .map(|(shard_id, row)| serde_json::json!({
+                        "shard_id": shard_id,
+                        "active_executions": row.active_executions,
+                        "history_bytes": row.history_bytes,
+                        "dead_letters": row.dead_letters,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// ── Per-activity-type pause / resume (issue #807) ────────────────────────────
+//
+// The queue-pause sibling (#619) is the direct prior art for every helper in
+// this block and the shapes are deliberately identical, one granularity down:
+// same fleet-wide fan-out, same collect-don't-abort per-shard loop, same 207
+// partial-application contract, same earliest-hold / longest-hold provenance
+// rules, same audited-rejection path. Where a helper is genuinely
+// feature-neutral it is REUSED rather than copied (see
+// `queue_pause_partial_status`, `queue_pause_attach_partial`,
+// `HoldGroupFold`/`ReleasedHoldGroup`, `released_holds_audit_reason`), so the
+// two features can never drift on the parts an operator reads.
+//
+// The one structural difference is the read side: a queue is only ever visible
+// through its pause row, whereas an activity **type** has a registered
+// catalogue, so `GET /activities` is driven by the registry and the pause table
+// is a cross-reference. See `merge_activity_catalog_rows`.
+
+/// Body of `POST /activities/{activity_name}/pause` — entirely optional.
+///
+/// Unlike the queue-pause sibling, which *requires* a reason, both fields here
+/// are optional and a bare `POST` with no body at all is a valid fleet-wide
+/// hold. During an incident the operator's first move is to stop the bleeding;
+/// rejecting that with a `400` because a reason was not typed would put
+/// paperwork ahead of containment. The reason still has a durable home — it
+/// defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`] so the read API, the CLI and
+/// the audit row always have *something* to show, and the row is never `NULL`.
+///
+/// `deny_unknown_fields` for the reason the queue sibling documents: a field
+/// this route silently ignores is a field an operator believes took effect.
+/// A typo'd `{"reasons": "..."}` must be a `400`, not an unexplained hold.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PauseActivityRequest {
+    /// Human-readable reason for the hold, surfaced on the read API and in the
+    /// audit trail. Defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`].
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Operator identity to record as `paused_by`.
+    ///
+    /// This is a **label**, not authentication: it lets an automation
+    /// ("oncall-bot") attribute a hold to the human it acted for. The durable
+    /// audit row always carries the *authenticated* actor derived from the
+    /// request headers, and records the on-behalf-of relationship when the two
+    /// differ, so a body field can never rewrite the security trail. Defaults
+    /// to the authenticated actor.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Body of `POST /activities/{activity_name}/resume` — must be empty or `{}`.
+///
+/// A resume records no provenance of its own: it `DELETE`s the pause row, so
+/// there is no column an `actor` field could set. Rather than accept a field
+/// that would be silently dropped, the struct carries none and
+/// `deny_unknown_fields` turns one into an audited `400`. The audit row's actor
+/// comes from the authenticated request, exactly as it does for pause.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeActivityRequest {}
+
+/// Reason stored when an operator pauses without supplying one.
+///
+/// A pause row's `reason` is `NOT NULL` and is the only durable record of *why*
+/// dispatch is held (the row is deleted on resume), so the optional-body
+/// contract above needs a default rather than an empty string — "(no reason
+/// given)" tells the next operator that nobody typed one, where `""` would read
+/// as a rendering bug.
+const DEFAULT_ACTIVITY_PAUSE_REASON: &str = "operator pause (no reason given)";
+
+/// Resolve every shard an activity pause/resume must touch, plus any shard the
+/// router knows about that this process has no pool for.
+///
+/// Always fleet-wide. Issue #807's contract is that a hold "applies on every
+/// shard and every worker", so — unlike the queue sibling, which exposes a
+/// `shard_id` scope — there is no per-shard variant to resolve here and no
+/// `unknown shard_id` rejection. The core still carries a `scope_shard_id`
+/// column (a future scoped surface, and the CLI, can write it), so the read and
+/// mutation responses report it verbatim; this route always writes `NULL`.
+///
+/// The expected-shard set comes from [`shard_fanout::expected_shards`], not the
+/// local pool map: a shard the router knows but this process has no pool for
+/// (mid a shard-add rollout) must be *reported*, never silently omitted.
+/// Omitting it would let a hold return an unqualified success while that shard
+/// kept dispatching into the outage.
+fn activity_pause_target_pools(
+    api_state: &HarvestApiState,
+) -> Result<QueuePauseTargets, AutumnError> {
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured",
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    let mut targets = Vec::new();
+    let mut unreachable = Vec::new();
+    for shard in expected {
+        if let Some(pool) = pools.get(&shard) {
+            targets.push((shard, pool.clone()));
+        } else {
+            unreachable.push(shard);
+        }
+    }
+    Ok((targets, unreachable))
+}
+
+/// Audit a rejected activity pause/resume and turn the error into a response.
+///
+/// Every rejection path is audited: a *refused* attempt on a fleet-wide
+/// dispatch kill switch is exactly what an incident review needs to see, and
+/// without it a mistyped activity name during an outage leaves no trace at all.
+async fn reject_activity_pause(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    operation: &'static str,
+    route: &'static str,
+    activity_name: &str,
+    status_error: AutumnError,
+    summary: &str,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit;
+    // A rejection happens before any shard target is resolved, so it writes to
+    // the first shard pool it can reach (the queue sibling's
+    // `write_queue_pause_rejection_audit` shape).
+    let pools: Vec<_> = shard_fanout::pools_by_shard(api_state)
+        .into_iter()
+        .collect();
+    write_activity_pause_audit(
+        &pools,
+        actor,
+        source,
+        request_id.as_deref(),
+        operation,
+        route,
+        activity_name,
+        STATUS_FAILED,
+        Some(summary),
+    )
+    .await;
+    status_error.into_response()
+}
+
+/// Validate the activity name and resolve the target shards for a
+/// pause/resume.
+///
+/// On rejection the audit row is written here and a ready-to-send response is
+/// returned in `Err`, so both handlers share one rejection contract. The
+/// returned `Vec<String>` seeds the per-shard failure list with any shard the
+/// router knows about but this process cannot reach.
+///
+/// The name is validated but **not** required to be registered on this node.
+/// A management API process need not register every activity the fleet runs
+/// (a heterogeneous deployment is the norm), so 404-ing an unregistered name
+/// would make a legitimately-remote activity unpausable during exactly the
+/// outage the operator is containing. The invisible-typo hazard that trade
+/// creates is closed on the read side instead: `GET /activities` surfaces a
+/// paused-but-unregistered activity with `registered: false` rather than
+/// dropping it (see [`merge_activity_catalog_rows`]).
+#[allow(clippy::result_large_err)]
+async fn prepare_activity_pause_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let canonical = match ::autumn_harvest::activity_pause::validate_activity_name(activity_name) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let summary = error.to_string();
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                map_error(error),
+                &summary,
+            )
+            .await);
+        }
+    };
+    let (targets, unreachable) = match activity_pause_target_pools(api_state) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let summary = format!("{error:?}");
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                error,
+                &summary,
+            )
+            .await);
+        }
+    };
+    let failures = unreachable
+        .iter()
+        .map(|shard| format!("shard {shard}: known to the router but has no pool in this process"))
+        .collect();
+    Ok((canonical, targets, failures))
+}
+
+/// Best-effort audit row for an activity pause/resume.
+///
+/// Written on the first reachable target shard — the operation is a fleet-wide
+/// control, so one row per request (not per shard) is the honest record.
+/// Mirrors [`write_queue_pause_audit`]; a separate function rather than a
+/// parameterised one only because the target type differs
+/// ([`TARGET_ACTIVITY`] vs [`TARGET_QUEUE`]) and that helper is already at its
+/// argument limit.
+///
+/// `shard_id` is always `None`: this route is fleet-wide by construction, so
+/// there is no single shard the record belongs to.
+#[allow(clippy::too_many_arguments)]
+async fn write_activity_pause_audit(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    activity_name: &str,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    for (_, pool) in targets {
+        if let Ok(mut conn) = acquire_conn(pool).await {
+            let ar = NewAuditRecord {
+                actor,
+                operation,
+                target_type: TARGET_ACTIVITY,
+                target_id: Some(activity_name),
+                route_or_command: route,
+                request_id,
+                idempotency_key: None,
+                status,
+                error_summary,
+                shard_id: None,
+                source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return;
+        }
+    }
+}
+
+/// Emit the issue #807 pause/resume counter, best-effort.
+///
+/// `changed_state` implements [`METRIC_ACTIVITY_PAUSE_ACTIONS`]'s documented
+/// emission contract: count only when the action genuinely flipped the hold,
+/// gating on `newly_paused` / `newly_resumed`. Both mutations are idempotent by
+/// design, so an operator retry after a lost response must not read as a second
+/// hold. On a fleet-wide fan-out "genuinely flipped" means *any* shard flipped,
+/// which is exactly what the response's own `newly_*` field reports.
+///
+/// Telemetry must never decide whether an outage can be contained, so a runtime
+/// that is not installed yet (the boot window) is skipped silently rather than
+/// failing the hold — the same posture as the audit write above.
+///
+/// [`METRIC_ACTIVITY_PAUSE_ACTIONS`]: ::autumn_harvest::telemetry::METRIC_ACTIVITY_PAUSE_ACTIONS
+fn record_activity_pause_metric(
+    api_state: &HarvestApiState,
+    activity_name: &str,
+    action: ::autumn_harvest::telemetry::ActivityPauseAction,
+    changed_state: bool,
+) {
+    if !changed_state {
+        return;
+    }
+    if let Ok(runtime) = api_state.runtime() {
+        // Bucket an UNREGISTERED name to the sentinel before it becomes a metric
+        // label. The pause routes accept unregistered names on purpose (an
+        // operator must be able to pre-pause an activity before its fleet rolls
+        // out, and a paused-but-unregistered hold must stay inspectable), so the
+        // raw name is caller-controlled free text — bounded in length, but not
+        // in CARDINALITY, which is what ADR-0001 §7 actually forbids. A
+        // remediation script templating a tenant id into the name would
+        // otherwise mint one permanent series per tenant. Same fix as the #684
+        // update-name label. The durable row and the read API keep the raw name.
+        let label = if runtime.registry.activities.contains_key(activity_name) {
+            activity_name
+        } else {
+            ::autumn_harvest::telemetry::UNREGISTERED_ACTIVITY_NAME
+        };
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_activity_pause_action(label, action);
+    }
+}
+
+/// The fleet-wide roll-up of an activity pause applied shard by shard.
+struct ActivityPauseApplication {
+    /// True when at least one shard transitioned from dispatching to held.
+    newly_paused: bool,
+    /// Held tasks summed across every shard the hold reached.
+    held_task_count: i64,
+    /// Every shard that applied the hold, with its own effective row.
+    ///
+    /// Kept per-shard rather than collapsed to the first success: a re-pause
+    /// preserves each shard's ORIGINAL provenance, so a request landing over a
+    /// pre-existing hold leaves the shards disagreeing, and labelling the
+    /// fleet-wide `held_task_count` with one shard's reason, actor and
+    /// timestamp would then be untrue for the rest of the fleet.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)>,
+}
+
+/// Apply the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting — one unreachable shard must not stop the
+/// others from being held.
+async fn apply_activity_pause_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    reason: &str,
+    paused_by: &str,
+    failures: &mut Vec<String>,
+) -> ActivityPauseApplication {
+    let mut applied = ActivityPauseApplication {
+        newly_paused: false,
+        held_task_count: 0,
+        per_shard: Vec::new(),
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::pause_activity(
+            &mut conn,
+            canonical_activity,
+            reason,
+            paused_by,
+            // Always fleet-wide — see `activity_pause_target_pools`.
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                applied.newly_paused |= outcome.newly_paused;
+                applied.held_task_count += outcome.held_task_count;
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity pause, plus each shard's
+/// own row.
+struct ActivityPauseProvenance<'a> {
+    /// The earliest hold — the deterministic top-level summary.
+    effective: &'a ::autumn_harvest::activity_pause::ActivityPauseOutcome,
+    /// False when the shards disagree on `(reason, paused_by, scope_shard_id)`.
+    uniform: bool,
+    /// Per-shard detail, so a divergent hold loses nothing.
+    shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first — see [`PauseProvenance::held_groups`].
+    held_groups: Vec<HeldHoldGroup>,
+}
+
+/// Summarise a fleet-wide activity pause without discarding any shard's
+/// provenance.
+///
+/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
+/// same rule [`merge_activity_catalog_rows`] uses, so the mutation response and
+/// the read endpoints can never tell an operator two different stories about
+/// one hold. `uniform` compares `(reason, paused_by, scope_shard_id)` and
+/// deliberately **not** `paused_at`: each shard stamps its own `NOW()`, so
+/// including it would flag essentially every healthy fleet-wide hold as
+/// divergent.
+///
+/// Returns `None` only when every target shard failed.
+fn summarise_activity_pause_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)],
+) -> Option<ActivityPauseProvenance<'_>> {
+    let (_, effective) = per_shard
+        .iter()
+        .min_by_key(|(shard_id, outcome)| (outcome.paused_at, *shard_id))?;
+    let uniform = per_shard.iter().all(|(_, outcome)| {
+        outcome.reason == effective.reason
+            && outcome.paused_by == effective.paused_by
+            && outcome.scope_shard_id == effective.scope_shard_id
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_paused": outcome.newly_paused,
+                "reason": outcome.reason,
+                "paused_by": outcome.paused_by,
+                "paused_at": outcome.paused_at,
+                "scope_shard_id": outcome.scope_shard_id,
+                "held_task_count": outcome.held_task_count,
+            })
+        })
+        .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
+    Some(ActivityPauseProvenance {
+        effective,
+        uniform,
+        shards,
+        held_groups,
+    })
+}
+
+/// The fleet-wide roll-up of an activity resume applied shard by shard.
+struct ActivityResumeApplication {
+    /// True when at least one shard actually released a hold.
+    newly_resumed: bool,
+    /// Tasks credited their held time back, summed across shards.
+    released_task_count: i64,
+    /// The longest hold released, in seconds.
+    paused_duration_secs: i64,
+    /// Every shard that completed, with the provenance it released.
+    ///
+    /// Per-shard rather than first-success: the resume DELETEs the pause rows,
+    /// so anything dropped here is gone for good.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)>,
+    /// True when at least one shard completed without error.
+    any_ok: bool,
+}
+
+/// Release the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting.
+async fn apply_activity_resume_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    failures: &mut Vec<String>,
+) -> ActivityResumeApplication {
+    let mut applied = ActivityResumeApplication {
+        newly_resumed: false,
+        released_task_count: 0,
+        paused_duration_secs: 0,
+        per_shard: Vec::new(),
+        any_ok: false,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::resume_activity(&mut conn, canonical_activity).await
+        {
+            Ok(outcome) => {
+                applied.any_ok = true;
+                applied.newly_resumed |= outcome.newly_resumed;
+                applied.released_task_count += outcome.released_task_count;
+                applied.paused_duration_secs = applied
+                    .paused_duration_secs
+                    .max(outcome.paused_duration_secs);
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity resume, plus each shard's
+/// own row.
+struct ActivityResumeProvenance {
+    /// Reason of the longest-held released hold.
+    released_reason: Option<String>,
+    /// Operator who placed that same hold.
+    released_paused_by: Option<String>,
+    /// Every released hold, deduplicated by `(reason, operator)` and ordered
+    /// longest-held first.
+    ///
+    /// The pause rows are already deleted by the time this exists, so this —
+    /// not the transient [`Self::shards`] response array — is what the durable
+    /// audit row must carry. Reuses the queue sibling's
+    /// [`ReleasedHoldGroup`]/[`HoldGroupFold`] so the two features render an
+    /// identical audit line for an identical situation.
+    released_groups: Vec<ReleasedHoldGroup>,
+    /// Per-shard detail for the HTTP response.
+    shards: Vec<Value>,
+}
+
+impl ActivityResumeProvenance {
+    /// False when the shards that actually released disagree on
+    /// `(released_reason, released_paused_by)`.
+    ///
+    /// Derived from the grouping rather than computed separately, so the flag
+    /// and the audit rendering can never disagree about what "uniform" means.
+    /// A fleet-wide no-op releases nothing and is trivially uniform.
+    const fn uniform(&self) -> bool {
+        self.released_groups.len() <= 1
+    }
+}
+
+/// Summarise a fleet-wide activity resume without discarding any shard's
+/// provenance.
+///
+/// The top-level reason/operator come from the **longest** hold released,
+/// tie-broken by shard id — deliberately the same shard the
+/// `paused_duration_secs` maximum describes, so the duration and the story it
+/// is paired with always come from one shard.
+///
+/// Only shards that actually released a hold carry provenance (a shard that was
+/// not paused returns `None`), so both the summary and the grouping consider
+/// just those.
+fn summarise_activity_resume_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)],
+) -> ActivityResumeProvenance {
+    let mut grouped: std::collections::BTreeMap<ReleasedHoldKey, HoldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, outcome) in per_shard {
+        let Some(reason) = outcome.released_reason.as_ref() else {
+            continue;
+        };
+        let fold = grouped
+            .entry((reason.clone(), outcome.released_paused_by.clone()))
+            .or_insert_with(HoldGroupFold::new);
+        fold.observe(*shard_id, outcome.paused_duration_secs);
+    }
+    let mut released_groups: Vec<ReleasedHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    released_groups
+        .sort_by_key(|group| (std::cmp::Reverse(group.anchor_secs), group.anchor_shard_id));
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_resumed": outcome.newly_resumed,
+                "released_task_count": outcome.released_task_count,
+                "paused_duration_secs": outcome.paused_duration_secs,
+                "released_reason": outcome.released_reason,
+                "released_paused_by": outcome.released_paused_by,
+            })
+        })
+        .collect();
+    ActivityResumeProvenance {
+        // `.as_slice()` and not `Vec::first`: diesel's `QueryDsl::first` is in
+        // scope here and shadows the inherent slice method on `Vec`.
+        released_reason: released_groups
+            .as_slice()
+            .first()
+            .map(|group| group.reason.clone()),
+        released_paused_by: released_groups
+            .as_slice()
+            .first()
+            .and_then(|group| group.paused_by.clone()),
+        released_groups,
+        shards,
+    }
+}
+
+/// Resolve the operator LABEL stored on the pause row, and the audit note that
+/// records an on-behalf-of relationship.
+///
+/// The label is body-supplied when present; the audit row always carries the
+/// AUTHENTICATED actor, and names the relationship when the two differ, so a
+/// body field can never rewrite the security trail. A blank or whitespace-only
+/// label falls back to the actor rather than storing `""`.
+fn resolve_pause_operator_label(requested: Option<&str>, actor: &str) -> (String, Option<String>) {
+    let paused_by = requested
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| actor.to_string(), truncate_operator_reason);
+    let on_behalf_of = (paused_by != actor).then(|| format!("on behalf of: {paused_by}"));
+    (paused_by, on_behalf_of)
+}
+
+/// `POST /activities/{activity_name}/pause` — hold dispatch for one activity
+/// type, fleet-wide (issue #807).
+///
+/// Held tasks stay `PENDING`: a pause never fails, retries, or dead-letters
+/// work, and never aborts an already-`RUNNING` activity. Idempotent —
+/// re-pausing an already-paused type is a `200` no-op that preserves the
+/// original reason and operator (`newly_paused: false`).
+async fn pause_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/pause";
+    let audit = audit_context(&headers, &api_state);
+
+    let request = match parse_activity_pause_request(
+        &api_state,
+        &audit,
+        &activity_name,
+        &body,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let reason = resolve_activity_pause_reason(request.reason.as_deref());
+
+    let (canonical_activity, targets, mut failures) =
+        match prepare_activity_pause_targets_checked(&api_state, &audit, &activity_name, ROUTE)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+
+    let (actor, source, request_id) = audit;
+
+    let (paused_by, on_behalf_of) = resolve_pause_operator_label(request.actor.as_deref(), &actor);
+
+    let ActivityPauseApplication {
+        newly_paused,
+        held_task_count,
+        per_shard,
+    } = apply_activity_pause_across_shards(
+        &targets,
+        &canonical_activity,
+        &reason,
+        &paused_by,
+        &mut failures,
+    )
+    .await;
+
+    let Some(provenance) = summarise_activity_pause_provenance(&per_shard) else {
+        // Every target shard failed: report it rather than claiming a hold that
+        // is not in effect anywhere.
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_PAUSE,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(Some(&reason), on_behalf_of.as_deref(), Some(&summary))
+                .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("activity pause failed: {summary}"))
+            .into_response();
+    };
+
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — `pause_activity` preserves each
+    // shard's original row on an idempotent re-pause, so echoing the request
+    // would record a reason in effect on no shard at all (issue #807 review).
+    // `on_behalf_of` stays request-scoped by contrast: it records what THIS
+    // caller claimed, which is a security fact about the request rather than a
+    // description of the hold.
+    let audit_context = activity_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        on_behalf_of.as_deref(),
+        partial.as_deref(),
+    );
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_PAUSE,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Pause,
+        newly_paused,
+    );
+
+    activity_pause_response(
+        &canonical_activity,
+        newly_paused,
+        held_task_count,
+        &provenance,
+        partial,
+    )
+}
+
+/// Parse the optional `POST /activities/{activity_name}/pause` body.
+///
+/// An absent body is the documented fleet-wide default, not an error. A body
+/// that is present but malformed (including one carrying an unknown field — see
+/// [`PauseActivityRequest`]) is an audited `400`, matching the queue sibling's
+/// `parse_pause_request` contract: on rejection the audit row is written here
+/// and a ready-to-send response is returned in `Err`.
+#[allow(clippy::result_large_err)]
+async fn parse_activity_pause_request(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    body: &axum::body::Bytes,
+    route: &'static str,
+) -> Result<PauseActivityRequest, axum::response::Response> {
+    if body.is_empty() {
+        return Ok(PauseActivityRequest::default());
+    }
+    match serde_json::from_slice(body) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            let summary = format!("invalid request body: {error}");
+            Err(reject_activity_pause(
+                api_state,
+                audit,
+                OP_ACTIVITY_PAUSE,
+                route,
+                activity_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await)
+        }
+    }
+}
+
+/// Resolve the durable pause reason from the optional body field.
+///
+/// Trims **before** truncating so the value that was checked for emptiness IS
+/// the value that gets stored, and so leading whitespace cannot eat the
+/// operator's actual words out of the 500-character budget. A missing or
+/// whitespace-only reason falls back to [`DEFAULT_ACTIVITY_PAUSE_REASON`]
+/// rather than storing `""`, which would read as a rendering bug on every
+/// surface that shows it.
+fn resolve_activity_pause_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map_or_else(
+            || DEFAULT_ACTIVITY_PAUSE_REASON.to_string(),
+            truncate_operator_reason,
+        )
+}
+
+/// Build the `POST /activities/{activity_name}/pause` response body.
+///
+/// Split out of the handler so the handler stays under the line cap (the same
+/// treatment `resume_queue_response` gives its sibling); the response shape is
+/// also the interesting part to read on its own.
+fn activity_pause_response(
+    canonical_activity: &str,
+    newly_paused: bool,
+    held_task_count: i64,
+    provenance: &ActivityPauseProvenance<'_>,
+    partial: Option<String>,
+) -> axum::response::Response {
+    // `queue_pause_partial_status` / `queue_pause_attach_partial` are reused
+    // verbatim from the queue sibling — the partial-application contract is
+    // identical, so sharing them keeps the two features from drifting.
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_paused": newly_paused,
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
+        // rather than whichever shard the fan-out reached first: `pause_activity`
+        // preserves each shard's original row on an idempotent re-pause, so
+        // echoing the request would pair one story with a fleet-wide
+        // `held_task_count` that is untrue for other shards.
+        "reason": provenance.effective.reason,
+        "paused_by": provenance.effective.paused_by,
+        "paused_at": provenance.effective.paused_at,
+        "scope_shard_id": provenance.effective.scope_shard_id,
+        "held_task_count": held_task_count,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// Build the durable audit `error_summary` for an activity pause/resume.
+///
+/// The pause row holds the reason only while the hold is in effect — a resume
+/// `DELETE`s it — so without this the audit trail could say who paused an
+/// activity but never *why*, which is precisely the question a post-incident
+/// review asks. `harvest_audit_log` has no metadata column, so the reason
+/// (plus the on-behalf-of label and any partial-failure text) is carried in the
+/// one free-text field the record already has, each contribution labelled so
+/// they stay distinguishable.
+///
+/// `error_summary` is therefore non-`None` on a fully successful pause. That is
+/// deliberate: `status` remains the outcome discriminator, and the labelled
+/// prefixes keep a `reason:` context row from reading as a failure. Same shape
+/// and rationale as [`queue_pause_audit_context`], with the extra
+/// `on_behalf_of` contribution this route's body-supplied `actor` needs.
+fn activity_pause_audit_context(
+    reason: Option<&str>,
+    on_behalf_of: Option<&str>,
+    partial: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(label) = on_behalf_of.map(str::trim).filter(|l| !l.is_empty()) {
+        parts.push(label.to_string());
+    }
+    if let Some(partial) = partial.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push(format!("failures: {partial}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// `POST /activities/{activity_name}/resume` — release the hold (issue #807).
+///
+/// Held tasks become immediately claimable again, and the time they spent held
+/// is credited back to `scheduled_at` so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog. Idempotent — resuming an
+/// activity that is not paused is a `200` no-op (`newly_resumed: false`).
+async fn resume_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/resume";
+    let audit = audit_context(&headers, &api_state);
+
+    // The body is optional; when present it must be `{}` (see
+    // `ResumeActivityRequest`).
+    if !body.is_empty()
+        && let Err(error) = serde_json::from_slice::<ResumeActivityRequest>(&body)
+    {
+        let summary = format!("invalid request body: {error}");
+        return reject_activity_pause(
+            &api_state,
+            &audit,
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &activity_name,
+            AutumnError::bad_request_msg(summary.clone()),
+            &summary,
+        )
+        .await;
+    }
+
+    let (canonical_activity, targets, mut failures) = match prepare_activity_pause_targets(
+        &api_state,
+        &audit,
+        &activity_name,
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let applied =
+        apply_activity_resume_across_shards(&targets, &canonical_activity, &mut failures).await;
+    let provenance = summarise_activity_resume_provenance(&applied.per_shard);
+
+    if !applied.any_ok {
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(
+                released_holds_audit_reason(&provenance.released_groups).as_deref(),
+                None,
+                Some(&summary),
+            )
+            .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!(
+            "activity resume failed: {summary}"
+        ))
+        .into_response();
+    }
+
+    // A resume that did not reach every shard leaves work still held on the
+    // shards it missed. That is the safe direction, but reporting it as an
+    // unqualified success would leave an operator believing the thaw is
+    // complete while a backlog sits frozen, so it is surfaced with the same
+    // 207 / `status` vocabulary as a partial pause.
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let audit_context = activity_pause_audit_context(
+        released_holds_audit_reason(&provenance.released_groups).as_deref(),
+        None,
+        partial.as_deref(),
+    );
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Resume,
+        applied.newly_resumed,
+    );
+
+    activity_resume_response(&canonical_activity, &applied, &provenance, partial)
+}
+
+/// Build the `POST /activities/{activity_name}/resume` response body.
+///
+/// Split out of the handler for the same reason as
+/// [`activity_pause_response`] and `resume_queue_response`.
+fn activity_resume_response(
+    canonical_activity: &str,
+    applied: &ActivityResumeApplication,
+    provenance: &ActivityResumeProvenance,
+    partial: Option<String>,
+) -> axum::response::Response {
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_resumed": applied.newly_resumed,
+        "released_task_count": applied.released_task_count,
+        "paused_duration_secs": applied.paused_duration_secs,
+        // The resume DELETES the pause rows, so this is the only surviving
+        // record of what was released. The summary describes the LONGEST hold
+        // (the same shard `paused_duration_secs` reports, so the two are
+        // coherent) and `shards` keeps every shard's own released provenance.
+        "released_reason": provenance.released_reason,
+        "released_paused_by": provenance.released_paused_by,
+        "provenance_uniform": provenance.uniform(),
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// The registered-catalogue facts `GET /activities` reports for an activity
+/// type, independent of whether it is paused.
+#[derive(Clone, Copy)]
+struct ActivityCatalogEntry {
+    /// The queue this activity dispatches on (`"default"` when undeclared) —
+    /// the context an operator needs to decide between this per-type hold and
+    /// the coarser queue pause (#619).
+    queue_name: &'static str,
+    /// Local activities run inline on the workflow worker and never take a
+    /// `harvest_task_queue` row, so a pause cannot hold one. Reported so the
+    /// read makes that visible rather than leaving an operator to wonder why a
+    /// hold is holding nothing.
+    is_local: bool,
+}
+
+/// Snapshot the registered activity catalogue for the read endpoints.
+fn registered_activity_catalog(
+    runtime: &HarvestApiRuntime,
+) -> std::collections::BTreeMap<String, ActivityCatalogEntry> {
+    runtime
+        .registry
+        .activities
+        .values()
+        .map(|info| {
+            (
+                info.name.to_string(),
+                ActivityCatalogEntry {
+                    queue_name: info.default_queue.unwrap_or("default"),
+                    is_local: info.is_local,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The operator-facing refusal when a pause could not possibly hold the named
+/// activity, or `None` when the pause may proceed.
+///
+/// # Why a pause on a local activity must be refused, not recorded
+///
+/// A `local = true` activity (issue #98) runs **inline on the workflow worker**
+/// inside the workflow task. It never takes a `harvest_task_queue` row, so the
+/// claim-path gate this whole feature is built on has nothing to skip: the
+/// pause row is written, the read model dutifully reports a hold, and every new
+/// invocation keeps running. Answering `ok: true` / `newly_paused: true` there
+/// is worse than answering nothing — during an incident it is the single call
+/// an operator makes to stop a broken dependency, and nobody re-reads a
+/// mutation that said it worked.
+///
+/// This is the same reasoning [`::autumn_harvest::activity_pause::validate_activity_name`]
+/// gives for rejecting a whitespace-padded name rather than trimming it: only
+/// rejecting cannot lie, and during an outage a `400` naming the problem beats
+/// a false green.
+///
+/// # Why an unregistered name still passes
+///
+/// These routes deliberately accept names this management node does not
+/// register — a management node need not register every activity the fleet
+/// runs, which is the same remote/unregistered case the read endpoints' 404-vs-
+/// 503 rule preserves. Refusing an unknown name would break pausing a genuinely
+/// remote activity, i.e. the feature's primary use. Only a name the node
+/// registers **and** knows to be local is refused.
+fn local_activity_pause_refusal(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    activity_name: &str,
+) -> Option<String> {
+    catalog
+        .get(activity_name)
+        .filter(|entry| entry.is_local)
+        .map(|_| {
+            format!(
+                "activity '{activity_name}' is registered as a local activity \
+                 (#[activity(local = true)]): it runs inline on the workflow worker and never \
+                 takes a task-queue row, so a pause cannot hold it. Refusing rather than \
+                 reporting a hold that would hold nothing. To contain it, pause the queue the \
+                 calling workflows are dispatched on (POST /queues/{{queue_name}}/pause, issue \
+                 #619), or rely on the activity's circuit breaker if one is declared (issue #369)."
+            )
+        })
+}
+
+/// [`prepare_activity_pause_targets`] plus the pause-only refusal of an
+/// activity a hold could not possibly reach (issue #807 review).
+///
+/// The refusal runs AFTER name validation, so a malformed name still reports
+/// the malformation rather than this, and BEFORE any pause row is written, so a
+/// refusal leaves no phantom hold behind. The decision itself lives in the pure
+/// [`local_activity_pause_refusal`] so it is testable without a runtime.
+///
+/// Resume deliberately does **not** get this check: a local pause row written
+/// by an older build must stay removable.
+///
+/// Deliberately fails **open** when the runtime is not installed yet: without
+/// it we cannot tell local from remote, and treating an unknowable activity as
+/// remote matches how an unregistered name is already handled. Failing closed
+/// would refuse EVERY pause during the boot window — including the ordinary
+/// remote ones an operator needs most mid-incident — to guard a case that is
+/// merely today's behaviour.
+#[allow(clippy::result_large_err)]
+async fn prepare_activity_pause_targets_checked(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let prepared =
+        prepare_activity_pause_targets(api_state, audit, activity_name, OP_ACTIVITY_PAUSE, route)
+            .await?;
+    let canonical = &prepared.0;
+    let Ok(runtime) = api_state.runtime() else {
+        return Ok(prepared);
+    };
+    let catalog = registered_activity_catalog(&runtime);
+    let Some(summary) = local_activity_pause_refusal(&catalog, canonical) else {
+        return Ok(prepared);
+    };
+    Err(reject_activity_pause(
+        api_state,
+        audit,
+        OP_ACTIVITY_PAUSE,
+        route,
+        canonical,
+        map_error(::autumn_harvest::error::HarvestError::Config(
+            summary.clone(),
+        )),
+        &summary,
+    )
+    .await)
+}
+
+/// Write one activity entry's pause block: the paused arm and the not-paused
+/// arm write the **same key set**, so a consumer never has to branch on which
+/// arm produced the entry.
+fn insert_activity_pause_fields(
+    map: &mut serde_json::Map<String, Value>,
+    shard_rows: &[(i32, ::autumn_harvest::activity_pause::PausedActivity)],
+    expected_shards: &[i32],
+) {
+    let Some((_, earliest)) = shard_rows
+        .iter()
+        .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+    else {
+        map.insert("paused".to_string(), Value::Bool(false));
+        map.insert("effective_scope".to_string(), Value::Null);
+        map.insert("paused_at".to_string(), Value::Null);
+        map.insert("paused_reason".to_string(), Value::Null);
+        map.insert("paused_actor".to_string(), Value::Null);
+        map.insert("scope_shard_id".to_string(), Value::Null);
+        map.insert("held_task_count".to_string(), serde_json::json!(0));
+        map.insert("provenance_uniform".to_string(), Value::Bool(true));
+        map.insert("shards".to_string(), serde_json::json!([]));
+        return;
+    };
+
+    let uniform = shard_rows.iter().all(|(_, row)| {
+        row.reason == earliest.reason
+            && row.paused_by == earliest.paused_by
+            && row.scope_shard_id == earliest.scope_shard_id
+    });
+    let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+
+    // Real coverage, not stored intent. REUSES the queue-pause classifier
+    // rather than restating the rule, so the two read models can never
+    // disagree about what "fleet-wide" means.
+    let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+    let scopes: Vec<Option<i32>> = shard_rows
+        .iter()
+        .map(|(_, row)| row.scope_shard_id)
+        .collect();
+    let coverage =
+        ::autumn_harvest::queue_pause::classify_pause_coverage(&holding, &scopes, expected_shards);
+
+    map.insert("paused".to_string(), Value::Bool(true));
+    map.insert("effective_scope".to_string(), serde_json::json!(coverage));
+    map.insert(
+        "paused_at".to_string(),
+        serde_json::json!(earliest.paused_at),
+    );
+    map.insert(
+        "paused_reason".to_string(),
+        Value::String(earliest.reason.clone()),
+    );
+    map.insert(
+        "paused_actor".to_string(),
+        Value::String(earliest.paused_by.clone()),
+    );
+    map.insert(
+        "scope_shard_id".to_string(),
+        serde_json::json!(earliest.scope_shard_id),
+    );
+    map.insert("held_task_count".to_string(), serde_json::json!(held_total));
+    map.insert("provenance_uniform".to_string(), Value::Bool(uniform));
+    map.insert(
+        "shards".to_string(),
+        serde_json::json!(
+            shard_rows
+                .iter()
+                .map(|(shard_id, row)| serde_json::json!({
+                    "shard_id": shard_id,
+                    "reason": row.reason,
+                    "paused_by": row.paused_by,
+                    "paused_at": row.paused_at,
+                    "scope_shard_id": row.scope_shard_id,
+                    "held_task_count": row.held_task_count,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+}
+
+/// A single-activity read found nothing: is that a definitive "does not exist",
+/// or an unanswerable question?
+///
+/// Returning `404` asserts nonexistence. That assertion is only true when every
+/// expected shard was inspected — a pause row living **only** on an unreachable
+/// shard produces exactly the same empty result, and the routes deliberately
+/// accept unregistered names (a management node need not register every
+/// activity the fleet runs), so this is a reachable state, not a theoretical
+/// one. Answering `404` there tells an operator the hold does not exist while
+/// it is actively holding work on the shard that could not be read.
+///
+/// So the read fails **closed** with `503` while any shard is unaccounted for,
+/// naming them — the same rule the `(workflow_name, workflow_id)` resolver
+/// (issue #805) applies for the same reason: "fail closed with 503 rather than
+/// risk a false 404".
+fn activity_missing_error(
+    activity_name: &str,
+    status: shard_fanout::FanoutStatus,
+    unavailable: &[shard_fanout::UnavailableShard],
+) -> AutumnError {
+    if matches!(status, shard_fanout::FanoutStatus::Complete) {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' is not registered and is not paused"
+        ));
+    }
+    let shards = unavailable
+        .iter()
+        .map(|u| u.shard_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AutumnError::service_unavailable_msg(format!(
+        "activity '{activity_name}' is not registered here and no pause row was found, \
+         but shard(s) [{shards}] could not be inspected; cannot rule out a hold there \
+         without risking a false 404"
+    ))
+}
+
+/// The shard set a hold is expected to span, as a sorted `Vec`.
+///
+/// One definition shared by the queue-pause (#619) and activity-pause (#807)
+/// read models: both derive real coverage from the shards the fleet is
+/// *supposed* to have, and computing that two ways is exactly how the two
+/// surfaces would come to disagree about whether the same partially-applied
+/// hold is fleet-wide.
+fn expected_shard_ids(api_state: &HarvestApiState) -> Vec<i32> {
+    let pools = shard_fanout::pools_by_shard(api_state);
+    shard_fanout::expected_shards(api_state, &pools)
+        .into_iter()
+        .collect()
+}
+
+/// Merge the registered activity catalogue with the cross-shard pause rows into
+/// one entry per activity type.
+///
+/// The list is driven by the **registered catalogue**, not the pause table, so a
+/// healthy activity appears with `paused: false` — the read is a fleet
+/// inventory an operator scans during an incident, and one that only listed the
+/// already-broken things could not answer "is `charge_card` held?".
+///
+/// A paused activity that this process does **not** have registered is still
+/// listed, flagged `registered: false`. Pause deliberately does not require
+/// registration (a management node need not register every activity the fleet
+/// runs — see [`prepare_activity_pause_targets`]), so without this a mistyped
+/// hold would be invisible on the one surface an operator uses to find it, and
+/// would keep silently holding nothing forever.
+///
+/// Per-activity pause provenance follows the same rules as the mutation
+/// response: the top-level summary is the **earliest** hold (tie-broken by
+/// shard id), `held_task_count` is the fleet-wide sum, `shards` carries every
+/// shard's own row, and `provenance_uniform` compares
+/// `(reason, paused_by, scope_shard_id)` — deliberately not `paused_at`, since
+/// each shard stamps its own `NOW()`.
+///
+/// `effective_scope` reports how much of the fleet the hold is **actually** in
+/// effect on, derived from `expected_shards` rather than from the stored
+/// `scope_shard_id` (issue #807 review). The distinction is load-bearing: a
+/// fleet-wide pause that only reached some shards returns 207 at mutation time,
+/// but the rows it *did* write are byte-identical to a complete hold
+/// (`scope_shard_id = NULL`) and the shards it missed hold no row at all — so a
+/// later read that reaches every shard has a `complete` status and rows that
+/// agree, and reading intent alone would present a clean fleet-wide hold while
+/// part of the fleet keeps dispatching the very activity the operator believes
+/// they stopped. An activity that is not held reports `null`: there is no hold,
+/// so there is no coverage, mirroring the other null provenance fields.
+fn merge_activity_catalog_rows(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    rows: Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    expected_shards: &[i32],
+) -> Vec<Value> {
+    let mut paused_by_activity: std::collections::BTreeMap<
+        String,
+        Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        paused_by_activity
+            .entry(row.activity_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    // `BTreeMap` keys are already sorted, so the union is emitted in a stable
+    // name order without a second sort. Owned keys, because the loop below
+    // drains `paused_by_activity` as it goes.
+    let names: std::collections::BTreeSet<String> = catalog
+        .keys()
+        .chain(paused_by_activity.keys())
+        .cloned()
+        .collect();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.as_str();
+            let registered = catalog.get(name);
+            let mut entry = serde_json::json!({
+                "activity_name": name,
+                "registered": registered.is_some(),
+                "queue_name": registered.map(|e| e.queue_name),
+                "is_local": registered.map(|e| e.is_local),
+            });
+
+            let mut shard_rows = paused_by_activity.remove(name).unwrap_or_default();
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+
+            let map = entry
+                .as_object_mut()
+                .expect("json! object literal is an object");
+            insert_activity_pause_fields(map, &shard_rows, expected_shards);
+            entry
+        })
+        .collect()
+}
+
+/// Read every activity's pause state across the fleet, degrading gracefully.
+///
+/// An unreachable shard is named in `unavailable_shards` and drops `status` to
+/// `partial` rather than failing the read — but a `paused: false` on a partial
+/// read is only "not paused on the shards we could reach", which is why both
+/// read endpoints surface `status` alongside the data.
+async fn observe_activity_pause_rows(
+    api_state: &HarvestApiState,
+) -> Result<FanoutRows<(i32, ::autumn_harvest::activity_pause::PausedActivity)>, AutumnError> {
+    let observations = observe_shards(api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::activity_pause::list_paused_activities(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(collect_fanout_rows(observations))
+}
+
+/// `GET /activities` — every registered activity type with its pause state
+/// (issue #807).
+async fn list_activities_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+    let expected = expected_shard_ids(&api_state);
+
+    Ok(Json(serde_json::json!({
+        "activities": merge_activity_catalog_rows(&catalog, collected.rows, &expected),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// `GET /activities/{activity_name}` — one activity type's pause state
+/// (issue #807).
+///
+/// `404` when the name is neither registered on this node **nor** currently
+/// paused anywhere the read could reach. The pause arm of that rule matters: an
+/// activity that is actively holding work is a real thing an operator must be
+/// able to inspect (and then resume), so 404-ing it merely because this
+/// process does not have its handler registered would be a lie told during
+/// exactly the incident the endpoint exists for.
+async fn get_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    // Validate before looking anything up, so the read and the two writes agree
+    // on what a valid name is. Without this, `GET /activities/%20charge_card%20`
+    // answers 404 ("not registered and not paused") while
+    // `POST /activities/%20charge_card%20/pause` answers 400 — the same input
+    // diagnosed two different ways, and the 404 is the misleading one: it
+    // implies the activity does not exist rather than that the name is invalid.
+    let activity_name = ::autumn_harvest::activity_pause::validate_activity_name(&activity_name)
+        .map_err(|e| AutumnError::bad_request_msg(e.to_string()))?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+
+    // Filter to the requested name BEFORE merging so an unrelated activity's
+    // rows can never leak into a single-record read.
+    let rows: Vec<_> = collected
+        .rows
+        .into_iter()
+        .filter(|(_, row)| row.activity_name == activity_name)
+        .collect();
+    let narrowed_catalog: std::collections::BTreeMap<String, ActivityCatalogEntry> = catalog
+        .get(&activity_name)
+        .map(|found| (activity_name.clone(), *found))
+        .into_iter()
+        .collect();
+    let expected = expected_shard_ids(&api_state);
+    let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows, &expected);
+
+    // `merge_activity_catalog_rows` emits one entry per name in the union of
+    // (catalogue, pause rows); both are already narrowed to this name, so an
+    // empty result means the name is unknown *on the shards that answered* --
+    // which is only the same as "unknown" when every shard answered.
+    let Some(activity) = merged.pop() else {
+        return Err(activity_missing_error(
+            &activity_name,
+            collected.status,
+            &collected.unavailable_shards,
+        ));
+    };
+
+    Ok(Json(serde_json::json!({
+        "activity": activity,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
 }
 
 async fn prometheus_metrics(
@@ -27295,6 +37412,50 @@ pub(crate) async fn db_conn_for_execution(
     acquire_conn(pool.pool_for_execution(exec_id)).await
 }
 
+/// Resolve a connection to the shard that *owns* `exec_id`, with **no default
+/// fallback** — for reads whose answer is "does this execution exist?".
+///
+/// [`db_conn_for_execution`] routes through `ShardedDbPool::pool_for_execution`,
+/// which falls back to the **default** shard when the id's encoded shard has no
+/// configured pool. For an existence question that fallback is a correctness
+/// hazard: mid a shard-add rollout (step 2 of the documented procedure widens
+/// `readable_shards` *before* this process has the new pool) the lookup
+/// silently queries the wrong database, finds nothing, and answers a confident
+/// `404` for a run that may exist on its own shard.
+///
+/// This variant fails closed instead, mirroring the business-id resolver
+/// (#805): `Err` → `503` when the owning shard is one this deployment claims
+/// but cannot query, so existence is genuinely undetermined; `Ok(None)` when
+/// the id encodes a shard neither the pools nor the router know about — nothing
+/// here could ever host it, so the caller's `404` is honest. Membership is
+/// decided by [`shard_fanout::expected_shards`], the same helper the lineage
+/// fan-out uses, so a single request can never call one shard `unavailable` for
+/// descendants while implying "does not exist" for the root.
+///
+/// Only `GET /workflows/{id}/tree` uses this today. The lenient
+/// [`db_conn_for_execution`] is left in place for the ~40 other
+/// single-execution routes: switching them all is a behaviour change across the
+/// whole management API and belongs in its own slice.
+pub(crate) async fn db_conn_for_execution_exact(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<Option<PoolConn>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
+        return acquire_conn(shard_pool).await.map(Some);
+    }
+    let shard = exec_id.shard().as_i32();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    if crate::shard_fanout::expected_shards(api_state, &pools).contains(&shard) {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "shard {shard} owns execution {exec_id} but has no configured storage \
+             pool on this node; cannot determine whether it exists without \
+             risking a false 404"
+        )));
+    }
+    Ok(None)
+}
+
 pub(crate) async fn db_conn_for_shard(
     api_state: &HarvestApiState,
     shard: ShardId,
@@ -27303,12 +37464,134 @@ pub(crate) async fn db_conn_for_shard(
     acquire_conn(pool.pool_for(shard)).await
 }
 
+/// Acquire a connection for `shard` with **no** default-shard fallback
+/// (issue #697).
+///
+/// [`db_conn_for_shard`] resolves through `pool_for`, which silently returns
+/// the default shard's pool when `shard` has no pool of its own. For an
+/// explicitly *pinned* start that fallback is a correctness failure, not a
+/// convenience: the execution id, the response, and the row's `shard_id`
+/// column would all report the pinned shard while the data physically landed
+/// in the default shard's database — a silent residency breach that only
+/// surfaces later, when the pinned shard's pool is finally wired up and those
+/// executions become invisible. Fail loudly instead.
+async fn db_conn_for_pinned_shard(
+    api_state: &HarvestApiState,
+    shard: ShardId,
+) -> Result<PoolConn, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let shard_pool = pool.exact_pool_for(shard).ok_or_else(|| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {shard} has no configured connection pool; it is known to the router but not \
+             yet serviceable, so a workflow cannot be pinned to it"
+        ))
+    })?;
+    acquire_conn(shard_pool).await
+}
+
 async fn db_conn_for_dag(
     api_state: &HarvestApiState,
     dag_name: &str,
 ) -> Result<PoolConn, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     db_conn_for_shard(api_state, runtime.router.pick_for_dag(dag_name)).await
+}
+
+/// Apply the `min_history_events` threshold filter -- "this execution's
+/// recorded `harvest_events` count is `>= min_events`" -- to a boxed
+/// `harvest_workflow_executions` query, without ever reading more of a
+/// workflow's history than the threshold itself requires.
+///
+/// Shared by `load_workflows`, `load_stalled_workflows`, and the WHERE-clause
+/// threshold check in `load_history_bloat_workflows` so all three apply the
+/// identical, bounded predicate rather than three hand-copied instances of an
+/// unbounded one (they used to be exactly that: `(SELECT COUNT(*) FROM
+/// harvest_events WHERE workflow_exec_id = id) >= min_events`, duplicated
+/// three times).
+///
+/// # Why `COUNT(*)` was the wrong tool
+///
+/// A workflow this filter is meant to *find* -- one whose recorded history is
+/// unusually large -- is exactly the case where `COUNT(*)` is most expensive:
+/// Postgres cannot know the threshold is already satisfied until it has
+/// counted every single matching row, so a workflow with 500,000 recorded
+/// events pays to have all 500,000 counted merely to answer "yes, that's
+/// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
+/// ordinary executions plus 15 long-running ones with 50k-450k events each;
+/// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
+/// committed under `docs/perf-artifacts/history-bloat-filter/`):
+/// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
+/// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
+/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=6 read=3970`) via a
+/// Parallel Index Only Scan in this fixture's current state, but the access
+/// path Postgres picks for the unbounded scan is sensitive to whether the
+/// table's visibility map is fresh -- see
+/// `docs/performance-history-bloat-filter.md#the-problem` for a fixture state
+/// in which the identical query instead read 158,593 buffers via a Parallel
+/// Seq Scan. What is *not* sensitive to that: `COUNT(*)` has no early exit
+/// regardless of which access path answers it, so every one of the 448,175
+/// matching rows still has to be visited to confirm the threshold.
+///
+/// # The fix
+///
+/// `EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = id ORDER BY
+/// event_id OFFSET min_events - 1 LIMIT 1)` is boolean-equivalent to the
+/// threshold check `COUNT(*) >= min_events` for every `min_events` (verified
+/// for `0`, `1`, `actual_count - 1`, `actual_count`, `actual_count + 1`, and
+/// values far past `actual_count`), but only ever needs to read
+/// `min(actual_count, min_events)` rows to answer it. On the same fixture
+/// this reads 94 total buffers against the identical 448,175-event
+/// execution -- a 97.64% reduction -- and is unchanged for an ordinary,
+/// un-bloated execution (5 buffers either way, both forms using an Index
+/// Only Scan since the whole history fits in a handful of rows).
+///
+/// **The `ORDER BY event_id` is insurance against stale table statistics, not
+/// a guaranteed buffer-count win.** Against this fixture's current,
+/// freshly-`VACUUM`'d state, dropping the `ORDER BY` costs almost nothing (93
+/// buffers vs. 94 -- both via an Index Only Scan, `Heap Fetches: 0`).
+/// Measured against a table whose visibility map had *not* yet been set by
+/// `VACUUM`, however, the identical no-`ORDER BY` query fell back to a plain
+/// Seq Scan reading 2,956,744 non-matching rows first -- 88,618 buffers,
+/// 228x worse than the `ORDER BY`'d form -- because an un-set visibility map
+/// doesn't just inflate `Heap Fetches` within a fixed plan, it can also make
+/// the planner's *cost estimate* for an Index Only Scan look bad enough that
+/// the planner rejects that access path shape entirely. `ORDER BY event_id`
+/// gives the planner a sort target that makes the intended composite index --
+/// the same one `store::load_history` already relies on -- the correct
+/// choice regardless of whether the visibility map happens to be fresh, at
+/// zero cost when it already is. See
+/// `docs/performance-history-bloat-filter.md#why-order-by-is-load-bearing`
+/// for the full before/after.
+///
+/// `min_events == 0` (`COUNT(*) >= 0`, always true for a non-negative count)
+/// and `min_events == None` (filter not requested) both leave `query`
+/// unfiltered, matching the pre-existing `COUNT(*)` form's behavior exactly
+/// -- `min_events == 0` is handled explicitly rather than emitting `OFFSET
+/// -1`, which Postgres rejects.
+fn apply_min_history_events_filter(
+    query: harvest_workflow_executions::BoxedQuery<'_, diesel::pg::Pg>,
+    min_events: Option<u64>,
+) -> harvest_workflow_executions::BoxedQuery<'_, diesel::pg::Pg> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Bool};
+
+    let Some(min_events) = min_events else {
+        return query;
+    };
+    if min_events == 0 {
+        return query;
+    }
+    // `min_events >= 1` here, so `min_events - 1` never underflows.
+    let offset = i64::try_from(min_events - 1).unwrap_or(i64::MAX);
+    query.filter(
+        sql::<Bool>(
+            "EXISTS (SELECT 1 FROM harvest_events \
+             WHERE workflow_exec_id = harvest_workflow_executions.id \
+             ORDER BY event_id OFFSET ",
+        )
+        .bind::<BigInt, _>(offset)
+        .sql(" LIMIT 1)"),
+    )
 }
 
 /// Apply the legacy `search_attr` containment predicates and the typed
@@ -27442,7 +37725,7 @@ pub(crate) async fn load_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{BigInt, Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
+    use diesel::sql_types::{Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
     // Honor `filters.limit` exactly. Direct callers (e.g. the DAG-runs UI loader
     // `load_dag_runs_from_owning_shard`) render every row returned, so the
@@ -27570,16 +37853,11 @@ pub(crate) async fn load_workflows(
             query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
         }
     }
-    if let Some(min_events) = filters.min_history_events {
-        // Correlated subquery: filter to executions with at least `min_events`
-        // recorded events. No schema migration is required — the count is
-        // computed on read from the existing `harvest_events` table.
-        query = query.filter(
-            sql::<Bool>(
-                "(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= "
-            ).bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
-        );
-    }
+    // Correlated existence check bounded to `min_events` rows (see
+    // `apply_min_history_events_filter`) rather than an unbounded
+    // `COUNT(*)`. No schema migration is required — it reads from the
+    // existing `harvest_events` table via the existing composite index.
+    query = apply_min_history_events_filter(query, filters.min_history_events);
     query
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -27617,7 +37895,13 @@ pub(crate) async fn load_workflows(
 /// letting a completeness `status` read `complete` even though that shard was
 /// never inspected (issue #756 review). This mirrors the exact-resolution
 /// `pools.get(&shard_id)` guard `resolve_workflow_by_business_id` already uses.
-fn resolve_expected_shard_pools<'a>(
+///
+/// `pub(crate)` so the Vantage Workers-page pause loader resolves shards through
+/// this exact function rather than a second copy of the rule: iterating only
+/// `pool.iter_shards()` there would give a router-known-but-poolless shard no
+/// future at all, so it could never be reported unreadable — the same
+/// presence-vs-coverage gap, reached from the UI side (issue #619 round 11).
+pub(crate) fn resolve_expected_shard_pools<'a>(
     expected: &std::collections::BTreeSet<i32>,
     pools: &'a BTreeMap<i32, DbPool>,
 ) -> Vec<(i32, Option<&'a DbPool>)> {
@@ -27976,15 +38260,9 @@ pub(crate) async fn load_stalled_workflows(
         query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
 
-    if let Some(min_events) = filters.min_history_events {
-        query = query.filter(
-            sql::<Bool>(
-                "(SELECT COUNT(*) FROM harvest_events \
-                 WHERE workflow_exec_id = harvest_workflow_executions.id) >= ",
-            )
-            .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
-        );
-    }
+    // Same bounded existence check as `load_workflows` — see
+    // `apply_min_history_events_filter`.
+    query = apply_min_history_events_filter(query, filters.min_history_events);
 
     // Honor the search-attribute filters on the stalled path too (issue #506
     // review): without this, `?no_progress_minutes=N&search_attr_filter=…` (or
@@ -28061,6 +38339,23 @@ pub(crate) async fn load_stalled_workflows(
         .into_iter()
         .filter_map(|(id, ts)| ts.map(|t| (id, t)))
         .collect();
+
+    // Issue #704 (PR #1139 review, Codex P2): `history_event_count` is
+    // documented (`docs/api-contract.json`) as populated ONLY when the
+    // request set `history_bloat_min_events` -- the dedicated AC2 discovery
+    // path served by `load_history_bloat_workflows`, a completely separate
+    // loader `list_workflows` routes to *instead of* this one (the two are
+    // mutually exclusive with `no_progress_minutes`, rejected 400 together).
+    // This function (`load_stalled_workflows`, the `no_progress_minutes`
+    // path) must therefore NEVER populate the field -- not even when the
+    // pre-existing, general-purpose `min_history_events` filter (issue #493)
+    // is also supplied, which composes as a pure row FILTER here (applied
+    // above) and was never meant to change the response shape. An earlier
+    // cut incorrectly ran an extra batch `COUNT(*)` query and populated
+    // `history_event_count` whenever `min_history_events` was set, silently
+    // changing the JSON shape for existing
+    // `?no_progress_minutes=N&min_history_events=M` callers and paying for a
+    // query the response never needed.
 
     // ── Step 3: any runnable task queue row (activity or workflow type) ────────
     // Checking all task_type values mirrors the sleeping-filter predicate so that
@@ -28158,9 +38453,291 @@ pub(crate) async fn load_stalled_workflows(
                 last_event_at,
                 last_event_age_seconds,
                 stall_reason,
+                // Never populated on this (`no_progress_minutes`) path --
+                // see the removed Step 2.5 block's doc comment above.
+                history_event_count: None,
             }
         })
         .collect())
+}
+
+// ── Issue #704: operator early-warning discovery for workflow history bloat
+// ─────────────────────────────────────────────────────────────────────────
+//
+// A dedicated `history_bloat_min_events` discovery path, using a query
+// parameter DISTINCT from the pre-existing general-purpose `min_history_events`
+// filter already composable on `load_workflows`/`load_stalled_workflows`
+// (issue #493): AC1 specifically requires the response be (a) restricted to
+// live (non-terminal) executions and (b) sorted by history size descending —
+// neither of which the general filter does (it composes with the caller's
+// own `state=`/`order=`/pagination choice, and must keep doing so). Using a
+// separate param — rather than repurposing `min_history_events` for this
+// incompatible behavior — is deliberate: hijacking the existing param broke
+// callers combining it with `state=`/pagination (see the PR #1139 review).
+// Mirrors `load_stalled_workflows`'s multi-step-query shape rather than
+// retrofitting these two behaviors into the general-purpose loader, so the
+// existing `min_history_events` composition on the default/stalled paths is
+// left byte-for-byte unchanged.
+
+/// Per-shard history-bloat discovery query (issue #704, AC1/AC2).
+///
+/// Returns non-terminal (live) executions whose current recorded
+/// `harvest_events` count is `>= filters.history_bloat_min_events` (and, when
+/// also supplied, `>= filters.min_history_events` -- PR #1139 review finding
+/// B: the two count thresholds compose rather than one silently overriding
+/// the other), each carrying its `history_event_count` so the caller can
+/// rank/triage without a second round-trip. Returns `Ok(vec![])` immediately
+/// when `history_bloat_min_events` is unset.
+///
+/// Non-terminal is enforced unconditionally (`state NOT IN` the six terminal
+/// states) in addition to — not instead of — any caller-supplied `state=`
+/// filter: the two AND together, so a `state=RUNNING` request narrows
+/// further as expected, while a `state=COMPLETED` request yields zero rows
+/// (an incompatible combination) rather than silently overriding the
+/// caller's explicit choice.
+///
+/// Bounded per-shard (PR #1139 review finding C): ordered by the current
+/// event count descending (with an `id` ascending tie-break matching
+/// [`build_history_bloat_fanout`]'s cross-shard merge order) and limited to
+/// `filters.limit` rows *before* any full [`WorkflowExecution`] row is
+/// loaded, so a shard with a large live population cannot force this query
+/// to materialize (and transfer, and JSON-decode) more candidate rows than
+/// the caller could ever see in the final, truncated response.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn load_history_bloat_workflows(
+    conn: &mut AsyncPgConnection,
+    filters: &WorkflowFilters,
+) -> HarvestResult<Vec<StalledWorkflowRow>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
+
+    // Correlated subquery computing each candidate's EXACT current recorded
+    // event count, for the `SELECT`/`ORDER BY` pair below (AC2 needs the real
+    // number for ranking/reporting, so this instance is inherent -- there is
+    // no threshold to bound it against). `ORDER BY` references the `SELECT`'s
+    // output alias (`HISTORY_EVENT_COUNT_ALIAS`, below) rather than
+    // re-stating the subquery text, so the two share exactly one evaluation.
+    //
+    // The WHERE-clause threshold check below is a SEPARATE, bounded
+    // predicate (`apply_min_history_events_filter`) -- Postgres evaluates
+    // WHERE before the SELECT list/ORDER BY in logical processing order, so
+    // sharing one physical scan across that boundary would need restructuring
+    // this query as a `LATERAL`/CTE join, judged too invasive a rewrite for
+    // this fix (PR #1139 review, third round). The two count-threshold
+    // filters that used to live in WHERE (this parameter and the composed
+    // `min_history_events`) are collapsed into ONE combined, bounded
+    // existence check before either is applied, so a non-bloated candidate
+    // (the common case) is rejected from a scan capped at `effective_min_events`
+    // rows rather than two unbounded `COUNT(*)` scans; a genuinely bloated
+    // candidate still pays one EXACT count afterward, for ranking, which is
+    // inherent to what this endpoint reports (see
+    // `apply_min_history_events_filter`'s doc comment for the mechanism and
+    // measurements).
+    const HISTORY_EVENT_COUNT_SUBQUERY: &str = "(SELECT COUNT(*) FROM harvest_events \
+         WHERE workflow_exec_id = harvest_workflow_executions.id)";
+    const HISTORY_EVENT_COUNT_ALIAS: &str = "history_event_count";
+
+    let Some(min_events) = filters.history_bloat_min_events else {
+        return Ok(vec![]);
+    };
+    // PR #1139 review (finding B, prior round): `count >= a AND count >= b`
+    // is exactly `count >= max(a, b)`, so the stricter of the two
+    // count-threshold filters always wins regardless of which parameter
+    // supplies it. Computed here (in Rust, before the query is built) rather
+    // than as two separate ANDed SQL predicates (PR #1139 review, third
+    // round) -- collapsing to one predicate halves the WHERE-clause
+    // evaluation count for the common "both filters supplied" case, on top
+    // of the semantics being identical either way.
+    let effective_min_events = filters
+        .min_history_events
+        .map_or(min_events, |min_history| min_history.max(min_events));
+
+    // ── Step 1: find candidate executions, bounded per-shard (AC1/AC2) ──────
+    // PR #1139 review (finding C): this used to `.load()` every matching live
+    // row on a shard with no `LIMIT`, truncating only after the cross-shard
+    // merge -- a shard with a large live population could materialize
+    // thousands of full `WorkflowExecution` rows (JSON payload columns
+    // included) just to discard all but `filters.limit` of them. Ordering by
+    // the same count expression the final merge sorts by
+    // (`build_history_bloat_fanout`), with the identical `id` ASC tie-break,
+    // and applying `.limit(filters.limit)` per shard is a correct
+    // top-K-per-partition-then-merge: any row excluded from a shard's own
+    // local top-`filters.limit` under this exact order has `filters.limit`
+    // other rows on that same shard ranked at or above it, so it can never be
+    // part of the global top-K after merging every shard's contribution --
+    // excluding it here changes nothing about the final, truncated result.
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        // AC1: "live (non-terminal)" — unconditional, ANDed with any explicit
+        // `state=` filter below. Derives from `erase::TERMINAL_STATES`, the
+        // engine's single source of truth for terminal-state classification
+        // (see its doc comment), so this filter can never silently drift from
+        // the states `is_terminal_state`/`resolve_execution_id_by_workflow_id`
+        // (issue #805) recognize as terminal.
+        .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES));
+    // Bounded existence check — see `apply_min_history_events_filter`. Reads
+    // at most `effective_min_events` rows from `harvest_events` regardless of
+    // how large a candidate's true recorded history is, rather than an
+    // unbounded `COUNT(*)`.
+    query = apply_min_history_events_filter(query, Some(effective_min_events));
+
+    if !filters.states.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
+    }
+    // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
+    // explicitly filters to a canary workflow name.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    if let Some(owner) = &filters.owner {
+        query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
+    }
+    if let Some(severity) = &filters.severity {
+        query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
+    }
+    query = apply_search_attr_filters(
+        query,
+        &filters.search_attrs,
+        &filters.search_attr_predicates,
+    );
+    // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
+    // omitting it here silently broadened the result to unrelated bloated
+    // executions instead of narrowing to the ones actually blocked by the
+    // named cause (e.g. non-determinism) when the two filters are combined.
+    if let Some(cause) = &filters.failure_cause {
+        let predicate = serde_json::json!({ "failure_cause": cause });
+        query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
+    }
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    if filters.nd_blocked {
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
+    if filters.legal_hold {
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
+    }
+    if let Some(src) = &filters.start_source {
+        if src == "unknown" {
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
+        } else {
+            query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
+        }
+    }
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.le(before));
+    }
+    if let Some(prefix) = &filters.exec_id_prefix {
+        let pattern = format!("{}%", prefix.to_lowercase());
+        query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
+    }
+
+    // ── Step 2: order by history size, bound, and fetch the count alongside
+    // each row in the SAME query (AC2) -- no separate batch-count round trip,
+    // and no full row materialized beyond the per-shard `LIMIT`. `ORDER BY`
+    // references the `SELECT`'s output alias by name (PR #1139 review, third
+    // round) rather than re-stating the correlated subquery: Postgres
+    // documents that a bare, simple-name `ORDER BY` expression matching an
+    // output column resolves to that output column (falling back to a
+    // same-named input column only when no output alias matches), so the two
+    // clauses share exactly one evaluation of the subquery per candidate row
+    // instead of each independently re-evaluating it.
+    let rows: Vec<(WorkflowExecution, i64)> = query
+        .order(sql::<BigInt>(HISTORY_EVENT_COUNT_ALIAS).desc())
+        .then_order_by(harvest_workflow_executions::id.asc())
+        .limit(filters.limit)
+        .select((
+            WorkflowExecution::as_select(),
+            sql::<BigInt>(&format!(
+                "{HISTORY_EVENT_COUNT_SUBQUERY} AS {HISTORY_EVENT_COUNT_ALIAS}"
+            )),
+        ))
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(execution, history_event_count)| StalledWorkflowRow {
+            execution,
+            last_event_at: None,
+            last_event_age_seconds: None,
+            stall_reason: None,
+            history_event_count: Some(history_event_count),
+        })
+        .collect())
+}
+
+/// Fan-out `load_history_bloat_workflows` across all configured shards and
+/// merge results sorted by `history_event_count` descending, truncated to
+/// `filters.limit` (issue #704, AC1).
+///
+/// Partial availability (issue #756): an unreachable shard is folded into the
+/// returned [`FanoutRows`] rather than failing the whole request; reachable
+/// shards' rows still merge, sort, and truncate normally.
+pub(crate) async fn load_history_bloat_workflows_from_shards(
+    api_state: &HarvestApiState,
+    filters: &WorkflowFilters,
+) -> Result<FanoutRows<StalledWorkflowRow>, AutumnError> {
+    let observations = observe_shards(api_state, |_shard_id, mut conn| {
+        let filters = filters.clone();
+        async move {
+            load_history_bloat_workflows(&mut conn, &filters)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
+    Ok(build_history_bloat_fanout(observations, filters.limit))
+}
+
+/// Merge, sort by `history_event_count` descending, and truncate per-shard
+/// history-bloat observations (pure, no DB) — issue #704.
+///
+/// Ties break on `execution.id` for a total, deterministic order across
+/// repeated calls. A row with no computed count (unreachable in practice —
+/// every candidate is fetched alongside its count in the same loader pass)
+/// sorts as `0`, never panics.
+pub(crate) fn build_history_bloat_fanout(
+    observations: Vec<ShardObservation<StalledWorkflowRow>>,
+    limit_raw: i64,
+) -> FanoutRows<StalledWorkflowRow> {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
+
+    rows.sort_by(|a, b| {
+        b.history_event_count
+            .unwrap_or(0)
+            .cmp(&a.history_event_count.unwrap_or(0))
+            .then_with(|| a.execution.id.cmp(&b.execution.id))
+    });
+    rows.truncate(usize::try_from(limit_raw).unwrap_or(usize::MAX));
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
 }
 
 /// Fan-out `load_stalled_workflows` across all configured shards and merge
@@ -28235,6 +38812,11 @@ fn export_history_for_execution(
             // replay path (mirrors `parent_execution_id`; the column lives in no
             // `WorkflowEvent`).
             workflow_id: Some(execution.workflow_id.clone()),
+            // Issue #798: carry the execution's task queue so a workflow that
+            // branches on `ctx.queue_name()` replays against the queue it really
+            // ran on, not "" (the live worker sets it from the task row, so it
+            // lives in no `WorkflowEvent`).
+            queue_name: Some(execution.queue_name.clone()),
             execution_id: ExecutionId::from_uuid(execution.id),
             shard_id: execution.shard_id,
             state: execution.state.clone(),
@@ -28274,6 +38856,9 @@ fn export_history_for_candidate(
             // round-trips `ctx.info().workflow_id` into the replay path — parity
             // with the single-execution export.
             workflow_id: Some(candidate.workflow_id.clone()),
+            // Issue #798: carry the execution's task queue — parity with the
+            // single-execution export.
+            queue_name: Some(candidate.queue_name.clone()),
             execution_id: ExecutionId::from_uuid(candidate.id),
             shard_id: candidate.shard_id,
             state: candidate.state.clone(),
@@ -28281,7 +38866,13 @@ fn export_history_for_candidate(
             exported_at: chrono::Utc::now(),
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
-            context_headers: None,
+            // Issue #798: carry the execution's own ambient headers so a
+            // header-branching workflow replays against what the live run saw
+            // instead of an empty map (which would be a FALSE divergence).
+            context_headers: candidate.context_headers.as_ref().and_then(|value| {
+                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
+                    .ok()
+            }),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
@@ -28376,6 +38967,56 @@ async fn export_selected_history_candidates(
     }
 }
 
+/// Re-read the execution's **mutable** deadline metadata, so a fixture pairs a
+/// history and a deadline observed at the same point in the execution's life.
+///
+/// `deadline_at` is the one candidate field that moves after discovery: pause
+/// (#383) suspends the SLA clock and resume pushes `deadline_at` forward by the
+/// pause span. Candidate discovery and the per-candidate fetch are separate
+/// round-trips with the whole export loop between them (up to `MAX_SAMPLE_TOTAL`
+/// candidates), so a `PAUSED` execution resumed inside that window leaves the
+/// discovery-time value *stale and earlier* than the history it is paired with.
+///
+/// That direction is the harmful one. `should_continue_as_new()` (#772) reads
+/// the live shifted `deadline_at`, and an earlier deadline reports **less**
+/// remaining budget — so replay can trip the checkpoint fraction and emit
+/// `ContinueAsNew` where the resumed live worker, seeing the extended deadline,
+/// did not. A sampled execution is non-terminal by definition, so its recorded
+/// history can never contain that command: the gate reports a divergence the
+/// candidate build did not cause and goes falsely red.
+///
+/// Calling this *after* the history load is therefore not merely a narrower
+/// window — it flips the residual READ COMMITTED race into the safe direction. A
+/// deadline fresher than the history makes the checkpoint **less** likely to
+/// fire, which always matches a history carrying no `ContinueAsNew`.
+///
+/// `execution_timeout` is re-read alongside it because it is the fallback the
+/// same deadline branch uses; it is not known to be mutated after start, but
+/// reading both from one row is cheaper to reason about than justifying why one
+/// of the pair is exempt.
+async fn reload_execution_deadline(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Result<
+    Option<(
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    diesel::result::Error,
+> {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select((dsl::execution_timeout, dsl::deadline_at))
+        .first::<(
+            Option<chrono::Duration>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )>(conn)
+        .await
+        .optional()
+}
+
 async fn export_history_candidate(
     pool: &HarvestDbPool,
     candidate: &HistoryExportCandidate,
@@ -28389,7 +39030,10 @@ async fn export_history_candidate(
     let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
         Ok(conn) => conn,
         Err(error) => {
-            work.note_unavailable(shard_id, error.to_string());
+            // This candidate was already *selected*, so an unhealthy-shard note
+            // alone would leave `export_failures = 0` and let a bundle holding a
+            // silently biased subset exit 0 (Codex round-11 P1).
+            work.note_dropped_candidate(shard_id, &exec_id, &error.to_string());
             return;
         }
     };
@@ -28410,7 +39054,44 @@ async fn export_history_candidate(
             return;
         }
     };
-    match export_history_for_candidate(candidate, history.events, query, decoder, outcome) {
+    // Read *after* the history (see `reload_execution_deadline`): pairing a
+    // newer history with the discovery-time deadline is what makes the gate
+    // falsely red, and reading last flips the residual race the safe way.
+    let refreshed = match reload_execution_deadline(&mut conn, exec_id).await {
+        Ok(Some((execution_timeout, deadline_at))) => {
+            let mut refreshed = candidate.clone();
+            refreshed.execution_timeout = execution_timeout;
+            refreshed.deadline_at = deadline_at;
+            refreshed
+        }
+        // The row vanished between the two reads — retention collected the
+        // execution *and* its events in one transaction, so the history in hand
+        // describes something that no longer exists. Fail the candidate rather
+        // than shipping a fixture for it: `export_failures` then blocks the gate
+        // at rung 2 instead of letting a silently biased bundle exit 0.
+        Ok(None) => {
+            work.note_dropped_candidate(
+                shard_id,
+                &exec_id,
+                "execution row disappeared between its history load and deadline refresh",
+            );
+            return;
+        }
+        // Same treatment as the history-load error immediately above: a
+        // candidate we selected but cannot export soundly is a failure, not a
+        // silent omission.
+        Err(error) => {
+            work.failures.push(HistoryExportFailure {
+                execution_id: Some(exec_id.to_string()),
+                shard_id,
+                reason: format!("failed to refresh execution deadline: {error}"),
+                actual_bytes: None,
+                max_bytes: None,
+            });
+            return;
+        }
+    };
+    match export_history_for_candidate(&refreshed, history.events, query, decoder, outcome) {
         Ok(document) => work.exports.push(document),
         Err(HistoryExportError::SizeLimitExceeded {
             actual_bytes,
@@ -28469,14 +39150,17 @@ SELECT
     COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at,
     w.execution_timeout AS execution_timeout,
     w.deadline_at AS deadline_at,
-    w.parent_id AS parent_id
+    w.parent_id AS parent_id,
+    w.context_headers AS context_headers,
+    w.queue_name AS queue_name
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
-         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id
+         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
+         w.queue_name
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -28507,6 +39191,613 @@ async fn load_history_export_candidates(
         .load(conn)
         .await
         .map_err(database_error)
+}
+
+// ---------------------------------------------------------------------------
+// Stratified in-flight sample export (issue #798)
+// ---------------------------------------------------------------------------
+
+/// Take at most `$3` in-flight executions **per workflow type**, oldest first,
+/// and report each type's full in-flight population on this shard.
+///
+/// One statement, two window functions:
+/// * `ROW_NUMBER() OVER (PARTITION BY workflow_name …)` performs the
+///   stratification — without it a plain `LIMIT` returns the noisiest workflow
+///   type's rows and nothing else, which is the exact failure this route
+///   exists to prevent.
+/// * `COUNT(*) OVER (PARTITION BY workflow_name)` reports the population the
+///   sample was drawn from. Computing it in the *same* statement is what makes
+///   `sampled <= in_flight_total` true by construction — a second query could
+///   observe a different snapshot and report a sample larger than its own
+///   population (AC2).
+///
+/// Deliberately no `harvest_events` join: the batch export needs one for
+/// `last_history_event_at`, but that column is only ever a sort key there and
+/// is never carried into the export document, so the sample orders by the
+/// indexed `started_at` instead and stays cheap on a large in-flight fleet.
+///
+/// Two clauses in the `WHERE` are load-bearing beyond the caller's filters:
+/// * `w.shard_id = $4::INT4` — two **logical** shards may share one physical
+///   database, so a fan-out that omitted it would run this statement twice over
+///   the same rows: `in_flight_total` would double (corrupting the very
+///   denominator AC2 exists to state honestly) and every execution would be
+///   sampled twice, halving real per-type coverage. Mirrors the same predicate
+///   on `execution::COUNT_WHERE_CLAUSE` and `schedule_run_state_summary`.
+/// * `NOT starts_with(w.workflow_name, '__harvest_canary_probe')` — the built-in
+///   liveness canary (issue #796) is engine-internal and is registered by no
+///   user gate binary, so a sampled probe would land in `blocked` and pin the
+///   gate at exit 2 on every deployment that enables it. `starts_with`, not
+///   `LIKE '…%'`: the prefix is underscore-heavy and `_` is a single-character
+///   `LIKE` wildcard, so a `LIKE` form would over-match real workflow names.
+///   The literal mirrors `canary::CANARY_WORKFLOW_NAME_PREFIX`, kept in sync by
+///   `the_canary_exclusion_literal_matches_the_canary_prefix_constant`.
+///
+/// # Why the row limit is not simply `rn <= per_workflow`
+///
+/// `per_workflow` bounds each *type*, but nothing bounds the number of types,
+/// so the returned set is `types × per_workflow`. `stratify_sample_rows` then
+/// discards all but `MAX_SAMPLE_TOTAL` of it — after the whole superset has
+/// been decoded into `HistorySampleCandidate`s, strings and `context_headers`
+/// JSON included. At 2,000 in-flight types and `per_workflow = 500` that is a
+/// million rows materialized per shard to keep 2,000, and the management API is
+/// a shared service: a routine authenticated CI export must not be able to
+/// exhaust it.
+///
+/// So the per-type limit applied here is the *effective* share the global
+/// budget will allow — `LEAST(per_workflow, GREATEST(MAX_SAMPLE_TOTAL / types,
+/// 1))` — mirroring `stratify_sample_rows`'s own `effective_per_workflow`.
+/// `types` is counted over `ranked`, which is unfiltered, so it is this shard's
+/// true distinct-type count.
+///
+/// Three properties make this safe rather than merely smaller:
+///
+/// * **The sample is unchanged.** A shard sees at most the types the union
+///   sees, so its share (`MAX/types_shard`) is never *smaller* than the global
+///   share (`MAX/types_union`) the stratifier will apply. Each shard therefore
+///   still returns a superset of its contribution to the global top-N, which is
+///   exactly the property the cross-shard union already relied on.
+/// * **The population census survives.** `GREATEST(…, 1)` floors the limit at
+///   one row per type, and `shard_population` reads `in_flight_total` from the
+///   first row of each name partition — so no type can drop out of the
+///   manifest, which is what `zero_coverage_types` and the coverage denominator
+///   depend on.
+/// * **The common case is byte-identical.** The global budget only binds at
+///   `types × per_workflow > MAX_SAMPLE_TOTAL`; below that `LEAST` selects
+///   `per_workflow` and the statement behaves exactly as before.
+///
+/// The database-side work is unchanged either way — `COUNT(*) OVER (PARTITION
+/// BY …)` already scans every in-flight row — so this narrows what crosses the
+/// wire and lands in process memory, which is where the cost was.
+const HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL: &str = r"
+WITH ranked AS (
+    SELECT
+        w.id AS id,
+        w.workflow_name AS workflow_name,
+        w.workflow_id AS workflow_id,
+        w.shard_id AS shard_id,
+        w.state AS state,
+        w.started_at AS started_at,
+        w.execution_timeout AS execution_timeout,
+        w.deadline_at AS deadline_at,
+        w.parent_id AS parent_id,
+        w.context_headers AS context_headers,
+        w.queue_name AS queue_name,
+        ROW_NUMBER() OVER (
+            PARTITION BY w.workflow_name
+            ORDER BY w.started_at ASC, w.id ASC
+        ) AS rn,
+        COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total
+    FROM harvest_workflow_executions w
+    WHERE w.shard_id = $4::INT4
+      AND w.state = ANY($1::TEXT[])
+      AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
+      AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+),
+type_count AS (
+    SELECT COUNT(*)::BIGINT AS types FROM (SELECT DISTINCT workflow_name FROM ranked) d
+)
+SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
+       execution_timeout, deadline_at, parent_id, context_headers, queue_name,
+       in_flight_total
+FROM ranked, type_count
+WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
+ORDER BY workflow_name ASC, rn ASC
+";
+
+/// Newest-first variant of [`HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL`].
+///
+/// A separate constant because `ORDER BY` direction cannot be bound as a
+/// parameter, and interpolating it would be a SQL-injection seam. The two
+/// statements differ **only** in the `ROW_NUMBER()` window's sort direction.
+const HISTORY_SAMPLE_CANDIDATES_NEWEST_SQL: &str = r"
+WITH ranked AS (
+    SELECT
+        w.id AS id,
+        w.workflow_name AS workflow_name,
+        w.workflow_id AS workflow_id,
+        w.shard_id AS shard_id,
+        w.state AS state,
+        w.started_at AS started_at,
+        w.execution_timeout AS execution_timeout,
+        w.deadline_at AS deadline_at,
+        w.parent_id AS parent_id,
+        w.context_headers AS context_headers,
+        w.queue_name AS queue_name,
+        ROW_NUMBER() OVER (
+            PARTITION BY w.workflow_name
+            ORDER BY w.started_at DESC, w.id DESC
+        ) AS rn,
+        COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total
+    FROM harvest_workflow_executions w
+    WHERE w.shard_id = $4::INT4
+      AND w.state = ANY($1::TEXT[])
+      AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
+      AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+),
+type_count AS (
+    SELECT COUNT(*)::BIGINT AS types FROM (SELECT DISTINCT workflow_name FROM ranked) d
+)
+SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
+       execution_timeout, deadline_at, parent_id, context_headers, queue_name,
+       in_flight_total
+FROM ranked, type_count
+WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
+ORDER BY workflow_name ASC, rn ASC
+";
+
+const fn history_sample_candidates_sql(
+    order: autumn_harvest::replay_sample::SampleOrder,
+) -> &'static str {
+    match order {
+        autumn_harvest::replay_sample::SampleOrder::Oldest => HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL,
+        autumn_harvest::replay_sample::SampleOrder::Newest => HISTORY_SAMPLE_CANDIDATES_NEWEST_SQL,
+    }
+}
+
+/// Load one **logical shard's** sample candidates.
+///
+/// `shard_id` is the logical shard being inspected, not a caller filter — the
+/// caller's `--shard-id` is applied by skipping shards in the fan-out. It is
+/// bound separately because a connection can serve more than one logical shard
+/// (see the predicate's rationale on `HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL`).
+async fn load_history_sample_candidates(
+    conn: &mut AsyncPgConnection,
+    filters: &HistorySampleExportQuery,
+    shard_id: i32,
+) -> HarvestResult<Vec<HistorySampleCandidate>> {
+    let per_workflow = i64::try_from(filters.per_workflow).unwrap_or(i64::MAX);
+    // Bound so this shard cannot return a superset the global stratifier will
+    // only throw away — see the statement's own "why the row limit is not
+    // simply `rn <= per_workflow`".
+    let max_sample_total =
+        i64::try_from(autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL).unwrap_or(i64::MAX);
+    diesel::sql_query(history_sample_candidates_sql(filters.order))
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            filters.workflow_name.clone(),
+        )
+        .bind::<diesel::sql_types::BigInt, _>(per_workflow)
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .bind::<diesel::sql_types::BigInt, _>(max_sample_total)
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+#[derive(Debug, Default)]
+struct HistorySampleExportWork {
+    /// Reused wholesale so the sample export shares one export pipeline with
+    /// the batch export (payload policy, #608 decoding, `max_bytes`, failures).
+    batch: HistoryBatchExportWork,
+    /// One entry per shard: the in-flight population per workflow type on that
+    /// shard. Summed into the manifest denominator after the fan-out.
+    per_shard_population: Vec<Vec<autumn_harvest::replay_sample::SampleWorkflowCoverage>>,
+    /// Sample rows from every shard, globally re-stratified before export.
+    sample_rows: Vec<HistorySampleCandidate>,
+    /// Set when the export stopped early on
+    /// [`autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES`], so the
+    /// manifest can report the cut rather than presenting a quietly-trimmed
+    /// bundle as the sample that was asked for.
+    truncated_by_size: bool,
+}
+
+/// Extract the per-workflow-type in-flight population from one shard's rows.
+///
+/// The window `COUNT(*)` is constant within a workflow-name partition, so the
+/// first row per name carries the whole population for that shard — including
+/// the part beyond `per_workflow` that this shard did not return.
+fn shard_population(
+    rows: &[HistorySampleCandidate],
+) -> Vec<autumn_harvest::replay_sample::SampleWorkflowCoverage> {
+    let mut seen: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for row in rows {
+        seen.entry(row.workflow_name.as_str())
+            .or_insert_with(|| u64::try_from(row.in_flight_total).unwrap_or(0));
+    }
+    seen.into_iter()
+        .map(|(workflow_name, in_flight_total)| {
+            autumn_harvest::replay_sample::SampleWorkflowCoverage {
+                workflow_name: workflow_name.to_string(),
+                // Both filled in after export from the documents actually
+                // written, so a size-limit failure is never counted as a
+                // sample.
+                sampled: 0,
+                in_flight_total,
+                sampled_execution_ids: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// Re-apply the per-type cap **globally** after the cross-shard union.
+///
+/// Each shard already returned its own top-`per_workflow`, so the union is a
+/// superset of the global top-`per_workflow` (an execution in the global top-N
+/// is necessarily in its own shard's top-N). Re-sorting by the same key and
+/// truncating therefore yields exactly the global stratified sample, and the
+/// per-type cap in AC1 is a fleet-wide cap rather than a per-shard one.
+///
+/// `MAX_SAMPLE_TOTAL` additionally bounds the whole response; the resulting
+/// shortfall is visible in the manifest as `sampled < in_flight_total` (AC2).
+fn stratify_sample_rows(
+    rows: &mut Vec<HistorySampleCandidate>,
+    per_workflow: usize,
+    order: autumn_harvest::replay_sample::SampleOrder,
+) {
+    let newest = order == autumn_harvest::replay_sample::SampleOrder::Newest;
+    rows.sort_by(|left, right| {
+        left.workflow_name.cmp(&right.workflow_name).then_with(|| {
+            let by_time = left
+                .started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.id.cmp(&right.id));
+            if newest { by_time.reverse() } else { by_time }
+        })
+    });
+
+    // Spread the global budget across types instead of letting the
+    // alphabetically-earliest ones drink it dry.
+    //
+    // Rows are sorted by `workflow_name` first, so a naive running `total`
+    // guard hands the whole `MAX_SAMPLE_TOTAL` budget to the types that sort
+    // first and leaves the rest with ZERO fixtures — while the manifest still
+    // reports `complete` (its status is shard-derived, not coverage-derived)
+    // and the gate exits 0. That is a silent false pass: a release certified
+    // against workflow types the gate never looked at. It is the same "noisy
+    // type crowds out the quiet ones" failure the per-type cap exists to
+    // prevent, reintroduced on the alphabetical axis, and it triggers at
+    // `types * per_workflow > MAX_SAMPLE_TOTAL` — i.e. 41 types at the default
+    // `per_workflow = 50`.
+    //
+    // Giving every type an equal floor is a no-op whenever the global budget
+    // does not bind (`MAX_SAMPLE_TOTAL / types >= per_workflow`), so the common
+    // case is unchanged.
+    let type_count = rows
+        .iter()
+        .map(|row| row.workflow_name.as_str())
+        .dedup_count_sorted();
+    // `checked_div` rather than a `type_count == 0` guard around `/`: an empty
+    // row set means no type binds the global budget, so the caller's
+    // `per_workflow` stands unchanged.
+    let effective_per_workflow = autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL
+        .checked_div(type_count)
+        .map_or(per_workflow, |share| per_workflow.min(share.max(1)));
+
+    let mut taken_for_name = 0usize;
+    let mut total = 0usize;
+    let mut current: Option<&str> = None;
+    let mut keep = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        if current != Some(row.workflow_name.as_str()) {
+            current = Some(row.workflow_name.as_str());
+            taken_for_name = 0;
+        }
+        keep.push(
+            taken_for_name < effective_per_workflow
+                && total < autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL,
+        );
+        if *keep.last().unwrap_or(&false) {
+            taken_for_name += 1;
+            total += 1;
+        }
+    }
+    let mut iter = keep.into_iter();
+    rows.retain(|_| iter.next().unwrap_or(false));
+}
+
+/// Count distinct adjacent values in an already-sorted iterator.
+///
+/// A tiny local helper so `stratify_sample_rows` can size the per-type budget
+/// without allocating a set over every candidate row.
+trait DedupCountSorted<'a> {
+    fn dedup_count_sorted(self) -> usize;
+}
+
+impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
+    fn dedup_count_sorted(self) -> usize {
+        let mut count = 0usize;
+        let mut previous: Option<&'a str> = None;
+        for value in self {
+            if previous != Some(value) {
+                count += 1;
+                previous = Some(value);
+            }
+        }
+        count
+    }
+}
+
+/// Discover sample candidates across every shard the deployment is **expected**
+/// to have, not merely every shard this process holds a pool for.
+///
+/// The distinction is load-bearing for the gate. `pool.iter_shards()` yields
+/// only shards wired up in *this* process, but during a shard-add rollout the
+/// router's `readable_shards` is widened first (see the workspace CLAUDE.md
+/// "add a shard" procedure), so a shard can be routable — and already holding
+/// in-flight executions — while this node has no pool for it. Enumerating only
+/// the pools would omit that shard *silently*: it would appear in neither
+/// `inspected_shards` nor `unavailable_shards`, and `SampleStatus::from_counts`
+/// derives `Complete` from `unavailable == 0`. The manifest would then claim
+/// complete coverage, and even `require_complete_coverage(true)` would certify
+/// a candidate build without replaying a single one of that shard's workflows —
+/// the exact false green the coverage record exists to prevent.
+///
+/// So this iterates `shard_fanout::expected_shards` (pools ∪ router-known) and
+/// records a shard with no resolvable pool as `unavailable`, which is the same
+/// treatment every other cross-shard read in the repo gives it.
+async fn collect_history_sample_candidates_from_shards(
+    api_state: &HarvestApiState,
+    query: &HistorySampleExportQuery,
+    work: &mut HistorySampleExportWork,
+) {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    for shard_id in crate::shard_fanout::expected_shards(api_state, &pools) {
+        if query.shard_id.is_some_and(|target| target != shard_id) {
+            continue;
+        }
+        work.batch.saw_requested_shard = true;
+
+        // A router-known shard this process has no pool for is unavailable, not
+        // absent. Reported rather than skipped so the status can never read
+        // `complete` over a shard that was never queried.
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            work.batch
+                .note_unavailable(shard_id, "shard pool is not configured".to_string());
+            continue;
+        };
+
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                work.batch.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        let rows = match load_history_sample_candidates(&mut conn, query, shard_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                work.batch.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        // Recorded only once the query succeeded. Counting a shard as inspected
+        // the moment its connection was acquired puts a failed shard in *both*
+        // lists, and `SampleStatus::from_counts` reads `inspected == 0` as its
+        // "unavailable" signal — so on a single-shard deployment a failing query
+        // would report `partial` (with one shard supposedly inspected) instead
+        // of `unavailable`, understating the outage in the very record the gate
+        // uses to decide whether coverage was proven.
+        work.batch.inspected_shards.push(shard_id);
+        if !rows.is_empty() {
+            work.batch.matched_shards.push(shard_id);
+        }
+        work.per_shard_population.push(shard_population(&rows));
+        work.sample_rows.extend(rows);
+    }
+}
+
+async fn export_sampled_history_candidates(
+    pool: &HarvestDbPool,
+    query: &HistorySampleExportQuery,
+    work: &mut HistorySampleExportWork,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) {
+    stratify_sample_rows(&mut work.sample_rows, query.per_workflow, query.order);
+    let single_query = HistoryExportQuery {
+        payload_policy: query.payload_policy,
+        max_bytes: query.max_bytes,
+    };
+    let rows = std::mem::take(&mut work.sample_rows);
+    let mut budget = SampleByteBudget::default();
+    for row in rows {
+        if budget.exhausted() {
+            work.truncated_by_size = true;
+            break;
+        }
+        let before = work.batch.exports.len();
+        let candidate = row.into_export_candidate();
+        export_history_candidate(
+            pool,
+            &candidate,
+            &single_query,
+            &mut work.batch,
+            decoder,
+            outcome,
+        )
+        .await;
+        // A candidate that failed (size limit, unreadable shard) records a
+        // failure instead of an export, so charge the budget from what was
+        // actually retained rather than assuming every row costs something.
+        let retained = (work.batch.exports.len() > before)
+            .then(|| {
+                work.batch
+                    .exports
+                    .last()
+                    .map(|document| document.size_limit.actual_bytes)
+            })
+            .flatten();
+        budget.charge_attempt(retained);
+    }
+}
+
+/// Running total of the bytes one sample export has accumulated in memory.
+///
+/// [`autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL`] bounds the fixture
+/// *count*, but `max_bytes` is per-document and caller-raisable, so the count
+/// cap alone leaves the aggregate unbounded — ~20 GiB at the defaults, on a
+/// shared management API. This is the aggregate bound.
+///
+/// Split out as a value rather than inlined so the two rules that matter are
+/// unit-testable without a database: the budget must actually *stop* the loop,
+/// and a candidate that produced no document must not be charged for one.
+#[derive(Debug, Default, Clone, Copy)]
+struct SampleByteBudget {
+    used: usize,
+}
+
+impl SampleByteBudget {
+    /// Whether no further history should be fetched.
+    ///
+    /// Checked *before* a fetch: a document's size is not knowable until it is
+    /// loaded, so peak retained bytes are the budget plus at most one document.
+    const fn exhausted(self) -> bool {
+        self.used >= autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES
+    }
+
+    /// Charge one export attempt.
+    ///
+    /// `retained` is `None` when the attempt produced a *failure* rather than a
+    /// document (over `max_bytes`, unreadable shard). Such an attempt holds no
+    /// bytes, so charging it would shrink the budget for histories that were
+    /// never retained and cut the sample short for free — which is why the
+    /// "did this attempt retain anything?" rule lives here, where it is
+    /// testable, rather than in the loop.
+    ///
+    /// Saturating, so a pathological `max_bytes` cannot wrap the running total
+    /// back under the budget and reopen an exhausted export.
+    const fn charge_attempt(&mut self, retained: Option<usize>) {
+        if let Some(bytes) = retained {
+            self.used = self.used.saturating_add(bytes);
+        }
+    }
+}
+
+/// Merge the per-shard populations and count what was actually exported.
+///
+/// A workflow type whose entire sample failed the size limit still appears with
+/// `sampled: 0` and its real `in_flight_total`, so an operator can never mistake
+/// "nothing was exported for this type" for "this type has nothing in flight"
+/// (AC2).
+fn build_sample_manifest(
+    query: &HistorySampleExportQuery,
+    work: &HistorySampleExportWork,
+) -> autumn_harvest::replay_sample::SampleManifest {
+    let mut per_workflow =
+        autumn_harvest::replay_sample::merge_coverage(&work.per_shard_population);
+
+    // Identities, not just a tally. `sampled` alone accepts any substitution
+    // that preserves the count — swap one execution of a type for a duplicate
+    // of another and the number still matches — so the gate cannot tell the
+    // bundle it was handed apart from a bundle of the right shape. Recording
+    // what was actually written lets it (see
+    // `ReplayDriftReport::bundle_inventory_mismatches`).
+    let mut exported: std::collections::BTreeMap<&str, Vec<autumn_harvest::ExecutionId>> =
+        std::collections::BTreeMap::new();
+    for document in &work.batch.exports {
+        exported
+            .entry(document.workflow_name.as_str())
+            .or_default()
+            .push(document.execution_id);
+    }
+    for entry in &mut per_workflow {
+        let mut ids = exported
+            .get(entry.workflow_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        // Sorted so two exports of the same sample produce a byte-identical
+        // manifest rather than one that differs by export iteration order.
+        ids.sort_unstable_by_key(autumn_harvest::ExecutionId::as_uuid);
+        // Derived from the same list rather than counted separately, so the
+        // count and the identities can never disagree with each other.
+        entry.sampled = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+        entry.sampled_execution_ids = ids;
+    }
+
+    let sampled_total = per_workflow.iter().map(|entry| entry.sampled).sum();
+    let in_flight_total = per_workflow.iter().map(|entry| entry.in_flight_total).sum();
+
+    autumn_harvest::replay_sample::SampleManifest {
+        generated_at: chrono::Utc::now(),
+        status: autumn_harvest::replay_sample::SampleStatus::from_counts(
+            work.batch.inspected_shards.len(),
+            work.batch.unavailable_shards.len(),
+        ),
+        states: query.states.clone(),
+        per_workflow,
+        sampled_total,
+        in_flight_total,
+        unavailable_shards: work
+            .batch
+            .unavailable_shards
+            .iter()
+            .map(|shard| format!("shard {}: {}", shard.shard_id, shard.reason))
+            .collect(),
+        inspected_shards: work.batch.inspected_shards.clone(),
+        truncated_by_size: work.truncated_by_size,
+        // A selected candidate that failed to export produces a failure instead
+        // of a document, so `sampled_total` above counts only the survivors and
+        // therefore agrees exactly with the bundle. Carrying the count is the
+        // only way the gate can tell that the sample it replayed is a subset of
+        // the sample that was chosen.
+        export_failures: work.batch.failures.len() as u64,
+    }
+}
+
+async fn load_history_sample_from_shards(
+    api_state: &HarvestApiState,
+    query: &HistorySampleExportQuery,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) -> Result<HistorySampleExportResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut work = HistorySampleExportWork::default();
+
+    collect_history_sample_candidates_from_shards(api_state, query, &mut work).await;
+    export_sampled_history_candidates(&pool, query, &mut work, decoder, outcome).await;
+    // Only reachable when an explicit `shard_id` names a shard that is neither
+    // pooled nor router-known; a router-known-but-poolless shard is already
+    // recorded as unavailable by the discovery loop itself.
+    if let Some(shard_id) = query.shard_id
+        && !work.batch.saw_requested_shard
+    {
+        work.batch
+            .note_unavailable(shard_id, "shard pool is not configured".to_string());
+    }
+    work.batch.normalize_coverage();
+
+    let manifest = build_sample_manifest(query, &work);
+    Ok(HistorySampleExportResponse {
+        status: work.batch.status(),
+        observed_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        filters: HistorySampleExportFiltersResponse {
+            workflow_name: query.workflow_name.clone(),
+            states: query.states.clone(),
+            per_workflow: query.per_workflow,
+            order: query.order.as_str(),
+            shard_id: query.shard_id,
+            max_bytes: query.max_bytes,
+        },
+        manifest,
+        exports: work.batch.exports,
+        failures: work.batch.failures,
+        shard_coverage: ExternalHandoffShardCoverage {
+            inspected: work.batch.inspected_shards,
+            matched: work.batch.matched_shards,
+            unavailable: work.batch.unavailable_shards,
+        },
+    })
 }
 
 fn sort_history_export_candidates(candidates: &mut [HistoryExportCandidate]) {
@@ -28661,6 +39952,125 @@ fn parse_conflict_policy(raw: Option<&str>) -> Result<WorkflowIdConflictPolicy, 
             "unknown conflict_policy '{other}'; expected one of: unspecified, fail, use_existing, \
              terminate_existing"
         ))),
+    }
+}
+
+/// Write a best-effort `FAILED` audit row for a rejected workflow start.
+///
+/// Mirrors the inline audit blocks the reuse-policy / conflict-policy `400`
+/// paths already use; extracted so the issue-#697 placement rejections record
+/// the same trail without a third copy of the boilerplate.
+/// Request-scoped identity for a failed workflow-start audit row.
+///
+/// Bundled rather than passed positionally because every call site supplies the
+/// same six values verbatim and only `error_summary` varies.
+struct StartFailureAudit<'a> {
+    actor: &'a str,
+    workflow_name: &'a str,
+    route: &'static str,
+    request_id: Option<&'a str>,
+    source: &'a str,
+    /// The shard the caller *requested*, when they requested one (issue #697).
+    ///
+    /// Recorded so an operator can answer "who repeatedly tried to pin
+    /// EU-tagged work at the US shard and was refused?" from the audit log
+    /// alone — the success path already records the resolved shard, so a
+    /// hardcoded `None` here would make rejections forensically silent.
+    requested_shard_id: Option<i32>,
+}
+
+async fn audit_start_failure(
+    api_state: &HarvestApiState,
+    ctx: &StartFailureAudit<'_>,
+    error_summary: &str,
+) {
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let ar = NewAuditRecord {
+            actor: ctx.actor,
+            operation: OP_WORKFLOW_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(ctx.workflow_name),
+            route_or_command: ctx.route,
+            request_id: ctx.request_id,
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(error_summary),
+            shard_id: ctx.requested_shard_id,
+            source: ctx.source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+}
+
+/// Parse the optional explicit shard placement (issue #697).
+///
+/// Cap on a caller-supplied `residency_key`.
+///
+/// A residency key names a declared jurisdiction/tenant bucket, so a legitimate
+/// one is short. Capping it keeps an unbounded caller-supplied string from being
+/// reflected back in the `400` body — `input` has a payload cap, this field
+/// otherwise had none.
+const MAX_RESIDENCY_KEY_LEN: usize = 128;
+
+/// `shard_id` and `residency_key` are mutually exclusive placement sources;
+/// supplying both is ambiguous and rejected rather than silently preferring
+/// one. Omitting both yields [`ShardPlacement::Auto`] — today's rendezvous
+/// routing, byte-for-byte.
+///
+/// This validates only the *shape* of the request. Whether the requested shard
+/// actually exists (and is writable), or the residency key is declared, is the
+/// router's call — see [`ShardPlacement`] and
+/// `ShardRouter::resolve_placement`. Both layers return `400`-class errors, so
+/// an out-of-range or unparseable value can never fall through to a silent
+/// re-hash onto the default shard.
+fn parse_shard_placement(
+    shard_id: Option<i32>,
+    residency_key: Option<&str>,
+) -> Result<ShardPlacement, AutumnError> {
+    match (shard_id, residency_key) {
+        (Some(_), Some(_)) => Err(AutumnError::bad_request_msg(
+            "shard_id and residency_key are mutually exclusive; supply at most one placement",
+        )),
+        (Some(raw), None) => {
+            if raw < 0 {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id must be a non-negative shard number, got {raw}"
+                )));
+            }
+            if ShardId::new(raw).is_unencoded() {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id {raw} is the reserved routing sentinel, not a placeable shard"
+                )));
+            }
+            // Above `0xFFFE` the value cannot round-trip through an
+            // `ExecutionId` (the encoder masks to 16 bits), so the row would be
+            // written to one database while every id-based lookup routed to the
+            // truncated shard. The router rejects it too; catching it at the
+            // request boundary gives the caller the precise reason.
+            if !autumn_harvest::shard::is_encodable_shard(ShardId::new(raw)) {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id must be at most {}, got {raw}",
+                    autumn_harvest::shard::MAX_ENCODABLE_SHARD
+                )));
+            }
+            Ok(ShardPlacement::Shard(ShardId::new(raw)))
+        }
+        (None, Some(key)) => {
+            if key.trim().is_empty() {
+                return Err(AutumnError::bad_request_msg(
+                    "residency_key must not be blank",
+                ));
+            }
+            if key.trim().len() > MAX_RESIDENCY_KEY_LEN {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "residency_key must be at most {MAX_RESIDENCY_KEY_LEN} characters"
+                )));
+            }
+            Ok(ShardPlacement::residency_key(key.trim()))
+        }
+        (None, None) => Ok(ShardPlacement::Auto),
     }
 }
 
@@ -29610,6 +41020,32 @@ async fn stream_workflow_progress(
         .into_response()
 }
 
+/// Shared flat JSON body for a `HarvestError::QuotaExceeded` 429 response
+/// (issue #946, AC4) -- the single source of truth for the wire shape used
+/// by every bespoke route arm (`start_workflow`, `signal_with_start_workflow`,
+/// `update_with_start_workflow`) that constructs its own `(StatusCode,
+/// Json<..>)` response (rather than going through [`map_error`], since each
+/// of those routes must also perform a route-specific audit-record insert
+/// and throttle-token refund the shared [`map_error`] fallback below cannot
+/// do). Extracted so the three previously hand-duplicated `serde_json::json!`
+/// literals can never silently drift apart.
+fn quota_exceeded_body(
+    workflow_name: &str,
+    key: &str,
+    resource: autumn_harvest::quota::QuotaResource,
+    limit: u64,
+    current: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "quota exceeded",
+        "workflow_name": workflow_name,
+        "key": key,
+        "resource": resource.as_str(),
+        "limit": limit,
+        "current": current,
+    })
+}
+
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
         HarvestError::NotFound(message)
@@ -29673,6 +41109,39 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(format!(
             "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
         )),
+        // Safety-net fallback for a per-tenant resource quota rejection
+        // (issue #946) reached from a route that has no bespoke structured
+        // 429 arm of its own (every request-time `map_error` call site not
+        // already special-cased for `QuotaExceeded` above -- e.g. the manual
+        // schedule-trigger route). AC4 requires this surface as a typed 429
+        // naming the exhausted resource with STRUCTURED (not just prose)
+        // fields, never a fall-through to the generic `other => 503`
+        // catch-all. `map_error` returns `AutumnError`, which always
+        // serializes through the RFC 7807 Problem Details envelope (see
+        // `autumn_web::error::AutumnError::into_response`) -- there is no
+        // way to emit the bespoke arms' flat `quota_exceeded_body` shape
+        // from here without widening `map_error`'s signature across its
+        // ~100 other call sites, so this reuses the framework's OWN
+        // established idiom for attaching structured, field-keyed data to
+        // an error response (`AutumnError::validation`'s `errors: [{field,
+        // messages}]` extension, the same mechanism every validation-style
+        // 4xx elsewhere in this codebase already relies on), with the
+        // status overridden from its 422 default to 429.
+        HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        } => {
+            let mut details = std::collections::HashMap::new();
+            details.insert("workflow_name".to_string(), vec![workflow_name]);
+            details.insert("key".to_string(), vec![key]);
+            details.insert("resource".to_string(), vec![resource.as_str().to_string()]);
+            details.insert("limit".to_string(), vec![limit.to_string()]);
+            details.insert("current".to_string(), vec![current.to_string()]);
+            AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        }
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
@@ -31513,7 +42982,19 @@ pub(crate) async fn admit_update(
     // becoming durable history that runs/fails deep inside the workflow.
     // Scoped by (workflow_name, update_name), not update_name alone, since two
     // different workflows may register update handlers with the same name.
-    let execution_for_validation = load_execution(&mut conn, exec_id).await;
+    //
+    // Issue #843: an update addresses the LOGICAL run, so follow the
+    // workflow-level retry chain (#523/#842) to the live attempt before both
+    // validating and admitting. A retry successor is minted on the
+    // predecessor's shard, so `conn` above already owns the whole chain.
+    // `resolve_live_attempt` returns the resolved row, so the validation below
+    // reuses it rather than re-loading the identical row by id.
+    let resolved = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut target = ExecutionId::from_uuid(resolved.id);
+    let execution_for_validation: Result<_, autumn_harvest::HarvestError> = Ok(resolved);
 
     // Resolve the registered update handler once and reuse it for both the
     // #610 schema-400 check and the #684 validator-422 check. Scoped by
@@ -31564,21 +43045,46 @@ pub(crate) async fn admit_update(
     // the workflow could complete between a separate state read and the insert.
     // UpdateRejected is returned if the execution is no longer RUNNING. The
     // recorder emits harvest.update.admitted post-commit (issue #684).
-    if let Err(e) = store::admit_update_event(
+    //
+    // Issue #843: if the resolved attempt failed and the chain advanced under
+    // us between the resolve above and the admit, re-drive onto the fresh live
+    // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
+    // lock and rolls back on rejection, so a re-driven admit can never
+    // double-admit.
+    let mut admit = store::admit_update_event(
         &mut conn,
-        exec_id,
+        target,
         update_id,
-        update_name,
-        request.input,
+        update_name.clone(),
+        request.input.clone(),
         Some(runtime.registry.telemetry().metrics.as_ref()),
     )
-    .await
-    {
+    .await;
+    for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
+        let Err(error) = admit else { break };
+        let fresh = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id)
+            .await
+            .unwrap_or(target);
+        if !autumn_harvest::execution::redrive_target(target, fresh) {
+            return map_error(error).into_response();
+        }
+        target = fresh;
+        admit = store::admit_update_event(
+            &mut conn,
+            target,
+            update_id,
+            update_name.clone(),
+            request.input.clone(),
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await;
+    }
+    if let Err(e) = admit {
         return map_error(e).into_response();
     }
 
     // Wake the workflow worker so it picks up the new admitted update.
-    if let Err(e) = queue::wake_workflow_task(&mut conn, exec_id).await {
+    if let Err(e) = queue::wake_workflow_task(&mut conn, target).await {
         return map_error(e).into_response();
     }
 
@@ -31599,7 +43105,7 @@ pub(crate) async fn admit_update(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    poll_update_result(&pool, exec_id, update_id, timeout_secs).await
+    poll_update_result(&pool, target, update_id, timeout_secs).await
 }
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
@@ -31747,23 +43253,45 @@ async fn get_update_result(
         Err(e) => return e.into_response(),
     };
 
-    let history = match store::load_history(&mut conn, exec_id).await {
-        Ok(h) => h,
+    // Issue #843: `admit_update` routes admission to the live attempt of the
+    // workflow-level retry chain, and its `wait=admitted` 202 carries only the
+    // `update_id` — no execution id. So this paired read MUST follow the same
+    // chain, or the caller's only follow-up would 404 forever.
+    //
+    // Resolving *straight to the live attempt* is not enough, though. An
+    // `update_id` is minted per admission, so it lives on exactly ONE attempt;
+    // if the update was admitted (and possibly already completed) on attempt N
+    // and N then failed and scheduled N+1, the durable `UpdateAdmitted` /
+    // `UpdateCompleted` pair stays on N while the live attempt N+1 replays an
+    // empty history. So search the CHAIN for the attempt that actually carries
+    // this admission — deepest first, because the live attempt is the common
+    // case (an update admitted moments ago) and a workflow that never retried
+    // has a one-element chain, i.e. exactly today's single history load.
+    let chain = match autumn_harvest::execution::retry_chain_ids(&mut conn, exec_id).await {
+        Ok(c) => c,
         Err(e) => return map_error(e).into_response(),
     };
-
-    // Confirm the update was ever admitted.
-    let admitted = history.events.iter().any(
-        |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
-    );
-    if !admitted {
-        return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
+    let mut found = None;
+    for candidate in chain.into_iter().rev() {
+        let history = match store::load_history(&mut conn, candidate).await {
+            Ok(h) => h,
+            Err(e) => return map_error(e).into_response(),
+        };
+        if history.events.iter().any(
+            |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
+        ) {
+            found = Some((candidate, history));
+            break;
+        }
     }
+    let Some((target, history)) = found else {
+        return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
+    };
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
     if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
         && let Ok(Some(db_state)) = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
+            .find(target.as_uuid())
             .select(harvest_workflow_executions::state)
             .first::<String>(&mut conn)
             .await
@@ -32958,6 +44486,120 @@ pub struct TaskEligibilityResponse {
     pub summary: EligibilitySummary,
 }
 
+/// Order a merged `reason_codes` array for the eligibility explainer.
+///
+/// The operator's own deliberate holds ([`OPERATOR_PAUSE_REASON_CODES`]) lead;
+/// everything else is alphabetical so the array is stable across polls. Within
+/// the leading group the order is alphabetical too, so a task held by *both* a
+/// queue pause and an activity pause reports them deterministically.
+///
+/// This exists because [`task_intrinsic_impediment_reasons`] pushes the pause
+/// codes first but *both* eligibility merges collapse the per-task reason lists
+/// through a `HashSet` — destroying insertion order — and then re-sort. A plain
+/// `sort()` puts `concurrency_saturated` ahead of `queue_paused`, so the
+/// helper's documented priority never reached the response an operator actually
+/// reads (issue #619 review). Both merge sites call *this* function rather than
+/// sorting by hand, so they cannot drift.
+fn sort_reason_codes(reason_codes: &mut [String]) {
+    reason_codes.sort_by(|a, b| {
+        let rank = |code: &str| u8::from(!is_operator_pause_reason(code));
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+}
+
+/// The eligibility reason code for a task held by an operator queue pause.
+///
+/// Named so [`sort_reason_codes`] and [`task_intrinsic_impediment_reasons`]
+/// cannot disagree about the string that carries the priority.
+const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
+
+/// The eligibility reason code for a task held by an operator activity pause
+/// (issue #807), the per-activity-type sibling of
+/// [`QUEUE_PAUSED_REASON_CODE`].
+const ACTIVITY_PAUSED_REASON_CODE: &str = "activity_paused";
+
+/// Every reason code that represents a deliberate *operator hold* rather than a
+/// capacity or compatibility impediment.
+///
+/// These share two behaviours — they lead [`sort_reason_codes`], and they are
+/// excluded from [`is_worker_draining_only`] — so they are listed once here
+/// rather than enumerated at each site, where a future third hold would
+/// otherwise have to be remembered twice.
+const OPERATOR_PAUSE_REASON_CODES: [&str; 2] =
+    [QUEUE_PAUSED_REASON_CODE, ACTIVITY_PAUSED_REASON_CODE];
+
+/// Whether `code` is one of [`OPERATOR_PAUSE_REASON_CODES`].
+fn is_operator_pause_reason(code: &str) -> bool {
+    OPERATOR_PAUSE_REASON_CODES.contains(&code)
+}
+
+/// Whether an activity pause holds this task (issue #807).
+///
+/// **Mirrors the authoritative claim gate in `queue::claim_task` exactly**, and
+/// must keep doing so or the explainer lies about why a task is not moving:
+///
+/// - Scoped by `task_type == "activity"`. A **workflow** task can legitimately
+///   carry a non-NULL `activity_name` — the engine stamps the
+///   `'mixed_signal_suspension'` sentinel there — so keying on `activity_name`
+///   alone would report `activity_paused` on mixed-signal-suspended workflow
+///   tasks the gate never holds. The core pins this with
+///   `anti_join_is_scoped_by_task_type_not_by_a_null_activity_name`.
+/// - Not filtered by `scope_shard_id`. That column records operator *intent*
+///   and is consulted by neither the claim gate nor the anti-join; the row's
+///   presence on *this shard's database* is the hold, and
+///   `evaluate_eligibility_for_shard` already runs per-shard on that shard's
+///   connection.
+fn task_is_activity_paused(
+    task_type: &str,
+    activity_name: Option<&str>,
+    paused_activities: &std::collections::HashSet<String>,
+) -> bool {
+    task_type == autumn_harvest::activity_pause::ACTIVITY_TASK_TYPE
+        && activity_name.is_some_and(|name| paused_activities.contains(name))
+}
+
+/// Which operator holds apply to one task, for
+/// [`task_intrinsic_impediment_reasons`].
+///
+/// Grouped into a struct rather than passed as two more positional `bool`s
+/// because the helper already takes three (`has_cb`, `concurrency_saturated`,
+/// and formerly `queue_paused`): a fourth would put four bare booleans in a row
+/// at every call site, where transposing two is a silent semantic bug no type
+/// check catches. It also keeps the argument count at clippy's default
+/// `too_many_arguments` threshold instead of needing an `allow`.
+#[derive(Debug, Clone, Copy, Default)]
+struct OperatorPauseHolds {
+    /// The task's queue is held by an operator queue pause (issue #619).
+    queue: bool,
+    /// The task's activity type is held by an operator activity pause
+    /// (issue #807).
+    activity: bool,
+}
+
+/// Whether a worker's only *worker-level* impediment is that it is draining.
+///
+/// The [`OPERATOR_PAUSE_REASON_CODES`] are filtered out because they describe
+/// the WORK, not the worker: the `all_draining` diagnosis is a statement about
+/// fleet state, and it stays true when an operator additionally holds the queue
+/// (issue #619) or one of its activity types (issue #807). Reporting a pause
+/// therefore never silently downgrades the diagnosis — the independent facts
+/// surface on their own channels, the diagnosis and the worker's
+/// `reason_codes`.
+///
+/// `activity_paused` is filtered for the same reason as `queue_paused` even
+/// though it is a *task*-level rather than a queue-level fact: on the
+/// worker-reason short-circuit there is no per-task context anyway, and the
+/// question this predicate answers ("is the fleet merely draining?") is about
+/// workers either way.
+fn is_worker_draining_only(reason_codes: &[String]) -> bool {
+    let worker_level: Vec<&str> = reason_codes
+        .iter()
+        .map(String::as_str)
+        .filter(|code| !is_operator_pause_reason(code))
+        .collect();
+    worker_level == ["worker_draining"]
+}
+
 /// Compute the reason codes that depend only on the task and shared runtime
 /// state — not on any particular worker (issue #611).
 ///
@@ -32973,6 +44615,13 @@ pub struct TaskEligibilityResponse {
 /// breaker (`has_cb`) enforces rate limiting at dispatch, not at claim, so a
 /// stale `rate_limit_exhausted` reason is never surfaced for it — its
 /// impediment is the circuit reason instead.
+///
+/// Operator pauses (issues #619 and #807): a held queue is reported as
+/// `queue_paused` and a held activity type as `activity_paused`. They are
+/// listed first because they are the *operator's own deliberate action* — the
+/// impediments a triaging operator should see before anything else. Both are
+/// reported when both apply; a pause reorders the array, it never suppresses a
+/// co-occurring impediment.
 fn task_intrinsic_impediment_reasons(
     activity_name: Option<&str>,
     rate_limit_key: Option<&str>,
@@ -32980,8 +44629,24 @@ fn task_intrinsic_impediment_reasons(
     saturated_rate_limits: &std::collections::HashSet<String>,
     concurrency_saturated: bool,
     cb_phase: &std::collections::HashMap<String, &'static str>,
+    pauses: OperatorPauseHolds,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+
+    // Issues #619 / #807: an operator pause blocks every worker equally, so
+    // without these the explainer would report an EMPTY reason set for a held
+    // task — a false "no impediment" during exactly the idle-worker triage
+    // this endpoint exists for.
+    //
+    // Pushed in the same alphabetical order `sort_reason_codes` restores after
+    // the merges, so the producer and the response agree even for a task held
+    // by both.
+    if pauses.activity {
+        reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+    }
+    if pauses.queue {
+        reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
+    }
 
     if concurrency_saturated {
         reasons.push("concurrency_saturated".to_string());
@@ -33237,36 +44902,78 @@ async fn evaluate_eligibility_for_shard(
             #[diesel(sql_type = diesel::sql_types::Text)]
             key: String,
             #[diesel(sql_type = diesel::sql_types::Double)]
-            tokens: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            burst: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            refill_rate: f64,
-            #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-            last_refilled_at: chrono::DateTime<chrono::Utc>,
+            effective_tokens: f64,
         }
 
-        let rows: Vec<RateLimitRow> = diesel::sql_query(
-            "SELECT key, tokens, burst, refill_rate, last_refilled_at \
+        // Issue #945 review (round 4, P2): this used to re-derive "tokens
+        // available right now" in Rust via a flat `elapsed *
+        // effective.refill_rate`, applying whichever rate is effective AT
+        // THE MOMENT OF THE READ to the WHOLE elapsed interval. That is
+        // exactly the class of bug `queue::token_accrual_expr` was written
+        // to fix (issue #945 round-1 P1) for the claim-time SQL gate: once
+        // an operator override has expired mid-interval with no intervening
+        // write to settle the bucket, retroactively applying the reverted
+        // baseline rate to the portion of the interval the override was
+        // still throttling produces a phantom refill -- so this diagnostic
+        // could report a key as available when `claim_task` is still
+        // treating it as saturated (or the reverse). Delegating the whole
+        // computation to `queue::effective_available_tokens_expr` -- the
+        // SAME expression the claim-time gate, the dispatch-time debit, and
+        // the refund all use -- makes this diagnostic structurally unable to
+        // drift from what `claim_task` is actually enforcing, mirroring
+        // `check_throttled_keys`'s convention of doing the whole
+        // override-and-accrual computation in SQL rather than re-deriving it
+        // in Rust.
+        let effective_tokens_expr =
+            queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+        let rows: Vec<RateLimitRow> = diesel::sql_query(format!(
+            "SELECT key, {effective_tokens_expr} AS effective_tokens \
              FROM harvest_rate_limit_buckets \
-             WHERE key = ANY($1)",
-        )
+             WHERE key = ANY($1)"
+        ))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
         .load(&mut conn)
         .await
         .map_err(database_error)?;
 
         for r in rows {
-            let elapsed = chrono::Utc::now()
-                .signed_duration_since(r.last_refilled_at)
-                .num_milliseconds() as f64
-                / 1000.0;
-            let current_tokens = (r.tokens + elapsed * r.refill_rate).min(r.burst);
-            if current_tokens < 1.0 {
+            if r.effective_tokens < 1.0 {
                 saturated_rate_limits.insert(r.key);
             }
         }
     }
+
+    // Issue #619: a queue held by an operator pause is unclaimable for a reason
+    // that has nothing to do with worker capacity, so surface it explicitly
+    // rather than reporting an empty (falsely "unimpeded") reason set.
+    //
+    // The lookup PROPAGATES on failure rather than defaulting to empty: this
+    // explainer exists to answer "why is nothing being claimed?" during an
+    // incident, and swallowing a database error would answer it with a
+    // confident, wrong "nothing is holding this queue". Matches the sibling
+    // rate-limit read above.
+    let paused_queues: std::collections::HashSet<String> =
+        autumn_harvest::queue_pause::paused_queue_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Issue #807: the per-activity-type sibling of the read above, and
+    // propagating for the same reason. Unfiltered by `queue_name`, matching the
+    // `paused_activities` CTE in `queue::claim_task`: an activity pause holds
+    // that activity type across every queue on the shard.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Hoisted out of the worker loop: the pause is a property of the queue under
+    // evaluation, so both the worker-reason short-circuit and the per-task loop
+    // below read the same answer.
+    let queue_is_paused = paused_queues.contains(queue_name);
 
     let mut eligible_workers = Vec::new();
     let mut ineligible_workers = Vec::new();
@@ -33282,6 +44989,15 @@ async fn evaluate_eligibility_for_shard(
                     || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
         })
         .collect();
+
+    // Issue #807, for the worker-reason short-circuit below, which has no
+    // per-task context the way the per-task loop does. The queue-level analogue
+    // of "this task is held" is "the backlog under evaluation contains a held
+    // task", which is a true and actionable statement about why nothing is
+    // dispatching.
+    let any_pending_task_activity_paused = pending_tasks.iter().any(|t| {
+        task_is_activity_paused(&t.task_type, t.activity_name.as_deref(), &paused_activities)
+    });
 
     for w in &online_workers {
         let w_id = w.worker.worker_id.clone();
@@ -33325,7 +45041,20 @@ async fn evaluate_eligibility_for_shard(
             worker_reasons.push("wrong_queue_subscription".to_string());
         }
 
-        if !shard_assignments.contains(&(shard_id.as_i32())) {
+        // Issue #1150 / #961: the canonical predicate, not literal membership.
+        // An empty array is the auto (no sharded pool) / legacy shape and means
+        // "covers whatever shard this row was read from"; treating it as
+        // covering nothing would report a healthy worker polling this very
+        // database as `wrong_shard_assignment`.
+        // Deliberately reads the raw JSON value, not the decoded `Vec<i32>`
+        // above: that decode maps a *malformed* (non-array) value to an empty
+        // vec, which the predicate would then read as the permissive
+        // empty/legacy shape. Passing the value through keeps malformed ==
+        // covers nothing, matching every other consumer.
+        if !autumn_harvest::workers::shard_assignments_cover(
+            &w.worker.shard_assignments,
+            shard_id.as_i32(),
+        ) {
             worker_reasons.push("wrong_shard_assignment".to_string());
         }
 
@@ -33338,6 +45067,28 @@ async fn evaluate_eligibility_for_shard(
         }
 
         if !worker_reasons.is_empty() {
+            // Issue #619: a queue pause blocks every worker equally, so it has
+            // to be reported on this path too. It returns before the per-task
+            // loop below, so a fleet that is entirely unsubscribed / off-shard /
+            // draining / stopped — e.g. drained for the very outage the operator
+            // paused for — would otherwise never surface the operator's own hold
+            // on the one endpoint that answers "why is nothing being claimed?".
+            //
+            // `queue_name` is the right key in both call paths: the queue
+            // endpoint filters tasks to it, and the single-task endpoint passes
+            // that task's own `queue_name`.
+            if queue_is_paused {
+                worker_reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
+            }
+            // Issue #807: same argument, one level down. A fleet drained for the
+            // very outage the operator paused an *activity type* for would
+            // otherwise never surface that hold either.
+            if any_pending_task_activity_paused {
+                worker_reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+            }
+            // The per-task path below sorts; this one did not, so the pauses
+            // would trail the worker reasons alphabetically instead of leading.
+            sort_reason_codes(&mut worker_reasons);
             ineligible_workers.push(IneligibleWorkerInfo {
                 worker_id: w_id,
                 reason_codes: worker_reasons,
@@ -33391,6 +45142,14 @@ async fn evaluate_eligibility_for_shard(
                     &saturated_rate_limits,
                     concurrency_saturated,
                     &cb_phase,
+                    OperatorPauseHolds {
+                        queue: paused_queues.contains(&t.queue_name),
+                        activity: task_is_activity_paused(
+                            &t.task_type,
+                            t.activity_name.as_deref(),
+                            &paused_activities,
+                        ),
+                    },
                 ));
 
                 let parsed_reqs = if t.task_type == "activity" {
@@ -33464,7 +45223,10 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
                 let mut reason_codes: Vec<String> = merged_reasons.into_iter().collect();
-                reason_codes.sort();
+                // `merged_reasons` is a HashSet, so the producer's ordering is
+                // already gone; this restores the documented queue-pause
+                // priority rather than sorting plain-alphabetically (#619).
+                sort_reason_codes(&mut reason_codes);
                 if reason_codes.is_empty() {
                     reason_codes.push("unknown".to_string());
                 }
@@ -33484,7 +45246,7 @@ async fn evaluate_eligibility_for_shard(
             && !ineligible_workers.is_empty()
             && ineligible_workers
                 .iter()
-                .all(|w| w.reason_codes == vec!["worker_draining".to_string()]);
+                .all(|w| is_worker_draining_only(&w.reason_codes));
         if all_draining {
             "all_draining".to_string()
         } else {
@@ -33647,7 +45409,10 @@ async fn get_queue_eligibility(
             eligible_workers.push(w_info.clone());
         } else if let Some(reasons_set) = shard_ineligible.get(&w_id) {
             let mut reason_codes: Vec<String> = reasons_set.iter().cloned().collect();
-            reason_codes.sort();
+            // Second destructive merge (cross-shard): the per-shard arrays are
+            // unioned through another HashSet, so the priority has to be
+            // re-established here too (#619).
+            sort_reason_codes(&mut reason_codes);
             ineligible_workers.push(IneligibleWorkerInfo {
                 worker_id: w_id,
                 reason_codes,
@@ -33733,7 +45498,7 @@ async fn get_task_eligibility(
 
 #[cfg(test)]
 mod eligibility_reason_tests {
-    use super::task_intrinsic_impediment_reasons;
+    use super::{OperatorPauseHolds, task_intrinsic_impediment_reasons};
     use std::collections::{HashMap, HashSet};
 
     fn saturated(keys: &[&str]) -> HashSet<String> {
@@ -33746,6 +45511,175 @@ mod eligibility_reason_tests {
 
     // AC1: a task deferred solely because its rate-limit bucket is exhausted
     // reports `rate_limit_exhausted` — never `concurrency_saturated`.
+    /// Issue #619: a queue held by an operator pause must surface as
+    /// `queue_paused`, listed first, and must not suppress the other
+    /// task-intrinsic impediments that also apply.
+    #[test]
+    fn queue_paused_is_reported_first_and_composes_with_other_reasons() {
+        let saturated = std::collections::HashSet::new();
+        let cb_phase = std::collections::HashMap::new();
+        let queue_held = OperatorPauseHolds {
+            queue: true,
+            activity: false,
+        };
+
+        let only_pause = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, false, &cb_phase, queue_held,
+        );
+        assert_eq!(only_pause, vec!["queue_paused".to_string()]);
+
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, true, &cb_phase, queue_held,
+        );
+        assert_eq!(
+            with_concurrency,
+            vec![
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string()
+            ],
+            "a pause is listed first but never hides a co-occurring impediment"
+        );
+
+        let unpaused = task_intrinsic_impediment_reasons(
+            None,
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
+        );
+        assert!(unpaused.is_empty(), "an unpaused queue contributes nothing");
+    }
+
+    /// Issue #807: an activity held by an operator pause must surface as
+    /// `activity_paused`, lead the array like its queue-level sibling, and
+    /// never suppress a co-occurring impediment.
+    #[test]
+    fn activity_paused_is_reported_first_and_composes_with_other_reasons() {
+        let saturated = std::collections::HashSet::new();
+        let cb_phase = std::collections::HashMap::new();
+        let activity_held = OperatorPauseHolds {
+            queue: false,
+            activity: true,
+        };
+
+        let only_pause = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(only_pause, vec!["activity_paused".to_string()]);
+
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            true,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(
+            with_concurrency,
+            vec![
+                "activity_paused".to_string(),
+                "concurrency_saturated".to_string()
+            ],
+            "a pause is listed first but never hides a co-occurring impediment"
+        );
+
+        let unpaused = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
+        );
+        assert!(
+            unpaused.is_empty(),
+            "an unpaused activity contributes nothing"
+        );
+    }
+
+    /// A task held by BOTH pauses reports BOTH codes (issue #807).
+    ///
+    /// The two holds are independent — an operator can pause a queue and an
+    /// activity type during the same incident — so surfacing one must never
+    /// mask the other, or resuming the reported hold leaves the task still
+    /// stuck with no explanation on the endpoint built to give one.
+    #[test]
+    fn both_pauses_report_both_codes_ahead_of_other_impediments() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &HashSet::new(),
+            true,
+            &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds {
+                queue: true,
+                activity: true,
+            },
+        );
+        assert_eq!(
+            reasons,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "circuit_open".to_string(),
+            ],
+            "both deliberate holds lead (alphabetically among themselves, so the \
+             producer agrees with sort_reason_codes after the merges), and \
+             neither suppresses a co-occurring impediment; got {reasons:?}"
+        );
+    }
+
+    /// The explainer must key on `task_type` exactly as `queue::claim_task`'s
+    /// gate does (issue #807).
+    ///
+    /// A **workflow** task can legitimately carry a non-NULL `activity_name` —
+    /// the engine stamps the `'mixed_signal_suspension'` sentinel there — and
+    /// the claim gate is scoped by `task_type = 'activity'` precisely so a
+    /// pause never holds those. An explainer keyed on `activity_name` alone
+    /// would report `activity_paused` on tasks that are not held at all.
+    #[test]
+    fn activity_pause_predicate_matches_the_claim_gate_scoping() {
+        let held: HashSet<String> = ["charge_card", "mixed_signal_suspension"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert!(super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &held
+        ));
+        assert!(
+            !super::task_is_activity_paused("workflow", Some("mixed_signal_suspension"), &held),
+            "a workflow task carrying the sentinel is never held by the claim \
+             gate, so it must never be reported as activity_paused"
+        );
+        assert!(!super::task_is_activity_paused("activity", None, &held));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("send_email"),
+            &held
+        ));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &HashSet::new()
+        ));
+    }
+
     #[test]
     fn rate_limit_only_reports_rate_limit_exhausted() {
         let reasons = task_intrinsic_impediment_reasons(
@@ -33755,6 +45689,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &HashMap::new(),
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
     }
@@ -33770,6 +45705,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &HashMap::new(),
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
     }
@@ -33785,6 +45721,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -33803,6 +45740,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "half_open")]),
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_half_open".to_string()),
@@ -33820,6 +45758,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "closed")]),
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -33835,6 +45774,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -33856,6 +45796,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"concurrency_saturated".to_string()),
@@ -33877,6 +45818,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &HashMap::new(),
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -33895,19 +45837,1139 @@ mod eligibility_reason_tests {
             &saturated(&["k"]),
             false,
             &phases(&[("a", "closed")]),
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    /// The `all_draining` diagnosis describes the WORKER fleet, so an operator's
+    /// queue hold must not downgrade it (issue #619). Surfacing `queue_paused`
+    /// on the worker-reason short-circuit would otherwise flip the diagnosis to
+    /// the vaguer `no_eligible_workers` for an unrelated reason.
+    #[test]
+    fn draining_only_ignores_a_queue_pause_but_not_a_real_worker_reason() {
+        let owned =
+            |codes: &[&str]| -> Vec<String> { codes.iter().map(|c| (*c).to_string()).collect() };
+
+        assert!(super::is_worker_draining_only(&owned(&["worker_draining"])));
+        // The pause rides alongside without changing the fleet verdict, in
+        // either order (`sort_reason_codes` puts it first).
+        assert!(super::is_worker_draining_only(&owned(&[
+            "queue_paused",
+            "worker_draining"
+        ])));
+
+        // Issue #807: the activity-level hold is filtered for the same reason,
+        // alone and alongside its queue-level sibling.
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining"
+        ])));
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "queue_paused",
+            "worker_draining"
+        ])));
+
+        // A genuine second worker-level condition still disqualifies it.
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "queue_paused",
+            "worker_draining",
+            "wrong_shard_assignment"
+        ])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining",
+            "wrong_shard_assignment"
+        ])));
+        assert!(!super::is_worker_draining_only(&owned(&["worker_stopped"])));
+        // A hold alone is not a draining fleet.
+        assert!(!super::is_worker_draining_only(&owned(&["queue_paused"])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused"
+        ])));
+        assert!(!super::is_worker_draining_only(&[]));
+    }
+}
+
+#[cfg(test)]
+mod reserved_idempotency_key_tests {
+    use super::*;
+
+    /// The plugin's HTTP-shaped validator must refuse an engine-derived key,
+    /// or a caller can squat it and the broker's own delivery is acked as an
+    /// idempotent replay without ever dispatching (issue #944 review).
+    #[test]
+    fn the_start_route_validator_refuses_a_derived_key() {
+        let derived = "conn:L6:orders:L0::L10:orders:0:7".to_string();
+        let resp = validate_start_idempotency_key(Some(derived), false)
+            .expect_err("a caller must not be able to claim an engine-derived key");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// One predicate, one message: the HTTP paths and the core validator must
+    /// refuse identically, so a caller cannot find a path that still accepts.
+    #[test]
+    fn the_reject_helper_agrees_with_the_core_predicate() {
+        for key in [
+            "conn:",
+            "conn:L6:orders:L0::L10:orders:0:7",
+            "  conn:leading-space-is-trimmed",
+        ] {
+            assert!(
+                autumn_harvest::start_idempotency::is_reserved_key(key),
+                "{key} must read as reserved"
+            );
+            let resp = reject_reserved_idempotency_key(key.trim())
+                .expect("a reserved key must be refused");
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        // And must not over-reject: these cannot alias a derived key.
+        for ok in ["CONN:x", "conn", "connector", "xconn:y", "normal-key"] {
+            assert!(
+                reject_reserved_idempotency_key(ok).is_none(),
+                "{ok} must be accepted"
+            );
+        }
+    }
+
+    /// The exemption exists only so the connector's own dispatch — which
+    /// delegates through this same handler — is not refused by the guard that
+    /// stops a caller squatting its key. It must be unreachable from a request
+    /// body: `engine_derived_idempotency_key` is `#[serde(skip)]`, so JSON
+    /// carrying it still deserializes to `false` and the key is refused.
+    #[test]
+    fn the_engine_exemption_cannot_be_claimed_from_the_request_body() {
+        let derived = "conn:L6:orders:L0::L10:orders:0:7";
+        let body = serde_json::json!({
+            "workflow_id": "wf-1",
+            "input": {},
+            "idempotency_key": derived,
+            // A caller trying to opt itself into the exemption.
+            "engine_derived_idempotency_key": true,
+        });
+        let request: StartWorkflowRequest =
+            serde_json::from_value(body).expect("body must still deserialize");
+        assert!(
+            !request.engine_derived_idempotency_key,
+            "a caller must not be able to set the engine exemption"
+        );
+        assert!(
+            validate_start_idempotency_key(
+                request.idempotency_key.clone(),
+                request.engine_derived_idempotency_key,
+            )
+            .is_err(),
+            "the derived key must still be refused for this caller"
+        );
+        // And the exemption does admit the key when the engine sets it.
+        assert!(
+            validate_start_idempotency_key(Some(derived.to_string()), true).is_ok(),
+            "the connector's own dispatch must not be refused"
+        );
+    }
+
+    /// The length cap must still win where it applies, so this guard did not
+    /// reorder the existing rejections.
+    #[test]
+    fn the_existing_empty_and_length_rejections_still_apply() {
+        assert!(validate_start_idempotency_key(Some("   ".to_string()), false).is_err());
+        assert!(validate_start_idempotency_key(Some("x".repeat(513)), false).is_err());
+        assert_eq!(
+            validate_start_idempotency_key(Some("  fine  ".to_string()), false)
+                .expect("a normal key is accepted"),
+            Some("fine".to_string()),
+        );
+        assert_eq!(
+            validate_start_idempotency_key(None, false).expect("no key"),
+            None
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Latest-wins is a *workflow-start* admission control: the supersede runs
+    /// inside `start_or_load_workflow_execution_collect` and sheds workflow
+    /// *executions*. An activity task that carries a concurrency key is gated
+    /// purely at claim time and always defers, so reporting its owning
+    /// workflow's declared `cancel_running` on the `task_type = "activity"`
+    /// admin row advertises a strategy nothing enforces.
+    #[test]
+    fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
+        use autumn_harvest::concurrency::ConcurrencyOnConflict;
+
+        // A workflow row reports whatever the workflow declares.
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::CancelRunning,
+        );
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // An activity row always reports defer -- that is what is enforced.
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+            "an activity concurrency group cannot latest-wins; reporting the \
+             owning workflow's cancel_running would advertise an unenforced strategy",
+        );
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // Defensive: an unrecognised task_type is not a workflow start either.
+        assert_eq!(
+            effective_admin_on_conflict("something_else", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+        );
+    }
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    // ── #798 running build id for the in-process replay gates (pure, no DB) ──
+
+    /// The deploy canary and replay-diagnosis endpoints both run *inside* the
+    /// deployed candidate, so they must replay under this process's own
+    /// configured build id — not the execution's recorded `assigned_build_id`.
+    ///
+    /// A runtime with no captured config snapshot, or one whose build id is the
+    /// empty default (no build routing configured), must resolve to `None` so
+    /// `ctx.build_id()` matches what the live worker reports rather than an
+    /// empty string no worker ever reports.
+    #[test]
+    fn running_build_id_treats_absent_and_empty_config_as_none() {
+        assert_eq!(
+            normalize_running_build_id(None),
+            None,
+            "a runtime booted without the effective-config seam must resolve to None"
+        );
+        assert_eq!(
+            normalize_running_build_id(Some(String::new())),
+            None,
+            "an empty configured build id must resolve to None, not Some(\"\")"
+        );
+        assert_eq!(
+            normalize_running_build_id(Some("v2".to_string())),
+            Some("v2".to_string()),
+            "the configured build id must reach the in-process replay gates"
+        );
+    }
+
+    // ── #619 per-shard pause provenance merge (pure, no DB) ────────────────
+    fn paused_row(
+        queue: &str,
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::queue_pause::PausedQueue {
+        ::autumn_harvest::queue_pause::PausedQueue {
+            queue_name: queue.to_string(),
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    /// The ordinary fleet-wide hold: one entry, counts summed, every shard
+    /// listed, and `provenance_uniform` true even though each shard stamped its
+    /// own `paused_at`.
+    #[test]
+    fn merge_paused_queues_collapses_a_uniform_fleet_wide_hold() {
+        let merged = merge_paused_queue_rows(
+            vec![
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_row("payments", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1, "one hold must read as one entry");
+        let e = &merged[0];
+        assert_eq!(e["queue_name"], "payments");
+        assert_eq!(e["reason"], "stripe outage");
+        assert_eq!(e["held_task_count"], 10, "held counts must be summed");
+        assert_eq!(
+            e["provenance_uniform"], true,
+            "per-shard paused_at always differs (each shard stamps its own \
+             NOW()), so it must not make a healthy fleet-wide hold look divergent"
+        );
+        assert_eq!(e["shards"].as_array().expect("shards").len(), 2);
+    }
+
+    /// Divergent provenance must not be silently dropped.
+    ///
+    /// This state is produced by our own idempotency rule: a re-pause preserves
+    /// the ORIGINAL reason/actor, so a fleet-wide hold landing over a
+    /// pre-existing shard-scoped hold leaves that shard telling a different
+    /// story. Showing only one of them would hand the operator a reason and
+    /// scope that are not true for part of the fleet.
+    #[test]
+    fn merge_paused_queues_preserves_divergent_per_shard_provenance() {
+        let merged = merge_paused_queue_rows(
+            vec![
+                // Later fleet-wide hold on shard 1...
+                (
+                    1,
+                    paused_row("payments", "fleet-wide freeze", "bob", 10, None, 2),
+                ),
+                // ...over an OLDER shard-scoped hold on shard 0, whose provenance
+                // the idempotent re-pause deliberately preserved.
+                (
+                    0,
+                    paused_row("payments", "shard-0 provider down", "alice", 90, Some(0), 5),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1);
+        let e = &merged[0];
+        assert_eq!(
+            e["provenance_uniform"], false,
+            "the shards disagree, and a single boolean is what lets a script \
+             notice that in one field"
+        );
+        assert_eq!(
+            e["reason"], "shard-0 provider down",
+            "the top-level summary must be the EARLIEST hold -- a deterministic \
+             rule, not whichever shard the fan-out happened to reach first"
+        );
+        assert_eq!(e["scope_shard_id"], 0);
+        assert_eq!(e["held_task_count"], 7);
+
+        let shards = e["shards"].as_array().expect("shards");
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0]["shard_id"], 0, "shards must be ordered by id");
+        assert_eq!(shards[0]["reason"], "shard-0 provider down");
+        assert_eq!(shards[0]["scope_shard_id"], 0);
+        assert_eq!(shards[1]["shard_id"], 1);
+        assert_eq!(
+            shards[1]["reason"], "fleet-wide freeze",
+            "each shard's own reason must survive the merge"
+        );
+        assert_eq!(shards[1]["held_task_count"], 2);
+    }
+
+    fn pause_outcome(
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::queue_pause::PauseOutcome {
+        ::autumn_harvest::queue_pause::PauseOutcome {
+            queue_name: "payments".to_string(),
+            newly_paused: false,
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    fn resume_outcome(
+        reason: Option<&str>,
+        actor: Option<&str>,
+        duration_secs: i64,
+        released: i64,
+    ) -> ::autumn_harvest::queue_pause::ResumeOutcome {
+        ::autumn_harvest::queue_pause::ResumeOutcome {
+            queue_name: "payments".to_string(),
+            newly_resumed: reason.is_some(),
+            released_task_count: released,
+            paused_duration_secs: duration_secs,
+            released_reason: reason.map(str::to_string),
+            released_paused_by: actor.map(str::to_string),
+        }
+    }
+
+    /// Issue #619 review: the PAUSE response must not label a fleet-wide
+    /// `held_task_count` with one shard's story.
+    ///
+    /// A re-pause preserves each shard's ORIGINAL provenance, so a fleet-wide
+    /// request landing over a pre-existing scoped hold leaves the shards
+    /// disagreeing. Keeping the first success would report shard 0's reason,
+    /// actor and scope next to a total that is true for neither shard alone.
+    #[test]
+    fn pause_summary_is_earliest_and_keeps_every_shards_provenance() {
+        let per_shard = vec![
+            // Fan-out order deliberately puts the LATER hold first, so a
+            // first-success pick would produce a different answer.
+            (1, pause_outcome("fleet-wide freeze", "bob", 10, None, 2)),
+            (
+                0,
+                pause_outcome("shard-0 provider down", "alice", 90, Some(0), 5),
+            ),
+        ];
+        let p = summarise_pause_provenance(&per_shard).expect("a shard applied the hold");
+
+        assert!(!p.uniform, "the shards disagree on reason, actor and scope");
+        assert_eq!(
+            p.effective.reason, "shard-0 provider down",
+            "the summary must be the EARLIEST hold -- deterministic, not \
+             whichever shard the fan-out reached first"
+        );
+        assert_eq!(p.effective.paused_by, "alice");
+        assert_eq!(p.effective.scope_shard_id, Some(0));
+
+        assert_eq!(p.shards.len(), 2);
+        assert_eq!(p.shards[0]["shard_id"], 1);
+        assert_eq!(
+            p.shards[0]["reason"], "fleet-wide freeze",
+            "the shard the summary did NOT pick must still be recoverable"
+        );
+        assert_eq!(p.shards[1]["shard_id"], 0);
+        assert_eq!(p.shards[1]["reason"], "shard-0 provider down");
+    }
+
+    /// A healthy fleet-wide hold is uniform even though each shard stamps its
+    /// own `NOW()` -- the same rule the list endpoint and the banner use.
+    #[test]
+    fn pause_summary_is_uniform_when_only_paused_at_differs() {
+        let per_shard = vec![
+            (0, pause_outcome("stripe outage", "alice", 3, None, 2)),
+            (1, pause_outcome("stripe outage", "alice", 1, None, 5)),
+        ];
+        let p = summarise_pause_provenance(&per_shard).expect("hold applied");
+        assert!(p.uniform, "per-shard NOW() skew is not a divergence");
+        assert_eq!(p.effective.paused_at, per_shard[0].1.paused_at);
+    }
+
+    /// Every target shard failed: no provenance to report.
+    #[test]
+    fn pause_summary_is_none_when_no_shard_applied() {
+        assert!(summarise_pause_provenance(&[]).is_none());
+    }
+
+    /// Issue #619 review: a fleet-wide RESUME deletes every pause row, so any
+    /// provenance dropped here is gone for good.
+    ///
+    /// Independently-paused shards legitimately carry different reasons and
+    /// operators; an operator closing out an incident needs all of them, and
+    /// the summary must describe the same shard `paused_duration_secs` does.
+    #[test]
+    fn resume_summary_keeps_every_shards_released_provenance() {
+        let per_shard = vec![
+            (0, resume_outcome(Some("sendgrid down"), Some("bob"), 30, 2)),
+            (
+                1,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 5),
+            ),
+        ];
+        let p = summarise_resume_provenance(&per_shard);
+
+        assert!(!p.uniform(), "the two shards released different incidents");
+        assert_eq!(
+            p.released_reason.as_deref(),
+            Some("stripe outage"),
+            "the summary must describe the LONGEST hold -- the same shard \
+             paused_duration_secs reports, so the two are coherent"
+        );
+        assert_eq!(p.released_paused_by.as_deref(), Some("alice"));
+
+        assert_eq!(p.shards.len(), 2);
+        assert_eq!(
+            p.shards[0]["released_reason"], "sendgrid down",
+            "the shard the summary did NOT pick must still be recoverable -- \
+             its pause row is already deleted"
+        );
+        assert_eq!(p.shards[0]["released_paused_by"], "bob");
+        assert_eq!(p.shards[1]["released_reason"], "stripe outage");
+    }
+
+    /// Shards that were not paused carry no provenance, so they must not drag
+    /// the summary or falsely flag divergence.
+    #[test]
+    fn resume_summary_ignores_shards_that_were_not_paused() {
+        let per_shard = vec![
+            (0, resume_outcome(None, None, 0, 0)),
+            (
+                1,
+                resume_outcome(Some("stripe outage"), Some("alice"), 60, 4),
+            ),
+        ];
+        let p = summarise_resume_provenance(&per_shard);
+        assert!(p.uniform(), "one released hold cannot disagree with itself");
+        assert_eq!(p.released_reason.as_deref(), Some("stripe outage"));
+        assert_eq!(p.shards.len(), 2, "every shard is still reported");
+        assert_eq!(p.shards[0]["newly_resumed"], false);
+    }
+
+    /// A fleet-wide no-op (nothing was paused) is trivially uniform.
+    #[test]
+    fn resume_summary_of_a_full_noop_is_uniform_and_empty() {
+        let p = summarise_resume_provenance(&[
+            (0, resume_outcome(None, None, 0, 0)),
+            (1, resume_outcome(None, None, 0, 0)),
+        ]);
+        assert!(p.uniform());
+        assert!(p.released_reason.is_none());
+        assert!(p.released_paused_by.is_none());
+        assert_eq!(p.shards.len(), 2);
+    }
+
+    /// Two independently-held queues stay two entries, keyed by queue name.
+    #[test]
+    fn merge_paused_queues_keeps_distinct_queues_separate() {
+        let merged = merge_paused_queue_rows(
+            vec![
+                (0, paused_row("email", "sendgrid down", "carol", 5, None, 1)),
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 5, None, 2),
+                ),
+            ],
+            &[0],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["queue_name"], "email");
+        assert_eq!(merged[1]["queue_name"], "payments");
+    }
+
+    #[test]
+    fn merge_paused_queues_is_empty_when_nothing_is_held() {
+        assert!(merge_paused_queue_rows(Vec::new(), &[0]).is_empty());
+    }
+
+    /// Issue #619 review: `effective_scope` must be derived from the shards that
+    /// actually hold the queue, not from the stored `scope_shard_id`.
+    ///
+    /// A fleet-wide pause that only reached some shards writes
+    /// `scope_shard_id = NULL` on the shards it reached and **no row** on the
+    /// ones it missed — so the stored intent is byte-identical to a complete
+    /// hold, while the missed shards keep dispatching.
+    #[test]
+    fn effective_scope_reflects_real_coverage_not_stored_intent() {
+        // One of two expected shards holds it: intent says fleet, reality does not.
+        let partial = merge_paused_queue_rows(
+            vec![(
+                0,
+                paused_row("payments", "stripe outage", "alice", 30, None, 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(
+            partial[0]["effective_scope"], "partial_fleet",
+            "a partially-applied fleet-wide hold must be reported as such"
+        );
+        assert_eq!(
+            partial[0]["scope_shard_id"],
+            serde_json::Value::Null,
+            "the recorded intent is still reported verbatim"
+        );
+
+        // Both expected shards hold it: the same intent now really is fleet-wide.
+        let complete = merge_paused_queue_rows(
+            vec![
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_row("payments", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(complete[0]["effective_scope"], "fleet");
+
+        // A deliberately shard-scoped hold is not "partially applied".
+        let scoped = merge_paused_queue_rows(
+            vec![(
+                0,
+                paused_row("payments", "shard-0 only", "alice", 30, Some(0), 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(scoped[0]["effective_scope"], "shard");
+    }
+
+    fn paused_activity_row(
+        activity: &str,
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::PausedActivity {
+        ::autumn_harvest::activity_pause::PausedActivity {
+            activity_name: activity.to_string(),
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    /// Issue #807 review: a single-activity read must not assert nonexistence
+    /// while a shard is unaccounted for.
+    ///
+    /// The routes deliberately accept **unregistered** names — a management node
+    /// need not register every activity the fleet runs — so "not in this
+    /// process's catalogue, and no pause row on the shards that answered" is
+    /// reachable with a live hold sitting on the shard that did not answer. A
+    /// `404` there tells an operator the hold does not exist while it is
+    /// actively holding work. Same rule as the `(workflow_name, workflow_id)`
+    /// resolver (#805): fail closed rather than risk a false 404.
+    #[test]
+    fn single_activity_read_fails_closed_while_a_shard_is_unaccounted_for() {
+        let down = vec![shard_fanout::UnavailableShard {
+            shard_id: 1,
+            reason: "connect timeout".to_string(),
+        }];
+
+        // Every shard answered: the negative is real, so 404 is the honest answer.
+        let complete =
+            activity_missing_error("charge_card", shard_fanout::FanoutStatus::Complete, &[]);
+        assert_eq!(
+            complete.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a fully-observed miss is a genuine 404"
+        );
+
+        // A shard is missing: the hold may be there, so the read must not deny it.
+        for status in [
+            shard_fanout::FanoutStatus::Partial,
+            shard_fanout::FanoutStatus::Unavailable,
+        ] {
+            let err = activity_missing_error("charge_card", status, &down);
+            assert_eq!(
+                err.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{status:?}: an unobserved shard must not be reported as absence"
+            );
+            assert!(
+                format!("{err:?}").contains('1'),
+                "{status:?}: the unreachable shard must be named so the operator \
+                 knows where to re-check: {err:?}"
+            );
+        }
+    }
+
+    /// A pause must be REFUSED for an activity registered `local = true`, and
+    /// still ALLOWED for an unregistered name.
+    ///
+    /// Issue #807 review, Codex round 16. A local activity runs inline on the
+    /// workflow worker and never takes a `harvest_task_queue` row, so the
+    /// claim-path gate this feature is built on can never hold one. The pause
+    /// route nevertheless wrote its rows and answered `ok: true` /
+    /// `newly_paused: true` — during an incident, the one call an operator
+    /// makes to stop a broken dependency reported containment while every new
+    /// invocation kept running. The read model already labelled it a no-op, but
+    /// nobody re-reads a mutation that said it worked.
+    ///
+    /// The unregistered arm is the load-bearing half of the fix: these routes
+    /// deliberately accept names this management node does not register (the
+    /// same remote/unregistered case the 404-vs-503 read fix preserves), so a
+    /// blanket "must be registered" check would break pausing a genuinely
+    /// remote activity — the feature's primary use.
+    #[test]
+    fn a_pause_is_refused_for_a_registered_local_activity_but_not_a_remote_one() {
+        let catalog = std::collections::BTreeMap::from([
+            (
+                "compute_checksum".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "default",
+                    is_local: true,
+                },
+            ),
+            (
+                "charge_card".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "payments",
+                    is_local: false,
+                },
+            ),
+        ]);
+
+        let refusal = local_activity_pause_refusal(&catalog, "compute_checksum")
+            .expect("a registered local activity must be refused");
+        assert!(
+            refusal.contains("compute_checksum") && refusal.contains("local"),
+            "the refusal must name the activity and why it cannot be held: {refusal}"
+        );
+        assert!(
+            refusal.contains("queue"),
+            "and must point at the containment that does work: {refusal}"
+        );
+
+        assert!(
+            local_activity_pause_refusal(&catalog, "charge_card").is_none(),
+            "an ordinary dispatched activity is pausable"
+        );
+        assert!(
+            local_activity_pause_refusal(&catalog, "remote_unregistered").is_none(),
+            "an unregistered name may be a genuinely remote activity this node \
+             does not register -- refusing it would break the feature's main use"
+        );
+    }
+
+    /// Issue #807 review: the activity read model must report real coverage for
+    /// exactly the reason its queue-level sibling does.
+    ///
+    /// A fleet-wide activity pause that only reached some shards returns 207 at
+    /// mutation time, but the pause rows it *did* write are byte-identical to a
+    /// complete hold (`scope_shard_id = NULL`), and the missed shards hold no
+    /// row at all. A later read that reaches every shard therefore has a
+    /// `complete` status and rows that agree — so without comparing the holding
+    /// shards against the expected set, `GET /activities` presents a clean
+    /// fleet-wide hold while part of the fleet is still dispatching the very
+    /// activity an operator believes they stopped.
+    #[test]
+    fn activity_effective_scope_reflects_real_coverage_not_stored_intent() {
+        let catalog = std::collections::BTreeMap::from([(
+            "charge_card".to_string(),
+            ActivityCatalogEntry {
+                queue_name: "payments",
+                is_local: false,
+            },
+        )]);
+
+        // One of two expected shards holds it: intent says fleet, reality does not.
+        let partial = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(
+            partial[0]["effective_scope"], "partial_fleet",
+            "a partially-applied fleet-wide hold must be reported as such"
+        );
+        assert_eq!(
+            partial[0]["scope_shard_id"],
+            serde_json::Value::Null,
+            "the recorded intent is still reported verbatim"
+        );
+
+        // Both expected shards hold it: the same intent really is fleet-wide.
+        let complete = merge_activity_catalog_rows(
+            &catalog,
+            vec![
+                (
+                    0,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(complete[0]["effective_scope"], "fleet");
+
+        // A deliberately shard-scoped hold is not "partially applied".
+        let scoped = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "shard-0 only", "alice", 30, Some(0), 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(scoped[0]["effective_scope"], "shard");
+
+        // An activity that is not held at all has no coverage to report.
+        let unheld = merge_activity_catalog_rows(&catalog, Vec::new(), &[0, 1]);
+        assert_eq!(unheld[0]["paused"], serde_json::json!(false));
+        assert_eq!(
+            unheld[0]["effective_scope"],
+            serde_json::Value::Null,
+            "no hold means no coverage, mirroring the other null provenance fields"
+        );
+    }
+
+    /// Issue #619 review: the operator's reason must reach the durable audit
+    /// row, because `harvest_queue_pauses` (its only other home) is `DELETE`d on
+    /// resume — leaving a post-incident review able to see *who* paused a queue
+    /// but never *why*.
+    #[test]
+    fn pause_audit_context_carries_the_reason_on_full_success() {
+        let ctx = queue_pause_audit_context(Some("stripe outage"), None)
+            .expect("a fully successful pause must still record its reason");
+        assert_eq!(ctx, "reason: stripe outage");
+    }
+
+    /// The reason and any partial-failure text are both preserved, and stay
+    /// distinguishable — `status` remains the outcome discriminator.
+    #[test]
+    fn pause_audit_context_labels_reason_and_failures_separately() {
+        let ctx = queue_pause_audit_context(Some("stripe outage"), Some("shard 1: no pool"))
+            .expect("both contributions present");
+        assert_eq!(ctx, "reason: stripe outage | failures: shard 1: no pool");
+
+        // Failure-only (a resume that released nothing) keeps today's shape,
+        // just labelled.
+        assert_eq!(
+            queue_pause_audit_context(None, Some("shard 1: no pool")).as_deref(),
+            Some("failures: shard 1: no pool")
+        );
+        // Nothing to say stays None rather than writing an empty string.
+        assert!(queue_pause_audit_context(None, None).is_none());
+        assert!(queue_pause_audit_context(Some("   "), Some("")).is_none());
+    }
+
+    /// A resume deletes the pause row, so the audit row must capture what it
+    /// released.
+    #[test]
+    fn resume_audit_reason_records_the_released_hold() {
+        let uniform = summarise_resume_provenance(&[(
+            0,
+            resume_outcome(Some("stripe outage"), Some("alice"), 60, 4),
+        )]);
+        assert_eq!(
+            resume_released_audit_reason(&uniform).as_deref(),
+            Some("released hold by alice: stripe outage"),
+            "a single released hold keeps the plain single-line form -- a shard \
+             list would be noise when every released shard tells one story"
+        );
+
+        let divergent = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("shard-0 hold"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("fleet freeze"), Some("bob"), 60, 2)),
+        ]);
+        let rendered = resume_released_audit_reason(&divergent).expect("a hold was released");
+        assert!(
+            rendered.contains("shard-0 hold") && rendered.contains("alice"),
+            "the longest hold must lead; got {rendered}"
+        );
+        assert!(
+            rendered.contains("2 holds"),
+            "a divergent release must say so rather than presenting one shard's \
+             reason as the fleet's; got {rendered}"
+        );
+
+        // Releasing nothing records nothing.
+        let noop = summarise_resume_provenance(&[(0, resume_outcome(None, None, 0, 0))]);
+        assert!(resume_released_audit_reason(&noop).is_none());
+    }
+
+    /// EVERY released reason must survive in the durable audit row, not just
+    /// the longest hold's.
+    ///
+    /// `resume_queue` has already `DELETE`d every pause row by the time this
+    /// renders, and the per-shard detail goes only to the transient HTTP
+    /// response body, so an audit row that keeps one shard's story plus a
+    /// generic "shards disagreed" marker leaves the other shards' *why*
+    /// permanently unrecoverable (issue #619 review).
+    #[test]
+    fn resume_audit_reason_preserves_every_released_hold() {
+        let provenance = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("pg failover"), Some("bob"), 60, 2)),
+            (
+                2,
+                resume_outcome(Some("stripe outage"), Some("alice"), 120, 3),
+            ),
+        ]);
+        let rendered = resume_released_audit_reason(&provenance).expect("holds were released");
+
+        // Both incidents and both operators -- nothing discarded.
+        for fragment in ["stripe outage", "alice", "pg failover", "bob"] {
+            assert!(
+                rendered.contains(fragment),
+                "'{fragment}' is unrecoverable anywhere else once the pause row \
+                 is deleted; got {rendered}"
+            );
+        }
+
+        // Attribution: which shards each distinct hold covered. Shards sharing
+        // one story collapse into a single entry so the common fleet-wide case
+        // stays short.
+        assert!(
+            rendered.contains("shards 0,2"),
+            "the two shards sharing one incident must collapse into one entry; \
+             got {rendered}"
+        );
+        assert!(rendered.contains("shard 1"), "got {rendered}");
+        assert_eq!(
+            rendered.matches("stripe outage").count(),
+            1,
+            "the shared reason must not be repeated per shard; got {rendered}"
+        );
+
+        // The longest hold still leads, so the audit row stays coherent with the
+        // response's top-level released_reason and paused_duration_secs.
+        let stripe = rendered.find("stripe outage").expect("present");
+        let pg = rendered.find("pg failover").expect("present");
+        assert!(stripe < pg, "the longest hold must lead; got {rendered}");
+    }
+
+    /// A hold whose operator is unknown must still contribute its reason -- the
+    /// missing name must not drop the whole entry.
+    #[test]
+    fn resume_audit_reason_renders_a_hold_with_no_operator() {
+        let provenance = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("orphaned hold"), None, 60, 2)),
+        ]);
+        let rendered = resume_released_audit_reason(&provenance).expect("holds were released");
+        assert!(rendered.contains("orphaned hold"), "got {rendered}");
+        assert!(
+            rendered.contains("unknown"),
+            "an absent operator renders as 'unknown', not an empty gap; got {rendered}"
+        );
+    }
+
+    fn activity_pause_outcome(
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+        ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+            activity_name: "charge_card".to_string(),
+            newly_paused: false,
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: None,
+            held_task_count: held,
+        }
+    }
+
+    /// The pause audit row must record the hold that is actually IN EFFECT, not
+    /// the reason the request happened to carry (issue #807 review).
+    ///
+    /// `pause_activity` / `pause_queue` preserve each shard's ORIGINAL
+    /// provenance on an idempotent re-pause, so a second pause -- most starkly
+    /// one that omits the reason entirely and resolves to the default -- would
+    /// otherwise write an audit row claiming a reason that is in effect on no
+    /// shard at all. The response body already reports the effective provenance
+    /// for exactly this reason; the durable row must not tell a different story
+    /// than the response the operator just read.
+    #[test]
+    fn pause_audit_reason_records_the_effective_hold_not_the_request() {
+        // Both features, because the bug and the fix are identical and the two
+        // audit trails must never drift on the same question.
+        let queue_shards = [(0, pause_outcome("stripe outage", "alice", 900, None, 4))];
+        let queue = summarise_pause_provenance(&queue_shards).expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&queue.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "a uniform fleet-wide hold keeps the plain single-line form"
+        );
+
+        let activity_shards = [(0, activity_pause_outcome("stripe outage", "alice", 900, 4))];
+        let activity = summarise_activity_pause_provenance(&activity_shards)
+            .expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&activity.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "the per-activity hold must render byte-identically to the queue \
+             sibling for a byte-identical situation"
+        );
+    }
+
+    /// EVERY reason actually holding some part of the fleet must survive in the
+    /// durable row, not just the earliest one (issue #807 review).
+    ///
+    /// This is the retry-a-partial-fleet case: the first attempt reached shard 0
+    /// and stamped its reason there; the retry reaches shard 1 and stamps a
+    /// different one, while shard 0 idempotently keeps the original. Recording
+    /// only the request's reason hides shard 0's; recording only the earliest
+    /// hides shard 1's. The resume `DELETE`s both rows, so whichever is dropped
+    /// here is unrecoverable.
+    #[test]
+    fn pause_audit_reason_preserves_every_divergent_shard_reason() {
+        let per_shard = [
+            (0, activity_pause_outcome("stripe outage", "alice", 900, 1)),
+            (
+                1,
+                activity_pause_outcome("retry: fleet freeze", "bob", 60, 2),
+            ),
+            (2, activity_pause_outcome("stripe outage", "alice", 300, 3)),
+        ];
+        let provenance =
+            summarise_activity_pause_provenance(&per_shard).expect("shards applied the hold");
+        let rendered =
+            held_holds_audit_reason(&provenance.held_groups).expect("a hold is in effect");
+
+        for fragment in ["stripe outage", "alice", "retry: fleet freeze", "bob"] {
+            assert!(
+                rendered.contains(fragment),
+                "'{fragment}' is unrecoverable once the pause row is deleted; got {rendered}"
+            );
+        }
+
+        // Shards sharing one story collapse, so the row grows with the number of
+        // distinct holds (operator-authored, small) not the shard count.
+        assert!(
+            rendered.contains("shards 0,2"),
+            "the two shards sharing one incident must collapse into one entry; got {rendered}"
+        );
+        assert!(rendered.contains("shard 1"), "got {rendered}");
+        assert_eq!(
+            rendered.matches("stripe outage").count(),
+            1,
+            "the shared reason must not be repeated per shard; got {rendered}"
+        );
+
+        // The EARLIEST hold leads, matching the response's top-level `reason`
+        // and `paused_at`, so the row and the response stay coherent.
+        let stripe = rendered.find("stripe outage").expect("present");
+        let freeze = rendered.find("retry: fleet freeze").expect("present");
+        assert!(
+            stripe < freeze,
+            "the earliest hold must lead, matching the response summary; got {rendered}"
+        );
+    }
+
+    /// A typo in a queue-control body must be REJECTED, not silently widened
+    /// (issue #619 review).
+    ///
+    /// Serde ignores unknown fields by default, so `{"shard": 1}` on the resume
+    /// route would deserialize to `shard_id: None` — which this feature reads as
+    /// the *fleet-wide* default. A one-character typo would therefore release
+    /// every shard's hold mid-outage while reporting success, the exact quiet-
+    /// and-dangerous direction the `207`/`effective_scope` work exists to close.
+    #[test]
+    fn a_typo_in_a_queue_control_body_is_rejected_not_widened_to_fleet_wide() {
+        // The precise scenario from the review: `shard` instead of `shard_id`.
+        let typo = serde_json::json!({ "shard": 1 });
+        assert!(
+            serde_json::from_value::<ResumeQueueRequest>(typo).is_err(),
+            "a resume body with an unknown field must be rejected — accepting it \
+             silently promotes a shard-scoped release to fleet-wide"
+        );
+        assert!(
+            serde_json::from_value::<PauseQueueRequest>(serde_json::json!({
+                "reason": "outage",
+                "shard": 1,
+            }))
+            .is_err(),
+            "a pause body with an unknown field must be rejected symmetrically"
+        );
+
+        // The legitimate shapes still parse, including the shard-scoped one the
+        // typo was reaching for and the empty resume body (fleet-wide default).
+        let scoped: ResumeQueueRequest =
+            serde_json::from_value(serde_json::json!({ "shard_id": 1 })).expect("valid");
+        assert_eq!(scoped.shard_id, Some(1));
+        let fleet: ResumeQueueRequest =
+            serde_json::from_value(serde_json::json!({})).expect("valid");
+        assert_eq!(fleet.shard_id, None);
+        let paused: PauseQueueRequest = serde_json::from_value(serde_json::json!({
+            "reason": "stripe outage",
+            "shard_id": 0,
+        }))
+        .expect("valid");
+        assert_eq!(paused.reason, "stripe outage");
+        assert_eq!(paused.shard_id, Some(0));
+    }
+
+    /// `queue_paused` keeps its documented first position in the FINAL response
+    /// (issue #619 review).
+    ///
+    /// `task_intrinsic_impediment_reasons` pushes it first, but both eligibility
+    /// merges collapse reasons through a `HashSet` and re-sort — and
+    /// `concurrency_saturated` sorts before `queue_paused` alphabetically. The
+    /// helper's own doc comment and `harvest-alerts.md` both promise the operator
+    /// sees the deliberate hold first, so the ordering has to survive the merge,
+    /// not just the helper.
+    #[test]
+    fn queue_paused_stays_first_through_the_reason_code_merge() {
+        let mut merged = vec![
+            "sticky_owned_by_other_worker".to_string(),
+            "concurrency_saturated".to_string(),
+            "queue_paused".to_string(),
+            "circuit_open".to_string(),
+        ];
+        sort_reason_codes(&mut merged);
+        assert_eq!(
+            merged,
+            vec![
+                "queue_paused".to_string(),
+                "circuit_open".to_string(),
+                "concurrency_saturated".to_string(),
+                "sticky_owned_by_other_worker".to_string(),
+            ],
+            "the operator's own deliberate hold must lead, with the rest \
+             alphabetical so the array stays stable across polls"
+        );
+
+        // Without a hold the order is exactly today's plain alphabetical sort,
+        // so no existing consumer's expectations change.
+        let mut no_hold = vec![
+            "rate_limit_exhausted".to_string(),
+            "concurrency_saturated".to_string(),
+        ];
+        sort_reason_codes(&mut no_hold);
+        assert_eq!(
+            no_hold,
+            vec![
+                "concurrency_saturated".to_string(),
+                "rate_limit_exhausted".to_string(),
+            ]
+        );
+
+        // Idempotent, and a lone hold is untouched.
+        let mut single = vec!["queue_paused".to_string()];
+        sort_reason_codes(&mut single);
+        sort_reason_codes(&mut single);
+        assert_eq!(single, vec!["queue_paused".to_string()]);
+
+        let mut empty: Vec<String> = Vec::new();
+        sort_reason_codes(&mut empty);
+        assert!(empty.is_empty());
+
+        // Issue #807: the activity-level hold leads too, and a task held by
+        // BOTH reports them in a deterministic order rather than whichever the
+        // HashSet merge happened to yield.
+        let mut both = vec![
+            "concurrency_saturated".to_string(),
+            "queue_paused".to_string(),
+            "worker_draining".to_string(),
+            "activity_paused".to_string(),
+        ];
+        sort_reason_codes(&mut both);
+        assert_eq!(
+            both,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "worker_draining".to_string(),
+            ],
+            "both deliberate holds lead, alphabetical within the group and \
+             within the remainder, so the array is stable across polls"
+        );
+    }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values
@@ -34693,6 +47755,9 @@ mod tests {
     fn dag_registration_marker_is_separate_from_workflow_registry() {
         let registry = Arc::new(HandlerRegistry::new(
             vec![autumn_harvest::WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "workflow_only",
                 module: "tests",
@@ -35634,6 +48699,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -35722,6 +48788,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -35848,6 +48915,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -35933,6 +49001,133 @@ mod tests {
         );
     }
 
+    /// Codex P2 finding (issue #605/#777 review, PR #1152): during the
+    /// plugin-startup boot window (storage pool installed, `install(runtime)`
+    /// not yet complete) `rerun_workflow`'s runtime lookup returned an error
+    /// WITHOUT writing the failed `workflow.rerun` audit row -- unlike every
+    /// other rejection path in this handler, which all audit through the
+    /// caller's own connection (`conn`/`exec_id_str` are already in scope by
+    /// this point). Reproduce that exact state and assert the audit row is
+    /// now written, mirroring the sibling boot-window tests above.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // matches the sibling boot-window tests above
+    async fn rerun_workflow_audits_failure_when_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct AuditRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            status: String,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to rerun_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "rerun_no_runtime",
+                workflow_id: "rerun-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                chain_execution_timeout: None,
+                max_workflow_chain_timeout_ceiling: None,
+                inherited_chain_deadline_at: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = rerun_workflow(
+            Extension(state),
+            Path(exec_id.to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "rerun_workflow must fail closed when the runtime isn't installed yet"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // The regression under test: a failed `workflow.rerun` audit row must
+        // exist for this rejection, matching every other rejection path in
+        // the handler -- previously this branch returned before ever calling
+        // `audit_rerun_failure_on`.
+        let rows: Vec<AuditRow> = diesel::sql_query(
+            "SELECT status FROM harvest_audit_log WHERE operation = $1 AND target_id = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(OP_WORKFLOW_RERUN)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .load(&mut conn)
+        .await
+        .expect("audit query should run");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one workflow.rerun audit row for this rejection, got {}",
+            rows.len()
+        );
+        assert_eq!(rows[0].status, "failed");
+    }
+
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
         let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
             diesel_async::AsyncPgConnection,
@@ -35965,6 +49160,126 @@ mod tests {
         autumn_web::migrate::run_pending(&database_url, autumn_harvest::MIGRATIONS)
             .expect("failed to run Harvest migrations");
         Some((database_url, container))
+    }
+
+    // ── #798 round 14: the exported deadline is re-read, never trusted ──────
+
+    /// Candidate discovery and the per-candidate history fetch are separate
+    /// round-trips, and `deadline_at` moves in between when a `PAUSED`
+    /// execution resumes (#383 shifts it forward by the pause span). A fixture
+    /// carrying the stale, *earlier* value reports less remaining budget than
+    /// the live worker saw, so `should_continue_as_new()` (#772) can fire in
+    /// replay and emit a `ContinueAsNew` the recorded history cannot contain —
+    /// a false divergence that blocks an unchanged candidate build.
+    ///
+    /// This drives the export with a candidate whose deadline is deliberately
+    /// wrong. The exported document must carry the row's *current* value, which
+    /// is only true if the export re-reads it rather than trusting the
+    /// discovery-time copy.
+    #[tokio::test]
+    async fn the_exported_deadline_is_re_read_not_taken_from_the_stale_candidate() {
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let pool = workflow_result_test_pool(&database_url);
+        let mut conn = pool.get().await.expect("conn");
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        // Unique per run: the active-uniqueness index spans
+        // (workflow_name, workflow_id) and this row is left RUNNING.
+        let workflow_id = format!("deadline-{exec_id}");
+        // Whole seconds: Postgres `timestamptz` is microsecond-precision, so a
+        // nanosecond-precision `Utc::now()` would not round-trip exactly and the
+        // comparison below would fail on precision rather than on staleness.
+        let started_at = chrono::DateTime::from_timestamp(
+            (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp(),
+            0,
+        )
+        .expect("valid timestamp");
+        // The value a resume left behind: an hour further out than discovery saw.
+        let fresh_deadline = started_at + chrono::Duration::hours(3);
+        let fresh_timeout = chrono::Duration::hours(3);
+
+        diesel::sql_query(
+            "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+              queue_name, started_at, execution_timeout, deadline_at, workflow_attempt) \
+             VALUES ($1, 'deadline_wf', $5, gen_random_uuid(), 0, 'RUNNING', \
+                     '{}'::jsonb, 'default', $2, $3, $4, 1)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+        .bind::<diesel::sql_types::Interval, _>(fresh_timeout)
+        .bind::<diesel::sql_types::Timestamptz, _>(fresh_deadline)
+        .bind::<diesel::sql_types::Text, _>(workflow_id.clone())
+        .execute(&mut conn)
+        .await
+        .expect("insert execution");
+
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[autumn_harvest::WorkflowEvent::workflow_started(
+                serde_json::json!({}),
+                started_at,
+            )],
+            1,
+        )
+        .await
+        .expect("append history");
+
+        // What discovery captured *before* the resume: an hour too early.
+        let stale_deadline = fresh_deadline - chrono::Duration::hours(1);
+        let candidate = HistoryExportCandidate {
+            id: exec_id.as_uuid(),
+            workflow_name: "deadline_wf".to_string(),
+            workflow_id: workflow_id.clone(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            last_history_event_at: started_at,
+            execution_timeout: Some(fresh_timeout),
+            deadline_at: Some(stale_deadline),
+            parent_id: None,
+            context_headers: None,
+            queue_name: "default".to_string(),
+        };
+
+        let mut work = HistoryBatchExportWork::default();
+        let mut outcome = LossyDecodeOutcome::default();
+        export_history_candidate(
+            &HarvestDbPool::single(pool.clone()),
+            &candidate,
+            &HistoryExportQuery {
+                payload_policy: autumn_harvest::HistoryPayloadPolicy::Full,
+                max_bytes: autumn_harvest::DEFAULT_HISTORY_EXPORT_MAX_BYTES,
+            },
+            &mut work,
+            None,
+            &mut outcome,
+        )
+        .await;
+
+        assert!(
+            work.failures.is_empty(),
+            "export must succeed: {:?}",
+            work.failures
+        );
+        assert_eq!(work.exports.len(), 1, "exactly one document expected");
+        // Indexed rather than `.first()`: `use super::*` pulls diesel's
+        // `FirstDsl` into scope and it wins method resolution on a `Vec`.
+        let document = &work.exports[0];
+        assert_eq!(
+            document.deadline_at,
+            Some(fresh_deadline),
+            "the fixture must carry the row's CURRENT deadline; carrying the stale \
+             discovery-time value makes should_continue_as_new() fire in replay and \
+             falsely blocks an unchanged candidate"
+        );
+        assert_ne!(
+            document.deadline_at,
+            Some(stale_deadline),
+            "the stale candidate value must not survive into the fixture"
+        );
     }
 
     #[test]
@@ -36042,6 +49357,8 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_id: None,
+            context_headers: None,
+            queue_name: "default".to_string(),
         }
     }
 
@@ -36081,6 +49398,877 @@ mod tests {
         assert!(
             !sql.contains("COALESCE(completed_at, started_at, created_at) >="),
             "updated windows must not be based only on workflow row timestamps"
+        );
+    }
+
+    // ── Stratified in-flight sample export (issue #798) ───────────────────────
+
+    fn sample_row(
+        workflow_name: &str,
+        seq: u128,
+        started_at: chrono::DateTime<chrono::Utc>,
+        in_flight_total: i64,
+    ) -> HistorySampleCandidate {
+        HistorySampleCandidate {
+            id: uuid::Uuid::from_u128(seq),
+            workflow_name: workflow_name.to_string(),
+            workflow_id: format!("{workflow_name}-{seq}"),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            started_at,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_id: None,
+            context_headers: None,
+            queue_name: "default".to_string(),
+            in_flight_total,
+        }
+    }
+
+    fn sample_base() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// AC1: the per-type cap is applied **per workflow name**, so a noisy type
+    /// can never crowd a quiet one out of the sample — the exact failure a
+    /// plain global `LIMIT` produces.
+    #[test]
+    fn stratify_sample_rows_caps_each_workflow_type_independently() {
+        let base = sample_base();
+        let mut rows = Vec::new();
+        for index in 0..5u128 {
+            rows.push(sample_row(
+                "noisy",
+                index,
+                base + chrono::Duration::seconds(i64::try_from(index).expect("fits")),
+                5,
+            ));
+        }
+        rows.push(sample_row(
+            "quiet",
+            100,
+            base + chrono::Duration::hours(1),
+            1,
+        ));
+
+        stratify_sample_rows(
+            &mut rows,
+            2,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 3, "2 noisy + 1 quiet");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.workflow_name == "noisy")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.workflow_name == "quiet")
+                .count(),
+            1,
+            "the quiet type must survive the noisy type's volume"
+        );
+    }
+
+    /// AC1: the cap is re-applied **globally** after the cross-shard union, so
+    /// two shards each returning their own top-N cannot yield 2N.
+    #[test]
+    fn stratify_sample_rows_reapplies_the_cap_across_the_shard_union() {
+        let base = sample_base();
+        let mut rows = vec![
+            // Shard 0's own top-3.
+            sample_row("wf", 1, base, 3),
+            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
+            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+            // Shard 1's own top-3, interleaved in time.
+            sample_row("wf", 4, base + chrono::Duration::seconds(1), 3),
+            sample_row("wf", 5, base + chrono::Duration::seconds(3), 3),
+            sample_row("wf", 6, base + chrono::Duration::seconds(5), 3),
+        ];
+
+        stratify_sample_rows(
+            &mut rows,
+            3,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 3, "the union must be re-truncated to the cap");
+        // Oldest-first across the union, not shard-0-first.
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_u128()).collect::<Vec<_>>(),
+            vec![1, 4, 2]
+        );
+    }
+
+    #[test]
+    fn stratify_sample_rows_honours_newest_order() {
+        let base = sample_base();
+        let mut rows = vec![
+            sample_row("wf", 1, base, 3),
+            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
+            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+        ];
+
+        stratify_sample_rows(
+            &mut rows,
+            2,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        );
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_u128()).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    /// The global `MAX_SAMPLE_TOTAL` budget must be spread across workflow
+    /// types, not consumed alphabetically by whichever types sort first.
+    ///
+    /// Rows arrive sorted by `workflow_name`, so a naive running `total` guard
+    /// hands the whole budget to the alphabetically-earliest types and leaves the
+    /// rest with **zero** fixtures — while the manifest still reports `complete`
+    /// (its status is shard-derived) and the gate exits `0`. That is a silent
+    /// false pass: a release certified against a fleet the gate never looked at.
+    /// It is the same "noisy type crowds out the quiet ones" failure the
+    /// per-type stratification exists to prevent, on the alphabetical axis.
+    #[test]
+    fn stratify_sample_rows_spreads_the_global_cap_across_every_type() {
+        let base = sample_base();
+        let per_workflow = 50usize;
+        // 60 types x 50 in flight = 3000 candidates against a 2000 budget, so
+        // the global cap genuinely binds.
+        let type_count = 60usize;
+        let mut rows = Vec::new();
+        for type_index in 0..type_count {
+            for row_index in 0..per_workflow {
+                let id = u128::try_from(type_index * 1000 + row_index).expect("fits");
+                rows.push(sample_row(
+                    &format!("wf_type_{type_index:02}"),
+                    id,
+                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    i64::try_from(per_workflow).expect("fits"),
+                ));
+            }
+        }
+
+        stratify_sample_rows(
+            &mut rows,
+            per_workflow,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        let mut sampled_per_type: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            *sampled_per_type
+                .entry(row.workflow_name.clone())
+                .or_insert(0) += 1;
+        }
+
+        assert!(
+            rows.len() <= autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL,
+            "the global cap must still hold: {} rows",
+            rows.len()
+        );
+        assert_eq!(
+            sampled_per_type.len(),
+            type_count,
+            "every in-flight workflow type must get at least one fixture, or the \
+             gate is blind to it while reporting a clean run: {:?}",
+            sampled_per_type
+                .iter()
+                .filter(|(_, count)| **count == 0)
+                .collect::<Vec<_>>()
+        );
+        let smallest = sampled_per_type.values().copied().min().unwrap_or(0);
+        assert!(
+            smallest > 0,
+            "no type may be starved to zero coverage: {sampled_per_type:?}"
+        );
+    }
+
+    /// When the global cap does **not** bind, per-type sampling is unchanged.
+    #[test]
+    fn stratify_sample_rows_leaves_the_per_type_cap_alone_under_the_global_budget() {
+        let base = sample_base();
+        let mut rows = Vec::new();
+        for type_index in 0..3u128 {
+            for row_index in 0..10u128 {
+                rows.push(sample_row(
+                    &format!("wf_{type_index}"),
+                    type_index * 100 + row_index,
+                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    10,
+                ));
+            }
+        }
+
+        stratify_sample_rows(
+            &mut rows,
+            4,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 12, "3 types x the per-type cap of 4");
+    }
+
+    /// The window `COUNT(*)` is constant within a workflow-name partition, so
+    /// the population is read once per name — including the part beyond the cap
+    /// that the shard did not return (AC2).
+    #[test]
+    fn shard_population_reports_the_full_partition_count_per_type() {
+        let base = sample_base();
+        let rows = vec![
+            sample_row("alpha", 1, base, 40),
+            sample_row("alpha", 2, base + chrono::Duration::seconds(1), 40),
+            sample_row("beta", 3, base, 2),
+        ];
+
+        let population = shard_population(&rows);
+        assert_eq!(population.len(), 2);
+        let alpha = population
+            .iter()
+            .find(|entry| entry.workflow_name == "alpha")
+            .expect("alpha");
+        assert_eq!(alpha.in_flight_total, 40, "not the 2 rows returned");
+        assert_eq!(
+            alpha.sampled, 0,
+            "sampled is filled in from the documents actually exported"
+        );
+        let beta = population
+            .iter()
+            .find(|entry| entry.workflow_name == "beta")
+            .expect("beta");
+        assert_eq!(beta.in_flight_total, 2);
+    }
+
+    #[test]
+    fn shard_population_of_no_rows_is_empty() {
+        assert!(shard_population(&[]).is_empty());
+    }
+
+    /// Two logical shards may share one physical database — a supported
+    /// topology this repo scopes for everywhere else (`COUNT_WHERE_CLAUSE`,
+    /// `schedule_run_state_summary`, `non_terminal_counts_by_workflow_name` all
+    /// carry `WHERE shard_id = $N`).
+    ///
+    /// Without the predicate the cross-shard fan-out runs the same statement
+    /// twice against the same rows, which corrupts the manifest in both
+    /// directions at once: `in_flight_total` is doubled (the denominator AC2
+    /// exists to state honestly becomes a lie), and every execution is sampled
+    /// twice, halving real per-type coverage while the count looks unchanged.
+    #[test]
+    fn history_sample_sql_scopes_to_one_logical_shard() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("w.shard_id = $4::INT4"),
+                "a shard-scoped fan-out must filter by shard, or two logical \
+                 shards sharing a database double-count: {sql}"
+            );
+        }
+    }
+
+    /// The built-in liveness canary (issue #796) is engine-internal: no user
+    /// gate binary registers `__harvest_canary_probe*`, so sampling one would
+    /// land it in `blocked` and pin the gate at exit 2 forever on any
+    /// deployment with the canary enabled.
+    ///
+    /// `starts_with`, not `LIKE '…%'` — the prefix is underscore-heavy and `_`
+    /// is a single-character wildcard in `LIKE`, so a `LIKE` form over-matches
+    /// real workflow names. Mirrors `execution::COUNT_WHERE_CLAUSE`.
+    #[test]
+    fn history_sample_sql_excludes_the_liveness_canary() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("NOT starts_with(w.workflow_name, '__harvest_canary_probe')"),
+                "engine-internal canary probes must never enter a user gate \
+                 bundle: {sql}"
+            );
+            assert!(
+                !sql.contains("LIKE '__harvest_canary_probe"),
+                "LIKE would over-match: `_` is a wildcard: {sql}"
+            );
+        }
+    }
+
+    /// Discovery must not materialize a superset the stratifier will discard.
+    ///
+    /// `rn <= $3` bounds each *type* but nothing bounds the number of types, so
+    /// the returned set is `types × per_workflow` — a million rows per shard at
+    /// 2,000 types and `per_workflow = 500`, decoded into owned strings and
+    /// `context_headers` JSON, only for `stratify_sample_rows` to keep 2,000 of
+    /// them. On a shared management API that is a memory-exhaustion vector for
+    /// a routine authenticated CI export.
+    ///
+    /// The statement must therefore apply the same *effective* per-type share
+    /// the global budget allows. `GREATEST(…, 1)` is the load-bearing half of
+    /// it: without the floor, a deployment with more types than
+    /// `MAX_SAMPLE_TOTAL` gets an integer-divided limit of zero and the export
+    /// returns nothing at all — no candidates *and* no per-type population
+    /// census, which is what `zero_coverage_types` and the coverage denominator
+    /// read.
+    #[test]
+    fn history_sample_sql_bounds_discovery_by_the_effective_per_type_share() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))"),
+                "discovery must bound rows by the effective per-type share, or a \
+                 many-type deployment materializes `types * per_workflow` rows to \
+                 keep MAX_SAMPLE_TOTAL: {sql}"
+            );
+            assert!(
+                !sql.contains("WHERE rn <= $3\n"),
+                "the unbounded per-type limit must be gone, not merely joined: {sql}"
+            );
+            assert!(
+                sql.contains("SELECT DISTINCT workflow_name FROM ranked"),
+                "the type count must be taken over the *unfiltered* ranked set, or \
+                 the share is computed from an already-truncated population: {sql}"
+            );
+        }
+    }
+
+    /// The bound is only correct if it is at least as generous as what the
+    /// global stratifier will keep, or a shard would withhold rows the union
+    /// needed and silently shrink real coverage.
+    ///
+    /// A shard sees at most the types the union sees, so `MAX / types_shard >=
+    /// MAX / types_union`: the per-shard share is never smaller than the global
+    /// one. This pins that arithmetic rather than trusting the prose.
+    #[test]
+    fn the_per_shard_share_is_never_smaller_than_the_global_share() {
+        let max = autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL;
+        let share = |types: usize| max.checked_div(types).map_or(max, |s| s.max(1));
+        for types_union in [1usize, 2, 41, 500, 2_000, 5_000] {
+            for types_shard in 1..=types_union {
+                assert!(
+                    share(types_shard) >= share(types_union),
+                    "shard share must be >= global share: {types_shard} vs {types_union}"
+                );
+            }
+        }
+        // And every type keeps at least one row, so the population census — the
+        // manifest's `in_flight_total` and `zero_coverage_types` — survives even
+        // when types outnumber the whole budget.
+        assert_eq!(share(max * 3), 1);
+    }
+
+    /// The literal above must track the constant it mirrors, or the exclusion
+    /// silently stops matching when the prefix changes.
+    #[test]
+    fn the_canary_exclusion_literal_matches_the_canary_prefix_constant() {
+        assert_eq!(
+            autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe",
+            "update the SQL literal in both HISTORY_SAMPLE_CANDIDATES_*_SQL"
+        );
+    }
+
+    fn sample_query() -> HistorySampleExportQuery {
+        HistorySampleExportQuery {
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: 1_000_000,
+            workflow_name: None,
+            states: vec!["RUNNING".to_string()],
+            per_workflow: 50,
+            order: autumn_harvest::replay_sample::SampleOrder::Oldest,
+            shard_id: None,
+        }
+    }
+
+    /// AC2, the load-bearing half: a workflow type whose **entire** sample
+    /// failed to export (every candidate blew the per-execution size ceiling)
+    /// must still appear in the manifest with `sampled: 0` and its **real**
+    /// `in_flight_total`.
+    ///
+    /// The failure mode this pins is the worst one a coverage record can have.
+    /// If such a type were dropped from `per_workflow` instead, the manifest
+    /// would read as though the type has nothing in flight — an operator would
+    /// see a clean gate and no row, and conclude the type was covered. Stating
+    /// `sampled: 0, in_flight_total: 40` is the honest answer: "there are forty
+    /// of these running and this gate verified none of them."
+    #[test]
+    fn a_type_whose_whole_sample_failed_to_export_still_reports_its_population() {
+        let base = sample_base();
+        // Both types are in flight and were sampled, but the export step
+        // produced nothing at all (e.g. every candidate exceeded `max_bytes`).
+        // `exports` stays empty; `failures` is what the route reports separately.
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[
+                sample_row("exported_fine", 1, base, 3),
+                sample_row("all_exports_failed", 2, base, 40),
+            ])],
+            ..Default::default()
+        };
+        assert!(work.batch.exports.is_empty());
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        let failed = manifest
+            .per_workflow
+            .iter()
+            .find(|entry| entry.workflow_name == "all_exports_failed")
+            .expect(
+                "a type whose exports all failed must NOT be dropped from the \
+                 manifest — a missing row reads as 'nothing in flight'",
+            );
+        assert_eq!(failed.sampled, 0);
+        assert_eq!(
+            failed.in_flight_total, 40,
+            "the population is the truth even when the sample is empty"
+        );
+
+        assert_eq!(manifest.sampled_total, 0);
+        assert_eq!(
+            manifest.in_flight_total, 43,
+            "the denominator sums every type's real population"
+        );
+        assert!(
+            manifest.is_truncated(),
+            "0 sampled of 43 in flight is the definition of truncated"
+        );
+    }
+
+    /// The aggregate byte budget must actually stop the export loop.
+    ///
+    /// `MAX_SAMPLE_TOTAL` bounds the fixture count, but `max_bytes` is
+    /// per-document and caller-raisable, so without an aggregate bound a routine
+    /// authenticated CI export can accumulate ~20 GiB before the management API
+    /// serializes a single response — on a shared service.
+    #[test]
+    fn sample_byte_budget_stops_the_export_when_exhausted() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        let mut budget = SampleByteBudget::default();
+        assert!(
+            !budget.exhausted(),
+            "a fresh budget must admit the first fetch"
+        );
+
+        budget.charge_attempt(Some(cap - 1));
+        assert!(
+            !budget.exhausted(),
+            "one byte under the budget must still admit a fetch"
+        );
+
+        budget.charge_attempt(Some(1));
+        assert!(budget.exhausted(), "reaching the budget must stop the loop");
+    }
+
+    /// A candidate that produced no document must not be charged for one.
+    ///
+    /// A failed export (over `max_bytes`, unreadable shard) records a failure
+    /// rather than a document, so charging it would shrink the budget for
+    /// histories that were never retained — cutting the sample short for free.
+    #[test]
+    fn sample_byte_budget_charges_only_retained_documents() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        let mut budget = SampleByteBudget::default();
+
+        // Park the budget one byte short of exhaustion, so a single wrongly
+        // charged attempt would visibly close it.
+        budget.charge_attempt(Some(cap - 1));
+        assert!(!budget.exhausted());
+
+        // Every candidate here FAILED (over `max_bytes`, unreadable shard), so
+        // no document was retained. Charging any of them would end the export
+        // early and silently shrink the sample.
+        for _ in 0..1_000 {
+            budget.charge_attempt(None);
+        }
+        assert!(
+            !budget.exhausted(),
+            "failed candidates retain no bytes and must not consume the budget"
+        );
+
+        // Control: a genuinely retained document still charges.
+        budget.charge_attempt(Some(1));
+        assert!(budget.exhausted());
+    }
+
+    /// A pathological `max_bytes` must not wrap the running total back under
+    /// the budget and reopen an exhausted export.
+    #[test]
+    fn sample_byte_budget_saturates_rather_than_wrapping() {
+        let mut budget = SampleByteBudget::default();
+        budget.charge_attempt(Some(usize::MAX));
+        budget.charge_attempt(Some(usize::MAX));
+        assert!(budget.exhausted(), "saturating add must stay exhausted");
+    }
+
+    /// The aggregate budget is checked *before* a fetch, so peak retained bytes
+    /// are the budget plus at most one document. That is only a bound if one
+    /// document is itself bounded — and `max_bytes` is caller-supplied.
+    ///
+    /// Without a ceiling the budget starts at zero, so the very first candidate
+    /// is always fetched and retained whatever its size: a single multi-gigabyte
+    /// history exhausts the management API despite `MAX_SAMPLE_RESPONSE_BYTES`.
+    /// Asking for one document larger than the entire response budget is also
+    /// incoherent — it can never be returned within that budget — so it is
+    /// rejected at the edge rather than accepted and then failed after the load.
+    #[test]
+    fn sample_max_bytes_above_the_response_budget_is_rejected() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+
+        let err =
+            parse_history_sample_export_query(&[("max_bytes".to_string(), (cap + 1).to_string())])
+                .expect_err(
+                    "a single document larger than the whole response budget must be rejected",
+                );
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("max_bytes"),
+            "the rejection must name the offending parameter: {rendered}"
+        );
+        assert!(
+            rendered.contains(&cap.to_string()),
+            "the rejection must name the ceiling so the operator can act on it: {rendered}"
+        );
+
+        // Exactly at the ceiling stays legal: it is the largest coherent request.
+        let at_cap =
+            parse_history_sample_export_query(&[("max_bytes".to_string(), cap.to_string())])
+                .expect("max_bytes exactly at the response budget must be accepted");
+        assert_eq!(at_cap.max_bytes, cap);
+    }
+
+    /// The bound the ceiling actually buys, stated as an invariant rather than a
+    /// single example: every query this parser accepts caps one document at or
+    /// below the aggregate budget, so peak retained bytes are bounded by
+    /// `budget + one document` = 2x the budget rather than by caller input.
+    #[test]
+    fn every_accepted_sample_query_bounds_one_document_by_the_response_budget() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        for candidate in [
+            "1",
+            "1024",
+            &(cap - 1).to_string(),
+            &cap.to_string(),
+            &(cap + 1).to_string(),
+            &usize::MAX.to_string(),
+        ] {
+            if let Ok(query) = parse_history_sample_export_query(&[(
+                "max_bytes".to_string(),
+                candidate.to_string(),
+            )]) {
+                assert!(
+                    query.max_bytes <= cap,
+                    "accepted max_bytes '{candidate}' must not exceed the response budget"
+                );
+            }
+        }
+    }
+
+    /// The manifest must carry the size-truncation flag, so a bundle cut short
+    /// by the byte budget cannot read back as the full sample that was asked
+    /// for. `is_truncated()` alone cannot say this: it reports the *intended*
+    /// truncation of sampling `per_workflow` out of a larger population.
+    #[test]
+    fn manifest_reports_a_size_truncated_export() {
+        let base = sample_base();
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            truncated_by_size: true,
+            ..Default::default()
+        };
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        assert!(
+            manifest.truncated_by_size,
+            "an export stopped by the byte budget must say so"
+        );
+
+        // Control: the default path must not claim a size truncation.
+        let untruncated = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        assert!(!build_sample_manifest(&sample_query(), &untruncated).truncated_by_size);
+    }
+
+    /// A candidate the sample selected but the export could not fetch (over
+    /// `max_bytes`, unreadable shard) must reach the manifest as a count.
+    ///
+    /// This is the one shortfall no other manifest field can express: the failed
+    /// candidate produces no document, so `sampled_total` counts only survivors
+    /// and agrees *exactly* with the fixture count in the bundle. Without this
+    /// count the gate replays a biased subset — biased against the largest
+    /// histories — and exits `0`.
+    #[test]
+    fn manifest_reports_candidates_the_export_dropped() {
+        let base = sample_base();
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        work.batch.failures.push(HistoryExportFailure {
+            execution_id: Some(uuid::Uuid::from_u128(1).to_string()),
+            shard_id: 0,
+            reason: "history exceeds max_bytes".to_string(),
+            actual_bytes: Some(20_000_000),
+            max_bytes: Some(10_000_000),
+        });
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        assert_eq!(
+            manifest.export_failures, 1,
+            "a dropped candidate must be counted on the manifest"
+        );
+        assert!(
+            manifest.is_incomplete_export(),
+            "the gate reads this predicate, so it must follow from the count"
+        );
+
+        // Control: a clean export claims no shortfall.
+        let clean = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_sample_manifest(&sample_query(), &clean).export_failures,
+            0
+        );
+        assert!(!build_sample_manifest(&sample_query(), &clean).is_incomplete_export());
+    }
+
+    /// A shard that dies **after** discovery selected a candidate must be
+    /// recorded as a dropped candidate, not merely an unhealthy shard.
+    ///
+    /// The two signals gate differently, which is the whole point: the shard
+    /// note only flips `status` to `partial`, which the #798 replay gate honours
+    /// solely under the opt-in `require_complete_coverage(true)`. The failure
+    /// entry is what makes `export_failures > 0`, which blocks the gate
+    /// unconditionally (exit 2).
+    ///
+    /// Recording only the shard note let a bundle with at least one survivor
+    /// replay clean and exit `0` while silently omitting selected executions —
+    /// a biased subset presented as a passing gate (Codex round-11 P1). The
+    /// reacquire race that triggers this is not injectable in a DB test, so the
+    /// decision is pinned here instead.
+    #[test]
+    fn a_candidate_dropped_after_selection_is_counted_as_an_export_failure() {
+        let base = sample_base();
+        let exec_id = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+
+        work.batch
+            .note_dropped_candidate(0, &exec_id, "pool timed out");
+
+        assert_eq!(
+            work.batch.unavailable_shards.len(),
+            1,
+            "the shard is genuinely unhealthy and must still be reported"
+        );
+        assert_eq!(
+            work.batch.failures.len(),
+            1,
+            "a selected-but-unexported candidate is a dropped candidate, not just \
+             an unhealthy shard"
+        );
+        assert_eq!(
+            work.batch.failures[0].execution_id.as_deref(),
+            Some(exec_id.to_string().as_str()),
+            "the operator needs the execution id to know what was dropped"
+        );
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        assert_eq!(manifest.export_failures, 1);
+        assert!(
+            manifest.is_incomplete_export(),
+            "this is the predicate the gate blocks on, unconditionally: {manifest:?}"
+        );
+    }
+
+    /// The control: `note_unavailable` on its own — the correct call for every
+    /// *pre*-selection failure — must NOT fabricate a dropped candidate.
+    ///
+    /// Six of the seven `note_unavailable` call sites fail before any candidate
+    /// is selected; counting those as export failures would block the gate for a
+    /// shard that never owed the bundle a row.
+    #[test]
+    fn an_unavailable_shard_before_selection_is_not_an_export_failure() {
+        let base = sample_base();
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+
+        work.batch.note_unavailable(1, "pool timed out".to_string());
+
+        assert_eq!(work.batch.unavailable_shards.len(), 1);
+        assert!(
+            work.batch.failures.is_empty(),
+            "no candidate was selected from this shard, so none was dropped"
+        );
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        assert_eq!(manifest.export_failures, 0);
+        assert!(!manifest.is_incomplete_export());
+    }
+
+    /// The complement: `sampled` counts the documents actually exported, per
+    /// type, not the rows the query returned. Without this, a partial export
+    /// failure would inflate `sampled` and the manifest would overstate the
+    /// gate's coverage.
+    #[test]
+    fn sampled_counts_exported_documents_per_type_not_candidate_rows() {
+        let base = sample_base();
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[
+                sample_row("alpha", 1, base, 9),
+                sample_row("beta", 2, base, 4),
+            ])],
+            batch: HistoryBatchExportWork {
+                exports: vec![
+                    sample_export_document("alpha", 1),
+                    sample_export_document("alpha", 2),
+                    sample_export_document("beta", 3),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        let by_name: std::collections::BTreeMap<&str, &_> = manifest
+            .per_workflow
+            .iter()
+            .map(|entry| (entry.workflow_name.as_str(), entry))
+            .collect();
+
+        assert_eq!(by_name["alpha"].sampled, 2);
+        assert_eq!(by_name["alpha"].in_flight_total, 9);
+        assert_eq!(by_name["beta"].sampled, 1);
+        assert_eq!(by_name["beta"].in_flight_total, 4);
+        assert_eq!(manifest.sampled_total, 3);
+        assert_eq!(manifest.in_flight_total, 13);
+    }
+
+    fn sample_export_document(workflow_name: &str, seq: u128) -> HistoryExportDocument {
+        HistoryExportDocument {
+            schema: "harvest.history.export".to_string(),
+            version: 1,
+            workflow_name: workflow_name.to_string(),
+            workflow_id: None,
+            queue_name: None,
+            execution_id: autumn_harvest::ExecutionId::from_uuid(uuid::Uuid::from_u128(seq)),
+            shard_id: 0,
+            exported_at: sample_base(),
+            event_count: 0,
+            status: autumn_harvest::history_export::HistoryExportStatus {
+                state: "RUNNING".to_string(),
+                terminal: false,
+            },
+            payload_policy: HistoryPayloadPolicy::Full,
+            size_limit: autumn_harvest::history_export::HistoryExportSizeLimit {
+                max_bytes: 1_000_000,
+                actual_bytes: 128,
+                truncated: false,
+                truncation_behavior: "reject".to_string(),
+            },
+            events: Vec::new(),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+        }
+    }
+
+    /// The stratification window is what makes the sample per-type; a plain
+    /// `LIMIT` would silently regress it to a global top-N.
+    #[test]
+    fn history_sample_sql_stratifies_and_counts_the_population() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("ROW_NUMBER() OVER (\n            PARTITION BY w.workflow_name"),
+                "the sample must be stratified per workflow type"
+            );
+            assert!(
+                sql.contains("COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total"),
+                "the population must be computed in the same statement as the sample"
+            );
+            assert!(
+                sql.contains("w.state = ANY($1::TEXT[])"),
+                "states must be bound, never interpolated"
+            );
+            assert!(
+                !sql.contains("harvest_events"),
+                "the sample must not join the event log"
+            );
+        }
+        assert!(
+            history_sample_candidates_sql(autumn_harvest::replay_sample::SampleOrder::Oldest)
+                .contains("ORDER BY w.started_at ASC")
+        );
+        assert!(
+            history_sample_candidates_sql(autumn_harvest::replay_sample::SampleOrder::Newest)
+                .contains("ORDER BY w.started_at DESC")
+        );
+    }
+
+    #[test]
+    fn history_sample_query_defaults_to_the_in_flight_states() {
+        let query = parse_history_sample_export_query(&[]).expect("defaults parse");
+        assert_eq!(
+            query.states,
+            vec!["PAUSED".to_string(), "RUNNING".to_string()]
+        );
+        assert_eq!(
+            query.per_workflow,
+            autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE
+        );
+        assert_eq!(query.payload_policy, HistoryPayloadPolicy::Redacted);
+        assert_eq!(
+            query.order,
+            autumn_harvest::replay_sample::SampleOrder::Oldest
+        );
+    }
+
+    #[test]
+    fn history_sample_query_rejects_terminal_and_unknown_states() {
+        for bad in ["COMPLETED", "FAILED", "NOT_A_STATE"] {
+            assert!(
+                parse_history_sample_export_query(&[("states".to_string(), bad.to_string())])
+                    .is_err(),
+                "'{bad}' must be rejected, never silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn history_sample_query_clamps_per_workflow() {
+        let query = parse_history_sample_export_query(&[(
+            "per_workflow".to_string(),
+            "1000000".to_string(),
+        )])
+        .expect("clamped, not rejected");
+        assert_eq!(
+            query.per_workflow,
+            autumn_harvest::replay_sample::MAX_PER_WORKFLOW_SAMPLE
         );
     }
 
@@ -36203,6 +50391,8 @@ mod tests {
             retry_policy: None,
             overdue: false,
             overdue_by_secs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
@@ -36973,6 +51163,9 @@ mod tests {
         Arc::new(HandlerRegistry::new(
             vec![
                 autumn_harvest::WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "schema_wf",
                     module: "tests",
@@ -36996,6 +51189,9 @@ mod tests {
                     retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
+                    quota: None,
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "no_schema_wf",
                     module: "tests",
@@ -37716,6 +51912,204 @@ mod tests {
         );
     }
 
+    // ── issue #780: the run-graph readers must see DECODED payloads ────────
+    //
+    // `dag_retry::is_compensation_dispatch` reads `ActivityScheduled.input`, a
+    // payload-bearing field. On a codec-encrypting or payload-offloading
+    // deployment a raw history hands it an opaque envelope, the predicate
+    // returns `false`, and the compensator is read back as a forward node —
+    // the exact defect the exclusion exists to close.
+
+    /// Build a codec registry whose default is the byte-reversal test codec, so
+    /// `encode_event` produces the real `_harvest_codec_envelope` shape.
+    fn reversing_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+        let mut codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseReadPathCodec));
+        codecs
+    }
+
+    /// A compensation dispatch exactly as `unwind_dag_compensations` records it.
+    fn compensation_dispatch_event() -> autumn_harvest::WorkflowEvent {
+        autumn_harvest::WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: "undo_a".to_string(),
+            input: serde_json::json!({
+                "dag_compensate": "a",
+                "input": serde_json::Value::Null,
+                "output": serde_json::Value::Null,
+            }),
+            queue: "default".to_string(),
+        }
+    }
+
+    /// The forward dispatch of node `a`, which is what makes the compensation
+    /// envelope's `dag_compensate` corroborate (issue #780 round 4: the
+    /// corroboration is *dispatch*, not completion).
+    fn forward_dispatch_event(name: &str) -> autumn_harvest::WorkflowEvent {
+        autumn_harvest::WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::json!({"payload": "ordinary user input"}),
+            queue: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn graph_history_needs_inflation_detects_opaque_payload_fields() {
+        // A plain history needs no inflation pass at all — the default
+        // deployment (identity codecs, no payload store) must stay byte-for-byte
+        // on the pre-#780 path.
+        let clean = vec![forward_dispatch_event("a"), compensation_dispatch_event()];
+        assert!(
+            !graph_history_needs_inflation(&clean),
+            "a history with no envelope must skip the inflate/decode pass entirely"
+        );
+
+        // A codec-encoded `ActivityScheduled.input` must trigger it.
+        let codecs = reversing_codecs();
+        let encoded_value = codecs
+            .encode_event(&compensation_dispatch_event())
+            .expect("encode");
+        assert_eq!(
+            encoded_value["data"]["input"]["_harvest_codec_envelope"], 1,
+            "fixture sanity: the stored event carries a codec envelope on `input`"
+        );
+        let encoded: autumn_harvest::WorkflowEvent =
+            serde_json::from_value(encoded_value).expect("re-deserialize stored shape");
+        assert!(
+            graph_history_needs_inflation(&[encoded]),
+            "an opaque ActivityScheduled.input must trigger the inflate/decode pass"
+        );
+
+        // A `MarkerRecorded.details` envelope must trigger it too: the run
+        // graph's `dag_skip` fingerprint validation reads that field.
+        let opaque_marker = autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:2".to_string(),
+            details: serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "store_id": "s3",
+                "key": "blob-1",
+                "len": 4096,
+                "checksum": "deadbeef",
+            }),
+        };
+        assert!(
+            graph_history_needs_inflation(&[opaque_marker]),
+            "an opaque MarkerRecorded.details must trigger the inflate/decode pass"
+        );
+    }
+
+    /// An offload reference that survives the pass must FAIL the retry, not
+    /// silently pass through as an opaque payload (issue #780 round 9).
+    ///
+    /// The reachable shape is a *configuration removal*: a deployment that had a
+    /// `PayloadStore` registered offloaded an oversized compensation envelope,
+    /// and the store was later unregistered (or failed to construct at boot). On
+    /// the next read `offloader` is `None`, so the inflate pass is skipped
+    /// entirely and `decode_event` happily returns the reference verbatim — it
+    /// is not a codec envelope, so nothing else rejects it. The issue #780
+    /// signal-2 guard then looks for `dag_compensate` inside
+    /// `{"_harvest_offload_envelope": 1, ...}` and finds nothing, so a run that
+    /// fully rolled back reads as retryable.
+    #[tokio::test]
+    async fn a_residual_offload_reference_fails_closed_when_no_store_is_configured() {
+        use autumn_harvest::WorkflowEvent;
+
+        // The stored shape: an `ActivityScheduled.input` that is an offload
+        // reference rather than the real compensation envelope.
+        let mut value = serde_json::to_value(compensation_dispatch_event()).expect("ser");
+        value["data"]["input"] = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3-main",
+            "key": "blob-abc",
+            "len": 4096,
+            "checksum": "deadbeef",
+        });
+        let stored: WorkflowEvent = serde_json::from_value(value).expect("re-deser");
+
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let err = inflate_and_decode_events(&[stored], &codecs, None)
+            .await
+            .expect_err(
+                "a history still carrying an offload reference must fail closed: with no store \
+                 configured the compensation envelope is unreadable, and degrading to the raw \
+                 reference would let an already-rolled-back run be retried",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offload") && msg.contains("s3-main"),
+            "the error must name the offload reference and the store it points at, so an \
+             operator can restore the right configuration; got: {msg}"
+        );
+    }
+
+    /// The default deployment — no payload store, no offloaded payloads — must
+    /// stay byte-for-byte on the pre-round-9 path.
+    #[tokio::test]
+    async fn a_plain_history_still_passes_with_no_store_configured() {
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let decoded = inflate_and_decode_events(
+            &[forward_dispatch_event("a"), compensation_dispatch_event()],
+            &codecs,
+            None,
+        )
+        .await
+        .expect("a history with no offload reference must pass untouched");
+        assert_eq!(decoded.len(), 2, "every event must survive the pass");
+    }
+
+    #[tokio::test]
+    async fn a_codec_encoded_compensation_dispatch_is_only_recognised_after_decoding() {
+        use autumn_harvest::WorkflowEvent;
+
+        let codecs = reversing_codecs();
+        let plain = [forward_dispatch_event("a"), compensation_dispatch_event()];
+
+        // The stored shape: exactly what `load_history_with_timestamps` hands a
+        // run-graph reader on a codec-encrypting deployment.
+        let stored: Vec<WorkflowEvent> = plain
+            .iter()
+            .map(|e| {
+                serde_json::from_value(codecs.encode_event(e).expect("encode")).expect("re-deser")
+            })
+            .collect();
+
+        // RED without the fix: the predicate cannot see through the envelope, so
+        // the compensator reads as an ordinary forward dispatch.
+        let stored_dispatched = crate::dag_retry::dispatched_activity_names(&stored);
+        let WorkflowEvent::ActivityScheduled { input, .. } = &stored[1] else {
+            panic!("fixture");
+        };
+        assert!(
+            !crate::dag_retry::is_compensation_dispatch(input, &stored_dispatched),
+            "fixture sanity: on the RAW stored history the envelope is opaque, which is \
+             precisely why the caller must decode before applying the filter"
+        );
+
+        // GREEN: after the caller's in-memory pass the predicate sees the real
+        // envelope and excludes the compensator.
+        let decoded = inflate_and_decode_events(&stored, &codecs, None)
+            .await
+            .expect("decode must succeed with the codec registered");
+        let decoded_dispatched = crate::dag_retry::dispatched_activity_names(&decoded);
+        let WorkflowEvent::ActivityScheduled { input, .. } = &decoded[1] else {
+            panic!("fixture");
+        };
+        assert!(
+            crate::dag_retry::is_compensation_dispatch(input, &decoded_dispatched),
+            "after decoding, the compensation envelope must be recognised so the run graph \
+             excludes it from a same-named forward node"
+        );
+
+        // And the ordinary forward dispatch is untouched by the pass.
+        // (`WorkflowEvent` has no `PartialEq`; compare the serialized form.)
+        assert_eq!(
+            serde_json::to_value(&decoded[0]).expect("ser"),
+            serde_json::to_value(&plain[0]).expect("ser"),
+            "the forward dispatch round-trips through the pass unchanged"
+        );
+    }
+
     /// Byte-reversal test codec + envelope fixtures shared by the #608 unit
     /// tests below (the SSE frame test above keeps its own local copy).
     #[derive(Debug)]
@@ -37738,6 +52132,549 @@ mod tests {
             v.reverse();
             Ok(v)
         }
+    }
+
+    // ── issue #809 / PR #1188 round 6: decode exactly what is surfaced ─────
+    //
+    // The per-row activity facts carry `last_error` RAW so a LOSING row's
+    // encrypted error is never decrypted and never written to the
+    // `payload.decode_read` audit row. Only the winning verdict's error is
+    // decoded, and only when a decoder is active.
+
+    /// Wrap `plaintext` the way a codec-encrypting deployment stores an
+    /// encoded TEXT error: the serialized form of a codec envelope around a
+    /// JSON string. Built through the public `encode_event` seam (encoding a
+    /// string-valued payload field) so the fixture can never drift from the
+    /// engine's real envelope shape.
+    fn encoded_error_envelope(plaintext: &str) -> String {
+        let codecs = reversing_codecs();
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::String(plaintext.to_string()),
+        };
+        let event_data = codecs.encode_event(&event).expect("encode event");
+        let envelope = &event_data["data"]["output"];
+        assert_eq!(
+            envelope["_harvest_codec_envelope"], 1,
+            "fixture sanity: the encoded field must carry a codec envelope"
+        );
+        serde_json::to_string(envelope).expect("serialize envelope")
+    }
+
+    /// Build a live `WorkerRow` for the eligibility tests below.
+    fn eligibility_worker(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+    ) -> WorkerRow {
+        eligibility_worker_with_status(worker_id, queues, build_id, labels, "Active")
+    }
+
+    /// The same, with an explicit fleet status so the drain case is testable.
+    fn eligibility_worker_with_status(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+        status: &str,
+    ) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!([0]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: status.to_string(),
+                drain_deadline_at: None,
+                build_id: build_id.to_string(),
+                deployment_name: None,
+                labels,
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    /// The common case: a queue name and no other claim requirement.
+    fn claim_reqs(queue: &str) -> TaskClaimRequirements<'_> {
+        TaskClaimRequirements {
+            queue_name: queue,
+            ..TaskClaimRequirements::default()
+        }
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_build_not_just_the_queue() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker(
+            "w-old",
+            &["default"],
+            "build-1",
+            serde_json::json!({}),
+        )];
+
+        // No build requirement -> the queue poller is enough.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+        // Same build -> eligible.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        // A build the only queue poller does NOT run and is not declared
+        // compatible with: the task is unclaimable even though the queue is
+        // covered.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_honours_declared_build_compatibility() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        // `build-2` is declared able to process work assigned `build-1`.
+        let mut compat = BuildCompatibilitySet::new();
+        compat.add_declaration("build-2", "build-1");
+        let workers = vec![eligibility_worker(
+            "w-new",
+            &["default"],
+            "build-2",
+            serde_json::json!({}),
+        )];
+
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        // A legacy worker (empty build_id) may claim anything.
+        let legacy = vec![eligibility_worker(
+            "w-legacy",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &legacy,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-9"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let cpu_only = vec![eligibility_worker(
+            "w-cpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let gpu = vec![eligibility_worker(
+            "w-gpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+
+        assert!(!task_has_eligible_worker(
+            &cpu_only,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        assert!(task_has_eligible_worker(
+            &gpu,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_checks_every_dimension_against_the_same_worker() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        // One worker satisfies the build, a DIFFERENT one satisfies the label.
+        // Neither can claim the task, so the split fleet is not coverage.
+        let split = vec![
+            eligibility_worker("w-build", &["default"], "build-2", serde_json::json!({})),
+            eligibility_worker(
+                "w-gpu",
+                &["default"],
+                "build-1",
+                serde_json::json!({"gpu": "true"}),
+            ),
+        ];
+        assert!(!task_has_eligible_worker(
+            &split,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+
+        // The same worker satisfying both IS coverage.
+        let both = vec![eligibility_worker(
+            "w-both",
+            &["default"],
+            "build-2",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &both,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_falls_back_to_other_dimensions_on_unparseable_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let garbage = serde_json::json!({"not": "a requirement list"});
+        let workers = vec![eligibility_worker(
+            "w",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+
+        // Never fabricate a stall from a value this endpoint cannot read: the
+        // capability dimension is skipped, the others still apply.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("other-queue")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_requires_its_pinned_host() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // A peer covers the queue, but the session's pinned host is gone.
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["gpu"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(
+            !task_has_eligible_worker(
+                &peer_only,
+                0,
+                TaskClaimRequirements {
+                    is_session_member: true,
+                    sticky_worker_id: Some("w-host"),
+                    ..claim_reqs("gpu")
+                },
+                &compat,
+                ""
+            ),
+            "a session member is claimable ONLY by its pinned host; a peer that \
+             covers the queue can never claim it, so this is a genuine stall"
+        );
+
+        // The pinned host itself is live -> claimable.
+        let with_host = vec![
+            eligibility_worker("w-peer", &["gpu"], "", serde_json::json!({})),
+            eligibility_worker("w-host", &["gpu"], "", serde_json::json!({})),
+        ];
+        assert!(task_has_eligible_worker(
+            &with_host,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_without_a_recorded_host_is_unclaimable() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker("w", &["gpu"], "", serde_json::json!({}))];
+
+        // `sticky_worker_id = $1` can never hold against a NULL column.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: None,
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_pin_still_applies_build_and_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // The pinned host is live and polls the queue but runs the wrong build:
+        // no OTHER worker may stand in for it, so the task is unclaimable.
+        let workers = vec![
+            eligibility_worker("w-host", &["gpu"], "build-1", serde_json::json!({})),
+            eligibility_worker("w-peer", &["gpu"], "build-2", serde_json::json!({})),
+        ];
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_ignores_an_ordinary_sticky_lease() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // Sticky owner recorded but NOT a session member: the lease self-heals
+        // at `sticky_until`, so any eligible poller counts and this is not a
+        // stall (see `task_has_eligible_worker`'s doc comment).
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &peer_only,
+            0,
+            TaskClaimRequirements {
+                sticky_worker_id: Some("w-gone"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_excludes_draining_workers() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // `Worker::run` leaves its poll loop BEFORE transitioning to
+        // `Draining`, so a draining worker claims no new task for the whole
+        // drain window even though queue coverage still counts it.
+        let draining = vec![eligibility_worker_with_status(
+            "w-draining",
+            &["default"],
+            "",
+            serde_json::json!({}),
+            "Draining",
+        )];
+        assert!(!task_has_eligible_worker(
+            &draining,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+
+        // The same worker while still `Active` IS coverage.
+        let active = vec![eligibility_worker(
+            "w-active",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &active,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn only_the_surfaced_activity_error_is_decoded() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let encoded = encoded_error_envelope("card declined");
+
+        // The winning verdict's error IS decoded, and the outcome is non-empty
+        // so the caller's `payload.decode_read` audit row is written.
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: Some("charge_card".to_string()),
+            attempt: 3,
+            last_error: Some(encoded),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(outcome.touched(), "a surfaced error must be audited");
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(decoded),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(decoded, "card declined");
+        assert!(
+            !decoded.contains("_harvest_codec_envelope"),
+            "the surfaced error must not leak the envelope: {decoded}"
+        );
+    }
+
+    #[test]
+    fn a_losing_rows_error_is_never_decoded_or_audited() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        // The fan-out case Codex named: a retrying row loses precedence to a
+        // paused-queue row, so its error never reaches the caller.
+        let mut winner = BlockedOn::ActivityQueuePaused {
+            queue: "payments".to_string(),
+            activity_name: Some("charge_card".to_string()),
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(
+            !outcome.touched(),
+            "an unsurfaced error must not write a decode audit row"
+        );
+    }
+
+    #[test]
+    fn decode_is_a_noop_without_an_active_decoder() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let encoded = encoded_error_envelope("card declined");
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: Some(encoded.clone()),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, None);
+        assert!(!outcome.touched());
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(unchanged),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(
+            unchanged, &encoded,
+            "with no decoder the stored bytes must be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn a_retrying_verdict_without_an_error_is_a_noop() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: None,
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(!outcome.touched());
     }
 
     fn read_path_test_codecs() -> PayloadCodecs {
@@ -37766,6 +52703,7 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
             workflow_id: "wf-1".to_string(),
@@ -37820,6 +52758,8 @@ mod tests {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            history_bloat_warned_at: None,
+            triage_note: None,
         }
     }
 
@@ -38420,6 +53360,8 @@ mod tests {
             failed_at,
             owner: None,
             severity: None,
+            workflow_name: None,
+            quota_key: None,
         }
     }
 
@@ -38591,6 +53533,58 @@ mod tests {
     }
 
     #[test]
+    fn build_history_bloat_fanout_sorts_by_count_descending_and_names_down_shard() {
+        let t = chrono::Utc::now();
+        let mut r_small = StalledWorkflowRow::from(exec_at(1, t));
+        r_small.history_event_count = Some(50);
+        let mut r_huge = StalledWorkflowRow::from(exec_at(2, t));
+        r_huge.history_event_count = Some(9_000);
+        let mut r_mid = StalledWorkflowRow::from(exec_at(3, t));
+        r_mid.history_event_count = Some(500);
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![r_small, r_huge, r_mid],
+                error: None,
+            },
+            ShardObservation::<StalledWorkflowRow> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("down".to_string()),
+            },
+        ];
+        let page = build_history_bloat_fanout(obs, 2);
+        // (a) largest-history-first, (b) truncated to limit=2.
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].history_event_count, Some(9_000));
+        assert_eq!(page.rows[1].history_event_count, Some(500));
+        // (d) partial + shard 1 named (issue #756).
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_history_bloat_fanout_ties_break_on_execution_id() {
+        let t = chrono::Utc::now();
+        // Two rows with the identical count but different ids — the merge must
+        // be deterministic across repeated calls, not left to sort stability.
+        let mut r_a = StalledWorkflowRow::from(exec_at(9, t));
+        r_a.history_event_count = Some(100);
+        let mut r_b = StalledWorkflowRow::from(exec_at(1, t));
+        r_b.history_event_count = Some(100);
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![r_a, r_b],
+            error: None,
+        }];
+        let page = build_history_bloat_fanout(obs, 10);
+        assert_eq!(page.rows.len(), 2);
+        // Tied on count -> lower execution id sorts first.
+        assert!(page.rows[0].execution.id < page.rows[1].execution.id);
+    }
+
+    #[test]
     fn build_dead_letter_fanout_truncates_and_names_down_shard_during_degradation() {
         let t = chrono::Utc::now();
         let obs = vec![
@@ -38656,5 +53650,776 @@ mod tests {
         assert_eq!(page.status, FanoutStatus::Partial);
         assert_eq!(page.unavailable_shards.len(), 1);
         assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    // ── issue #697: explicit shard placement parsing (pure, no DB) ──────────
+
+    #[test]
+    fn placement_defaults_to_auto_when_neither_field_is_supplied() {
+        // AC1: omitting both fields must be byte-for-byte today's behaviour.
+        let placement = parse_shard_placement(None, None).expect("no placement is valid");
+        assert_eq!(placement, ShardPlacement::Auto);
+        assert!(placement.is_auto());
+    }
+
+    #[test]
+    fn placement_parses_an_explicit_shard_id() {
+        assert_eq!(
+            parse_shard_placement(Some(3), None).expect("shard 3 parses"),
+            ShardPlacement::Shard(ShardId::new(3))
+        );
+    }
+
+    #[test]
+    fn placement_parses_a_residency_key() {
+        assert_eq!(
+            parse_shard_placement(None, Some("eu")).expect("eu parses"),
+            ShardPlacement::residency_key("eu")
+        );
+    }
+
+    #[test]
+    fn placement_rejects_supplying_both_fields() {
+        // Two placement sources are ambiguous; never silently prefer one.
+        let err = parse_shard_placement(Some(1), Some("eu")).expect_err("both is ambiguous");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("shard_id") && msg.contains("residency_key"),
+            "message must name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_a_negative_shard_id() {
+        // Shard numbers are non-negative; a negative value is unparseable
+        // rather than a silent re-hash.
+        let err = parse_shard_placement(Some(-1), None).expect_err("negative is invalid");
+        assert!(
+            format!("{err:?}").contains("shard_id"),
+            "message must name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_the_unencoded_sentinel_shard_id() {
+        // 0xFFFF is the routing sentinel, never a placeable shard.
+        let err = parse_shard_placement(Some(0xFFFF), None).expect_err("sentinel is invalid");
+        assert!(
+            format!("{err:?}").contains("shard_id"),
+            "message must name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_a_blank_residency_key() {
+        for blank in ["", "   "] {
+            let err =
+                parse_shard_placement(None, Some(blank)).expect_err("blank keys are unparseable");
+            assert!(
+                format!("{err:?}").contains("residency_key"),
+                "message must name the field: {err:?}"
+            );
+        }
+    }
+
+    // ── issue #743: DAG-level execution_timeout/sla -- schedule API surfacing (AC9),
+    //    pure (no DB): resolve_schedule_deadline_secs directly. ──────────────────
+
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> autumn_harvest::WorkflowInfo {
+        autumn_harvest::WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_returns_none_none_with_no_registry() {
+        // A schedule read while no runtime is installed (or the workflow is
+        // unknown to the registry) must resolve to (None, None), never panic
+        // or guess a stale value.
+        assert_eq!(
+            resolve_schedule_deadline_secs(None, "anything"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_returns_none_none_for_an_unregistered_name() {
+        let registry =
+            HandlerRegistry::new(vec![deadline_info_fixture("known_wf", None, None)], vec![]);
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "unknown_wf"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_propagates_declared_values_verbatim() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "deadline_wf",
+                Some(std::time::Duration::from_secs(4 * 3600)),
+                Some(std::time::Duration::from_secs(3 * 3600)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "deadline_wf"),
+            (Some(14_400), Some(10_800)),
+            "a declared 4h execution_timeout / 3h sla (sla < timeout) must read back unclamped"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_clamps_sla_to_execution_timeout() {
+        // AC5's read-side manifestation: sla (10h) > execution_timeout (1h)
+        // must resolve CLAMPED to the 1h ceiling, mirroring the same clamp
+        // `clamp_info_default_sla` applies at start time.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "clamp_wf",
+                Some(std::time::Duration::from_secs(3600)),
+                Some(std::time::Duration::from_secs(10 * 3600)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "clamp_wf"),
+            (Some(3_600), Some(3_600)),
+            "sla must be clamped down to execution_timeout, never the raw declared 36000"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_leaves_undeclared_fields_none() {
+        // AC7: zero regression -- a workflow declaring neither attribute
+        // resolves to (None, None), identical to a pre-#743 schedule read.
+        let registry =
+            HandlerRegistry::new(vec![deadline_info_fixture("plain_wf", None, None)], vec![]);
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "plain_wf"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_applies_fleet_wide_ceiling() {
+        // Codex review on issue #743 (PR #1141): the resolver previously
+        // reported the RAW declared execution_timeout/sla, disagreeing with
+        // what a real fire would actually set on deadline_at/sla_deadline_at
+        // once a fleet-wide `max_workflow_execution_timeout` ceiling is
+        // configured. Both the advertised timeout AND the sla (clamped
+        // against the CEILED timeout, not the raw one) must reflect the 1h
+        // ceiling, never the raw 10h/8h declarations.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "ceiling_wf",
+                Some(std::time::Duration::from_secs(10 * 3600)),
+                Some(std::time::Duration::from_secs(8 * 3600)),
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "ceiling_wf"),
+            (Some(3_600), Some(3_600)),
+            "the ceiling must cap the advertised execution_timeout AND the sla \
+             clamp must be computed against the CEILED value, not the raw 10h/8h"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_ceiling_never_widens_a_smaller_declared_value() {
+        // The ceiling only CAPS -- it must never widen a value the workflow
+        // declared smaller than the fleet-wide ceiling.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "small_wf",
+                Some(std::time::Duration::from_secs(1800)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "small_wf"),
+            (Some(1_800), None),
+            "a 30m declared timeout under a 1h ceiling must read back as 30m, not widened to 1h"
+        );
+    }
+
+    #[test]
+    fn schedule_entry_from_row_resolves_execution_timeout_and_sla_for_a_dag_schedule() {
+        // Closes the review gap left by the 5 tests above, which only exercise
+        // plain-workflow-named schedules. A `kind: "dag"` row's `name` resolves
+        // to `s.dag_name` (see the `(kind, name)` derivation in
+        // `schedule_entry_from_row`), and `HarvestBuilder::dags(...)`
+        // auto-registers a unified DAG's shadow `WorkflowInfo` under that SAME
+        // name in `registry.workflows` (`DagInfo::as_workflow_info()` ->
+        // `self.workflows.push(workflow_info)`), so `resolve_schedule_deadline_secs`
+        // must resolve identically for `kind: "dag"` schedules as it does for
+        // plain-workflow schedules -- the "ONE lookup covers both schedule
+        // kinds identically" claim documented on `resolve_schedule_deadline_secs`.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "nightly_reconciliation",
+                Some(std::time::Duration::from_secs(4 * 3600)),
+                Some(std::time::Duration::from_secs(3 * 3600)),
+            )],
+            vec![],
+        );
+        let schedule = sched_named(1, Some("nightly_reconciliation"), None);
+
+        let entry = schedule_entry_from_row(schedule, None, false, None, Some(&registry));
+
+        assert_eq!(
+            entry.kind,
+            ScheduleKind::Dag,
+            "a dag_name-bearing row must resolve to ScheduleKind::Dag"
+        );
+        assert_eq!(entry.name, "nightly_reconciliation");
+        assert_eq!(
+            entry.execution_timeout_secs,
+            Some(14_400),
+            "a kind:dag schedule must resolve execution_timeout via the DAG's shadow \
+             WorkflowInfo, registered under the DAG's own name"
+        );
+        assert_eq!(entry.sla_secs, Some(10_800));
+    }
+
+    // ── Stall diagnosis (issue #809) — derivation helpers ──────────────────
+
+    #[test]
+    fn circuit_cooldown_until_derives_an_absolute_deadline() {
+        let now = chrono::Utc::now();
+        let at = circuit_cooldown_until(now, 30.0).expect("30s is representable");
+        assert_eq!((at - now).num_seconds(), 30);
+    }
+
+    #[test]
+    fn circuit_cooldown_until_degrades_on_unrepresentable_input() {
+        // A missing `cooldown_until` is already the documented shape for a
+        // force-opened breaker, so degrading is never a lie — but it must never
+        // panic or wrap either.
+        let now = chrono::Utc::now();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e30] {
+            assert!(
+                circuit_cooldown_until(now, bad).is_none(),
+                "{bad} must not yield a cooldown"
+            );
+        }
+        // Zero is representable and simply means "probe now".
+        assert_eq!(circuit_cooldown_until(now, 0.0), Some(now));
+    }
+
+    #[test]
+    fn contributing_reasons_union_across_rows_not_just_the_winner() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // Slot A: paused queue (the highest-ranked verdict, so `blocked_on`
+        // names it). Slot B: no live poller. The `no_live_worker` condition
+        // holds and MUST still be surfaced — that is the endpoint's whole
+        // "100% of the time it holds" guarantee.
+        let base = |queue: &str| PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: queue.to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let mut a = base("paused-q");
+        a.queue_paused = true;
+        let mut b = base("dead-q");
+        b.has_live_worker = false;
+
+        let reasons = contributing_reasons_for(&[a, b]);
+        assert!(
+            reasons.iter().any(|r| r == "queue_paused"),
+            "expected queue_paused in {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r == "no_live_worker"),
+            "a lower-ranked sibling's cause must not be hidden behind the winner: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_skip_claim_gates_for_a_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row a live worker already holds is running; reporting `queue_paused`
+        // next to `health: healthy` would be self-contradictory.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: true,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert!(contributing_reasons_for(&[facts]).is_empty());
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphaned_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The converse: a claimed row whose fleet is gone (issue #367) is an
+        // orphan, and worker liveness is not a claim-time gate — it holds for a
+        // claimed row too.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts]),
+            vec!["no_live_worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_use_claimant_liveness_for_a_held_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row held by its own claimant, which has begun graceful shutdown
+        // (`Draining`, so it claims nothing new but IS finishing exactly this
+        // row). Queue-level claim eligibility is therefore false, but the
+        // claimant is alive and the classifier reports `healthy_in_progress` —
+        // so `no_live_worker` must NOT appear, or the reason codes would
+        // contradict the headline verdict.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(true),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            // Nothing *Active* covers the queue, so a PENDING row here would
+            // genuinely be `no_live_worker`.
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert!(
+            contributing_reasons_for(&[facts]).is_empty(),
+            "a held row whose own claimant is alive is progressing; \
+             reporting no_live_worker would contradict `healthy_in_progress`"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphan_even_when_an_active_peer_covers_the_queue() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The mirror image: the recorded claimant is gone (a poison-pill orphan,
+        // issue #367) while a healthy Active peer still covers the queue. A peer
+        // cannot pick up an already-claimed row, so the classifier reports
+        // `activity_no_worker` and the reason code must be present.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(false),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            // An Active peer covers the queue, so claim eligibility is true.
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts]),
+            vec!["no_live_worker".to_string()],
+            "an orphan held by a dead claimant must surface no_live_worker even \
+             when a live Active peer covers the queue"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_backfill_registered_requirements_for_an_unsnapshotted_row() {
+        // A legacy or manually enqueued activity row carries NULL
+        // `required_capabilities`, but `claim_task`'s ineligible-activities
+        // gate ($6) still enforces the REGISTERED handler's `requires`. The
+        // row's absent snapshot must not be read as "no requirements".
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+        assert_eq!(
+            resolved.requirements,
+            registered.get("gated"),
+            "a NULL snapshot must resolve to the registered requirements"
+        );
+        assert!(
+            resolved.from_registry_fallback,
+            "and must report that they came from THIS process's registry"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_prefer_the_rows_own_snapshot() {
+        // A snapshot is what the row was enqueued with; the registry may have
+        // changed since. `claim_task` gates on the snapshot when present
+        // (`required_capabilities IS NOT NULL` short-circuits $6), so the
+        // snapshot must win and the registry must never override it.
+        let snapshot = serde_json::json!([{"Exact": {"key": "region", "value": "eu"}}]);
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        let resolved = resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert_eq!(resolved.requirements, Some(&snapshot));
+        assert!(
+            !resolved.from_registry_fallback,
+            "a snapshotted requirement is row-side, so it gates every build"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_are_none_when_neither_source_has_any() {
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for resolved in [
+            resolve_required_capabilities(None, Some("ungated"), &registered),
+            resolve_required_capabilities(None, None, &registered),
+        ] {
+            assert!(resolved.requirements.is_none());
+            assert!(!resolved.from_registry_fallback);
+        }
+    }
+
+    /// The circuit registry is **in-process** (`circuit_breaker.rs`) and each
+    /// worker process builds its own (`HandlerRegistry::new`), so a local
+    /// snapshot only describes the local worker's breaker. It may be treated as
+    /// the answer for a task ONLY when the local worker is the sole worker that
+    /// could claim that task — otherwise a peer replica whose breaker is closed
+    /// can still dispatch it, and reporting a fleet-wide stall would be a false
+    /// positive on the flagship verdict.
+    #[test]
+    fn local_circuit_snapshot_is_authoritative_only_for_a_sole_local_eligible_worker() {
+        // Sole eligible worker, and it is us: our breaker IS the one that will
+        // be consulted at dispatch.
+        assert!(local_circuit_snapshot_is_authoritative(
+            &["w-local"],
+            Some("w-local")
+        ));
+
+        // A peer is also eligible: its breaker may be closed, so our local
+        // snapshot cannot support a fleet-wide verdict.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-local", "w-peer"],
+            Some("w-local")
+        ));
+
+        // The sole eligible worker is someone else entirely — our breaker is
+        // irrelevant to this task.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-peer"],
+            Some("w-local")
+        ));
+
+        // No co-located worker in this process (an API-only replica): nothing
+        // drives our registry, so it describes no dispatcher at all.
+        assert!(!local_circuit_snapshot_is_authoritative(&["w-peer"], None));
+
+        // No eligible worker at all -- `activity_no_worker` outranks the
+        // breaker anyway, but the predicate must not claim authority.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &[],
+            Some("w-local")
+        ));
+    }
+
+    #[test]
+    fn eligible_worker_ids_lists_every_worker_that_can_claim() {
+        // Two pollers cover the queue; a third covers a different queue.
+        let workers = vec![
+            eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-other", &["reports"], "", serde_json::json!({})),
+        ];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let reqs = TaskClaimRequirements {
+            queue_name: "payments",
+            ..TaskClaimRequirements::default()
+        };
+
+        let ids = eligible_worker_ids(&workers, 0, reqs, &compat, "");
+        assert_eq!(ids, vec!["w-a", "w-b"]);
+
+        // The boolean helper stays exactly "the set is non-empty", so every
+        // existing eligibility guarantee is preserved by construction.
+        assert_eq!(
+            task_has_eligible_worker(&workers, 0, reqs, &compat, ""),
+            !ids.is_empty()
+        );
+    }
+
+    #[test]
+    fn unsnapshotted_row_with_registered_requirements_has_no_eligible_worker() {
+        // The behavioural composition: an unsnapshotted row whose registered
+        // activity demands `gpu=true` is NOT claimable by a live poller that
+        // advertises `gpu=false`, so the endpoint must not read it as healthy.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let workers = vec![eligibility_worker(
+            "w-cpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+
+        assert!(
+            !task_has_eligible_worker(
+                &workers,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "",
+            ),
+            "an unsnapshotted row must still be gated by the registered requirements"
+        );
+
+        // The control: a worker that DOES advertise the label is coverage.
+        let workers = vec![eligibility_worker(
+            "w-gpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                queue_name: "payments",
+                required_capabilities: resolved.requirements,
+                capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                ..TaskClaimRequirements::default()
+            },
+            &compat,
+            "",
+        ));
+    }
+    #[test]
+    fn registry_fallback_binds_only_to_a_worker_on_the_local_build() {
+        // Same build -- the local registry genuinely describes that worker's
+        // handler, so its `requires` is what `claim_task` will enforce.
+        assert!(registry_fallback_binds("build-x", "build-x"));
+
+        // The default, no-build-routing deployment: every worker (and this
+        // process) advertises no build identity, so they are treated as one
+        // build and the fallback binds exactly as it did before.
+        assert!(registry_fallback_binds("", ""));
+
+        // Rolling deploy: the worker runs a DIFFERENT build, whose handler may
+        // declare no requirement at all. We have no evidence about it, so the
+        // fallback must not be used to reject it.
+        assert!(!registry_fallback_binds("build-old", "build-new"));
+
+        // One side unidentified is still not evidence of a shared build.
+        assert!(!registry_fallback_binds("build-old", ""));
+        assert!(!registry_fallback_binds("", "build-new"));
+    }
+
+    #[test]
+    fn local_build_id_reads_the_local_workers_advertised_build() {
+        let workers = vec![
+            eligibility_worker("w-peer", &["payments"], "build-old", serde_json::json!({})),
+            eligibility_worker("w-local", &["payments"], "build-new", serde_json::json!({})),
+        ];
+
+        assert_eq!(
+            local_build_id_from_workers(&workers, Some("w-local")),
+            "build-new",
+        );
+
+        // A co-located worker that has not registered a row yet, and an
+        // API-only replica, both leave the local build unidentified -- which
+        // `registry_fallback_binds` reads as "no build identity configured".
+        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
+        assert!(local_build_id_from_workers(&workers, None).is_empty());
+    }
+
+    #[test]
+    fn registry_fallback_does_not_gate_a_worker_on_a_different_build() {
+        // Rolling deploy. THIS replica runs `build-new`, whose `gated` handler
+        // declares `requires = gpu=true`. The row was enqueued by `build-old`,
+        // whose handler declared nothing, so its snapshot is NULL -- and
+        // `claim_task` admits the old worker, because that worker builds its
+        // own `ineligible_activities` from its OWN registry, which has no
+        // requirement for `gated`. Diagnosis must not reject it on our
+        // requirement and report a false `activity_no_worker`.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+        assert!(
+            resolved.from_registry_fallback,
+            "a NULL snapshot resolved from the registry IS a fallback"
+        );
+
+        let old_build = vec![eligibility_worker(
+            "w-old",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert_eq!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            ),
+            vec!["w-old"],
+            "a worker on another build must not be rejected on OUR registry's requirement"
+        );
+
+        // Control 1 -- round 11 preserved. A worker on the SAME build is still
+        // gated by the fallback, because our registry does describe its handler.
+        let same_build = vec![eligibility_worker(
+            "w-new",
+            &["payments"],
+            "build-new",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        assert!(
+            eligible_worker_ids(
+                &same_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "the fallback must still gate a worker running the build it came from"
+        );
+
+        // Control 2 -- a requirement carried on the ROW's own snapshot is what
+        // `claim_task` enforces server-side, independent of any worker's build,
+        // so it gates every build.
+        let snapshot = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let snapshotted =
+            resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert!(!snapshotted.from_registry_fallback);
+        assert!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: snapshotted.requirements,
+                    capabilities_from_registry_fallback: snapshotted.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "a snapshotted requirement is row-side and gates every build"
+        );
     }
 }

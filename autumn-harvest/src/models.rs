@@ -18,7 +18,7 @@ use crate::schema::{
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
-    harvest_workflow_executions,
+    harvest_workflow_executions, harvest_workflow_logs,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -200,6 +200,24 @@ pub struct WorkflowExecution {
     /// when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_by: Option<String>,
+    /// Wall-clock the operator early-warning soft threshold was first crossed
+    /// for this execution's recorded history size (issue #704). `None` = not
+    /// yet warned. Never read on replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Operator-mutable free-text triage note (issue #759). `None` = no note.
+    /// Metadata only -- never read on replay, never set at insert time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triage_note: Option<String>,
+    /// Resolved per-tenant quota key (issue #946), stamped at admission time
+    /// from the workflow type's declared `QuotaPolicy::key_expr` resolved
+    /// against the start input. `None` when the workflow type declares no
+    /// quota policy, or the key expression could not be resolved from the
+    /// input. Never read on replay -- purely an admission-time bookkeeping
+    /// column that backs the `harvest_workflow_executions` quota-usage
+    /// aggregate queries in `quota.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_key: Option<String>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -283,6 +301,12 @@ pub struct NewWorkflowExecution<'a> {
     /// Optional human/operator attribution for the start (issue #740). `None`
     /// when absent.
     pub started_by: Option<&'a str>,
+    /// Resolved per-tenant quota key (issue #946). `None` when the workflow
+    /// type declares no `QuotaPolicy`, or its key expression could not be
+    /// resolved against the start input. Stamped once at insert time;
+    /// required for the quota-usage aggregate queries in `quota.rs` to find
+    /// this execution's active-executions/history-bytes contribution.
+    pub quota_key: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -424,6 +448,58 @@ pub struct TaskQueueItem {
     /// ordinary activity dispatch.
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    /// Consecutive claims by workers with no handler registered for this task's
+    /// type (issue #804).
+    ///
+    /// Incremented each time a worker releases this task back to `PENDING`
+    /// because it has no handler for the workflow/activity type, so a capable
+    /// peer can claim it. Reset to `0` by every path that proves the claiming
+    /// worker *was* capable, so it measures **consecutive** capability misses.
+    /// At `WorkerConfig::capability_miss_max_redeliveries` the task escalates to
+    /// the existing terminal-failure path with a `no_capable_worker:` reason.
+    ///
+    /// Deliberately distinct from `attempt` (retry budget) and `crash_strikes`
+    /// (poison-pill quarantine): a clean "handler not registered" miss must
+    /// consume neither.
+    #[serde(default)]
+    pub capability_misses: i32,
+    /// Distinct worker ids that have missed this task (issue #804).
+    ///
+    /// The redelivery budget is consumed **per distinct worker**: a repeat miss
+    /// by a worker already in this set still backs off and still increments
+    /// `capability_misses`, but does not consume budget. Without that, one
+    /// incapable worker winning the claim race `N + 1` times in a row could
+    /// terminally fail a run while a capable peer was live — the released task
+    /// is eligible to every worker again and the claim query has no capability
+    /// filter.
+    ///
+    /// Cleared by exactly the paths that reset `capability_misses`, so the two
+    /// stay consistent. Bounded in practice by the budget + 1, since exceeding
+    /// it escalates.
+    #[serde(default)]
+    pub capability_miss_workers: Vec<String>,
+
+    /// Which handler the two counters above are evidence about, as
+    /// `{kind}:{name}` (issue #804, Codex round-46 P1).
+    ///
+    /// The counters describe **one frontier** — the position the workflow is
+    /// stuck at, and so the single handler a claiming worker must register to
+    /// move it. Without this, evidence survived a frontier change that no
+    /// reset covered: `prepare_workflow_task_with_cache` ingests due timers and
+    /// pending signals *before* the persist-time capability gate, so a signal
+    /// arriving while the task bounces on missing handler X can move the replay
+    /// onto a branch needing Y — no park, no inline progress, and X's missers
+    /// still on the row, counted as evidence about Y.
+    ///
+    /// A mismatch is treated as a **fresh** frontier by both the decision (the
+    /// read zeroes the counters) and the release (it resets them to this one
+    /// miss). `None` reads as a mismatch, which is the safe direction.
+    ///
+    /// Deliberately **not** cleared by the paths that zero the counters: with
+    /// the counts already `0` a stale key is inert, since a match increments
+    /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
+    #[serde(default)]
+    pub capability_miss_handler: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -490,6 +566,17 @@ pub struct RateLimitBucket {
     pub last_refilled_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// TTL'd operator override refill rate (issue #945); `None` when no
+    /// override refill rate has been declared (an override may set only
+    /// `override_burst`).
+    pub override_refill_rate: Option<f64>,
+    /// TTL'd operator override burst (issue #945); `None` when no override
+    /// burst has been declared.
+    pub override_burst: Option<f64>,
+    /// The override is active (and `override_refill_rate`/`override_burst`
+    /// take precedence, per-field, over the declared baseline) while this is
+    /// set and in the future (issue #945).
+    pub override_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for a rate limit bucket.
@@ -688,6 +775,13 @@ pub struct DeadLetter {
     pub failed_at: DateTime<Utc>,
     pub owner: Option<String>,
     pub severity: Option<String>,
+    /// Denormalized workflow type name (issue #946), mirroring the
+    /// owner/severity precedent so quota accounting never depends on the
+    /// originating execution row still existing.
+    pub workflow_name: Option<String>,
+    /// Denormalized resolved quota key (issue #946). `None` when the
+    /// originating workflow type had no declared `QuotaPolicy`.
+    pub quota_key: Option<String>,
 }
 
 /// Insert struct for moving a failed task to the dead-letter queue.
@@ -704,6 +798,11 @@ pub struct NewDeadLetter<'a> {
     pub attempts: i32,
     pub owner: Option<&'a str>,
     pub severity: Option<&'a str>,
+    /// Denormalized workflow type name (issue #946).
+    pub workflow_name: Option<&'a str>,
+    /// Denormalized resolved quota key (issue #946). `None` when the
+    /// originating workflow type had no declared `QuotaPolicy`.
+    pub quota_key: Option<&'a str>,
 }
 
 // ── ExternalTask ──────────────────────────────────────────────────────────────
@@ -1512,4 +1611,36 @@ pub struct HarvestMutexWaiter {
 pub struct NewHarvestMutexWaiter {
     pub lock_key: String,
     pub waiter_exec_id: Uuid,
+}
+
+/// One durable workflow log line from `harvest_workflow_logs` (issue #790).
+///
+/// Observational only — never part of `harvest_events`, never replayed.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_workflow_logs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestWorkflowLog {
+    pub id: i64,
+    pub workflow_exec_id: Uuid,
+    pub seq: i64,
+    pub level: String,
+    pub message: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Insert struct for one durable workflow log line (issue #790).
+///
+/// `id` (BIGSERIAL) and `occurred_at` (`DEFAULT NOW()`) are omitted so Postgres
+/// fills them. `seq` is supplied by the workflow context and is the
+/// exactly-once dedup key against the partial unique index on
+/// `(workflow_exec_id, seq)`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_workflow_logs)]
+pub struct NewHarvestWorkflowLog {
+    pub workflow_exec_id: Uuid,
+    pub seq: i64,
+    pub level: String,
+    pub message: String,
 }

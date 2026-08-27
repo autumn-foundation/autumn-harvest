@@ -44,6 +44,11 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # Resolved base revision, exported so the issue #794 schema gate can
+      # compare the checked-in artifact against its PREVIOUS revision. This job
+      # is the only one with `fetch-depth: 0`, so it is the only place the base
+      # can be resolved reliably.
+      base_sha: ${{ steps.filter.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +72,7 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
           echo "Comparing ${base}...${head}"
+          echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
           changed="$(git diff --name-only --no-renames "$base" "$head")"
@@ -74,7 +80,14 @@ jobs:
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
           # other path is present, we have code changes and must run the matrix.
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+          #
+          # Carve-out: `docs/workflow-schema-contract.json` is a checked-in
+          # CONTRACT artifact, not prose. The issue #794 schema gate compares it
+          # against the freshly generated contract, so a baseline-only PR must
+          # still run the matrix — otherwise a hand-edited, stale, or malformed
+          # baseline merges with no comparison at all, defeating the gate.
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
+            || echo "$changed" | grep -qxF 'docs/workflow-schema-contract.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -108,12 +121,90 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-plugin (webhooks feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
+      # issue #944. `connectors` alone is the broker-agnostic layer (no broker
+      # client), so it lints without any system dependency. `kafka` needs the
+      # libcurl headers vendored librdkafka's cmake build looks for.
+      - name: Clippy autumn-harvest-plugin (connectors feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
+      - name: Clippy autumn-harvest-plugin (sqs feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Clippy autumn-harvest-plugin (kafka feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
+      # DOCS-ONLY pull requests — which is the change class most likely to break
+      # them, and the one the `test` matrix below skips entirely (every step
+      # there is gated on `changes.outputs.code == 'true'`). The Clippy step
+      # above only *compiles* these tests; it never executes them. So they run
+      # here, in the job that is deliberately ungated.
+      #
+      # Unconditional rather than `if: code == 'false'`: "the guards always run"
+      # is a stronger property than "the guards run when the other place did
+      # not", and does not silently break the day someone edits the matrix's
+      # gating. The duplicate run on code PRs is 7 tests against a
+      # `--no-default-features` build, which is cheap and cached.
+      #
+      # Guarded by `performance_docs::performance_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional.
+      # The filter is quoted because it ends in `::`, and a trailing colon in an
+      # unquoted YAML scalar is a mapping indicator — unquoted, this line makes
+      # the entire workflow file unparseable, so GitHub loads zero jobs and every
+      # run fails instantly. Guarded by
+      # `performance_docs::ci_yaml_plain_scalars_do_not_contain_a_mapping_colon`.
+      - name: Run docs/performance.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
+
+      # Issue #966: same reasoning as the step above, for the R&D report's
+      # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
+      # clauses of the docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits
+      # only the report — deleting inventory rows, staling a count, dropping a
+      # classification — sets `code=false` and skips the entire `test` matrix.
+      # That is precisely the change class these guards exist to catch, so they
+      # run here in the ungated `lint` job.
+      #
+      # Guarded by `sqlite_feasibility_docs::guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted for
+      # the same trailing-`::` YAML reason as above.
+      - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
+
+      # Issue #1202: same reasoning as the two steps above, for
+      # docs/testing/chaos.md's worked local-iteration example. It lives
+      # under `docs/`, so a PR that edits only that page — e.g. dropping the
+      # `chaos_tests::` scope from the `HARVEST_TEST_DATABASE_URL` example,
+      # which risks a chaos test's global TRUNCATE scrub racing a concurrent,
+      # unrelated integration-test module against the same shared database —
+      # sets `code=false` and skips the entire `test` matrix. That is
+      # precisely the change class these guards exist to catch.
+      #
+      # Guarded by `chaos_docs::chaos_docs_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted
+      # for the same trailing-`::` YAML reason as above.
+      - name: Run docs/testing/chaos.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration chaos_docs::"
+
+      # Issue #947: same reasoning as the two steps above, for the Temporal
+      # migration guide's anti-drift guards. A PR that edits only
+      # `docs/migrating-from-temporal.md` -- fixing a stale link, updating a
+      # citation, editing the worked-example prose -- matches the docs-only
+      # filter and skips the entire `test` matrix below, where every step is
+      # gated on `changes.outputs.code`. That is precisely the change class
+      # these guards exist to catch, so they run here in the ungated `lint`
+      # job instead.
+      #
+      # Guarded by
+      # `migrating_from_temporal_docs::guards_run_on_docs_only_changes`, which
+      # fails if this step is removed or becomes conditional. Quoted for the
+      # same trailing-`::` YAML reason as above.
+      - name: Run docs/migrating-from-temporal.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migrating_from_temporal_docs::"
 
   test:
     name: Test (${{ matrix.os }})
@@ -149,6 +240,21 @@ jobs:
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --tests --no-run
+      # Issue #786: the claim/enqueue benchmark shares its harness with the
+      # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
+      # the manifest below). Compile-checking it here keeps the published
+      # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
+      # deliberately NOT run per-PR, since the measurement is minutes-long and
+      # the *gate* is the test, not the report.
+      #
+      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark is
+      # only ever *run* on Linux (see the manifest). The macOS and Windows legs
+      # already compile the same harness module through the `--all-features
+      # --tests --no-run` step above, so restricting this one costs no coverage
+      # and saves two legs' worth of minutes.
+      - name: Compile claim/enqueue benchmark (issue #786)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
@@ -161,6 +267,15 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
+      - name: Run plugin connector tests (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # No CI step ran the plugin's doctests, so a broken `///` example landed
+      # silently (issue #944 review found exactly that). These are compile-only
+      # (`no_run`), so they cost seconds and need no database.
+      - name: Run plugin doctests (issue #944 review)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --doc -p autumn-harvest-plugin --features connectors
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
@@ -170,6 +285,18 @@ jobs:
       - name: Compile plugin metrics scrape example
         if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
+      # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
+      - name: Compile plugin SQS connector example (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
+      # issue #944: the Kafka example is the success metric's measured artifact
+      # (see tests/connector_example_budget.rs), so it must keep compiling.
+      # Linux-only for the same librdkafka reason as the broker suite.
+      - name: Compile plugin Kafka connector example (issue #944, Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+          cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-macros
@@ -185,27 +312,117 @@ jobs:
       - name: Run typed_workflow_failure example tests (issue #767)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
+      - name: Run activity_ctx_info example tests (issue #783)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_ctx_info
       - name: Run activity_interceptor example tests (issue #680)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor
       - name: Run child_with_timeout example tests (issue #779)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example child_with_timeout
+      - name: Run replay_debugger example tests (issue #949)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features debugger --example replay_debugger
       - name: Run long_lived_entity_deadline example tests (issue #772)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
+      # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
+      # would silently truncate the step name at "(issue".
+      - name: "Run temporal_port_subscription_renewal example tests (issue #947)"
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example temporal_port_subscription_renewal
       - name: Run dag_data_flow example tests (issue #702)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow
+      # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
+      # would silently truncate the step name at "(issue".
+      - name: "Run dag_compensation example tests (issue #780)"
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_compensation
       - name: Run interface_schema_workflow example tests (issue #610)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
+      - name: Run entity_phase_transition example tests (issue #803)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
+      - name: Run workflow_logs example tests (issue #790)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example workflow_logs
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
+      - name: Run business_day_escalation example tests (issue #806)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example business_day_escalation
+      # The WASM example is a `main()` that self-asserts the sandbox contract
+      # (echo round-trip, a granted capability, and an ungranted import denied as
+      # SandboxDenied), so RUN it rather than only building it. It needs no
+      # database. Linux-only: it is the one example gated on `wasm-activities`,
+      # which drags in wasmtime — a multi-minute build not worth paying on three
+      # legs, and the macOS/Windows legs never build core examples at all.
+      - name: Run wasm_activity example (issue #965)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
+      # Issue #794: the schema-contract gate, end to end. Generates the
+      # currently-published schemas from the example registry, then diffs them
+      # against the checked-in baseline. This is simultaneously the drift guard
+      # for `docs/workflow-schema-contract.json` and the proof that the
+      # documented CI recipe actually works. No database, no services.
+      #
+      # Linux-only, matching the benchmark bit-rot guard above: schema drift is
+      # a property of the checked-in artifact, not of the OS, so one leg proves
+      # it. The step builds twice (`--features schema` pulls schemars; the CLI
+      # links the whole `harvest` binary), so restricting it saves two legs'
+      # worth of minutes for zero added coverage.
+      - name: "Gate workflow payload-schema changes (issue #794)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+          ARTIFACT: docs/workflow-schema-contract.json
+        run: |
+          set -euo pipefail
+          cargo run --quiet -p autumn-harvest --no-default-features --features schema \
+            --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
+
+          # 1. Is the checked-in artifact current, and is every delta safe?
+          #    --require-current also refuses an unabsorbed COMPATIBLE delta: a
+          #    baseline allowed to lag records what was deployed some time ago
+          #    while this gate reads it as what was deployed last, so a field
+          #    added in one release and removed in the next is invisible even
+          #    though replay of data written in between fails.
+          cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+            schema check --require-current --current "${RUNNER_TEMP}/schema-current.json"
+
+          # 2. Was the ARTIFACT's own change since the base revision recorded?
+          #
+          # Step 1 alone is bypassable: regenerate the artifact by hand in the
+          # same PR and it agrees with the generated contract, so the diff is
+          # empty and a replay-breaking change merges with no justification.
+          # Comparing against the artifact's PREVIOUS revision is the only
+          # signal left, so this is what makes the escape hatch auditable.
+          #
+          # The matrix checkout is shallow, so fetch just the base commit.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            # The base object is unreachable (a force-push, or a transient fetch
+            # failure). Warn rather than block every PR on infrastructure: step 1
+            # still ran, and a reviewer sees the artifact in the diff.
+            echo "::warning::base commit ${BASE_SHA} unavailable — skipped the" \
+                 "acknowledgement check; review artifact changes manually"
+          elif git cat-file -e "${BASE_SHA}:${ARTIFACT}" 2>/dev/null; then
+            git show "${BASE_SHA}:${ARTIFACT}" > "${RUNNER_TEMP}/schema-base.json"
+            cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+              schema check --baseline "${RUNNER_TEMP}/schema-base.json" \
+                           --current "${RUNNER_TEMP}/schema-current.json" \
+                           --acknowledged-in "$ARTIFACT"
+          else
+            echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
+          fi
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
@@ -239,6 +456,18 @@ jobs:
       - name: Run Docker-backed signal/update metric integration tests (issue #684)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
+      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
+      # than a manifest row: it needs the apt install below first, and the
+      # manifest's `compile` mode would try to build vendored librdkafka on the
+      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
+      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
+      # pure Rust and compiles everywhere.)
+      - name: Install librdkafka build deps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run plugin Kafka broker connector tests (issue #944)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds
@@ -288,12 +517,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
-      - name: Build the scaffolded project against published crates.io deps
-        # NO `[patch.crates-io]`: the scaffold pins `autumn-harvest = "0.4"`,
-        # `autumn-harvest-plugin = "0.4"`, `autumn-web = "0.5"`, all resolved
-        # from crates.io — exactly what a real user gets from `harvest new` +
-        # `cargo build`. This is the honest AC-2 guard (published API, not trunk).
-        run: cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml"
+      - name: Build the scaffolded project against the release candidates
+        # Harvest 0.6 is not available on crates.io until this release lands.
+        # Patch only the two workspace crates under test; autumn-web 0.7 still
+        # resolves from crates.io, just as it will for users of `harvest new`.
+        run: |
+          cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
+            --config 'patch.crates-io.autumn-harvest.path="autumn-harvest"' \
+            --config 'patch.crates-io.autumn-harvest-plugin.path="autumn-harvest-plugin"'
       - name: Run the scaffold and assert a workflow reaches COMPLETED
         # Boots the generated app, triggers its workflow, and polls the execution
         # to a terminal state — the literal AC-8 assertion ("generate, build, and

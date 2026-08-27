@@ -1,0 +1,4950 @@
+//! Payload-schema compatibility gate (issue #794).
+//!
+//! These tests are the falsifiable statement of the compatibility ruleset
+//! required by AC-3. Every rule gets: a baseline schema, a current schema, the
+//! expected verdict, and — for every rule that is a *validation* narrowing — an
+//! independent ORACLE check against the engine's own
+//! [`autumn_harvest::info::validate_against_schema`].
+//!
+//! No database, no network: the whole gate is pure `serde_json` analysis.
+
+use autumn_harvest::info::validate_against_schema;
+use autumn_harvest::schema_contract::{
+    AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
+    SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
+};
+use serde_json::{Value, json};
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// A contract holding a single workflow whose `input` schema is `schema`.
+fn input_contract(schema: Value) -> WorkflowSchemaContract {
+    WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "wf".to_string(),
+            description: None,
+            input_schema: Some(schema),
+            output_schema: None,
+            error_schema: None,
+        }],
+    )
+}
+
+/// Diff two `input` schemas for the same workflow.
+fn diff_input(baseline: Value, current: Value) -> SchemaContractDiff {
+    autumn_harvest::schema_contract::diff_schema_contracts(
+        &input_contract(baseline),
+        &input_contract(current),
+    )
+}
+
+/// One branch of an externally-tagged enum, exactly as `schemars` 0.8.22
+/// emits it: the variant name as the single required and single declared
+/// property, under `additionalProperties: false`.
+///
+/// The closure is not decoration — it is the whole disjointness proof. Two
+/// OPEN single-required-field objects both accept `{"A":…,"B":…}` (each
+/// treats the other's key as an undeclared extra), so under `oneOf`'s
+/// exactly-one rule that payload is valid against a one-branch baseline and
+/// rejected once the sibling is added. `adding_a_oneof_branch_keyed_on_an_
+/// open_single_field_object_is_breaking` pins that case.
+fn variant(name: &str, payload: &Value) -> Value {
+    json!({
+        "type": "object",
+        "required": [name],
+        "properties": {name: payload},
+        "additionalProperties": false,
+    })
+}
+
+#[track_caller]
+fn assert_breaking(baseline: Value, current: Value, expect: ChangeKind) {
+    let diff = diff_input(baseline, current);
+    assert!(
+        diff.has_breaking(),
+        "expected a BREAKING delta ({expect:?}) but got: {:#?}",
+        diff.deltas
+    );
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == expect && d.verdict == Verdict::Breaking),
+        "expected a breaking delta of kind {expect:?}, got: {:#?}",
+        diff.deltas
+    );
+}
+
+#[track_caller]
+fn assert_compatible(baseline: Value, current: Value) {
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "expected NO breaking delta, got: {:#?}",
+        diff.deltas
+            .iter()
+            .filter(|d| d.verdict == Verdict::Breaking)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Like [`assert_compatible`], but also pins that the delta was actually
+/// *reported*.
+///
+/// `assert_compatible` alone only says "nothing broke", which stays true if the
+/// rule stops emitting anything at all — so a deleted non-breaking rule is
+/// invisible to it. Naming the expected [`ChangeKind`] makes the compatible
+/// half of the ruleset falsifiable too.
+#[track_caller]
+fn assert_compatible_delta(baseline: Value, current: Value, expect: ChangeKind) {
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "expected NO breaking delta, got: {:#?}",
+        diff.deltas
+            .iter()
+            .filter(|d| d.verdict == Verdict::Breaking)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == expect && d.verdict == Verdict::Compatible),
+        "expected a compatible delta of kind {expect:?}, got: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The single reason string for a diff expected to hold exactly one delta.
+#[track_caller]
+fn sole_reason(baseline: Value, current: Value) -> String {
+    let diff = diff_input(baseline, current);
+    assert_eq!(
+        diff.deltas.len(),
+        1,
+        "expected one delta: {:#?}",
+        diff.deltas
+    );
+    diff.deltas[0].reason.clone()
+}
+
+/// The ORACLE: an instance that is valid under `baseline` and INVALID under
+/// `current` proves the change is objectively breaking, independently of the
+/// differ. Uses the engine's own validator — the same code that gates
+/// `POST /workflows/{name}/start`.
+#[track_caller]
+fn assert_oracle_agrees_breaking(baseline: &Value, current: &Value, recorded: &Value) {
+    assert!(
+        validate_against_schema(baseline, recorded).is_ok(),
+        "oracle fixture is wrong: the recorded instance must be VALID under the baseline schema"
+    );
+    assert!(
+        validate_against_schema(current, recorded).is_err(),
+        "oracle disagrees: the recorded instance still validates under the current schema, so \
+         this change is not a validation narrowing"
+    );
+}
+
+// ── AC-3: the ruleset, rule by rule ─────────────────────────────────────────
+
+#[test]
+fn adding_a_required_property_is_breaking() {
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]});
+    let current = json!({
+        "type":"object",
+        "properties":{"a":{"type":"string"},"b":{"type":"string"}},
+        "required":["a","b"]
+    });
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":"x"}));
+}
+
+#[test]
+fn adding_an_optional_property_is_compatible() {
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}),
+        json!({
+            "type":"object",
+            "properties":{"a":{"type":"string"},"b":{"type":["string","null"]}},
+            "required":["a"]
+        }),
+    );
+}
+
+#[test]
+fn removing_a_property_is_breaking() {
+    // serde tolerates the extra key on read, but the recorded value is silently
+    // DROPPED — and this is also how a rename surfaces (remove + add).
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"]}),
+        json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}),
+        ChangeKind::PropertyRemoved,
+    );
+}
+
+#[test]
+fn renaming_a_property_is_breaking_via_both_halves() {
+    let baseline =
+        json!({"type":"object","properties":{"email":{"type":"string"}},"required":["email"]});
+    let current = json!({
+        "type":"object",
+        "properties":{"email_address":{"type":"string"}},
+        "required":["email_address"]
+    });
+    let diff = diff_input(baseline.clone(), current.clone());
+    assert!(diff.has_breaking());
+    let kinds: Vec<ChangeKind> = diff.deltas.iter().map(|d| d.change).collect();
+    assert!(
+        kinds.contains(&ChangeKind::PropertyRemoved),
+        "the removed half of the rename must be reported: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&ChangeKind::RequiredPropertyAdded),
+        "the added-required half of the rename must be reported: {kinds:?}"
+    );
+    // The added-required half is objectively a validation narrowing.
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"email":"a@b.c"}));
+}
+
+#[test]
+fn making_an_optional_property_required_is_breaking() {
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}}});
+    let current = json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::PropertyBecameRequired,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({}));
+}
+
+#[test]
+fn making_a_required_property_optional_is_compatible() {
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}),
+        json!({"type":"object","properties":{"a":{"type":"string"}}}),
+    );
+}
+
+#[test]
+fn narrowing_a_type_is_breaking() {
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}}});
+    let current = json!({"type":"object","properties":{"a":{"type":"integer"}}});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::TypeNarrowed);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":"x"}));
+}
+
+#[test]
+fn widening_a_type_is_compatible() {
+    // `String` -> `Option<String>` (schemars emits `["string","null"]`).
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"string"}}}),
+        json!({"type":"object","properties":{"a":{"type":["string","null"]}}}),
+    );
+    // `i64` -> `f64`: every recorded integer is a valid number.
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"integer"}}}),
+        json!({"type":"object","properties":{"a":{"type":"number"}}}),
+    );
+}
+
+#[test]
+fn number_to_integer_is_breaking() {
+    let baseline = json!({"type":"object","properties":{"a":{"type":"number"}}});
+    let current = json!({"type":"object","properties":{"a":{"type":"integer"}}});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::TypeNarrowed);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":1.5}));
+}
+
+#[test]
+fn removing_an_enum_variant_is_breaking() {
+    // schemars 0.8 emits a unit-only Rust enum as a top-level `enum` array.
+    let baseline = json!({"type":"string","enum":["A","B","C"]});
+    let current = json!({"type":"string","enum":["A","B"]});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::EnumValueRemoved,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("C"));
+}
+
+#[test]
+fn adding_an_enum_variant_is_compatible() {
+    assert_compatible(
+        json!({"type":"string","enum":["A","B"]}),
+        json!({"type":"string","enum":["A","B","C"]}),
+    );
+}
+
+#[test]
+fn removing_a_data_carrying_enum_variant_is_breaking() {
+    // schemars 0.8 emits a data-carrying Rust enum as `oneOf`, and collapses ALL
+    // unit variants into ONE branch that it emits FIRST — so branches must be
+    // matched by discriminator, never by index.
+    let baseline = json!({"oneOf":[
+        {"type":"string","enum":["C"]},
+        {"type":"object","required":["A"],"properties":{"A":{"type":"integer"}}},
+        {"type":"object","required":["B"],"properties":{"B":{"type":"string"}}}
+    ]});
+    let current = json!({"oneOf":[
+        {"type":"string","enum":["C"]},
+        {"type":"object","required":["A"],"properties":{"A":{"type":"integer"}}}
+    ]});
+    assert_breaking(baseline, current, ChangeKind::VariantRemoved);
+}
+
+#[test]
+fn adding_a_data_carrying_enum_variant_is_compatible_even_when_reordered() {
+    // Adding the first UNIT variant inserts a branch at index 0 and shifts every
+    // existing branch — a positional differ would report a false-positive storm.
+    let baseline = json!({"oneOf":[
+        {"type":"object","required":["A"],"properties":{"A":{"type":"integer"}}}
+    ]});
+    let current = json!({"oneOf":[
+        {"type":"string","enum":["NewUnit"]},
+        {"type":"object","required":["A"],"properties":{"A":{"type":"integer"}}}
+    ]});
+    assert_compatible(baseline, current);
+}
+
+#[test]
+fn narrowing_inside_a_matched_oneof_branch_is_breaking() {
+    let baseline = json!({"oneOf":[
+        {"type":"object","required":["A"],"properties":{"A":{"type":"string"}}}
+    ]});
+    let current = json!({"oneOf":[
+        {"type":"object","required":["A"],"properties":{"A":{"type":"integer"}}}
+    ]});
+    assert_breaking(baseline, current, ChangeKind::TypeNarrowed);
+}
+
+// ── Pre-mortem F2: numeric width lives ONLY in `format` ─────────────────────
+
+#[test]
+fn narrowing_an_integer_width_is_breaking() {
+    // `i64` -> `i32` changes ONLY `format`; `type` stays "integer". Treating
+    // `format` as an ignorable annotation would make this textbook break invisible.
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int64"}}}),
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int32"}}}),
+        ChangeKind::NumericFormatNarrowed,
+    );
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"number","format":"double"}}}),
+        json!({"type":"object","properties":{"a":{"type":"number","format":"float"}}}),
+        ChangeKind::NumericFormatNarrowed,
+    );
+}
+
+#[test]
+fn widening_an_integer_width_is_compatible() {
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int32"}}}),
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int64"}}}),
+    );
+    // unsigned -> wider signed still covers every recorded value
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"uint32"}}}),
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int64"}}}),
+    );
+}
+
+#[test]
+fn signed_to_unsigned_same_width_is_breaking() {
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"int32"}}}),
+        json!({"type":"object","properties":{"a":{"type":"integer","format":"uint32"}}}),
+        ChangeKind::NumericFormatNarrowed,
+    );
+}
+
+/// Superseded assertion, kept as a regression test for the reasoning error.
+///
+/// This used to assert that swapping `uuid` for `date-time` produced NO delta,
+/// justified by "the engine's validator ignores `format` entirely; a string is
+/// a string". The validator does ignore it — but the validator is not what
+/// reads recorded history. `serde` is, and `Uuid`/`DateTime` both reject a
+/// string that does not parse, so the swap drops every recorded value.
+#[test]
+fn swapping_one_semantic_format_for_another_is_breaking_not_an_annotation() {
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"string","format":"uuid"}}}),
+        json!({"type":"object","properties":{"a":{"type":"string","format":"date-time"}}}),
+        ChangeKind::StringFormatNarrowed,
+    );
+}
+
+// ── Bounds, additionalProperties, maps, tuples ──────────────────────────────
+
+#[test]
+fn tightening_a_bound_is_breaking() {
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}}});
+    let current = json!({"type":"object","properties":{"a":{"type":"string","minLength":5}}});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::BoundTightened,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":"ab"}));
+
+    assert_breaking(
+        json!({"type":"integer","minimum":0}),
+        json!({"type":"integer","minimum":10}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+#[test]
+fn relaxing_a_bound_is_compatible() {
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"string","minLength":5}}}),
+        json!({"type":"object","properties":{"a":{"type":"string"}}}),
+    );
+}
+
+#[test]
+fn restricting_additional_properties_is_breaking() {
+    // `#[serde(deny_unknown_fields)]` — every recorded payload carrying a since-
+    // removed key now hard-fails, not silently drops.
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}}});
+    let current =
+        json!({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":false});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::AdditionalPropertiesRestricted,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":"x","legacy":1}));
+}
+
+#[test]
+fn relaxing_additional_properties_is_compatible() {
+    assert_compatible(
+        json!({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":false}),
+        json!({"type":"object","properties":{"a":{"type":"string"}}}),
+    );
+}
+
+#[test]
+fn narrowing_a_map_value_type_is_breaking() {
+    // `HashMap<String, i64>` has no `properties` at all — only
+    // `additionalProperties`. The differ must recurse into it.
+    let baseline = json!({"type":"object","additionalProperties":{"type":"string"}});
+    let current = json!({"type":"object","additionalProperties":{"type":"integer"}});
+    assert_breaking(baseline, current, ChangeKind::TypeNarrowed);
+}
+
+#[test]
+fn narrowing_an_array_item_type_is_breaking() {
+    let baseline = json!({"type":"array","items":{"type":"string"}});
+    let current = json!({"type":"array","items":{"type":"integer"}});
+    assert_breaking(baseline, current, ChangeKind::TypeNarrowed);
+}
+
+#[test]
+fn narrowing_a_tuple_element_type_is_breaking() {
+    // schemars emits a Rust tuple struct as array-form `items`.
+    let baseline = json!({"type":"array","items":[{"type":"string"},{"type":"integer"}],"minItems":2,"maxItems":2});
+    let current = json!({"type":"array","items":[{"type":"integer"},{"type":"integer"}],"minItems":2,"maxItems":2});
+    assert_breaking(baseline, current, ChangeKind::TypeNarrowed);
+}
+
+#[test]
+fn changing_tuple_arity_is_breaking() {
+    assert_breaking(
+        json!({"type":"array","items":[{"type":"string"}],"minItems":1,"maxItems":1}),
+        json!({"type":"array","items":[{"type":"string"},{"type":"integer"}],"minItems":2,"maxItems":2}),
+        ChangeKind::TupleArityChanged,
+    );
+}
+
+// ── $ref resolution + cycle safety ──────────────────────────────────────────
+
+#[test]
+fn narrowing_behind_a_ref_is_breaking() {
+    // A naive top-level diff sees an unchanged `{"$ref":"#/definitions/Inner"}`
+    // on both sides and misses the change inside the definition entirely.
+    let baseline = json!({
+        "type":"object",
+        "properties":{"inner":{"$ref":"#/definitions/Inner"}},
+        "definitions":{"Inner":{"type":"object","properties":{"z":{"type":"string"}}}}
+    });
+    let current = json!({
+        "type":"object",
+        "properties":{"inner":{"$ref":"#/definitions/Inner"}},
+        "definitions":{"Inner":{"type":"object","properties":{"z":{"type":"integer"}}}}
+    });
+    assert_breaking(baseline, current, ChangeKind::TypeNarrowed);
+}
+
+#[test]
+fn a_ref_and_its_inlined_equivalent_are_not_a_false_positive() {
+    let baseline = json!({
+        "type":"object",
+        "properties":{"inner":{"$ref":"#/definitions/Inner"}},
+        "definitions":{"Inner":{"type":"object","properties":{"z":{"type":"string"}}}}
+    });
+    let current = json!({
+        "type":"object",
+        "properties":{"inner":{"type":"object","properties":{"z":{"type":"string"}}}}
+    });
+    assert_compatible(baseline, current);
+}
+
+#[test]
+fn a_recursive_ref_cycle_terminates() {
+    // schemars emits a genuine cycle for a recursive Rust type.
+    let recursive = json!({
+        "type":"object",
+        "properties":{"children":{"type":"array","items":{"$ref":"#/definitions/R"}}},
+        "definitions":{"R":{"type":"object","properties":{
+            "children":{"type":"array","items":{"$ref":"#/definitions/R"}}
+        }}}
+    });
+    let diff = diff_input(recursive.clone(), recursive);
+    assert!(!diff.has_breaking());
+}
+
+#[test]
+fn a_cyclic_ref_still_has_its_sibling_keywords_compared() {
+    // `{"$ref":"#", …}` is a chain that terminates on a CYCLE: resolution lands
+    // back on a node that STILL carries `$ref`. Recursing into it would re-resolve
+    // to the same pair and hit the memo, so the landing node's own keywords would
+    // never be compared — and the memo is what makes the whole diff linear, so it
+    // cannot simply be dropped. The engine's `validate_node` breaks the cycle the
+    // same way and then enforces exactly those siblings, so they must be compared.
+    let baseline = json!({"$ref":"#","type":"string"});
+    let current = json!({"$ref":"#","type":"integer"});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::TypeNarrowed);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("recorded"));
+}
+
+#[test]
+fn a_multi_hop_ref_cycle_has_the_landing_nodes_keywords_compared() {
+    // A -> B -> A: resolution walks two hops and terminates on the second, so the
+    // landing node is `B`, not the node the property pointed at. The changed
+    // constraint lives on `B`.
+    let schema = |ty: &str| {
+        json!({
+            "type":"object",
+            "properties":{"x":{"$ref":"#/definitions/A"}},
+            "definitions":{
+                "A":{"$ref":"#/definitions/B"},
+                "B":{"$ref":"#/definitions/A","type":ty}
+            }
+        })
+    };
+    assert_breaking(
+        schema("string"),
+        schema("integer"),
+        ChangeKind::TypeNarrowed,
+    );
+}
+
+/// Over-firing guard: an unchanged cyclic schema must still be silent.
+#[test]
+fn an_unchanged_cyclic_ref_is_not_reported() {
+    let cyclic = json!({"$ref":"#","type":"string"});
+    let diff = diff_input(cyclic.clone(), cyclic);
+    assert!(
+        diff.deltas.is_empty(),
+        "expected silence: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Over-firing guard: annotation churn inside a cyclic node is still ignored.
+#[test]
+fn annotation_churn_in_a_cyclic_ref_is_not_reported() {
+    let diff = diff_input(
+        json!({"$ref":"#","type":"string","description":"before"}),
+        json!({"$ref":"#","type":"string","description":"after"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "expected silence: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Over-firing guard: comparing the landing node's keywords must not re-walk the
+/// cycle. A recursive type reaches its own definition through `properties`, which
+/// is exactly the path the fall-through now opens up.
+#[test]
+fn comparing_a_cyclic_landing_nodes_keywords_still_terminates() {
+    let recursive = json!({
+        "$ref":"#/definitions/R",
+        "definitions":{"R":{
+            "$ref":"#/definitions/R",
+            "type":"object",
+            "properties":{"child":{"$ref":"#/definitions/R"}}
+        }}
+    });
+    let diff = diff_input(recursive.clone(), recursive);
+    assert!(!diff.has_breaking(), "expected silence: {:#?}", diff.deltas);
+}
+
+#[test]
+fn a_deeply_nested_schema_stops_at_the_depth_cap_rather_than_recursing() {
+    // Just past the differ's cap — deep enough that the cap must engage, and
+    // shallow enough to be safe on every platform's test-thread stack.
+    //
+    // Deliberately NOT a "survives depth 5000" test: a bare `drop(value)` of a
+    // `serde_json::Value` that deep overflows with zero library code on the
+    // stack, so no library can defend against it and asserting otherwise would
+    // be untestable theatre. The externally-reachable bound is the parse test
+    // below; this one pins that the in-process cap fires and *says so*.
+    let mut deep = json!({"type":"string"});
+    for _ in 0..200 {
+        deep = json!({"type":"object","properties":{"n":deep}});
+    }
+    let diff = diff_input(deep.clone(), deep);
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::DiffDepthCapReached),
+        "the depth cap must be reported, never silently truncated: {:#?}",
+        diff.deltas
+    );
+    assert!(
+        diff.has_breaking(),
+        "an uncompared branch must fail closed, not pass"
+    );
+}
+
+#[test]
+fn a_deeply_nested_schema_from_a_file_is_rejected_at_parse_and_never_silently_truncated() {
+    // The externally-reachable path is a *file*, and `serde_json`'s recursive
+    // descent parser enforces its own 128-frame limit — so a hostile contract
+    // file is refused with a clear error long before it can reach the differ.
+    // This is the load-bearing bound for the CLI; the in-process cap above is
+    // defence in depth for an embedder building a `Value` by hand.
+    let mut nested = String::new();
+    for _ in 0..5_000 {
+        nested.push_str(r#"{"type":"object","properties":{"n":"#);
+    }
+    nested.push_str(r#"{"type":"string"}"#);
+    for _ in 0..5_000 {
+        nested.push_str("}}");
+    }
+    let doc = format!(
+        r#"{{"version":"v","contract_version":"1","workflows":[{{"name":"w","input_schema":{nested}}}]}}"#
+    );
+    let err = WorkflowSchemaContract::parse(&doc)
+        .expect_err("a pathologically nested contract must be refused, never truncated");
+    assert!(
+        format!("{err}").contains("recursion"),
+        "the refusal must name the reason: {err}"
+    );
+}
+
+// ── Unanalysed constraint keywords: fail closed ─────────────────────────────
+
+#[test]
+fn adding_an_unanalysed_constraint_is_breaking_fail_closed() {
+    assert_breaking(
+        json!({"type":"object","properties":{"a":{"type":"string"}}}),
+        json!({"type":"object","properties":{"a":{"type":"string","pattern":"^x"}}}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+#[test]
+fn removing_an_unanalysed_constraint_is_also_breaking_fail_closed() {
+    // "Removing a constraint always loosens" is FALSE in JSON Schema: keywords
+    // interact. Dropping a `patternProperties` entry while
+    // `additionalProperties: false` remains TIGHTENS the schema — the keys that
+    // the pattern used to admit become "additional" and are now rejected.
+    // The differ does not model those interactions, so it fails closed in both
+    // directions and lets the author acknowledge.
+    assert_breaking(
+        json!({
+            "type":"object",
+            "patternProperties":{"^x_":{"type":"string"}},
+            "additionalProperties":false
+        }),
+        json!({"type":"object","additionalProperties":false}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+#[test]
+fn schema_containers_are_not_mistaken_for_unanalysed_constraints() {
+    // `definitions`/`$defs` are containers resolved through `$ref`, never
+    // constraints — a definition that is added (or renamed) while every live
+    // `$ref` still resolves must not fail closed.
+    assert_compatible(
+        json!({
+            "type":"object",
+            "properties":{"a":{"$ref":"#/definitions/A"}},
+            "definitions":{"A":{"type":"string"}}
+        }),
+        json!({
+            "type":"object",
+            "properties":{"a":{"$ref":"#/definitions/A"}},
+            "definitions":{"A":{"type":"string"},"Unused":{"type":"integer"}}
+        }),
+    );
+}
+
+// ── Annotation churn must never dirty the gate ──────────────────────────────
+
+#[test]
+fn annotation_only_changes_produce_zero_deltas() {
+    // A doc-comment edit changes schemars' `description`/`title`. It must not
+    // produce a delta, and must not force a baseline regeneration.
+    let diff = diff_input(
+        json!({
+            "$schema":"http://json-schema.org/draft-07/schema#",
+            "title":"OnboardInput","description":"Old prose.",
+            "type":"object",
+            "properties":{"a":{"type":"string","description":"Old field prose."}},
+            "required":["a"]
+        }),
+        json!({
+            "$schema":"http://json-schema.org/draft-07/schema#",
+            "title":"OnboardInput","description":"Brand new prose.",
+            "type":"object",
+            "properties":{"a":{"type":"string","description":"New field prose.","examples":["x"]}},
+            "required":["a"]
+        }),
+    );
+    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
+}
+
+#[test]
+fn documenting_one_unit_enum_variant_is_not_a_catastrophic_false_positive() {
+    // MEASURED with schemars 0.8.22: adding a doc comment to ONE unit variant
+    // flips the whole representation from a flat `enum` array to a REORDERED
+    // `oneOf` of singleton enums. Without normalising the two forms into one, a
+    // pure documentation edit reads as "every enum value removed + two branches
+    // added" — the single loudest false positive available.
+    let diff = diff_input(
+        json!({"type":"string","enum":["A","B"]}),
+        json!({"oneOf":[
+            {"type":"string","enum":["B"]},
+            {"description":"doc on A","type":"string","enum":["A"]}
+        ]}),
+    );
+    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
+}
+
+#[test]
+fn the_two_unit_enum_forms_still_detect_a_removed_variant() {
+    // Normalising the forms must not blind the rule it exists to protect.
+    assert_breaking(
+        json!({"oneOf":[{"type":"string","enum":["A"]},{"type":"string","enum":["B"]}]}),
+        json!({"type":"string","enum":["A"]}),
+        ChangeKind::EnumValueRemoved,
+    );
+}
+
+#[test]
+fn enum_value_reordering_alone_is_not_a_delta() {
+    let diff = diff_input(
+        json!({"type":"string","enum":["A","B","C"]}),
+        json!({"type":"string","enum":["C","A","B"]}),
+    );
+    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
+}
+
+#[test]
+fn wrapping_a_struct_field_in_option_is_compatible_in_both_representations() {
+    // `Option<T>` has TWO schemars representations: `["string","null"]` for a
+    // primitive, and `anyOf:[{$ref},{null}]` for a non-primitive. Both are a
+    // strict widening.
+    assert_compatible(
+        json!({
+            "type":"object",
+            "properties":{"inner":{"$ref":"#/definitions/Inner"}},
+            "required":["inner"],
+            "definitions":{"Inner":{"type":"object","properties":{"z":{"type":"string"}}}}
+        }),
+        json!({
+            "type":"object",
+            "properties":{"inner":{"anyOf":[{"$ref":"#/definitions/Inner"},{"type":"null"}]}},
+            "definitions":{"Inner":{"type":"object","properties":{"z":{"type":"string"}}}}
+        }),
+    );
+}
+
+#[test]
+fn unwrapping_option_on_a_struct_field_is_breaking() {
+    assert_breaking(
+        json!({
+            "type":"object",
+            "properties":{"inner":{"anyOf":[{"$ref":"#/definitions/Inner"},{"type":"null"}]}},
+            "definitions":{"Inner":{"type":"object"}}
+        }),
+        json!({
+            "type":"object",
+            "properties":{"inner":{"$ref":"#/definitions/Inner"}},
+            "required":["inner"],
+            "definitions":{"Inner":{"type":"object"}}
+        }),
+        ChangeKind::PropertyBecameRequired,
+    );
+}
+
+#[test]
+fn constraining_previously_unconstrained_additional_properties_is_breaking() {
+    // The 3-point lattice: absent/true (anything) > schema > false.
+    // `absent -> schema` is a genuine tightening the `false`-toggle rule misses.
+    let baseline = json!({"type":"object","properties":{"a":{"type":"string"}}});
+    let current = json!({
+        "type":"object",
+        "properties":{"a":{"type":"string"}},
+        "additionalProperties":{"type":"integer"}
+    });
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::AdditionalPropertiesRestricted,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a":"x","extra":"str"}));
+}
+
+#[test]
+fn canonicalize_strips_annotations_but_keeps_every_format() {
+    let out = canonicalize_schema(&json!({
+        "$schema":"http://json-schema.org/draft-07/schema#",
+        "title":"T","description":"d","readOnly":true,
+        "type":"integer","format":"int64","minimum":0
+    }));
+    assert_eq!(out, json!({"type":"integer","format":"int64","minimum":0}));
+
+    // A SEMANTIC format is kept too. It used to be stripped as an annotation,
+    // on the reasoning that "the engine's validator ignores `format`, and a
+    // string is a string" — which answers the wrong question. This gate asks
+    // whether recorded JSON still DESERIALIZES, and `format: "uuid"` is
+    // `schemars`' record that the field is a `Uuid`, whose `Deserialize`
+    // rejects a string that is not one. Stripping it made `String -> Uuid`
+    // canonicalize identically on both sides and vanish from the diff.
+    let out2 = canonicalize_schema(&json!({"type":"string","format":"uuid","description":"d"}));
+    assert_eq!(
+        out2,
+        json!({"type":"string","format":"uuid"}),
+        "a semantic `format` names a real parser and must survive canonicalization"
+    );
+}
+
+// ── Workflow-level and schema-level deltas ──────────────────────────────────
+
+#[test]
+fn adding_a_workflow_type_is_compatible() {
+    let baseline = WorkflowSchemaContract::from_entries("0.0.0-test", vec![]);
+    let current = input_contract(json!({"type":"object"}));
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &current);
+    assert!(!diff.has_breaking(), "got: {:#?}", diff.deltas);
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::WorkflowAdded)
+    );
+}
+
+#[test]
+fn removing_a_workflow_type_is_compatible_and_defers_to_reachability() {
+    // Deliberately NOT breaking: `harvest workflow-types reachability` (#520)
+    // already gates handler removal and does it BETTER — it counts actual
+    // non-terminal executions of the type. Double-gating with a weaker signal
+    // would demand an acknowledgement for something #520 already proved safe,
+    // which is pure ack fatigue. The delta is still reported, with a reason that
+    // routes the operator to the accurate tool.
+    let baseline = input_contract(json!({"type":"object"}));
+    let current = WorkflowSchemaContract::from_entries("0.0.0-test", vec![]);
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &current);
+    assert!(!diff.has_breaking(), "got: {:#?}", diff.deltas);
+    let d = diff
+        .deltas
+        .iter()
+        .find(|d| d.change == ChangeKind::WorkflowRemoved)
+        .expect("the removal must still be REPORTED, never silent");
+    assert_eq!(d.verdict, Verdict::Compatible);
+    assert!(
+        d.reason.contains("workflow-types reachability"),
+        "the reason must route the operator to the accurate #520 tool, got: {}",
+        d.reason
+    );
+}
+
+#[test]
+fn publishing_a_schema_for_the_first_time_is_compatible() {
+    let baseline = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "wf".to_string(),
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+    );
+    let current = input_contract(json!({"type":"object","required":["a"]}));
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &current);
+    assert!(!diff.has_breaking(), "got: {:#?}", diff.deltas);
+}
+
+#[test]
+fn unpublishing_a_schema_is_breaking_coverage_regression() {
+    let baseline = input_contract(json!({"type":"object","required":["a"]}));
+    let current = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "wf".to_string(),
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+    );
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &current);
+    assert!(
+        diff.has_breaking(),
+        "deleting `with_schemas` to silence the gate must not be silent"
+    );
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::SchemaRemoved)
+    );
+}
+
+#[test]
+fn every_role_is_diffed_independently() {
+    let base = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "wf".to_string(),
+            description: None,
+            input_schema: Some(json!({"type":"object","properties":{"a":{"type":"string"}}})),
+            output_schema: Some(json!({"type":"object","properties":{"b":{"type":"string"}}})),
+            error_schema: Some(json!({"type":"string"})),
+        }],
+    );
+    let cur = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "wf".to_string(),
+            description: None,
+            input_schema: Some(json!({"type":"object","properties":{"a":{"type":"integer"}}})),
+            output_schema: Some(json!({"type":"object","properties":{"b":{"type":"integer"}}})),
+            error_schema: Some(json!({"type":"integer"})),
+        }],
+    );
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&base, &cur);
+    for role in [SchemaRole::Input, SchemaRole::Output, SchemaRole::Error] {
+        assert!(
+            diff.deltas
+                .iter()
+                .any(|d| d.role == Some(role) && d.verdict == Verdict::Breaking),
+            "role {role:?} must be diffed: {:#?}",
+            diff.deltas
+        );
+    }
+}
+
+// ── AC-1 / AC-4: the artifact and the exit-code contract ────────────────────
+
+#[test]
+fn a_contract_round_trips_through_json() {
+    let c = input_contract(json!({"type":"object","required":["a"]}));
+    let json_text = c.to_json_pretty().expect("serialize");
+    let back = WorkflowSchemaContract::parse(&json_text).expect("parse");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&c, &back);
+    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
+    assert_eq!(back.contract_version, SCHEMA_CONTRACT_VERSION);
+}
+
+#[test]
+fn parse_accepts_a_bare_registered_workflow_array() {
+    // `curl .../workflows/registered` returns a bare array — it must be usable
+    // as `--current` with no post-processing.
+    let body = json!([
+        {"name":"wf","input_schema":{"type":"object"},"output_schema":null,
+         "error_schema":null,"mcp":false}
+    ])
+    .to_string();
+    let c = WorkflowSchemaContract::parse(&body).expect("bare array must parse");
+    assert_eq!(c.workflows.len(), 1);
+    assert_eq!(c.workflows[0].name, "wf");
+    assert!(c.workflows[0].input_schema.is_some());
+}
+
+#[test]
+fn entries_are_sorted_and_deduplicated_last_wins() {
+    // The runtime collapses duplicate workflow names into a HashMap (last wins);
+    // the generator must match or it publishes a schema the runtime won't use.
+    let c = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![
+            WorkflowSchemaEntry {
+                name: "zebra".to_string(),
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            },
+            WorkflowSchemaEntry {
+                name: "apple".to_string(),
+                description: None,
+                input_schema: Some(json!({"type":"string"})),
+                output_schema: None,
+                error_schema: None,
+            },
+            WorkflowSchemaEntry {
+                name: "apple".to_string(),
+                description: None,
+                input_schema: Some(json!({"type":"integer"})),
+                output_schema: None,
+                error_schema: None,
+            },
+        ],
+    );
+    let names: Vec<&str> = c.workflows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, vec!["apple", "zebra"]);
+    assert_eq!(
+        c.workflows[0].input_schema,
+        Some(json!({"type":"integer"})),
+        "last registration must win, mirroring the runtime's HashMap collapse"
+    );
+}
+
+#[test]
+fn generating_the_contract_is_byte_stable() {
+    let a = input_contract(
+        json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"integer"}}}),
+    )
+    .to_json_pretty()
+    .unwrap();
+    let b = input_contract(
+        json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"integer"}}}),
+    )
+    .to_json_pretty()
+    .unwrap();
+    assert_eq!(a, b, "the artifact must be byte-stable or the guard flaps");
+}
+
+// ── AC-5: the auditable escape hatch ────────────────────────────────────────
+
+#[test]
+fn acknowledging_a_breaking_change_records_an_audit_entry() {
+    let baseline =
+        input_contract(json!({"type":"object","properties":{"email":{"type":"string"}}}));
+    let current = input_contract(
+        json!({"type":"object","properties":{"email_address":{"type":"string"}},"required":["email_address"]}),
+    );
+    let updated = baseline
+        .acknowledged_update(
+            &current,
+            "renamed for GDPR; in-flight runs drained via #148 reset",
+            Some("docs/changelog.d/pr-794.md"),
+        )
+        .expect("acknowledging a breaking change must succeed");
+
+    // The new baseline matches current, so the next check is clean...
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&updated, &current);
+    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
+
+    // ...and the acknowledgement is a visible, permanent audit record.
+    assert!(
+        !updated.acknowledged_breaking_changes.is_empty(),
+        "the acknowledgement must be recorded in the artifact, never silent"
+    );
+    let ack = &updated.acknowledged_breaking_changes[0];
+    assert_eq!(ack.workflow, "wf");
+    assert!(ack.reason.contains("GDPR"));
+    assert_eq!(
+        ack.recorded_in.as_deref(),
+        Some("docs/changelog.d/pr-794.md")
+    );
+}
+
+#[test]
+fn updating_a_baseline_without_a_reason_is_refused_when_breaking() {
+    let baseline =
+        input_contract(json!({"type":"object","properties":{"email":{"type":"string"}}}));
+    let current = input_contract(
+        json!({"type":"object","properties":{"email_address":{"type":"string"}},"required":["email_address"]}),
+    );
+    assert!(
+        baseline.acknowledged_update(&current, "   ", None).is_err(),
+        "a blank justification must be refused — an acknowledgement without a reason is a rubber stamp"
+    );
+}
+
+#[test]
+fn a_compatible_update_needs_no_acknowledgement() {
+    let baseline = input_contract(json!({"type":"object","properties":{"a":{"type":"string"}}}));
+    let current = input_contract(
+        json!({"type":"object","properties":{"a":{"type":"string"},"b":{"type":["string","null"]}}}),
+    );
+    let updated = baseline
+        .compatible_update(&current)
+        .expect("a compatible update needs no acknowledgement");
+    assert!(updated.acknowledged_breaking_changes.is_empty());
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&updated, &current);
+    assert!(diff.deltas.is_empty());
+}
+
+#[test]
+fn a_breaking_update_without_acknowledgement_is_refused() {
+    let baseline = input_contract(
+        json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}),
+    );
+    let current = input_contract(
+        json!({"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"]}),
+    );
+    assert!(
+        baseline.compatible_update(&current).is_err(),
+        "regenerating over a breaking delta must require an explicit acknowledgement"
+    );
+}
+
+#[test]
+fn an_acknowledgement_without_a_reason_is_reported_as_breaking() {
+    // A hand-edited artifact must not smuggle in a blank rubber stamp.
+    let mut c = input_contract(json!({"type":"object"}));
+    c.acknowledged_breaking_changes
+        .push(AcknowledgedBreakingChange {
+            workflow: "wf".to_string(),
+            role: Some(SchemaRole::Input),
+            field_path: "/email".to_string(),
+            change: ChangeKind::PropertyRemoved,
+            reason: String::new(),
+            recorded_in: None,
+        });
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&c, &c);
+    assert!(
+        diff.has_breaking(),
+        "a blank acknowledgement reason must fail the gate"
+    );
+}
+
+// ── SUCCESS METRIC: seeded breaking + seeded compatible fixtures ────────────
+
+#[test]
+fn success_metric_seeded_breaking_change_trips_the_gate() {
+    let baseline = WorkflowSchemaContract::parse(SEED_BASELINE).expect("seed parses");
+    let breaking = WorkflowSchemaContract::parse(SEED_BREAKING).expect("seed parses");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &breaking);
+    assert!(
+        diff.has_breaking(),
+        "the seeded breaking fixture MUST trip the gate: {:#?}",
+        diff.deltas
+    );
+    assert_eq!(diff.exit_code(), 1);
+}
+
+#[test]
+fn success_metric_seeded_compatible_change_passes_the_gate() {
+    let baseline = WorkflowSchemaContract::parse(SEED_BASELINE).expect("seed parses");
+    let compatible = WorkflowSchemaContract::parse(SEED_COMPATIBLE).expect("seed parses");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&baseline, &compatible);
+    assert!(
+        !diff.has_breaking(),
+        "the seeded compatible fixture MUST pass the gate: {:#?}",
+        diff.deltas
+    );
+    assert_eq!(diff.exit_code(), 0);
+}
+
+const SEED_BASELINE: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "1",
+  "workflows": [
+    { "name": "onboarding",
+      "input_schema": {
+        "type": "object",
+        "properties": { "user_id": {"type":"integer","format":"int64"},
+                        "email": {"type":"string"} },
+        "required": ["user_id","email"] } }
+  ]
+}"#;
+
+/// `email` renamed to `email_address` — the canonical footgun from the issue.
+const SEED_BREAKING: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "1",
+  "workflows": [
+    { "name": "onboarding",
+      "input_schema": {
+        "type": "object",
+        "properties": { "user_id": {"type":"integer","format":"int64"},
+                        "email_address": {"type":"string"} },
+        "required": ["user_id","email_address"] } }
+  ]
+}"#;
+
+/// A new `Option<String>` field plus a doc-comment edit — both safe on replay.
+const SEED_COMPATIBLE: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "1",
+  "workflows": [
+    { "name": "onboarding",
+      "description": "Now with better prose.",
+      "input_schema": {
+        "title": "OnboardInput",
+        "description": "Edited doc comment.",
+        "type": "object",
+        "properties": { "user_id": {"type":"integer","format":"int64"},
+                        "email": {"type":"string"},
+                        "referral_code": {"type":["string","null"]} },
+        "required": ["user_id","email"] } }
+  ]
+}"#;
+
+// ── AC-1: the checked-in baseline artifact ──────────────────────────────────
+
+const CHECKED_IN_BASELINE: &str = include_str!("../../../docs/workflow-schema-contract.json");
+
+#[test]
+fn the_checked_in_baseline_parses_and_is_self_consistent() {
+    let c = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE)
+        .expect("docs/workflow-schema-contract.json must be a valid schema contract");
+    assert_eq!(c.contract_version, SCHEMA_CONTRACT_VERSION);
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&c, &c);
+    assert!(
+        diff.deltas.is_empty(),
+        "the checked-in baseline must diff cleanly against itself: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The artifact embeds the ruleset, so it is one of the two places the rules
+/// are published (the other is the guide). Nothing else compares it to the
+/// code: `schema check` diffs SCHEMAS, and a ruleset edit produces no delta —
+/// so a new rule could ship while the checked-in artifact kept telling
+/// operators the old one. This is the drift guard for that.
+#[test]
+fn the_checked_in_baseline_documents_the_current_ruleset() {
+    let c = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    assert_eq!(
+        c.compatibility,
+        autumn_harvest::schema_contract::CompatibilityRules::current(),
+        "the checked-in artifact's published ruleset has drifted from the code — regenerate it \
+         with `harvest schema update`"
+    );
+}
+
+/// The parenthesised keyword list the description says is stripped.
+#[track_caller]
+fn described_stripped_keywords(description: &str) -> Vec<&str> {
+    let head = description
+        .split_once("are stripped")
+        .unwrap_or_else(|| panic!("description must name what is stripped: {description}"))
+        .0;
+    let open = head
+        .rfind('(')
+        .expect("stripped list must be parenthesised");
+    let close = head
+        .rfind(')')
+        .expect("stripped list must be parenthesised");
+    head[open + 1..close].split('/').map(str::trim).collect()
+}
+
+/// The prose description must not claim to strip a keyword the differ analyses.
+///
+/// `the_checked_in_baseline_documents_the_current_ruleset` cannot catch this:
+/// it compares the artifact to the code constant, so a hand-written sentence
+/// that has fallen behind the ruleset is stale on *both* sides and matches. The
+/// human-readable half is the part operators actually read when auditing an
+/// acknowledgement, so it is pinned against `ANALYSED_KEYWORDS` directly.
+#[test]
+fn the_baseline_description_never_claims_an_analysed_keyword_is_stripped() {
+    let contract = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    let described = described_stripped_keywords(&contract.description);
+    for keyword in &contract.compatibility.analysed_keywords {
+        assert!(
+            !described.contains(&keyword.as_str()),
+            "the contract description claims `{keyword}` is stripped, but it is an ANALYSED \
+             keyword whose change is reported. Described as stripped: {described:?}"
+        );
+    }
+}
+
+/// …and it must name exactly the annotations that genuinely are stripped.
+///
+/// Guards the trivial "delete the sentence" fix to the test above, and pins the
+/// list against the ruleset rather than against a hand-written copy of it.
+#[test]
+fn the_baseline_description_names_exactly_the_stripped_annotations() {
+    let contract = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    let described = described_stripped_keywords(&contract.description);
+    let expected: Vec<&str> = contract
+        .compatibility
+        .ignored_annotations
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        described, expected,
+        "the description's stripped-keyword list has drifted from the ruleset; it is generated \
+         from ANNOTATION_KEYWORDS, so regenerate the baseline with `harvest schema update`"
+    );
+}
+
+#[test]
+fn every_acknowledgement_in_the_checked_in_baseline_has_a_justification() {
+    let c = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    for ack in &c.acknowledged_breaking_changes {
+        assert!(
+            !ack.reason.trim().is_empty(),
+            "acknowledged breaking change for {} has no recorded justification",
+            ack.workflow
+        );
+    }
+}
+
+#[test]
+fn the_checked_in_baseline_workflows_are_sorted_and_unique() {
+    // Asserted against the RAW json, not against `parse` output: `parse` sorts
+    // and de-duplicates as it reads, so checking its result would assert a
+    // post-condition the parser just established and would pass for a
+    // deliberately unsorted file.
+    let raw: Value = serde_json::from_str(CHECKED_IN_BASELINE).expect("baseline is valid json");
+    let names: Vec<&str> = raw["workflows"]
+        .as_array()
+        .expect("workflows array")
+        .iter()
+        .map(|w| w["name"].as_str().expect("name"))
+        .collect();
+    let mut want = names.clone();
+    want.sort_unstable();
+    want.dedup();
+    assert_eq!(
+        names, want,
+        "the checked-in baseline must be stored sorted and unique — regenerate it"
+    );
+}
+
+#[test]
+fn the_checked_in_baseline_schemas_are_canonicalised() {
+    // Annotation churn must never dirty the file: the stored schemas already
+    // have annotations stripped, so a doc-comment edit is a no-op here.
+    // Against the RAW json for the same reason as the sorting test: `parse`
+    // canonicalises on the way in, so this would be vacuous on its output.
+    let raw: Value = serde_json::from_str(CHECKED_IN_BASELINE).expect("baseline is valid json");
+    for w in raw["workflows"].as_array().expect("workflows array") {
+        let name = w["name"].as_str().unwrap_or("<unnamed>");
+        for role in ["input_schema", "output_schema", "error_schema"] {
+            let Some(stored) = w.get(role).filter(|v| !v.is_null()) else {
+                continue;
+            };
+            assert_eq!(
+                &canonicalize_schema(stored),
+                stored,
+                "workflow `{name}` stores a non-canonical `{role}` — regenerate the baseline"
+            );
+        }
+    }
+}
+
+// ── review hardening: rules that had implementations but no protection ───────
+//
+// Every test below was added after a mutation-testing pass found that deleting
+// or inverting the rule it covers broke no test. Each one is a real rule the
+// artifact documents; several are cases where the differ was outright WRONG.
+
+/// `allOf` is a conjunction, so adding a member narrows the schema — and this
+/// case was a genuine false-COMPATIBLE: `allOf` sits in `ANALYSED_KEYWORDS`
+/// (which exempts it from the fail-closed sweep) while nothing analysed it.
+#[test]
+fn introducing_an_all_of_conjunction_is_breaking() {
+    assert_breaking(
+        json!({"type": "integer"}),
+        json!({"allOf": [{"type": "integer"}, {"minimum": 10}]}),
+        ChangeKind::AllOfMembersChanged,
+    );
+    // The oracle proves the narrowing is real, not merely differ opinion.
+    assert_oracle_agrees_breaking(
+        &json!({"type": "integer"}),
+        &json!({"allOf": [{"type": "integer"}, {"minimum": 10}]}),
+        &json!(1),
+    );
+}
+
+/// A change *inside* an `allOf` member is reported at its own path, not as a
+/// wholesale replacement.
+#[test]
+fn tightening_a_bound_inside_an_all_of_member_is_breaking() {
+    let diff = diff_input(
+        json!({"allOf": [{"type": "integer"}, {"minimum": 1}]}),
+        json!({"allOf": [{"type": "integer"}, {"minimum": 10}]}),
+    );
+    assert!(diff.has_breaking(), "{:#?}", diff.deltas);
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.field_path.contains("allOf[1]")),
+        "the delta should point INTO the changed member: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Removing a conjunct looks like a loosening but is reported: `allOf` members
+/// interact with the parent's `additionalProperties`, which draft-07 does not
+/// let see inside subschemas.
+#[test]
+fn removing_an_all_of_conjunction_is_reported_fail_closed() {
+    assert_breaking(
+        json!({"allOf": [{"type": "integer"}, {"minimum": 10}]}),
+        json!({"type": "integer"}),
+        ChangeKind::AllOfMembersChanged,
+    );
+}
+
+/// The `schemars` `RemoveRefSiblings` shape — a lone `{"allOf":[{"$ref":…}]}`
+/// wrapper, produced merely by adding a doc comment to a struct-typed field —
+/// must be a **no-op**. Without the canonicalisation flatten this is the single
+/// most common false-BREAKING storm: one `///` line would report every nested
+/// field as rewritten.
+#[test]
+fn a_single_member_all_of_ref_wrapper_is_not_a_delta() {
+    let defs = json!({"Inner": {"type": "object", "properties": {"a": {"type": "string"}}}});
+    let plain = json!({
+        "type": "object",
+        "properties": {"inner": {"$ref": "#/definitions/Inner"}},
+        "definitions": defs,
+    });
+    let wrapped = json!({
+        "type": "object",
+        "properties": {"inner": {"allOf": [{"$ref": "#/definitions/Inner"}]}},
+        "definitions": defs,
+    });
+    let diff = diff_input(plain, wrapped);
+    assert!(
+        diff.deltas.is_empty(),
+        "the RemoveRefSiblings wrapper must canonicalise away: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A single-member `allOf` is only lifted when the parent adds nothing of its
+/// own; otherwise the conjunction is real and must still be compared.
+#[test]
+fn a_single_member_all_of_with_a_sibling_constraint_is_not_flattened_away() {
+    assert_breaking(
+        json!({"type": "integer"}),
+        json!({"allOf": [{"minimum": 10}], "type": "integer"}),
+        ChangeKind::AllOfMembersChanged,
+    );
+}
+
+/// `float -> int32` widens on the integer-range lattice but is breaking on the
+/// integrality axis: a recorded `1.5` deserializes into no integer type.
+#[test]
+fn a_fractional_to_integral_numeric_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "number", "format": "float"}),
+        json!({"type": "number", "format": "int32"}),
+        ChangeKind::NumericFormatNarrowed,
+    );
+}
+
+/// A `required` entry with no `properties` counterpart still changes what
+/// recorded JSON must contain.
+#[test]
+fn a_required_key_with_no_properties_entry_is_still_compared() {
+    assert_breaking(
+        json!({"type": "object", "required": ["a"]}),
+        json!({"type": "object", "required": ["a", "b"]}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(
+        &json!({"type": "object", "required": ["a"]}),
+        &json!({"type": "object", "required": ["a", "b"]}),
+        &json!({"a": 1}),
+    );
+}
+
+/// JSON Schema's boolean form: `true` accepts everything, `false` accepts
+/// nothing. The node is not an object, so no keyword comparison applies — but a
+/// change between them is not "no change".
+#[test]
+fn a_non_object_schema_node_change_is_reported_not_skipped() {
+    assert_breaking(
+        json!({"type": "object", "additionalProperties": true, "properties": {"a": true}}),
+        json!({"type": "object", "additionalProperties": true, "properties": {"a": false}}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The delta cap bounds the *report*, never the verdict. A diff whose first
+/// `MAX_DELTAS` entries are compatible must still fail on breaking changes past
+/// the cap — otherwise exit `0` would mean "nothing breaking that fit".
+#[test]
+fn breaking_changes_past_the_delta_cap_still_count_and_mark_truncation() {
+    let n = autumn_harvest::MAX_DELTAS + 50;
+    let mut base = serde_json::Map::new();
+    for i in 0..n {
+        base.insert(format!("f{i}"), json!({"type": "string"}));
+    }
+    // Every property removed => n breaking deltas, far past the cap.
+    let diff = diff_input(
+        json!({"type": "object", "properties": Value::Object(base)}),
+        json!({"type": "object", "properties": {}}),
+    );
+    assert!(diff.truncated, "the report must mark itself incomplete");
+    assert_eq!(
+        diff.deltas.len(),
+        autumn_harvest::MAX_DELTAS,
+        "storage is capped"
+    );
+    assert_eq!(diff.breaking_count, n, "but the TALLY is not capped");
+    assert!(diff.has_breaking());
+    assert_eq!(diff.exit_code(), 1);
+}
+
+// ── the upper-bound / item-count family (previously untested) ────────────────
+
+#[test]
+fn tightening_each_upper_bound_is_breaking() {
+    for (kw, ty, loose, tight, instance) in [
+        ("maximum", "integer", json!(100), json!(10), json!(50)),
+        ("maxLength", "string", json!(100), json!(2), json!("abcdef")),
+    ] {
+        assert_breaking(
+            json!({"type": ty, kw: loose}),
+            json!({"type": ty, kw: tight}),
+            ChangeKind::BoundTightened,
+        );
+        assert_oracle_agrees_breaking(
+            &json!({"type": ty, kw: loose}),
+            &json!({"type": ty, kw: tight}),
+            &instance,
+        );
+    }
+    // maxItems/minItems are analysed by the differ even though the engine's
+    // validator ignores them, so they get no oracle — see the guide's note on
+    // the analysed set being a deliberate superset.
+    assert_breaking(
+        json!({"type": "array", "maxItems": 10}),
+        json!({"type": "array", "maxItems": 2}),
+        ChangeKind::BoundTightened,
+    );
+    assert_breaking(
+        json!({"type": "array", "minItems": 1}),
+        json!({"type": "array", "minItems": 5}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+#[test]
+fn relaxing_each_upper_bound_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "integer", "maximum": 10}),
+        json!({"type": "integer", "maximum": 100}),
+        ChangeKind::BoundRelaxed,
+    );
+    assert_compatible_delta(
+        json!({"type": "array", "maxItems": 2}),
+        json!({"type": "array", "maxItems": 10}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+// ── rules that were implemented but had zero regression protection ───────────
+
+#[test]
+fn constraining_a_previously_unconstrained_type_is_breaking() {
+    assert_breaking(
+        json!({}),
+        json!({"type": "string"}),
+        ChangeKind::TypeNarrowed,
+    );
+    assert_oracle_agrees_breaking(&json!({}), &json!({"type": "string"}), &json!(1));
+}
+
+#[test]
+fn introducing_an_enum_where_the_value_was_unconstrained_is_breaking() {
+    assert_breaking(
+        json!({"type": "string"}),
+        json!({"type": "string", "enum": ["a", "b"]}),
+        // `BoundTightened` is the shared slug for "a constraint appeared where
+        // the value was unconstrained"; the reason names which constraint.
+        ChangeKind::BoundTightened,
+    );
+    assert_oracle_agrees_breaking(
+        &json!({"type": "string"}),
+        &json!({"type": "string", "enum": ["a", "b"]}),
+        &json!("zzz"),
+    );
+}
+
+#[test]
+fn introducing_an_items_restriction_is_breaking() {
+    assert_breaking(
+        json!({"type": "array"}),
+        json!({"type": "array", "items": {"type": "integer"}}),
+        ChangeKind::BoundTightened,
+    );
+    assert_oracle_agrees_breaking(
+        &json!({"type": "array"}),
+        &json!({"type": "array", "items": {"type": "integer"}}),
+        &json!(["a"]),
+    );
+}
+
+#[test]
+fn introducing_a_numeric_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "integer"}),
+        json!({"type": "integer", "format": "int32"}),
+        ChangeKind::NumericFormatNarrowed,
+    );
+}
+
+#[test]
+fn changing_items_between_tuple_and_array_form_is_breaking() {
+    assert_breaking(
+        json!({"type": "array", "items": [{"type": "string"}, {"type": "integer"}]}),
+        json!({"type": "array", "items": {"type": "string"}}),
+        // Form changes are fail-closed rather than analysed: tuple and
+        // single-schema `items` are not comparable member-by-member.
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The fail-closed guard for a `oneOf` container that also carries sibling
+/// constraint keywords the branch-set comparison would silently drop.
+#[test]
+fn a_branch_container_with_sibling_constraints_is_reported() {
+    assert_breaking(
+        json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+        json!({
+            "oneOf": [{"type": "object", "properties": {"a": {"type": "string"}}}],
+            "minProperties": 2,
+        }),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Adding a `oneOf` branch is only safe when nothing recorded can match it.
+/// `oneOf` demands *exactly one* match, so a non-disjoint addition turns a
+/// previously-valid instance into a two-match failure.
+#[test]
+fn adding_a_non_disjoint_one_of_variant_is_breaking() {
+    // The existing branch is a real externally-tagged variant (`{"A": payload}`),
+    // so it keys as discriminated; the ADDED branch carries no tag at all, so it
+    // can overlap and turns a single match into two.
+    let tagged = json!({
+        "type": "object",
+        "required": ["A"],
+        "properties": {"A": {"type": "string"}},
+    });
+    assert_breaking(
+        json!({"oneOf": [tagged]}),
+        json!({"oneOf": [tagged, {"type": "object"}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// Two branches the differ cannot tell apart must fail closed, not collapse.
+///
+/// Branches are matched across revisions BY KEY in a map, so two same-keyed
+/// branches would collapse and one would be silently dropped — hiding a variant
+/// REMOVAL behind a same-keyed survivor and reporting it compatible.
+#[test]
+fn indistinguishable_one_of_branches_fail_closed_rather_than_collapsing() {
+    // Neither branch carries a variant tag, a unit `enum`, or a single-property
+    // external tag, so both key identically.
+    assert_breaking(
+        json!({"oneOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}},
+            {"type": "object", "properties": {"b": {"type": "string"}}},
+        ]}),
+        json!({"oneOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// An ordinary struct with one mandatory field is NOT an externally-tagged
+/// variant, and two of them are not disjoint (`{"id":…,"name":…}` matches both).
+#[test]
+fn a_single_required_field_struct_is_not_treated_as_a_disjoint_variant() {
+    let one = json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": {"id": {"type": "string"}, "note": {"type": "string"}},
+    });
+    let two = json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string"}, "note": {"type": "string"}},
+    });
+    // Adding `two` alongside `one` under `oneOf` can reject `{"id":…,"name":…}`,
+    // which previously matched exactly one branch.
+    let diff = diff_input(json!({"oneOf": [one]}), json!({"oneOf": [one, two]}));
+    assert!(
+        diff.has_breaking(),
+        "adding an overlapping non-variant branch must not be compatible: {:#?}",
+        diff.deltas
+    );
+}
+
+// ── compatible rules, asserted as REPORTED rather than merely "not breaking" ──
+
+#[test]
+fn adding_an_enum_value_is_reported_compatible() {
+    assert_compatible_delta(
+        json!({"type": "string", "enum": ["a"]}),
+        json!({"type": "string", "enum": ["a", "b"]}),
+        ChangeKind::EnumValueAdded,
+    );
+}
+
+#[test]
+fn adding_an_optional_property_is_reported_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}),
+        json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a"],
+        }),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+// ── the remediation guidance IS the feature's user value ─────────────────────
+
+#[test]
+fn a_removed_property_reason_names_the_serde_alias_remedy() {
+    let reason = sole_reason(
+        json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+        json!({"type": "object", "properties": {}}),
+    );
+    assert!(
+        reason.contains("serde(alias"),
+        "a rename is the usual cause; the fix must be named: {reason}"
+    );
+}
+
+#[test]
+fn a_required_property_add_reason_names_the_option_and_default_remedies() {
+    let reason = sole_reason(
+        json!({"type": "object", "properties": {}}),
+        json!({
+            "type": "object",
+            "properties": {"email": {"type": "string"}},
+            "required": ["email"],
+        }),
+    );
+    assert!(reason.contains("Option<T>"), "{reason}");
+    assert!(reason.contains("serde(default)"), "{reason}");
+}
+
+// ── canonicalisation primitives, asserted directly ───────────────────────────
+
+#[test]
+fn canonicalisation_sorts_enum_values() {
+    let out = canonicalize_schema(&json!({"type": "string", "enum": ["c", "a", "b"]}));
+    assert_eq!(
+        out["enum"],
+        json!(["a", "b", "c"]),
+        "sorting is what makes a reordering a non-delta"
+    );
+}
+
+/// The acknowledgement log is an **append-only audit trail**, not a live
+/// suppression list. Regenerating over a second breaking change must never
+/// quietly erase the record of the first — that record is the only permanent
+/// evidence of why an earlier migration was judged safe.
+#[test]
+fn regenerating_a_baseline_carries_prior_acknowledgements_forward() {
+    let v1 = input_contract(json!({"type": "object", "properties": {"a": {"type": "string"}}}));
+    let v2 = input_contract(json!({"type": "object", "properties": {}}));
+    let after_first = v1
+        .acknowledged_update(&v2, "first migration: drained via reset", None)
+        .expect("first acknowledgement");
+    assert_eq!(after_first.acknowledged_breaking_changes.len(), 1);
+
+    // A second, unrelated breaking change.
+    let v3 = input_contract(json!({
+        "type": "object",
+        "properties": {"b": {"type": "string"}},
+        "required": ["b"],
+    }));
+    let after_second = after_first
+        .acknowledged_update(&v3, "second migration: pinned by build routing", None)
+        .expect("second acknowledgement");
+
+    let reasons: Vec<&str> = after_second
+        .acknowledged_breaking_changes
+        .iter()
+        .map(|a| a.reason.as_str())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("first migration")),
+        "the earlier acknowledgement must survive: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("second migration")),
+        "the new acknowledgement must be recorded: {reasons:?}"
+    );
+}
+
+/// Coverage counters are derived, so they must be recomputed on parse rather
+/// than trusted from the file — otherwise a hand-edited artifact could claim
+/// coverage it does not have.
+#[test]
+fn coverage_is_recomputed_on_parse_not_trusted_from_the_file() {
+    let mut raw: Value = serde_json::from_str(
+        &input_contract(json!({"type": "object"}))
+            .to_json_pretty()
+            .expect("serialize"),
+    )
+    .expect("json");
+    // Claim coverage that is not there.
+    raw["coverage"] = json!({
+        "workflows_total": 999,
+        "with_input_schema": 999,
+        "with_output_schema": 999,
+        "with_error_schema": 999,
+    });
+    let parsed = WorkflowSchemaContract::parse(&raw.to_string())
+        .expect("a lying coverage block still parses");
+    assert_eq!(
+        parsed.coverage.workflows_total, 1,
+        "recomputed, not trusted"
+    );
+    assert_eq!(parsed.coverage.with_input_schema, 1);
+    assert_eq!(parsed.coverage.with_output_schema, 0);
+}
+
+/// A schema whose definitions cross-reference must not fan out exponentially.
+///
+/// `visited` is a monotonic memo, not a stack-scoped cycle guard: with the
+/// latter, each of N definitions referencing the previous one is re-expanded
+/// along every path and a few KB of `$ref`s never finishes. This is a
+/// termination test — its value is that it *completes*.
+#[test]
+fn cross_referencing_definitions_do_not_fan_out_exponentially() {
+    const N: usize = 40;
+    let mut defs = serde_json::Map::new();
+    for i in 0..N {
+        // Each level references the next one twice: 2^40 paths without memoing.
+        let next = if i + 1 < N {
+            json!({
+                "type": "object",
+                "properties": {
+                    "l": {"$ref": format!("#/definitions/D{}", i + 1)},
+                    "r": {"$ref": format!("#/definitions/D{}", i + 1)},
+                },
+            })
+        } else {
+            json!({"type": "string"})
+        };
+        defs.insert(format!("D{i}"), next);
+    }
+    let schema = json!({
+        "type": "object",
+        "properties": {"root": {"$ref": "#/definitions/D0"}},
+        "definitions": Value::Object(defs),
+    });
+    // Identical on both sides: the point is that it terminates promptly.
+    let diff = diff_input(schema.clone(), schema);
+    assert!(!diff.has_breaking(), "{:#?}", diff.deltas);
+}
+
+// ── review round: sibling clobber, opaque `$ref`, malformed bounds, version ───
+
+/// A node carrying BOTH `enum` and `oneOf` must keep its `enum`.
+///
+/// `collapse_unit_enum_branches` normalises `schemars`' unit-enum shape
+/// (`{"oneOf":[{"enum":["A"]},{"enum":["B"]}]}`) down to a flat `enum`. If it
+/// ran on a node that ALSO carries its own `enum`, it would overwrite a real
+/// constraint — `validate_against_schema` enforces both — and a later narrowing
+/// of that `enum` would read as a widening, or vanish.
+#[test]
+fn collapsing_unit_enum_branches_never_clobbers_a_sibling_enum() {
+    let with_both = |vals: Value| {
+        json!({
+            "type": "string",
+            "enum": vals,
+            "oneOf": [{"type": "string", "enum": ["x"]}, {"type": "string", "enum": ["y"]}],
+        })
+    };
+    // The sibling `enum` survives canonicalisation verbatim.
+    let canon = canonicalize_schema(&with_both(json!(["a", "b"])));
+    assert_eq!(
+        canon.get("enum"),
+        Some(&json!(["a", "b"])),
+        "the node's own `enum` must not be replaced by the branch values: {canon:#?}"
+    );
+
+    // ...so narrowing it is still caught.
+    assert_breaking(
+        with_both(json!(["a", "b"])),
+        with_both(json!(["a"])),
+        ChangeKind::EnumValueRemoved,
+    );
+}
+
+/// A parent `type` that disagrees with the branches is left alone.
+#[test]
+fn collapsing_unit_enum_branches_leaves_a_contradictory_parent_type_alone() {
+    let schema = json!({
+        "type": "integer",
+        "oneOf": [{"type": "string", "enum": ["x"]}, {"type": "string", "enum": ["y"]}],
+    });
+    let canon = canonicalize_schema(&schema);
+    assert_eq!(
+        canon.get("type"),
+        Some(&json!("integer")),
+        "a contradictory parent `type` must not be rewritten: {canon:#?}"
+    );
+    assert!(
+        canon.get("oneOf").is_some(),
+        "the node should be left intact rather than half-normalised: {canon:#?}"
+    );
+}
+
+/// Swapping one *unresolvable* `$ref` for another must not read as no change.
+///
+/// `$ref` sits in `ANALYSED_KEYWORDS`, which excludes it from
+/// `diff_unanalysed`'s fail-closed sweep — so an external or dangling reference
+/// that the resolver cannot follow would otherwise be compared as an opaque
+/// object whose only differing key is deliberately skipped: a silent PASS on a
+/// wholesale type replacement.
+#[test]
+fn swapping_a_dangling_ref_is_breaking_not_invisible() {
+    assert_breaking(
+        json!({"type": "object", "properties": {"p": {"$ref": "#/definitions/Gone1"}}}),
+        json!({"type": "object", "properties": {"p": {"$ref": "#/definitions/Gone2"}}}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+#[test]
+fn swapping_an_external_ref_is_breaking_not_invisible() {
+    assert_breaking(
+        json!({"$ref": "https://example.com/schemas/A.json"}),
+        json!({"$ref": "https://example.com/schemas/B.json"}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Replacing a concrete schema with an opaque reference is breaking.
+#[test]
+fn replacing_a_concrete_schema_with_an_unresolvable_ref_is_breaking() {
+    assert_breaking(
+        json!({"type": "string"}),
+        json!({"type": "string", "$ref": "https://example.com/schemas/A.json"}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The SAME unresolvable `$ref` on both sides is not a change *at this node*.
+///
+/// Pins the documented limitation: the gate cannot see behind an external
+/// reference, but it also does not manufacture a phantom delta for one.
+#[test]
+fn an_unchanged_external_ref_is_not_reported() {
+    assert_compatible(
+        json!({"$ref": "https://example.com/schemas/A.json"}),
+        json!({"$ref": "https://example.com/schemas/A.json"}),
+    );
+}
+
+/// An unanalysed constraint that *points* at a definition must not hide a
+/// change to that definition.
+///
+/// `diff_unanalysed` compares an untracked keyword's value literally, and
+/// `definitions`/`$defs` are filtered out of that sweep as containers reached
+/// through `$ref`. So `"not": {"$ref": "#/$defs/T"}` stays byte-identical while
+/// `T` is rewritten underneath it — and nothing in the analysed traversal walks
+/// there either, because no analysed keyword references `T`. A recorded `1`
+/// goes from accepted (`not: string`) to rejected (`not: integer`) with the
+/// gate reporting a clean pass.
+///
+/// Changing the constraint *inline* is already breaking; routing the identical
+/// change through one level of indirection must not launder it.
+#[test]
+fn a_definition_reached_only_through_an_unanalysed_constraint_is_followed() {
+    let with_target = |t: Value| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": t},
+        })
+    };
+    assert_breaking(
+        with_target(json!({"type": "string"})),
+        with_target(json!({"type": "integer"})),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The indirection may be several hops deep: the closure is transitive.
+#[test]
+fn a_transitively_referenced_definition_is_followed_through_an_unanalysed_constraint() {
+    let with_target = |t: Value| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/Outer"}}},
+            "$defs": {
+                "Outer": {"type": "object", "properties": {"inner": {"$ref": "#/$defs/Inner"}}},
+                "Inner": t,
+            },
+        })
+    };
+    assert_breaking(
+        with_target(json!({"type": "string"})),
+        with_target(json!({"type": "integer"})),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// A definition that vanishes under an unanalysed constraint fails closed.
+#[test]
+fn a_definition_dropped_under_an_unanalysed_constraint_is_breaking() {
+    assert_breaking(
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string"}},
+        }),
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {},
+        }),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Over-firing guard: an *unchanged* referenced definition stays silent.
+///
+/// Without this, "always flag a constraint that contains a `$ref`" would pass
+/// the tests above while making every schema with a referencing constraint
+/// permanently dirty.
+#[test]
+fn an_unchanged_definition_under_an_unanalysed_constraint_is_not_reported() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+        "$defs": {"T": {"type": "string"}},
+    });
+    assert_compatible(schema.clone(), schema);
+}
+
+/// Over-firing guard: annotation churn inside the referenced definition is not
+/// a change.
+///
+/// Both roots are canonicalised before the diff, so a doc-comment edit on a
+/// definition reached only through an unanalysed constraint must stay invisible
+/// — the same promise the analysed traversal makes.
+#[test]
+fn annotation_churn_in_a_definition_under_an_unanalysed_constraint_is_not_reported() {
+    assert_compatible(
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string", "description": "before"}},
+        }),
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string", "description": "after"}},
+        }),
+    );
+}
+
+/// Over-firing guard: a recursive definition must terminate, not hang.
+#[test]
+fn a_self_referential_definition_under_an_unanalysed_constraint_terminates() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"not": {"$ref": "#/$defs/Node"}}},
+        "$defs": {
+            "Node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/Node"}}},
+        },
+    });
+    assert_compatible(schema.clone(), schema);
+}
+
+/// A bound that is present but not a number must not read as "removed".
+///
+/// `as_f64` collapses `"10"` to `None`, which is indistinguishable from absent
+/// — so a malformed value would be reported `BoundRelaxed`/COMPATIBLE even
+/// though the constraint is still there.
+#[test]
+fn a_malformed_bound_is_breaking_not_reported_as_removed() {
+    let diff = diff_input(
+        json!({"type": "integer", "minimum": 10}),
+        json!({"type": "integer", "minimum": "10"}),
+    );
+    assert!(
+        diff.has_breaking(),
+        "a numeric bound replaced by a non-number must fail closed, got: {:#?}",
+        diff.deltas
+    );
+    assert!(
+        !diff
+            .deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::BoundRelaxed),
+        "a malformed bound must never be reported as a relaxation: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Two *different* malformed bounds must not produce zero deltas.
+#[test]
+fn changing_between_two_malformed_bounds_is_breaking() {
+    assert_breaking(
+        json!({"type": "integer", "minimum": "10"}),
+        json!({"type": "integer", "minimum": "20"}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// An unchanged malformed bound is not a change.
+#[test]
+fn an_unchanged_malformed_bound_is_not_reported() {
+    assert_compatible(
+        json!({"type": "integer", "minimum": "10"}),
+        json!({"type": "integer", "minimum": "10"}),
+    );
+}
+
+/// A `contract_version` this build does not implement is refused.
+///
+/// A future v2 may change what a verdict MEANS. Diffing it silently under v1
+/// rules would hand back confident answers computed from the wrong ruleset —
+/// the one failure mode a compatibility gate must never have.
+#[test]
+fn an_unsupported_contract_version_is_refused_not_silently_diffed() {
+    let mut v: Value = serde_json::from_str(
+        &input_contract(json!({"type": "object"}))
+            .to_json_pretty()
+            .unwrap(),
+    )
+    .unwrap();
+    v["contract_version"] = json!("999");
+    let err = WorkflowSchemaContract::parse(&v.to_string())
+        .expect_err("an unknown contract_version must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("contract_version") && msg.contains("999"),
+        "the refusal must name the offending version: {msg}"
+    );
+    assert!(
+        msg.contains(SCHEMA_CONTRACT_VERSION),
+        "the refusal must name the version this build implements: {msg}"
+    );
+}
+
+/// The current version still parses (the guard is not a blanket refusal).
+#[test]
+fn the_current_contract_version_still_parses() {
+    let json = input_contract(json!({"type": "object"}))
+        .to_json_pretty()
+        .unwrap();
+    WorkflowSchemaContract::parse(&json).expect("the current version must parse");
+}
+
+// ── Codex review: exact bounds, container keyword, anyOf order, truncated ack ─
+
+/// A bound change smaller than `f64::EPSILON` is still a narrowing.
+///
+/// `f64::EPSILON` (~2.2e-16) is machine epsilon **at 1.0**; used as an absolute
+/// tolerance it swallows every smaller change. `minimum: 1e-20` → `2e-20`
+/// rejects values the baseline accepted.
+#[test]
+fn a_sub_epsilon_bound_tightening_is_still_breaking() {
+    assert_breaking(
+        json!({"type": "number", "minimum": 1e-20}),
+        json!({"type": "number", "minimum": 2e-20}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// ...and the relaxation in the same range is still reported.
+#[test]
+fn a_sub_epsilon_bound_relaxation_is_reported_compatible() {
+    assert_compatible_delta(
+        json!({"type": "number", "minimum": 2e-20}),
+        json!({"type": "number", "minimum": 1e-20}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// Distinct integers above 2^53 must not collapse through `f64`.
+///
+/// `f64` has a 53-bit mantissa, so `9007199254740993` and `9007199254740992`
+/// become the same value — a bound on an `i64` field could move with no delta.
+#[test]
+fn a_bound_change_above_the_f64_mantissa_is_not_collapsed() {
+    assert_breaking(
+        json!({"type": "integer", "format": "int64", "minimum": 9_007_199_254_740_992_i64}),
+        json!({"type": "integer", "format": "int64", "minimum": 9_007_199_254_740_993_i64}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// An identical bound is still not a delta (the exact path did not over-report).
+#[test]
+fn an_unchanged_large_integer_bound_is_not_reported() {
+    assert_compatible(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+    );
+}
+
+/// `anyOf` → `oneOf` narrows even when every branch is untouched.
+///
+/// `anyOf` accepts a value matching two or more branches; `oneOf` requires
+/// exactly one. A recorded integer matches both an `integer` and a `number`
+/// branch, so it is accepted under `anyOf` and rejected under `oneOf`.
+#[test]
+fn changing_anyof_to_oneof_is_breaking_even_with_identical_branches() {
+    let branches = json!([{"type": "integer"}, {"type": "number"}]);
+    assert_breaking(
+        json!({"anyOf": branches}),
+        json!({"oneOf": branches}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// `oneOf` → `anyOf` is the widening direction.
+#[test]
+fn changing_oneof_to_anyof_is_reported_compatible() {
+    let branches = json!([{"type": "integer"}, {"type": "number"}]);
+    assert_compatible_delta(
+        json!({"oneOf": branches}),
+        json!({"anyOf": branches}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// A node carrying BOTH keywords is outside what the branch model covers.
+///
+/// `branch_set` selects `oneOf` first, so the `anyOf` sibling is ignored — and
+/// `anyOf` is in the analysed set, so the fail-closed sweep skips it too.
+#[test]
+fn a_node_with_both_oneof_and_anyof_fails_closed_on_change() {
+    assert_breaking(
+        json!({
+            "oneOf": [{"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}}],
+            "anyOf": [{"type": "string"}],
+        }),
+        json!({
+            "oneOf": [{"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}}],
+            "anyOf": [{"type": "integer"}],
+        }),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The guard above compares the two keywords' LITERAL arrays, so an ignored
+/// sibling whose `$ref` target was rewritten slips past it unchanged.
+///
+/// The engine enforces `anyOf` and `oneOf` as independent blocks, so narrowing
+/// the referenced target newly rejects a recorded value that still satisfies the
+/// analysed `oneOf`. Nothing else would see it: `branch_set` traverses `oneOf`
+/// only, `anyOf` is an ANALYSED keyword so the unanalysed sweep skips it, and
+/// `definitions` is excluded from that sweep as "reached through `$ref`".
+#[test]
+fn a_rewritten_ref_target_under_the_ignored_branch_sibling_is_breaking() {
+    let node = json!({
+        "oneOf": [{"type": "string"}],
+        "anyOf": [{"$ref": "#/definitions/T"}],
+    });
+    let with_defs = |t: Value| {
+        let mut s = node.as_object().unwrap().clone();
+        s.insert("definitions".into(), json!({"T": t}));
+        Value::Object(s)
+    };
+    let baseline = with_defs(json!({"type": "string"}));
+    let current = with_defs(json!({"type": "integer"}));
+
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+}
+
+/// The over-firing guard: an UNCHANGED target under the ignored sibling must
+/// stay silent, or every schema carrying both keywords reports a false break.
+#[test]
+fn an_unchanged_ref_target_under_the_ignored_branch_sibling_is_not_reported() {
+    let schema = json!({
+        "oneOf": [{"type": "string"}],
+        "anyOf": [{"$ref": "#/definitions/T"}],
+        "definitions": {"T": {"type": "string"}},
+    });
+    assert_compatible(schema.clone(), schema);
+}
+
+/// Annotation churn inside the referenced target is not a change: both roots are
+/// canonicalised before the diff, so the sweep compares constraints only.
+#[test]
+fn annotation_churn_under_the_ignored_branch_sibling_is_not_reported() {
+    let with_desc = |d: &str| {
+        json!({
+            "oneOf": [{"type": "string"}],
+            "anyOf": [{"$ref": "#/definitions/T"}],
+            "definitions": {"T": {"type": "string", "description": d}},
+        })
+    };
+    assert_compatible(with_desc("before"), with_desc("after"));
+}
+
+/// Reordering `anyOf` branches silently rebinds recorded data.
+///
+/// For `#[serde(untagged)]`, serde binds the FIRST matching variant in
+/// declaration order. Swapping `Int(i64)` and `Float(f64)` means a recorded
+/// integer — which matches both — now deserializes as the float variant. It
+/// still parses; it no longer means the same thing.
+#[test]
+fn reordering_untagged_anyof_variants_is_breaking() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "integer", "format": "int64"},
+            {"type": "number", "format": "double"},
+        ]}),
+        json!({"anyOf": [
+            {"type": "number", "format": "double"},
+            {"type": "integer", "format": "int64"},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `oneOf` requires exactly one match, so order cannot affect binding there.
+#[test]
+fn reordering_oneof_branches_is_not_a_delta() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_compatible(json!({"oneOf": [a, b]}), json!({"oneOf": [b, a]}));
+}
+
+/// Appending an `anyOf` branch is not a reorder — `T` → `Option<T>` appends a
+/// `null` branch and must stay compatible.
+#[test]
+fn appending_an_anyof_branch_is_not_reported_as_a_reorder() {
+    let obj = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    assert_compatible(
+        json!({"anyOf": [obj]}),
+        json!({"anyOf": [obj, {"type": "null"}]}),
+    );
+}
+
+/// A truncated diff cannot be acknowledged.
+///
+/// The artifact promises an audit record for every absorbed breaking delta, but
+/// the stored listing is capped while the rebase takes the whole contract — so
+/// the excess would be absorbed with no record of it.
+#[test]
+fn acknowledging_a_truncated_diff_is_refused() {
+    // One property per workflow, renamed — two breaking deltas each — enough
+    // workflows to push the tally past the cap.
+    let entries = |suffix: &str| {
+        (0..(MAX_DELTAS / 2 + 10))
+            .map(|i| WorkflowSchemaEntry {
+                name: format!("wf{i:05}"),
+                description: None,
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {format!("f{suffix}"): {"type": "string"}},
+                    "required": [format!("f{suffix}")],
+                })),
+                output_schema: None,
+                error_schema: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let base = WorkflowSchemaContract::from_entries("0.0.0-test", entries("a"));
+    let cur = WorkflowSchemaContract::from_entries("0.0.0-test", entries("b"));
+
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&base, &cur);
+    assert!(diff.truncated, "fixture must exceed the delta cap");
+    assert!(
+        diff.breaking_count > diff.deltas.len(),
+        "the tally must exceed the stored listing: {} vs {}",
+        diff.breaking_count,
+        diff.deltas.len()
+    );
+
+    let err = base
+        .acknowledged_update(&cur, "drained", None)
+        .expect_err("a truncated diff must not be acknowledgeable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("truncated"),
+        "the refusal must name truncation as the cause: {msg}"
+    );
+}
+
+// ── Codex review 2: unchanged ambiguous branches, prepended `anyOf` variants ──
+
+/// An UNCHANGED ambiguous branch set must not be reported breaking.
+///
+/// Two multi-field object variants of a `#[serde(untagged)]` enum both key as
+/// `type:object`, so the collision guard fires — on BOTH sides. Reporting that
+/// breaking means the workflow's own baseline can never pass the gate again,
+/// permanently blocking every unrelated change to the repository.
+#[test]
+fn an_unchanged_ambiguous_branch_set_is_not_breaking() {
+    let ambiguous = json!({"anyOf": [
+        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+        {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+    ]});
+    assert_compatible(ambiguous.clone(), ambiguous);
+}
+
+/// The positional fallback still recurses, so a nested change inside an
+/// ambiguous branch is caught rather than waved through.
+#[test]
+fn a_nested_change_inside_an_ambiguous_branch_is_still_detected() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            // `c` narrowed from string to integer — recorded strings no longer read.
+            {"type": "object", "properties": {"c": {"type": "integer"}, "d": {"type": "string"}}},
+        ]}),
+        ChangeKind::TypeNarrowed,
+    );
+}
+
+/// A LENGTH change in an ambiguous set is genuinely unclassifiable: the differ
+/// cannot say which branch was dropped, so it must still fail closed.
+#[test]
+fn an_ambiguous_branch_set_that_changes_length_still_fails_closed() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// For `#[serde(untagged)]`, serde binds the FIRST matching branch. Inserting a
+/// permissive variant AHEAD of an existing one silently rebinds recorded data
+/// to a different branch — e.g. prepending `Float(f64)` before `Int(i64)`
+/// captures every recorded integer.
+#[test]
+fn prepending_an_anyof_variant_ahead_of_an_existing_branch_is_breaking() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "integer", "format": "int64"},
+        ]}),
+        json!({"anyOf": [
+            {"type": "number", "format": "double"},
+            {"type": "integer", "format": "int64"},
+        ]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// A variant inserted between two existing branches is equally a rebind risk
+/// for every branch after it.
+#[test]
+fn inserting_an_anyof_variant_between_existing_branches_is_breaking() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_breaking(
+        json!({"anyOf": [a, b]}),
+        json!({"anyOf": [a, {"type": "object"}, b]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// Appending stays compatible — nothing recorded can rebind to a branch that
+/// sits after every pre-existing one. This is the `T` -> `Option<T>` shape.
+#[test]
+fn appending_an_anyof_variant_after_every_existing_branch_stays_compatible() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_compatible_delta(
+        json!({"anyOf": [a, b]}),
+        json!({"anyOf": [a, b, {"type": "null"}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// `oneOf` demands exactly one match, so branch ORDER cannot rebind anything —
+/// the position rule is `anyOf`-only and must not leak into `oneOf`.
+#[test]
+fn prepending_a_disjoint_oneof_variant_stays_compatible() {
+    let a = variant("A", &json!({"type": "string"}));
+    let b = variant("B", &json!({"type": "string"}));
+    assert_compatible_delta(
+        json!({"oneOf": [a]}),
+        json!({"oneOf": [b, a]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+// ── Codex review 2: the gate must run when only the BASELINE changes ─────────
+
+const CI_YAML: &str = include_str!("../../../.github/workflows/ci.yml");
+
+/// The gate step must exist in CI at all.
+#[test]
+fn ci_runs_the_schema_gate() {
+    assert!(
+        CI_YAML.contains("schema check --require-current --current"),
+        "ci.yml must run `harvest schema check --current` — without it the gate is decorative"
+    );
+}
+
+/// CI must demand a CURRENT baseline, not merely a non-breaking one.
+///
+/// `schema check` alone exits 0 for a compatible delta, so the artifact is free
+/// to lag — and a lagging baseline records what was deployed some time ago while
+/// the gate reads it as what was deployed last. A variant added in one release
+/// and removed in the next then round-trips to the stale baseline with zero
+/// deltas reported, even though replay of data written in between fails.
+#[test]
+fn ci_requires_the_baseline_to_be_current() {
+    // Scan the INVOCATION, not the file: the step carries a comment explaining
+    // the flag, and a bare `contains` would happily pass on that comment while
+    // the command itself had lost it.
+    let invocations: Vec<&str> = CI_YAML
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("schema check"))
+        .collect();
+    assert!(
+        !invocations.is_empty(),
+        "ci.yml must invoke `harvest schema check`"
+    );
+    assert!(
+        invocations.iter().any(|l| l.contains("--require-current")),
+        "the currency check must be on the COMMAND, not just described in a \
+         comment — an unabsorbed compatible delta otherwise leaves the baseline \
+         stale and a later removal becomes invisible: {invocations:?}"
+    );
+}
+
+/// A PR that changes ONLY the checked-in baseline must still run the gate.
+///
+/// The baseline lives under `docs/`, and the matrix is skipped for docs-only
+/// changes — so without an explicit carve-out a hand-edited, stale, or malformed
+/// baseline merges with no comparison against the generated contract, which is
+/// precisely the drift the gate exists to catch.
+#[test]
+fn the_schema_baseline_is_not_classified_as_a_docs_only_change() {
+    let filter = CI_YAML
+        .split("Docs-only =")
+        .nth(1)
+        .expect("ci.yml must document its docs-only classification rule");
+    // Bound the window to the classification block so a mention elsewhere in the
+    // file cannot satisfy this assertion.
+    let block = &filter[..filter.len().min(1200)];
+    assert!(
+        block.contains("docs/workflow-schema-contract.json"),
+        "the docs-only filter must carve out `docs/workflow-schema-contract.json` so a \
+         baseline-only PR still runs the schema gate; block was:\n{block}"
+    );
+}
+
+// ── Codex review 3: a tagged branch is not disjoint from a BROADER sibling ────
+
+/// A tag on the ADDED branch says nothing about the branches already there.
+///
+/// `oneOf` requires EXACTLY one match. Adding the singleton `{"enum":["x"]}`
+/// alongside a broad `{"type":"string"}` makes the recorded value `"x"` match
+/// two branches, so it is rejected — even though the new branch is "tagged".
+#[test]
+fn adding_a_tagged_branch_beside_a_broader_branch_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]}),
+        ChangeKind::VariantAdded,
+    );
+    // …and the oracle agrees: `"x"` reads under the baseline and not after.
+    assert_oracle_agrees_breaking(
+        &json!({"oneOf": [{"type": "string"}]}),
+        &json!({"oneOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]}),
+        &json!("x"),
+    );
+}
+
+/// The all-tagged case stays compatible: every branch of a serde
+/// externally-tagged enum carries a distinct variant key, and serde's
+/// serializer emits exactly one — so a recorded payload matches exactly one
+/// branch no matter how many variants are added.
+#[test]
+fn adding_a_variant_to_an_all_tagged_one_of_stays_compatible() {
+    let a = variant("A", &json!({"type": "string"}));
+    let b = variant("B", &json!({"type": "string"}));
+    let c = variant("C", &json!({"type": "string"}));
+    assert_compatible_delta(
+        json!({"oneOf": [a, b]}),
+        json!({"oneOf": [a, b, c]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// A unit variant mixed with tagged variants is the shape `schemars` emits for
+/// `enum Foo { A, B(i32) }` — still all-discriminated, still compatible.
+#[test]
+fn adding_a_variant_to_a_mixed_unit_and_tagged_one_of_stays_compatible() {
+    let unit = json!({"type": "string", "enum": ["A"]});
+    let tagged = variant("B", &json!({"type": "integer"}));
+    let added = variant("C", &json!({"type": "string"}));
+    assert_compatible_delta(
+        json!({"oneOf": [unit, tagged]}),
+        json!({"oneOf": [unit, tagged, added]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+// ── Codex review 3: the escape hatch must not be bypassable by hand-editing ──
+
+/// Fixtures for the bypass: a workflow whose input field is renamed, which is a
+/// breaking change from the replay-read perspective.
+fn bypass_fixture(field: &str) -> WorkflowSchemaContract {
+    WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "onboarding".to_string(),
+            description: None,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {field: {"type": "string"}},
+                "required": [field],
+            })),
+            output_schema: None,
+            error_schema: None,
+        }],
+    )
+}
+
+/// A hand-edited baseline that silently absorbed a breaking change must be
+/// caught by comparing against the PREVIOUS revision of the artifact.
+///
+/// Regenerating the artifact in the same PR makes the ordinary check trivially
+/// clean — baseline and generated contract agree — so the *only* signal left is
+/// the artifact's own change since the base revision. Without an
+/// acknowledgement covering it, the escape hatch has been bypassed.
+#[test]
+fn a_hand_edited_baseline_absorbing_a_break_is_unacknowledged() {
+    let base_artifact = bypass_fixture("email");
+    // The contributor renamed the field AND overwrote the artifact by hand, so
+    // the head artifact equals the generated contract and no ack was recorded.
+    let head_generated = bypass_fixture("email_address");
+    let head_artifact = bypass_fixture("email_address");
+
+    // The ordinary check is clean — this is exactly why it cannot catch it.
+    assert!(
+        !autumn_harvest::schema_contract::diff_schema_contracts(&head_artifact, &head_generated)
+            .has_breaking(),
+        "the in-PR check is clean by construction; the bypass is invisible to it"
+    );
+
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "the change since base IS breaking");
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        !missing.is_empty(),
+        "a breaking change with no acknowledgement must be reported unacknowledged"
+    );
+}
+
+/// The legitimate path — `schema update --acknowledge` — must pass.
+#[test]
+fn an_acknowledged_baseline_update_covers_its_breaking_deltas() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let head_artifact = base_artifact
+        .acknowledged_update(&head_generated, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        missing.is_empty(),
+        "an acknowledged update must leave nothing unacknowledged: {missing:#?}"
+    );
+}
+
+/// An acknowledgement already present at the base revision was recorded for an
+/// EARLIER change. Reusing it would let the same field break twice with one
+/// record, so only acknowledgements NEW in this revision count.
+#[test]
+fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
+    let plain_base = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&plain_base, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    // Records covering EVERY breaking delta — so the only thing that can make
+    // this unacknowledged is the rule that base-carried records do not count.
+    let stale: Vec<AcknowledgedBreakingChange> = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "an EARLIER, unrelated break".to_string(),
+            recorded_in: Some("#111".to_string()),
+        })
+        .collect();
+    assert!(!stale.is_empty(), "fixture must produce records to carry");
+
+    // Base already carries them; head carries exactly the same list and adds
+    // nothing, so this revision recorded no justification of its own.
+    let mut base_artifact = plain_base;
+    base_artifact.acknowledged_breaking_changes = stale.clone();
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = stale;
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert_eq!(
+        missing.len(),
+        diff.breaking_count,
+        "records carried over from the base revision must cover nothing: {missing:#?}"
+    );
+}
+
+// ── Canonicalisation must not confuse payload keys with annotations ─────────
+
+/// A payload field is not an annotation, however it is spelled.
+///
+/// Annotation stripping is keyed on the KEY NAME, and the recursion treated
+/// every object as a schema — including the `properties` map, whose keys are
+/// arbitrary field names chosen by the payload author. A field literally named
+/// `description` was therefore deleted from both revisions, and a field that
+/// does not exist cannot be seen to change type.
+#[test]
+fn a_payload_field_named_like_an_annotation_survives_canonicalisation() {
+    for name in ["description", "title", "examples", "deprecated", "readOnly"] {
+        let baseline = json!({
+            "type": "object",
+            "properties": { name: {"type": "string"} },
+            "required": [name],
+        });
+        let current = json!({
+            "type": "object",
+            "properties": { name: {"type": "integer"} },
+            "required": [name],
+        });
+
+        let canon = canonicalize_schema(&baseline);
+        assert!(
+            canon["properties"].get(name).is_some(),
+            "the payload field `{name}` must survive canonicalisation: {canon}"
+        );
+
+        let diff = diff_input(baseline, current);
+        assert!(
+            diff.has_breaking(),
+            "narrowing `{name}` from string to integer is breaking: {:#?}",
+            diff.deltas
+        );
+    }
+}
+
+/// The over-firing guard: a real annotation, in the position a real annotation
+/// occupies, is still stripped — otherwise every doc-comment edit is a delta.
+#[test]
+fn a_genuine_annotation_beside_a_schema_keyword_is_still_stripped() {
+    let plain = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+    let documented = json!({
+        "type": "object",
+        "title": "Onboard",
+        "description": "the input",
+        "properties": { "a": {"type": "string", "description": "the field"} },
+    });
+    assert_eq!(
+        canonicalize_schema(&plain),
+        canonicalize_schema(&documented),
+        "annotations in annotation position must still be stripped"
+    );
+    assert!(
+        diff_input(plain, documented).deltas.is_empty(),
+        "documenting a schema must produce no delta"
+    );
+}
+
+/// An object-valued `default` is an INSTANCE, not a schema: its keys are the
+/// payload author's, so stripping annotation names from it rewrites the very
+/// value `diff_serde_default` compares.
+#[test]
+fn an_object_valued_default_keeps_its_payload_keys() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "opts": {
+                "type": "object",
+                "default": {"description": "hello", "retries": 3},
+            }
+        },
+    });
+    let canon = canonicalize_schema(&schema);
+    let default = &canon["properties"]["opts"]["default"];
+    assert_eq!(
+        default,
+        &json!({"description": "hello", "retries": 3}),
+        "a default is instance data and must be preserved verbatim: {canon}"
+    );
+}
+
+/// A definition named after an annotation must not vanish from `$defs`, or the
+/// `$ref` pointing at it resolves to nothing and the subtree stops being compared.
+#[test]
+fn a_definition_named_like_an_annotation_survives_canonicalisation() {
+    let schema = json!({
+        "$defs": { "description": {"type": "string"} },
+        "properties": { "a": {"$ref": "#/$defs/description"} },
+    });
+    let canon = canonicalize_schema(&schema);
+    assert!(
+        canon["$defs"].get("description").is_some(),
+        "a definition key is a name, not an annotation: {canon}"
+    );
+}
+
+/// A record with a blank justification is a rubber stamp, and the contract
+/// refuses one at every authoring path — so it must not buy coverage either.
+///
+/// `diff_schema_contracts` reports a blank reason, but it only ever sees `base`
+/// and `current`; the head artifact is loaded separately by the escape-hatch
+/// mode. Run that mode on its own — without the ordinary check, whose baseline
+/// *is* the head artifact — and nothing had looked at the head records' reasons
+/// before counting them as coverage.
+#[test]
+fn a_blank_reason_record_cannot_cover_a_breaking_change() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    // Hand-written records covering EVERY breaking delta by identity, each with
+    // a whitespace-only reason. Identity is the only thing coverage matched on,
+    // so these would otherwise absorb the whole change.
+    let blank: Vec<AcknowledgedBreakingChange> = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "   ".to_string(),
+            recorded_in: Some("#794".to_string()),
+        })
+        .collect();
+    assert!(
+        !blank.is_empty(),
+        "fixture must produce records to blank out"
+    );
+
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = blank;
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert_eq!(
+        missing.len(),
+        diff.breaking_count,
+        "a blank justification must buy no coverage: {missing:#?}"
+    );
+}
+
+/// The over-firing guard for the check above: a record that DOES justify itself
+/// still covers its delta, so the blank filter cannot reject real records.
+#[test]
+fn a_record_with_a_real_reason_still_covers_its_breaking_change() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    let head_artifact = base_artifact
+        .acknowledged_update(&head_generated, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        missing.is_empty(),
+        "a justified record must still cover its delta: {missing:#?}"
+    );
+}
+
+/// Nothing breaking since base means nothing to acknowledge.
+#[test]
+fn a_compatible_baseline_update_needs_no_acknowledgement() {
+    let base_artifact = bypass_fixture("email");
+    // Widening the field type is compatible.
+    let head_generated = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "onboarding".to_string(),
+            description: None,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {"email": {}},
+                "required": ["email"],
+            })),
+            output_schema: None,
+            error_schema: None,
+        }],
+    );
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(!diff.has_breaking(), "fixture must be compatible");
+    assert!(
+        unacknowledged_breaking(&diff, &base_artifact, &head_generated).is_empty(),
+        "a compatible change needs no acknowledgement"
+    );
+}
+
+// ── Codex review 4: degenerate duplicate branches, audit-log integrity ───────
+
+/// Canonicalisation must not dedupe DUPLICATE `oneOf` singleton branches.
+///
+/// `oneOf` requires exactly one match, so a second identical `{"enum":["x"]}`
+/// branch makes the recorded value `"x"` match twice and be rejected. Merging
+/// the branches into one flat `enum` and deduping the values erases exactly
+/// that difference, so both revisions canonicalise identically.
+#[test]
+fn duplicating_a_one_of_singleton_branch_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string", "enum": ["x"]}]}),
+        json!({"oneOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "string", "enum": ["x"]},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `anyOf` is "at least one", so duplicate branches are genuinely harmless and
+/// must still collapse — otherwise every unit-only enum churns.
+#[test]
+fn duplicating_an_any_of_singleton_branch_stays_compatible() {
+    assert_compatible(
+        json!({"anyOf": [{"type": "string", "enum": ["x"]}]}),
+        json!({"anyOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "string", "enum": ["x"]},
+        ]}),
+    );
+}
+
+/// The ordinary unit-enum collapse — distinct values — is untouched, in both
+/// containers. This is the shape `schemars` emits for a unit-only Rust enum, so
+/// a regression here would churn every such workflow.
+#[test]
+fn distinct_one_of_singleton_branches_still_collapse() {
+    let flat = json!({"type": "string", "enum": ["A", "B"]});
+    for kw in ["oneOf", "anyOf"] {
+        let branched = json!({
+            kw: [{"type": "string", "enum": ["A"]}, {"type": "string", "enum": ["B"]}]
+        });
+        assert_eq!(
+            canonicalize_schema(&branched),
+            canonicalize_schema(&flat),
+            "distinct singleton `{kw}` branches must still normalise to the flat form"
+        );
+    }
+}
+
+/// The acknowledgement log is promised **append-only**. Retargeting an existing
+/// record at a fresh break — editing its workflow/path/change while keeping a
+/// plausible reason — would cover the new delta while erasing the old record,
+/// so the multiset subtraction alone cannot see it.
+#[test]
+fn a_rewritten_acknowledgement_record_is_detected() {
+    let plain_base = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&plain_base, &head_generated);
+
+    // Base carries a record for an unrelated, earlier break.
+    let stale = AcknowledgedBreakingChange {
+        workflow: "some_other_workflow".to_string(),
+        role: Some(SchemaRole::Output),
+        field_path: "/legacy".to_string(),
+        change: ChangeKind::PropertyRemoved,
+        reason: "an EARLIER, unrelated break".to_string(),
+        recorded_in: Some("#111".to_string()),
+    };
+    let mut base_artifact = plain_base;
+    base_artifact.acknowledged_breaking_changes = vec![stale];
+
+    // Head RETARGETS that one record at this PR's break instead of appending.
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "retargeted".to_string(),
+            recorded_in: Some("#111".to_string()),
+        })
+        .collect();
+
+    let dropped = dropped_acknowledgements(&base_artifact, &head_artifact);
+    assert!(
+        !dropped.is_empty(),
+        "a record present at the base revision but absent now must be reported"
+    );
+    assert_eq!(dropped[0].workflow, "some_other_workflow");
+}
+
+/// A legitimate acknowledged update APPENDS, so nothing is ever dropped.
+#[test]
+fn a_legitimate_acknowledged_update_drops_nothing() {
+    let mut base_artifact = bypass_fixture("email");
+    base_artifact
+        .acknowledged_breaking_changes
+        .push(AcknowledgedBreakingChange {
+            workflow: "some_other_workflow".to_string(),
+            role: Some(SchemaRole::Output),
+            field_path: "/legacy".to_string(),
+            change: ChangeKind::PropertyRemoved,
+            reason: "an EARLIER, unrelated break".to_string(),
+            recorded_in: Some("#111".to_string()),
+        });
+    let head_artifact = base_artifact
+        .acknowledged_update(
+            &bypass_fixture("email_address"),
+            "renamed for GDPR",
+            Some("#794"),
+        )
+        .expect("acknowledging must succeed");
+
+    assert!(
+        dropped_acknowledgements(&base_artifact, &head_artifact).is_empty(),
+        "an append-only update must drop nothing"
+    );
+}
+
+// ── Codex review 5: optional tags, untagged rebinding ────────────────────────
+
+/// A tag proves disjointness only when the tag property is REQUIRED.
+///
+/// With an optional `tag` pinned to `"A"`, the empty object `{}` already
+/// validates. Adding a branch whose optional `tag` is pinned to `"B"` makes
+/// `{}` match twice, and `oneOf` requires exactly one — so a recorded `{}` is
+/// rejected. Probed against `schemars` 0.8.22: a real `#[serde(tag = "type")]`
+/// enum emits the discriminant in `required`, so this narrowing cannot make a
+/// genuine internally-tagged enum churn.
+#[test]
+fn adding_a_one_of_branch_with_an_optional_tag_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [
+            {"type": "object", "properties": {"tag": {"enum": ["A"]}}},
+        ]}),
+        json!({"oneOf": [
+            {"type": "object", "properties": {"tag": {"enum": ["A"]}}},
+            {"type": "object", "properties": {"tag": {"enum": ["B"]}}},
+        ]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The shape `schemars` actually emits for `#[serde(tag = "type")]` — the tag
+/// in `required` — must stay compatible, or every internally-tagged enum churns.
+#[test]
+fn adding_a_one_of_branch_with_a_required_tag_is_compatible() {
+    assert_compatible(
+        json!({"oneOf": [
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["A"]}}},
+        ]}),
+        json!({"oneOf": [
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["A"]}}},
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["B"]}}},
+        ]}),
+    );
+}
+
+/// Widening a non-final `anyOf` branch can rebind recorded data.
+///
+/// `anyOf` is `#[serde(untagged)]` and serde binds the FIRST matching variant.
+/// Both branches here are objects, so neither is provably disjoint from the
+/// other; broadening branch 0's `v` to also accept a string lets a recorded
+/// `{"v": "x"}` — which bound to variant B — match branch 0 and bind to
+/// variant A instead. It still deserializes; it no longer means the same thing.
+///
+/// The widening is deliberately INSIDE a property so the branch's identity key
+/// is unchanged: this must fail because of the rebind rule, not because the
+/// branch looked removed-and-re-added.
+#[test]
+fn widening_a_non_final_untagged_branch_is_breaking() {
+    let base = json!({"anyOf": [
+        {"type": "object", "required": ["v"],
+         "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+        {"type": "object", "required": ["w"],
+         "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+    ]});
+    let cur = json!({"anyOf": [
+        {"type": "object", "required": ["v"],
+         "properties": {"v": {"type": ["integer", "string"]}, "note": {"type": "string"}}},
+        {"type": "object", "required": ["w"],
+         "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+    ]});
+    let diff = diff_input(base, cur);
+    assert!(
+        diff.deltas.iter().any(|d| d.verdict == Verdict::Breaking
+            && d.reason
+                .contains("not provably disjoint from a branch declared after it")),
+        "widening a non-final untagged branch can rebind recorded data: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The LAST `anyOf` branch has nothing after it to steal from, so widening it
+/// cannot rebind anything. Same shape as the test above, widening the other
+/// branch — so the two together pin that the guard is position-aware rather
+/// than flagging every untagged widening.
+#[test]
+fn widening_the_final_untagged_branch_is_compatible() {
+    assert_compatible(
+        json!({"anyOf": [
+            {"type": "object", "required": ["v"],
+             "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+            {"type": "object", "required": ["w"],
+             "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "required": ["v"],
+             "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+            {"type": "object", "required": ["w"],
+             "properties": {"w": {"type": ["string", "integer"]}, "note": {"type": "string"}}},
+        ]}),
+    );
+}
+
+/// The single most common widening must NOT regress: `Option<Struct>` is
+/// `anyOf: [{$ref: Struct}, {"type":"null"}]`, so adding an optional field to
+/// `Struct` widens the non-final branch 0 — but `object` and `null` are
+/// provably disjoint, so nothing can rebind. Verified against `schemars`
+/// 0.8.22 output.
+#[test]
+fn widening_an_option_struct_branch_stays_compatible() {
+    let base = json!({
+        "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                   "properties": {"a": {"type": "integer"}}}},
+        "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+    });
+    let cur = json!({
+        "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                   "properties": {"a": {"type": "integer"},
+                                                  "b": {"type": ["string", "null"]}}}},
+        "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+    });
+    let diff = diff_input(base, cur);
+    assert!(
+        !diff.has_breaking(),
+        "adding an optional field behind `Option<T>` must stay compatible: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Adding an OPTIONAL property does not change which instances a branch
+/// matches (the schema already accepted the key), so it must not be reported
+/// as a rebind even on a non-final, non-disjoint branch.
+#[test]
+fn adding_an_optional_property_to_a_non_final_untagged_branch_is_compatible() {
+    assert_compatible(
+        json!({"anyOf": [
+            {"type": "object", "required": ["a"],
+             "properties": {"a": {"type": "integer"}, "tail": {"type": "string"}}},
+            {"type": "object", "required": ["b"],
+             "properties": {"b": {"type": "integer"}, "tail": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "required": ["a"],
+             "properties": {"a": {"type": "integer"}, "tail": {"type": "string"},
+                            "note": {"type": ["string", "null"]}}},
+            {"type": "object", "required": ["b"],
+             "properties": {"b": {"type": "integer"}, "tail": {"type": "string"}}},
+        ]}),
+    );
+}
+
+/// `oneOf` requires exactly one match, so declaration order cannot affect
+/// binding — the rebind guard is `anyOf`-only and must not fire here.
+#[test]
+fn widening_a_non_final_one_of_branch_is_not_a_rebind() {
+    let base = json!({"oneOf": [
+        {"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}},
+        {"type": "string"},
+    ]});
+    let cur = json!({"oneOf": [
+        {"type": "object", "properties": {"a": {"type": "integer"}}},
+        {"type": "string"},
+    ]});
+    let diff = diff_input(base, cur);
+    assert!(
+        !diff.deltas.iter().any(|d| d
+            .reason
+            .contains("not provably disjoint from a branch declared after it")),
+        "the rebind guard is anyOf-only: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The disjointness escape is what keeps the rebind guard from flagging the
+/// most common untagged shape there is.
+///
+/// `Option<Struct>` is `anyOf: [{$ref: Struct}, {"type":"null"}]`, so ANY
+/// change inside `Struct` alters the non-final branch 0. Widening a field's
+/// type genuinely changes what branch 0 matches — but `object` and `null` can
+/// share no instance, so nothing can rebind and the change must stay
+/// compatible. Without the escape this reports breaking, and every widening
+/// behind an `Option<T>` would need an acknowledgement.
+#[test]
+fn widening_a_field_behind_option_struct_stays_compatible() {
+    let with_type = |t: Value| {
+        json!({
+            "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                       "properties": {"a": t}}},
+            "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+        })
+    };
+    let diff = diff_input(
+        with_type(json!({"type": "integer"})),
+        with_type(json!({"type": ["integer", "string"]})),
+    );
+    assert!(
+        !diff.has_breaking(),
+        "`object` and `null` are disjoint, so branch 0 can steal nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+// ── Codex review 7: mixed-precision bounds, closed-branch widening, malformed enum ──
+
+/// A bound moving between a float and an integer that differ only above 2^53.
+///
+/// `cmp_json_numbers` takes its exact `i128` path only when **both** sides are
+/// JSON integers. `9007199254740992.0` is a float (it has a `.`), so the pair
+/// falls back to `f64` — where `9007199254740993` rounds *down* to `2^53` and
+/// compares equal to the baseline. The bound genuinely tightened: a recorded
+/// `9007199254740992` satisfied the old minimum and is rejected by the new one.
+#[test]
+fn a_bound_tightening_across_the_f64_mantissa_is_breaking() {
+    assert_breaking(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_992.0}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// The same collapse in the relaxing direction still has to produce a delta.
+#[test]
+fn a_bound_relaxing_across_the_f64_mantissa_is_reported() {
+    let diff = diff_input(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_992.0}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "a bound that moved must emit a delta, not compare equal through f64: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Ordinary same-representation bounds must keep comparing equal.
+///
+/// Guards the fix from over-firing: making the mixed path exact must not make
+/// an *unchanged* bound look changed just because it is written `10` vs `10.0`.
+#[test]
+fn an_unchanged_bound_written_two_ways_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "number", "minimum": 10}),
+        json!({"type": "number", "minimum": 10.0}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "10 and 10.0 are the same bound: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Adding an *optional* property to a branch that denies unknown properties.
+///
+/// The rebind guard exempts `OptionalPropertyAdded` because a schema that
+/// tolerates extra keys already accepted that payload. That reasoning does not
+/// survive `additionalProperties: false`: branch 0 rejected `{a,b}` before and
+/// accepts it now, so a recorded `{a,b}` that used to bind branch 1 is silently
+/// rebound to branch 0 under serde's first-match `untagged` rule.
+#[test]
+fn adding_an_optional_property_to_a_closed_earlier_branch_is_breaking() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        diff.has_breaking(),
+        "a closed branch that grew an optional property can steal a later \
+         branch's payloads: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The exemption must survive on an OPEN branch — this is the common widening.
+///
+/// Without `additionalProperties: false` the branch already matched `{a,b}`
+/// (the extra key was simply undeclared), so declaring `b` changes nothing
+/// about which payloads validate and must stay compatible.
+#[test]
+fn adding_an_optional_property_to_an_open_earlier_branch_stays_compatible() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"]}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a"]},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"]}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "an open branch already accepted the extra key, so declaring it is a \
+         no-op for matching: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A closed branch in FINAL position has nothing after it to steal from.
+#[test]
+fn adding_an_optional_property_to_a_closed_final_branch_stays_compatible() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false},
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "c": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "the last branch has no later branch to rebind away from: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A malformed `enum` becoming a well-formed one newly constrains the value.
+///
+/// Both revisions carry the key, so neither presence branch fires and the
+/// comparison returns silently. At runtime the malformed baseline imposes no
+/// restriction while the corrected array does, so recorded values outside the
+/// set are newly rejected — the unanalysed sweep's fail-closed posture applied
+/// to a keyword that is nominally analysed.
+#[test]
+fn a_malformed_enum_becoming_an_array_is_breaking() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": "x"}),
+        json!({"type": "string", "enum": ["x"]}),
+    );
+    assert!(
+        diff.has_breaking(),
+        "an unreadable baseline enum constrains nothing; the corrected array \
+         does: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The mirror: a well-formed `enum` degrading into a malformed one.
+///
+/// The differ can no longer tell what the current schema accepts, which is the
+/// definition of unanalysable — fail closed rather than call it a relaxation.
+#[test]
+fn an_enum_becoming_malformed_is_breaking() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": ["x"]}),
+        json!({"type": "string", "enum": "x"}),
+    );
+    assert!(
+        diff.has_breaking(),
+        "an unreadable current enum cannot be certified compatible: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Two malformed enums that are identical are not a change at all.
+#[test]
+fn an_unchanged_malformed_enum_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": "x"}),
+        json!({"type": "string", "enum": "x"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged (if malformed) enum is not an edit: {:#?}",
+        diff.deltas
+    );
+}
+
+// ── Codex review 8: discriminator identity ──────────────────────────────────
+
+/// Two branches can each carry a real discriminator and still overlap when the
+/// tags pin DIFFERENT locations, because one payload can carry both keys.
+///
+/// `branches_provably_disjoint` used to compare the branch *identity strings*
+/// and accept any difference, so `tag:tag="A"` beside `tag:kind="B"` read as
+/// disjoint. Under `oneOf`'s exactly-one rule the recorded
+/// `{"tag":"A","kind":"B"}` — valid against the baseline, whose branch is open
+/// — then matches both branches and is rejected.
+#[test]
+fn adding_a_oneof_branch_tagged_at_a_different_key_is_breaking() {
+    assert_breaking(
+        json!({
+            "oneOf": [
+                {"type": "object", "required": ["tag"],
+                 "properties": {"tag": {"type": "string", "enum": ["A"]}}}
+            ]
+        }),
+        json!({
+            "oneOf": [
+                {"type": "object", "required": ["tag"],
+                 "properties": {"tag": {"type": "string", "enum": ["A"]}}},
+                {"type": "object", "required": ["kind"],
+                 "properties": {"kind": {"type": "string", "enum": ["B"]}}}
+            ]
+        }),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The shape `#[serde(tag = "…")]` actually emits — every branch pinned at the
+/// SAME key — must stay compatible, or the fix above would block every
+/// internally-tagged enum that gains a variant.
+#[test]
+fn adding_a_oneof_branch_tagged_at_the_same_key_stays_compatible() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["kind"],
+               "properties": {"kind": {"type": "string", "enum": [v]}}})
+    };
+    assert_compatible(
+        json!({"oneOf": [branch("A")]}),
+        json!({"oneOf": [branch("A"), branch("B")]}),
+    );
+}
+
+/// A `const` tag proves nothing, because the engine does not enforce `const`.
+///
+/// `validate_node` has no `const` arm at all, so `{"const": "B"}` accepts every
+/// value — the same universal-set problem an unrecognised `type` name has. Two
+/// branches "pinned" to different `const`s therefore both accept a recorded
+/// `{"tag": "A"}`, and `oneOf`'s exactly-one rule rejects it.
+#[test]
+fn adding_a_oneof_branch_tagged_with_const_is_breaking() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}}})
+    };
+    let baseline = json!({"oneOf": [branch("A")]});
+    let current = json!({"oneOf": [branch("A"), branch("B")]});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::VariantAdded);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"tag": "A"}));
+}
+
+/// The engine-enforced spelling of the same shape — a singleton `enum`, which is
+/// what `schemars` emits — must stay compatible, or the fix above would block
+/// every internally-tagged enum that gains a variant.
+#[test]
+fn adding_a_oneof_branch_tagged_with_a_singleton_enum_stays_compatible() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"enum": [v]}}})
+    };
+    assert_compatible(
+        json!({"oneOf": [branch("A")]}),
+        json!({"oneOf": [branch("A"), branch("B")]}),
+    );
+}
+
+/// Refusing `const` as a *proof* must not stop it identifying a branch. An
+/// untouched `const`-tagged `oneOf` still keys each branch by its tag, so
+/// nothing is reported and no branch is mistaken for another.
+#[test]
+fn an_unchanged_const_tagged_oneof_is_not_reported() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}, "n": {"type": "integer"}}})
+    };
+    let schema = json!({"oneOf": [branch("A"), branch("B")]});
+    assert_compatible(schema.clone(), schema);
+}
+
+/// The identity claim, exercised rather than asserted: with the tag keying each
+/// branch, REMOVING one is a clean variant removal. Were `const` dropped from the
+/// key, both branches would key alike as bare objects and the removal would read
+/// as something else — which is why the fix above narrows the *proof* only.
+#[test]
+fn removing_a_const_tagged_oneof_branch_is_reported_as_a_variant_removal() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}, "n": {"type": "integer"}}})
+    };
+    assert_breaking(
+        json!({"oneOf": [branch("A"), branch("B")]}),
+        json!({"oneOf": [branch("A")]}),
+        ChangeKind::VariantRemoved,
+    );
+}
+
+/// An ordinary one-required-field struct is not an externally-tagged variant.
+/// Without `additionalProperties: false` the recorded `{"id":1,"name":"x"}`
+/// satisfies both branches — `name` is merely an undeclared extra on the first.
+#[test]
+fn adding_a_oneof_branch_keyed_on_an_open_single_field_object_is_breaking() {
+    let open = |k: &str| json!({"type": "object", "required": [k], "properties": {k: {}}});
+    assert_breaking(
+        json!({"oneOf": [open("id")]}),
+        json!({"oneOf": [open("id"), open("name")]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The shape `schemars` emits for an externally-tagged enum — one required
+/// property, one declared property, `additionalProperties: false` — keeps its
+/// proof, so adding a variant stays compatible.
+#[test]
+fn adding_a_oneof_branch_keyed_on_a_closed_single_field_object_stays_compatible() {
+    let closed = |k: &str| {
+        json!({"type": "object", "required": [k], "properties": {k: {}},
+               "additionalProperties": false})
+    };
+    assert_compatible(
+        json!({"oneOf": [closed("A")]}),
+        json!({"oneOf": [closed("A"), closed("B")]}),
+    );
+}
+
+/// A `type` name the engine does not enforce falls through `type_matches` to
+/// `_ => true`, so it accepts EVERY value — it is the universal set, and can be
+/// disjoint from nothing. Comparing the declared names as strings says the
+/// opposite, so the disjointness proof must refuse to read it.
+#[test]
+fn adding_a_branch_typed_with_an_unrecognised_name_is_breaking() {
+    let baseline = json!({"oneOf": [{"type": "string"}]});
+    let current = json!({"oneOf": [{"type": "string"}, {"type": "bogus"}]});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::VariantAdded);
+    // The recorded string now matches BOTH branches, and `oneOf` requires
+    // exactly one.
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+}
+
+/// The same hole via a multi-name `type` array: one unreadable name is enough to
+/// make the whole set universal.
+#[test]
+fn adding_a_branch_whose_type_array_contains_an_unrecognised_name_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": ["integer", "bogus"]}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The unreadable name is breaking on EITHER side of the pair, not only when it
+/// is the one being added.
+#[test]
+fn adding_a_branch_beside_an_existing_unrecognised_type_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "bogus"}]}),
+        json!({"oneOf": [{"type": "bogus"}, {"type": "string"}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// Over-firing guard: the proof must still work for recognised names, or every
+/// untagged enum that gains a variant would be blocked.
+#[test]
+fn adding_a_branch_typed_with_a_recognised_name_stays_compatible() {
+    assert_compatible(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+    );
+}
+
+/// Over-firing guard: every recognised name must remain provably disjoint from
+/// every other, so the guard reads as a whitelist rather than a blanket refusal.
+#[test]
+fn every_recognised_type_name_still_proves_disjointness() {
+    let names = ["array", "boolean", "integer", "null", "object", "string"];
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            // `integer` is deliberately widened to cover `number`, so the pair
+            // below is the only one of these that is NOT disjoint; it has its
+            // own coverage elsewhere.
+            assert_compatible(
+                json!({"oneOf": [{"type": a}]}),
+                json!({"oneOf": [{"type": a}, {"type": b}]}),
+            );
+        }
+    }
+}
+
+/// The whitelist is pinned against the ENGINE, not against a copy of itself: a
+/// name the engine stops enforcing must not keep buying a compatible verdict.
+#[test]
+fn the_recognised_type_whitelist_matches_what_the_engine_enforces() {
+    // A value of the WRONG type for `t`: a string for every other name, and a
+    // number for `string` itself.
+    let sample = |t: &str| if t == "string" { json!(1) } else { json!("x") };
+    for t in [
+        "array", "boolean", "integer", "null", "number", "object", "string",
+    ] {
+        assert!(
+            validate_against_schema(&json!({"type": t}), &sample(t)).is_err(),
+            "the differ treats `{t}` as a constraint it can reason about, but the engine \
+             accepted a value of the wrong type for it — the whitelist is stale"
+        );
+    }
+    // And the premise of the fix: an unrecognised name constrains nothing.
+    for v in [
+        json!("x"),
+        json!(1),
+        json!(null),
+        json!({}),
+        json!([]),
+        json!(true),
+    ] {
+        assert!(
+            validate_against_schema(&json!({"type": "bogus"}), &v).is_ok(),
+            "an unrecognised type name must accept every value, which is why it can be \
+             disjoint from nothing"
+        );
+    }
+}
+
+// ── Codex review 9: oneOf overlap from widening an EXISTING branch ───────────
+
+/// `oneOf` requires exactly one match, so widening a branch until it overlaps a
+/// sibling rejects a payload that used to match one branch alone.
+///
+/// The recorded `1` matches only `{"minimum":1}` against the baseline. Relaxing
+/// the other branch to `{"maximum":2}` reads as a compatible bound relaxation
+/// in isolation, but `1` now satisfies both branches and `oneOf` rejects it.
+/// The rebind guard used to return early for anything that was not `anyOf`.
+#[test]
+fn widening_a_oneof_branch_into_a_sibling_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [
+            {"type": "number", "maximum": 0},
+            {"type": "number", "minimum": 1}
+        ]}),
+        json!({"oneOf": [
+            {"type": "number", "maximum": 2},
+            {"type": "number", "minimum": 1}
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Narrowing needs no overlap guard: it cannot create one, and the payloads it
+/// drops are already reported by the narrowing itself. Reporting a second
+/// verdict here would just be noise on an already-breaking change.
+#[test]
+fn narrowing_a_oneof_branch_reports_only_the_narrowing() {
+    let diff = diff_input(
+        json!({"oneOf": [
+            {"type": "number", "maximum": 5},
+            {"type": "number", "minimum": 10}
+        ]}),
+        json!({"oneOf": [
+            {"type": "number", "maximum": 1},
+            {"type": "number", "minimum": 10}
+        ]}),
+    );
+    assert!(diff.has_breaking(), "a narrowing is breaking on its own");
+    assert!(
+        !diff.deltas.iter().any(|d| {
+            d.change == ChangeKind::UnanalysedConstraintChanged && d.verdict == Verdict::Breaking
+        }),
+        "narrowing must not also raise an overlap verdict: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The shape that matters most: widening a branch of a real internally-tagged
+/// enum. Every branch is pinned at the same key, so no widening of one can ever
+/// make it match a payload tagged for another — this must stay compatible or
+/// the guard blocks routine field additions on every tagged enum.
+#[test]
+fn widening_a_provably_disjoint_oneof_branch_stays_compatible() {
+    let branch = |v: &str, extra: Value| {
+        json!({"type": "object", "required": ["kind"],
+               "properties": {"kind": {"type": "string", "enum": [v]}, "n": extra}})
+    };
+    assert_compatible(
+        json!({"oneOf": [branch("A", json!({"maximum": 0})), branch("B", json!({}))]}),
+        json!({"oneOf": [branch("A", json!({"maximum": 9})), branch("B", json!({}))]}),
+    );
+}
+
+/// A single-branch `oneOf` has no sibling to overlap with, so widening it is
+/// judged purely on its own merits.
+#[test]
+fn widening_the_only_oneof_branch_stays_compatible() {
+    assert_compatible(
+        json!({"oneOf": [{"type": "number", "maximum": 0}]}),
+        json!({"oneOf": [{"type": "number", "maximum": 9}]}),
+    );
+}
+
+// ── Codex review 9: malformed `additionalProperties` ────────────────────────
+
+/// A value that is neither a boolean nor an object is not a schema, and a
+/// validator ignores it — so the baseline accepted arbitrary extras. Correcting
+/// it to a real schema restricts them.
+///
+/// Both revisions used to rank as "a schema", so the lattice comparison emitted
+/// nothing while every recorded non-string extra became invalid.
+#[test]
+fn correcting_a_malformed_additional_properties_to_a_schema_is_breaking() {
+    assert_breaking(
+        json!({"type": "object", "additionalProperties": "oops"}),
+        json!({"type": "object", "additionalProperties": {"type": "string"}}),
+        ChangeKind::AdditionalPropertiesRestricted,
+    );
+}
+
+/// The reverse direction genuinely relaxes: a real schema constrained extras,
+/// and a value the validator ignores does not.
+#[test]
+fn replacing_an_additional_properties_schema_with_a_malformed_value_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": {"type": "string"}}),
+        json!({"type": "object", "additionalProperties": 7}),
+        ChangeKind::AdditionalPropertiesRelaxed,
+    );
+}
+
+/// Two different malformed values are both ignored at runtime, so nothing about
+/// what validates changed and the gate must stay quiet — otherwise the fix
+/// above would fire on cosmetic edits to an already-broken schema.
+#[test]
+fn editing_one_malformed_additional_properties_into_another_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "object", "additionalProperties": "oops"}),
+        json!({"type": "object", "additionalProperties": ["also", "wrong"]}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "neither value constrains anything: {:#?}",
+        diff.deltas
+    );
+}
+
+/// `deny_unknown_fields` on top of a malformed value is still a restriction,
+/// and a real schema is still stricter than nothing.
+#[test]
+fn a_malformed_additional_properties_still_outranks_false() {
+    assert_breaking(
+        json!({"type": "object", "additionalProperties": "oops"}),
+        json!({"type": "object", "additionalProperties": false}),
+        ChangeKind::AdditionalPropertiesRestricted,
+    );
+}
+
+// ── Codex review 9: serde's `default` is not an annotation ──────────────────
+
+/// `default` survives canonicalization because it is only an annotation to a
+/// *validator*. To serde it is the value substituted for an omitted key, so
+/// stripping it hid every change of meaning it can cause.
+#[test]
+fn canonicalize_keeps_default_because_serde_consults_it() {
+    let out = canonicalize_schema(&json!({"type": "integer", "default": 3, "title": "T"}));
+    assert_eq!(out, json!({"type": "integer", "default": 3}));
+}
+
+/// The headline case: `#[serde(default = "retries")]` returning `3` becomes
+/// `5`. Recorded JSON that omitted `retries` still deserializes, but the
+/// workflow now observes a different number — and both revisions used to have
+/// the key stripped before comparison, so the diff was empty.
+#[test]
+fn changing_the_default_of_an_optional_property_is_breaking() {
+    let schema = |d: i64| {
+        json!({"type": "object", "required": ["plain"], "properties": {
+            "plain": {"type": "integer"},
+            "retries": {"type": "integer", "default": d}
+        }})
+    };
+    assert_breaking(schema(3), schema(5), ChangeKind::DefaultChanged);
+}
+
+/// Adding a default where there was none also changes what an omitted key
+/// means — `Option<T>` yielding `None` becomes the fallback value.
+#[test]
+fn adding_a_default_to_an_optional_property_is_breaking() {
+    assert_breaking(
+        json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+        json!({"type": "object", "properties": {"n": {"type": "integer", "default": 7}}}),
+        ChangeKind::DefaultChanged,
+    );
+}
+
+/// A default beside a REQUIRED key is dead — no recorded payload omitted it, so
+/// serde never substitutes it. Flagging it would block documentation edits on
+/// every required field.
+#[test]
+fn changing_the_default_of_a_required_property_emits_nothing() {
+    let schema = |d: i64| {
+        json!({"type": "object", "required": ["n"],
+               "properties": {"n": {"type": "integer", "default": d}}})
+    };
+    let diff = diff_input(schema(3), schema(5));
+    assert!(
+        diff.deltas.is_empty(),
+        "a default on a required key is never consulted: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A key that only just became optional was REQUIRED when the recorded payloads
+/// were written, so none of them omitted it and the newly-live default cannot
+/// change what any of them means.
+#[test]
+fn a_default_appearing_as_a_property_becomes_optional_is_not_a_default_change() {
+    let diff = diff_input(
+        json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}}),
+        json!({"type": "object", "properties": {"n": {"type": "integer", "default": 7}}}),
+    );
+    assert!(
+        !diff
+            .deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::DefaultChanged),
+        "no recorded payload omitted a then-required key: {:#?}",
+        diff.deltas
+    );
+    assert!(!diff.has_breaking(), "got: {:#?}", diff.deltas);
+}
+
+/// A `default` outside a property — on the root, or on an array's item schema —
+/// is never substituted for anything, so it must stay silent. This is what
+/// keeps the un-stripping from turning every cosmetic edit into a verdict.
+#[test]
+fn changing_a_root_level_default_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "integer", "default": 1}),
+        json!({"type": "integer", "default": 2}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "a root default is never substituted: {:#?}",
+        diff.deltas
+    );
+}
+
+// ── Codex review 8: declaring a key the baseline typed as an extra ──────────
+
+/// Serde IGNORES an undeclared key but PARSES a declared one, so declaring a
+/// key whose recorded values cannot satisfy the new type breaks replay.
+///
+/// This is only provable when the baseline said what an extra had to be. Here
+/// it declared extras as integers and the new property is a string, so every
+/// recorded `b` fails.
+#[test]
+fn declaring_a_property_disjoint_from_the_baselines_extras_is_breaking() {
+    assert_breaking(
+        json!({"type": "object", "properties": {"a": {"type": "string"}},
+               "additionalProperties": {"type": "integer"}}),
+        json!({"type": "object",
+               "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+               "additionalProperties": {"type": "integer"}}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
+/// The same site, with an *unreadable* extras type — and the reason the
+/// recognised-name restriction is applied to the compatible-proving direction
+/// ONLY, not inside `type_sets_disjoint` itself.
+///
+/// A baseline `additionalProperties: {"type":"bogus"}` accepts extras of every
+/// type, so a recorded `{"a":"x","b":1}` is valid. Declaring `b` as a string
+/// therefore breaks it. Refusing the disjointness proof here — the way the
+/// compatible-proving direction must — would report this compatible and LOSE a
+/// true break.
+#[test]
+fn declaring_a_property_over_unreadable_baseline_extras_is_still_breaking() {
+    let baseline = json!({"type": "object", "properties": {"a": {"type": "string"}},
+                          "additionalProperties": {"type": "bogus"}});
+    let current = json!({"type": "object",
+                         "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                         "additionalProperties": {"type": "bogus"}});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a": "x", "b": 1}));
+}
+
+/// Overlap is not enough: the new property must admit EVERY value the baseline
+/// allowed as an extra. Extras typed `["string","integer"]` share `string` with
+/// a new `b: Option<String>`, but a recorded `b: 1` passed the extras schema and
+/// is now parsed against `b` and rejected.
+#[test]
+fn declaring_a_property_narrower_than_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": ["string", "integer"]});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object", "properties": {"b": {"type": "string"}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": 1}));
+}
+
+/// Over-firing guard: a new property WIDER than the baseline's extras admits
+/// every recorded value, so it stays compatible.
+#[test]
+fn declaring_a_property_wider_than_the_baselines_extras_stays_compatible() {
+    let baseline = json!({"type": "object", "additionalProperties": {"type": "string"}});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": ["string", "integer"]}},
+                         "additionalProperties": {"type": "string"}});
+    assert_compatible_delta(baseline, current, ChangeKind::OptionalPropertyAdded);
+}
+
+/// Over-firing guard: an unconstrained new property admits everything, so it
+/// stays compatible however the baseline typed its extras.
+#[test]
+fn declaring_an_unconstrained_property_over_typed_extras_stays_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": {"type": "integer"}}),
+        json!({"type": "object", "properties": {"b": {}},
+               "additionalProperties": {"type": "integer"}}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Extras with no readable `type` admitted every type, so containment cannot be
+/// proved and the declaration fails closed.
+#[test]
+fn declaring_a_property_over_untyped_baseline_extras_is_breaking() {
+    let extras = json!({"minLength": 3});
+    assert_breaking(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object", "properties": {"b": {"type": "string"}},
+               "additionalProperties": extras}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
+/// When the new property's type OVERLAPS what the baseline allowed for extras,
+/// every recorded value still parses, so the addition stays compatible.
+#[test]
+fn declaring_a_property_compatible_with_the_baselines_extras_stays_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": {"type": "integer"}}),
+        json!({"type": "object", "properties": {"b": {"type": "integer"}},
+               "additionalProperties": {"type": "integer"}}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// The ordinary case must stay compatible or the gate blocks every schema
+/// evolution: an open object says nothing about what an extra had to look like,
+/// so nothing is provable and the issue's own acceptance criterion — adding an
+/// optional field is compatible — governs. `docs/workflow-schema-contract-
+/// guide.md` documents the residual and the `deny_unknown_fields` mitigation.
+#[test]
+fn declaring_a_property_on_a_fully_open_object_stays_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+        json!({"type": "object",
+               "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Containing the extras' TYPE is not containing the extras. A declared property
+/// may carry any other constraint keyword, and every one of them narrows further
+/// than the type alone.
+#[test]
+fn declaring_a_property_that_adds_an_enum_over_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": "string"});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "enum": ["x"]}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "y"}));
+}
+
+/// The same hole through a bound rather than an `enum`.
+#[test]
+fn declaring_a_property_that_adds_a_bound_over_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": "string"});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "minLength": 3}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "xy"}));
+}
+
+/// The over-firing guard: a declared property that merely REPEATS what the
+/// baseline already demanded of an extra accepts exactly the same values, so it
+/// must stay compatible or every constrained extras schema becomes unusable.
+#[test]
+fn declaring_a_property_repeating_the_baselines_extra_constraints_stays_compatible() {
+    let extras = json!({"type": "string", "minLength": 3});
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object", "properties": {"b": extras},
+               "additionalProperties": extras}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Carrying the same keyword is not carrying the same constraint. Extras
+/// demanding `minLength: 3` and a property demanding `minLength: 5` share the
+/// keyword and the type, yet a recorded four-character extra is newly rejected —
+/// so the comparison is on the VALUE, not on the key's presence.
+#[test]
+fn declaring_a_property_that_tightens_a_baseline_extra_constraint_is_breaking() {
+    let baseline = json!({"type": "object",
+                          "additionalProperties": {"type": "string", "minLength": 3}});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "minLength": 5}},
+                         "additionalProperties": {"type": "string", "minLength": 3}});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "abcd"}));
+}
+
+/// A deliberate over-fire, pinned so it is a decision rather than a surprise.
+///
+/// A property whose constraint is LOOSER than the extras schema's genuinely
+/// admits every recorded extra, but proving that means ordering every keyword's
+/// value space — full schema containment. Only `type` gets that treatment; the
+/// rest fail closed, and `--acknowledge` is the exit.
+#[test]
+fn declaring_a_property_that_loosens_a_baseline_extra_constraint_fails_closed() {
+    assert_breaking(
+        json!({"type": "object",
+               "additionalProperties": {"type": "string", "minLength": 3}}),
+        json!({"type": "object",
+               "properties": {"b": {"type": "string", "minLength": 1}},
+               "additionalProperties": {"type": "string", "minLength": 3}}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
+/// `default` is not a restriction: it supplies a value for an ABSENT key, and a
+/// recorded extra is by definition present. Failing closed on it would report
+/// every `#[serde(default = "…")]` field added over typed extras as breaking.
+#[test]
+fn declaring_a_property_with_a_serde_default_over_typed_extras_stays_compatible() {
+    let extras = json!({"type": "string"});
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object",
+               "properties": {"b": {"type": "string", "default": "d"}},
+               "additionalProperties": extras}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// A present-but-unreadable `properties` is the SAME case as an absent one, not
+/// a separate one, so it inherits the deferral above rather than failing closed
+/// the way a malformed `enum` or `additionalProperties` does.
+///
+/// The engine reads the keyword as `.get("properties").and_then(as_object)` in
+/// both places it consults it — the recursion into declared fields and the
+/// `known_keys` set that `additionalProperties` subtracts — so `"oops"` declares
+/// exactly nothing, byte-identically to omitting the key. This test pins that
+/// equivalence against the real validator: were the two ever to diverge, the
+/// malformed spelling would need its own rule.
+///
+/// Failing closed on only the malformed spelling would make the verdict depend
+/// on a difference the runtime cannot observe — deleting a corrupt line would
+/// flip BREAKING to COMPATIBLE with no change in behaviour.
+#[test]
+fn a_malformed_properties_baseline_is_indistinguishable_from_an_absent_one() {
+    let recorded = json!({"a": 1});
+    let malformed = json!({"type": "object", "properties": "oops"});
+    let absent = json!({"type": "object"});
+    let declared = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+
+    // The engine cannot tell the two baselines apart.
+    assert!(validate_against_schema(&malformed, &recorded).is_ok());
+    assert!(validate_against_schema(&absent, &recorded).is_ok());
+    assert!(validate_against_schema(&declared, &recorded).is_err());
+
+    // So the differ must not either: both inherit the open-object deferral.
+    assert_compatible_delta(
+        malformed,
+        declared.clone(),
+        ChangeKind::OptionalPropertyAdded,
+    );
+    assert_compatible_delta(absent, declared, ChangeKind::OptionalPropertyAdded);
+}
+
+/// The deferral is scoped to the OPTIONAL case. A corrupt baseline that also
+/// names the key in `required` is still caught, because the `required` walk
+/// visits names the property map never mentions.
+#[test]
+fn a_malformed_properties_baseline_still_reports_a_newly_required_key() {
+    assert_breaking(
+        json!({"type": "object", "properties": "oops"}),
+        json!({"type": "object", "properties": {"a": {"type": "string"}},
+               "required": ["a"]}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
+/// A baseline that DENIED unknown keys could not have recorded the key at all,
+/// so declaring it is provably safe. This is the mitigation the guide points at.
+#[test]
+fn declaring_a_property_on_a_closed_baseline_stays_compatible() {
+    assert_compatible(
+        json!({"type": "object", "properties": {"a": {"type": "string"}},
+               "additionalProperties": false}),
+        json!({"type": "object",
+               "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: ambiguous `oneOf` — widening the LAST branch
+// ---------------------------------------------------------------------------
+//
+// `diff_ambiguous_branches` compares branches by POSITION, and used to hand
+// `diff_branch_guarding_rebind` only the branches declared *after* the one
+// being compared — for `anyOf` and `oneOf` alike. `anyOf` binds the FIRST
+// match, so later-only is right there. `oneOf` requires EXACTLY one match and
+// is order-independent, so widening the LAST branch until it overlaps an
+// EARLIER one is just as fatal — and it got no rivals at all, so the widening
+// was scored on its own (compatible) merits.
+
+/// Two ambiguous object branches: relaxing the LAST one's `required` makes it
+/// match anything, so a payload that used to match branch 0 alone now matches
+/// both and `oneOf` rejects it.
+#[test]
+fn widening_the_last_ambiguous_oneof_branch_to_overlap_an_earlier_one_is_breaking() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    assert_breaking(
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The mirror guard: under `anyOf` the LAST branch has nothing after it, so
+/// widening it cannot steal a binding from anyone. Must stay compatible, or
+/// the fix has over-fired onto every untagged-enum edit.
+#[test]
+fn widening_the_last_ambiguous_anyof_branch_is_compatible() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    assert_compatible(
+        json!({"anyOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"anyOf": [branch_a, {
+            "type": "object",
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+    );
+}
+
+/// The over-firing guard that matters most: ambiguous by KEY, but provably
+/// disjoint by an internal tag. Widening the last branch's bound cannot create
+/// an overlap, so it stays a plain compatible relaxation.
+#[test]
+fn widening_the_last_ambiguous_oneof_branch_stays_compatible_when_tags_prove_disjointness() {
+    let tagged = |tag: &str, max: i64| {
+        json!({
+            "type": "object",
+            "required": ["kind", "n"],
+            "properties": {"kind": {"enum": [tag]}, "n": {"type": "integer", "maximum": max}},
+        })
+    };
+    assert_compatible(
+        json!({"oneOf": [tagged("A", 10), tagged("B", 10)]}),
+        json!({"oneOf": [tagged("A", 10), tagged("B", 20)]}),
+    );
+}
+
+/// Narrowing the last `oneOf` branch cannot create an overlap. It is breaking
+/// on its own terms (the payloads it drops), but must not also draw the
+/// rebind verdict — otherwise every narrowing is double-reported.
+#[test]
+fn narrowing_the_last_ambiguous_oneof_branch_reports_only_the_narrowing() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    let diff = diff_input(
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c", "d"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}, "d": {"type": "string"}},
+        }]}),
+    );
+    assert!(
+        !diff
+            .deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::UnanalysedConstraintChanged),
+        "a narrowing cannot create an overlap and must not draw the rebind verdict: {:#?}",
+        diff.deltas
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: a semantic `format` is not an annotation
+// ---------------------------------------------------------------------------
+//
+// Canonicalization used to drop every non-numeric `format`, on the reasoning
+// that "the engine's validator never reads it, and a string stays a string".
+// That answers the wrong question. This gate's perspective is the REPLAY READ:
+// does JSON already in `harvest_events` still deserialize into the new Rust
+// type? `format: "uuid"` is `schemars`' record that the field is a `Uuid`, and
+// `Uuid`'s `Deserialize` rejects a string that is not one. Stripping it made
+// `String -> Uuid` — a textbook break — canonicalize identically on both sides.
+
+#[test]
+fn introducing_a_semantic_string_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "string"}),
+        json!({"type": "string", "format": "uuid"}),
+        ChangeKind::StringFormatNarrowed,
+    );
+}
+
+#[test]
+fn changing_a_semantic_string_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string", "format": "date-time"}),
+        ChangeKind::StringFormatNarrowed,
+    );
+}
+
+/// The widening direction: every recorded UUID string is still a valid
+/// `String`, so dropping the format is compatible.
+#[test]
+fn dropping_a_semantic_string_format_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string"}),
+        ChangeKind::StringFormatWidened,
+    );
+}
+
+/// Over-firing guard: an UNCHANGED semantic format must produce no delta at
+/// all, or every workflow carrying a `Uuid` field fails the gate forever.
+#[test]
+fn an_unchanged_semantic_string_format_is_not_a_delta() {
+    let diff = diff_input(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string", "format": "uuid"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged format is not a change: {:#?}",
+        diff.deltas
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: cardinality bounds are unsigned integers
+// ---------------------------------------------------------------------------
+//
+// `minLength`/`maxLength`/`minItems`/`maxItems` are cardinalities: JSON Schema
+// requires a non-negative integer, and the engine's own `validate_node` reads
+// them with `as_u64` — silently ignoring anything else. Reading them here with
+// `as_f64` put a value the validator IGNORES (`1.5`) on the same lattice as
+// one it ENFORCES (`1`) and called the change a relaxation, when the effective
+// constraint actually went from "none" to "rejects the empty string".
+
+#[test]
+fn a_non_integer_cardinality_bound_fails_closed() {
+    assert_breaking(
+        json!({"type": "string", "minLength": 1.5}),
+        json!({"type": "string", "minLength": 1}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+#[test]
+fn a_non_integer_max_items_bound_fails_closed() {
+    assert_breaking(
+        json!({"type": "array", "maxItems": 2.5}),
+        json!({"type": "array", "maxItems": 2}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `minimum`/`maximum` are genuine numbers — the validator reads them with
+/// `as_f64` — so a fractional bound there is readable and its relaxation is a
+/// real relaxation. The stricter cardinality check must not leak onto them.
+#[test]
+fn a_fractional_numeric_bound_is_still_readable_and_relaxing_it_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "number", "minimum": 1.5}),
+        json!({"type": "number", "minimum": 1}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// Over-firing guard: an ordinary integer cardinality relaxation is untouched.
+#[test]
+fn relaxing_an_integer_cardinality_bound_is_still_compatible() {
+    assert_compatible_delta(
+        json!({"type": "string", "minLength": 2}),
+        json!({"type": "string", "minLength": 1}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+// ── Round 19: unit-enum collapse must not drop per-branch types ─────────────
+
+#[test]
+fn swapping_types_between_mixed_type_singleton_branches_is_breaking() {
+    // Every branch is a singleton `enum`, so the collapse fires — but the
+    // branches carry DIFFERENT types, so there is no single type to lift. The
+    // values alone are identical on both sides, so dropping the types makes
+    // two schemas with opposite meanings canonicalize to the same node.
+    let baseline = json!({
+        "oneOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "integer", "enum": [1]}
+        ]
+    });
+    // Swapped: each branch now demands a type its own value cannot have, so the
+    // schema accepts NOTHING.
+    let current = json!({
+        "oneOf": [
+            {"type": "integer", "enum": ["x"]},
+            {"type": "string", "enum": [1]}
+        ]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "swapping the types between mixed-type singleton branches must not canonicalize away"
+    );
+}
+
+#[test]
+fn typing_a_previously_untyped_singleton_branch_is_breaking() {
+    // Only SOME branches declare a type, so the declared ones agree trivially.
+    // Lifting that single type onto the collapsed node would constrain the
+    // untyped branch too, which is a narrowing the differ must not perform
+    // silently — and here the current revision performs it for real.
+    let baseline = json!({
+        "oneOf": [{"enum": ["x"]}, {"type": "integer", "enum": [1]}]
+    });
+    let current = json!({
+        "oneOf": [{"type": "integer", "enum": ["x"]}, {"type": "integer", "enum": [1]}]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "adding a type to one singleton branch must be reported"
+    );
+}
+
+#[test]
+fn same_type_singleton_branches_still_collapse() {
+    // The over-firing guard, asserted on the collapse ITSELF rather than on a
+    // verdict. Comparing an added variant would prove nothing: distinct
+    // singleton branches are a disjointness proof, so that stays compatible
+    // whether or not the collapse fires. Diffing the branch form against the
+    // flat form is the sharp test — they agree only if one canonicalizes into
+    // the other, which also pins that the shared `type` is LIFTED rather than
+    // dropped.
+    let diff = diff_input(
+        json!({"oneOf": [{"type": "string", "enum": ["a"]}, {"type": "string", "enum": ["b"]}]}),
+        json!({"type": "string", "enum": ["a", "b"]}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "a same-typed unit enum must still collapse to the flat form (with its type): {:#?}",
+        diff.deltas
+    );
+}
+
+#[test]
+fn untyped_singleton_branches_still_collapse() {
+    // The other half: no branch declares a type, so there is nothing to
+    // preserve and the collapse must still fire — to a flat `enum` carrying no
+    // type at all.
+    let diff = diff_input(
+        json!({"oneOf": [{"enum": ["a"]}, {"enum": ["b"]}]}),
+        json!({"enum": ["a", "b"]}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an untyped unit enum must still collapse to the flat form: {:#?}",
+        diff.deltas
+    );
+}
+
+#[test]
+fn reordering_mixed_type_singleton_branches_is_not_reported() {
+    // `oneOf` requires exactly one match, so its branch ORDER cannot affect
+    // binding — a pure reorder of the very shape the collapse no longer
+    // flattens must still produce nothing, or every such schema churns.
+    assert_compatible(
+        json!({"oneOf": [{"type": "string", "enum": ["x"]}, {"type": "integer", "enum": [1]}]}),
+        json!({"oneOf": [{"type": "integer", "enum": [1]}, {"type": "string", "enum": ["x"]}]}),
+    );
+}
+
+// ── Round 19: what the engine actually enforces ────────────────────────────
+
+#[test]
+fn every_keyword_the_engine_enforces_is_in_the_analysed_set() {
+    // The invariant behind two of this differ's rules: the fail-closed sweep
+    // may skip a `$ref`'s siblings (the engine reassigns `schema = resolved`
+    // and never looks at them), and an unenforced keyword may never buy a
+    // COMPATIBLE verdict. Both hold only while every keyword the engine
+    // actually enforces is one the differ analyses.
+    //
+    // Asserted behaviourally rather than by reading `validate_node`: each entry
+    // is a schema whose keyword WOULD reject the instance if it were enforced.
+    // A passing validation therefore proves the engine ignores it. If someone
+    // teaches the engine one of these, this test fails and forces the differ to
+    // stop discarding it.
+    let unenforced: &[(&str, Value, Value)] = &[
+        (
+            "pattern",
+            json!({"type": "string", "pattern": "^a$"}),
+            json!("zzz"),
+        ),
+        ("const", json!({"const": "a"}), json!("b")),
+        ("not", json!({"not": {"type": "string"}}), json!("a")),
+        (
+            "multipleOf",
+            json!({"type": "integer", "multipleOf": 10}),
+            json!(3),
+        ),
+        (
+            "uniqueItems",
+            json!({"type": "array", "uniqueItems": true}),
+            json!([1, 1]),
+        ),
+        (
+            "exclusiveMinimum",
+            json!({"type": "integer", "exclusiveMinimum": 10}),
+            json!(10),
+        ),
+        (
+            "patternProperties",
+            json!({"type": "object", "patternProperties": {"^a$": {"type": "integer"}}}),
+            json!({"a": "not-an-integer"}),
+        ),
+        (
+            "dependencies",
+            json!({"type": "object", "dependencies": {"a": ["b"]}}),
+            json!({"a": 1}),
+        ),
+        (
+            "propertyNames",
+            json!({"type": "object", "propertyNames": {"pattern": "^a$"}}),
+            json!({"zzz": 1}),
+        ),
+        (
+            "contains",
+            json!({"type": "array", "contains": {"type": "string"}}),
+            json!([1, 2]),
+        ),
+    ];
+    for (keyword, schema, instance) in unenforced {
+        assert!(
+            validate_against_schema(schema, instance).is_ok(),
+            "the engine now enforces `{keyword}`, so the differ may no longer treat it as inert: \
+             a `$ref` sibling carrying it must stop being discarded, and it may now prove things"
+        );
+    }
+}
+
+#[test]
+fn a_ref_sibling_is_inert_at_runtime_so_changing_one_is_not_reported() {
+    // Pins the refutation of "flattening an `allOf` `$ref` wrapper hides an
+    // unanalysed sibling". The engine resolves `$ref` in a loop and then
+    // validates ONLY the landing node, so a sibling constrains nothing — it is
+    // the same value under both revisions, which is what makes reporting no
+    // delta correct rather than merely convenient.
+    let with = |pattern: &str| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"allOf": [{"$ref": "#/definitions/T"}], "pattern": pattern}},
+            "definitions": {"T": {"type": "string"}}
+        })
+    };
+    let recorded = json!({"a": "zzz"});
+    // Neither revision rejects the recorded payload: the sibling is dead.
+    assert!(validate_against_schema(&with("^a$"), &recorded).is_ok());
+    assert!(validate_against_schema(&with("^b$"), &recorded).is_ok());
+    assert_compatible(with("^a$"), with("^b$"));
+}
+
+#[test]
+fn a_ref_target_change_under_that_same_wrapper_is_still_breaking() {
+    // The over-firing guard for the refutation above: the wrapper must not
+    // become a blind spot. A change to what the `$ref` actually points at is
+    // still compared, so only the provably-inert sibling is skipped.
+    let with = |ty: &str| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"allOf": [{"$ref": "#/definitions/T"}], "pattern": "^a$"}},
+            "definitions": {"T": {"type": ty}}
+        })
+    };
+    assert_oracle_agrees_breaking(&with("string"), &with("integer"), &json!({"a": "x"}));
+    assert!(
+        diff_input(with("string"), with("integer")).has_breaking(),
+        "the ref target is still compared through the wrapper"
+    );
+}
+
+#[test]
+fn narrowing_an_array_typed_singleton_branch_set_is_breaking() {
+    // The array spelling of `type` is the other half of the same bug: read
+    // through `as_str` it looks ABSENT, so every branch's type was dropped and
+    // dropping `null` from all of them canonicalized to no change at all.
+    let baseline = json!({
+        "oneOf": [
+            {"type": ["string", "null"], "enum": ["x"]},
+            {"type": ["string", "null"], "enum": [null]}
+        ]
+    });
+    // Both revisions use the ARRAY spelling deliberately: with the current side
+    // written as a bare `"string"` the old code lifted THAT one and reported an
+    // added type, catching the break by accident. Only when both sides are
+    // invisible to `as_str` does the miss show.
+    let current = json!({
+        "oneOf": [{"type": ["string"], "enum": ["x"]}, {"type": ["string"], "enum": [null]}]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!(null));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "dropping `null` from every branch's array type must be reported"
+    );
+}
+
+// ── Round 20: a memoized $ref must not silence the branch-overlap guard ────
+
+/// `A` is referenced from an ordinary property AND from a `oneOf` branch.
+/// `properties` is a sorted map, so `a_common` is traversed first and consumes
+/// the `A`/`A` memo entry; `z_choice`'s branch then resolves to the same pair
+/// and returns without emitting anything.
+fn shared_ref_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "a_common": {"$ref": "#/definitions/A"},
+            "z_choice": {
+                "oneOf": [{"$ref": "#/definitions/A"}, {"type": "integer", "minimum": 1}]
+            }
+        },
+        "definitions": {"A": {"type": "integer", "maximum": maximum}}
+    })
+}
+
+#[test]
+fn relaxing_a_shared_ref_into_a_sibling_branch_is_breaking() {
+    // Relaxing `A.maximum` 0 -> 2 reads as an ordinary compatible bound
+    // relaxation at `/a_common`. Under `z_choice` it is not: the recorded `1`
+    // used to match ONLY the `minimum: 1` branch, and now matches both — and
+    // `oneOf` requires exactly one, so it is rejected. The branch guard has to
+    // see the change even though the memo already consumed the ref pair.
+    let baseline = shared_ref_branch_schema(0);
+    let current = shared_ref_branch_schema(2);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a_common": 0, "z_choice": 1}));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a compatible-looking relaxation must not absorb a `oneOf` overlap through a memoized ref"
+    );
+}
+
+#[test]
+fn relaxing_a_shared_ref_with_disjoint_siblings_stays_compatible() {
+    // The over-firing guard: same shape, but the sibling branch is a different
+    // JSON type, so no relaxation of `A` can ever make a payload match both.
+    // Replaying the change signal must not turn every shared ref into a break.
+    let with = |maximum: i64| {
+        json!({
+            "type": "object",
+            "properties": {
+                "a_common": {"$ref": "#/definitions/A"},
+                "z_choice": {
+                    "oneOf": [{"$ref": "#/definitions/A"}, {"type": "string"}]
+                }
+            },
+            "definitions": {"A": {"type": "integer", "maximum": maximum}}
+        })
+    };
+    assert_compatible(with(0), with(2));
+}
+
+#[test]
+fn an_unchanged_shared_ref_under_a_branch_is_not_reported() {
+    // The churn guard: an untouched definition must stay silent, or every
+    // schema that references one from a `oneOf` reports on every run.
+    let diff = diff_input(shared_ref_branch_schema(0), shared_ref_branch_schema(0));
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged shared ref must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Two levels of sharing: `B` is reached first from an ordinary property, then
+/// through `A` (which has its own keywords, so it is its own memo pair), and
+/// only then from a `oneOf` branch. `A` emits nothing of its own — its whole
+/// change is a swallowed hit on `B` — so the signal has to propagate UP through
+/// the memo, not just out of it.
+fn nested_shared_ref_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "a_first": {"$ref": "#/definitions/B"},
+            "m_mid": {"$ref": "#/definitions/A"},
+            "z_choice": {
+                "oneOf": [
+                    {"$ref": "#/definitions/A"},
+                    {"type": "array", "items": {"type": "integer", "minimum": 1}}
+                ]
+            }
+        },
+        "definitions": {
+            "A": {"type": "array", "items": {"$ref": "#/definitions/B"}},
+            "B": {"type": "integer", "maximum": maximum}
+        }
+    })
+}
+
+#[test]
+fn relaxing_a_transitively_shared_ref_into_a_sibling_branch_is_breaking() {
+    let baseline = nested_shared_ref_branch_schema(0);
+    let current = nested_shared_ref_branch_schema(2);
+    assert_oracle_agrees_breaking(
+        &baseline,
+        &current,
+        &json!({"a_first": 0, "m_mid": [0], "z_choice": [1]}),
+    );
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a change swallowed one level DOWN must still reach the branch guard"
+    );
+}
+
+#[test]
+fn an_unchanged_transitively_shared_ref_is_not_reported() {
+    let diff = diff_input(
+        nested_shared_ref_branch_schema(0),
+        nested_shared_ref_branch_schema(0),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged nested shared ref must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A **self**-recursive definition whose own `oneOf` branch points back at it.
+/// Unlike the shared-definition cases above, the second visit to `A` happens
+/// while `A`'s first traversal is *still running*, so the memo holds the
+/// termination placeholder rather than a settled verdict.
+///
+/// `A`'s own body is byte-identical across revisions — only `C`, which it
+/// reaches through `properties.n`, changes. That is load-bearing: a change to
+/// `A` itself would alter the branch's identity key and be caught as a
+/// variant swap long before the memo mattered. Keys sort `choice` ahead of `n`,
+/// so the branch guard runs *before* the delta that proves `A` changed.
+fn self_recursive_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entry": {"$ref": "#/definitions/A"}
+        },
+        "definitions": {
+            "A": {
+                "properties": {
+                    "n": {"$ref": "#/definitions/C"},
+                    "choice": {
+                        "oneOf": [
+                            {"$ref": "#/definitions/A"},
+                            {
+                                "type": "object",
+                                "required": ["n"],
+                                "properties": {"n": {"type": "integer", "minimum": 1}}
+                            }
+                        ]
+                    }
+                }
+            },
+            "C": {"type": "integer", "maximum": maximum}
+        }
+    })
+}
+
+#[test]
+fn relaxing_a_bound_on_an_actively_traversed_recursive_ref_is_breaking() {
+    let baseline = self_recursive_branch_schema(0);
+    let current = self_recursive_branch_schema(2);
+    // Baseline: `{"n": 1}` fails `A` (C caps `n` at 0), so only the object rival
+    // matches — exactly one. Current: C admits `1`, so `A` matches too and
+    // `oneOf` rejects a payload it used to accept.
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"entry": {"choice": {"n": 1}}}));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a back-edge into a pair still being traversed must not be read as `unchanged`"
+    );
+}
+
+#[test]
+fn an_unchanged_self_recursive_branch_is_not_reported() {
+    // The negative control that rules out fixing the above by simply failing
+    // closed on every back-edge: these branches are not provably disjoint, so a
+    // blanket pessimistic hit would report this unchanged schema breaking and
+    // permanently block its own baseline.
+    let diff = diff_input(
+        self_recursive_branch_schema(0),
+        self_recursive_branch_schema(0),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged self-recursive branch must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The same recursive `A`, held completely fixed, beside an unrelated
+/// definition that does change. `A` is reached first, so its branch parks a
+/// check; the change then lands somewhere `A` cannot see.
+fn self_recursive_with_unrelated_schema(unrelated_maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entry": {"$ref": "#/definitions/A"},
+            "other": {"$ref": "#/definitions/D"}
+        },
+        "definitions": {
+            "A": {
+                "properties": {
+                    "n": {"$ref": "#/definitions/C"},
+                    "choice": {
+                        "oneOf": [
+                            {"$ref": "#/definitions/A"},
+                            {
+                                "type": "object",
+                                "required": ["n"],
+                                "properties": {"n": {"type": "integer", "minimum": 1}}
+                            }
+                        ]
+                    }
+                }
+            },
+            "C": {"type": "integer", "maximum": 0},
+            "D": {"type": "integer", "maximum": unrelated_maximum}
+        }
+    })
+}
+
+#[test]
+fn an_unrelated_change_does_not_fire_a_parked_recursive_branch_check() {
+    // A parked check must be keyed to the pair it actually depends on. Firing
+    // it on whichever pair happens to settle as changed would report this
+    // branch breaking because a definition it never reaches was relaxed.
+    let diff = diff_input(
+        self_recursive_with_unrelated_schema(0),
+        self_recursive_with_unrelated_schema(2),
+    );
+    assert!(
+        !diff.has_breaking(),
+        "a change outside the recursive branch's own subtree must not fire its \
+         parked overlap check: {:#?}",
+        diff.deltas
+    );
+    assert_eq!(
+        diff.compatible_count, 1,
+        "the unrelated relaxation is still reported: {:#?}",
+        diff.deltas
+    );
+}
+
+/// `dependentRequired` is keyed by author-chosen property names, so the
+/// annotation filter must not reach them. Before this was recognised, a
+/// dependency keyed `description` was deleted from both revisions and two
+/// genuinely different schemas canonicalised alike.
+///
+/// The engine does not enforce this keyword, so the change is inert at runtime
+/// and the resulting verdict is conservative rather than load-bearing — but the
+/// silence was arbitrary either way: the very same edit under a key named
+/// `card` was reported, and only a collision with an annotation name hid it.
+#[test]
+fn a_dependency_keyed_by_an_annotation_name_is_still_compared() {
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"description": ["b"]}}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "a `dependentRequired` entry keyed by an annotation name must not be \
+         canonicalised away"
+    );
+}
+
+#[test]
+fn a_dependency_keyed_by_an_ordinary_name_is_compared() {
+    // The control the case above is measured against: identical edit, ordinary
+    // key. Both must be reported, and for the same reason.
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"card": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"card": ["b"]}}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "an ordinary dependency key is reported"
+    );
+}
+
+#[test]
+fn an_unchanged_dependent_required_map_is_not_reported() {
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "preserving the key must not make an UNCHANGED map look changed: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The remedy offered for a renamed property has to be followed by an
+/// acknowledgement, because `#[serde(alias = "...")]` is deserialization-only:
+/// `schemars` publishes the new canonical name and nothing else, so the alias
+/// is invisible to a gate that reads the published schema. Advising the alias
+/// alone reads as "do this and the finding goes away", which it does not.
+#[test]
+fn the_rename_remedy_says_the_alias_alone_will_not_clear_the_gate() {
+    let diff = diff_input(
+        json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+        json!({"type": "object", "properties": {"email_address": {"type": "string"}}}),
+    );
+    let removed = diff
+        .deltas
+        .iter()
+        .find(|d| d.change == ChangeKind::PropertyRemoved)
+        .expect("the removal is reported");
+    assert!(
+        removed.reason.contains("serde(alias"),
+        "the remedy still names the alias: {}",
+        removed.reason
+    );
+    assert!(
+        removed.reason.contains("acknowledge"),
+        "and says the alias alone does not clear the gate: {}",
+        removed.reason
+    );
+}

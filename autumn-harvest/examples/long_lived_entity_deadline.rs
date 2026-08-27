@@ -203,6 +203,9 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: state.clone(),
+                // Same-type continuation (issue #803): this example checkpoints
+                // itself, it does not change phase.
+                new_workflow_type: None,
             },
         ];
 

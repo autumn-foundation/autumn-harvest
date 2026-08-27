@@ -126,7 +126,7 @@ mod tests {
     use autumn_harvest::context::WorkflowContext;
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
-    use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalSignalId};
+    use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalSignalId, ExternalTarget};
     use chrono::Utc;
     use serde_json::{Value, json};
 
@@ -167,7 +167,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target: target_id,
+                target: ExternalTarget::ExecutionId(target_id),
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
                 idempotency_key: None,
@@ -194,7 +194,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target: target_id,
+                target: ExternalTarget::ExecutionId(target_id),
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
                 idempotency_key: None,
@@ -268,6 +268,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         WorkflowReplayer::new()

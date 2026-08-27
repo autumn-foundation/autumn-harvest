@@ -15,6 +15,16 @@ struct DagAttrs {
     runbook: Option<String>,
     severity: Option<String>,
     mcp: bool,
+    /// `#[dag(execution_timeout = "4h")]` (issue #743): a hard wall-clock
+    /// deadline for the whole scheduled DAG run, propagated to the shadow
+    /// `WorkflowInfo::execution_timeout` and enforced by the EXISTING #243
+    /// `enforce_workflow_execution_timeouts` scanner — no new scanner.
+    execution_timeout: Option<String>,
+    /// `#[dag(sla = "3h")]` (issue #743): a soft SLA observed by the EXISTING
+    /// #487 `enforce_workflow_sla_breaches` scanner without altering the run's
+    /// lifecycle. Clamped down to `execution_timeout` at start when declared
+    /// larger than it (AC5, via the shared `clamp_info_default_sla` logic).
+    sla: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
@@ -65,9 +75,32 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
         } else if meta.path.is_ident("mcp") {
             result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
+        } else if meta.path.is_ident("execution_timeout") {
+            let value: LitStr = meta.value()?.parse()?;
+            // Validate at compile time (issue #743 AC10) so a typo is a build
+            // error, not a registration-time panic from the emitted duration
+            // parse.
+            if !crate::attr_util::is_valid_task_duration(&value.value()) {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "invalid execution_timeout duration; expected e.g. \"30s\", \"5m\", \"4h\", \"2d\"",
+                ));
+            }
+            result.execution_timeout = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("sla") {
+            let value: LitStr = meta.value()?.parse()?;
+            if !crate::attr_util::is_valid_task_duration(&value.value()) {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "invalid sla duration; expected e.g. \"30s\", \"5m\", \"3h\", \"2d\"",
+                ));
+            }
+            result.sla = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, severity, or mcp",
+                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, severity, mcp, execution_timeout, or sla",
             ))
         }
     })
@@ -121,19 +154,24 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    // Emit execution_timeout/sla as Option<Duration> (issue #743). Already
+    // validated for parseability in `parse_attrs`, so `task_duration` here
+    // always succeeds -- mirrors `#[workflow(execution_timeout = ...)]`'s
+    // emission in `workflow.rs`.
+    let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+    let sla_expr = attrs.sla.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+
     // Emit the shadow WorkflowInfo companion when the unified-dag-execution
     // feature is enabled on the proc-macro crate (transitively enabled by
     // `autumn-harvest/unified-dag-execution`).
     #[cfg(feature = "unified-dag-execution")]
-    let workflow_companion = emit_workflow_companion(
-        fn_name,
-        &fn_name_str,
-        attrs.default_queue.as_ref(),
-        attrs.owner.as_deref(),
-        attrs.runbook.as_deref(),
-        attrs.severity.as_deref(),
-        attrs.mcp,
-    );
+    let workflow_companion = emit_workflow_companion(fn_name, &fn_name_str, &attrs);
 
     #[cfg(not(feature = "unified-dag-execution"))]
     let workflow_companion = quote! {};
@@ -218,6 +256,8 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 runbook_url: #runbook_url_expr,
                 severity: #severity_expr,
                 mcp: #mcp,
+                execution_timeout: #execution_timeout_expr,
+                sla: #sla_expr,
             }
         }
 
@@ -231,22 +271,41 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn emit_workflow_companion(
     fn_name: &syn::Ident,
     fn_name_str: &str,
-    default_queue: Option<&String>,
-    owner: Option<&str>,
-    runbook: Option<&str>,
-    severity: Option<&str>,
-    mcp: bool,
+    attrs: &DagAttrs,
 ) -> TokenStream {
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
 
-    let builder_init = default_queue.map(String::as_str).map_or_else(
+    let builder_init = attrs.default_queue.as_deref().map_or_else(
         || quote! { ::autumn_harvest::DagBuilder::new() },
         |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
     );
 
-    let owner_expr = owner.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
-    let runbook_url_expr = runbook.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
-    let severity_expr = severity.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let owner_expr = attrs
+        .owner
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let runbook_url_expr = attrs
+        .runbook
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let severity_expr = attrs
+        .severity
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let mcp = attrs.mcp;
+    // issue #743: the shadow WorkflowInfo must carry the SAME
+    // execution_timeout/sla the DagInfo companion carries, so the unified
+    // start path (`start_or_load_workflow_execution`) resolves an identical
+    // deadline/sla regardless of whether the run was dispatched via the DAG
+    // trigger route or a plain workflow start.
+    let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+    let sla_expr = attrs.sla.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
 
     quote! {
         /// Shadow `WorkflowInfo` for this DAG, emitted when the
@@ -288,14 +347,19 @@ fn emit_workflow_companion(
                         ::autumn_harvest::dag::run_unified_dag(ctx, _input, __levels, __tasks).await
                     })
                 },
-                execution_timeout: None,
+                execution_timeout: #execution_timeout_expr,
                 // DAGs carry no chain-scoped lifetime cap (issue #617).
                 chain_execution_timeout: None,
-                sla: ::std::option::Option::None,
+                sla: #sla_expr,
                 concurrency: ::std::option::Option::None,
                 debounce: ::std::option::Option::None,
                 batch: ::std::option::Option::None,
                 throttle: ::std::option::Option::None,
+                // DAGs carry no per-tenant quota (issue #946) -- the
+                // `#[dag]` macro has no `quota` attribute and DAG start
+                // paths bypass the registry-aware admission gates quota
+                // enforcement runs on.
+                quota: ::std::option::Option::None,
                 max_input_bytes: ::std::option::Option::None,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
@@ -315,6 +379,15 @@ fn emit_workflow_companion(
                 // its `start` tool through `trigger_dag_run` rather than the
                 // generic `start_workflow` path.
                 mcp: #mcp,
+                // Issue #802 targets the IMPERATIVE path: a `#[dag]` already
+                // declares its activity references structurally, and preflight
+                // validates those through `dag_unregistered_activity_failures`.
+                // Opting the shadow `WorkflowInfo` in as well would make the
+                // workflow pass re-report the same misses, doubling every DAG
+                // failure in `details.failures`. Mirrors
+                // `DagInfo::as_workflow_info`.
+                declared_activities: ::std::option::Option::None,
+                declared_children: ::std::option::Option::None,
             }
         }
     }

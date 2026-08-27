@@ -256,6 +256,9 @@ fn wf_info(
     retry_policy: Option<RetryPolicy>,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "workflow_retry_tests",
@@ -313,6 +316,7 @@ fn make_worker(
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -333,12 +337,32 @@ async fn start_workflow(
     workflow_id: &str,
     retry_policy: Option<RetryPolicy>,
 ) -> ExecutionId {
+    start_workflow_on_shard(
+        conn,
+        workflow_name,
+        workflow_id,
+        retry_policy,
+        ShardId::new(0),
+    )
+    .await
+}
+
+/// Like [`start_workflow`] but seeds the run on a caller-chosen shard, so the
+/// issue #697 AC4 retry-inheritance test can use a NON-default shard (a
+/// `default_shard` regression would otherwise pass on shard 0).
+async fn start_workflow_on_shard(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    workflow_id: &str,
+    retry_policy: Option<RetryPolicy>,
+    shard: ShardId,
+) -> ExecutionId {
     start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
             workflow_name,
             workflow_id,
-            exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            exec_id: ExecutionId::new_for_shard(shard),
             input: serde_json::Value::Null,
             parent_id: None,
             queue_name: "default",
@@ -354,6 +378,7 @@ async fn start_workflow(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -416,6 +441,7 @@ async fn start_workflow_with_source(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -1604,5 +1630,93 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     assert!(
         dl < chrono::Utc::now() + chrono::Duration::days(1),
         "a re-anchored now+7d deadline would be days out; verbatim is ~6h"
+    );
+}
+
+/// Issue #697 AC4: a workflow-level retry (#523) is the same logical run trying
+/// again, so the retry execution must stay on the predecessor's shard — both in
+/// the encoded `ExecutionId` (what every later id-based lookup routes on) and in
+/// the row's `shard_id` column. Otherwise a residency-pinned run would silently
+/// migrate to another country's database the first time it hit a transient
+/// failure.
+///
+/// Seeded on a **non-default** shard (6) so this falsifies BOTH an
+/// `ExecutionId::new()` regression (UNENCODED sentinel) and a "always use
+/// `default_shard`" one. Driven end to end through the real worker loop: the
+/// retry execution id is minted inside `persist_workflow_failure`, which is
+/// engine-internal and not reachable from a pure unit test.
+#[tokio::test]
+async fn workflow_retry_stays_on_the_predecessor_shard() {
+    let pinned = ShardId::new(6);
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    };
+
+    let counter = Arc::new(CallCounter::default());
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = format!("retry-shard-{}", uuid::Uuid::new_v4().simple());
+    let exec_id = start_workflow_on_shard(
+        &mut conn,
+        "retry_transient_wf",
+        &workflow_id,
+        Some(policy.clone()),
+        pinned,
+    )
+    .await;
+    assert_eq!(
+        exec_id.shard(),
+        pinned,
+        "precondition: the predecessor must actually be pinned"
+    );
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "retry_transient_wf",
+            fail_once_then_succeed_handler,
+            Some(policy),
+        )],
+        make_shared_state(counter),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    let retry_exec = wait_for_retry_state(&mut check, exec_id, &["COMPLETED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(
+        retry_exec.shard(),
+        pinned,
+        "the retry execution's ExecutionId must encode the predecessor's shard \
+         (issue #697 AC4) -- an `ExecutionId::new()` or default-shard retry \
+         would silently move a residency-bound run off its shard"
+    );
+
+    let row_shard: i32 = harvest_workflow_executions::table
+        .find(retry_exec.as_uuid())
+        .select(harvest_workflow_executions::shard_id)
+        .first(&mut check)
+        .await
+        .expect("retry execution row");
+    assert_eq!(
+        row_shard,
+        pinned.as_i32(),
+        "the retry execution's row must live on the predecessor's shard (issue #697 AC4)"
     );
 }

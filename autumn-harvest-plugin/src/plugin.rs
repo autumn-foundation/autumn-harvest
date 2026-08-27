@@ -2,6 +2,9 @@
 //! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;
+#[cfg(feature = "connectors")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use autumn_web::AppState;
@@ -26,7 +29,78 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::DbPool;
 
 const HARVEST_MIGRATIONS: EmbeddedMigrations = autumn_harvest::MIGRATIONS;
-const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+/// Plugin migrations that belong to the **application** database — the
+/// transactional-outbox table an embedder writes to in their own business
+/// transaction.
+const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/app");
+
+/// Plugin migrations that belong to the **harvest** database.
+///
+/// Split from [`OUTBOX_MIGRATIONS`] because the two are different databases
+/// under `HarvestMode::Split`/`External`. The connector dead-letter table
+/// (issue #944) is written by `PostgresDeadLetterSink`, which is built from
+/// the *harvest* pool — applying it only to the app database left the table
+/// missing where the sink actually writes, so every dead-letter write failed,
+/// `settle` downgraded the poison message to a retry, and it was redelivered
+/// forever: exactly the partition wedge the feature exists to prevent.
+const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/harvest");
+
+/// Hand Harvest's embedded migration sets to Autumn, which owns applying them
+/// (autumn-web 0.7's [`AppBuilder::plugin_migrations`]).
+///
+/// Autumn applies every registered set inside `setup_database`, i.e. *before*
+/// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
+/// already-migrated database. It also keeps the same dev/prod policy the plugin
+/// applied by hand before: auto-apply under the `dev` profile, warn-only
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+///
+/// Registering here rather than migrating ourselves is what lets Autumn resolve
+/// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
+/// is keyed by version alone, so two independently authored migrations picking
+/// the same timestamp would otherwise silently skip one of them forever. Autumn
+/// sees every registered set at once and tracks the loser under a substitute
+/// version so both still apply.
+///
+/// # Why the harvest sets are conditional
+///
+/// `plugin_migrations` can only target the application's primary database.
+/// Under [`HarvestMode::Embedded`] (the default) that *is* the Harvest
+/// database, so Autumn can own all three sets. Under [`HarvestMode::Split`] /
+/// [`HarvestMode::External`], Harvest storage is a **separate** database that
+/// Autumn has no handle on — those two sets stay on the plugin's own apply path
+/// in [`ensure_runtime_migrations`], which connects to `harvest.database.url`
+/// directly.
+///
+/// The outbox set is unconditional: the transactional-outbox table an embedder
+/// writes to in their own business transaction always lives in the application
+/// database, in every mode.
+///
+/// If the Harvest config cannot be loaded here, registration fails immediately
+/// rather than guessing: applying the sets to the app database for an unknown
+/// mode could create Harvest tables in the wrong place, while registering only
+/// the outbox would let migration-only commands report false success.
+fn register_plugin_migrations(app: AppBuilder) -> AppBuilder {
+    let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
+
+    match migration_registration_mode(HarvestRuntimeConfig::load()) {
+        HarvestMode::Embedded => app
+            .plugin_migrations("autumn-harvest", HARVEST_MIGRATIONS)
+            .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
+        HarvestMode::Split | HarvestMode::External => app,
+    }
+}
+
+/// Resolve the topology before migration registration. This must be fail-fast:
+/// `autumn migrate` builds plugins but does not execute their startup hooks, so
+/// deferring a configuration error would let that command report success after
+/// registering only the application outbox migrations.
+fn migration_registration_mode(
+    config: Result<HarvestRuntimeConfig, autumn_web::config::ConfigError>,
+) -> HarvestMode {
+    config
+        .unwrap_or_else(|error| panic!("cannot register Harvest migrations: {error}"))
+        .mode
+}
 
 struct OutboxRuntime {
     shutdown: CancellationToken,
@@ -42,6 +116,9 @@ struct HarvestRuntime {
     runner: HarvestRunner,
     outbox: Option<OutboxRuntime>,
     gate_refresh: Option<GateRefreshRuntime>,
+    /// Running broker connector consumer loops (issue #944).
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRuntimeHandle>,
 }
 
 /// Plugin-local shared slot: holds the pre-built `HarvestBuilder` until the
@@ -51,6 +128,11 @@ struct HarvestRuntime {
 struct HarvestRuntimeSlot {
     builder: Option<HarvestBuilder>,
     runtime: Option<HarvestRuntime>,
+    /// Broker connector registrations (issue #944), stashed alongside the
+    /// builder so `start_harvest_runtime` can spawn one consumer loop each
+    /// once the API state and pools exist.
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRegistration>,
 }
 
 type ApiMiddlewareFn = Box<
@@ -140,10 +222,63 @@ pub struct HarvestPlugin {
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
     webhook_triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
+    /// Broker event-source connectors (issue #944). Set via
+    /// [`Self::connector`] (feature `connectors`). Each entry pairs one
+    /// binding with the adapter that feeds it.
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRegistration>,
     /// Built-in Prometheus scrape endpoint (issue #355). Set via
     /// [`Self::with_metrics_scrape`] (feature `metrics`).
     #[cfg(feature = "metrics")]
     metrics_scrape_enabled: bool,
+}
+
+/// One registered broker connector: a binding plus the source that feeds it.
+#[cfg(feature = "connectors")]
+struct ConnectorRegistration {
+    binding: std::sync::Arc<crate::connector::SourceBinding>,
+    source: std::sync::Arc<dyn crate::connector::EventSource>,
+    config: Option<crate::connector::ConnectorRuntimeConfig>,
+}
+
+/// A running connector consumer loop.
+#[cfg(feature = "connectors")]
+struct ConnectorRuntimeHandle {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+/// Stop every connector consumer loop, cancelling *all* of them before
+/// awaiting *any*.
+///
+/// Cancelling and awaiting one at a time would serialize the drains:
+/// connector *N* keeps consuming — and therefore keeps accruing more in-flight
+/// work of its own to drain — for as long as connectors *1..N* take to finish.
+/// Each drain is individually bounded
+/// ([`ConnectorRuntime::drain_in_flight`](crate::connector::ConnectorRuntime)),
+/// but serialized those bounds *sum*, so a fleet of bindings turns a
+/// per-connector deadline into an N-times-longer shutdown — and the messages
+/// the late connectors consumed in the meantime are the ones most likely to be
+/// hard-stopped when their own turn finally comes. Cancelling first starts
+/// every drain deadline at the same instant, so the total is the slowest
+/// connector rather than their sum.
+#[cfg(feature = "connectors")]
+async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
+    let draining: Vec<JoinHandle<()>> = connectors
+        .into_iter()
+        .map(|connector| {
+            connector.shutdown.cancel();
+            connector.handle
+        })
+        .collect();
+
+    for handle in draining {
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(error = %error, "harvest connector failed during shutdown");
+        }
+    }
 }
 
 impl Default for HarvestPlugin {
@@ -170,6 +305,8 @@ impl HarvestPlugin {
             canary_config: None,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
+            #[cfg(feature = "connectors")]
+            connectors: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
         }
@@ -235,6 +372,56 @@ impl HarvestPlugin {
     #[must_use]
     pub fn retention(mut self, config: autumn_harvest::retention::RetentionConfig) -> Self {
         self.builder = self.builder.retention(config);
+        self
+    }
+
+    /// How long a keyed workflow start's idempotency claim is retained
+    /// (issue #808; default 24 h).
+    ///
+    /// Load-bearing for broker connectors (issue #944): a `BrokerCoordinates`
+    /// binding dedupes through this claim, so the "one execution per message"
+    /// guarantee lasts exactly as long as the window. Brokers replay much
+    /// older than a day — a Kafka consumer-group reset or topic replay, an SQS
+    /// message redelivered across many receives — and a redelivery arriving
+    /// after the claim is purged reserves the key as *fresh*, starting a
+    /// second execution. Size this to how far back your broker can replay;
+    /// harvest warns at startup if a coordinate-dedupe binding is registered
+    /// while this is left at its default.
+    #[must_use]
+    pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
+        self.builder = self.builder.start_idempotency_window(window);
+        self
+    }
+
+    /// Enable the **opt-in durable per-execution workflow log sink** (issue
+    /// #790).
+    ///
+    /// With it, lines emitted through the existing
+    /// `ctx.logger()` / `ctx.log_info` / `ctx.log_warn` / `ctx.log_error`
+    /// entry points (issue #379) are additionally persisted per execution and
+    /// readable in one call via `GET /api/harvest/workflows/{id}/logs`, the
+    /// `harvest workflow logs` CLI command, or the Vantage execution-detail
+    /// **Logs** panel — no external log-aggregation correlation.
+    ///
+    /// **Off by default, and additive.** Without this call `ctx.logger()`
+    /// behaves exactly as before (`tracing`-only), and the workflow body does
+    /// not change either way.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest_plugin::HarvestPlugin;
+    /// # use autumn_harvest::WorkflowLogPolicy;
+    /// // Defaults: 1,000 lines per execution, 4 KiB per line.
+    /// let plugin = HarvestPlugin::new().workflow_log_persistence(WorkflowLogPolicy::new());
+    /// ```
+    ///
+    /// See [`docs/workflow-logs.md`](https://github.com/autumn-foundation/autumn-harvest/blob/main/docs/workflow-logs.md)
+    /// for the full contract.
+    #[must_use]
+    pub fn workflow_log_persistence(
+        mut self,
+        policy: autumn_harvest::context::WorkflowLogPolicy,
+    ) -> Self {
+        self.builder = self.builder.workflow_log_persistence(policy);
         self
     }
 
@@ -527,6 +714,309 @@ impl HarvestPlugin {
         self.metrics_scrape_enabled = true;
         self
     }
+
+    /// Bind a broker topic/queue to a workflow (issue #944).
+    ///
+    /// `binding` says *what* a message maps to; `source` is the adapter that
+    /// feeds it ([`KafkaSource`][k], [`SqsSource`][s], [`MockSource`][m], or
+    /// your own [`EventSource`][e]). A consumer loop is spawned per binding at
+    /// startup and cancelled on shutdown.
+    ///
+    /// Call `.workflows(...)` with every binding's target workflow **before**
+    /// this — `HarvestPlugin::build` fails fast (panics) on an unregistered
+    /// target, a DAG target, a duplicate binding name, a missing mapping
+    /// function, or a `BrokerCoordinates` dedupe mode explicitly requested on a
+    /// workflow whose admission is deferred by a throttle/debounce/batch
+    /// policy (the start route rejects that combination with `400`).
+    ///
+    /// Accumulates across repeated calls, mirroring `.workflows` / `.webhooks`.
+    ///
+    /// [k]: crate::connector::KafkaSource
+    /// [s]: crate::connector::SqsSource
+    /// [m]: crate::connector::MockSource
+    /// [e]: crate::connector::EventSource
+    ///
+    /// See `docs/getting-started/13-broker-connectors.md`.
+    #[cfg(feature = "connectors")]
+    #[must_use]
+    pub fn connector(
+        self,
+        binding: crate::connector::SourceBinding,
+        source: std::sync::Arc<dyn crate::connector::EventSource>,
+    ) -> Self {
+        self.connector_with_config(binding, source, None)
+    }
+
+    /// [`Self::connector`] with explicit polling knobs.
+    ///
+    /// `None` uses [`ConnectorRuntimeConfig::default`][c], which is tuned for
+    /// a cheap idle binding (a ≥ 1s poll so SQS *long*-polls rather than
+    /// short-polls, an idle backoff, and a throttled consumer-lag sample).
+    /// Override it to trade idle API cost against pickup latency, or to raise
+    /// `max_batch` for a high-throughput topic.
+    ///
+    /// [c]: crate::connector::ConnectorRuntimeConfig
+    #[cfg(feature = "connectors")]
+    #[must_use]
+    pub fn connector_with_config(
+        mut self,
+        binding: crate::connector::SourceBinding,
+        source: std::sync::Arc<dyn crate::connector::EventSource>,
+        config: Option<crate::connector::ConnectorRuntimeConfig>,
+    ) -> Self {
+        self.connectors.push(ConnectorRegistration {
+            binding: std::sync::Arc::new(binding),
+            source,
+            config,
+        });
+        self
+    }
+}
+
+/// Validate every registered binding, then spawn one consumer loop per binding.
+///
+/// Split out of `start_harvest_runtime` so the wiring stays readable, and so
+/// the validation half is reachable from `build()` for fail-fast.
+///
+/// # Panics
+///
+/// Panics when a binding is invalid or when its adapter's `stream()` does not
+/// match the binding's declared `stream` — both are startup misconfigurations
+/// that would otherwise surface as a silently idle consumer.
+/// What actually bounds a binding's dedupe guarantee, when that bound is left
+/// somewhere the operator has probably not weighed (issue #944, Codex review).
+///
+/// A binding's dedupe rests on one of two records with *different lifetimes*,
+/// so one knob cannot cover both.
+#[cfg(feature = "connectors")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UntunedDedupeBound {
+    /// A coordinate-keyed `Starts` binding reserves a
+    /// `harvest_start_idempotency` row (#808), purged after
+    /// `HarvestBuilder::start_idempotency_window` (default 24 h).
+    StartIdempotencyWindow,
+    /// The dedupe record lives on — or cascades from — the **execution row**,
+    /// so retention deleting the run deletes the only evidence a redelivery was
+    /// already handled. `start_idempotency_window` governs a claim table this
+    /// path never touches, so it does nothing here. Two bindings land here:
+    ///
+    /// * `SignalsWithStart`, which persists its key *only* on
+    ///   `harvest_signals` (`ON DELETE CASCADE` on its execution) and never
+    ///   reserves a start-idempotency claim.
+    /// * Any [`IdempotencyMode::WorkflowId`][m] binding, which passes no
+    ///   idempotency key at all: dedupe rests entirely on the
+    ///   `(workflow_name, workflow_id)` reuse-policy attach against the
+    ///   execution row.
+    ///
+    /// [m]: crate::connector::IdempotencyMode::WorkflowId
+    ExecutionRetention {
+        /// The effective retention age that bounds the claim.
+        max_age: std::time::Duration,
+    },
+}
+
+/// Resolve which bound — if any — is worth naming at startup for one binding.
+///
+/// Exactly one shape rides the start-idempotency claim table: a
+/// **coordinate-keyed `Starts`** binding. Everything else — `SignalsWithStart`,
+/// and any `WorkflowId` binding, which passes no idempotency key at all — rests
+/// on the execution row and is bounded by retention.
+///
+/// Returns `None` when the guarantee needs no caveat:
+///
+/// * A coordinate-keyed `Starts` binding with an explicitly configured window:
+///   an explicit value is a considered one.
+/// * An execution-row-bound binding with retention **off** (harvest's default):
+///   the row — and with it the claim — is never deleted, so the dedupe is
+///   *unbounded*, which is stronger than the claim-table case rather than
+///   weaker.
+///
+/// An execution-row-bound binding under active retention always reports its
+/// bound, deliberately: tuning `start_idempotency_window` must not silence it,
+/// because that knob does not govern this path at all. Naming the wrong remedy
+/// is the failure mode this exists to prevent.
+///
+/// Pure so the decision is unit-testable without capturing `tracing` output.
+#[cfg(feature = "connectors")]
+fn untuned_dedupe_bound(
+    mode: crate::connector::IdempotencyMode,
+    target: crate::connector::ConnectorTarget,
+    configured_window: Option<std::time::Duration>,
+    execution_retention_age: Option<std::time::Duration>,
+) -> Option<UntunedDedupeBound> {
+    match (mode, target) {
+        (
+            crate::connector::IdempotencyMode::BrokerCoordinates,
+            crate::connector::ConnectorTarget::Starts { .. },
+        ) => configured_window
+            .is_none()
+            .then_some(UntunedDedupeBound::StartIdempotencyWindow),
+        _ => execution_retention_age
+            .map(|max_age| UntunedDedupeBound::ExecutionRetention { max_age }),
+    }
+}
+
+/// The first pair of registrations that share one event source, if any
+/// (issue #944, Codex review).
+///
+/// Each registration gets its own [`ConnectorRuntime`][r] and therefore its own
+/// `OffsetTracker`, so handing the same `Arc<dyn EventSource>` to two of them
+/// starts two receive loops over **one client** with two independent views of
+/// what is durable. On Kafka that is a message-loss hazard: the loops split the
+/// stream nondeterministically, so one tracker can commit a contiguous mark
+/// covering offsets the *other* loop is still dispatching, and a crash then
+/// skips them permanently. On SQS it is a silent fan-out failure: each message
+/// goes to exactly one of the two bindings, so neither target sees the whole
+/// queue.
+///
+/// Callers pass source identities (`Arc::as_ptr` addresses); taking plain
+/// integers keeps the decision unit-testable without constructing sources,
+/// mirroring [`binding_stream_matches_adapter`].
+///
+/// [r]: crate::connector::ConnectorRuntime
+#[cfg(feature = "connectors")]
+fn first_shared_source(identities: &[usize]) -> Option<(usize, usize)> {
+    for (i, id) in identities.iter().enumerate() {
+        if let Some(j) = identities[i + 1..].iter().position(|other| other == id) {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
+/// Index pair of the first two entries that declare the same identity.
+///
+/// The sibling of [`first_shared_source`] for a *declared* identity rather
+/// than an object pointer: two separately constructed sources over one
+/// physical subscription have distinct pointers, so the pointer check cannot
+/// see them, but they still compete for the same messages.
+///
+/// A `None` entry declares no identity and never matches — not even another
+/// `None`. An adapter that cannot name its subscription is not evidence of a
+/// clash, and treating absence as a match would reject every pair of custom
+/// adapters on sight.
+#[cfg(feature = "connectors")]
+fn first_shared_identity<T: PartialEq>(identities: &[Option<T>]) -> Option<(usize, usize)> {
+    for (i, id) in identities.iter().enumerate() {
+        let Some(id) = id else { continue };
+        if let Some(j) = identities[i + 1..]
+            .iter()
+            .position(|other| other.as_ref().is_some_and(|o| o == id))
+        {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
+/// Index pair of the first two bindings that consume the same logical
+/// `(stream, target)` pair (issue #944).
+///
+/// Not an error, unlike a shared *physical* subscription: two independent
+/// brokers can expose the same stream name and legitimately feed one workflow
+/// (active/active, or a cluster migration), and only the operator knows which
+/// they meant. But on ONE broker it double-dispatches every message — each
+/// binding derives its own idempotency key, because the binding name
+/// namespaces it — so it is worth saying out loud once at startup.
+///
+/// Callers pass `(stream, workflow, signal_name)` triples; taking plain tuples
+/// keeps the decision unit-testable without constructing bindings, mirroring
+/// [`first_shared_source`].
+#[cfg(feature = "connectors")]
+fn first_duplicate_stream_target<'a>(
+    pairs: &[(&'a str, &'a str, Option<&'a str>)],
+) -> Option<(usize, usize)> {
+    for (i, p) in pairs.iter().enumerate() {
+        if let Some(j) = pairs[i + 1..].iter().position(|other| other == p) {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
+/// Index registered workflows by name the way the engine itself resolves them:
+/// **last-wins** (issue #944).
+///
+/// `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+/// `HashMap`, so a name registered twice executes under the *last* definition.
+/// A `.find()` would be first-wins, which is not a cosmetic difference here:
+/// the target's info decides the effective [`IdempotencyMode`][im], so a first
+/// throttled definition followed by a plain one makes the runtime dedupe on
+/// broker coordinates while a first-wins lookup describes a definition that
+/// will never run — suppressing the 24-hour claim-lifetime warning and leaving
+/// the operator unaware that a late replay can start a second execution.
+///
+/// One helper so every connector path that reads a target's info agrees by
+/// construction rather than by comment.
+///
+/// [im]: crate::connector::IdempotencyMode
+#[cfg(feature = "connectors")]
+fn workflow_infos_by_name(workflows: &[WorkflowInfo]) -> HashMap<&str, &WorkflowInfo> {
+    workflows.iter().map(|w| (w.name, w)).collect()
+}
+
+/// Whether a binding's declared stream matches the stream its adapter
+/// actually consumes (issue #944).
+///
+/// A mismatch is silent and total: the consumer connects, polls forever, and
+/// delivers nothing, with no error anywhere. Pure so the decision is
+/// unit-testable without standing up a whole `Plugin::build`.
+#[cfg(feature = "connectors")]
+const fn binding_stream_matches_adapter(declared: &str, adapter: &str) -> bool {
+    // `const fn` cannot use `==` on `&str`.
+    let (a, b) = (declared.as_bytes(), adapter.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(feature = "connectors")]
+fn spawn_connectors(
+    registrations: &[ConnectorRegistration],
+    api_state: &crate::api::HarvestApiState,
+    metrics: &std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>,
+    workflows: &[WorkflowInfo],
+    dead_letter_pool: &DbPool,
+) -> Vec<ConnectorRuntimeHandle> {
+    let mut handles = Vec::with_capacity(registrations.len());
+    let sink: std::sync::Arc<dyn crate::connector::DeadLetterSink> = std::sync::Arc::new(
+        crate::connector::PostgresDeadLetterSink::new(dead_letter_pool.clone()),
+    );
+
+    // Last-wins, matching `HandlerRegistry` and the validation pass -- see
+    // `workflow_infos_by_name` for why first-wins is a correctness bug here.
+    let by_name = workflow_infos_by_name(workflows);
+
+    for registration in registrations {
+        let binding = std::sync::Arc::clone(&registration.binding);
+        let info = by_name.get(binding.target.workflow()).copied();
+        let runtime = crate::connector::ConnectorRuntime::for_binding(
+            std::sync::Arc::clone(&binding),
+            std::sync::Arc::clone(&registration.source),
+            api_state.clone(),
+            std::sync::Arc::clone(metrics),
+            info,
+        )
+        .with_dead_letter_sink(std::sync::Arc::clone(&sink));
+        let runtime = match registration.config {
+            Some(config) => runtime.with_config(config),
+            None => runtime,
+        };
+
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.child_token();
+        let handle = tokio::spawn(async move { runtime.run(cancel).await });
+        handles.push(ConnectorRuntimeHandle { shutdown, handle });
+    }
+    handles
 }
 
 /// Whether the generated MCP tool routes are about to be registered with no
@@ -554,11 +1044,17 @@ impl Plugin for HarvestPlugin {
             canary_config,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
+            #[cfg(feature = "connectors")]
+            connectors,
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+
+        // Autumn owns migrations for every set that lives in the application
+        // database (autumn-web 0.7). See `register_plugin_migrations`.
+        let app = register_plugin_migrations(app);
 
         let api_state = HarvestApiState::new();
 
@@ -606,6 +1102,192 @@ impl Plugin for HarvestPlugin {
                 &api_state,
             )
         };
+
+        // Issue #944: validate broker bindings before the builder is stashed
+        // in the runtime slot (`builder.workflow_infos()` is only available
+        // pre-build), so a misconfigured binding is a startup panic rather
+        // than a consumer that silently never dispatches anything.
+        #[cfg(feature = "connectors")]
+        if !connectors.is_empty() {
+            let bindings: Vec<_> = connectors
+                .iter()
+                .map(|c| std::sync::Arc::clone(&c.binding))
+                .collect();
+            let borrowed: Vec<&crate::connector::SourceBinding> =
+                bindings.iter().map(std::sync::Arc::as_ref).collect();
+            let dag_names: Vec<String> = builder
+                .dag_infos()
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string())
+                .collect();
+            // `validate_bindings` takes a slice of values; rebuild one from
+            // the Arc'd registrations without cloning the mappers.
+            if let Err(e) = crate::connector::validate_bindings_refs(
+                &borrowed,
+                builder.workflow_infos(),
+                &dag_names,
+            ) {
+                panic!("harvest connector configuration error: {e}");
+            }
+            // One source per binding. Sharing one across registrations gives
+            // each its own `OffsetTracker` over a single client, which loses
+            // messages on Kafka and silently splits the queue on SQS.
+            let identities: Vec<usize> = connectors
+                .iter()
+                .map(|r| std::sync::Arc::as_ptr(&r.source).cast::<()>() as usize)
+                .collect();
+            if let Some((i, j)) = first_shared_source(&identities) {
+                panic!(
+                    "harvest connector bindings '{}' and '{}' share one event source: each \
+                     binding gets its own consumer loop and its own offset tracker, so two \
+                     loops over one client would split the stream between them -- on Kafka \
+                     one tracker can commit past offsets the other has not made durable \
+                     (lost on a crash), and on SQS neither target would see every message. \
+                     Give each binding its own source. To fan one stream out to two targets, \
+                     use two Kafka consumers with distinct group ids, or two SQS queues \
+                     behind an SNS topic",
+                    connectors[i].binding.name, connectors[j].binding.name,
+                );
+            }
+            // The same clash reached a different way: two *separately
+            // constructed* sources over one physical subscription have
+            // distinct pointers, so the identity check above cannot see them,
+            // but they still compete for the same messages. An adapter that
+            // declares no identity keeps the pointer check only.
+            let subscriptions: Vec<Option<String>> = connectors
+                .iter()
+                .map(|r| r.source.subscription_identity())
+                .collect();
+            if let Some((i, j)) = first_shared_identity(&subscriptions) {
+                panic!(
+                    "harvest connector bindings '{}' and '{}' consume the same physical \
+                     subscription ('{}'): both receive loops compete for the same messages, \
+                     so each binding sees an arbitrary SUBSET rather than the whole stream -- \
+                     on SQS every receiver on a queue competes, and on Kafka two consumers in \
+                     one group split the partitions between them. To fan one stream out to \
+                     two targets, use two Kafka consumers with DISTINCT group ids, or two SQS \
+                     queues behind an SNS topic",
+                    connectors[i].binding.name,
+                    connectors[j].binding.name,
+                    subscriptions[i].as_deref().unwrap_or("<unknown>"),
+                );
+            }
+            // Two bindings on DISTINCT subscriptions consuming the same
+            // logical stream into the same target is legitimate fan-in across
+            // independent brokers, so it is not rejected -- but on one broker
+            // it double-dispatches every message (each binding derives its own
+            // idempotency key, since the name namespaces it), so say it once.
+            // Reached only when the identity check above passed, i.e. the two
+            // are genuinely different subscriptions.
+            let pairs: Vec<(&str, &str, Option<&str>)> = connectors
+                .iter()
+                .map(|r| {
+                    (
+                        r.binding.stream.as_str(),
+                        r.binding.target.workflow(),
+                        r.binding.target.signal_name(),
+                    )
+                })
+                .collect();
+            if let Some((i, j)) = first_duplicate_stream_target(&pairs) {
+                tracing::warn!(
+                    first = connectors[i].binding.name,
+                    second = connectors[j].binding.name,
+                    stream = connectors[i].binding.stream,
+                    workflow = connectors[i].binding.target.workflow(),
+                    "two harvest connector bindings consume the same stream into the same \
+                     target from different subscriptions: every message is dispatched TWICE \
+                     (each binding namespaces its own idempotency key by binding name, so \
+                     the two do not dedupe each other). Intentional for fan-in across \
+                     independent brokers; otherwise consolidate them or retarget one"
+                );
+            }
+            // Last-wins, so this warning describes the definition the engine
+            // will actually execute -- see `workflow_infos_by_name`.
+            let target_infos = workflow_infos_by_name(builder.workflow_infos());
+            for registration in &connectors {
+                assert!(
+                    binding_stream_matches_adapter(
+                        &registration.binding.stream,
+                        registration.source.stream(),
+                    ),
+                    "harvest connector binding '{}' declares stream '{}' but its adapter \
+                     consumes '{}': the two must match or the consumer would silently \
+                     never deliver anything",
+                    registration.binding.name,
+                    registration.binding.stream,
+                    registration.source.stream()
+                );
+                // Not fatal: a bounded dedupe guarantee is correct for most
+                // deployments, and only the operator knows how far back their
+                // broker can replay. But the bound is invisible otherwise, so
+                // say it out loud once at startup -- naming the knob that
+                // actually governs THIS binding's claim.
+                match untuned_dedupe_bound(
+                    crate::connector::resolve_idempotency_mode(
+                        registration.binding.target,
+                        registration.binding.idempotency_mode,
+                        target_infos
+                            .get(registration.binding.target.workflow())
+                            .copied(),
+                    ),
+                    registration.binding.target,
+                    builder.start_idempotency_window_config(),
+                    builder
+                        .retention_config()
+                        .effective_max_age(registration.binding.target.workflow()),
+                ) {
+                    Some(UntunedDedupeBound::StartIdempotencyWindow) => {
+                        tracing::warn!(
+                            binding = registration.binding.name,
+                            stream = registration.binding.stream,
+                            "harvest connector dedupes on broker coordinates, but \
+                             `start_idempotency_window` is the 24h default: a redelivery \
+                             arriving after the claim is purged would start a SECOND \
+                             execution. Size the window to how far back your broker can \
+                             replay (Kafka retention / SQS message retention) via \
+                             `HarvestBuilder::start_idempotency_window`"
+                        );
+                    }
+                    Some(UntunedDedupeBound::ExecutionRetention { max_age }) => {
+                        tracing::warn!(
+                            binding = registration.binding.name,
+                            stream = registration.binding.stream,
+                            workflow = registration.binding.target.workflow(),
+                            retention_secs = max_age.as_secs(),
+                            "harvest connector binding's dedupe record lives with its \
+                             EXECUTION ROW (a `signals_with_start` claim cascade-deletes \
+                             with the run; a `workflow_id` binding passes no claim at all \
+                             and dedupes on the reuse-policy attach): retention is the \
+                             bound here, NOT `start_idempotency_window`, which this path \
+                             never reserves. A redelivery arriving after the run is \
+                             collected would start a SECOND execution. Size \
+                             `RetentionConfig` for this workflow to at least how far back \
+                             your broker can replay"
+                        );
+                    }
+                    None => {}
+                }
+                assert!(
+                    crate::connector::broker_native_dead_letter_is_supported(
+                        registration.binding.dead_letter_mode,
+                        registration.source.has_native_dead_letter(),
+                    ),
+                    "harvest connector binding '{}' asks for broker-native dead-lettering, but \
+                     its adapter for stream '{}' reports no dead-letter destination that \
+                     abandoning a message feeds, so a poison message would be re-read forever \
+                     instead of being quarantined. Kafka has no per-message nack at all. SQS \
+                     needs a redrive policy on the queue: add one, or (when the source was built \
+                     with `SqsSource::new`, or its `GetQueueAttributes` probe was denied) declare \
+                     it with `SqsSourceConfig::has_redrive_policy(true)`. Otherwise drop \
+                     `.broker_native_dead_letter()` so poison messages land in \
+                     `harvest_connector_dead_letters` instead",
+                    registration.binding.name,
+                    registration.binding.stream,
+                );
+            }
+        }
 
         // Issue #597: generate the MCP tool routes before the builder is
         // stashed in the runtime slot. These are app-level typed routes
@@ -683,6 +1365,8 @@ impl Plugin for HarvestPlugin {
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             runtime: None,
+            #[cfg(feature = "connectors")]
+            connectors,
         }));
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
@@ -872,7 +1556,7 @@ async fn start_harvest_runtime(
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
         .set_workflow_result_notification_database_url(workflow_result_notification_url.clone());
-    ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
+    ensure_runtime_migrations(state.profile(), &app_config, &harvest_config).await?;
 
     let runtime_state = state.clone();
     let app_pool = state.pool().cloned();
@@ -882,6 +1566,11 @@ async fn start_harvest_runtime(
     let (builder, runtime_already_started) = {
         let mut guard = slot.lock().expect("harvest lock poisoned");
         (guard.builder.take(), guard.runtime.is_some())
+    };
+    #[cfg(feature = "connectors")]
+    let connector_registrations = {
+        let mut guard = slot.lock().expect("harvest lock poisoned");
+        std::mem::take(&mut guard.connectors)
     };
 
     if runtime_already_started {
@@ -931,6 +1620,15 @@ async fn start_harvest_runtime(
     let mut built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    // Issue #944: capture what the connector consumer loops need before
+    // `built` is moved into the runner. `metrics` is Arc-identical to the
+    // recorder the workers use, so connector samples land in the same sink.
+    #[cfg(feature = "connectors")]
+    let (built_metrics, built_workflow_infos) = (
+        Arc::clone(&built.telemetry().metrics),
+        built.workflow_infos().to_vec(),
+    );
 
     // Derive the API stale threshold from the worker heartbeat interval so that
     // /workers correctly classifies workers under non-default configurations.
@@ -1054,6 +1752,13 @@ async fn start_harvest_runtime(
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
     let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
+    // Issue #763 review (Codex finding): the transactional-start idempotency
+    // dedup window must honor the operator's configured
+    // `HarvestBuilder::start_idempotency_window`, the same value the HTTP
+    // start route and the purge scanner already use (see `api_state.set_start_idempotency_window`
+    // and `start_idempotency::set_purge_window_secs` above) -- not a hardcoded
+    // default.
+    let start_idempotency_window = built.start_idempotency_window;
     // Pre-flight: reject a multi-shard WorkerConfig before spawning any background
     // tasks.  The plugin configures WorkflowHandleClient with only shard-0's
     // LISTEN/NOTIFY URL; workflows hashed to non-zero shards would fail
@@ -1239,6 +1944,25 @@ async fn start_harvest_runtime(
     .with_codecs(payload_codecs)
     .with_shared_state(runner.api_runtime().registry().shared_state())
     .with_handlers(query_handlers, update_handlers)
+    // Issue #763: registered `WorkflowInfo`s so the in-process transactional
+    // start API can resolve defaults (execution_timeout, sla, concurrency key)
+    // and published input-schema validation, the same way the HTTP start
+    // route does.
+    //
+    // Issue #763 review ("Exclude registered DAGs from transactional workflow
+    // starts"): unified DAGs are filtered out by `transactional_client_workflows`
+    // below — see its doc comment for the full rationale.
+    .with_workflows(transactional_client_workflows(
+        runner.api_runtime().registry().workflows.values(),
+        runner.api_runtime().registered_dag_names(),
+    ))
+    // Issue #763 review ("Carry the default queue on the handle client"): the
+    // SAME runtime-carried queue list `POST /workflows/{name}/start` resolves
+    // its own default queue from, so a start with no explicit
+    // `TransactionalStartOptions::queue_name` lands on a queue this fleet's
+    // workers actually poll instead of the (possibly unset or stale)
+    // process-global default.
+    .with_queues(runner.api_runtime().queues().iter().map(String::as_str))
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_chain_timeout(max_workflow_chain_timeout)
@@ -1248,6 +1972,9 @@ async fn start_harvest_runtime(
     .with_history_policy(runner.api_runtime().registry().history_policy())
     .with_default_debounce_max_wait(default_debounce_max_wait)
     .with_max_workflow_attempts(max_workflow_attempts)
+    // Issue #763 review: use the operator-configured idempotency window for
+    // transactional-start dedup, matching the HTTP start route.
+    .with_start_idempotency_window(start_idempotency_window)
     // Issue #684: wire the engine recorder so the in-process typed-update path
     // emits harvest.update.admitted, matching the HTTP/UI admission paths.
     .with_metrics(runner.api_runtime().registry().telemetry().metrics.clone());
@@ -1356,6 +2083,8 @@ async fn start_harvest_runtime(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: autumn_harvest::prelude::Priority::default(),
                         max_workflow_input_bytes,
                         start_at: None,
@@ -1512,12 +2241,30 @@ async fn start_harvest_runtime(
     // `fail` action cannot let a worker claim and terminally fail an orphaned
     // run before the abort. See the gate block above the runner start.
 
+    // Issue #944: spawn one consumer loop per registered broker binding, after
+    // `api_state.install(...)` above so the very first message a connector
+    // pulls can already reach the dispatch path.
+    #[cfg(feature = "connectors")]
+    let connectors = if connector_registrations.is_empty() {
+        Vec::new()
+    } else {
+        spawn_connectors(
+            &connector_registrations,
+            api_state,
+            &built_metrics,
+            &built_workflow_infos,
+            &harvest_db_pool.clone_inner(),
+        )
+    };
+
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
         guard.runtime = Some(HarvestRuntime {
             runner,
             outbox,
             gate_refresh,
+            #[cfg(feature = "connectors")]
+            connectors,
         });
     }
 
@@ -1525,6 +2272,35 @@ async fn start_harvest_runtime(
     // F-round7); `stop_harvest_runtime` clears them (ptr-eq guarded) on shutdown.
     admission_guard.commit();
     Ok(())
+}
+
+/// Workflows to expose on the in-process transactional-start client (issue
+/// #763), with unified DAGs excluded (issue #763 review, "Exclude registered
+/// DAGs from transactional workflow starts").
+///
+/// A unified DAG's shadow `WorkflowInfo` (issue #256) lives in
+/// `registry.workflows` right alongside ordinary workflows, but
+/// `POST /workflows/{name}/start` rejects a DAG name outright and points
+/// callers at `POST /dags/{name}/trigger` instead — the only path that runs
+/// `trigger_unified_dag`'s pause / `max_active_runs` admission checks and
+/// schedule bookkeeping. Passing every registry workflow straight through
+/// would let `start_workflow_transactional` start a paused or
+/// capacity-saturated DAG as an ordinary workflow execution, silently
+/// bypassing those checks. Filtering here — against the exact same
+/// `registered_dag_names()` set `HarvestApiRuntime::is_registered_dag` checks
+/// against for the HTTP route — means the transactional client never
+/// registers a DAG name at all; a caller naming one is rejected the same way
+/// any other unregistered workflow name is. Extracted as a pure function
+/// (rather than an inline closure in the builder chain) so the exclusion is
+/// directly unit-testable without booting a plugin/database.
+fn transactional_client_workflows<'a>(
+    workflows: impl Iterator<Item = &'a WorkflowInfo>,
+    registered_dag_names: &HashSet<String>,
+) -> Vec<WorkflowInfo> {
+    workflows
+        .filter(|info| !registered_dag_names.contains(info.name))
+        .cloned()
+        .collect()
 }
 
 fn resolve_harvest_pool(
@@ -1599,6 +2375,13 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         .metrics
         .clone();
 
+    // Issue #944: stop the broker consumers FIRST, before the runner. Each
+    // `ConnectorRuntime::run` drains its in-flight dispatches before
+    // returning, so a message whose dispatch already committed still gets
+    // acknowledged rather than being redelivered after the restart.
+    #[cfg(feature = "connectors")]
+    stop_connectors(runtime.connectors).await;
+
     if let Some(gate_refresh) = runtime.gate_refresh {
         gate_refresh.shutdown.cancel();
         let _ = gate_refresh.handle.await;
@@ -1640,26 +2423,80 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     api_state.clear();
 }
 
-fn ensure_runtime_migrations(
+/// Runs pending-migration checks for the outbox, Harvest storage, and plugin
+/// Harvest storage databases, awaiting the result off the calling task's own
+/// async executor thread.
+///
+/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous and
+/// genuinely block the calling thread: as of autumn-web 0.7 both route through
+/// `with_migration_connection!`, which runs the connect *and* the migration
+/// body on a freshly spawned `std::thread::scope` thread and `join()`s it.
+/// `spawn_blocking` keeps that join off an async worker thread, where it would
+/// otherwise stall the worker for the full duration of the migration.
+///
+/// Historical note (issue #1232): under autumn-web 0.6 this wrapper was also
+/// required for *correctness*, not just for scheduling hygiene. A
+/// TLS-requiring `sslmode` (`require`/`verify-ca`/`verify-full`) used to reuse
+/// the *current* Tokio runtime handle and call `Handle::block_on` on it --
+/// which Tokio forbids (and panics on) from a thread already driving that
+/// runtime's tasks, exactly what an `on_startup` hook is. autumn-web 0.7 fixed
+/// that upstream by moving the whole operation onto a thread that has never
+/// entered a runtime, so the TLS path is now safe from any caller context.
+/// `migration_body_is_safe_to_call_directly_from_an_async_context` below pins
+/// that upstream guarantee, so a regression in it is caught here rather than
+/// resurfacing as a production startup panic.
+async fn ensure_runtime_migrations(
     profile: &str,
     app_config: &AutumnConfig,
     harvest_config: &HarvestRuntimeConfig,
 ) -> autumn_web::AutumnResult<()> {
-    if let Some(app_database_url) = app_config.database.url.as_deref() {
-        apply_migrations_for_profile(
-            profile,
-            app_database_url,
-            OUTBOX_MIGRATIONS,
-            "Harvest workflow outbox",
-        )?;
-    }
+    let profile = profile.to_owned();
+    let app_config = app_config.clone();
+    let harvest_config = harvest_config.clone();
 
+    match tokio::task::spawn_blocking(move || {
+        ensure_runtime_migrations_blocking(&profile, &app_config, &harvest_config)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_error) => Err(AutumnError::service_unavailable_msg(format!(
+            "harvest runtime migrations task failed to join: {join_error}"
+        ))),
+    }
+}
+
+/// The synchronous migration-check body. **Must never be called from a thread
+/// that is currently driving a Tokio runtime's async tasks** -- against a
+/// TLS-requiring database URL it panics (see [`ensure_runtime_migrations`]).
+/// Sync contexts (the CLI) and `spawn_blocking` tasks are both fine; call
+/// [`ensure_runtime_migrations`] from an async context instead.
+fn ensure_runtime_migrations_blocking(
+    profile: &str,
+    app_config: &AutumnConfig,
+    harvest_config: &HarvestRuntimeConfig,
+) -> autumn_web::AutumnResult<()> {
+    // Autumn owns every set that lives in the APPLICATION database -- the
+    // outbox always, plus the two Harvest sets under `Embedded`, where the
+    // application database *is* the Harvest database. They are registered in
+    // `register_plugin_migrations` and applied during `setup_database`, before
+    // this startup hook runs. Under `Embedded` there is therefore nothing left
+    // for the plugin to migrate.
     let harvest_database_url = match harvest_config.mode {
-        HarvestMode::Embedded => app_config.database.url.as_deref().ok_or_else(|| {
-            AutumnError::service_unavailable_msg(
-                "autumn-harvest requires database.url when harvest.mode is embedded",
-            )
-        })?,
+        HarvestMode::Embedded => {
+            // Still validate the invariant Autumn cannot check for us: with no
+            // `database.url` there is no Harvest storage at all, and failing
+            // here is far clearer than a missing-table error later.
+            if app_config.database.url.is_none() {
+                return Err(AutumnError::service_unavailable_msg(
+                    "autumn-harvest requires database.url when harvest.mode is embedded",
+                ));
+            }
+            return Ok(());
+        }
+        // A dedicated Harvest database Autumn has no handle on: `plugin_migrations`
+        // only ever targets the application's primary database, so these two sets
+        // are applied here, against `harvest.database.url`.
         HarvestMode::Split | HarvestMode::External => {
             harvest_config.database.url.as_deref().ok_or_else(|| {
                 AutumnError::service_unavailable_msg(
@@ -1674,6 +2511,17 @@ fn ensure_runtime_migrations(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+    )?;
+
+    // Plugin-owned tables that live in the harvest database (issue #944's
+    // connector dead-letter table). Applied to the same dedicated URL as the
+    // core migrations above so `Split`/`External` deployments get them where
+    // the code that writes them actually connects.
+    apply_migrations_for_profile(
+        profile,
+        harvest_database_url,
+        PLUGIN_HARVEST_MIGRATIONS,
+        "Harvest plugin storage",
     )
 }
 
@@ -1924,8 +2772,58 @@ mod tests {
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
 
+    /// Shutting a fleet of connectors down must not serialize their drains.
+    ///
+    /// Deliberately *not* a wall-clock threshold: the first connector's drain
+    /// is made to genuinely depend on the second having been cancelled. Under
+    /// a cancel-then-await-one-at-a-time shutdown that dependency can never be
+    /// satisfied — the second connector's cancellation is still queued behind
+    /// the first connector's `await` — so the shutdown deadlocks and the
+    /// timeout below fires. It is exactly the deadlock a real fleet risks in
+    /// slow motion, and it either happens or it does not.
+    #[cfg(feature = "connectors")]
+    #[tokio::test]
+    async fn every_connector_is_cancelled_before_any_drain_is_awaited() {
+        let (second_cancelled_tx, second_cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first_shutdown = CancellationToken::new();
+        let first = ConnectorRuntimeHandle {
+            shutdown: first_shutdown.clone(),
+            handle: tokio::spawn(async move {
+                first_shutdown.cancelled().await;
+                // Stand-in for "this drain outlives the next connector's
+                // cancellation" — true of any real drain that is still
+                // finishing when the next connector is asked to stop.
+                let _ = second_cancelled_rx.await;
+            }),
+        };
+
+        let second_shutdown = CancellationToken::new();
+        let second = ConnectorRuntimeHandle {
+            shutdown: second_shutdown.clone(),
+            handle: tokio::spawn(async move {
+                second_shutdown.cancelled().await;
+                let _ = second_cancelled_tx.send(());
+            }),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_connectors(vec![first, second]),
+        )
+        .await
+        .expect(
+            "shutdown must cancel every connector before awaiting any of their drains; \
+             awaiting one at a time leaves later connectors running — and consuming — \
+             for the whole of the earlier ones' bounded drains",
+        );
+    }
+
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "echo",
             module: "tests",
@@ -1994,7 +2892,56 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
+    }
+
+    /// Issue #763 review, "Exclude registered DAGs from transactional workflow
+    /// starts": `transactional_client_workflows` must drop exactly the names
+    /// present in `registered_dag_names` and keep every other registered
+    /// workflow untouched, mirroring what `HarvestApiRuntime::is_registered_dag`
+    /// checks against for the HTTP start route.
+    #[test]
+    fn transactional_client_workflows_excludes_registered_dag_names() {
+        let plain = fake_workflow_info();
+        let dag_shadow = WorkflowInfo {
+            name: "daily",
+            ..fake_workflow_info()
+        };
+        let registered_dags: HashSet<String> = HashSet::from(["daily".to_string()]);
+
+        let kept =
+            transactional_client_workflows([&plain, &dag_shadow].into_iter(), &registered_dags);
+
+        let kept_names: Vec<&str> = kept.iter().map(|w| w.name).collect();
+        assert_eq!(
+            kept_names,
+            vec!["echo"],
+            "the DAG-shadow WorkflowInfo (name \"daily\", present in \
+             registered_dag_names) must be excluded so a caller naming it hits the \
+             same 'not registered' rejection as any other unregistered workflow \
+             name -- never a silent bypass of trigger_unified_dag's pause / \
+             max_active_runs admission checks"
+        );
+    }
+
+    /// Regression guard for the fix above: with no DAGs registered at all, every
+    /// workflow passes through unchanged -- the filter must not accidentally cut
+    /// out ordinary workflows.
+    #[test]
+    fn transactional_client_workflows_keeps_everything_when_no_dags_registered() {
+        let a = fake_workflow_info();
+        let b = WorkflowInfo {
+            name: "other",
+            ..fake_workflow_info()
+        };
+        let registered_dags: HashSet<String> = HashSet::new();
+
+        let kept = transactional_client_workflows([&a, &b].into_iter(), &registered_dags);
+
+        let kept_names: Vec<&str> = kept.iter().map(|w| w.name).collect();
+        assert_eq!(kept_names, vec!["echo", "other"]);
     }
 
     #[cfg(feature = "webhooks")]
@@ -2020,6 +2967,42 @@ mod tests {
             handler: dispatch,
             queue: None,
         }
+    }
+
+    #[test]
+    fn workflow_log_persistence_threads_the_policy_into_the_built_harvest() {
+        // Issue #790 (review P1): the durable log sink lives on
+        // `HarvestBuilder`, and `HarvestPlugin` holds its builder privately
+        // behind a hand-picked forwarder set. Without this forwarder the
+        // feature has NO enabling path for a plugin-wired app -- which is the
+        // primary documented deployment shape, and exactly what every doc
+        // snippet shows.
+        let built = HarvestPlugin::new()
+            .workflow_log_persistence(
+                autumn_harvest::WorkflowLogPolicy::new()
+                    .with_max_lines(7)
+                    .with_max_message_bytes(64),
+            )
+            .builder
+            .try_build()
+            .expect("builder must build");
+
+        let policy = built
+            .workflow_log_policy
+            .expect("the forwarded policy must reach BuiltHarvest");
+        assert_eq!(policy.max_lines(), 7);
+        assert_eq!(policy.max_message_bytes(), 64);
+    }
+
+    #[test]
+    fn workflow_log_persistence_is_off_unless_the_forwarder_is_called() {
+        // The AC6 opt-in boundary: absent the call the sink is disabled and
+        // `ctx.logger()` is byte-for-byte today's tracing-only behaviour.
+        let built = HarvestPlugin::new()
+            .builder
+            .try_build()
+            .expect("builder must build");
+        assert!(built.workflow_log_policy.is_none());
     }
 
     #[cfg(feature = "webhooks")]
@@ -2315,6 +3298,146 @@ mod tests {
         assert_eq!(harvest_pool.status().max_size, 10);
     }
 
+    /// Fixture for the two tests below: a `Split`-mode `AutumnConfig`/
+    /// `HarvestRuntimeConfig` pair whose **Harvest** database URL requires
+    /// TLS (`sslmode=require`), pointed at a port nothing is listening on.
+    /// `127.0.0.1:1` refuses the connection almost instantly on every
+    /// platform, so these tests are hermetic and fast -- no real
+    /// TLS-enabled Postgres server is needed. Reaching
+    /// `autumn_web::migrate`'s rustls connection path at all is what
+    /// triggers the "`block_on` from within a runtime" hazard, before any
+    /// network I/O happens -- so whether the target is actually reachable
+    /// is irrelevant to what these tests exercise.
+    ///
+    /// `Split` (rather than `Embedded`) is load bearing: since Autumn took
+    /// ownership of the application database's migrations via
+    /// `plugin_migrations`, a dedicated Harvest database is the *only* thing
+    /// the plugin still migrates itself, so it is the only mode that reaches
+    /// the connection path this regression is about. Under `Embedded`,
+    /// `ensure_runtime_migrations_blocking` returns before connecting and both
+    /// tests below would pass vacuously.
+    fn tls_url_fixture() -> (AutumnConfig, HarvestRuntimeConfig) {
+        let app_config = AutumnConfig {
+            database: DatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/app".to_owned()),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Split,
+            database: crate::config::HarvestDatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/harvest?sslmode=require".to_owned()),
+            },
+            ..HarvestRuntimeConfig::default()
+        };
+        (app_config, harvest_config)
+    }
+
+    /// Migration-only commands build plugins without running startup hooks, so
+    /// invalid Harvest configuration must fail during registration rather than
+    /// silently producing an incomplete migration plan.
+    #[test]
+    #[should_panic(expected = "cannot register Harvest migrations: configuration error: bad mode")]
+    fn migration_registration_rejects_unreadable_harvest_config() {
+        migration_registration_mode(Err(autumn_web::config::ConfigError::Validation(
+            "bad mode".to_owned(),
+        )));
+    }
+
+    /// Pins the ownership split itself: under `Embedded` the plugin migrates
+    /// nothing (Autumn applied the registered sets during `setup_database`,
+    /// before this startup hook ran), so the body returns `Ok` **without**
+    /// dialling the database -- proven here by a URL that would otherwise
+    /// fail to connect. This is what makes `tls_url_fixture`'s use of
+    /// `Split` necessary rather than incidental.
+    #[test]
+    fn embedded_mode_migrates_nothing_and_never_connects() {
+        let app_config = AutumnConfig {
+            database: DatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/app".to_owned()),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Embedded,
+            ..HarvestRuntimeConfig::default()
+        };
+
+        let result = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+
+        assert!(
+            result.is_ok(),
+            "embedded mode must short-circuit before connecting: {result:?}"
+        );
+    }
+
+    /// The one invariant Autumn cannot check for us: `Embedded` means "Harvest
+    /// lives in the application database", so with no `database.url` there is
+    /// no Harvest storage at all. Failing here beats a missing-table error
+    /// deep in the first workflow start.
+    #[test]
+    fn embedded_mode_without_a_database_url_is_rejected() {
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Embedded,
+            ..HarvestRuntimeConfig::default()
+        };
+
+        let result =
+            ensure_runtime_migrations_blocking("dev", &AutumnConfig::default(), &harvest_config);
+
+        assert!(
+            result.is_err(),
+            "embedded mode with no database.url must be rejected: {result:?}"
+        );
+    }
+
+    /// Pins the autumn-web 0.7 upstream fix that the wrapper's original
+    /// rationale depended on (issue #1232): the synchronous migration body is
+    /// now safe to call *directly* from an async task -- the shape a
+    /// `#[tokio::test]` gives, matching the real `on_startup` hook -- even
+    /// against a TLS-requiring URL. Under 0.6 the rustls branch reused this
+    /// task's own runtime handle and panicked with "Cannot start a runtime
+    /// from within a runtime"; 0.7 runs connect and body on a freshly spawned
+    /// thread that has never entered a runtime.
+    ///
+    /// `ensure_runtime_migrations` still wraps this in `spawn_blocking`, now
+    /// purely so the blocking `join()` never stalls an async worker thread.
+    /// If a future autumn-web reintroduces the ambient-runtime dependency,
+    /// this test fails loudly here instead of at a customer's startup.
+    #[tokio::test]
+    async fn migration_body_is_safe_to_call_directly_from_an_async_context() {
+        let (app_config, harvest_config) = tls_url_fixture();
+
+        let result = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+
+        assert!(
+            result.is_err(),
+            "127.0.0.1:1 refuses the connection, so this must return an ordinary \
+             error rather than panicking the calling task: {result:?}"
+        );
+    }
+
+    /// Regression test for `ensure_runtime_migrations` failing on a
+    /// TLS-enabled Postgres: it must be safely callable from within an
+    /// async context (replicating the real `start_harvest_runtime`/
+    /// `on_startup` call site) against a TLS-requiring database URL.
+    /// Before the fix this panicked the calling task instead of returning
+    /// an ordinary connection error.
+    #[tokio::test]
+    async fn ensure_runtime_migrations_does_not_panic_on_a_tls_requiring_database_url() {
+        let (app_config, harvest_config) = tls_url_fixture();
+
+        let result = ensure_runtime_migrations("dev", &app_config, &harvest_config).await;
+
+        assert!(
+            result.is_err(),
+            "127.0.0.1:1 refuses the connection, so this must fail cleanly with an \
+             ordinary error rather than panicking the calling task: {result:?}"
+        );
+    }
+
     #[test]
     fn harvest_plugin_forwards_updates_and_queries_to_builder() {
         // Issue #597 gap-fill: #[update(..., mcp)] handlers must reach the
@@ -2416,5 +3539,354 @@ mod tests {
             .expect("valid retention config should build");
         assert_eq!(built.retention().max_age_secs, Some(42));
         assert_eq!(built.retention().tick_interval_secs, 7);
+    }
+
+    // ── Connector build-time validation (issue #944) ──────────────────────
+    //
+    // These guard the two inline `assert!`s in `Plugin::build`, which are
+    // otherwise only reachable by standing up a whole plugin. Both failures
+    // are SILENT in production if they slip through: a stream mismatch makes
+    // the consumer poll forever and deliver nothing, and an unsupported
+    // broker-native mode re-reads a poison message forever.
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_binding_whose_stream_does_not_match_its_adapter_is_rejected() {
+        assert!(binding_stream_matches_adapter("orders", "orders"));
+        assert!(!binding_stream_matches_adapter("orders", "orders.v2"));
+        assert!(!binding_stream_matches_adapter("orders", "payments"));
+        // Length-equal but different, so a naive length check cannot pass.
+        assert!(!binding_stream_matches_adapter("orders", "ordera"));
+        assert!(binding_stream_matches_adapter("", ""));
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn two_registrations_sharing_one_source_are_rejected() {
+        // Two receive loops over ONE client, each with its own OffsetTracker,
+        // is the failure this catches: on Kafka one loop can commit a mark
+        // covering offsets the other has not made durable, permanently
+        // skipping them on a crash; on SQS the stream is split between the
+        // bindings so neither target sees every message.
+        assert_eq!(first_shared_source(&[1, 2, 3]), None);
+        assert_eq!(first_shared_source(&[1, 2, 1]), Some((0, 2)));
+        assert_eq!(first_shared_source(&[7, 7]), Some((0, 1)));
+        // Reports the FIRST offending pair, so the panic names a stable pair
+        // rather than whichever one the iteration order happened to reach.
+        assert_eq!(first_shared_source(&[4, 4, 5, 5]), Some((0, 1)));
+        assert_eq!(first_shared_source(&[]), None);
+        assert_eq!(first_shared_source(&[9]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn two_sources_on_one_physical_subscription_are_rejected() {
+        // Pointer identity only catches a *shared* `Arc`. Two separately
+        // constructed sources over the same physical subscription have
+        // distinct pointers and compete for the same messages, so each target
+        // sees an arbitrary subset -- the same split the shared-`Arc` case
+        // produces, reached a different way.
+        let q = |s: &str| Some(s.to_string());
+        assert_eq!(
+            first_shared_identity(&[q("sqs:a"), q("sqs:b")]),
+            None,
+            "distinct subscriptions are the normal case"
+        );
+        assert_eq!(
+            first_shared_identity(&[q("sqs:a"), q("sqs:a")]),
+            Some((0, 1)),
+            "two sources on one queue url must be rejected"
+        );
+        // Two Kafka consumers on ONE topic under DISTINCT group ids is the
+        // sanctioned fan-out -- the existing panic message recommends it -- so
+        // the identity must include the group, not just the topic.
+        assert_eq!(
+            first_shared_identity(&[q("kafka:g1/orders"), q("kafka:g2/orders")]),
+            None,
+            "distinct consumer groups on one topic are a legitimate fan-out"
+        );
+        assert_eq!(
+            first_shared_identity(&[q("kafka:g1/orders"), q("kafka:g1/orders")]),
+            Some((0, 1)),
+            "two consumers in one group compete for the same partitions"
+        );
+        // An adapter that declares no identity is not evidence of a clash:
+        // two `None`s must never match each other, or every pair of custom
+        // adapters would be rejected on sight.
+        assert_eq!(first_shared_identity::<String>(&[None, None]), None);
+        assert_eq!(first_shared_identity(&[None, q("sqs:a")]), None);
+        // Reports the FIRST offending pair, matching `first_shared_source`.
+        assert_eq!(
+            first_shared_identity(&[q("a"), q("a"), q("b"), q("b")]),
+            Some((0, 1))
+        );
+        assert_eq!(first_shared_identity::<String>(&[]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_duplicate_stream_target_pair_is_warned_about_not_rejected() {
+        // Rejecting this would break legitimate fan-in from two independent
+        // brokers exposing the same stream name, which no operator can work
+        // around (a Kafka source's `stream()` IS the topic, and the plugin
+        // requires the binding to match it). It still double-dispatches on one
+        // broker, so it is worth a warning -- which is what this drives.
+        let p = |stream, wf, sig| (stream, wf, sig);
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "order_flow", None),
+                p("orders", "order_flow", None),
+            ]),
+            Some((0, 1)),
+        );
+        // A different target on one stream is an ordinary fan-out.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "order_flow", None),
+                p("orders", "audit_flow", None),
+            ]),
+            None,
+        );
+        // The signal name is part of the target: two `signals_with_start`
+        // bindings delivering DIFFERENT signals from one stream is normal.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "cart", Some("add_item")),
+                p("orders", "cart", Some("remove_item")),
+            ]),
+            None,
+        );
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "cart", Some("add_item")),
+                p("orders", "cart", Some("add_item")),
+            ]),
+            Some((0, 1)),
+        );
+        // Reports the FIRST offending pair, matching its siblings.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("a", "w", None),
+                p("a", "w", None),
+                p("b", "w", None),
+                p("b", "w", None),
+            ]),
+            Some((0, 1)),
+        );
+        assert_eq!(first_duplicate_stream_target(&[]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_duplicate_workflow_name_resolves_last_wins_everywhere() {
+        // `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+        // `HashMap`, so a name registered twice resolves LAST-wins -- that is
+        // the info the engine actually executes. Every connector path that
+        // reads a target's info must agree, or the startup warning describes a
+        // definition the runtime will never run: a first *throttled* definition
+        // followed by a plain one makes the runtime dedupe on broker
+        // coordinates while a first-wins lookup suppresses the 24h
+        // claim-lifetime warning, leaving the operator unaware that a late
+        // replay can start a second execution.
+        let named = |name| WorkflowInfo {
+            name,
+            ..fake_workflow_info()
+        };
+        let throttled = named("order_flow").with_throttle(
+            autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
+                .unwrap(),
+        );
+        let plain = named("order_flow");
+        let other = named("cart");
+
+        let registered = [throttled, plain, other];
+        let map = workflow_infos_by_name(&registered);
+        assert!(
+            map["order_flow"].throttle.is_none(),
+            "the LAST definition of a duplicated name must win, matching \
+             HandlerRegistry -- a first-wins lookup would return the throttled one"
+        );
+        assert_eq!(map["cart"].name, "cart");
+        assert_eq!(map.len(), 2, "a duplicated name occupies one entry");
+        assert!(workflow_infos_by_name(&[]).is_empty());
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_signals_with_start_binding_is_bounded_by_retention_not_the_window() {
+        use crate::connector::{ConnectorTarget, IdempotencyMode};
+        use std::time::Duration;
+
+        const STARTS: ConnectorTarget = ConnectorTarget::Starts {
+            workflow: "order_flow",
+        };
+        const SIGNALS: ConnectorTarget = ConnectorTarget::SignalsWithStart {
+            workflow: "cart",
+            signal_name: "add_item",
+        };
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+
+        // `Starts` reserves a `harvest_start_idempotency` row, so the window IS
+        // the bound and an untuned one is the thing worth saying.
+        assert_eq!(
+            untuned_dedupe_bound(IdempotencyMode::BrokerCoordinates, STARTS, None, None),
+            Some(UntunedDedupeBound::StartIdempotencyWindow),
+        );
+        assert_eq!(
+            untuned_dedupe_bound(IdempotencyMode::BrokerCoordinates, STARTS, Some(week), None),
+            None,
+            "an explicit window is a considered one",
+        );
+        // Even a *shorter* explicit window is a deliberate choice.
+        assert_eq!(
+            untuned_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                STARTS,
+                Some(Duration::from_secs(60)),
+                None,
+            ),
+            None,
+        );
+        // Retention is irrelevant to a `Starts` binding: its claim is its own
+        // `harvest_start_idempotency` row, which outlives the execution.
+        assert_eq!(
+            untuned_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                STARTS,
+                Some(week),
+                Some(Duration::from_secs(60)),
+            ),
+            None,
+        );
+
+        // `SignalsWithStart` persists its key ONLY on `harvest_signals`, which
+        // is ON DELETE CASCADE on its execution. So retention deleting the run
+        // deletes the claim, and the window does nothing for this path -- which
+        // is exactly why tuning it must NOT silence the warning.
+        assert_eq!(
+            untuned_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                SIGNALS,
+                Some(week),
+                Some(Duration::from_secs(3 * 24 * 60 * 60)),
+            ),
+            Some(UntunedDedupeBound::ExecutionRetention {
+                max_age: Duration::from_secs(3 * 24 * 60 * 60),
+            }),
+            "a tuned window must not silence the retention bound it does not govern",
+        );
+
+        // Retention is OFF by default, and then the signal row -- and with it
+        // the claim -- outlives every window. Nothing to warn about.
+        assert_eq!(
+            untuned_dedupe_bound(IdempotencyMode::BrokerCoordinates, SIGNALS, None, None),
+            None,
+            "with retention off the claim is unbounded, which is stronger, not weaker",
+        );
+
+        // `WorkflowId` rides neither *claim table*, but that does not make it
+        // unbounded -- see `a_workflow_id_binding_is_bounded_by_retention_too`.
+        assert_eq!(
+            untuned_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, None),
+            None,
+            "with retention off nothing deletes the execution row, so the attach is unbounded",
+        );
+    }
+
+    /// `WorkflowId` dedupe is bounded by retention, not by nothing.
+    ///
+    /// The dispatcher passes `idempotency_key: None` in this mode, so dedupe
+    /// rests entirely on the `(workflow_name, workflow_id)` reuse-policy attach
+    /// -- resolved against the **execution row**. Retention deleting that row
+    /// deletes the only record that a redelivery was already handled, so the
+    /// next one starts a fresh run. `start_idempotency_window` governs a claim
+    /// table this path never touches, so naming it would be the wrong remedy.
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_workflow_id_binding_is_bounded_by_retention_too() {
+        use crate::connector::{ConnectorTarget, IdempotencyMode};
+        use std::time::Duration;
+
+        const STARTS: ConnectorTarget = ConnectorTarget::Starts {
+            workflow: "order_flow",
+        };
+        let three_days = Duration::from_secs(3 * 24 * 60 * 60);
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+
+        assert_eq!(
+            untuned_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, Some(three_days)),
+            Some(UntunedDedupeBound::ExecutionRetention {
+                max_age: three_days,
+            }),
+            "an execution-row attach is bounded by how long that row survives",
+        );
+
+        // Same reason the SignalsWithStart case reports through a tuned window:
+        // this knob does not govern the execution row at all.
+        assert_eq!(
+            untuned_dedupe_bound(
+                IdempotencyMode::WorkflowId,
+                STARTS,
+                Some(week),
+                Some(three_days),
+            ),
+            Some(UntunedDedupeBound::ExecutionRetention {
+                max_age: three_days,
+            }),
+            "a tuned start-idempotency window must not silence a bound it does not govern",
+        );
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn connector_target_workflow_resolution_is_last_wins_like_the_registry() {
+        // `spawn_connectors` resolves a binding's target `WorkflowInfo` from a
+        // last-wins map because that is what `HandlerRegistry` itself does
+        // when it collapses the builder's `Vec` into a `HashMap`. A first-wins
+        // `.find()` would hand the connector a DIFFERENT info than the engine
+        // will actually execute -- e.g. an un-throttled one -- silently
+        // resolving the wrong `IdempotencyMode` and defeating the very
+        // backpressure the operator configured.
+        let mut plain = fake_workflow_info();
+        plain.name = "dup";
+        let mut throttled = fake_workflow_info();
+        throttled.name = "dup";
+        throttled.throttle = Some(autumn_harvest::throttle::ThrottlePolicy {
+            refill_per_sec: 1.0,
+            burst: 1.0,
+            key_expr: None,
+            schedule_to_start: None,
+        });
+
+        let workflows = [plain, throttled];
+        let by_name: std::collections::HashMap<&str, &WorkflowInfo> =
+            workflows.iter().map(|w| (w.name, w)).collect();
+        let resolved = by_name.get("dup").copied().expect("registered");
+
+        assert!(
+            resolved.throttle.is_some(),
+            "last-wins must win: the engine executes the LAST registration, so \
+             the connector must resolve its idempotency mode from that one",
+        );
+        // ...and that really does change the mode, so the distinction matters.
+        assert_eq!(
+            crate::connector::resolve_idempotency_mode(
+                crate::connector::ConnectorTarget::Starts { workflow: "dup" },
+                None,
+                Some(resolved),
+            ),
+            crate::connector::IdempotencyMode::WorkflowId,
+            "a deferred-admission target cannot carry a keyed start",
+        );
+        assert_eq!(
+            crate::connector::resolve_idempotency_mode(
+                crate::connector::ConnectorTarget::Starts { workflow: "dup" },
+                None,
+                Some(&workflows[0]),
+            ),
+            crate::connector::IdempotencyMode::BrokerCoordinates,
+            "the FIRST registration would have resolved differently -- which is \
+             exactly the silent bug last-wins resolution prevents",
+        );
     }
 }

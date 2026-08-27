@@ -176,6 +176,8 @@ fn classic_dag_with_gate_is_rejected_at_build_time() {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
 
     let result = HarvestBuilder::new()
@@ -234,6 +236,8 @@ mod gate_signal_name_is_not_a_local_activity {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
 
         let result = HarvestBuilder::new()

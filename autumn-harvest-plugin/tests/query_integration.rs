@@ -151,6 +151,9 @@ fn continue_as_new_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "progress_wf",
         module: "tests",
@@ -176,6 +179,9 @@ fn progress_info() -> WorkflowInfo {
 
 fn continue_as_new_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "continue_as_new_wf",
         module: "tests",
@@ -241,6 +247,9 @@ fn deadline_probe_workflow<'a>(
 
 fn deadline_probe_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "deadline_probe_wf",
         module: "tests",
@@ -266,6 +275,9 @@ fn deadline_probe_info() -> WorkflowInfo {
 
 fn spin_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "spin_wf",
         module: "tests",
@@ -650,6 +662,7 @@ async fn ac2_continued_as_new_answers_200_with_internal_state() {
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
         input: json!({ "carry": 2 }),
+        new_workflow_type: None,
     });
     let exec_id = seed_execution(
         &pool,

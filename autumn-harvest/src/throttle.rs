@@ -148,6 +148,14 @@ pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 #[cfg(feature = "db")]
 const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Re-defer backoff for a row blocked by an exhausted per-tenant quota
+/// (issue #946) at fire time — same value and same rationale as
+/// [`GATE_REDEFER_BACKOFF`] (a separate constant purely for the log/intent
+/// clarity of naming the two distinct block causes independently; nothing
+/// depends on them staying numerically equal).
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Maximum allowed byte length for a resolved throttle key.
 ///
 /// Keys longer than this are rejected at admission with
@@ -427,6 +435,16 @@ pub struct PendingThrottleRecord {
 }
 
 /// One `(workflow_name, throttle_key)` backlog group for the admin read.
+///
+/// Alongside the resolved state of that throttle's shared token bucket
+/// (issue #945): the declared baseline, any live TTL'd operator override,
+/// and the resulting effective rate-limit parameters.
+///
+/// The bucket-derived fields are `None`/`false` only in the (practically
+/// unreachable) case that a backlog row exists with no matching
+/// `harvest_rate_limit_buckets` row -- [`reserve_or_defer`] always creates
+/// the bucket before writing the backlog row, so this is a defensive
+/// fallback rather than an expected shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThrottleBacklogEntry {
     pub workflow_name: String,
@@ -434,6 +452,65 @@ pub struct ThrottleBacklogEntry {
     pub deferred_count: i64,
     pub oldest_deferred_at: DateTime<Utc>,
     pub shard_id: i32,
+    /// The declared baseline refill rate (`#[workflow(throttle(rate = ...))]`).
+    pub declared_refill_rate: Option<f64>,
+    /// The declared baseline burst.
+    pub declared_burst: Option<f64>,
+    /// A live or expired TTL'd operator override refill rate, if one has
+    /// ever been set (issue #945).
+    pub override_refill_rate: Option<f64>,
+    /// A live or expired TTL'd operator override burst.
+    pub override_burst: Option<f64>,
+    /// Whether the override is currently in effect (`expires_at` set and
+    /// strictly in the future).
+    pub override_active: bool,
+    /// The refill rate actually enforced right now: the override's, when
+    /// `override_active`, else `declared_refill_rate`.
+    pub effective_refill_rate: Option<f64>,
+    /// The burst actually enforced right now: the override's, when
+    /// `override_active`, else `declared_burst`.
+    pub effective_burst: Option<f64>,
+    /// When the override expires (or expired); `None` when no override has
+    /// ever been set.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Resolves the effective-rate-limit view for one throttle backlog row's
+/// `LEFT JOIN`ed bucket columns (issue #945) -- the pure mapping
+/// [`throttle_backlog_by_key`] applies to each grouped row.
+///
+/// `(declared_refill_rate, declared_burst)` are `None` only when the
+/// backlog row's `bucket_key` has no matching `harvest_rate_limit_buckets`
+/// row (a `LEFT JOIN` miss) -- practically unreachable since
+/// [`reserve_or_defer`] always creates the bucket first, but handled
+/// defensively rather than panicking.
+#[cfg(feature = "db")]
+fn resolve_backlog_bucket_state(
+    declared_refill_rate: Option<f64>,
+    declared_burst: Option<f64>,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (bool, Option<f64>, Option<f64>) {
+    match (declared_refill_rate, declared_burst) {
+        (Some(refill_rate), Some(burst)) => {
+            let effective = crate::queue::resolve_effective_rate_limit(
+                refill_rate,
+                burst,
+                override_refill_rate,
+                override_burst,
+                override_expires_at,
+                now,
+            );
+            (
+                effective.override_active,
+                Some(effective.refill_rate),
+                Some(effective.burst),
+            )
+        }
+        _ => (false, None, None),
+    }
 }
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
@@ -815,7 +892,7 @@ type FiredThrottle = (
     String, // queue_name
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
-    Vec<(String, String)>,
+    Vec<crate::execution::StartCancelledRun>,
     // Whether this fire should count toward `harvest.schedule.runs` (issue
     // #607 code review): true only when the deferred start's persisted
     // `origin == "scheduled"` (set only by the scheduler-tick and
@@ -1017,6 +1094,7 @@ async fn fire_claimed_throttle_row(
         inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
+        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,
@@ -1144,6 +1222,43 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
+        // issue #946 (Task #7 hardening): a declared per-tenant quota (#946)
+        // is exhausted at fire time. Unlike `AlreadyExists` above this is
+        // TEMPORARY — the tenant's usage can free up as an existing execution
+        // completes or is deleted — so the row is RE-DEFERRED (left, token
+        // refunded, `deferred_at` bumped with backoff), mirroring the
+        // `AdmissionBlocked` arm's exact shape, rather than dropped or
+        // (via a bare `?`) allowed to abort this whole scanner-tick's claim
+        // transaction. Un-caught, that `?` would roll back every OTHER
+        // already-started row in the same batch and propagate out through
+        // `enforce_timeouts_once`, starving every later scanner duty
+        // (history-ceiling enforcement, broken-session/mutex-lease reclaim,
+        // start-idempotency sweep, …) on every tick for as long as one
+        // quota-blocked tenant sits at the head of the claim queue — the
+        // exact "runaway tenant" scenario #946 exists to contain, turned
+        // into a fleet-wide scanner stall instead.
+        Err(crate::error::HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
+            redefer_throttle_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            tracing::debug!(
+                workflow_name = %workflow_name,
+                throttle_key = %throttle_key,
+                workflow_id = %workflow_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "throttled start blocked by a per-tenant quota at fire time; \
+                 re-deferred with backoff (row left, token refunded)",
+            );
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }
@@ -1190,8 +1305,8 @@ async fn fire_due_on_conn(
 
     // Claim + fire + delete the whole due batch in one transaction so each
     // `FOR UPDATE SKIP LOCKED` lock is held until its row is deleted (or left).
-    let fired: Vec<FiredThrottle> = Box::pin(conn
-        .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
+    let fired: Vec<FiredThrottle> = Box::pin(
+        conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
             let now = Utc::now();
             // Per-key-fair claim (code review P1, issue #607): a flat
             // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
@@ -1206,11 +1321,21 @@ async fn fire_due_on_conn(
             // `candidates` is pre-filtered to rows that are actually
             // examinable this tick -- either already past their
             // `schedule_to_start` deadline (must be examined so AC-c can
-            // time them out), or whose bucket's *snapshot* token level
-            // (`LEAST(burst, tokens + elapsed*refill_rate)`) currently
-            // shows >= 1.0 available (a genuinely exhausted bucket is
-            // excluded from the candidate set entirely, at any scale --
-            // code review, issue #607). Without this pre-filter, enough
+            // time them out), or whose bucket's *effective* token level
+            // (`effective_available_tokens_expr`, issue #945 -- honors a
+            // live TTL'd rate-limit override, not just the declared
+            // baseline `refill_rate`/`burst`) currently shows >= 1.0
+            // available (a genuinely exhausted bucket is excluded from the
+            // candidate set entirely, at any scale -- code review, issue
+            // #607). Using the baseline-only formula here would silently
+            // defeat an operator's own override: raising a throttled
+            // workflow's rate specifically to unstick its already-deferred
+            // backlog (the whole point of an override on this bucket
+            // family) would never make the pre-filter admit those rows,
+            // even though the debit below (`fire_claimed_throttle_row` ->
+            // `try_consume_rate_limit_token`) is already override-aware and
+            // would happily fire them if only they reached it (issue #945
+            // review, P1). Without this pre-filter, enough
             // concurrently-exhausted keys can permanently occupy the
             // entire batch with rows that can never fire regardless of
             // ordering: this round's earlier fix (rank-then-date
@@ -1233,7 +1358,9 @@ async fn fire_due_on_conn(
             // function, so the lock must be taken on the outer,
             // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
             // `FOR UPDATE`).
-            let due_sql = "
+            let effective_tokens = crate::queue::effective_available_tokens_expr("b");
+            let due_sql = format!(
+                "
                 WITH candidates AS (
                     SELECT t.id, t.deferred_at,
                            ROW_NUMBER() OVER (
@@ -1243,10 +1370,7 @@ async fn fire_due_on_conn(
                     LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
                     WHERE (t.expires_at IS NOT NULL AND t.expires_at < NOW())
                        OR b.key IS NULL
-                       OR LEAST(
-                              b.burst,
-                              b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate
-                          ) >= 1.0
+                       OR {effective_tokens} >= 1.0
                 ),
                 selected AS (
                     SELECT id FROM candidates WHERE rn <= $1
@@ -1258,7 +1382,8 @@ async fn fire_due_on_conn(
                 JOIN selected s ON s.id = t.id
                 ORDER BY t.deferred_at ASC
                 FOR UPDATE OF t SKIP LOCKED
-            ";
+            "
+            );
             let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
                 .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
                 .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
@@ -1273,8 +1398,9 @@ async fn fire_due_on_conn(
                 }
             }
             Ok(results)
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
     Ok(fired)
 }
@@ -1322,14 +1448,7 @@ pub async fn fire_due_throttled_starts(
                 )
                 .await;
             }
-            for (wf_name, q_name) in cancel_metrics {
-                crate::telemetry::emit_workflow_terminal(
-                    metrics,
-                    &wf_name,
-                    &q_name,
-                    crate::telemetry::WorkflowStatus::Cancelled,
-                );
-            }
+            crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
             // A throttled scheduler-tick / buffered-backfill-fire dispatch is
             // counted here, on the same terms its immediate-path sibling
             // uses (`if outcome.created() { metrics.record_schedule_run(...) }`)
@@ -1437,7 +1556,15 @@ pub async fn list_pending_throttle(
         .collect())
 }
 
-/// Per-`(workflow_name, throttle_key)` backlog counts on this shard (admin read).
+/// Per-`(workflow_name, throttle_key)` backlog counts on this shard (admin
+/// read).
+///
+/// Joined against that key's shared token bucket so the response also
+/// surfaces `override_active`, the resolved effective refill rate/burst,
+/// and the declared baseline (issue #945). The join is
+/// `LEFT JOIN ... ON b.key = t.bucket_key`, scoped to this
+/// shard's own tables exactly like the pre-existing `GROUP BY` -- shard-local,
+/// consistent with the rest of the throttle admission path.
 ///
 /// # Errors
 /// Returns `HarvestError` if the database query fails.
@@ -1458,26 +1585,62 @@ pub async fn throttle_backlog_by_key(
         oldest_deferred_at: DateTime<Utc>,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+        declared_refill_rate: Option<f64>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+        declared_burst: Option<f64>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+        override_refill_rate: Option<f64>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+        override_burst: Option<f64>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        override_expires_at: Option<DateTime<Utc>>,
     }
     let rows: Vec<GroupRow> = diesel::sql_query(
-        "SELECT workflow_name, throttle_key, shard_id,
+        "SELECT t.workflow_name, t.throttle_key, t.shard_id,
                 COUNT(*) AS deferred_count,
-                MIN(deferred_at) AS oldest_deferred_at
-         FROM harvest_start_throttle
-         GROUP BY workflow_name, throttle_key, shard_id
+                MIN(t.deferred_at) AS oldest_deferred_at,
+                MAX(b.refill_rate) AS declared_refill_rate,
+                MAX(b.burst) AS declared_burst,
+                MAX(b.override_refill_rate) AS override_refill_rate,
+                MAX(b.override_burst) AS override_burst,
+                MAX(b.override_expires_at) AS override_expires_at
+         FROM harvest_start_throttle t
+         LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
+         GROUP BY t.workflow_name, t.throttle_key, t.shard_id
          ORDER BY deferred_count DESC",
     )
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
+    let now = Utc::now();
     Ok(rows
         .into_iter()
-        .map(|r| ThrottleBacklogEntry {
-            workflow_name: r.workflow_name,
-            throttle_key: r.throttle_key,
-            deferred_count: r.deferred_count,
-            oldest_deferred_at: r.oldest_deferred_at,
-            shard_id: r.shard_id,
+        .map(|r| {
+            let (override_active, effective_refill_rate, effective_burst) =
+                resolve_backlog_bucket_state(
+                    r.declared_refill_rate,
+                    r.declared_burst,
+                    r.override_refill_rate,
+                    r.override_burst,
+                    r.override_expires_at,
+                    now,
+                );
+            ThrottleBacklogEntry {
+                workflow_name: r.workflow_name,
+                throttle_key: r.throttle_key,
+                deferred_count: r.deferred_count,
+                oldest_deferred_at: r.oldest_deferred_at,
+                shard_id: r.shard_id,
+                declared_refill_rate: r.declared_refill_rate,
+                declared_burst: r.declared_burst,
+                override_refill_rate: r.override_refill_rate,
+                override_burst: r.override_burst,
+                override_active,
+                effective_refill_rate,
+                effective_burst,
+                expires_at: r.override_expires_at,
+            }
         })
         .collect())
 }
@@ -1783,5 +1946,73 @@ mod tests {
         let got = compute_expiry(deferred, Some(Duration::from_secs(u64::MAX)));
         assert!(got.is_some());
         assert!(got.unwrap() > deferred);
+    }
+
+    // ── resolve_backlog_bucket_state (issue #945) ───────────────────────────
+    //
+    // Pure mapping `throttle_backlog_by_key` applies to each LEFT-JOINed
+    // backlog row so `GET /admin/start-throttle` surfaces `override_active`,
+    // the resolved effective values, and the declared baseline alongside the
+    // existing backlog counts.
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn resolve_backlog_bucket_state_no_override() {
+        let now = ts(12, 0, 0);
+        let (active, refill, burst) =
+            resolve_backlog_bucket_state(Some(5.0), Some(10.0), None, None, None, now);
+        assert!(!active);
+        assert_eq!(refill, Some(5.0));
+        assert_eq!(burst, Some(10.0));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn resolve_backlog_bucket_state_active_override() {
+        let now = ts(12, 0, 0);
+        let expires = now + chrono::Duration::seconds(60);
+        let (active, refill, burst) = resolve_backlog_bucket_state(
+            Some(5.0),
+            Some(10.0),
+            Some(50.0),
+            Some(100.0),
+            Some(expires),
+            now,
+        );
+        assert!(active);
+        assert_eq!(refill, Some(50.0));
+        assert_eq!(burst, Some(100.0));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn resolve_backlog_bucket_state_expired_override_falls_back_to_declared() {
+        let now = ts(12, 0, 0);
+        let expired = now - chrono::Duration::seconds(1);
+        let (active, refill, burst) = resolve_backlog_bucket_state(
+            Some(5.0),
+            Some(10.0),
+            Some(50.0),
+            Some(100.0),
+            Some(expired),
+            now,
+        );
+        assert!(!active);
+        assert_eq!(refill, Some(5.0));
+        assert_eq!(burst, Some(10.0));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn resolve_backlog_bucket_state_missing_bucket_row_is_defensive_none() {
+        // A `LEFT JOIN` miss (practically unreachable -- `reserve_or_defer`
+        // always creates the bucket before writing the backlog row) must not
+        // panic and must report no override / no effective values.
+        let now = ts(12, 0, 0);
+        let (active, refill, burst) =
+            resolve_backlog_bucket_state(None, None, None, None, None, now);
+        assert!(!active);
+        assert_eq!(refill, None);
+        assert_eq!(burst, None);
     }
 }

@@ -46,10 +46,19 @@ pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 pub const OP_WORKFLOW_TERMINATE: &str = "workflow.terminate";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+/// Audit operation: Operator re-run of a terminal workflow (issue #777).
+///
+/// Distinct from [`OP_WORKFLOW_RESET`], which forks an execution mid-history;
+/// a re-run starts a brand-new execution of the whole workflow. The audit
+/// row's `target_id` is the SOURCE execution id.
+pub const OP_WORKFLOW_RERUN: &str = "workflow.rerun";
 /// Audit operation: Paused an individual workflow execution (issue #383).
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
 /// Audit operation: Resumed a paused workflow execution (issue #383).
 pub const OP_WORKFLOW_RESUME: &str = "workflow.resume";
+/// Audit operation: Set, updated, or cleared an execution's operator-mutable
+/// triage tags -- owner, severity, note (issue #759).
+pub const OP_WORKFLOW_ANNOTATE: &str = "workflow.annotate";
 /// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
 /// Audit operation: Retried a DAG run from a failed node (issue #366).
@@ -92,6 +101,27 @@ pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
 /// Audit operation: Overrode rate-limiting parameters.
 pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
+/// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
+/// declared per-activity rate limit (issue #945).
+///
+/// Distinct from the legacy [`OP_RATE_LIMIT_OVERRIDE`] (issue #332), which is
+/// a permanent write to a bucket's baseline `refill_rate`/`burst`: this
+/// records a *temporary*, self-expiring layer on top of that baseline that
+/// requires no worker restart to take effect and no operator action to
+/// revert.
+pub const OP_RATE_LIMIT_PACING_OVERRIDE_SET: &str = "rate_limit.pacing_override.set";
+/// Audit operation: Cleared a TTL'd runtime pacing override on a declared
+/// per-activity rate limit before its TTL elapsed (issue #945).
+pub const OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR: &str = "rate_limit.pacing_override.clear";
+/// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
+/// declared workflow-start throttle (issue #945).
+///
+/// See [`OP_RATE_LIMIT_PACING_OVERRIDE_SET`] -- same TTL'd-layer semantics,
+/// applied to a `#[workflow(throttle(...))]` bucket instead of an activity's.
+pub const OP_START_THROTTLE_PACING_OVERRIDE_SET: &str = "start_throttle.pacing_override.set";
+/// Audit operation: Cleared a TTL'd runtime pacing override on a declared
+/// workflow-start throttle before its TTL elapsed (issue #945).
+pub const OP_START_THROTTLE_PACING_OVERRIDE_CLEAR: &str = "start_throttle.pacing_override.clear";
 /// Audit operation: Opened an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
@@ -125,6 +155,15 @@ pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
 /// Audit operation: Force-failed a hung in-flight activity task (issue #765).
 pub const OP_ACTIVITY_FAIL_NOW: &str = "activity.fail_now";
+/// Audit operation: an operator held dispatch for one activity **type**
+/// (issue #807).
+///
+/// Distinct from [`OP_ACTIVITY_RETRY_NOW`] / [`OP_ACTIVITY_FAIL_NOW`], which
+/// act on a single in-flight *task*: this is the type-wide, fleet-wide hold an
+/// operator reaches for when one downstream dependency is in a known outage.
+pub const OP_ACTIVITY_PAUSE: &str = "activity.pause";
+/// Audit operation: an operator released a per-activity-type hold (issue #807).
+pub const OP_ACTIVITY_RESUME: &str = "activity.resume";
 /// Audit operation: Batch-reset workflow executions to a semantic point (issue #538).
 pub const OP_BATCH_RESET: &str = "batch.reset";
 /// Audit operation: Set (or updated) a queue's percentage build ramp (issue #604).
@@ -158,6 +197,11 @@ pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 /// new route exists.
 pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
 /// Audit operation: minted a scoped API token (issue #942).
+/// Operation: an operator paused dispatch on a task queue (issue #619).
+pub const OP_QUEUE_PAUSE: &str = "queue.pause";
+/// Operation: an operator resumed dispatch on a task queue (issue #619).
+pub const OP_QUEUE_RESUME: &str = "queue.resume";
+
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
@@ -180,11 +224,15 @@ pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 pub const TARGET_ACTIVITY: &str = "activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+/// Audit target type for workflow-start throttle operations (issues #607, #945).
+pub const TARGET_THROTTLE: &str = "throttle";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 /// Audit target type for completion-callback delivery operations (issue #605).
 pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
 /// Audit target type for scoped API token operations (issue #942).
 pub const TARGET_TOKEN: &str = "token";
+/// Target type: a named task queue (issue #619).
+pub const TARGET_QUEUE: &str = "queue";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -308,8 +356,22 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
+    // Recursive cross-shard lineage tree (issue #621): a point-in-time read of
+    // `harvest_workflow_executions` rows over the existing `parent_id` edges.
+    // Appends no events, performs no writes.
+    ("GET /workflows/{id}/tree", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
     ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
+    // Durable per-execution author log lines (issue #790): admin-gated,
+    // read-only projection of `harvest_workflow_logs`. Appends nothing.
+    ("GET /workflows/{id}/logs", RouteClass::ReadOnly),
+    // Open-awaitables diagnostic (issue #615): read-only replay projection of
+    // what an execution is parked on; appends no events, performs no writes.
+    ("GET /workflows/{id}/awaitables", RouteClass::ReadOnly),
+    // Per-execution stall diagnosis (issue #809): read-only root-cause verdict
+    // for a single stuck run. Reads only the owning shard; appends no events,
+    // performs no task-queue mutation.
+    ("GET /workflows/{id}/diagnose", RouteClass::ReadOnly),
     ("GET /workflows/{id}/run-chain", RouteClass::ReadOnly),
     // Single-execution replay diagnosis (issue #614): POST for the replay action
     // but read-only (appends no events, performs no writes, no audit trail).
@@ -352,6 +414,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /dead-letters", RouteClass::ReadOnly),
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
+    // Fleet-wide task-queue coverage (issue #774): read-only.
+    ("GET /admin/queue-coverage", RouteClass::ReadOnly),
     ("GET /admin/status", RouteClass::ReadOnly),
     // Effective runtime-config introspection (issue #695): read-only, secret-free.
     ("GET /admin/config", RouteClass::ReadOnly),
@@ -369,12 +433,15 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/usage", RouteClass::ReadOnly),
     ("GET /admin/debounce", RouteClass::ReadOnly),
     ("GET /admin/start-throttle", RouteClass::ReadOnly),
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    ("GET /admin/quotas", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
         "GET /admin/workflow-types/reachability",
         RouteClass::ReadOnly,
     ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
+    ("GET /admin/history/export-sample", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
     // Admission gates (issue #377)
@@ -415,8 +482,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
     ("POST /workflows/{id}/terminate", RouteClass::Mutating),
+    ("POST /workflows/{id}/rerun", RouteClass::Mutating),
     ("POST /workflows/{id}/pause", RouteClass::Mutating),
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
+    ("PATCH /workflows/{id}/triage", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -462,8 +531,49 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /activities/external/{token}/heartbeat",
         RouteClass::Mutating,
     ),
+    // Per-activity-type pause/resume (issue #807): the operator's hand on one
+    // activity's dispatch valve during a scoped downstream outage. The two
+    // reads are admin-gated but audit-excluded (a diagnostic read, like every
+    // other read model); the two mutations are the fleet-wide hold control.
+    ("GET /activities", RouteClass::ReadOnly),
+    ("GET /activities/{activity_name}", RouteClass::ReadOnly),
+    (
+        "POST /activities/{activity_name}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /activities/{activity_name}/resume",
+        RouteClass::Mutating,
+    ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
+    // TTL'd runtime pacing overrides for a declared per-activity rate limit
+    // (issue #945): a temporary layer atop the baseline, not a permanent
+    // write like the legacy route directly above.
+    (
+        "POST /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    // TTL'd runtime pacing overrides for a declared workflow-start throttle
+    // (issue #945). Same semantics as the rate-limit pair above.
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
+    // Read-only companion: resolves an override's live state directly,
+    // independent of any current deferred-start backlog (issue #945).
+    (
+        "GET /admin/start-throttle/{workflow_name}/override",
+        RouteClass::ReadOnly,
+    ),
     ("POST /batch-operations", RouteClass::Mutating),
     // Batch workflow start (issue #357)
     ("POST /workflows/batch_start", RouteClass::Mutating),
@@ -589,6 +699,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/circuits", RouteClass::ReadOnly),
     ("GET /admin/circuits/{activity_name}", RouteClass::ReadOnly),
     ("GET /admin/queues/scaling", RouteClass::ReadOnly),
+    // Task-queue pause/resume (issue #619): the hold control for a scoped
+    // downstream outage. GET is read-only; the two mutations are admin-gated.
+    ("GET /admin/queues/paused", RouteClass::ReadOnly),
+    (
+        "POST /admin/queues/{queue_name}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /admin/queues/{queue_name}/resume",
+        RouteClass::Mutating,
+    ),
     ("GET /admin/metrics", RouteClass::ReadOnly),
     ("GET /admin/completion-triggers", RouteClass::ReadOnly),
     ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
@@ -650,7 +771,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_PAUSE,
     OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_ANNOTATE,
     OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RERUN,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
@@ -671,6 +794,12 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
     OP_RATE_LIMIT_OVERRIDE,
+    // TTL'd runtime pacing overrides for rate limits and start-throttles
+    // (issue #945)
+    OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+    OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+    OP_START_THROTTLE_PACING_OVERRIDE_SET,
+    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -689,6 +818,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_ACTIVITY_RETRY_NOW,
     // Force-fail hung in-flight activity (issue #765)
     OP_ACTIVITY_FAIL_NOW,
+    // Per-activity-type pause/resume (issue #807)
+    OP_ACTIVITY_PAUSE,
+    OP_ACTIVITY_RESUME,
     // Batch reset by semantic point (issue #538)
     OP_BATCH_RESET,
     // Percentage build ramp (issue #604)
@@ -713,6 +845,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_CIRCUIT_FORCE_OPEN,
     OP_CIRCUIT_FORCE_CLOSE,
     // Scoped API tokens (issue #942)
+    // Task-queue pause/resume (issue #619)
+    OP_QUEUE_PAUSE,
+    OP_QUEUE_RESUME,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
 ];
@@ -728,8 +863,12 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows",
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
+    "GET /workflows/{id}/tree",
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/timeline",
+    "GET /workflows/{id}/logs",
+    "GET /workflows/{id}/awaitables",
+    "GET /workflows/{id}/diagnose",
     "GET /workflows/{id}/run-chain",
     "POST /workflows/{id}/replay-diagnosis",
     "GET /workflows/{id}/query/{query_name}",
@@ -749,6 +888,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /health",
     "GET /admin/preflight",
     "GET /admin/shards/health",
+    "GET /admin/queue-coverage",
     "GET /admin/status",
     "GET /admin/config",
     "GET /admin/canary",
@@ -759,13 +899,22 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/usage",
     "GET /admin/debounce",
     "GET /admin/start-throttle",
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    "GET /admin/quotas",
+    // Read-only pacing-override lookup (issue #945); the SET/DELETE mutations
+    // above (OP_START_THROTTLE_PACING_OVERRIDE_SET/CLEAR) are audited.
+    "GET /admin/start-throttle/{workflow_name}/override",
     "GET /admin/history/exports",
+    "GET /admin/history/export-sample",
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
     "GET /admin/schedules",
     "GET /admin/rate-limits",
     // Heartbeats are high-volume liveness pings, not operator mutations.
     "POST /activities/external/{token}/heartbeat",
+    // Activity-pause catalogue reads (issue #807) — diagnostic, no audit trail.
+    "GET /activities",
+    "GET /activities/{activity_name}",
     "GET /workers",
     "GET /workers/health",
     "GET /workers/{worker_id}",
@@ -812,6 +961,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/circuits",
     "GET /admin/circuits/{activity_name}",
     "GET /admin/queues/scaling",
+    // Paused-queue list is read-only.
+    "GET /admin/queues/paused",
     "GET /admin/metrics",
     "GET /admin/completion-triggers",
     "GET /admin/schedules/{id}",
@@ -851,8 +1002,15 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows", None),
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
+    // Issue #621: read-only, no audit operation.
+    ("GET /workflows/{id}/tree", None),
     ("GET /workflows/{id}/stack", None),
     ("GET /workflows/{id}/timeline", None),
+    ("GET /workflows/{id}/logs", None),
+    // Issue #615: read-only, no audit operation.
+    ("GET /workflows/{id}/awaitables", None),
+    // Issue #809: read-only, no audit operation.
+    ("GET /workflows/{id}/diagnose", None),
     ("GET /workflows/{id}/run-chain", None),
     // Issue #614: read-only, no audit operation.
     ("POST /workflows/{id}/replay-diagnosis", None),
@@ -869,8 +1027,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /workflows/{id}/terminate",
         Some(OP_WORKFLOW_TERMINATE),
     ),
+    ("POST /workflows/{id}/rerun", Some(OP_WORKFLOW_RERUN)),
     ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
+    ("PATCH /workflows/{id}/triage", Some(OP_WORKFLOW_ANNOTATE)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -905,6 +1065,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /health", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
+    ("GET /admin/queue-coverage", None),
     ("GET /admin/status", None),
     ("GET /admin/config", None),
     ("GET /admin/canary", None),
@@ -916,9 +1077,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/usage", None),
     ("GET /admin/debounce", None),
     ("GET /admin/start-throttle", None),
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    ("GET /admin/quotas", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
+    ("GET /admin/history/export-sample", None),
     ("GET /admin/external-handoffs", None),
     ("GET /admin/external-handoffs/{token}", None),
     // Schedule management
@@ -950,6 +1114,17 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_EXTERNAL_ACTIVITY_FAIL),
     ),
     ("POST /activities/external/{token}/heartbeat", None),
+    // Per-activity-type pause/resume (issue #807)
+    ("GET /activities", None),
+    ("GET /activities/{activity_name}", None),
+    (
+        "POST /activities/{activity_name}/pause",
+        Some(OP_ACTIVITY_PAUSE),
+    ),
+    (
+        "POST /activities/{activity_name}/resume",
+        Some(OP_ACTIVITY_RESUME),
+    ),
     // Worker fleet
     ("GET /workers/health", None),
     ("GET /workers", None),
@@ -960,6 +1135,24 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /admin/rate-limits/{key}",
         Some(OP_RATE_LIMIT_OVERRIDE),
     ),
+    // TTL'd runtime pacing overrides (issue #945)
+    (
+        "POST /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_PACING_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR),
+    ),
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_PACING_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_PACING_OVERRIDE_CLEAR),
+    ),
+    ("GET /admin/start-throttle/{workflow_name}/override", None),
     // Batch operations
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),
@@ -1087,6 +1280,15 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/circuits", None),
     ("GET /admin/circuits/{activity_name}", None),
     ("GET /admin/queues/scaling", None),
+    ("GET /admin/queues/paused", None),
+    (
+        "POST /admin/queues/{queue_name}/pause",
+        Some(OP_QUEUE_PAUSE),
+    ),
+    (
+        "POST /admin/queues/{queue_name}/resume",
+        Some(OP_QUEUE_RESUME),
+    ),
     ("GET /admin/metrics", None),
     ("GET /admin/completion-triggers", None),
     ("GET /admin/schedules/{id}", None),
@@ -1406,6 +1608,187 @@ mod tests {
     }
 
     #[test]
+    fn activity_pause_routes_are_classified_and_audited() {
+        // Per-activity-type pause/resume (issue #807). This dedicated test --
+        // not just the general exhaustiveness guards, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each OTHER -- is
+        // what catches a route dropped from BOTH lists at once.
+        //
+        // The mutations are a fleet-wide dispatch kill switch for one activity
+        // type, so they must be classified Mutating (which is what makes the
+        // read-only-operator role, issue #776, deny them) and audited.
+        for (route, op) in [
+            ("POST /activities/{activity_name}/pause", OP_ACTIVITY_PAUSE),
+            (
+                "POST /activities/{activity_name}/resume",
+                OP_ACTIVITY_RESUME,
+            ),
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #807)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+                "{route} must map to {op} in ALL_MUTATION_ROUTES (issue #807)"
+            );
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "{op} must be registered in AUDITED_OPERATIONS (issue #807)"
+            );
+        }
+
+        // The two catalogue reads are diagnostics: classified ReadOnly, mapped
+        // to no operation, and explicitly audit-excluded.
+        for route in ["GET /activities", "GET /activities/{activity_name}"] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+                "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #807)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, op)| *r == route && op.is_none()),
+                "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #807)"
+            );
+            assert!(
+                EXCLUDED_ROUTES.contains(&route),
+                "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #807)"
+            );
+        }
+    }
+
+    #[test]
+    fn pacing_override_routes_are_classified_and_audited() {
+        // TTL'd runtime pacing overrides for a declared per-activity rate
+        // limit and a declared workflow-start throttle (issue #945). This
+        // dedicated test -- not just the general exhaustiveness guards, which
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against
+        // each OTHER -- is what catches a route dropped from BOTH lists at
+        // once.
+        //
+        // Both the set and the clear are audited under NEW, distinct ops from
+        // the legacy `OP_RATE_LIMIT_OVERRIDE` (a permanent baseline write),
+        // since a TTL'd override is a fundamentally different, self-expiring
+        // operation.
+        for (route, op) in [
+            (
+                "POST /admin/rate-limits/{activity_name}/override",
+                OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            ),
+            (
+                "DELETE /admin/rate-limits/{activity_name}/override",
+                OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            ),
+            (
+                "POST /admin/start-throttle/{workflow_name}/override",
+                OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            ),
+            (
+                "DELETE /admin/start-throttle/{workflow_name}/override",
+                OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            ),
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #945)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+                "{route} must map to {op} in ALL_MUTATION_ROUTES (issue #945)"
+            );
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "{op} must be registered in AUDITED_OPERATIONS (issue #945)"
+            );
+            assert_ne!(
+                op, OP_RATE_LIMIT_OVERRIDE,
+                "a TTL'd pacing override must use a distinct op from the legacy permanent override (issue #945)"
+            );
+        }
+
+        // Read-only companion to the start-throttle SET/DELETE pair above
+        // (issue #945): resolves an override's live state directly, so it is
+        // ReadOnly (never Mutating -- it writes nothing) and, having no audit
+        // op, must map to `None` in ALL_MUTATION_ROUTES rather than being
+        // silently absent from the manifest entirely.
+        let get_route = "GET /admin/start-throttle/{workflow_name}/override";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == get_route && *c == RouteClass::ReadOnly),
+            "{get_route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #945)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, mapped)| *r == get_route && mapped.is_none()),
+            "{get_route} must map to None in ALL_MUTATION_ROUTES -- it is read-only (issue #945)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&get_route),
+            "{get_route} should be listed in EXCLUDED_ROUTES, matching its GET /admin/circuits/{{activity_name}} sibling (issue #945)"
+        );
+    }
+
+    #[test]
+    fn rerun_route_is_classified_and_audited() {
+        // Operator re-run of a terminal workflow (issue #777): the route is an
+        // admin-only mutation and must be classified + audited. This dedicated
+        // test -- not just the general exhaustiveness guards, which only
+        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other -- is what catches a route dropped from BOTH lists.
+        let route = "POST /workflows/{id}/rerun";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #777)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_RERUN)),
+            "{route} must map to OP_WORKFLOW_RERUN in ALL_MUTATION_ROUTES (issue #777)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_RERUN));
+    }
+
+    #[test]
+    fn triage_route_is_classified_and_audited() {
+        // Operator-mutable triage tags (issue #759): the route is an
+        // admin-only mutation and must be classified + audited. This
+        // dedicated test -- not just the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other -- is what catches a route dropped from BOTH
+        // lists.
+        let route = "PATCH /workflows/{id}/triage";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #759)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_ANNOTATE)),
+            "{route} must map to OP_WORKFLOW_ANNOTATE in ALL_MUTATION_ROUTES (issue #759)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_ANNOTATE));
+    }
+
+    #[test]
     fn token_routes_are_classified_and_audited() {
         // Scoped API tokens (issue #942): create + revoke are admin-only
         // mutations; list is a read. This dedicated pin — not just the general
@@ -1521,6 +1904,120 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn queue_coverage_route_is_classified_read_only() {
+        // The fleet-wide task-queue coverage read model (issue #774) is a
+        // read-only fan-out projection, no different from the other cross-shard
+        // read models it's modeled after (workflow_reachability, workflow_count,
+        // shard_health). This pinned test — not just the general exhaustiveness
+        // guards below, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other rather than against the live
+        // router — is what actually catches the route being dropped from BOTH
+        // lists at once.
+        let route = "GET /admin/queue-coverage";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #774)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #774)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #774)"
+        );
+    }
+
+    #[test]
+    fn lineage_tree_route_is_classified_read_only() {
+        // The recursive cross-shard lineage tree (issue #621) is a
+        // point-in-time read over the existing `parent_id` edges: it appends no
+        // events, performs no writes, and adds no `WorkflowEvent` variant.
+        // Pinned here rather than relying on the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES against ALL_MUTATION_ROUTES
+        // and therefore stay green if the route is dropped from BOTH lists.
+        let route = "GET /workflows/{id}/tree";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #621)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #621)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #621)"
+        );
+    }
+
+    #[test]
+    fn awaitables_route_is_classified_read_only() {
+        // The open-awaitables diagnostic (issue #615) replays recorded history
+        // to the current suspension point and enumerates every open awaitable.
+        // It is read-only (appends no events, performs no writes) and writes no
+        // audit rows. This pinned test — not just the general exhaustiveness
+        // guards below, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other rather than against the live
+        // router — is what actually catches the route being dropped from BOTH
+        // lists at once.
+        let route = "GET /workflows/{id}/awaitables";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #615)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #615)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #615)"
+        );
+    }
+
+    #[test]
+    fn diagnose_route_is_classified_read_only() {
+        // The per-execution stall diagnosis endpoint (issue #809) resolves the
+        // owning shard from the ExecutionId and reads only that shard: it
+        // appends no WorkflowEvent, performs no task-queue mutation, and adds
+        // no migration, so it is safe to call repeatedly. Pinned here (not only
+        // via the general exhaustiveness guards, which cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
+        // than against the live router) so dropping it from BOTH lists at once
+        // is caught.
+        let route = "GET /workflows/{id}/diagnose";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #809)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #809)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #809)"
         );
     }
 
@@ -1880,6 +2377,9 @@ mod tests {
             "POST /calendars",
             "PUT /calendars/{name}",
             "DELETE /calendars/{name}",
+            // Operator re-run of a terminal workflow (issue #777): starts a
+            // brand-new execution, so a read-only principal must never reach it.
+            "POST /workflows/{id}/rerun",
         ] {
             assert!(
                 CLASSIFIED_ROUTES

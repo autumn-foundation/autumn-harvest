@@ -22,6 +22,11 @@ db = [
     "dep:tokio-postgres",
 ]
 testing = []
+# Time-travel replay debugger (issue #949): a stepping/diff API over the existing
+# replay machinery. Read-only by construction -- no new `WorkflowEvent` variant, no
+# migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
+# and the `WorkflowReplayer` handler-registration surface.
+debugger = ["testing"]
 metrics-rs = ["dep:metrics"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
@@ -35,9 +40,14 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
+# Deterministic chaos / fault-injection test harness (issue #940). Off by
+# default and never in `default`: injection points compile to a zero-cost
+# const-check when this feature is off, so a non-chaos build has no hot-path
+# cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
+chaos = ["db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.5.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.6.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -99,6 +109,10 @@ required-features = ["db"]
 name = "timezone_cron_schedule"
 
 [[example]]
+name = "activity_ctx_info"
+required-features = ["testing"]
+
+[[example]]
 name = "auto_heartbeat"
 
 [[example]]
@@ -125,6 +139,9 @@ name = "business_metrics"
 name = "sleep_until_renewal_reminder"
 
 [[example]]
+name = "business_day_escalation"
+
+[[example]]
 name = "long_lived_entity_deadline"
 
 [[example]]
@@ -149,14 +166,33 @@ name = "dag_data_flow"
 required-features = ["unified-dag-execution"]
 
 [[example]]
+name = "dag_compensation"
+required-features = ["unified-dag-execution"]
+
+[[example]]
 name = "child_with_timeout"
 
 [[example]]
 name = "ctx_info"
 
 [[example]]
+name = "transactional_start_order"
+required-features = ["db"]
+
+[[example]]
 name = "wasm_activity"
 required-features = ["wasm-activities"]
+
+[[example]]
+name = "workflow_logs"
+required-features = ["testing"]
+
+[[example]]
+name = "entity_phase_transition"
+
+[[example]]
+name = "replay_debugger"
+required-features = ["debugger"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -165,12 +201,25 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
+# Already a normal dependency at the same version (the heartbeat task takes a
+# `CancellationToken`), so this unifies rather than widening the graph. Declared
+# here because a `[dependencies]` entry is not visible to integration test
+# binaries, and the round-49 regression test drives the real `do_heartbeat_tick`.
+tokio-util = { version = "0.7", features = ["rt"] }
 schemars = { version = "0.8" }
 # Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
 # tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here
 # so the integration test binaries can build guest modules regardless of feature
 # resolution.
 wat = "1"
+# Token-based scan of `src/` for the chaos-catalogue drift guard
+# (`tests/integration/chaos_catalogue_drift.rs`, issue #940): lexing each source
+# into a `TokenStream` drops comments and correctly delimits string / raw-string
+# / char literals, so a commented-out or stringified `chaos_point!(NAME)` is not
+# miscounted as live wiring. Already in the lockfile (the proc-macro crate depends
+# on it) at the workspace version, so `{ workspace = true }` unifies rather than
+# widening the graph — same rationale as the `tokio-util` dev-dep above.
+proc-macro2 = { workspace = true }
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
@@ -200,6 +249,80 @@ harness = false
 [[bench]]
 name = "replay_verifier_bench"
 required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `WorkflowReplayer` (issue #135's realistic replay budget). `harness =
+# false` + its own `main()`, same shape as `claim_bench.rs` below, so the
+# compiled artifact is a plain executable meant to be pointed at
+# `valgrind --tool=callgrind` / `valgrind --tool=dhat` directly rather than
+# measured with `cargo bench`'s wall-clock timing loop. See
+# `benches/replay_profile.rs` and `docs/performance-replay.md`.
+[[bench]]
+name = "replay_profile"
+required-features = ["testing"]
+harness = false
+
+# Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
+# its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
+# criterion's repeat-the-closure model would drain the seeded backlog and time
+# an empty queue. Requires `db`; skips cleanly (exit 0) when neither Docker nor
+# HARVEST_TEST_DATABASE_URL is available, so Windows / `--no-default-features`
+# builds are unaffected.
+[[bench]]
+name = "claim_bench"
+required-features = ["db"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `ReplayVerifier::verify_dir` (issue #251's batch-fixture-verification
+# budget). Exercises real filesystem I/O and `serde_json` deserialize of
+# `WorkflowEvent`/`HistorySnapshot` -- a boundary `replay_profile.rs` (which
+# builds events as Rust struct literals) never crosses. See
+# `benches/verify_profile.rs` and `docs/performance-verify.md`.
+[[bench]]
+name = "verify_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `info::validate_against_schema` (issue #373's boundary validator). No
+# feature requirement: the function is unconditional, so this measures the
+# same code every deployment runs on the HTTP start/signal/update path when a
+# schema is published. See `benches/schema_validate_profile.rs`.
+[[bench]]
+name = "schema_validate_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `det_check::check_paths` -- the source-scanning engine behind
+# `harvest det-check` (issue #778), the CI governance gate for the determinism
+# guardrails. No feature requirement: `det_check` is unconditional. See
+# `benches/det_check_profile.rs`.
+[[bench]]
+name = "det_check_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
+# `GET /admin/dead-letters/aggregate` (issue #385 / #613). `dlq.rs` uses
+# `diesel_async` unconditionally (no per-item `cfg(feature = "db")` gates), so
+# the whole file -- and this bench -- requires `db`; `required-features`
+# makes `cargo bench --no-default-features` skip it cleanly instead of
+# failing to compile, mirroring `claim_bench` above. See
+# `benches/dlq_aggregate_profile.rs` and `docs/performance-dlq-aggregate.md`.
+[[bench]]
+name = "dlq_aggregate_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `stall_diagnosis::classify_execution` -- the pure root-cause classifier
+# behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809). No feature
+# requirement: `stall_diagnosis` is pure and unconditional (no DB access). See
+# `benches/stall_diagnosis_profile.rs`.
+[[bench]]
+name = "stall_diagnosis_profile"
 harness = false
 
 [lints]
