@@ -4850,8 +4850,16 @@ pub async fn run_migrate_run(
         };
         match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
             Ok(report) => targets.push((redacted, report)),
-            Err(error) => {
-                let failure = migrate_error(url, &redacted, &error);
+            Err(partial) => {
+                let failure = migrate_error(url, &redacted, &partial.error);
+                // The failing target's own applied migrations are committed --
+                // each one commits on its own -- so it joins the report rather
+                // than being reduced to a count inside the error message.
+                if !partial.report.applied.is_empty()
+                    || !partial.report.applied_concurrently.is_empty()
+                {
+                    targets.push((redacted, partial.report));
+                }
                 return report_and_fail(&targets, format, failure);
             }
         }

@@ -181,6 +181,14 @@ async fn a_failing_migration_rolls_back_with_its_ledger_row() {
         "a rolled-back migration must not be recorded: {recorded:?}"
     );
 
+    // The failure carries what DID apply, not just a count in its message: a
+    // multi-shard deploy needs that to say which databases moved.
+    assert_eq!(
+        error.report.applied,
+        vec!["29990101000000_harvest_migrate_probe".to_string()],
+        "the partial report must name the migration that committed"
+    );
+
     // And the run is resumable: fixing the migration and re-running applies
     // only what is still pending.
     let fixed = probe_migration(
