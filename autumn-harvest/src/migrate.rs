@@ -178,7 +178,8 @@ impl MigrationScript {
 ///
 /// [`HarvestError::Config`] naming the migration when the metadata contains a
 /// table header, a `run_in_transaction` value that is not `true`/`false`, or
-/// the key twice.
+/// the key more than once — a duplicate key is invalid TOML whether or not the
+/// two values agree, so Diesel refuses to parse the file at all.
 pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<bool> {
     let mut found: Option<bool> = None;
     for raw in metadata.lines() {
@@ -214,10 +215,15 @@ pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<boo
                 )));
             }
         };
-        if found.is_some_and(|previous| previous != parsed) {
+        // Any repeat, agreeing or not: TOML forbids a duplicate key outright,
+        // so Diesel rejects the file rather than reading it. Accepting the
+        // agreeing case would apply and record a migration whose metadata
+        // `diesel migration run` refuses to parse at all.
+        if found.is_some() {
             return Err(HarvestError::Config(format!(
                 "migration `{name}`: {METADATA_FILE} sets \
-                 `{RUN_IN_TRANSACTION_KEY}` twice, with different values"
+                 `{RUN_IN_TRANSACTION_KEY}` more than once; duplicate keys are \
+                 not valid TOML"
             )));
         }
         found = Some(parsed);
@@ -997,7 +1003,11 @@ mod tests {
             "[section]\nrun_in_transaction = false\n",
             "run_in_transaction = yes\n",
             "run_in_transaction = 0\n",
+            // Duplicate keys are invalid TOML whether or not they agree:
+            // Diesel refuses to parse the file at all, so accepting the
+            // agreeing case would apply a migration on metadata it rejects.
             "run_in_transaction = true\nrun_in_transaction = false\n",
+            "run_in_transaction = false\nrun_in_transaction = false\n",
         ] {
             parse_run_in_transaction("m", metadata)
                 .expect_err(&format!("should have refused: {metadata:?}"));
