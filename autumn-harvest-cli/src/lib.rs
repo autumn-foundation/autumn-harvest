@@ -10,6 +10,7 @@ use autumn_harvest::backup_verify::{
     Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
     dsn_targets_same_database, redact_dsn, verify_restore,
 };
+use autumn_harvest::migrate::{MigrationPlan, MigrationReport, MigrationScript};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
@@ -179,6 +180,19 @@ pub enum SchemaCheckFormat {
     #[default]
     Text,
     /// Machine-readable diff JSON for CI consumption.
+    Json,
+}
+
+/// Output format for the `migrate` subcommands (issue #1240).
+///
+/// This is a **local** flag (`--format`); it is deliberately distinct from the
+/// global `--output` used for API responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum MigrateFormat {
+    /// Human-readable per-database summary (default).
+    #[default]
+    Text,
+    /// Machine-readable JSON for deploy pipelines.
     Json,
 }
 
@@ -631,6 +645,35 @@ pub enum CliError {
         /// The underlying error, rendered.
         reason: String,
     },
+
+    /// A `migrate` operation failed against one database (issue #1240).
+    ///
+    /// The DSN is redacted before it reaches this message: a migration command
+    /// is run from deploy pipelines whose logs are far more widely readable
+    /// than the credential in `harvest.database.url`. Exit code is `1`.
+    #[error("migrate: {database}: {reason}")]
+    Migrate {
+        /// Redacted DSN of the database the operation was pointed at.
+        database: String,
+        /// The underlying failure, rendered.
+        reason: String,
+    },
+
+    /// `migrate status --check` found a pending migration (issue #1240).
+    ///
+    /// The report itself is already printed; this only signals the exit code.
+    /// Exit code is `1` — "determined: not migrated", as distinct from the
+    /// exit-`2` gates that mean "could not determine".
+    #[error(
+        "migrate status: {pending} pending migration(s) across {databases} database(s) — \
+         run `harvest migrate run` before rolling replicas"
+    )]
+    MigrationsPending {
+        /// Total pending migrations across every inspected database.
+        pending: usize,
+        /// How many databases still have at least one pending migration.
+        databases: usize,
+    },
 }
 
 impl CliError {
@@ -1029,6 +1072,28 @@ enum Commands {
         command: DebugCommand,
     },
 
+    /// Apply Harvest's schema migrations to a dedicated Harvest database
+    /// (issue #1240).
+    ///
+    /// For `harvest.mode = "split"` / `"external"` deployments, where Harvest
+    /// storage is a database Autumn has no handle on: `autumn migrate` reaches
+    /// the application database only, and outside the `dev` profile the plugin
+    /// warns about pending Harvest migrations rather than applying them.
+    ///
+    /// Talks to Postgres directly — no management API, no running app — and
+    /// uses the same `__diesel_schema_migrations` ledger Autumn and Diesel use,
+    /// so a migration is applied exactly once no matter which of them applies
+    /// it. Under `embedded` mode use `autumn migrate` instead; the two Harvest
+    /// sets are Autumn's there.
+    ///
+    /// Harvest's own migrations are embedded in this binary. Sets that are not
+    /// (the plugin's connector dead-letter table, an application's own) are
+    /// applied by pointing `--include-dir` at their migration directories.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
+
     /// Gate backward-incompatible workflow payload-schema changes (issue #794).
     ///
     /// Read-only file comparison: no database, no network.
@@ -1062,6 +1127,78 @@ enum Commands {
         /// Template to emit. Currently only `minimal` ships.
         #[arg(long, value_enum, default_value_t)]
         template: ScaffoldTemplate,
+    },
+}
+
+/// `harvest migrate` subcommands (issue #1240).
+///
+/// Both talk to Postgres directly and never to the management API. `status` is
+/// strictly read-only — it does not even create the migration ledger — so it is
+/// safe to point at a database you are only inspecting.
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Report applied and pending migrations without changing anything.
+    ///
+    /// Exits `0` normally, and `1` with `--check` when any target still has a
+    /// pending migration (the deploy-gate form: run it before rolling
+    /// replicas).
+    Status {
+        /// Harvest database to inspect: the value of `harvest.database.url`.
+        ///
+        /// Repeat once per shard database for a multi-shard deployment; each
+        /// one needs the full set.
+        #[arg(
+            long = "database-url",
+            env = "HARVEST_DATABASE_URL",
+            value_name = "URL",
+            required = true
+        )]
+        database_url: Vec<String>,
+        /// Additional migration directory to include, e.g.
+        /// `autumn-harvest-plugin/migrations/harvest` for the connector
+        /// dead-letter table. Repeatable; each is a directory of
+        /// `<version>_<description>/up.sql` migrations.
+        #[arg(long = "include-dir", value_name = "DIR")]
+        include_dir: Vec<PathBuf>,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: MigrateFormat,
+        /// Exit non-zero while any target has a pending migration.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+    },
+    /// Apply every pending migration, in version order.
+    ///
+    /// Each migration runs inside one transaction together with its ledger row,
+    /// so a failure leaves neither the schema change nor the record of it. A
+    /// failing target stops the run: remaining targets are left untouched
+    /// rather than half-migrated behind a database that already failed.
+    Run {
+        /// Harvest database to migrate: the value of `harvest.database.url`.
+        ///
+        /// Repeat once per shard database for a multi-shard deployment; they
+        /// are migrated in the order given.
+        #[arg(
+            long = "database-url",
+            env = "HARVEST_DATABASE_URL",
+            value_name = "URL",
+            required = true
+        )]
+        database_url: Vec<String>,
+        /// Additional migration directory to include, e.g.
+        /// `autumn-harvest-plugin/migrations/harvest` for the connector
+        /// dead-letter table. Repeatable; each is a directory of
+        /// `<version>_<description>/up.sql` migrations.
+        #[arg(long = "include-dir", value_name = "DIR")]
+        include_dir: Vec<PathBuf>,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: MigrateFormat,
+        /// Report what would be applied and exit without applying it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -2947,6 +3084,9 @@ impl Cli {
             Commands::Schema { .. } => {
                 unreachable!("Schema handles its own execution locally")
             }
+            Commands::Migrate { .. } => {
+                unreachable!("Migrate handles its own execution locally")
+            }
             Commands::New { .. } => {
                 unreachable!("New handles its own execution locally")
             }
@@ -3121,6 +3261,26 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 acknowledge.as_deref(),
                 recorded_in.as_deref(),
             ),
+        };
+    }
+
+    // `migrate` talks to the Harvest database directly (issue #1240): no HTTP,
+    // and deliberately no running app — it is the step that happens *before*
+    // replicas roll (mirrors `backup verify`).
+    if let Commands::Migrate { command } = &cli.command {
+        return match command {
+            MigrateCommand::Status {
+                database_url,
+                include_dir,
+                format,
+                check,
+            } => run_migrate_status(database_url, include_dir, *format, *check).await,
+            MigrateCommand::Run {
+                database_url,
+                include_dir,
+                format,
+                dry_run,
+            } => run_migrate_run(database_url, include_dir, *format, *dry_run).await,
         };
     }
 
@@ -4218,6 +4378,308 @@ pub async fn run_backup_verify(
     }
 
     backup_verify_gate(&report).map_or(Ok(()), Err)
+}
+
+// ── harvest migrate: dedicated Harvest-database migrations (issue #1240) ────
+
+/// Assemble the migration set to apply: Harvest's own, embedded in this binary,
+/// plus every `--include-dir` set in the order given.
+///
+/// The combined set is validated for duplicate versions here rather than per
+/// directory, because that is exactly where a collision arises — two
+/// independently authored sets that picked the same version. Diesel's ledger is
+/// keyed by version alone, so one of them would otherwise be recorded and never
+/// run.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when a directory cannot be read, when a migration
+/// in it has no readable `up.sql`, or when two migrations share a version.
+fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliError> {
+    let mut scripts = autumn_harvest::migrate::embedded();
+    for dir in include_dir {
+        let extra = autumn_harvest::migrate::from_directory(dir).map_err(|error| {
+            CliError::InvalidInput(format!("--include-dir `{}`: {error}", dir.display()))
+        })?;
+        scripts.extend(extra);
+    }
+    autumn_harvest::migrate::validate_versions(&scripts)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+    Ok(scripts)
+}
+
+/// Render a migration failure without leaking the DSN.
+///
+/// A migration command runs from deploy pipelines whose logs are read far more
+/// widely than the credential in `harvest.database.url`, and a driver is free
+/// to quote the connection string it was handed. Substituting the redacted form
+/// costs nothing and removes the whole class.
+fn migrate_error(database_url: &str, redacted: &str, error: &impl std::fmt::Display) -> CliError {
+    CliError::Migrate {
+        database: redacted.to_string(),
+        reason: error.to_string().replace(database_url, redacted),
+    }
+}
+
+/// Human-readable `migrate status` report: one block per database.
+///
+/// `heading` distinguishes a plain status report from `run --dry-run`, which
+/// renders the same plan under a different promise.
+#[must_use]
+pub fn format_migrate_plan_text(heading: &str, targets: &[(String, MigrationPlan)]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{heading}");
+    for (database, plan) in targets {
+        let _ = writeln!(out, "  {database}");
+        if !plan.ledger_exists {
+            let _ = writeln!(
+                out,
+                "    ledger:  absent — this database has never been migrated"
+            );
+        }
+        let _ = writeln!(out, "    applied: {}", plan.already_applied.len());
+        let _ = writeln!(out, "    pending: {}", plan.pending.len());
+        for script in &plan.pending {
+            let _ = writeln!(out, "      {}", script.name);
+        }
+        // Reported, never removed: the usual cause is a newer build having
+        // already migrated this database, but it also catches a DSN pointed at
+        // the wrong one.
+        if !plan.unrecognized.is_empty() {
+            let _ = writeln!(
+                out,
+                "    unrecognized: {} ledger row(s) this binary does not know \
+                 (is it older than the deployed schema?)",
+                plan.unrecognized.len()
+            );
+            for version in &plan.unrecognized {
+                let _ = writeln!(out, "      {version}");
+            }
+        }
+    }
+    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
+    let _ = write!(
+        out,
+        "{pending} pending migration(s) across {} database(s)",
+        targets.len()
+    );
+    out
+}
+
+/// Human-readable `migrate run` report: one block per database.
+#[must_use]
+pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "harvest migrate run");
+    for (database, report) in targets {
+        let _ = writeln!(out, "  {database}");
+        let _ = writeln!(out, "    applied: {}", report.applied.len());
+        for name in &report.applied {
+            let _ = writeln!(out, "      {name}");
+        }
+        let _ = writeln!(out, "    already applied: {}", report.already_applied.len());
+        // Another migrator committed these between the plan and the apply. Said
+        // out loud because "applied: 0" on the database an operator is watching
+        // otherwise looks like the command did nothing.
+        if !report.applied_concurrently.is_empty() {
+            let _ = writeln!(
+                out,
+                "    applied by a concurrent migrator: {}",
+                report.applied_concurrently.len()
+            );
+            for name in &report.applied_concurrently {
+                let _ = writeln!(out, "      {name}");
+            }
+        }
+        if !report.unrecognized.is_empty() {
+            let _ = writeln!(
+                out,
+                "    unrecognized: {} ledger row(s) this binary does not know \
+                 (is it older than the deployed schema?)",
+                report.unrecognized.len()
+            );
+        }
+    }
+    let applied: usize = targets.iter().map(|(_, r)| r.applied.len()).sum();
+    let _ = write!(
+        out,
+        "{applied} migration(s) applied across {} database(s)",
+        targets.len()
+    );
+    out
+}
+
+/// Machine-readable `migrate status` / `run --dry-run` report.
+///
+/// # Errors
+///
+/// [`CliError::SerializeResponse`] if the report cannot be serialized.
+pub fn migrate_plan_json(
+    command: &str,
+    targets: &[(String, MigrationPlan)],
+) -> Result<String, CliError> {
+    let body = json!({
+        "command": command,
+        "targets": targets
+            .iter()
+            .map(|(database, plan)| json!({
+                "database": database,
+                "ledger_exists": plan.ledger_exists,
+                "already_applied": plan.already_applied,
+                "pending": plan.pending.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                "unrecognized": plan.unrecognized,
+            }))
+            .collect::<Vec<_>>(),
+        "pending_total": targets.iter().map(|(_, plan)| plan.pending.len()).sum::<usize>(),
+    });
+    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
+}
+
+/// Machine-readable `migrate run` report.
+///
+/// # Errors
+///
+/// [`CliError::SerializeResponse`] if the report cannot be serialized.
+pub fn migrate_run_json(targets: &[(String, MigrationReport)]) -> Result<String, CliError> {
+    let body = json!({
+        "command": "migrate run",
+        "targets": targets
+            .iter()
+            .map(|(database, report)| json!({
+                "database": database,
+                "applied": report.applied,
+                "already_applied": report.already_applied,
+                "applied_concurrently": report.applied_concurrently,
+                "unrecognized": report.unrecognized,
+            }))
+            .collect::<Vec<_>>(),
+        "applied_total": targets.iter().map(|(_, r)| r.applied.len()).sum::<usize>(),
+    });
+    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
+}
+
+/// The `--check` deploy gate: pending migrations anywhere fail the command.
+#[must_use]
+pub fn migrate_pending_gate(targets: &[(String, MigrationPlan)]) -> Option<CliError> {
+    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
+    if pending == 0 {
+        return None;
+    }
+    Some(CliError::MigrationsPending {
+        pending,
+        databases: targets
+            .iter()
+            .filter(|(_, plan)| plan.has_pending())
+            .count(),
+    })
+}
+
+/// Read every target's migration plan, leaving all of them untouched.
+async fn migrate_plans(
+    database_url: &[String],
+    scripts: &[MigrationScript],
+) -> Result<Vec<(String, MigrationPlan)>, CliError> {
+    let mut targets = Vec::with_capacity(database_url.len());
+    for url in database_url {
+        let redacted = redact_dsn(url);
+        let plan = autumn_harvest::migrate::plan(url, scripts)
+            .await
+            .map_err(|error| migrate_error(url, &redacted, &error))?;
+        targets.push((redacted, plan));
+    }
+    Ok(targets)
+}
+
+/// Run `harvest migrate status` end to end.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
+/// migration version; [`CliError::Migrate`] when a database cannot be reached;
+/// [`CliError::MigrationsPending`] when `--check` is set and any target still
+/// has a pending migration. The report is printed before the gate fires.
+pub async fn run_migrate_status(
+    database_url: &[String],
+    include_dir: &[PathBuf],
+    format: MigrateFormat,
+    check: bool,
+) -> Result<(), CliError> {
+    let scripts = migration_set(include_dir)?;
+    let targets = migrate_plans(database_url, &scripts).await?;
+
+    match format {
+        MigrateFormat::Text => println!(
+            "{}",
+            format_migrate_plan_text("harvest migrate status", &targets)
+        ),
+        MigrateFormat::Json => println!("{}", migrate_plan_json("migrate status", &targets)?),
+    }
+
+    if let Some(error) = check.then(|| migrate_pending_gate(&targets)).flatten() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Run `harvest migrate run` end to end.
+///
+/// Databases are migrated in the order given and a failure stops the run: the
+/// remaining targets are left untouched rather than migrated behind a database
+/// that already failed. Whatever completed first is still reported, so an
+/// operator can see exactly how far the deploy step got.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
+/// migration version; [`CliError::Migrate`] when a database cannot be reached
+/// or a migration fails.
+pub async fn run_migrate_run(
+    database_url: &[String],
+    include_dir: &[PathBuf],
+    format: MigrateFormat,
+    dry_run: bool,
+) -> Result<(), CliError> {
+    let scripts = migration_set(include_dir)?;
+
+    if dry_run {
+        let targets = migrate_plans(database_url, &scripts).await?;
+        match format {
+            MigrateFormat::Text => println!(
+                "{}",
+                format_migrate_plan_text("harvest migrate run --dry-run", &targets)
+            ),
+            MigrateFormat::Json => {
+                println!("{}", migrate_plan_json("migrate run --dry-run", &targets)?);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut targets = Vec::with_capacity(database_url.len());
+    for url in database_url {
+        let redacted = redact_dsn(url);
+        match autumn_harvest::migrate::apply(url, &scripts).await {
+            Ok(report) => targets.push((redacted, report)),
+            Err(error) => {
+                let failure = migrate_error(url, &redacted, &error);
+                // Print what DID happen before failing: on a multi-shard run the
+                // operator needs to know which databases are already migrated.
+                if !targets.is_empty() {
+                    match format {
+                        MigrateFormat::Text => println!("{}", format_migrate_run_text(&targets)),
+                        MigrateFormat::Json => println!("{}", migrate_run_json(&targets)?),
+                    }
+                }
+                return Err(failure);
+            }
+        }
+    }
+
+    match format {
+        MigrateFormat::Text => println!("{}", format_migrate_run_text(&targets)),
+        MigrateFormat::Json => println!("{}", migrate_run_json(&targets)?),
+    }
+    Ok(())
 }
 
 // ── harvest schema: payload-schema contract gate (issue #794) ───────────────
@@ -15071,5 +15533,374 @@ mod debug_cli_tests {
     #[test]
     fn debug_diff_requires_two_paths() {
         assert!(try_parse(&["debug", "diff", "only-one.json"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod migrate_cli_tests {
+    //! `harvest migrate` argument mapping, rendering, and the `--check` gate
+    //! (issue #1240). No database: the DB half is covered by
+    //! `autumn-harvest/tests/integration/migrate_tests.rs`.
+    use super::*;
+    use autumn_harvest::migrate::{MigrationPlan, MigrationReport, MigrationScript};
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn script(name: &str) -> MigrationScript {
+        MigrationScript::new(name, "SELECT 1;").expect("well-formed migration name")
+    }
+
+    fn plan(pending: &[&str], already: usize, unrecognized: &[&str]) -> MigrationPlan {
+        MigrationPlan {
+            already_applied: (0..already)
+                .map(|i| format!("2026010{i}000000_applied"))
+                .collect(),
+            pending: pending.iter().map(|n| script(n)).collect(),
+            unrecognized: unrecognized.iter().map(|v| (*v).to_string()).collect(),
+            ledger_exists: true,
+        }
+    }
+
+    // ── argument mapping ────────────────────────────────────────────────────
+
+    #[test]
+    fn migrate_status_parses_repeated_targets_and_include_dirs() {
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+            "--database-url",
+            "postgres://harvest/b",
+            "--include-dir",
+            "autumn-harvest-plugin/migrations/harvest",
+            "--format",
+            "json",
+            "--check",
+        ]);
+        let Commands::Migrate {
+            command:
+                MigrateCommand::Status {
+                    database_url,
+                    include_dir,
+                    format,
+                    check,
+                },
+        } = cli.command
+        else {
+            panic!("expected migrate status");
+        };
+        // A multi-shard deployment migrates every shard database; one flag per
+        // shard, not a delimiter-split single value.
+        assert_eq!(
+            database_url,
+            vec!["postgres://harvest/a", "postgres://harvest/b"]
+        );
+        assert_eq!(
+            include_dir,
+            vec![PathBuf::from("autumn-harvest-plugin/migrations/harvest")]
+        );
+        assert_eq!(format, MigrateFormat::Json);
+        assert!(check);
+    }
+
+    #[test]
+    fn migrate_defaults_are_text_and_ungated() {
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+        ]);
+        let Commands::Migrate {
+            command:
+                MigrateCommand::Status {
+                    include_dir,
+                    format,
+                    check,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected migrate status");
+        };
+        assert!(include_dir.is_empty());
+        assert_eq!(format, MigrateFormat::Text);
+        assert!(!check, "the deploy gate must be opt-in");
+    }
+
+    #[test]
+    fn migrate_run_dry_run_is_opt_in() {
+        let cli = parse(&[
+            "migrate",
+            "run",
+            "--database-url",
+            "postgres://harvest/a",
+            "--dry-run",
+        ]);
+        let Commands::Migrate {
+            command: MigrateCommand::Run { dry_run, .. },
+        } = cli.command
+        else {
+            panic!("expected migrate run");
+        };
+        assert!(dry_run);
+
+        let cli = parse(&["migrate", "run", "--database-url", "postgres://harvest/a"]);
+        let Commands::Migrate {
+            command: MigrateCommand::Run { dry_run, .. },
+        } = cli.command
+        else {
+            panic!("expected migrate run");
+        };
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn migrate_requires_a_database_url() {
+        // Nothing to default to: the whole point is a database Autumn cannot
+        // reach, so guessing one would migrate the wrong database.
+        assert!(
+            Cli::try_parse_from(["harvest", "migrate", "run"]).is_err()
+                || std::env::var("HARVEST_DATABASE_URL").is_ok(),
+            "--database-url must be required when the env var is unset"
+        );
+    }
+
+    #[test]
+    fn migrate_is_not_routed_through_the_api() {
+        // Guards the local-execution early return in `run_cli`: if a future
+        // edit drops it, this panics instead of the command silently trying to
+        // build an HTTP request.
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+        ]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.api_request()));
+        assert!(
+            result.is_err(),
+            "migrate must be handled locally, never mapped to an API request"
+        );
+    }
+
+    // ── include-dir loading ─────────────────────────────────────────────────
+
+    #[test]
+    fn include_dir_extends_the_embedded_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("29990101000000_extra")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("29990101000000_extra").join("up.sql"),
+            "SELECT 1;",
+        )
+        .expect("write up.sql");
+
+        let scripts = migration_set(&[dir.path().to_path_buf()]).expect("set loads");
+        let embedded = autumn_harvest::migrate::embedded();
+        assert_eq!(scripts.len(), embedded.len() + 1);
+        assert!(scripts.iter().any(|s| s.name == "29990101000000_extra"));
+    }
+
+    #[test]
+    fn an_include_dir_reusing_an_embedded_version_is_refused() {
+        // Diesel's ledger is keyed by version alone: one of the two would be
+        // recorded and never run. Refused up front, before any connection.
+        let embedded = autumn_harvest::migrate::embedded();
+        let collision = embedded
+            .first()
+            .expect("Harvest has migrations")
+            .version
+            .clone();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = format!("{collision}_collides");
+        std::fs::create_dir(dir.path().join(&name)).expect("mkdir");
+        std::fs::write(dir.path().join(&name).join("up.sql"), "SELECT 1;").expect("write up.sql");
+
+        let error = migration_set(&[dir.path().to_path_buf()])
+            .expect_err("a duplicate version must be refused");
+        assert!(error.to_string().contains(&collision), "{error}");
+    }
+
+    #[test]
+    fn a_missing_include_dir_names_the_path() {
+        let error = migration_set(&[PathBuf::from("/nonexistent/harvest/migrations")])
+            .expect_err("a missing directory must fail loudly");
+        assert!(
+            error
+                .to_string()
+                .contains("/nonexistent/harvest/migrations"),
+            "{error}"
+        );
+    }
+
+    // ── rendering ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_text_lists_pending_migrations_per_database() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            ("postgres://harvest/b".to_string(), plan(&[], 3, &[])),
+        ];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("postgres://harvest/a"));
+        assert!(text.contains("20260801000000_x"));
+        assert!(
+            text.contains("1 pending migration(s) across 2 database(s)"),
+            "the summary must total across databases: {text}"
+        );
+    }
+
+    #[test]
+    fn status_text_says_when_a_database_has_never_been_migrated() {
+        let mut empty = plan(&["20260801000000_x"], 0, &[]);
+        empty.ledger_exists = false;
+        let targets = vec![("postgres://harvest/a".to_string(), empty)];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("never been migrated"), "{text}");
+    }
+
+    #[test]
+    fn status_text_flags_ledger_rows_the_binary_does_not_know() {
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            plan(&[], 2, &["29990101000000"]),
+        )];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("unrecognized"), "{text}");
+        assert!(text.contains("29990101000000"), "{text}");
+    }
+
+    #[test]
+    fn status_json_reports_names_and_a_pending_total() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            (
+                "postgres://harvest/b".to_string(),
+                plan(&["20260802000000_y"], 2, &[]),
+            ),
+        ];
+        let rendered = migrate_plan_json("migrate status", &targets).expect("serializes");
+        let value: Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["command"], "migrate status");
+        assert_eq!(value["pending_total"], 2);
+        assert_eq!(value["targets"][0]["database"], "postgres://harvest/a");
+        assert_eq!(value["targets"][0]["pending"][0], "20260801000000_x");
+        assert_eq!(value["targets"][1]["ledger_exists"], true);
+    }
+
+    #[test]
+    fn run_text_and_json_report_what_was_applied() {
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: vec!["20260101000000_a".to_string()],
+                applied_concurrently: vec!["20260802000000_y".to_string()],
+                unrecognized: Vec::new(),
+            },
+        )];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("20260801000000_x"), "{text}");
+        assert!(
+            text.contains("applied by a concurrent migrator"),
+            "a concurrent apply must not read as 'nothing happened': {text}"
+        );
+        assert!(
+            text.contains("1 migration(s) applied across 1 database(s)"),
+            "{text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["command"], "migrate run");
+        assert_eq!(value["applied_total"], 1);
+        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
+        assert_eq!(
+            value["targets"][0]["applied_concurrently"][0],
+            "20260802000000_y"
+        );
+    }
+
+    // ── the deploy gate ─────────────────────────────────────────────────────
+
+    #[test]
+    fn the_check_gate_is_silent_when_every_database_is_migrated() {
+        let targets = vec![("postgres://harvest/a".to_string(), plan(&[], 3, &[]))];
+        assert!(migrate_pending_gate(&targets).is_none());
+    }
+
+    #[test]
+    fn the_check_gate_counts_pending_migrations_and_databases() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            ("postgres://harvest/b".to_string(), plan(&[], 2, &[])),
+            (
+                "postgres://harvest/c".to_string(),
+                plan(&["20260801000000_x", "20260802000000_y"], 2, &[]),
+            ),
+        ];
+        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
+        match error {
+            CliError::MigrationsPending { pending, databases } => {
+                assert_eq!(pending, 3);
+                assert_eq!(databases, 2);
+            }
+            other => panic!("expected MigrationsPending, got {other:?}"),
+        }
+        // Exit 1 = "determined: not migrated", distinct from the exit-2
+        // "could not determine" gates.
+        assert_eq!(
+            migrate_pending_gate(&targets)
+                .expect("pending migrations must gate")
+                .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_ledger_row_alone_never_gates() {
+        // The database is ahead of this binary. That is worth reporting, but it
+        // is not a reason to fail a deploy that has nothing to apply.
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            plan(&[], 3, &["29990101000000"]),
+        )];
+        assert!(migrate_pending_gate(&targets).is_none());
+    }
+
+    // ── credential hygiene ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_failure_message_carries_the_redacted_dsn_not_the_password() {
+        let url = "postgres://harvest:hunter2@db.internal:5432/harvest";
+        let redacted = autumn_harvest::backup_verify::redact_dsn(url);
+        let error = migrate_error(
+            url,
+            &redacted,
+            &format!("connection to `{url}` was refused"),
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("hunter2"),
+            "a deploy log must not learn the database password: {rendered}"
+        );
+        assert!(rendered.contains(&redacted), "{rendered}");
+        assert_eq!(error.exit_code(), 1);
     }
 }

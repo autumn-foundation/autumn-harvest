@@ -52,7 +52,10 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
 /// already-migrated database. It also keeps the same dev/prod policy the plugin
 /// applied by hand before: auto-apply under the `dev` profile, warn-only
-/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas —
+/// and, for the dedicated Harvest database under `Split`/`External` that
+/// `autumn migrate` cannot reach, `harvest migrate run`; see
+/// [`ensure_runtime_migrations_blocking`]).
 ///
 /// Registering here rather than migrating ourselves is what lets Autumn resolve
 /// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
@@ -2552,7 +2555,14 @@ fn apply_migrations_for_profile(
             tracing::warn!(
                 target = label,
                 count = pending.len(),
-                "Pending migrations detected. Run `autumn migrate` to apply them."
+                // This path only ever runs for a DEDICATED Harvest database
+                // (`ensure_runtime_migrations_blocking` returns early under
+                // `Embedded`), and `autumn migrate` cannot reach one -- it
+                // applies the application database's sets. Naming it here sent
+                // operators to a command that exits 0 having changed nothing
+                // (issue #1240).
+                "Pending migrations detected. Run `harvest migrate run \
+                 --database-url <harvest.database.url>` to apply them."
             );
             for migration in pending {
                 tracing::warn!(target = label, migration = %migration, "Pending migration");

@@ -195,7 +195,7 @@ So pinning the **root** of a workflow tree confines the whole tree.
 
 ### Worked example — a two-region EU/US deployment
 
-1. **Provision two databases**, one per region, and run `diesel migration run` against each.
+1. **Provision two databases**, one per region, and run `harvest migrate run --database-url <dsn>` against each.
 
 2. **Declare the shards and the residency map** when building the router:
 
@@ -460,7 +460,7 @@ CREATE INDEX IF NOT EXISTS idx_harvest_we_created_id
     ON harvest_workflow_executions (created_at DESC, id DESC);
 ```
 
-This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and runs automatically with `diesel migration run`.
+This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and is applied by the normal migration step (`autumn migrate`, or `harvest migrate run` against a dedicated Harvest database).
 
 ## Cross-shard typed search-attribute predicates (`search_attr_filter`, issue #506)
 
@@ -513,8 +513,13 @@ Follow this procedure to add a new shard to a live deployment. Each step is safe
 Provision a new Postgres database and run migrations against it:
 
 ```bash
-DATABASE_URL=postgres://user:pass@new-shard-host/harvest diesel migration run
+harvest migrate run --database-url postgres://user:pass@new-shard-host/harvest
 ```
+
+Harvest's migrations are embedded in the `harvest` binary, so this needs no
+source tree. Add `--include-dir` for any set that is not (the plugin's
+connector dead-letter table, an application's own); see
+[Migrations](getting-started/10-operations.md#migrations).
 
 ### Step 2 — Add to readable_shards
 
@@ -536,7 +541,7 @@ Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reaso
 |---|---|---|
 | `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** covers this shard. | Widen a worker's coverage and redeploy — either add the shard to its `shard_assignments`, or remove the explicit `shard_assignments` narrowing entirely so "auto" coverage applies (issue #961). Verify with `GET /admin/config` → `worker.shard_assignments`. |
 | `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
-| `schema_migration_missing` | The shard is missing required migrations. | Re-run `diesel migration run` against the shard. |
+| `schema_migration_missing` | The shard is missing required migrations. | Re-run `harvest migrate run --database-url <shard-dsn>` against the shard. |
 
 The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522: until at least one `Healthy + Active` worker lists the new shard in its `shard_assignments`, the shard will not report `ready`. This prevents silently stranding work on the new shard.
 

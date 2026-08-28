@@ -293,9 +293,13 @@ a non-web context.
 
 ## CLI
 
-The `harvest` binary is a thin HTTP client for the optional management API. It
-does not talk to Postgres directly, so workflow queries, DAG triggers, auth, and
-runtime-owned behavior stay behind the same API surface your service exposes.
+The `harvest` binary is a thin HTTP client for the optional management API, so
+workflow queries, DAG triggers, auth, and runtime-owned behavior stay behind the
+same API surface your service exposes. A few commands take a database DSN
+instead, because they exist for the moments when no app is up to ask:
+[`harvest migrate`](#migrating-a-dedicated-harvest-database) (the schema step
+before replicas roll) and `harvest backup verify` (a restore drill against
+scratch databases).
 
 ```bash
 cargo run -p autumn-harvest-cli -- health
@@ -329,6 +333,36 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+### Migrating a dedicated Harvest database
+
+In the default `harvest.mode = "embedded"`, Harvest's migrations are Autumn's:
+they are registered with the framework and applied by `autumn migrate` (or
+automatically under the `dev` profile). Under `harvest.mode = "split"` or
+`"external"`, Harvest storage is a database Autumn has no handle on — that one
+is `harvest migrate`'s job:
+
+```bash
+export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+
+harvest migrate status          # what is applied, what is pending
+harvest migrate status --check  # same, but exits non-zero while anything is pending
+harvest migrate run             # apply every pending migration, in version order
+harvest migrate run --dry-run   # print the plan, change nothing
+
+# Sets the binary does not embed — the plugin's connector dead-letter table,
+# or your application's own — ride along:
+harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+
+# One flag per shard database in a multi-shard deployment:
+harvest migrate run --database-url "$SHARD_A" --database-url "$SHARD_B"
+```
+
+Harvest's own migrations are embedded in the binary, so this needs neither a
+source tree nor the `diesel` CLI. Each migration runs in one transaction
+together with its row in `__diesel_schema_migrations` — the same ledger Autumn
+and Diesel read — so a migration is applied exactly once whichever of them
+applies it, and a failure leaves neither the schema change nor the record of it.
 
 ### Deployment preflight
 

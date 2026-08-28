@@ -142,27 +142,38 @@ the target database:
   the application-database set (the workflow-start outbox). In non-`dev`
   profiles, the plugin only checks the dedicated Harvest database and warns
   about pending migrations; it does **not** apply them. Before rolling replicas,
-  run `autumn migrate`, then apply both Harvest sets to the URL configured as
-  `harvest.database.url`:
+  run `autumn migrate` for the application database and `harvest migrate run`
+  for the one configured as `harvest.database.url`:
 
   ```bash
   autumn migrate
 
-  diesel migration run \
-    --database-url "$HARVEST_DATABASE_URL" \
-    --migration-dir autumn-harvest/migrations
-  diesel migration run \
-    --database-url "$HARVEST_DATABASE_URL" \
-    --migration-dir autumn-harvest-plugin/migrations/harvest
+  export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+  harvest migrate run
   ```
 
-  Set `HARVEST_DATABASE_URL` to the same value as `harvest.database.url`, and
-  run these commands from the workspace root (or adjust the migration paths to
-  the installed source tree). Do not roll replicas if any command fails. See
-  the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
+  `harvest migrate` connects to Postgres directly — no running app, no
+  management API — and writes the same `__diesel_schema_migrations` ledger
+  Autumn and Diesel use, so a migration is applied exactly once no matter which
+  of them applies it. Harvest's own migrations are embedded in the `harvest`
+  binary, so no source tree is needed.
+
+  Sets the binary does not embed are added with `--include-dir`. The one that
+  matters in practice is the plugin's connector dead-letter table, needed
+  before you enable a [broker connector](13-broker-connectors.md):
+
+  ```bash
+  harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  To gate a deploy without applying anything, `harvest migrate status --check`
+  exits non-zero while any migration is still pending (and `harvest migrate run
+  --dry-run` prints the same plan). Do not roll replicas if any command fails.
+  See the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
   for the ownership table and complete procedure.
 - **Multi-shard deployments** — each Harvest shard database needs the full set
-  applied. See [`sharding.md`](../sharding.md).
+  applied; repeat `--database-url` once per shard. See
+  [`sharding.md`](../sharding.md).
 
 ## Dashboard
 
@@ -186,8 +197,11 @@ harvest dlq replay <dead-letter-id>
 harvest concurrency status
 ```
 
-It never talks to Postgres directly — every call goes through the API your
-service already exposes, so auth and policy stay in one place.
+Almost every call goes through the API your service already exposes, so auth
+and policy stay in one place. The exceptions are the commands that exist
+precisely because no app is up to ask: `harvest migrate` (the schema step that
+runs *before* replicas roll) and `harvest backup verify` (a restore drill
+against scratch databases). Both take a DSN and talk to Postgres directly.
 
 ## Dead letters
 
