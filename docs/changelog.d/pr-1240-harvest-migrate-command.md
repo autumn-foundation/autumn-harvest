@@ -64,6 +64,18 @@ with a substitute version because it sees every plugin's set at once, and the
 honest answer here — where one migration would be recorded and never run — is to
 refuse.
 
+Connections are the CLI's own, not `AsyncPgConnection::establish`: that is
+`NoTls` and could not reach a managed Harvest database at all, which is the
+production shape this command exists for. The CLI builds the same
+rustls-backed connector autumn-web's migration path uses (already in the
+workspace lockfile at the same versions, so the graph is unified rather than
+widened) and calls the module's `*_on_connection` entry points, keeping a
+rustls stack out of the engine core. TLS is always verified — chain and
+hostname — which is stricter than libpq's `require`; `sslmode=verify-ca` /
+`verify-full` are rewritten to `require` for tokio-postgres, which fails to
+*parse* those values, and that is not a downgrade because the connector
+verifies unconditionally.
+
 Harvest's own set is embedded in the binary; sets that are not (the plugin's
 connector dead-letter table, an application's own) are added with
 `--include-dir`. `--database-url` repeats once per shard database, and a failing

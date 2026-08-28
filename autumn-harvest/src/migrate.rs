@@ -49,10 +49,12 @@
 //!   set at once. This module sees only what it is handed, so a duplicate
 //!   version across sets is a hard error ([`validate_versions`]) rather than a
 //!   silently skipped migration.
-//! * **No TLS.** Connections are established the same way the rest of the
-//!   engine establishes them, so a DSN whose `sslmode` demands TLS is refused
-//!   by the server. Migrate such a database from inside the network perimeter,
-//!   or with the `diesel` CLI.
+//! * **No transport policy.** [`connect`] is `AsyncPgConnection::establish`,
+//!   which is `NoTls`. A caller that must reach a TLS-requiring database — the
+//!   `harvest migrate` CLI does, since a managed Harvest database usually is
+//!   one — builds its own connection and calls [`plan_on_connection`] /
+//!   [`apply_to_connection`] instead. Keeping the connector out of here is what
+//!   keeps a rustls stack out of the engine core.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

@@ -156,7 +156,9 @@ the target database:
   management API — and writes the same `__diesel_schema_migrations` ledger
   Autumn and Diesel use, so a migration is applied exactly once no matter which
   of them applies it. Harvest's own migrations are embedded in the `harvest`
-  binary, so no source tree is needed.
+  binary, so no source tree is needed. TLS DSNs work: `sslmode=require`,
+  `verify-ca` and `verify-full` all connect, and the certificate chain and
+  hostname are verified against the platform trust store in every case.
 
   Sets the binary does not embed are added with `--include-dir`. The one that
   matters in practice is the plugin's connector dead-letter table, needed

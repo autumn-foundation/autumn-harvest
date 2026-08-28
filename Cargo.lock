@@ -318,13 +318,19 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "diesel-async",
  "percent-encoding",
  "ratatui",
  "reqwest",
+ "rustls 0.23.40",
+ "rustls-native-certs",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "url",
 ]
 
 [[package]]

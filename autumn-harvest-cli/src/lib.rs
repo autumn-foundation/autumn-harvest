@@ -18,6 +18,7 @@ use autumn_harvest::{
     dropped_acknowledgements, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use diesel_async::AsyncPgConnection;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -4408,6 +4409,137 @@ fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliErr
     Ok(scripts)
 }
 
+/// Establish the connection `harvest migrate` works over.
+///
+/// Deliberately not [`autumn_harvest::migrate::connect`]: that is
+/// `AsyncPgConnection::establish`, which is `NoTls` and so cannot reach a
+/// database whose `sslmode` demands TLS — the common shape of a managed
+/// Harvest database, and exactly the production case this command exists for
+/// (issue #1240). This builds the same rustls-backed connector autumn-web's
+/// own migration path uses, so the two agree about which databases are
+/// reachable.
+///
+/// **TLS is always verified** — certificate chain *and* hostname, against the
+/// platform's trust store. That is stricter than libpq's `sslmode=require`
+/// (which encrypts without authenticating): a self-signed certificate must be
+/// in the system trust store to be accepted here. `sslmode=disable` still
+/// connects in plaintext, and `prefer` (the default) negotiates TLS with a
+/// plaintext fallback, both as tokio-postgres implements them.
+///
+/// # Errors
+///
+/// [`CliError::Migrate`] when the DSN cannot be parsed, when the platform has
+/// no usable trust store, or when the connection cannot be established.
+async fn connect_for_migration(
+    database_url: &str,
+    redacted: &str,
+) -> Result<AsyncPgConnection, CliError> {
+    let dsn = normalize_sslmode(database_url);
+    let config: tokio_postgres::Config = dsn
+        .parse()
+        .map_err(|error: tokio_postgres::Error| migrate_error(database_url, redacted, &error))?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A malformed certificate in the system store is not a reason to fail:
+        // rustls rejects it, the rest still anchor the chain.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err(CliError::Migrate {
+            database: redacted.to_string(),
+            reason: format!(
+                "no usable certificates in the platform trust store, so a TLS \
+                 connection cannot be verified (install your distribution's \
+                 ca-certificates package). Loader errors: {:?}",
+                native.errors
+            ),
+        });
+    }
+
+    // An explicit provider rather than the process-wide default: nothing else
+    // in this binary installs one, and `ClientConfig::builder()` panics when
+    // there is none.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| migrate_error(database_url, redacted, &error))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let (client, connection) = config
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
+        .await
+        .map_err(|error| migrate_error(database_url, redacted, &error))?;
+
+    // `try_from_client_and_connection` drives the connection task itself and
+    // surfaces its errors on the connection, so a dropped socket mid-migration
+    // is reported rather than hanging.
+    AsyncPgConnection::try_from_client_and_connection(client, connection)
+        .await
+        .map_err(|error| migrate_error(database_url, redacted, &error))
+}
+
+/// Rewrite `sslmode=verify-ca` / `verify-full` to `require`.
+///
+/// tokio-postgres 0.7 accepts only `disable`, `prefer` and `require`, and
+/// **fails to parse** the DSN otherwise — so a `verify-full` DSN that libpq and
+/// the `diesel` CLI accept would be rejected before a connection is attempted.
+///
+/// Substituting `require` is not a downgrade: verification is the rustls
+/// connector's job here, and it always checks the chain and the hostname. The
+/// two verify modes therefore describe what [`connect_for_migration`] already
+/// does unconditionally.
+///
+/// Handles both DSN spellings — a URL (`postgres://…?sslmode=verify-full`) and
+/// libpq keyword form (`host=… sslmode=verify-full`) — and leaves anything else
+/// byte-identical.
+#[must_use]
+pub fn normalize_sslmode(dsn: &str) -> String {
+    const VERIFY_MODES: [&str; 2] = ["verify-ca", "verify-full"];
+
+    if let Ok(mut url) = url::Url::parse(dsn) {
+        let needs_rewrite = url
+            .query_pairs()
+            .any(|(k, v)| k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()));
+        if !needs_rewrite {
+            return dsn.to_string();
+        }
+        let rewritten: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                if k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()) {
+                    (k.into_owned(), "require".to_string())
+                } else {
+                    (k.into_owned(), v.into_owned())
+                }
+            })
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(rewritten)
+            .finish();
+        return url.to_string();
+    }
+
+    // libpq keyword form. Only a whole `sslmode=<verify mode>` token is
+    // touched, so a password or path that merely contains the text is safe.
+    dsn.split_inclusive(char::is_whitespace)
+        .map(|token| {
+            let trimmed = token.trim_end();
+            let suffix = &token[trimmed.len()..];
+            match trimmed
+                .strip_prefix("sslmode=")
+                .filter(|mode| VERIFY_MODES.contains(mode))
+            {
+                Some(_) => format!("sslmode=require{suffix}"),
+                None => token.to_string(),
+            }
+        })
+        .collect()
+}
+
 /// Render a migration failure without leaking the DSN.
 ///
 /// A migration command runs from deploy pipelines whose logs are read far more
@@ -4582,7 +4714,8 @@ async fn migrate_plans(
     let mut targets = Vec::with_capacity(database_url.len());
     for url in database_url {
         let redacted = redact_dsn(url);
-        let plan = autumn_harvest::migrate::plan(url, scripts)
+        let mut conn = connect_for_migration(url, &redacted).await?;
+        let plan = autumn_harvest::migrate::plan_on_connection(&mut conn, scripts)
             .await
             .map_err(|error| migrate_error(url, &redacted, &error))?;
         targets.push((redacted, plan));
@@ -4658,7 +4791,8 @@ pub async fn run_migrate_run(
     let mut targets = Vec::with_capacity(database_url.len());
     for url in database_url {
         let redacted = redact_dsn(url);
-        match autumn_harvest::migrate::apply(url, &scripts).await {
+        let mut conn = connect_for_migration(url, &redacted).await?;
+        match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
             Ok(report) => targets.push((redacted, report)),
             Err(error) => {
                 let failure = migrate_error(url, &redacted, &error);
@@ -15882,6 +16016,55 @@ mod migrate_cli_tests {
             plan(&[], 3, &["29990101000000"]),
         )];
         assert!(migrate_pending_gate(&targets).is_none());
+    }
+
+    // ── TLS / DSN normalization ─────────────────────────────────────────────
+
+    #[test]
+    fn a_verify_dsn_is_rewritten_so_tokio_postgres_can_parse_it() {
+        // tokio-postgres 0.7 knows only disable/prefer/require and FAILS TO
+        // PARSE anything else, so a `verify-full` DSN that libpq and the
+        // `diesel` CLI accept would be rejected before we ever connect. rustls
+        // verifies the chain and the hostname regardless, so `require` here
+        // describes what the connector already does.
+        for mode in ["verify-ca", "verify-full"] {
+            let rewritten = normalize_sslmode(&format!(
+                "postgres://u:p@db.internal/harvest?sslmode={mode}"
+            ));
+            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
+            assert!(!rewritten.contains(mode), "{rewritten}");
+            rewritten
+                .parse::<tokio_postgres::Config>()
+                .expect("the rewritten DSN must parse");
+        }
+    }
+
+    #[test]
+    fn other_ssl_modes_and_dsns_pass_through_byte_identical() {
+        for dsn in [
+            "postgres://u:p@db.internal/harvest",
+            "postgres://u:p@db.internal/harvest?sslmode=require",
+            "postgres://u:p@db.internal/harvest?sslmode=disable",
+            "postgres://u:p@db.internal/harvest?application_name=harvest%20migrate",
+        ] {
+            assert_eq!(normalize_sslmode(dsn), dsn, "must not be rewritten: {dsn}");
+        }
+    }
+
+    #[test]
+    fn the_libpq_keyword_form_is_rewritten_too() {
+        let rewritten = normalize_sslmode("host=db.internal dbname=harvest sslmode=verify-full");
+        assert_eq!(rewritten, "host=db.internal dbname=harvest sslmode=require");
+        rewritten
+            .parse::<tokio_postgres::Config>()
+            .expect("the rewritten DSN must parse");
+    }
+
+    #[test]
+    fn a_password_that_merely_contains_the_text_is_untouched() {
+        // Only a whole `sslmode=<verify mode>` token is rewritten.
+        let dsn = "host=db.internal password=sslmode=verify-full-not-really sslmode=require";
+        assert_eq!(normalize_sslmode(dsn), dsn);
     }
 
     // ── credential hygiene ──────────────────────────────────────────────────

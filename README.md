@@ -367,6 +367,11 @@ A migration whose `metadata.toml` says `run_in_transaction = false`, as a
 `CREATE INDEX CONCURRENTLY` migration must, is applied without one, exactly as
 Diesel applies it.
 
+TLS is supported and always *verified* — chain and hostname, against the
+platform trust store — so `sslmode=require`, `verify-ca` and `verify-full` all
+connect (a self-signed certificate has to be in that trust store).
+`sslmode=disable` still connects in plaintext.
+
 ### Deployment preflight
 
 Run preflight before promoting a Harvest-backed service:
