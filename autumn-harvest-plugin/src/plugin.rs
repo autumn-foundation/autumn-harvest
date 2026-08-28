@@ -2514,6 +2514,7 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+        HARVEST_MIGRATE_REMEDY,
     )?;
 
     // Plugin-owned tables that live in the harvest database (issue #944's
@@ -2525,14 +2526,39 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         PLUGIN_HARVEST_MIGRATIONS,
         "Harvest plugin storage",
+        PLUGIN_HARVEST_MIGRATE_REMEDY,
     )
 }
+
+/// The command that applies [`HARVEST_MIGRATIONS`] to a dedicated Harvest
+/// database.
+///
+/// `autumn migrate` is deliberately NOT named: this path only ever runs for a
+/// dedicated Harvest database (`ensure_runtime_migrations_blocking` returns
+/// early under `Embedded`), which that command cannot reach — it applies the
+/// application database's sets and exits 0 having changed nothing (issue
+/// #1240).
+const HARVEST_MIGRATE_REMEDY: &str =
+    "Run `harvest migrate run --database-url <harvest.database.url>` to apply them.";
+
+/// The command that applies [`PLUGIN_HARVEST_MIGRATIONS`].
+///
+/// **Not the same command.** The `harvest` binary embeds Harvest's own
+/// migrations, not the plugin's, so this set only applies when its directory is
+/// named explicitly. An operator given [`HARVEST_MIGRATE_REMEDY`] for *this*
+/// warning would see a successful exit and roll replicas with
+/// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
+/// added the table to prevent, since the first poison message then fails its
+/// dead-letter write and redelivers forever.
+const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = "Run `harvest migrate run --database-url <harvest.database.url> \
+     --include-dir autumn-harvest-plugin/migrations/harvest` to apply them.";
 
 fn apply_migrations_for_profile(
     profile: &str,
     database_url: &str,
     migrations: EmbeddedMigrations,
     label: &str,
+    remedy: &str,
 ) -> autumn_web::AutumnResult<()> {
     if profile == "dev" {
         let result = autumn_web::migrate::run_pending(database_url, migrations)
@@ -2555,14 +2581,8 @@ fn apply_migrations_for_profile(
             tracing::warn!(
                 target = label,
                 count = pending.len(),
-                // This path only ever runs for a DEDICATED Harvest database
-                // (`ensure_runtime_migrations_blocking` returns early under
-                // `Embedded`), and `autumn migrate` cannot reach one -- it
-                // applies the application database's sets. Naming it here sent
-                // operators to a command that exits 0 having changed nothing
-                // (issue #1240).
-                "Pending migrations detected. Run `harvest migrate run \
-                 --database-url <harvest.database.url>` to apply them."
+                remedy,
+                "Pending migrations detected."
             );
             for migration in pending {
                 tracing::warn!(target = label, migration = %migration, "Pending migration");
@@ -2574,6 +2594,47 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_remedy_tests {
+    use super::{HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY};
+
+    #[test]
+    fn both_remedies_name_the_command_that_can_reach_a_dedicated_harvest_database() {
+        // `autumn migrate` reaches the application database only; naming it in
+        // either warning sends the operator to a command that exits 0 having
+        // changed nothing (issue #1240).
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("harvest migrate run --database-url"),
+                "remedy must name the dedicated-database command: {remedy}"
+            );
+            assert!(
+                !remedy.contains("autumn migrate"),
+                "remedy must not name a command that cannot apply these: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_plugin_remedy_names_the_plugin_migration_directory() {
+        // The `harvest` binary embeds Harvest's own migrations, not the
+        // plugin's: without `--include-dir` the plugin set is silently not
+        // applied, and the operator rolls replicas with
+        // `harvest_connector_dead_letters` absent.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY
+                .contains("--include-dir autumn-harvest-plugin/migrations/harvest"),
+            "the plugin-storage warning must name its own migration directory: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            !HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the core-storage warning needs no extra directory -- the binary \
+             embeds that set: {HARVEST_MIGRATE_REMEDY}"
+        );
+    }
 }
 
 #[cfg(test)]
