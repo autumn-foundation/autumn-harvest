@@ -169,12 +169,12 @@ impl MigrationScript {
 ///
 /// Diesel's metadata file defines exactly one key, and pulling a TOML crate
 /// into the engine core to read one boolean is not a trade worth making. This
-/// reads that one key and **refuses** anything it cannot interpret with
-/// certainty (a table header, a non-boolean value, a duplicate key) rather than
-/// guessing: guessing `false` runs DDL outside a transaction the author never
-/// asked to leave, and guessing `true` fails the `CONCURRENTLY` migration this
-/// exists to support. A file that says nothing about the key keeps Diesel's
-/// default of `true`.
+/// reads that one key and **refuses everything else** — a table header, a line
+/// that is not `<key> = <value>`, an unknown key, a non-boolean value, a
+/// duplicate key — rather than guessing: guessing `false` runs DDL outside a
+/// transaction the author never asked to leave, and guessing `true` fails the
+/// `CONCURRENTLY` migration this exists to support. An absent file, or one that
+/// only comments, keeps Diesel's default of `true`.
 ///
 /// # Errors
 ///
@@ -184,8 +184,12 @@ impl MigrationScript {
 /// key is invalid TOML whether or not the two values agree, so Diesel refuses
 /// to parse the file at all.
 ///
-/// Unknown *keys* are the one thing skipped rather than refused: Diesel reads
-/// this file with serde, which ignores fields it does not know.
+/// Unknown keys are refused as well. Diesel's serde layer would ignore them,
+/// but only after parsing the file as TOML — so an unknown key carrying an
+/// invalid value fails there while a line-at-a-time reader would shrug. What
+/// this accepts is therefore a strict subset of what Diesel accepts: blank
+/// lines, `#` comments, and `run_in_transaction = true|false`. Every file it
+/// reads, Diesel reads the same way; anything else is an error naming the line.
 pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<bool> {
     let mut found: Option<bool> = None;
     for raw in metadata.lines() {
@@ -218,8 +222,19 @@ pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<boo
         // Accept the quoted spelling of the key; TOML allows `"key" = value`.
         let key = key.trim().trim_matches(['"', '\'']);
         if key != RUN_IN_TRANSACTION_KEY {
-            // Diesel ignores keys it does not know; so do we.
-            continue;
+            // Refused, not skipped. Diesel's serde layer ignores unknown
+            // fields, but its TOML parse runs FIRST -- so an unknown key with
+            // an invalid value (`future_option = not-valid-toml`) fails there,
+            // and skipping the line here would apply a migration on metadata
+            // Diesel rejects. Validating such a value would mean implementing
+            // TOML; refusing the key keeps what this accepts to a provable
+            // subset of what Diesel accepts, which is the only side of that
+            // trade that is safe to be wrong on.
+            return Err(HarvestError::Config(format!(
+                "migration `{name}`: {METADATA_FILE} sets `{key}`, which is not \
+                 `{RUN_IN_TRANSACTION_KEY}` -- the only key understood here. \
+                 Apply this migration with the `diesel` CLI"
+            )));
         }
         let parsed = match value.trim() {
             "true" => true,
@@ -986,13 +1001,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_tolerates_comments_whitespace_quoting_and_unknown_keys() {
+    fn metadata_tolerates_comments_whitespace_and_quoting() {
         for metadata in [
             "# a comment\nrun_in_transaction = false\n",
             "  run_in_transaction   =   false  \n",
             "\"run_in_transaction\" = false\n",
             "run_in_transaction = false # trailing comment\n",
-            "some_future_key = 3\nrun_in_transaction = false\n",
         ] {
             assert!(
                 !parse_run_in_transaction("m", metadata).expect("metadata parses"),
@@ -1024,6 +1038,12 @@ mod tests {
             // agreeing case would apply a migration on metadata it rejects.
             "run_in_transaction = true\nrun_in_transaction = false\n",
             "run_in_transaction = false\nrun_in_transaction = false\n",
+            // An unknown key: Diesel's serde layer would ignore it, but only
+            // after parsing the file as TOML, so an invalid value fails there.
+            // Refusing the key keeps what this accepts inside what Diesel
+            // accepts without implementing TOML.
+            "some_future_key = 3\nrun_in_transaction = false\n",
+            "future_option = not-valid-toml\n",
             // Not `key = value` at all: Diesel's parser rejects the whole
             // file, so skipping the line would apply a migration on metadata
             // `diesel migration run` refuses to read.

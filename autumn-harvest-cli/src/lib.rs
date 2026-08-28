@@ -4439,6 +4439,16 @@ async fn connect_for_migration(
         .parse()
         .map_err(|error: tokio_postgres::Error| migrate_error(database_url, redacted, &error))?;
 
+    // `sslmode=disable` never touches the TLS configuration, so it must not be
+    // gated on one: a minimal container with no CA bundle is a perfectly good
+    // place to migrate a plaintext database, and failing there would contradict
+    // what this command promises.
+    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+        return autumn_harvest::migrate::connect(database_url)
+            .await
+            .map_err(|error| migrate_error(database_url, redacted, &error));
+    }
+
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {
@@ -4447,6 +4457,23 @@ async fn connect_for_migration(
         let _ = roots.add(cert);
     }
     if roots.is_empty() {
+        // With no anchors, every TLS handshake would fail verification. What
+        // that should mean depends on whether the operator asked for TLS:
+        // under `require` it is a hard error, and under `prefer` -- which is
+        // libpq's "TLS if it works, plaintext otherwise" -- plaintext is the
+        // documented degradation. Never the reverse: a `require` DSN is never
+        // quietly downgraded.
+        if config.get_ssl_mode() == tokio_postgres::config::SslMode::Prefer {
+            eprintln!(
+                "warning: {redacted}: no usable certificates in the platform trust \
+                 store, so TLS cannot be verified; sslmode=prefer falls back to a \
+                 PLAINTEXT connection. Install your distribution's ca-certificates \
+                 package, or pass sslmode=require to fail instead."
+            );
+            return autumn_harvest::migrate::connect(database_url)
+                .await
+                .map_err(|error| migrate_error(database_url, redacted, &error));
+        }
         return Err(CliError::Migrate {
             database: redacted.to_string(),
             reason: format!(
@@ -4723,6 +4750,27 @@ async fn migrate_plans(
     Ok(targets)
 }
 
+/// Print the targets a `run` finished before it failed, then return the
+/// failure.
+///
+/// A multi-shard run stops at the first failing target, so what came before it
+/// is already migrated and what comes after is untouched. Reporting that split
+/// is the difference between "re-run the command" and "work out by hand which
+/// databases moved".
+fn report_and_fail(
+    targets: &[(String, MigrationReport)],
+    format: MigrateFormat,
+    failure: CliError,
+) -> Result<(), CliError> {
+    if !targets.is_empty() {
+        match format {
+            MigrateFormat::Text => println!("{}", format_migrate_run_text(targets)),
+            MigrateFormat::Json => println!("{}", migrate_run_json(targets)?),
+        }
+    }
+    Err(failure)
+}
+
 /// Run `harvest migrate status` end to end.
 ///
 /// # Errors
@@ -4791,20 +4839,20 @@ pub async fn run_migrate_run(
     let mut targets = Vec::with_capacity(database_url.len());
     for url in database_url {
         let redacted = redact_dsn(url);
-        let mut conn = connect_for_migration(url, &redacted).await?;
+        // Every failure past the first target -- connecting to it as much as
+        // migrating it -- goes through `report_and_fail`: on a multi-shard run
+        // the operator needs to know which databases are already migrated
+        // before deciding what to do next, and an unreachable third shard says
+        // nothing about the two behind it.
+        let mut conn = match connect_for_migration(url, &redacted).await {
+            Ok(conn) => conn,
+            Err(failure) => return report_and_fail(&targets, format, failure),
+        };
         match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
             Ok(report) => targets.push((redacted, report)),
             Err(error) => {
                 let failure = migrate_error(url, &redacted, &error);
-                // Print what DID happen before failing: on a multi-shard run the
-                // operator needs to know which databases are already migrated.
-                if !targets.is_empty() {
-                    match format {
-                        MigrateFormat::Text => println!("{}", format_migrate_run_text(&targets)),
-                        MigrateFormat::Json => println!("{}", migrate_run_json(&targets)?),
-                    }
-                }
-                return Err(failure);
+                return report_and_fail(&targets, format, failure);
             }
         }
     }
