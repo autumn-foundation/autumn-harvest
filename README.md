@@ -363,6 +363,9 @@ source tree nor the `diesel` CLI. Each migration runs in one transaction
 together with its row in `__diesel_schema_migrations` — the same ledger Autumn
 and Diesel read — so a migration is applied exactly once whichever of them
 applies it, and a failure leaves neither the schema change nor the record of it.
+A migration whose `metadata.toml` says `run_in_transaction = false`, as a
+`CREATE INDEX CONCURRENTLY` migration must, is applied without one, exactly as
+Diesel applies it.
 
 ### Deployment preflight
 

@@ -29,7 +29,11 @@
 //!   first `_` (`20260409000000_harvest_initial` → `20260409000000`);
 //! * migrations are applied in ascending version order, each inside one
 //!   transaction together with its ledger row, so a failure leaves neither the
-//!   schema change nor the record of it.
+//!   schema change nor the record of it;
+//! * a migration whose `metadata.toml` says `run_in_transaction = false` — what
+//!   a `CREATE INDEX CONCURRENTLY` migration needs, since Postgres rejects that
+//!   statement inside a transaction block — is applied without one, as Diesel
+//!   applies it (see [`apply_without_transaction`]).
 //!
 //! A version already present in the ledger is skipped, whoever wrote it. Rows
 //! this binary does not recognise are *reported*, never removed: they normally
@@ -76,8 +80,15 @@ const CREATE_LEDGER_SQL: &str = "CREATE TABLE IF NOT EXISTS __diesel_schema_migr
 /// at all, so it is rejected when the set is read rather than mid-apply.
 const MAX_VERSION_LEN: usize = 50;
 
+/// Diesel's per-migration metadata file, sitting beside `up.sql`.
+const METADATA_FILE: &str = "metadata.toml";
+
+/// The only key Diesel's `metadata.toml` defines.
+const RUN_IN_TRANSACTION_KEY: &str = "run_in_transaction";
+
 /// One migration ready to apply: the directory name, the version Diesel keys
-/// the ledger by, and the `up.sql` body.
+/// the ledger by, the `up.sql` body, and whether Diesel would wrap it in a
+/// transaction.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct MigrationScript {
     /// Migration directory name, e.g. `20260409000000_harvest_initial`.
@@ -88,10 +99,18 @@ pub struct MigrationScript {
     /// it does not reprint the schema.
     #[serde(skip)]
     pub sql: String,
+    /// Whether to wrap the body in a transaction, from the migration's
+    /// `metadata.toml` (`run_in_transaction`, Diesel's key and default).
+    ///
+    /// `false` is what a `CREATE INDEX CONCURRENTLY` migration needs: Postgres
+    /// rejects that statement inside a transaction block, so a migration
+    /// Diesel applies happily would otherwise fail here.
+    pub run_in_transaction: bool,
 }
 
 impl MigrationScript {
-    /// Build a script from a migration directory name and its `up.sql` body.
+    /// Build a script from a migration directory name and its `up.sql` body,
+    /// with Diesel's default of running inside a transaction.
     ///
     /// # Errors
     ///
@@ -118,8 +137,92 @@ impl MigrationScript {
             name,
             version,
             sql: sql.into(),
+            run_in_transaction: true,
         })
     }
+
+    /// Build a script and apply the migration's `metadata.toml` to it.
+    ///
+    /// `metadata` is the file's contents, or `""` when the migration has none
+    /// (Diesel's default: run in a transaction).
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), plus [`HarvestError::Config`] when the metadata
+    /// cannot be read unambiguously — see [`parse_run_in_transaction`].
+    pub fn with_metadata(
+        name: impl Into<String>,
+        sql: impl Into<String>,
+        metadata: &str,
+    ) -> HarvestResult<Self> {
+        let mut script = Self::new(name, sql)?;
+        script.run_in_transaction = parse_run_in_transaction(&script.name, metadata)?;
+        Ok(script)
+    }
+}
+
+/// Read Diesel's `run_in_transaction` out of a `metadata.toml`.
+///
+/// # Why not a TOML parser
+///
+/// Diesel's metadata file defines exactly one key, and pulling a TOML crate
+/// into the engine core to read one boolean is not a trade worth making. This
+/// reads that one key and **refuses** anything it cannot interpret with
+/// certainty (a table header, a non-boolean value, a duplicate key) rather than
+/// guessing: guessing `false` runs DDL outside a transaction the author never
+/// asked to leave, and guessing `true` fails the `CONCURRENTLY` migration this
+/// exists to support. A file that says nothing about the key keeps Diesel's
+/// default of `true`.
+///
+/// # Errors
+///
+/// [`HarvestError::Config`] naming the migration when the metadata contains a
+/// table header, a `run_in_transaction` value that is not `true`/`false`, or
+/// the key twice.
+pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<bool> {
+    let mut found: Option<bool> = None;
+    for raw in metadata.lines() {
+        // `#` starts a comment. No key here can legitimately contain one, so
+        // cutting at the first `#` cannot truncate a value we care about.
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            return Err(HarvestError::Config(format!(
+                "migration `{name}`: {METADATA_FILE} contains a table section \
+                 ({line}); only a top-level `{RUN_IN_TRANSACTION_KEY} = <bool>` \
+                 is understood here -- apply this migration with the `diesel` CLI"
+            )));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Accept the quoted spelling of the key; TOML allows `"key" = value`.
+        let key = key.trim().trim_matches(['"', '\'']);
+        if key != RUN_IN_TRANSACTION_KEY {
+            // Diesel ignores keys it does not know; so do we.
+            continue;
+        }
+        let parsed = match value.trim() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(HarvestError::Config(format!(
+                    "migration `{name}`: {METADATA_FILE} sets \
+                     `{RUN_IN_TRANSACTION_KEY} = {other}`, which is not a boolean"
+                )));
+            }
+        };
+        if found.is_some_and(|previous| previous != parsed) {
+            return Err(HarvestError::Config(format!(
+                "migration `{name}`: {METADATA_FILE} sets \
+                 `{RUN_IN_TRANSACTION_KEY}` twice, with different values"
+            )));
+        }
+        found = Some(parsed);
+    }
+    Ok(found.unwrap_or(true))
 }
 
 /// Harvest's own migration set, embedded in the binary at build time.
@@ -138,11 +241,13 @@ impl MigrationScript {
 pub fn embedded() -> Vec<MigrationScript> {
     let mut scripts: Vec<MigrationScript> = EMBEDDED_MIGRATION_SCRIPTS
         .iter()
-        .map(|(name, sql)| {
-            // A name that cannot produce a version is a build-time authoring
-            // error in this repository, caught by `embedded_set_is_well_formed`
+        .map(|(name, sql, metadata)| {
+            // A name that cannot produce a version, or a `metadata.toml` this
+            // cannot read, is a build-time authoring error in this repository --
+            // caught by `embedded_set_is_well_formed_and_matches_the_build_manifest`
             // rather than left to fail against a production database.
-            MigrationScript::new(*name, *sql).expect("embedded migration name carries no version")
+            MigrationScript::with_metadata(*name, *sql, metadata)
+                .expect("embedded migration is not well formed")
         })
         .collect();
     scripts.sort_by(|a, b| a.version.cmp(&b.version));
@@ -156,12 +261,17 @@ pub fn embedded() -> Vec<MigrationScript> {
 /// Harvest-database migrations (connector dead-letters), or an application's.
 /// Hidden entries and plain files are skipped, exactly as Diesel skips them.
 ///
+/// A migration's optional `metadata.toml` is honoured
+/// ([`parse_run_in_transaction`]), so an application's `CREATE INDEX
+/// CONCURRENTLY` migration applies here exactly as `diesel migration run`
+/// applies it.
+///
 /// # Errors
 ///
 /// [`HarvestError::Config`] when the directory cannot be read, when a
 /// migration directory has no readable `up.sql` (a silently short set is the
-/// failure mode this exists to prevent), or when a name carries no usable
-/// version.
+/// failure mode this exists to prevent), when a name carries no usable
+/// version, or when a `metadata.toml` cannot be read unambiguously.
 pub fn from_directory(dir: &Path) -> HarvestResult<Vec<MigrationScript>> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         HarvestError::Config(format!(
@@ -195,7 +305,22 @@ pub fn from_directory(dir: &Path) -> HarvestResult<Vec<MigrationScript>> {
                 up.display()
             ))
         })?;
-        scripts.push(MigrationScript::new(name, sql)?);
+        // Diesel's optional per-migration metadata. Absent is the common case
+        // and means its default (run in a transaction); present and unreadable
+        // is an error rather than a silent default, because the one thing it
+        // says decides whether the body may contain `CONCURRENTLY`.
+        let metadata_path = dir.join(&name).join(METADATA_FILE);
+        let metadata = match std::fs::read_to_string(&metadata_path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(HarvestError::Config(format!(
+                    "migration `{name}`: unreadable {METADATA_FILE} ({}): {e}",
+                    metadata_path.display()
+                )));
+            }
+        };
+        scripts.push(MigrationScript::with_metadata(name, sql, &metadata)?);
     }
     scripts.sort_by(|a, b| a.version.cmp(&b.version));
     Ok(scripts)
@@ -346,6 +471,10 @@ pub async fn apply(
 /// applied ([`MigrationReport::applied_concurrently`]) instead of replaying DDL
 /// that has already happened.
 ///
+/// A `run_in_transaction = false` migration has no transaction to contend on,
+/// so that protection does not apply to it: see [`apply_without_transaction`]
+/// for what a race costs there.
+///
 /// # Errors
 ///
 /// As [`apply`].
@@ -374,8 +503,16 @@ pub async fn apply_to_connection(
             Ok(Applied::Yes) => report.applied.push(script.name.clone()),
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
             Err(error) => {
+                // Say which it was: a rolled-back migration left nothing
+                // behind, a non-transactional one may have applied part of
+                // its body and needs the operator's eyes before a re-run.
+                let aftermath = if script.run_in_transaction {
+                    "rolled back"
+                } else {
+                    "NOT rolled back -- it declares run_in_transaction = false,                      so any statement that already succeeded still stands"
+                };
                 return Err(HarvestError::Database(format!(
-                    "migration `{}` failed (rolled back; {} applied before it): {error}",
+                    "migration `{}` failed ({aftermath}; {} applied before it): {error}",
                     script.name,
                     report.applied.len()
                 )));
@@ -416,6 +553,56 @@ impl From<DieselError> for ApplyError {
 }
 
 async fn apply_one(
+    conn: &mut AsyncPgConnection,
+    script: &MigrationScript,
+) -> Result<Applied, DieselError> {
+    if script.run_in_transaction {
+        apply_in_transaction(conn, script).await
+    } else {
+        apply_without_transaction(conn, script).await
+    }
+}
+
+/// Apply a migration whose `metadata.toml` says `run_in_transaction = false`.
+///
+/// Postgres rejects `CREATE INDEX CONCURRENTLY` — the reason that key exists —
+/// inside a transaction block, so there is no transaction to put the ledger row
+/// in either. Two consequences, both Diesel's as well:
+///
+/// * **The body runs first, the ledger row second.** Recording a version before
+///   a statement that may fail would leave the ledger claiming a migration that
+///   never ran, and no later run can repair that. The reverse order can only
+///   lose the *record* of a migration that did run, which a re-run fixes.
+/// * **A partial failure stays partial.** With no transaction, statements that
+///   already succeeded are not rolled back. The version is not recorded, so the
+///   next run replays the whole body — write these migrations idempotently
+///   (`IF NOT EXISTS`), exactly as under `diesel migration run`.
+async fn apply_without_transaction(
+    conn: &mut AsyncPgConnection,
+    script: &MigrationScript,
+) -> Result<Applied, DieselError> {
+    conn.batch_execute(&script.sql).await?;
+
+    let recorded = diesel::sql_query(format!(
+        "INSERT INTO {MIGRATION_LEDGER} (version) VALUES ($1)"
+    ))
+    .bind::<Text, _>(script.version.as_str())
+    .execute(conn)
+    .await;
+
+    match recorded {
+        Ok(_) => Ok(Applied::Yes),
+        // A concurrent migrator recorded it while this body was running. Both
+        // ran the DDL — unavoidable without a transaction to contend on, and
+        // why such a migration must be idempotent.
+        Err(DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
+            Ok(Applied::Concurrently)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn apply_in_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
 ) -> Result<Applied, DieselError> {
@@ -524,7 +711,7 @@ fn build_plan(
 mod tests {
     use super::{
         EMBEDDED_MIGRATION_SCRIPTS, MigrationScript, build_plan, embedded, from_directory,
-        validate_versions,
+        parse_run_in_transaction, validate_versions,
     };
     use std::collections::BTreeSet;
 
@@ -666,6 +853,19 @@ mod tests {
             );
         }
 
+        // Harvest's own migrations are all transactional today, and the
+        // embedded loader would have panicked above on a `metadata.toml` it
+        // could not read -- so this also proves every metadata slot parses.
+        for script in &scripts {
+            assert!(
+                script.run_in_transaction,
+                "migration {} declares run_in_transaction = false; that is \
+                 supported, but `full_migrations_sql()` applies the whole \
+                 bundle in one batch, so the test fixtures need revisiting too",
+                script.name
+            );
+        }
+
         // Sorted by version, and every body non-empty: a blank up.sql would
         // record a version without changing anything, which no later run can
         // repair.
@@ -687,7 +887,7 @@ mod tests {
         // future edit cannot leave the applier and the test-fixture bundle
         // disagreeing about what a migration contains.
         let bundle = crate::full_migrations_sql();
-        for (name, sql) in EMBEDDED_MIGRATION_SCRIPTS {
+        for (name, sql, _metadata) in EMBEDDED_MIGRATION_SCRIPTS {
             assert!(
                 bundle.contains(&format!("-- harvest-migration: {name}\n")),
                 "migration {name} is missing from the concatenated bundle"
@@ -737,6 +937,113 @@ mod tests {
         assert_eq!(
             scripts.iter().map(|s| &s.name).collect::<Vec<_>>(),
             vec!["20260101000000_real"]
+        );
+    }
+
+    // ── Diesel's per-migration `metadata.toml` ─────────────────────────────
+
+    #[test]
+    fn a_migration_without_metadata_runs_in_a_transaction() {
+        // Diesel's default, and what every migration in this repository wants.
+        assert!(script("20260101000000_a").run_in_transaction);
+        assert!(parse_run_in_transaction("m", "").expect("empty metadata is fine"));
+    }
+
+    #[test]
+    fn run_in_transaction_false_is_honoured() {
+        // The `CREATE INDEX CONCURRENTLY` case: Postgres rejects that statement
+        // inside a transaction block, so ignoring this key would fail a
+        // migration that `diesel migration run` applies happily.
+        let script = MigrationScript::with_metadata(
+            "20260101000000_a",
+            "CREATE INDEX CONCURRENTLY idx ON t (c);",
+            "run_in_transaction = false\n",
+        )
+        .expect("metadata parses");
+        assert!(!script.run_in_transaction);
+    }
+
+    #[test]
+    fn metadata_tolerates_comments_whitespace_quoting_and_unknown_keys() {
+        for metadata in [
+            "# a comment\nrun_in_transaction = false\n",
+            "  run_in_transaction   =   false  \n",
+            "\"run_in_transaction\" = false\n",
+            "run_in_transaction = false # trailing comment\n",
+            "some_future_key = 3\nrun_in_transaction = false\n",
+        ] {
+            assert!(
+                !parse_run_in_transaction("m", metadata).expect("metadata parses"),
+                "should have read false from: {metadata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commented_out_key_leaves_the_default_alone() {
+        // Reading `false` out of a comment would run DDL outside a transaction
+        // the author never asked to leave.
+        assert!(
+            parse_run_in_transaction("m", "# run_in_transaction = false\n")
+                .expect("metadata parses")
+        );
+    }
+
+    #[test]
+    fn metadata_this_parser_cannot_read_is_refused_rather_than_guessed() {
+        // Both directions of a wrong guess are bad -- `false` runs unprotected
+        // DDL, `true` fails the CONCURRENTLY migration -- so refuse instead.
+        for metadata in [
+            "[section]\nrun_in_transaction = false\n",
+            "run_in_transaction = yes\n",
+            "run_in_transaction = 0\n",
+            "run_in_transaction = true\nrun_in_transaction = false\n",
+        ] {
+            parse_run_in_transaction("m", metadata)
+                .expect_err(&format!("should have refused: {metadata:?}"));
+        }
+    }
+
+    #[test]
+    fn from_directory_reads_a_migrations_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migration = dir.path().join("20260101000000_concurrent");
+        std::fs::create_dir(&migration).expect("mkdir");
+        std::fs::write(
+            migration.join("up.sql"),
+            "CREATE INDEX CONCURRENTLY idx ON t (c);",
+        )
+        .expect("write up.sql");
+        std::fs::write(
+            migration.join("metadata.toml"),
+            "run_in_transaction = false\n",
+        )
+        .expect("write metadata.toml");
+
+        let scripts = from_directory(dir.path()).expect("directory reads");
+        assert_eq!(scripts.len(), 1);
+        assert!(
+            !scripts[0].run_in_transaction,
+            "an --include-dir migration's metadata must survive the load"
+        );
+    }
+
+    #[test]
+    fn from_directory_refuses_metadata_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migration = dir.path().join("20260101000000_bad_metadata");
+        std::fs::create_dir(&migration).expect("mkdir");
+        std::fs::write(migration.join("up.sql"), "SELECT 1;").expect("write up.sql");
+        std::fs::write(
+            migration.join("metadata.toml"),
+            "run_in_transaction = maybe\n",
+        )
+        .expect("write metadata.toml");
+
+        let error = from_directory(dir.path()).expect_err("unreadable metadata must be loud");
+        assert!(
+            error.to_string().contains("20260101000000_bad_metadata"),
+            "the error must name the migration: {error}"
         );
     }
 

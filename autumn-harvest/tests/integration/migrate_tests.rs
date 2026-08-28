@@ -233,6 +233,74 @@ async fn a_unique_violation_from_the_migrations_own_sql_is_a_failure_not_a_skip(
 }
 
 #[tokio::test]
+async fn a_nontransactional_migration_may_create_an_index_concurrently() {
+    // The `metadata.toml` case: Postgres rejects `CREATE INDEX CONCURRENTLY`
+    // inside a transaction block, so wrapping this body -- as an applier that
+    // ignores `run_in_transaction = false` would -- fails a migration that
+    // `diesel migration run` applies happily.
+    let (_container, url) = empty_postgres().await;
+
+    let table = MigrationScript::new(
+        "29990101000000_harvest_migrate_probe_table",
+        "CREATE TABLE harvest_migrate_probe (id INTEGER PRIMARY KEY, c INTEGER);",
+    )
+    .expect("well-formed name");
+    let concurrent_index = MigrationScript::with_metadata(
+        "29990102000000_harvest_migrate_probe_index",
+        "CREATE INDEX CONCURRENTLY idx_harvest_migrate_probe_c ON harvest_migrate_probe (c);",
+        "run_in_transaction = false\n",
+    )
+    .expect("metadata parses");
+    assert!(!concurrent_index.run_in_transaction);
+
+    let report = migrate::apply(&url, &[table, concurrent_index])
+        .await
+        .expect("a non-transactional migration must apply");
+    assert_eq!(report.applied.len(), 2);
+    assert!(relation_exists(&url, "idx_harvest_migrate_probe_c").await);
+    assert!(
+        ledger_versions(&url)
+            .await
+            .contains(&"29990102000000".to_string()),
+        "a non-transactional migration must still be recorded"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_nontransactional_migration_is_not_recorded() {
+    // Nothing rolls back without a transaction, but the version must not be
+    // recorded: a ledger row for a migration that never finished is the one
+    // state no later run can repair.
+    let (_container, url) = empty_postgres().await;
+
+    let broken = MigrationScript::with_metadata(
+        "29990101000000_harvest_migrate_probe_broken",
+        "SELECT no_such_function_exists();",
+        "run_in_transaction = false\n",
+    )
+    .expect("metadata parses");
+
+    let error = migrate::apply(&url, std::slice::from_ref(&broken))
+        .await
+        .expect_err("a broken migration must fail the run");
+    let message = error.to_string();
+    assert!(
+        message.contains("29990101000000_harvest_migrate_probe_broken"),
+        "the failure must name the migration: {message}"
+    );
+    assert!(
+        message.contains("NOT rolled back"),
+        "the failure must say the body was not rolled back: {message}"
+    );
+    assert!(
+        !ledger_versions(&url)
+            .await
+            .contains(&"29990101000000".to_string()),
+        "a migration that failed must not be recorded"
+    );
+}
+
+#[tokio::test]
 async fn ledger_rows_this_binary_does_not_know_are_reported_not_removed() {
     // The database is ahead of the binary: a newer deploy already migrated it.
     // Diesel ignores such rows; so do we, but an operator is told.

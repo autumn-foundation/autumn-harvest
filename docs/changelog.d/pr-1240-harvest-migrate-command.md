@@ -29,8 +29,17 @@ neither can drift from `MIGRATIONS`.
 Deliberately bug-for-bug compatible with `diesel_migrations`, because Autumn,
 the plugin's startup path, and this command all write the same database: the
 ledger is `__diesel_schema_migrations`, the version is the name's leading
-component, and application is in ascending version order. No `down.sql` — a
-rollback under a live fleet is an operator decision with data loss attached.
+component, and application is in ascending version order. A migration's
+`metadata.toml` is honoured too — `run_in_transaction = false` (what a `CREATE
+INDEX CONCURRENTLY` migration needs, since Postgres rejects that statement
+inside a transaction block) applies the body without one, and the ledger row
+then goes in *after* the body rather than before it, because a version recorded
+for a migration that never finished is the one state no later run can repair.
+The one key is read by a strict hand parser that refuses anything ambiguous
+rather than pulling a TOML crate into the engine core; `build.rs` emits each
+migration's metadata text so the embedded set and an `--include-dir` set go
+through the same parser. No `down.sql` — a rollback under a live fleet is an
+operator decision with data loss attached.
 
 Two details worth naming:
 
@@ -68,12 +77,14 @@ Also fixed: the plugin's non-`dev` warning on a dedicated Harvest database said
 chapter, operations guide, sharding runbook and 0.6.0 upgrade guide all point at
 the new command.
 
-Tests: 16 unit tests in `src/migrate.rs` (version extraction, plan
+Tests: 23 unit tests in `src/migrate.rs` (version extraction, plan
 classification, directory reading, embedded-set/bundle agreement), 17 CLI tests
 (argument mapping, `--include-dir` loading and collision refusal, text/JSON
 rendering, the `--check` gate's counts and exit code, DSN redaction), and a new
 Docker-backed suite `migrate_tests` (fresh-database apply, idempotent re-run,
 `plan` writing nothing, an extra set applying alongside the embedded one, a
 failing migration rolling back with its ledger row and the run resuming after a
-fix, and an unrecognized ledger row surviving). No new `WorkflowEvent` variant,
-no migration.
+fix, a `CREATE INDEX CONCURRENTLY` migration applying under
+`run_in_transaction = false` and a failing one staying unrecorded, and an
+unrecognized ledger row surviving). No new `WorkflowEvent` variant, no
+migration.
