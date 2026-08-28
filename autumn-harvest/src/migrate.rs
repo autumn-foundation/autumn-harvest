@@ -177,9 +177,13 @@ impl MigrationScript {
 /// # Errors
 ///
 /// [`HarvestError::Config`] naming the migration when the metadata contains a
-/// table header, a `run_in_transaction` value that is not `true`/`false`, or
-/// the key more than once — a duplicate key is invalid TOML whether or not the
-/// two values agree, so Diesel refuses to parse the file at all.
+/// table header, a line that is not `<key> = <value>`, a `run_in_transaction`
+/// value that is not `true`/`false`, or the key more than once — a duplicate
+/// key is invalid TOML whether or not the two values agree, so Diesel refuses
+/// to parse the file at all.
+///
+/// Unknown *keys* are the one thing skipped rather than refused: Diesel reads
+/// this file with serde, which ignores fields it does not know.
 pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<bool> {
     let mut found: Option<bool> = None;
     for raw in metadata.lines() {
@@ -196,8 +200,18 @@ pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<boo
                  is understood here -- apply this migration with the `diesel` CLI"
             )));
         }
+        // A non-empty, non-comment line that is not `key = value` is not TOML
+        // Diesel would accept either -- its parser rejects the whole file. It
+        // is also how a multi-line construct (an array, an inline table
+        // spanning lines) reaches this line-at-a-time reader, which is exactly
+        // the shape this parser must not pretend to understand.
         let Some((key, value)) = line.split_once('=') else {
-            continue;
+            return Err(HarvestError::Config(format!(
+                "migration `{name}`: {METADATA_FILE} line `{line}` is not \
+                 `<key> = <value>`; only a top-level \
+                 `{RUN_IN_TRANSACTION_KEY} = <bool>` is understood here -- \
+                 apply this migration with the `diesel` CLI"
+            )));
         };
         // Accept the quoted spelling of the key; TOML allows `"key" = value`.
         let key = key.trim().trim_matches(['"', '\'']);
@@ -1008,6 +1022,11 @@ mod tests {
             // agreeing case would apply a migration on metadata it rejects.
             "run_in_transaction = true\nrun_in_transaction = false\n",
             "run_in_transaction = false\nrun_in_transaction = false\n",
+            // Not `key = value` at all: Diesel's parser rejects the whole
+            // file, so skipping the line would apply a migration on metadata
+            // `diesel migration run` refuses to read.
+            "this is not toml\n",
+            "run_in_transaction = false\nthis is not toml\n",
         ] {
             parse_run_in_transaction("m", metadata)
                 .expect_err(&format!("should have refused: {metadata:?}"));
