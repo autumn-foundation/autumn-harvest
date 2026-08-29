@@ -5081,6 +5081,34 @@
     },
     {
       "method": "GET",
+      "path": "/admin/codec/rotation",
+      "category": "admin",
+      "read_only": true,
+      "description": "Report payload-codec key rotation progress per shard (issue #948). Lists every registered codec key id, which one is active for new writes, and -- per shard -- how many harvest_events rows still carry each key id plus the lazy re-encryption sweep's durable resume cursor. This is the screen an operator watches to know when an outgoing key has zero remaining rows and can safely be retired. Admin-gated: the body names operator-chosen key identifiers and exposes the encryption posture of stored history. It carries NO key material and NO payload content.",
+      "idempotency": "Read-only; always idempotent. It runs the per-key census and reads the cursor -- it never rewrites a row and never advances the sweep.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "active_key_id",
+          "registered_key_ids",
+          "shards",
+          "rows_remaining_total",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry in `shards` is {shard_id, rows_by_key_id, rows_remaining, cursor}. `rows_by_key_id` maps every observed codec key id to the number of rows referencing it on that shard; rows written before key ids existed carry no `kid` and are counted under the designated legacy key id (\"legacy\"). `rows_remaining` is the sum over NON-active key ids -- the number that must reach zero before that key can be retired. `cursor` is {last_event_id, rows_reencrypted, completed_at, updated_at} for the active key's sweep pass, or null before the first batch runs; it is keyed on (shard, active key id), so flipping the active key starts a fresh pass. An unreachable shard degrades the response to `status: \"partial\"` and is named in `unavailable_shards`; `rows_remaining_total` is then a LOWER BOUND, not a count -- an unread shard's rows are unknown, never zero. The retirement gate applies the same fail-closed rule and refuses to retire a key while any expected shard is unreadable. On a deployment with no keyed codecs registered -- every deployment that has not adopted key rotation -- `registered_key_ids` is empty, `active_key_id` is the legacy sentinel, and every count is zero."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/batches/pending",
       "category": "workflow",
       "read_only": true,

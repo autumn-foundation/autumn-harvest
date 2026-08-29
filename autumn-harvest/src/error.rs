@@ -115,6 +115,37 @@ pub struct NonDeterministicDetails {
     pub build_id: Option<String>,
 }
 
+/// One shard's contribution to a refused codec-key retirement (issue #948).
+///
+/// Either the shard still holds `rows` events referencing the key, or it could
+/// not be read at all (`reachable = false`) — which blocks retirement just as
+/// firmly, because an uncounted shard is never a zero.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodecKeyShardRemainder {
+    /// The shard this remainder was observed on.
+    pub shard_id: i32,
+    /// Rows still carrying the key id. `0` when `reachable` is `false` — the
+    /// count is unknown, not zero.
+    pub rows: i64,
+    /// `false` when the shard could not be read; the retirement is refused on
+    /// that basis alone.
+    pub reachable: bool,
+    /// Why the shard could not be read, when `reachable` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for CodecKeyShardRemainder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reachable {
+            write!(f, "shard {}: {} row(s)", self.shard_id, self.rows)
+        } else {
+            let reason = self.reason.as_deref().unwrap_or("unreachable");
+            write!(f, "shard {}: unreadable ({reason})", self.shard_id)
+        }
+    }
+}
+
 /// Errors produced by the autumn-harvest workflow engine.
 ///
 /// ## Examples
@@ -280,6 +311,46 @@ pub enum HarvestError {
     UnknownPayloadCodec {
         /// The codec identifier stored on the event payload.
         id: String,
+    },
+
+    /// A stored codec envelope names a codec **key id** that is not registered
+    /// (issue #948).
+    ///
+    /// Distinct from [`HarvestError::UnknownPayloadCodec`]: the codec itself may
+    /// well be registered — it is the *key material* for that envelope's `kid`
+    /// that is missing, typically because the key was retired before the lazy
+    /// re-encryption sweep finished, or because a reader in a rotation window
+    /// was never given the outgoing key.
+    #[error("unknown payload codec key id {key_id} (codec {codec_id})")]
+    UnknownCodecKey {
+        /// The key id stored in the envelope's `kid` field.
+        key_id: String,
+        /// The `codec_id` stored alongside it.
+        codec_id: String,
+    },
+
+    /// Retiring a codec key was refused because stored rows still reference it
+    /// (issue #948).
+    ///
+    /// `remaining` names, per shard, how many `harvest_events` rows still carry
+    /// the key id. A shard that could not be read appears with
+    /// `reachable = false` and blocks retirement on its own — a shard we cannot
+    /// count is never counted as zero.
+    #[error(
+        "codec key id {key_id} cannot be retired: {} shard(s) still reference it or could not be \
+         read ({})",
+        remaining.len(),
+        remaining
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    CodecKeyRetirementBlocked {
+        /// The key id whose retirement was refused.
+        key_id: String,
+        /// One entry per blocking shard.
+        remaining: Vec<CodecKeyShardRemainder>,
     },
 
     /// A payload-store operation (offload `put`, fetch `get`, or `delete`)

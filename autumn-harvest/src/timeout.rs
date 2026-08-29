@@ -3279,6 +3279,12 @@ pub async fn enforce_external_awaits_outbox(
 /// poison-pill reclaimer's `worker_stale_secs` convention (`2 ×
 /// worker_heartbeat_interval`, computed once by the caller).
 ///
+/// `payload_codecs` / `codec_rotation_batch_size` drive the lazy payload-codec
+/// re-encryption sweep (issue #948). The sweep is a no-op — not one statement
+/// issued — unless the registry holds a keyed codec, so it costs nothing on
+/// every deployment that has not adopted key rotation. A batch size of `0`
+/// disables it outright.
+///
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
@@ -3292,6 +3298,8 @@ pub async fn enforce_timeouts_once(
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -3399,6 +3407,26 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    // Lazy payload-codec re-encryption (issue #948): convert a bounded batch of
+    // stored rows per shard from a retired key id onto the active one.
+    //
+    // ⚠️ This is the ONLY resident of this pass that mutates
+    // `harvest_events.event_data` in place — sanctioned exception #3, see
+    // `crate::codec_rotation` and CLAUDE.md. Only the ciphertext bytes inside
+    // payload fields change; decoded plaintext, event `type`, ids, ordering and
+    // timestamps are untouched, so replay is unaffected by construction.
+    //
+    // Returns without issuing a statement unless a keyed codec is registered,
+    // so a deployment that has never rotated pays nothing for it.
+    count += crate::codec_rotation::sweep_codec_reencryption(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        payload_codecs,
+        codec_rotation_batch_size,
+        metrics,
+    )
+    .await?;
     // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
     // each freed key's new head of line. Shard-local: it runs against this
     // connection's own database (like `enforce_broken_sessions`), and is a no-op
@@ -3458,6 +3486,13 @@ pub fn spawn_timeout_checker(
         max_workflow_history_events,
         session_worker_stale_secs,
         None,
+        // Issue #948: this legacy single-shard entry point carries no codec
+        // registry, so it drives the sweep with an empty one — which is an
+        // unconditional no-op. A deployment that has adopted key rotation
+        // reaches the sweep through `spawn_timeout_checker_for_shard`, wired
+        // from `WorkerConfig::payload_codecs` by `HarvestBuilder::build`.
+        crate::payload_codec::PayloadCodecs::default(),
+        0,
     )
 }
 
@@ -3484,6 +3519,8 @@ pub fn spawn_timeout_checker_for_shard(
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
     shard: Option<crate::types::ShardId>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
 ) -> tokio::task::JoinHandle<()> {
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
@@ -3535,6 +3572,8 @@ pub fn spawn_timeout_checker_for_shard(
                     Some(&circuit_breakers),
                     max_workflow_history_events,
                     session_worker_stale_secs,
+                    &payload_codecs,
+                    codec_rotation_batch_size,
                 )
                 .await
                 {

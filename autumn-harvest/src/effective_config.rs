@@ -180,6 +180,14 @@ pub struct WorkerConfigView {
     pub slot_tuner_enabled: bool,
     /// Advertised concurrent worker-session capacity (0 = sessions disabled).
     pub max_concurrent_sessions: i32,
+    /// Rows examined per shard, per scanner tick, by the lazy payload-codec
+    /// re-encryption sweep (issue #948). `0` = the sweep is disabled.
+    ///
+    /// The registry itself is deliberately NOT reported here: it holds live
+    /// codec handles that may close over key material. The operator-chosen key
+    /// *identifiers* and per-key rows-remaining are served by
+    /// `GET /admin/codec/rotation`.
+    pub codec_rotation_batch_size: i64,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -328,6 +336,12 @@ impl WorkerConfigView {
                 sharded_pool: _,
             max_concurrent_sessions,
             workflow_panic_max_attempts,
+            codec_rotation_batch_size,
+            // REDACTED — the registry holds live codec handles that may close
+            // over key material. Only the operator-chosen key IDENTIFIERS are
+            // safe to report, and those are served by
+            // `GET /admin/codec/rotation` (issue #948), never from here.
+            payload_codecs: _,
         } = worker;
 
         Self {
@@ -381,6 +395,7 @@ impl WorkerConfigView {
             mutex_lease_ttl_ms: dur_ms(*mutex_lease_ttl),
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
+            codec_rotation_batch_size: *codec_rotation_batch_size,
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),

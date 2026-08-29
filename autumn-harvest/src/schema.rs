@@ -983,6 +983,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable resume cursor for the lazy payload-codec re-encryption sweep
+    /// (issue #948).
+    ///
+    /// Keyed on `(shard_id, active_key_id)` rather than `shard_id` alone so a
+    /// key flip implicitly starts a fresh pass and a rollback resumes its own.
+    harvest_codec_rotation_cursor (shard_id, active_key_id) {
+        shard_id -> Int4,
+        active_key_id -> Text,
+        last_event_id -> Int8,
+        rows_reencrypted -> Int8,
+        completed_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -1020,4 +1038,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_locks,
     harvest_mutex_waiters,
     harvest_workflow_logs,
+    harvest_codec_rotation_cursor,
 );

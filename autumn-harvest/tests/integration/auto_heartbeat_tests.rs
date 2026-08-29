@@ -121,6 +121,8 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -452,6 +454,8 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }
@@ -661,6 +665,8 @@ async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }

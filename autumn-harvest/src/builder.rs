@@ -1522,6 +1522,54 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register a **keyed** payload codec under `key_id` for key rotation
+    /// (issue #948).
+    ///
+    /// Unlike [`HarvestBuilder::payload_codec`], which installs one default
+    /// codec, this builds a registry of codecs distinguished by *key material*:
+    /// during a rotation two codecs share a `codec_id` (`"aes-gcm"`) and differ
+    /// only in the key they hold, so `codec_id` cannot tell them apart and the
+    /// stored envelope carries a `kid` instead.
+    ///
+    /// The **first** key registered becomes the active key (the one new writes
+    /// are encoded under); rotate with
+    /// [`HarvestBuilder::active_payload_codec_key`].
+    ///
+    /// Registering your pre-rotation codec under
+    /// [`CODEC_LEGACY_KEY_ID`](crate::payload_codec::CODEC_LEGACY_KEY_ID) is
+    /// what lets already-stored, `kid`-less history keep decoding.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `key_id` is empty, longer than
+    /// [`MAX_CODEC_KEY_ID_BYTES`](crate::payload_codec::MAX_CODEC_KEY_ID_BYTES),
+    /// or contains anything outside ASCII alphanumerics and `-_.:`. A codec key
+    /// id is a compile-time-constant deployment decision, not runtime input, so
+    /// a malformed one is a configuration bug that must not boot.
+    #[must_use]
+    pub fn payload_codec_key(self, key_id: &str, codec: impl PayloadCodec + 'static) -> Self {
+        self.payload_codecs
+            .register_key(key_id, Arc::new(codec))
+            .expect("invalid payload codec key id");
+        self
+    }
+
+    /// Make an already-registered payload-codec key the **active** one — every
+    /// new write encodes under it (issue #948).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `key_id` was not registered with
+    /// [`HarvestBuilder::payload_codec_key`]. Activating a key this process
+    /// cannot encode with must not boot.
+    #[must_use]
+    pub fn active_payload_codec_key(self, key_id: &str) -> Self {
+        self.payload_codecs
+            .set_active_key(key_id)
+            .expect("unregistered payload codec key id");
+        self
+    }
+
     /// Register an external [`PayloadStore`](crate::payload_store::PayloadStore)
     /// for large-payload offloading via claim-check (issue #524).
     ///
@@ -2136,6 +2184,14 @@ impl HarvestBuilder {
             .unknown_target_grace_window
             .unwrap_or(worker_config.unknown_target_grace_window);
         worker_config.unknown_target_grace_window = unknown_target_grace_window;
+
+        // Issue #948: the worker's background re-encryption sweep must read the
+        // SAME codec registry the builder configured — not a fresh default,
+        // which would hold no keys and silently sweep nothing. This is the one
+        // choke point every built runtime passes through, so a runner cannot
+        // forget to wire it. The registry's rotation state is shared across
+        // clones, so a later `set_active_key` still reaches the running worker.
+        worker_config.payload_codecs = self.payload_codecs.clone();
 
         let usage_window_ceiling = self
             .usage_window_ceiling
@@ -3328,6 +3384,23 @@ pub struct WorkerConfig {
     /// **Defaults to `0`: sessions disabled, zero behavior change** for
     /// existing deployments. Set via `with_max_concurrent_sessions`.
     pub max_concurrent_sessions: i32,
+    /// Rows examined per shard, per scanner tick, by the lazy payload-codec
+    /// re-encryption sweep (issue #948).
+    ///
+    /// This is the sweep's **rate limiter**: raise it to convert stored history
+    /// faster, lower it to reduce the load a rotation puts on the scanner
+    /// connection, or set it to `0` to stop the sweep entirely without a
+    /// redeploy. The sweep is a no-op — not one statement issued — unless a
+    /// keyed codec is registered, so this costs nothing on a deployment that has
+    /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
+    pub codec_rotation_batch_size: i64,
+    /// The payload-codec registry this worker's background sweeps read
+    /// (issue #948).
+    ///
+    /// Wired from `BuiltHarvest::payload_codecs()` by the runner/plugin. The
+    /// rotation half of the registry is shared across clones, so flipping the
+    /// active key is observed by an already-running worker with no restart.
+    pub payload_codecs: PayloadCodecs,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -3470,6 +3543,8 @@ impl Default for WorkerConfig {
             #[cfg(feature = "db")]
             sharded_pool: None,
             max_concurrent_sessions: 0,
+            codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            payload_codecs: PayloadCodecs::default(),
         }
     }
 }
@@ -3894,6 +3969,27 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_max_concurrent_sessions(mut self, n: i32) -> Self {
         self.max_concurrent_sessions = n;
+        self
+    }
+
+    /// Set the lazy payload-codec re-encryption sweep's per-shard batch size
+    /// (issue #948).
+    ///
+    /// `0` disables the sweep. See
+    /// [`WorkerConfig::codec_rotation_batch_size`].
+    #[must_use]
+    pub const fn with_codec_rotation_batch_size(mut self, rows: i64) -> Self {
+        self.codec_rotation_batch_size = rows;
+        self
+    }
+
+    /// Install the payload-codec registry this worker's background sweeps read
+    /// (issue #948).
+    ///
+    /// Normally wired by the runner/plugin from `BuiltHarvest::payload_codecs()`.
+    #[must_use]
+    pub fn with_payload_codecs(mut self, codecs: PayloadCodecs) -> Self {
+        self.payload_codecs = codecs;
         self
     }
 

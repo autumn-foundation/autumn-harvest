@@ -168,11 +168,40 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
+    append_events_with_codecs(
+        conn,
+        exec_id,
+        events,
+        start_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
+/// Append events, encoding payload-bearing fields through `codecs` (issue #948).
+///
+/// The codec-aware sibling of [`append_events`], which delegates here with the
+/// identity registry. Payloads are encoded under `codecs`' **active** key, so a
+/// write issued after a rotation lands under the new key even when the caller
+/// captured its registry clone before the flip — the rotation state is shared
+/// across clones for exactly this reason.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the INSERT fails, or a
+/// codec error if encoding a payload fails.
+pub async fn append_events_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     if events.is_empty() {
         return Ok(0);
     }
 
-    let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+    let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
 
     let inserted = diesel::insert_into(harvest_events::table)
         .values(&rows)

@@ -270,6 +270,8 @@ fn build_worker_tuned(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: worker_id.to_string(),
                 queues: queues.iter().map(|q| (*q).to_string()).collect(),
                 notification_database_url: None,

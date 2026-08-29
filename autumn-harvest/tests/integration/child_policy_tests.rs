@@ -67,6 +67,8 @@ fn build_pool(url: &str) -> DbPool {
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -1277,6 +1279,8 @@ async fn workflow_task_timeout_cascades_detached_children() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("timeout enforcement should succeed");
