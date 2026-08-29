@@ -4570,6 +4570,50 @@ pub fn normalize_sslmode(dsn: &str) -> String {
 /// **unchanged**, so tokio-postgres reports its own parse error rather than
 /// this mangling the input first.
 fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
+    scan_keyword_dsn(dsn, |key, value| {
+        (key == "sslmode" && verify_modes.contains(&value)).then(|| "require".to_string())
+    })
+    .unwrap_or_else(|| dsn.to_string())
+}
+
+/// Redact the secrets in a libpq **keyword/value** DSN, leaving the rest legible.
+///
+/// [`redact_dsn`] parses URLs, and answers `<unparseable dsn>` for the keyword
+/// form. That is safe but useless as a *label*: repeat `--database-url` with
+/// three keyword-form shards and every line of the report reads the same, which
+/// is exactly the "which databases did we already migrate?" question a partial
+/// report exists to answer.
+///
+/// Returns `None` when the DSN cannot be scanned, so a caller can fall back
+/// rather than print something it has not actually inspected.
+fn redact_keyword_dsn(dsn: &str) -> Option<String> {
+    // Any key whose name carries `password` — `password`, and a future
+    // `sslpassword` — loses its value. Everything else (host, dbname, user,
+    // port) is what makes one target tellable from another.
+    scan_keyword_dsn(dsn, |key, _| {
+        key.to_ascii_lowercase()
+            .contains("password")
+            .then(|| "***".to_string())
+    })
+}
+
+/// Scan a libpq keyword/value DSN, replacing the values `replace` returns
+/// `Some` for and copying every other byte verbatim.
+///
+/// Reads the DSN the way libpq does — options separated by whitespace, optional
+/// whitespace around `=`, values optionally single-quoted, backslash escaping
+/// the next character in either form. A whitespace split cannot see quoting, so
+/// `password='abc sslmode=verify-full def'` would otherwise have the text
+/// *inside the password* rewritten.
+///
+/// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
+/// `=`, a value that never arrives — leaving the caller to pass the original
+/// through so tokio-postgres reports its own parse error rather than this
+/// mangling the input first.
+fn scan_keyword_dsn(
+    dsn: &str,
+    mut replace: impl FnMut(&str, &str) -> Option<String>,
+) -> Option<String> {
     let bytes = dsn.as_bytes();
     let mut out = String::with_capacity(dsn.len());
     let mut i = 0;
@@ -4596,16 +4640,21 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
             i += 1;
         }
         if i >= bytes.len() || bytes[i] != b'=' {
-            return dsn.to_string();
+            return None;
         }
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        // A DSN that ends after `=` (`host=db password=`) has no value to read;
+        // indexing here would panic before tokio-postgres could say so.
+        if i >= bytes.len() {
+            return None;
+        }
         out.push_str(key);
         out.push_str(&dsn[spacing_start..i]);
 
-        // Value: single-quoted (with `\` escapes) or bare up to whitespace.
+        // Value: single-quoted or bare, `\` escaping the next character in both.
         let value_start = i;
         let mut value = String::new();
         if bytes[i] == b'\'' {
@@ -4613,7 +4662,7 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
             loop {
                 if i >= bytes.len() {
                     // Unterminated quote: not ours to interpret.
-                    return dsn.to_string();
+                    return None;
                 }
                 match bytes[i] {
                     b'\\' if i + 1 < bytes.len() => {
@@ -4630,39 +4679,54 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
                         break;
                     }
                     _ => {
-                        value.push(dsn[i..].chars().next().unwrap_or_default());
-                        i += dsn[i..].chars().next().map_or(1, char::len_utf8);
+                        let c = dsn[i..].chars().next().unwrap_or_default();
+                        value.push(c);
+                        i += c.len_utf8();
                     }
                 }
             }
         } else {
-            // A bare value ends at whitespace, but `\` escapes the next
-            // character — `password=abc\ def` is one value, and tokio-postgres
-            // parses it that way. Stopping at the escaped space would treat
-            // `def` as the next option's keyword, find no `=` after it, and
-            // abandon the rewrite, leaving a `verify-full` the driver refuses.
             while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    let escaped = dsn[i + 1..].chars().next().map_or(1, char::len_utf8);
-                    value.push(dsn[i + 1..].chars().next().unwrap_or_default());
-                    i += 1 + escaped;
+                    let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
+                    value.push(escaped);
+                    i += 1 + escaped.len_utf8();
                 } else {
-                    value.push(dsn[i..].chars().next().unwrap_or_default());
-                    i += dsn[i..].chars().next().map_or(1, char::len_utf8);
+                    let c = dsn[i..].chars().next().unwrap_or_default();
+                    value.push(c);
+                    i += c.len_utf8();
                 }
             }
         }
 
-        if key == "sslmode" && verify_modes.contains(&value.as_str()) {
-            out.push_str("require");
-        } else {
-            // Verbatim, quotes and escapes included: only the one option this
-            // function exists for is ever rewritten.
-            out.push_str(&dsn[value_start..i]);
+        match replace(key, &value) {
+            Some(replacement) => out.push_str(&replacement),
+            // Verbatim, quotes and escapes included: only the options the
+            // caller asked about are ever touched.
+            None => out.push_str(&dsn[value_start..i]),
         }
     }
 
-    out
+    Some(out)
+}
+
+/// The label a migration target is reported under: its DSN with the credential
+/// removed, and — when it cannot be redacted at all — an ordinal, so repeated
+/// targets stay tellable apart.
+///
+/// `ordinal` is the target's 1-based position on the command line.
+#[must_use]
+pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
+    const UNPARSEABLE: &str = "<unparseable dsn>";
+
+    let redacted = redact_dsn(dsn);
+    if redacted != UNPARSEABLE {
+        return redacted;
+    }
+    // Not a URL: try the keyword form before giving up, so `host=shard-a
+    // dbname=harvest` reports as itself rather than as a placeholder shared
+    // with every other shard.
+    redact_keyword_dsn(dsn).unwrap_or_else(|| format!("{UNPARSEABLE} #{ordinal}"))
 }
 
 /// Render a migration failure without leaking the DSN.
@@ -4859,8 +4923,8 @@ async fn migrate_plans(
     scripts: &[MigrationScript],
 ) -> Result<Vec<(String, MigrationPlan)>, CliError> {
     let mut targets = Vec::with_capacity(database_url.len());
-    for url in database_url {
-        let redacted = redact_dsn(url);
+    for (ordinal, url) in database_url.iter().enumerate() {
+        let redacted = migrate_target_label(url, ordinal + 1);
         let mut conn = connect_for_migration(url, &redacted).await?;
         let plan = autumn_harvest::migrate::plan_on_connection(&mut conn, scripts)
             .await
@@ -4957,8 +5021,8 @@ pub async fn run_migrate_run(
     }
 
     let mut targets = Vec::with_capacity(database_url.len());
-    for url in database_url {
-        let redacted = redact_dsn(url);
+    for (ordinal, url) in database_url.iter().enumerate() {
+        let redacted = migrate_target_label(url, ordinal + 1);
         // Every failure past the first target -- connecting to it as much as
         // migrating it -- goes through `report_and_fail`: on a multi-shard run
         // the operator needs to know which databases are already migrated
@@ -16393,10 +16457,58 @@ mod migrate_cli_tests {
     #[test]
     fn a_dsn_this_cannot_scan_is_returned_unchanged() {
         // An unterminated quote is tokio-postgres's error to report, not ours
-        // to paper over by mangling the string first.
-        for dsn in ["password='unterminated sslmode=verify-full", "host"] {
+        // to paper over by mangling the string first. `host=db password=` ends
+        // after the `=`: reading a value there indexed past the end and
+        // panicked, which an empty templated environment value would trip.
+        for dsn in [
+            "password='unterminated sslmode=verify-full",
+            "host",
+            "host=db password=",
+            "host=db password=   ",
+            "host=db sslmode=",
+        ] {
             assert_eq!(normalize_sslmode(dsn), dsn);
         }
+    }
+
+    // ── target labels ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_keyword_form_target_is_labelled_by_its_own_dsn() {
+        // `redact_dsn` only parses URLs, so every keyword-form shard used to
+        // report as the same `<unparseable dsn>` -- and a partial report that
+        // cannot tell shard A from shard B answers nothing.
+        let label = migrate_target_label("host=shard-a dbname=harvest password='s e cret'", 1);
+        assert!(label.contains("host=shard-a"), "{label}");
+        assert!(label.contains("dbname=harvest"), "{label}");
+        assert!(
+            !label.contains("cret"),
+            "the credential must not survive: {label}"
+        );
+    }
+
+    #[test]
+    fn keyword_form_targets_stay_distinguishable() {
+        let a = migrate_target_label("host=shard-a dbname=harvest", 1);
+        let b = migrate_target_label("host=shard-b dbname=harvest", 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_url_target_still_uses_the_url_redaction() {
+        let label = migrate_target_label("postgres://u:hunter2@db.internal/harvest", 1);
+        assert!(!label.contains("hunter2"), "{label}");
+        assert!(label.contains("db.internal"), "{label}");
+    }
+
+    #[test]
+    fn an_unredactable_target_falls_back_to_an_ordinal() {
+        // Neither a URL nor a scannable keyword DSN: it must still be tellable
+        // apart from the next one, and must not print anything unexamined.
+        let first = migrate_target_label("host=db password='unterminated", 1);
+        let second = migrate_target_label("host=db password='unterminated", 2);
+        assert_eq!(first, "<unparseable dsn> #1");
+        assert_ne!(first, second);
     }
 
     // ── credential hygiene ──────────────────────────────────────────────────
