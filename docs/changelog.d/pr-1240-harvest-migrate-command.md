@@ -35,12 +35,15 @@ INDEX CONCURRENTLY` migration needs, since Postgres rejects that statement
 inside a transaction block) applies the body without one, and the ledger row
 then goes in *after* the body rather than before it, because a version recorded
 for a migration that never finished is the one state no later run can repair.
-The one key is read by a strict hand parser rather than pulling a TOML crate
-into the engine core: it accepts blank lines, `#` comments, and
-`run_in_transaction = true|false` — and refuses everything else, which makes
-what it accepts a provable subset of what Diesel accepts, the only side of that
-trade safe to be wrong on. `build.rs` emits each migration's metadata text so
-the embedded set and an `--include-dir` set go through the same parser. No `down.sql` — a rollback under a live fleet is an
+The file is read with the same `toml` crate Diesel reads it with, so what this
+applies and what `diesel migration run` applies can never disagree — rejections
+included. A hand-rolled subset was tried first and leaked five separate ways
+(an unknown key carrying an invalid value, a duplicate key, a line that is not
+`key = value`, an unbalanced quoted key, non-ASCII whitespace), each of them a
+file Diesel refuses and it accepted; `toml` is already in the workspace
+lockfile via the plugin, so the graph gains an edge rather than a package.
+`build.rs` emits each migration's metadata text so the embedded set and an
+`--include-dir` set go through the same parser. No `down.sql` — a rollback under a live fleet is an
 operator decision with data loss attached.
 
 Two details worth naming:
@@ -100,9 +103,8 @@ the new command.
 
 Tests: 25 unit tests in `src/migrate.rs` (version extraction, plan
 classification, directory reading, embedded-set/bundle agreement, and the
-metadata parser's refusals — a table header, a line that is not `key = value`,
-an unknown key, a non-boolean value, a duplicate key, unbalanced key quotes),
-21 CLI tests (argument mapping, `--include-dir` loading and collision refusal,
+metadata parser's parity with Diesel — what it accepts, and eleven files it
+refuses), 34 CLI tests (argument mapping, `--include-dir` loading and collision refusal,
 text/JSON rendering, the `--check` gate's counts and exit code, DSN redaction,
 `sslmode` normalization), and a new
 Docker-backed suite `migrate_tests` (fresh-database apply, idempotent re-run,
