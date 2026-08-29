@@ -4726,6 +4726,10 @@ fn scan_keyword_dsn(
 #[must_use]
 pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
     const UNPARSEABLE: &str = "<unparseable dsn>";
+    /// `redact_dsn`'s other whole-DSN withholding: a URL carrying its password
+    /// in the query string cannot be rewritten safely, so it returns this
+    /// instead. Like the unparseable case it is the same for every target.
+    const WITHHELD: &str = "<redacted dsn>";
 
     // Decide the FORM first, then redact with the reader for that form. The
     // other order leaks: `redact_dsn` parses with a general URL parser, and
@@ -4743,10 +4747,12 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
     if is_url_form {
         let redacted = redact_dsn(dsn);
         // A URL is a URL, malformed or not: if the URL reader cannot read it,
-        // the keyword scanner has no business trying. The ordinal is the only
-        // safe answer left.
-        return if redacted == UNPARSEABLE {
-            format!("{UNPARSEABLE} #{ordinal}")
+        // the keyword scanner has no business trying. Whenever the reader
+        // withholds the WHOLE DSN -- unparseable, or a password in the query
+        // string it cannot rewrite -- the label carries no identity, so every
+        // target would report the same. Keep the reason and add the ordinal.
+        return if redacted == UNPARSEABLE || redacted == WITHHELD {
+            format!("{redacted} #{ordinal}")
         } else {
             redacted
         };
@@ -16557,6 +16563,19 @@ mod migrate_cli_tests {
                 "credential leaked into: {label}"
             );
         }
+    }
+
+    #[test]
+    fn wholly_withheld_url_targets_stay_distinguishable() {
+        // A password in the query string cannot be rewritten, so `redact_dsn`
+        // withholds the whole DSN -- identically for every shard. Without the
+        // ordinal a partial multi-shard report cannot say which database moved.
+        let a = migrate_target_label("postgres://db-a/harvest?password=secret", 1);
+        let b = migrate_target_label("postgres://db-b/harvest?password=secret", 2);
+        assert!(!a.contains("secret"), "{a}");
+        assert!(!b.contains("secret"), "{b}");
+        assert_eq!(a, "<redacted dsn> #1");
+        assert_ne!(a, b);
     }
 
     #[test]
