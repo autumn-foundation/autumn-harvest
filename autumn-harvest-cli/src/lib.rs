@@ -1151,6 +1151,7 @@ enum MigrateCommand {
         #[arg(
             long = "database-url",
             env = "HARVEST_DATABASE_URL",
+            hide_env_values = true,
             value_name = "URL",
             required = true
         )]
@@ -1183,6 +1184,7 @@ enum MigrateCommand {
         #[arg(
             long = "database-url",
             env = "HARVEST_DATABASE_URL",
+            hide_env_values = true,
             value_name = "URL",
             required = true
         )]
@@ -4615,8 +4617,13 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
                 }
                 match bytes[i] {
                     b'\\' if i + 1 < bytes.len() => {
-                        value.push(dsn[i + 1..].chars().next().unwrap_or_default());
-                        i += 2;
+                        // Advance past the WHOLE escaped character: `\é` is
+                        // three bytes, and `i += 2` would leave `i` inside it,
+                        // so the next `dsn[i..]` slice panics on a non-char
+                        // boundary instead of connecting.
+                        let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
+                        value.push(escaped);
+                        i += 1 + escaped.len_utf8();
                     }
                     b'\'' => {
                         i += 1;
@@ -16366,6 +16373,21 @@ mod migrate_cli_tests {
         assert_eq!(rewritten, r"password=abc\ def sslmode=require");
         let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
         assert_eq!(config.get_password(), Some(b"abc def".as_slice()));
+    }
+
+    #[test]
+    fn an_escaped_multibyte_character_does_not_panic() {
+        // `\é` is three bytes: advancing two would leave the scanner inside
+        // the character and the next slice would panic on a non-char boundary.
+        for dsn in [
+            r"password='a\éb' sslmode=verify-full",
+            r"password=a\éb sslmode=verify-full",
+        ] {
+            let rewritten = normalize_sslmode(dsn);
+            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
+            let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+            assert_eq!(config.get_password(), Some("aéb".as_bytes()));
+        }
     }
 
     #[test]
