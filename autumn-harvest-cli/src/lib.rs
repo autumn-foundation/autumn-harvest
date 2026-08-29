@@ -1178,9 +1178,13 @@ enum MigrateCommand {
     /// Apply every pending migration, in version order.
     ///
     /// Each migration runs inside one transaction together with its ledger row,
-    /// so a failure leaves neither the schema change nor the record of it. A
-    /// failing target stops the run: remaining targets are left untouched
-    /// rather than half-migrated behind a database that already failed.
+    /// so a failure leaves neither the schema change nor the record of it —
+    /// with one exception, which the report names when it happens: a migration
+    /// whose `metadata.toml` sets `run_in_transaction = false` (what `CREATE
+    /// INDEX CONCURRENTLY` requires) has no transaction to roll back, so any
+    /// statement of it that already succeeded still stands. A failing target
+    /// stops the run: remaining targets are left untouched rather than
+    /// half-migrated behind a database that already failed.
     Run {
         /// Harvest database to migrate: the value of `harvest.database.url`.
         ///
@@ -4427,11 +4431,23 @@ fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliErr
 /// reachable.
 ///
 /// **TLS is always verified** — certificate chain *and* hostname, against the
-/// platform's trust store. That is stricter than libpq's `sslmode=require`
-/// (which encrypts without authenticating): a self-signed certificate must be
-/// in the system trust store to be accepted here. `sslmode=disable` still
-/// connects in plaintext, and `prefer` (the default) negotiates TLS with a
-/// plaintext fallback, both as tokio-postgres implements them.
+/// platform's trust store. That is stricter than libpq, whose `require` and
+/// `prefer` encrypt without authenticating: a certificate this cannot verify is
+/// refused here, where libpq would connect.
+///
+/// What that means per mode, precisely:
+///
+/// * `disable` — plaintext, no trust store consulted.
+/// * `prefer` (the default) — TLS is attempted; tokio-postgres falls back to
+///   plaintext only when the **server declines** TLS, not when the handshake
+///   fails. So an untrusted or hostname-mismatched certificate is an error
+///   here rather than a silent downgrade to an unauthenticated connection.
+///   Deliberate: this command carries a database password and applies schema
+///   changes, and "the certificate was wrong so we sent the credential in
+///   clear" is not a fallback worth having. Use `sslmode=disable` to say
+///   plaintext out loud, or put the CA in the trust store.
+/// * `require` / `verify-ca` / `verify-full` — TLS, verified. An empty trust
+///   store is a named error rather than a downgrade.
 ///
 /// # Errors
 ///
@@ -4473,9 +4489,11 @@ async fn connect_for_migration(
         if config.get_ssl_mode() == tokio_postgres::config::SslMode::Prefer {
             eprintln!(
                 "warning: {redacted}: no usable certificates in the platform trust \
-                 store, so TLS cannot be verified; sslmode=prefer falls back to a \
-                 PLAINTEXT connection. Install your distribution's ca-certificates \
-                 package, or pass sslmode=require to fail instead."
+                 store, so no TLS connection could be verified; sslmode=prefer \
+                 therefore connects in PLAINTEXT. Install your distribution's \
+                 ca-certificates package, or pass sslmode=require to fail instead. \
+                 (With a trust store present, a certificate that fails to verify \
+                 is an error, not a downgrade.)"
             );
             return autumn_harvest::migrate::connect(database_url)
                 .await
