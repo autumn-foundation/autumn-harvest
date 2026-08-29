@@ -35,10 +35,12 @@ INDEX CONCURRENTLY` migration needs, since Postgres rejects that statement
 inside a transaction block) applies the body without one, and the ledger row
 then goes in *after* the body rather than before it, because a version recorded
 for a migration that never finished is the one state no later run can repair.
-The one key is read by a strict hand parser that refuses anything ambiguous
-rather than pulling a TOML crate into the engine core; `build.rs` emits each
-migration's metadata text so the embedded set and an `--include-dir` set go
-through the same parser. No `down.sql` — a rollback under a live fleet is an
+The one key is read by a strict hand parser rather than pulling a TOML crate
+into the engine core: it accepts blank lines, `#` comments, and
+`run_in_transaction = true|false` — and refuses everything else, which makes
+what it accepts a provable subset of what Diesel accepts, the only side of that
+trade safe to be wrong on. `build.rs` emits each migration's metadata text so
+the embedded set and an `--include-dir` set go through the same parser. No `down.sql` — a rollback under a live fleet is an
 operator decision with data loss attached.
 
 Two details worth naming:
@@ -83,16 +85,26 @@ target stops the run rather than leaving later shards migrated behind a database
 that already failed. Failure messages carry the redacted DSN, never the
 credential — this runs in deploy pipelines whose logs are widely readable.
 
+A failure never loses what it did. `apply_to_connection` returns a
+`PartialMigration` pairing the error with everything committed before it —
+migrations commit one at a time, so a failure at the fourth of six leaves three
+applied — and the CLI prints that alongside the targets already finished, in
+whichever format was asked for. Connection failures take the same path, because
+an unreachable third shard says nothing about the two behind it.
+
 Also fixed: the plugin's non-`dev` warning on a dedicated Harvest database said
 "Run `autumn migrate`", the one command that cannot apply those migrations
 (issue #1240's root cause). It now names `harvest migrate run`. The connector
 chapter, operations guide, sharding runbook and 0.6.0 upgrade guide all point at
 the new command.
 
-Tests: 23 unit tests in `src/migrate.rs` (version extraction, plan
-classification, directory reading, embedded-set/bundle agreement), 17 CLI tests
-(argument mapping, `--include-dir` loading and collision refusal, text/JSON
-rendering, the `--check` gate's counts and exit code, DSN redaction), and a new
+Tests: 25 unit tests in `src/migrate.rs` (version extraction, plan
+classification, directory reading, embedded-set/bundle agreement, and the
+metadata parser's refusals — a table header, a line that is not `key = value`,
+an unknown key, a non-boolean value, a duplicate key, unbalanced key quotes),
+21 CLI tests (argument mapping, `--include-dir` loading and collision refusal,
+text/JSON rendering, the `--check` gate's counts and exit code, DSN redaction,
+`sslmode` normalization), and a new
 Docker-backed suite `migrate_tests` (fresh-database apply, idempotent re-run,
 `plan` writing nothing, an extra set applying alongside the embedded one, a
 failing migration rolling back with its ledger row and the run resuming after a
