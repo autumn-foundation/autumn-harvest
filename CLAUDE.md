@@ -20,30 +20,25 @@
 - Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
 ## Engine Invariants
 
-### `harvest_events` is append-only — the three sanctioned exceptions
+### `harvest_events` is append-only — the sanctioned exceptions
 
 Workflow history is an append-only log. Replay reconstructs a run by reading
 events back in order, so rewriting a stored row is, in general, a way to make a
 past run mean something different than it did. Do not add code that mutates
 `harvest_events` rows.
 
-There are exactly **three** sanctioned exceptions. Each is narrow, each is named
-here, and each is safe for a specific, stated reason. Anything else is a bug.
+Exactly **two** code paths write `harvest_events.event_data` after insert, and
+both are sanctioned, narrow, and named here. Anything else is a bug.
 
-1. **Heartbeat checkpoints** — `queue::record_heartbeat`. An activity's
-   in-flight heartbeat details are refreshed in place. Checkpoint details are
-   progress metadata a resumed activity reads, never a value replay matches a
-   command against.
+1. **PII erasure** — `erase.rs` (issue #495), historically numbered *exception
+   #2*. Payload-bearing fields are replaced with the `_harvest_erased`
+   tombstone. Terminal executions only, so no resumable history is affected;
+   the event `type`, event ids, ordering and timestamps are left intact, so an
+   erased history still replays structurally.
 
-2. **PII erasure** — `erase.rs` (issue #495). Payload-bearing fields are
-   replaced with the `_harvest_erased` tombstone. Terminal executions only, so
-   no resumable history is affected; the event `type`, event ids, ordering and
-   timestamps are left completely intact, so an erased history still replays
-   structurally.
-
-3. **⚠️ Codec key re-encryption** — `codec_rotation.rs` (issue #948). A stored
-   payload field's ciphertext is decoded with a retired codec key and
-   re-encoded under the active one, in place.
+2. **⚠️ Codec key re-encryption** — `codec_rotation.rs` (issue #948),
+   *exception #3*. A stored payload field's ciphertext is decoded with a retired
+   codec key and re-encoded under the active one, in place.
 
    The scope guarantee that makes exception #3 safe: **only the ciphertext bytes
    inside payload fields change.** The decoded plaintext is byte-identical
@@ -56,9 +51,19 @@ here, and each is safe for a specific, stated reason. Anything else is a bug.
    histories and `ReplaySucceeded` both times.
 
    The sweep writes with a compare-and-swap on the row's previous bytes, so it
-   always loses a race against exceptions #1 and #2 — re-writing ciphertext over
-   an erasure tombstone would resurrect payload data an erasure had just
-   destroyed, and the CAS makes that impossible rather than unlikely.
+   always loses a race against exception #1 — re-writing ciphertext over an
+   erasure tombstone would resurrect payload data an erasure had just destroyed,
+   and the CAS makes that impossible rather than unlikely. A lost CAS is counted
+   as unresolved, so the pass re-runs rather than reporting itself complete over
+   a row it never converted.
 
-If you add a fourth exception, it belongs in this list, with its own scope
+**On the numbering.** Issue #948 and `erase.rs` both described heartbeat
+checkpoints in `queue::record_heartbeat` as the *first* exception to this
+invariant. That is not accurate: `record_heartbeat` updates
+`harvest_task_queue.last_heartbeat_at` / `heartbeat_details` — an in-place
+mutation of the **task queue** row, not of the event log. The `#2` / `#3`
+numbering above is kept because the issues and their PRs use it, but there are
+two `harvest_events` writers, not three.
+
+If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.

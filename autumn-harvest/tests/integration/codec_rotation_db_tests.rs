@@ -146,9 +146,10 @@ fn swap_database(url: &str, db_name: &str) -> String {
 }
 
 fn build_pool(url: &str) -> autumn_harvest::worker::DbPool {
-    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-        AsyncPgConnection,
-    >::new(url);
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url,
+        );
     deadpool::managed::Pool::builder(manager)
         .max_size(4)
         .build()
@@ -263,6 +264,20 @@ async fn raw_event_data(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> V
         .load::<Value>(conn)
         .await
         .expect("load raw events")
+}
+
+async fn cursor_row_count(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: Count =
+        diesel::sql_query("SELECT COUNT(*)::BIGINT AS n FROM harvest_codec_rotation_cursor")
+            .get_result(conn)
+            .await
+            .expect("count cursor rows");
+    row.n
 }
 
 fn kid_of(event_data: &Value, field: &str) -> Option<String> {
@@ -441,7 +456,11 @@ async fn the_sweep_is_batched_and_resumes_from_its_cursor() {
     let third = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 2, &NoOpMetrics)
         .await
         .expect("batch 3");
-    assert_eq!(second + third, 3, "the remaining rows convert across batches");
+    assert_eq!(
+        second + third,
+        3,
+        "the remaining rows convert across batches"
+    );
 
     let done = load_shard_rotation_progress(&mut conn, 0, &codecs)
         .await
@@ -779,9 +798,10 @@ async fn offload_envelopes_and_tombstones_survive_a_sweep_untouched() {
     // erasure tombstone.
     let offload_envelope = json!({
         "_harvest_offload_envelope": 1,
+        "store_id": "mem",
         "key": "blob/abc",
-        "size_bytes": 4096,
-        "sha256": "deadbeef",
+        "len": 4096,
+        "checksum": "deadbeef",
     });
     for (row_id, field, replacement) in [
         (ids[0], "input", offload_envelope.clone()),
@@ -894,7 +914,10 @@ async fn retirement_fails_closed_on_an_unreachable_shard() {
             assert_eq!(remaining.len(), 1);
             assert_eq!(remaining[0].shard_id, 7);
             assert!(!remaining[0].reachable);
-            assert_eq!(remaining[0].rows, 0, "unknown is reported as 0-but-unreachable");
+            assert_eq!(
+                remaining[0].rows, 0,
+                "unknown is reported as 0-but-unreachable"
+            );
         }
         other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
     }
@@ -1070,22 +1093,16 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
 }
 
 #[tokio::test]
-async fn a_registry_with_no_keyed_codecs_issues_no_statements() {
+async fn a_registry_with_no_keyed_codecs_sweeps_nothing_and_writes_no_cursor() {
     // The zero-overhead default: an un-rotated deployment pays nothing.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let mut codecs = PayloadCodecs::default();
     codecs.set_default(Arc::new(XorCodec(0x11)));
     let exec_id = insert_execution(&mut conn, "unrotated").await;
-    store::append_events_with_codecs(
-        &mut conn,
-        exec_id,
-        &[started(json!({"a": 1}))],
-        0,
-        &codecs,
-    )
-    .await
-    .expect("append");
+    store::append_events_with_codecs(&mut conn, exec_id, &[started(json!({"a": 1}))], 0, &codecs)
+        .await
+        .expect("append");
     let before = raw_event_data(&mut conn, exec_id).await;
 
     assert_eq!(
@@ -1095,4 +1112,329 @@ async fn a_registry_with_no_keyed_codecs_issues_no_statements() {
         0
     );
     assert_eq!(raw_event_data(&mut conn, exec_id).await, before);
+    // The early return happens before any bookkeeping, so the sweep leaves no
+    // trace at all — the observable half of "not one statement issued".
+    assert_eq!(
+        cursor_row_count(&mut conn).await,
+        0,
+        "an un-rotated deployment must not even create a cursor row"
+    );
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert!(
+        progress.rows_by_key_id.is_empty(),
+        "the admin read must not run the census when rotation was never adopted"
+    );
+}
+
+/// A rotation that is later ROLLED BACK must rescan the shard.
+///
+/// The cursor deliberately carries the target key id as a column rather than as
+/// part of its key: resuming a rolled-back-to key's own already-completed pass
+/// would skip every row written under the key being rolled back FROM, and leave
+/// that key permanently unretirable.
+#[tokio::test]
+async fn rolling_back_to_a_previous_key_rescans_the_shard() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "rollback").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    // Forward: k1 -> k2, pass completes.
+    codecs.set_active_key("k2").expect("flip to k2");
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("forward sweep"),
+        1
+    );
+    assert!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .cursor
+            .expect("cursor")
+            .completed_at
+            .is_some(),
+        "the forward pass completed"
+    );
+
+    // Roll back: k2 -> k1. The k1 pass must start over, not resume.
+    codecs.set_active_key("k1").expect("roll back to k1");
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("rollback sweep"),
+        1,
+        "a rollback must rescan the shard, not resume the old k1 cursor"
+    );
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(kid_of(&rows[0], "input"), Some("k1".to_string()));
+    assert_eq!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .rows_remaining(),
+        0
+    );
+}
+
+/// A row the pass could not convert must not be abandoned behind the cursor.
+///
+/// The failure this guards is a two-phase rollout that activates the new key
+/// before every process has the outgoing key registered: without the
+/// unresolved-row accounting the pass would log each undecodable row, march the
+/// cursor to the end of the shard, stamp itself complete, and leave those rows
+/// on the retired key forever — with a manual `DELETE` on the cursor table as
+/// the only recovery.
+#[tokio::test]
+async fn an_unconvertible_row_is_retried_once_its_key_comes_back() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+
+    // Written under a key the sweeping process does not (yet) know.
+    let writer = PayloadCodecs::default();
+    writer
+        .register_key("k0", Arc::new(XorCodec(0x00)))
+        .expect("register k0");
+    let exec_id = insert_execution(&mut conn, "late_key").await;
+    append_under_key(
+        &mut conn,
+        &writer,
+        exec_id,
+        "k0",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k2", Arc::new(XorCodec(0x22)))
+        .expect("register k2");
+
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep with the key missing"),
+        0
+    );
+    let stalled = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor");
+    assert!(
+        stalled.completed_at.is_none(),
+        "a pass that left a row unconverted must NOT report itself complete"
+    );
+    assert_eq!(
+        stalled.last_event_id, 0,
+        "and must rewind so the row gets another attempt"
+    );
+
+    // The operator puts the key back, exactly as the runbook says.
+    codecs
+        .register_key("k0", Arc::new(XorCodec(0x00)))
+        .expect("re-register k0");
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep after re-registering"),
+        1,
+        "the previously-unconvertible row must be picked up with no manual intervention"
+    );
+    let done = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(done.rows_remaining(), 0);
+    assert!(done.cursor.expect("cursor").completed_at.is_some());
+}
+
+/// The third documented fail-closed path: the shard is reachable but its census
+/// errors. An unreadable shard is a blocker, never a zero.
+#[tokio::test]
+async fn retirement_fails_closed_when_a_shards_census_errors() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    codecs.set_active_key("k2").expect("flip");
+
+    // Make the census fail on an otherwise-reachable shard.
+    conn.batch_execute("DROP TABLE harvest_events CASCADE")
+        .await
+        .expect("drop events table");
+
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let err = retire_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k1")
+        .await
+        .expect_err("a failed census must block retirement");
+    match err {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
+            assert_eq!(remaining.len(), 1);
+            assert!(!remaining[0].reachable);
+            assert!(
+                remaining[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("census")),
+                "the error must say why: {:?}",
+                remaining[0].reason
+            );
+        }
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
+    }
+    assert!(codecs.codec_for_key("k1").is_some());
+}
+
+/// Retirement must refuse a shard list that omits a shard this process can see:
+/// an omitted shard is never censused, so `Ok` for it would be vacuous.
+#[tokio::test]
+async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    codecs.set_active_key("k2").expect("flip");
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    // Shard 0 exists in the pool but is not in the supplied list.
+    let err = retire_codec_key(&sharded, &[ShardId::new(9)], &codecs, "k1")
+        .await
+        .expect_err("an incomplete shard list must block retirement");
+    assert!(
+        matches!(err, HarvestError::CodecKeyRetirementBlocked { .. }),
+        "{err:?}"
+    );
+}
+
+/// Retiring a key that was never registered must not report a vacuous success.
+#[tokio::test]
+async fn retirement_refuses_an_unregistered_key_id() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = retire_codec_key(&sharded, &[ShardId::new(0)], &codecs, "never-registered")
+        .await
+        .expect_err("an unregistered key proves nothing");
+    assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+}
+
+/// AC4's "resident of the existing scanner cadence" half: the sweep must
+/// actually run from `enforce_timeouts_once`, not only when called directly.
+#[tokio::test]
+async fn the_sweep_runs_as_a_resident_of_the_timeout_scanner() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "scanner_resident").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    autumn_harvest::timeout::enforce_timeouts_once(
+        &mut conn,
+        &NoOpMetrics,
+        std::time::Duration::from_secs(5),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+        &codecs,
+        100,
+    )
+    .await
+    .expect("timeout tick");
+
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(
+        kid_of(&rows[0], "input"),
+        Some("k2".to_string()),
+        "the scanner tick must drive the sweep"
+    );
+}
+
+/// A `kid` read back out of STORAGE is untrusted input.
+///
+/// On a deployment with no non-identity codec, a caller's workflow input is
+/// stored verbatim — so envelope-shaped input carrying an arbitrary `kid` would
+/// otherwise inject an attacker-chosen, unbounded key into the rotation census
+/// and keep `rows_remaining` permanently non-zero, denying the retirement
+/// procedure outright.
+#[tokio::test]
+async fn a_crafted_key_id_in_stored_input_is_not_counted() {
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "crafted").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let mut data: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("row");
+    data["data"]["input"] = json!({
+        "_harvest_codec_envelope": 1,
+        "codec_id": "xor",
+        "data": "AAAA",
+        "kid": "A".repeat(4096),
+    });
+    diesel::update(harvest_events::table.find(row_id))
+        .set(harvest_events::event_data.eq(&data))
+        .execute(&mut conn)
+        .await
+        .expect("update");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert!(
+        progress.rows_by_key_id.keys().all(|k| k.len() <= 64),
+        "an over-long crafted key id must never reach the census: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        progress.rows_remaining(),
+        0,
+        "crafted input must not be able to hold the retirement gate open"
+    );
 }

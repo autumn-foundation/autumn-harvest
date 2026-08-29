@@ -86,6 +86,18 @@ type WorkflowChildProjection = (
     Option<String>,
 );
 
+/// The identity codec registry used by every non-codec-aware call site.
+///
+/// A `PayloadCodecs::default()` now allocates an `Arc<RwLock<_>>` and a
+/// `String` for its rotation state (issue #948), and `append_events` /
+/// `events_to_insert_rows*` are on the worker's hot write path with 20+ call
+/// sites — constructing a throwaway registry per append would be a real, if
+/// small, regression for every deployment. One shared instance costs nothing
+/// and behaves identically: it registers no keyed codec, so its rotation state
+/// is inert.
+static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
+    std::sync::LazyLock::new(crate::payload_codec::PayloadCodecs::default);
+
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
 ///
@@ -95,12 +107,7 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        0,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
+    events_to_insert_rows_from_with_codecs(exec_id, events, 0, &DEFAULT_PAYLOAD_CODECS)
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -118,12 +125,7 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        start_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
+    events_to_insert_rows_from_with_codecs(exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS)
 }
 
 pub fn events_to_insert_rows_from_with_codecs<'a>(
@@ -168,14 +170,7 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
-    append_events_with_codecs(
-        conn,
-        exec_id,
-        events,
-        start_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
-    .await
+    append_events_with_codecs(conn, exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS).await
 }
 
 /// Append events, encoding payload-bearing fields through `codecs` (issue #948).
@@ -716,12 +711,7 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
-    load_history_with_codecs(
-        conn,
-        exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
-    .await
+    load_history_with_codecs(conn, exec_id, &DEFAULT_PAYLOAD_CODECS).await
 }
 
 pub async fn load_history_with_codecs(
@@ -995,7 +985,7 @@ pub async fn load_history_since(
 
     let events = rows
         .into_iter()
-        .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
+        .map(|row| (*DEFAULT_PAYLOAD_CODECS).decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {

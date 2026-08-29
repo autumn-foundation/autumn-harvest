@@ -178,17 +178,17 @@ pub mod chaos;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
+/// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
+///
+/// Home of **sanctioned in-place mutation exception #3** — see the module docs
+/// and the "Engine invariants" section of `CLAUDE.md`.
+pub mod codec_rotation;
 /// Durable completion callbacks (issue #605).
 ///
 /// Pushes a workflow's terminal result to an operator-registered URL,
 /// HMAC-signed and SSRF-guarded.
 pub mod completion_callback;
 pub mod completion_trigger;
-/// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
-///
-/// Home of **sanctioned in-place mutation exception #3** — see the module docs
-/// and the "Engine invariants" section of `CLAUDE.md`.
-pub mod codec_rotation;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
 pub mod context;

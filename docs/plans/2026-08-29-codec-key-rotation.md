@@ -22,9 +22,12 @@ Options generated before narrowing:
 6. **Sweep as a standalone daemon.** Rejected: the repo's every other background duty is a
    resident of the shard-local scanner tick (`enforce_timeouts_once`). A second cadence is
    a second thing to operate, monitor and get wrong.
-7. **Cursor keyed by `(shard_id, active_key_id)`** rather than `(shard_id)`. Chosen: a
-   fresh rotation gets a fresh cursor for free, so "flip the key" cannot forget to reset a
-   cursor, and a rollback to a previous key resumes its own cursor.
+7. **Cursor carrying the target key id.** Chosen, but *not* by keying the row on
+   `(shard_id, active_key_id)` — review showed that resumes a rolled-back-to key's
+   already-completed cursor and silently skips every row written under the key being
+   rolled back *from*. The row is keyed on `shard_id` alone with the target key as a
+   column, so ANY change of active key — rotate, re-rotate, or roll back — restarts the
+   scan.
 8. **Compare-and-swap update rather than lock-and-update.** Chosen — see reverse
    brainstorming R1.
 9. **Full-scan census for the retirement gate** vs. a maintained counter. Chosen: full
@@ -137,7 +140,7 @@ in which a worker that cloned the registry at boot keeps writing under the retir
 
 New module `codec_rotation.rs`.
 
-Pure core (no DB): `reencrypt_event_value(codecs, &mut event_value)` walks the same
+Pure core (no DB): `reencrypt_event_payload_fields(codecs, &mut event_value)` walks the same
 `PAYLOAD_FIELD_KEYS` the codec/erasure/export paths share. Per field:
 skip erasure tombstones; skip offload envelopes; skip non-envelopes (plaintext is not
 "carrying a non-active key id"); skip envelopes already on the active key (idempotence);
@@ -198,3 +201,42 @@ added as the public, codec-aware write seam (`append_events` now delegates to it
 with the identity registry, so behaviour is byte-for-byte unchanged), and every
 rotation primitive here operates correctly on whatever the write path stores. The
 write-path defect is tracked separately.
+
+## 6. Review outcomes
+
+Four review agents (correctness/concurrency, security/crypto, API-contract/docs, Rust
+idiom/clippy/perf) ran against the first implementation. What they changed:
+
+- **Cursor keyed on `(shard, key)` was wrong for rollback** — re-keyed on `shard` with the
+  target key as a column, so any active-key change restarts the pass (plan item 7 above,
+  corrected).
+- **A row the sweep could not convert was abandoned behind the cursor forever** — a
+  decode failure or a lost compare-and-swap is now counted as `unresolved_rows`, and a
+  pass that ends with a non-zero count resets to 0 and runs again rather than stamping
+  `completed_at`. That is what makes "re-register the key you removed too early" actually
+  work, and what makes `completed_at` mean something.
+- **A concurrent `set_active_key` could make the sweep write plaintext** — the check was
+  a snapshot taken before the encode. `encode_payload_under` now refuses an identity
+  codec *at the point of use* and pins one key id for a whole row.
+- **A `kid` read back out of storage was untrusted** — on an identity deployment a
+  caller's workflow input is stored verbatim, so envelope-shaped input could inject
+  unbounded attacker-chosen key ids into the census, the admin response, and the logs,
+  and keep `rows_remaining` permanently non-zero. The stored `kid` is now held to the
+  same charset/length rule as a registered one, in Rust and in SQL.
+- **The offload skip used the strict parser** (`extract_offload_ref`) rather than the
+  discriminator, so a malformed offload envelope was mis-classified. Caught by my own
+  unit test; `is_offload_envelope` is now the predicate.
+- **The census ran unconditionally** — `GET /admin/codec/rotation` did a full-table scan
+  per shard even with no keyed codec registered. It now short-circuits.
+- **The retirement gate trusted the caller's shard list** — it now refuses a list that
+  omits a shard this process has a pool for, and refuses an unregistered key id.
+- **A per-shard sweep error aborted the whole scanner tick** — now logged and skipped, as
+  its own doc always claimed.
+- **`record_heartbeat` does not write `harvest_events`** — the "three exceptions" framing
+  in both `erase.rs` and issue #948 itself is inaccurate. `CLAUDE.md` now says so.
+
+Two limitations the reviews surfaced that are **real but out of this issue's scope**, and
+are documented rather than fixed (see the runbook's "What zero does and does not
+authorise"): the gate censuses `harvest_events` only, so offloaded blobs (#524),
+codec-encoded columns outside the event log, and nested envelopes are not covered by its
+zero.

@@ -20,10 +20,14 @@ worker that booted before the flip keeps writing under the retired key.
 
 **Sweep.** New `codec_rotation.rs`: a shard-local, batched, rate-limitable,
 idempotent, resumable re-encryption sweep, folded into `enforce_timeouts_once`
-alongside the other scanner residents. Its durable cursor is keyed on
-`(shard_id, active_key_id)` rather than `shard_id`, so flipping the key starts a
-fresh pass and a rollback resumes its own — no reset step an operator can
-forget. One migration (`20260726000000_harvest_codec_rotation_cursor`). The
+alongside the other scanner residents. Its durable cursor is one row per shard carrying the
+target key id as a column, so ANY change of active key — a rotation, a second
+rotation, or a rollback — restarts the scan, with no reset step an operator can
+forget. A row the pass could not convert (an unregistered key, corrupt
+ciphertext, a compare-and-swap lost to a concurrent erasure) is counted as
+unresolved, and a pass that ends with a non-zero count re-runs instead of being
+marked complete — so `completed_at` means "this pass converted everything it
+saw", and a key re-registered too late is still picked up. One migration (`20260726000000_harvest_codec_rotation_cursor`). The
 sweep returns without issuing a statement unless a keyed codec is registered, so
 every deployment that has not adopted rotation pays nothing.
 
@@ -70,7 +74,7 @@ never retire one) — per-key detail lives on the admin read, mirroring
 **No new `WorkflowEvent` variant, no change to the adjacently-tagged event JSON
 contract, one migration.**
 
-Tests: 13 new `payload_codec.rs` unit tests (envelope `kid`, kid-less legacy
+Tests: 12 new `payload_codec.rs` unit tests (envelope `kid`, kid-less legacy
 resolution, mixed-key decode, atomic flip across clones, malformed key ids,
 typed vs. lossy unknown-key handling, near-envelope strictness, `codec_id`
 back-compat fallback, active-key retirement refusal); 11 new `codec_rotation.rs`

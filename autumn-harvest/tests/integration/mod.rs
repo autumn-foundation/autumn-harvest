@@ -46,9 +46,9 @@ mod circuit_breaker_wiring_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
-mod completion_callback_tests;
 #[cfg(feature = "db")]
 mod codec_rotation_db_tests;
+mod completion_callback_tests;
 mod concurrency_key_tests;
 mod concurrency_supersede_tests;
 mod context_headers_tests;

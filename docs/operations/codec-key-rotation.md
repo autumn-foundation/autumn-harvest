@@ -37,6 +37,18 @@ history onto the new key.
 
 ## Wiring it up
 
+> **Read this first.** On the current engine, *no production write path applies
+> a configured `PayloadCodec` at all* — `store::append_events` (and therefore
+> every worker append) encodes with the identity registry, and the worker
+> replays with it too. The configured registry reaches only the read paths
+> (`WorkflowHandleClient`, the management API), which is what ADR-0003's issue
+> #608 addendum plumbed. Until that is fixed, registering a keyed codec
+> encrypts nothing new, the sweep finds nothing to convert, and this runbook
+> describes a rotation that rotates an empty set. It is an ADR-0003 write-path
+> defect rather than a rotation defect, and it is tracked separately;
+> `store::append_events_with_codecs` is the codec-aware seam it will be fixed
+> through.
+
 ```rust
 use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;
 
@@ -69,12 +81,14 @@ with no keyed codec registered.
 
 **Sizing the batch.** The unit is *rows examined*, not rows converted — the
 sweep walks `harvest_events` in `id` order and skips rows that need no work, so
-a pass costs one visit per row on the shard. At the default 200 rows per tick
-and a 5-second scanner interval that is roughly 40 rows/second, so a 1M-row
-shard converges in about seven hours. Raise the batch to convert faster (a
-first pass over a large corpus is the case that wants a big number); it is safe
-to change at any time, and once the first pass reaches the end of the shard the
-cursor keeps it cheap forever after — later ticks only look at rows appended
+a pass costs one visit per row on the shard. The scanner interval is
+`WorkerRuntimeConfig::poll_interval`, which the builder fixes at
+`DEFAULT_WORKER_POLL_INTERVAL` = **500 ms**, so the default 200 rows per tick is
+roughly 400 rows/second and a 1M-row shard converges in about 40 minutes. Raise
+the batch to convert faster (a first pass over a large corpus is the case that
+wants a big number) or lower it to reduce the load a rotation imposes; it is
+safe to change at any time, and once the first pass reaches the end of the shard
+the cursor keeps it cheap forever after — later ticks only look at rows appended
 since.
 
 Watch progress:
@@ -134,8 +148,44 @@ everywhere. It is **fail-closed** in three separate ways, all deliberate:
 - a shard whose census errors blocks retirement;
 - an empty shard list is refused outright — proving nothing is not proving zero.
 
-Only after a successful retirement should you dispose of the key material
-itself. Harvest never holds it.
+### ⚠️ What "zero" does and does not authorise
+
+The gate proves one specific thing: **no `harvest_events` row on any expected
+shard still references the key.** That is what the sweep converts, so that is
+what the census counts. It is *not* a licence to destroy the key material yet,
+because a codec envelope can also be sitting in places this feature does not
+sweep:
+
+- **Offloaded blobs** (issue #524). Offload composes *after* codec encode, so
+  the ciphertext — and its key id — lives in your `PayloadStore`, while the DB
+  row holds only a reference envelope. Those are the *large* payloads, and they
+  are explicitly out of scope here (embedder-owned storage). Re-encrypt or
+  re-key them yourself before retiring.
+- **Codec-encoded columns outside the event log**:
+  `harvest_workflow_executions.{input,output,memo,search_attrs,error}`,
+  `harvest_execution_summaries.{result,search_attrs}`,
+  `harvest_dead_letters.{input,error}`, `harvest_signals.payload`, and
+  `harvest_completion_deliveries.payload` are all decoded on the read path
+  (`decode_workflow_execution_fields` and friends) and are **not** swept or
+  censused.
+- **Nested envelopes.** The census and the sweep classify a payload field by its
+  *top-level* envelope. A field whose decoded plaintext itself contains an
+  envelope — e.g. an `ExternalAwaitResolved.output` frozen from another
+  execution's raw column — is counted only by its outer key id.
+
+So: treat a green gate as "the event log no longer needs this key", keep the key
+registered (not destroyed) until you have independently accounted for the three
+cases above, and prefer retiring the key from the registry well before
+destroying the material. Closing these gaps is tracked as follow-up work.
+
+Only after that, and after a successful retirement, should you dispose of the
+key material itself. Harvest never holds it.
+
+**Supplying `expected_shards`.** Pass every shard the deployment has, not just
+the ones this process serves. The gate refuses outright when the list omits a
+shard this process has a pool for, but it cannot see shards no process here
+knows about — an omitted shard is not censused, and the gate's `Ok` would be
+vacuous for it.
 
 ## What the sweep will not touch
 
@@ -173,10 +223,13 @@ would resurrect payload data the erasure had just destroyed.
 ## Troubleshooting
 
 **`rows_remaining` is stuck above zero.** A row the sweep cannot decode is
-logged (by row id only, never content) and skipped, and it keeps the retirement
-gate correctly blocked. The usual cause is a key that was removed from the
-registry before its rows were converted — re-register it and let the sweep
-finish.
+logged (by row id and the key ids it references, never content), skipped, and
+counted as *unresolved*. A pass that reaches the end of the shard with a
+non-zero unresolved count resets its cursor to 0 and runs again instead of
+being marked complete, so re-registering a key that was removed too early is
+enough — the next pass picks those rows up with no manual intervention. A
+cursor whose `completed_at` is set is therefore a real signal: that pass
+converted everything it saw.
 
 **`status` is `"partial"`.** A shard is unreachable. Retirement will refuse until
 it is readable again; that is intended.

@@ -172,7 +172,10 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn seed_event_under_key(pool: &DbPool, codecs: &PayloadCodecs, key_id: &str) {

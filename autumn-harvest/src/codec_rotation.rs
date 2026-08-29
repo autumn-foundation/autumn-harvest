@@ -14,9 +14,11 @@
 //! ## ⚠️ Sanctioned in-place mutation exception #3
 //!
 //! Re-encryption **mutates stored `harvest_events.event_data` bytes in place**.
-//! There are exactly three sanctioned exceptions to the append-only invariant:
-//! heartbeat checkpoints ([`crate::queue::record_heartbeat`]), PII erasure
-//! ([`crate::erase`], issue #495), and this. See `CLAUDE.md`.
+//! Exactly two code paths write `event_data` after insert: PII erasure
+//! ([`crate::erase`], issue #495, historically "exception #2") and this
+//! ("#3"). See the "Engine Invariants" section of `CLAUDE.md`, including why
+//! the heartbeat checkpoint issue #948 named as the first exception is not one
+//! (it mutates `harvest_task_queue`, not the event log).
 //!
 //! The scope guarantee that makes it safe: **only the ciphertext bytes inside
 //! payload fields change.** The decoded plaintext is byte-identical before and
@@ -41,9 +43,9 @@
 
 use serde_json::Value;
 
-use crate::error::HarvestResult;
+use crate::error::{HarvestError, HarvestResult};
 use crate::payload_codec::{PayloadCodecs, codec_envelope_key_id};
-use crate::payload_store::{PAYLOAD_FIELD_KEYS, extract_offload_ref};
+use crate::payload_store::{PAYLOAD_FIELD_KEYS, is_offload_envelope};
 
 /// What one call to [`reencrypt_event_payload_fields`] did to a single event.
 ///
@@ -74,7 +76,9 @@ impl ReencryptOutcome {
     #[must_use]
     pub const fn merged(self, other: Self) -> Self {
         Self {
-            fields_reencrypted: self.fields_reencrypted.saturating_add(other.fields_reencrypted),
+            fields_reencrypted: self
+                .fields_reencrypted
+                .saturating_add(other.fields_reencrypted),
             fields_skipped_offloaded: self
                 .fields_skipped_offloaded
                 .saturating_add(other.fields_skipped_offloaded),
@@ -98,9 +102,7 @@ impl ReencryptOutcome {
 /// is a crypto-shredding-in-reverse operation nobody asked for. The sweep
 /// refuses to do it and reports zero work instead.
 fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
-    codecs
-        .codec_for_key(&codecs.active_key_id())
-        .is_none_or(|codec| codec.codec_id() == "identity")
+    codecs.active_codec_id().is_none_or(|id| id == "identity")
 }
 
 /// Re-encode every payload-bearing field of one serialized event that carries a
@@ -131,16 +133,37 @@ pub fn reencrypt_event_payload_fields(
     codecs: &PayloadCodecs,
     event_value: &mut Value,
 ) -> HarvestResult<ReencryptOutcome> {
+    reencrypt_event_payload_fields_under(codecs, &codecs.active_key_id(), event_value)
+}
+
+/// [`reencrypt_event_payload_fields`], pinned to an explicit target key id.
+///
+/// [`sweep_codec_reencryption_once`] resolves the active key once per batch and
+/// calls THIS function (not the wrapper) for every row, so a concurrent
+/// `set_active_key` cannot straddle a single row and leave half its
+/// fields on the old key and half on the new one. It also cannot cause a
+/// plaintext write: [`PayloadCodecs::encode_payload_under`] refuses an identity
+/// codec at the point of use rather than relying on a check made earlier.
+///
+/// # Errors
+///
+/// As [`reencrypt_event_payload_fields`], plus [`HarvestError::Config`] when
+/// `target_key_id` names the identity codec and
+/// [`HarvestError::UnknownCodecKey`] when it is not registered at all.
+pub fn reencrypt_event_payload_fields_under(
+    codecs: &PayloadCodecs,
+    target_key_id: &str,
+    event_value: &mut Value,
+) -> HarvestResult<ReencryptOutcome> {
     let mut outcome = ReencryptOutcome::default();
-    if !codecs.has_keyed_codecs() || active_key_would_decrypt(codecs) {
+    if !codecs.has_keyed_codecs() {
         return Ok(outcome);
     }
-    let active = codecs.active_key_id();
     let Some(data) = event_value.get("data").and_then(Value::as_object) else {
         return Ok(outcome);
     };
 
-    let mut staged: Vec<(&'static str, Value)> = Vec::new();
+    let mut staged: Vec<(&'static str, Value)> = Vec::with_capacity(PAYLOAD_FIELD_KEYS.len());
     for key in PAYLOAD_FIELD_KEYS {
         let Some(field) = data.get(key) else {
             continue;
@@ -149,7 +172,11 @@ pub fn reencrypt_event_payload_fields(
             outcome.fields_skipped_erased += 1;
             continue;
         }
-        if extract_offload_ref(field).is_some() {
+        // Discriminator-only, NOT the strict `extract_offload_ref` parser: a
+        // field bearing the offload marker is passed through whether or not its
+        // reference parses, because there is no ciphertext here to rotate and
+        // rewriting it would orphan the blob either way.
+        if is_offload_envelope(field) {
             outcome.fields_skipped_offloaded += 1;
             continue;
         }
@@ -158,21 +185,58 @@ pub fn reencrypt_event_payload_fields(
             // newly encrypts history written in the clear.
             continue;
         };
-        if key_id == active {
+        if key_id == target_key_id {
             outcome.fields_already_active += 1;
             continue;
         }
         let plaintext = codecs.decode_payload(field)?;
-        staged.push((key, codecs.encode_payload(&plaintext)?));
+        staged.push((key, codecs.encode_payload_under(target_key_id, &plaintext)?));
     }
 
-    if let Some(data_mut) = event_value.get_mut("data").and_then(Value::as_object_mut) {
-        for (key, value) in staged {
-            data_mut.insert(key.to_string(), value);
-            outcome.fields_reencrypted += 1;
-        }
+    if staged.is_empty() {
+        return Ok(outcome);
+    }
+    // The immutable borrow above established that `data` is an object, so this
+    // cannot fail; treating it as an error rather than an `if let` keeps a
+    // future refactor from silently discarding `staged` and reporting no work.
+    let data_mut = event_value
+        .get_mut("data")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HarvestError::Config(
+                "event data object vanished between read and write during re-encryption"
+                    .to_string(),
+            )
+        })?;
+    for (key, value) in staged {
+        data_mut.insert(key.to_string(), value);
+        outcome.fields_reencrypted += 1;
     }
     Ok(outcome)
+}
+
+/// Whether any payload-bearing field of a serialized event carries a codec key
+/// id other than `active` — i.e. whether this row has anything for the sweep to
+/// do at all.
+///
+/// A few map lookups and no allocation, so the sweep can skip the deep clone of
+/// an event that is already fully converted. That is the steady state on a
+/// swept shard, and cloning multi-kilobyte event JSON to discover it is pure
+/// waste. Deliberately NOT built on [`event_key_ids`], which allocates a
+/// `BTreeSet<String>` — right for the error-reporting path, wrong for a
+/// per-row pre-check.
+#[must_use]
+pub fn has_non_active_key(event_value: &Value, active: &str) -> bool {
+    event_value
+        .get("data")
+        .and_then(Value::as_object)
+        .is_some_and(|data| {
+            PAYLOAD_FIELD_KEYS.iter().any(|key| {
+                data.get(*key)
+                    .and_then(codec_envelope_key_id)
+                    .is_some_and(|key_id| key_id != active)
+            })
+        })
 }
 
 /// Every codec key id referenced by one serialized event's payload fields
@@ -232,7 +296,9 @@ mod db {
     use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use crate::telemetry::MetricsRecorder;
 
-    use super::{active_key_would_decrypt, reencrypt_event_payload_fields};
+    use super::{
+        active_key_would_decrypt, has_non_active_key, reencrypt_event_payload_fields_under,
+    };
 
     /// The exact SQL mirror of
     /// [`codec_envelope_parts`](crate::payload_codec) — an object with
@@ -242,19 +308,29 @@ mod db {
     /// Kept byte-for-byte in step with the Rust shape check so the census can
     /// never count a row the sweep is unable to convert (which would make the
     /// retirement gate block forever) nor miss one it can (which would let the
-    /// gate open early). `codec_envelope_sql_and_rust_agree_on_near_envelopes`
-    /// in `tests/integration/codec_rotation_db_tests.rs` pins the two together.
+    /// gate open early). `a_near_envelope_is_neither_counted_nor_swept` in
+    /// `tests/integration/codec_rotation_db_tests.rs` pins the two together.
     const ENVELOPE_PREDICATE: &str = "
               jsonb_typeof(f.value) = 'object'
           AND f.value -> '_harvest_codec_envelope' = '1'::jsonb
+          -- jsonb compares numbers as `numeric`, so the line above alone also
+          -- accepts 1.0 -- which serde_json's `as_i64` rejects. Pin the text
+          -- form too, so Postgres and Rust classify byte-identically.
+          AND f.value ->> '_harvest_codec_envelope' = '1'
           AND jsonb_typeof(f.value -> 'codec_id') = 'string'
           AND jsonb_typeof(f.value -> 'data') = 'string'
+          -- Exactly 3 keys, or exactly 4 with a string `kid` that satisfies the
+          -- same charset/length rule `validate_key_id` applies in Rust (an
+          -- out-of-charset `kid` is not an envelope on either side, so crafted
+          -- workflow input cannot inject census rows).
+          AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value))
+              = CASE WHEN jsonb_typeof(f.value -> 'kid') = 'string'
+                          AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$'
+                     THEN 4 ELSE 3 END
           AND (
-                  (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 3
-               OR (
-                      (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 4
-                  AND jsonb_typeof(f.value -> 'kid') = 'string'
-                  )
+                  jsonb_typeof(f.value -> 'kid') IS NULL
+               OR (jsonb_typeof(f.value -> 'kid') = 'string'
+                   AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$')
               )";
 
     #[derive(diesel::QueryableByName)]
@@ -275,10 +351,14 @@ mod db {
 
     #[derive(diesel::QueryableByName)]
     struct CursorRow {
+        #[diesel(sql_type = Text)]
+        active_key_id: String,
         #[diesel(sql_type = BigInt)]
         last_event_id: i64,
         #[diesel(sql_type = BigInt)]
         rows_reencrypted: i64,
+        #[diesel(sql_type = BigInt)]
+        unresolved_rows: i64,
         #[diesel(sql_type = Nullable<Timestamptz>)]
         completed_at: Option<DateTime<Utc>>,
         #[diesel(sql_type = Timestamptz)]
@@ -294,11 +374,23 @@ mod db {
     /// The durable per-shard resume cursor for one rotation pass (issue #948).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct CodecRotationCursor {
+        /// The key id this pass is converting ONTO. When it differs from the
+        /// process's current active key the pass is stale and the next sweep
+        /// restarts from the beginning of the shard.
+        pub active_key_id: String,
         /// Highest `harvest_events.id` this pass has examined.
         pub last_event_id: i64,
         /// Rows this pass has actually rewritten.
         pub rows_reencrypted: i64,
-        /// When the pass first reached the end of the shard's events.
+        /// Rows this pass examined but could not convert — an unregistered key
+        /// id, corrupt ciphertext, or a compare-and-swap lost to a concurrent
+        /// erasure. Non-zero at the end of a pass forces another pass instead
+        /// of a completion stamp, so a transient failure always gets another
+        /// chance.
+        pub unresolved_rows: i64,
+        /// Set only when a pass reached the end of the shard having converted
+        /// everything it saw — "this key is safe to gate on", not merely "the
+        /// scan ran off the end".
         pub completed_at: Option<DateTime<Utc>>,
         /// Last time the cursor advanced.
         pub updated_at: DateTime<Utc>,
@@ -364,18 +456,18 @@ mod db {
     pub async fn count_rows_by_key_id(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<BTreeMap<String, i64>> {
+        // Targeted `->` lookups over the compile-time-constant field list,
+        // rather than `jsonb_each` materialising a tuple for every key of
+        // `data` (timestamps, ids, everything) only to discard most of them.
         let sql = format!(
             "SELECT key_id, COUNT(*)::BIGINT AS row_count \
              FROM ( \
                  SELECT e.id AS event_row_id, \
                         COALESCE(f.value ->> 'kid', $2) AS key_id \
                  FROM harvest_events e \
-                 CROSS JOIN LATERAL jsonb_each( \
-                     CASE WHEN jsonb_typeof(e.event_data -> 'data') = 'object' \
-                          THEN e.event_data -> 'data' \
-                          ELSE '{{}}'::jsonb END \
-                 ) AS f(key, value) \
-                 WHERE f.key = ANY($1) AND {ENVELOPE_PREDICATE} \
+                 CROSS JOIN LATERAL unnest($1::TEXT[]) AS k(field) \
+                 CROSS JOIN LATERAL (SELECT e.event_data -> 'data' -> k.field) AS f(value) \
+                 WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                  GROUP BY e.id, COALESCE(f.value ->> 'kid', $2) \
              ) s \
              GROUP BY key_id"
@@ -410,9 +502,21 @@ mod db {
         codecs: &PayloadCodecs,
     ) -> HarvestResult<ShardRotationProgress> {
         let active_key_id = codecs.active_key_id();
+        // With no keyed codec registered -- every deployment that has not
+        // adopted rotation -- the answer is trivially "nothing to rotate", and
+        // running a sequential scan of the largest table to say so would let an
+        // unauthenticated-to-the-DB dashboard poll turn an admin GET into
+        // repeated full-table reads on every shard.
+        if !codecs.has_keyed_codecs() {
+            return Ok(ShardRotationProgress {
+                active_key_id,
+                rows_by_key_id: BTreeMap::new(),
+                cursor: None,
+            });
+        }
         let rows_by_key_id = count_rows_by_key_id(conn).await?;
         let cursor = if cursor_table_present(conn).await? {
-            load_cursor(conn, shard_id, &active_key_id).await?
+            load_cursor(conn, shard_id).await?
         } else {
             None
         };
@@ -426,21 +530,21 @@ mod db {
     async fn load_cursor(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
-        active_key_id: &str,
     ) -> HarvestResult<Option<CodecRotationCursor>> {
         let rows: Vec<CursorRow> = diesel::sql_query(
-            "SELECT last_event_id, rows_reencrypted, completed_at, updated_at \
-             FROM harvest_codec_rotation_cursor \
-             WHERE shard_id = $1 AND active_key_id = $2",
+            "SELECT active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
+                    completed_at, updated_at \
+             FROM harvest_codec_rotation_cursor WHERE shard_id = $1",
         )
         .bind::<Integer, _>(shard_id)
-        .bind::<Text, _>(active_key_id)
         .load(conn)
         .await
         .map_err(database_error)?;
         Ok(rows.into_iter().next().map(|row| CodecRotationCursor {
+            active_key_id: row.active_key_id,
             last_event_id: row.last_event_id,
             rows_reencrypted: row.rows_reencrypted,
+            unresolved_rows: row.unresolved_rows,
             completed_at: row.completed_at,
             updated_at: row.updated_at,
         }))
@@ -470,8 +574,8 @@ mod db {
     /// The write is a **compare-and-swap**:
     /// `UPDATE harvest_events SET event_data = $new WHERE id = $1 AND event_data = $old`.
     /// If anything changed the row between the read and the write — PII erasure
-    /// (#495) tombstoning it, a heartbeat checkpoint, a second sweeper — the
-    /// update matches zero rows and this sweep simply skips it. The sweep always
+    /// (#495) tombstoning it, or a second sweeper — the update matches zero
+    /// rows and this sweep counts it unresolved and skips it. The sweep always
     /// loses such a race, which is the only safe direction: re-writing
     /// ciphertext over a tombstone would resurrect payload data an erasure had
     /// just destroyed.
@@ -496,37 +600,58 @@ mod db {
         if !cursor_table_present(conn).await? {
             return Ok(0);
         }
+        // Resolve the target key ONCE for the whole batch. Every row is
+        // re-encoded under this exact key id, so a concurrent `set_active_key`
+        // cannot straddle a row, and the progress we file below is attributed to
+        // the key we actually converted onto.
         let active_key_id = codecs.active_key_id();
-        let cursor = load_cursor(conn, shard_id, &active_key_id)
-            .await?
-            .map_or(0, |c| c.last_event_id);
+        let previous = load_cursor(conn, shard_id).await?;
+        // A cursor recorded against a DIFFERENT key is stale: rotating, rotating
+        // again, and ROLLING BACK all mean "rescan this shard from the start".
+        // Rollback is the case that makes this load-bearing — the key being
+        // rolled back to may have completed a pass of its own long ago, and
+        // resuming that pass would skip every row written under the key being
+        // rolled back from.
+        let resumed = previous
+            .as_ref()
+            .filter(|cursor| cursor.active_key_id == active_key_id);
+        let resume_from = resumed.map_or(0, |cursor| cursor.last_event_id);
 
         let rows: Vec<EventRow> = diesel::sql_query(
             "SELECT id, event_data FROM harvest_events \
              WHERE id > $1 ORDER BY id LIMIT $2",
         )
-        .bind::<BigInt, _>(cursor)
+        .bind::<BigInt, _>(resume_from)
         .bind::<BigInt, _>(batch_limit)
         .load(conn)
         .await
         .map_err(database_error)?;
 
         let reached_end = i64::try_from(rows.len()).unwrap_or(i64::MAX) < batch_limit;
-        let Some(highest_id) = rows.last().map(|row| row.id) else {
-            // Nothing left behind the cursor: mark the pass complete and stop.
-            upsert_cursor(conn, shard_id, &active_key_id, cursor, 0, true).await?;
-            return Ok(0);
-        };
+        let highest_id = rows.last().map_or(resume_from, |row| row.id);
 
         let mut rewritten = 0usize;
+        let mut unresolved = 0i64;
         for row in rows {
+            // Cheap pre-check before the deep clone: the steady state is a
+            // fully-converted shard where every fetched row is already on the
+            // active key, and cloning a multi-kilobyte event JSON to discover
+            // that is pure waste.
+            if !has_non_active_key(&row.event_data, &active_key_id) {
+                continue;
+            }
             let original = row.event_data;
             let mut candidate = original.clone();
-            match reencrypt_event_payload_fields(codecs, &mut candidate) {
+            match reencrypt_event_payload_fields_under(codecs, &active_key_id, &mut candidate) {
                 Ok(outcome) if outcome.changed() => {
                     if compare_and_swap_event(conn, row.id, &original, &candidate).await? {
                         rewritten += 1;
                     } else {
+                        // The row changed under us — a PII erasure, or another
+                        // sweeper. We lose, by design. Count it so the pass does
+                        // not report itself complete over a row it never
+                        // converted.
+                        unresolved += 1;
                         tracing::debug!(
                             event_row_id = row.id,
                             shard_id,
@@ -536,6 +661,7 @@ mod db {
                 }
                 Ok(_) => {}
                 Err(error) => {
+                    unresolved += 1;
                     // Bounded and content-free: the row id, the operator-chosen
                     // key ids the row references, and the typed error's own
                     // rendering. Never a payload, never ciphertext. Naming the
@@ -553,13 +679,43 @@ mod db {
             }
         }
 
-        upsert_cursor(
+        let carried = resumed.map_or((0, 0), |cursor| {
+            (cursor.rows_reencrypted, cursor.unresolved_rows)
+        });
+        let rows_reencrypted_total = carried
+            .0
+            .saturating_add(i64::try_from(rewritten).unwrap_or(i64::MAX));
+        let unresolved_total = carried.1.saturating_add(unresolved);
+
+        // A pass that ran off the end of the shard having left something
+        // unconverted must NOT be marked complete and must NOT leave those rows
+        // behind the cursor forever: reset to 0 so they get another attempt.
+        // That is what makes a transient failure — a key registered late, a race
+        // lost to an erasure — eventually consistent rather than permanent.
+        let (next_last_event_id, next_unresolved, next_completed_at) = if reached_end {
+            if unresolved_total > 0 {
+                (0, 0, None)
+            } else {
+                (
+                    highest_id,
+                    0,
+                    resumed
+                        .and_then(|cursor| cursor.completed_at)
+                        .or_else(|| Some(Utc::now())),
+                )
+            }
+        } else {
+            (highest_id, unresolved_total, None)
+        };
+
+        write_cursor(
             conn,
             shard_id,
             &active_key_id,
-            highest_id,
-            i64::try_from(rewritten).unwrap_or(i64::MAX),
-            reached_end,
+            next_last_event_id,
+            rows_reencrypted_total,
+            next_unresolved,
+            next_completed_at,
         )
         .await?;
 
@@ -577,9 +733,10 @@ mod db {
     ///
     /// This is the single guard that keeps sanctioned exception #3 from
     /// undoing exception #2: if anything changed the row between the sweep's
-    /// read and this write — a PII erasure (#495) tombstoning it, a heartbeat
-    /// checkpoint, a second sweeper — the `WHERE` clause matches nothing and
-    /// the sweep silently loses. That is the only safe direction.
+    /// read and this write — a PII erasure (#495) tombstoning it, or a second
+    /// sweeper — the `WHERE` clause matches nothing and the sweep loses. That
+    /// is the only safe direction, and the caller counts the loss so the pass
+    /// re-runs rather than reporting itself complete over that row.
     ///
     /// `#[doc(hidden)] pub` purely so that race semantics can be exercised
     /// directly by an integration test (a stale `original` must not win), which
@@ -608,31 +765,41 @@ mod db {
         Ok(updated > 0)
     }
 
-    async fn upsert_cursor(
+    /// Persist the pass's absolute state.
+    ///
+    /// Absolute rather than incremental (`SET x = x + n`) because the values are
+    /// computed from a read this same call made: only one scanner per shard runs
+    /// this, and a second one racing it simply overwrites with its own
+    /// consistent view rather than compounding two partial increments onto a
+    /// row whose meaning it never read.
+    async fn write_cursor(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
         active_key_id: &str,
         last_event_id: i64,
-        rewritten: i64,
-        reached_end: bool,
+        rows_reencrypted: i64,
+        unresolved_rows: i64,
+        completed_at: Option<DateTime<Utc>>,
     ) -> HarvestResult<()> {
         diesel::sql_query(
             "INSERT INTO harvest_codec_rotation_cursor \
-                 (shard_id, active_key_id, last_event_id, rows_reencrypted, completed_at, updated_at) \
-             VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN NOW() ELSE NULL END, NOW()) \
-             ON CONFLICT (shard_id, active_key_id) DO UPDATE SET \
-                 last_event_id = GREATEST(harvest_codec_rotation_cursor.last_event_id, EXCLUDED.last_event_id), \
-                 rows_reencrypted = harvest_codec_rotation_cursor.rows_reencrypted + $4, \
-                 completed_at = CASE WHEN $5 \
-                     THEN COALESCE(harvest_codec_rotation_cursor.completed_at, NOW()) \
-                     ELSE harvest_codec_rotation_cursor.completed_at END, \
+                 (shard_id, active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
+                  completed_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+             ON CONFLICT (shard_id) DO UPDATE SET \
+                 active_key_id = EXCLUDED.active_key_id, \
+                 last_event_id = EXCLUDED.last_event_id, \
+                 rows_reencrypted = EXCLUDED.rows_reencrypted, \
+                 unresolved_rows = EXCLUDED.unresolved_rows, \
+                 completed_at = EXCLUDED.completed_at, \
                  updated_at = NOW()",
         )
         .bind::<Integer, _>(shard_id)
         .bind::<Text, _>(active_key_id)
         .bind::<BigInt, _>(last_event_id)
-        .bind::<BigInt, _>(rewritten)
-        .bind::<diesel::sql_types::Bool, _>(reached_end)
+        .bind::<BigInt, _>(rows_reencrypted)
+        .bind::<BigInt, _>(unresolved_rows)
+        .bind::<Nullable<Timestamptz>, _>(completed_at)
         .execute(conn)
         .await
         .map_err(database_error)?;
@@ -665,6 +832,15 @@ mod db {
             Some(sp) if !shard_assignments.is_empty() => {
                 for shard in shard_assignments {
                     let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                        // Assigned but with no pool in this process (mid a
+                        // shard-add rollout). Logged rather than skipped
+                        // silently: its rows stay on the retired key, and an
+                        // operator watching rows_remaining refuse to fall needs
+                        // to know why.
+                        tracing::warn!(
+                            "[codec_rotation] shard {shard:?} is assigned but has no connection \
+                             pool in this process; its rows are not being swept"
+                        );
                         continue;
                     };
                     let mut shard_conn = match pool.get().await {
@@ -676,19 +852,41 @@ mod db {
                             continue;
                         }
                     };
-                    total += sweep_codec_reencryption_once(
+                    // Best-effort per shard. Propagating would abort the WHOLE
+                    // timeout tick -- timeout enforcement, broken-session
+                    // reclaim, mutex-lease reclaim, for every shard -- because
+                    // one shard's sweep failed. The rotation simply does not
+                    // advance there, which the admin read makes visible.
+                    match sweep_codec_reencryption_once(
                         &mut shard_conn,
                         shard.as_i32(),
                         codecs,
                         batch_limit,
                         metrics,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(n) => total += n,
+                        Err(e) => {
+                            tracing::error!("[codec_rotation] sweep failed on shard {shard:?}: {e}")
+                        }
+                    }
                 }
             }
             _ => {
-                total += sweep_codec_reencryption_once(conn, 0, codecs, batch_limit, metrics)
-                    .await?;
+                // Unsharded (or no explicit assignment): attribute progress to
+                // the shard this connection actually serves when we know it,
+                // rather than assuming 0 -- otherwise the admin read fans out
+                // over the router's shards and finds no cursor row.
+                let shard_id = shard_assignments.first().map_or(0, |s| s.as_i32());
+                match sweep_codec_reencryption_once(conn, shard_id, codecs, batch_limit, metrics)
+                    .await
+                {
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        tracing::error!("[codec_rotation] sweep failed on shard {shard_id}: {e}");
+                    }
+                }
             }
         }
         Ok(total)
@@ -731,6 +929,38 @@ mod db {
                 "cannot retire codec key id {key_id:?}: no shards were supplied to inspect, so \
                  zero remaining rows cannot be established"
             )));
+        }
+        if codecs.codec_for_key(key_id).is_none() {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is not registered; retiring it would report success \
+                 without having proved anything about the rows that reference it"
+            )));
+        }
+        // Fail closed on an INCOMPLETE list, not just an unreachable shard. A
+        // caller that passes a stale or process-local subset would otherwise get
+        // a vacuous `Ok` while whole shards were never censused -- and the
+        // runbook tells the operator that `Ok` is when key material may be
+        // destroyed.
+        let missing: Vec<CodecKeyShardRemainder> = sharded_pool
+            .iter_shards()
+            .map(|(shard, _)| shard)
+            .filter(|shard| !expected_shards.contains(shard))
+            .map(|shard| CodecKeyShardRemainder {
+                shard_id: shard.as_i32(),
+                rows: 0,
+                reachable: false,
+                reason: Some(
+                    "this process has a pool for this shard but it was omitted from the \
+                     supplied shard list"
+                        .to_string(),
+                ),
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(HarvestError::CodecKeyRetirementBlocked {
+                key_id: key_id.to_string(),
+                remaining: missing,
+            });
         }
 
         let mut remaining: Vec<CodecKeyShardRemainder> = Vec::new();
@@ -791,7 +1021,6 @@ mod db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::HarvestError;
     use crate::payload_codec::{
         CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec,
     };
@@ -909,9 +1138,10 @@ mod tests {
         let mut event = event_under(&codecs, "k1", json!({"user": "alice"}));
         let offload_envelope = json!({
             "_harvest_offload_envelope": 1,
+            "store_id": "mem",
             "key": "blob/abc",
-            "size_bytes": 4096,
-            "sha256": "deadbeef",
+            "len": 4096,
+            "checksum": "deadbeef",
         });
         event["data"]["input"] = offload_envelope.clone();
 
@@ -919,7 +1149,10 @@ mod tests {
 
         assert_eq!(outcome.fields_reencrypted, 0);
         assert_eq!(outcome.fields_skipped_offloaded, 1);
-        assert_eq!(event["data"]["input"], offload_envelope, "passed through verbatim");
+        assert_eq!(
+            event["data"]["input"], offload_envelope,
+            "passed through verbatim"
+        );
     }
 
     #[test]
@@ -990,8 +1223,14 @@ mod tests {
         let codecs = rotated_registry();
         let err = reencrypt_event_payload_fields(&codecs, &mut event)
             .expect_err("an unresolvable key must fail the row");
-        assert!(matches!(err, HarvestError::UnknownCodecKey { .. }), "{err:?}");
-        assert_eq!(event, before, "the row is byte-identical after a failed sweep");
+        assert!(
+            matches!(err, HarvestError::UnknownCodecKey { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            event, before,
+            "the row is byte-identical after a failed sweep"
+        );
     }
 
     #[test]
@@ -1008,7 +1247,10 @@ mod tests {
 
         assert_eq!(outcome.fields_reencrypted, PAYLOAD_FIELD_KEYS.len());
         for key in PAYLOAD_FIELD_KEYS {
-            assert_eq!(event["data"][key][CODEC_ENVELOPE_KID_KEY], "k2", "field {key}");
+            assert_eq!(
+                event["data"][key][CODEC_ENVELOPE_KID_KEY], "k2",
+                "field {key}"
+            );
         }
     }
 
@@ -1016,13 +1258,16 @@ mod tests {
     fn census_counts_key_ids_referenced_by_an_event() {
         let codecs = rotated_registry();
         let mut event = event_under(&codecs, "k1", json!({"user": "alice"}));
-        event["data"]["output"] = event_under(&codecs, "k2", json!({"done": true}))["data"]["input"]
-            .clone();
+        event["data"]["output"] =
+            event_under(&codecs, "k2", json!({"done": true}))["data"]["input"].clone();
         event["data"]["details"] = crate::erase::erasure_tombstone();
 
         let ids = event_key_ids(&event);
 
-        assert_eq!(ids, ["k1".to_string(), "k2".to_string()].into_iter().collect());
+        assert_eq!(
+            ids,
+            ["k1".to_string(), "k2".to_string()].into_iter().collect()
+        );
     }
 
     #[test]

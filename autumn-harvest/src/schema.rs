@@ -989,13 +989,16 @@ diesel::table! {
     /// Durable resume cursor for the lazy payload-codec re-encryption sweep
     /// (issue #948).
     ///
-    /// Keyed on `(shard_id, active_key_id)` rather than `shard_id` alone so a
-    /// key flip implicitly starts a fresh pass and a rollback resumes its own.
-    harvest_codec_rotation_cursor (shard_id, active_key_id) {
+    /// One row per shard, with the target key stored as a COLUMN: any change of
+    /// active key — including a rollback to a key that already completed a pass
+    /// — must restart the scan, which keying the row on the key id could not
+    /// express.
+    harvest_codec_rotation_cursor (shard_id) {
         shard_id -> Int4,
         active_key_id -> Text,
         last_event_id -> Int8,
         rows_reencrypted -> Int8,
+        unresolved_rows -> Int8,
         completed_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
     }

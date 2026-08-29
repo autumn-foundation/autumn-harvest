@@ -3,11 +3,13 @@
 //! ## Design
 //!
 //! This module implements **sanctioned in-place mutation exception #2** of
-//! `harvest_events.event_data` rows. The three sanctioned exceptions are
-//! heartbeat checkpoints (`queue::record_heartbeat`), this, and codec key
-//! re-encryption (`crate::codec_rotation`, issue #948); they are enumerated
-//! with their scope guarantees in the "Engine Invariants" section of
-//! `CLAUDE.md`. Payload-bearing fields inside each event's `data` object are
+//! `harvest_events.event_data` rows. There are exactly two such writers: this
+//! one and codec key re-encryption (`crate::codec_rotation`, issue #948,
+//! exception #3); both are enumerated with their scope guarantees in the
+//! "Engine Invariants" section of `CLAUDE.md`. (The heartbeat checkpoint this
+//! comment used to name alongside them mutates `harvest_task_queue`, not the
+//! event log — see that section.) Payload-bearing fields inside each event's
+//! `data` object are
 //! replaced with a tombstone marker while the append-only event log structure —
 //! variant `type`, event IDs, timestamps, sequence — is left completely intact.
 //!
