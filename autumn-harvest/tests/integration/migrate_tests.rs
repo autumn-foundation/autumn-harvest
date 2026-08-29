@@ -188,6 +188,16 @@ async fn a_failing_migration_rolls_back_with_its_ledger_row() {
         vec!["29990101000000_harvest_migrate_probe".to_string()],
         "the partial report must name the migration that committed"
     );
+    let failed = error
+        .report
+        .failed
+        .as_ref()
+        .expect("the report must name the failure");
+    assert_eq!(failed.name, "29990102000000_harvest_migrate_probe_bad");
+    assert!(
+        failed.rolled_back,
+        "a transactional failure leaves the database as it was"
+    );
 
     // And the run is resumable: fixing the migration and re-running applies
     // only what is still pending.
@@ -305,6 +315,18 @@ async fn a_failing_nontransactional_migration_is_not_recorded() {
             .await
             .contains(&"29990101000000".to_string()),
         "a migration that failed must not be recorded"
+    );
+
+    // Structurally, not just in the message: nothing rolled back, so the report
+    // must say a change may stand that it cannot list.
+    let failed = error
+        .report
+        .failed
+        .expect("the report must name the failure");
+    assert_eq!(failed.name, "29990101000000_harvest_migrate_probe_broken");
+    assert!(
+        !failed.rolled_back,
+        "a run_in_transaction = false failure is not a rollback"
     );
 }
 

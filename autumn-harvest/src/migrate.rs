@@ -490,10 +490,30 @@ impl From<HarvestError> for PartialMigration {
                 already_applied: Vec::new(),
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
+                failed: None,
             },
             error,
         }
     }
+}
+
+/// The migration a run stopped on.
+///
+/// Named separately from the error message so a report — JSON included — says
+/// *structurally* what the database may now contain. That matters most for a
+/// `run_in_transaction = false` migration: nothing rolls it back, so an early
+/// statement can stand while a later one fails, and the run has applied
+/// something it cannot list.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct FailedMigration {
+    /// The migration that failed.
+    pub name: String,
+    /// `true` when its transaction rolled the whole body back, so the database
+    /// is exactly as it was before this migration started. `false` when the
+    /// migration declared `run_in_transaction = false`: any statement that
+    /// already succeeded still stands, and a re-run replays the whole body —
+    /// which is why such migrations must be written idempotently.
+    pub rolled_back: bool,
 }
 
 /// What a migration run actually did against one database.
@@ -509,6 +529,9 @@ pub struct MigrationReport {
     /// Ledger versions no supplied set accounts for. See
     /// [`MigrationPlan::unrecognized`].
     pub unrecognized: Vec<String>,
+    /// The migration the run stopped on, when it stopped. `None` on a run that
+    /// finished.
+    pub failed: Option<FailedMigration>,
 }
 
 /// Connect to `database_url`.
@@ -613,6 +636,7 @@ pub async fn apply_to_connection(
         already_applied: plan.already_applied,
         applied_concurrently: Vec::new(),
         unrecognized: plan.unrecognized,
+        failed: None,
     };
 
     for script in &plan.pending {
@@ -635,6 +659,13 @@ pub async fn apply_to_connection(
                 ));
                 // The migrations that DID apply are committed, and are the
                 // caller's to report -- they never travel in the message alone.
+                // The failing migration is named structurally too: when it is
+                // non-transactional, "nothing applied" and "part of it applied
+                // and nobody can say which" look identical without this.
+                report.failed = Some(FailedMigration {
+                    name: script.name.clone(),
+                    rolled_back: script.run_in_transaction,
+                });
                 return Err(PartialMigration {
                     report,
                     error: failure,

@@ -4738,6 +4738,20 @@ pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String 
                 report.unrecognized.len()
             );
         }
+        if let Some(failed) = &report.failed {
+            let _ = writeln!(out, "    FAILED: {}", failed.name);
+            let _ = writeln!(
+                out,
+                "      {}",
+                if failed.rolled_back {
+                    "rolled back -- this database is as it was before that migration"
+                } else {
+                    "NOT rolled back (run_in_transaction = false) -- any statement \
+                     of it that already succeeded still stands; re-run once the \
+                     cause is fixed, it is written to be idempotent"
+                }
+            );
+        }
     }
     let applied: usize = targets.iter().map(|(_, r)| r.applied.len()).sum();
     let _ = write!(
@@ -4790,6 +4804,14 @@ pub fn migrate_run_json(targets: &[(String, MigrationReport)]) -> Result<String,
                 "already_applied": report.already_applied,
                 "applied_concurrently": report.applied_concurrently,
                 "unrecognized": report.unrecognized,
+                // `null` on a target that finished. On one that did not, the
+                // migration it stopped on and whether that rolled back -- the
+                // difference between "nothing changed" and "something changed
+                // and the run cannot say what".
+                "failed": report.failed.as_ref().map(|failed| json!({
+                    "name": failed.name,
+                    "rolled_back": failed.rolled_back,
+                })),
             }))
             .collect::<Vec<_>>(),
         "applied_total": targets.iter().map(|(_, r)| r.applied.len()).sum::<usize>(),
@@ -4932,14 +4954,12 @@ pub async fn run_migrate_run(
             Ok(report) => targets.push((redacted, report)),
             Err(partial) => {
                 let failure = migrate_error(url, &redacted, &partial.error);
-                // The failing target's own applied migrations are committed --
-                // each one commits on its own -- so it joins the report rather
-                // than being reduced to a count inside the error message.
-                if !partial.report.applied.is_empty()
-                    || !partial.report.applied_concurrently.is_empty()
-                {
-                    targets.push((redacted, partial.report));
-                }
+                // The failing target always joins the report, even with nothing
+                // applied: a `run_in_transaction = false` migration that failed
+                // part-way leaves changes it cannot list, and "no report at
+                // all" and "nothing happened" must not look the same to the
+                // tooling reading this.
+                targets.push((redacted, partial.report));
                 return report_and_fail(&targets, format, failure);
             }
         }
@@ -15812,7 +15832,9 @@ mod migrate_cli_tests {
     //! (issue #1240). No database: the DB half is covered by
     //! `autumn-harvest/tests/integration/migrate_tests.rs`.
     use super::*;
-    use autumn_harvest::migrate::{MigrationPlan, MigrationReport, MigrationScript};
+    use autumn_harvest::migrate::{
+        FailedMigration, MigrationPlan, MigrationReport, MigrationScript,
+    };
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
@@ -16079,6 +16101,7 @@ mod migrate_cli_tests {
                 already_applied: vec!["20260101000000_a".to_string()],
                 applied_concurrently: vec!["20260802000000_y".to_string()],
                 unrecognized: Vec::new(),
+                failed: None,
             },
         )];
 
@@ -16102,6 +16125,88 @@ mod migrate_cli_tests {
             value["targets"][0]["applied_concurrently"][0],
             "20260802000000_y"
         );
+    }
+
+    #[test]
+    fn a_failing_target_is_reported_even_when_nothing_applied() {
+        // The case that matters: a `run_in_transaction = false` migration that
+        // failed part-way left changes it cannot list. An empty report for that
+        // target would read as "nothing happened".
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            MigrationReport {
+                applied: Vec::new(),
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: Some(FailedMigration {
+                    name: "20260801000000_concurrent_index".to_string(),
+                    rolled_back: false,
+                }),
+            },
+        )];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            text.contains("FAILED: 20260801000000_concurrent_index"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT rolled back"),
+            "an unrolled-back failure must say so: {text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(
+            value["targets"][0]["failed"]["name"],
+            "20260801000000_concurrent_index"
+        );
+        assert_eq!(value["targets"][0]["failed"]["rolled_back"], false);
+    }
+
+    #[test]
+    fn a_transactional_failure_says_the_database_is_unchanged() {
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: Some(FailedMigration {
+                    name: "20260802000000_y".to_string(),
+                    rolled_back: true,
+                }),
+            },
+        )];
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("rolled back"), "{text}");
+        assert!(!text.contains("NOT rolled back"), "{text}");
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["failed"]["rolled_back"], true);
+        // What DID apply is still listed beside the failure.
+        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
+    }
+
+    #[test]
+    fn a_finished_target_reports_no_failure() {
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+            },
+        )];
+        assert!(!format_migrate_run_text(&targets).contains("FAILED"));
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert!(value["targets"][0]["failed"].is_null());
     }
 
     // ── the deploy gate ─────────────────────────────────────────────────────
