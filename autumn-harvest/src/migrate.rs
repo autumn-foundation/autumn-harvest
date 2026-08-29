@@ -125,11 +125,15 @@ impl MigrationScript {
                 "migration `{name}`: no version prefix (expected `<version>_<description>`)"
             )));
         }
-        if version.len() > MAX_VERSION_LEN {
+        // Characters, not bytes: Postgres counts `VARCHAR(50)` in characters,
+        // so a 26-character prefix of two-byte characters is 52 bytes and
+        // records perfectly well. Measuring in bytes would refuse a migration
+        // Diesel accepts.
+        let version_chars = version.chars().count();
+        if version_chars > MAX_VERSION_LEN {
             return Err(HarvestError::Config(format!(
-                "migration `{name}`: version `{version}` is {} characters, but \
-                 {MIGRATION_LEDGER}.version is VARCHAR({MAX_VERSION_LEN})",
-                version.len()
+                "migration `{name}`: version `{version}` is {version_chars} characters, but \
+                 {MIGRATION_LEDGER}.version is VARCHAR({MAX_VERSION_LEN})"
             )));
         }
         Ok(Self {
@@ -855,6 +859,18 @@ mod tests {
             error.to_string().contains("no version prefix"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn a_multibyte_version_is_measured_in_characters_not_bytes() {
+        // `VARCHAR(50)` counts characters. A 26-character prefix of two-byte
+        // characters is 52 bytes and records fine; refusing it would reject a
+        // migration `diesel migration run` applies.
+        let version = "é".repeat(26);
+        assert_eq!(version.len(), 52);
+        let script = MigrationScript::new(format!("{version}_harvest_x"), "SELECT 1;")
+            .expect("26 characters is inside VARCHAR(50)");
+        assert_eq!(script.version.chars().count(), 26);
     }
 
     #[test]

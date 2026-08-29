@@ -4635,6 +4635,14 @@ fn scan_keyword_dsn(
             i += 1;
         }
         let key = &dsn[key_start..i];
+        // A libpq keyword is `[A-Za-z0-9_]+`. Anything else means this is not
+        // keyword form at all -- a malformed URL
+        // (`postgres://alice:hunter2@db:notaport/db?sslmode=require`) otherwise
+        // scans as one giant "keyword" whose value needs no redaction, and the
+        // whole DSN, password included, comes back as if it had been examined.
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
         let spacing_start = i;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -4719,13 +4727,31 @@ fn scan_keyword_dsn(
 pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
     const UNPARSEABLE: &str = "<unparseable dsn>";
 
-    let redacted = redact_dsn(dsn);
-    if redacted != UNPARSEABLE {
-        return redacted;
+    // Decide the FORM first, then redact with the reader for that form. The
+    // other order leaks: `redact_dsn` parses with a general URL parser, and
+    // `alice:hunter2@db.internal/harvest` is a syntactically fine URL whose
+    // scheme is `alice` and whose password is nowhere the parser looks — so it
+    // came back unredacted and went into the log. libpq's own rule is the
+    // scheme prefix, so use exactly that.
+    let trimmed = dsn.trim_start();
+    let is_url_form = ["postgres://", "postgresql://"].iter().any(|scheme| {
+        trimmed
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    });
+
+    if is_url_form {
+        let redacted = redact_dsn(dsn);
+        // A URL is a URL, malformed or not: if the URL reader cannot read it,
+        // the keyword scanner has no business trying. The ordinal is the only
+        // safe answer left.
+        return if redacted == UNPARSEABLE {
+            format!("{UNPARSEABLE} #{ordinal}")
+        } else {
+            redacted
+        };
     }
-    // Not a URL: try the keyword form before giving up, so `host=shard-a
-    // dbname=harvest` reports as itself rather than as a placeholder shared
-    // with every other shard.
+
     redact_keyword_dsn(dsn).unwrap_or_else(|| format!("{UNPARSEABLE} #{ordinal}"))
 }
 
@@ -16499,6 +16525,38 @@ mod migrate_cli_tests {
         let label = migrate_target_label("postgres://u:hunter2@db.internal/harvest", 1);
         assert!(!label.contains("hunter2"), "{label}");
         assert!(label.contains("db.internal"), "{label}");
+    }
+
+    #[test]
+    fn a_malformed_url_never_reaches_the_keyword_scanner() {
+        // `redact_dsn` cannot parse this (`notaport`), and the keyword scanner
+        // would take the whole prefix for one keyword whose value needs no
+        // redaction -- handing the password straight to the deploy log.
+        let label = migrate_target_label(
+            "postgres://alice:hunter2@db:notaport/harvest?sslmode=require",
+            1,
+        );
+        assert!(
+            !label.contains("hunter2"),
+            "credential leaked into: {label}"
+        );
+        assert_eq!(label, "<unparseable dsn> #1");
+    }
+
+    #[test]
+    fn a_credential_bearing_non_url_is_not_passed_through_either() {
+        // No scheme, so not caught by the URL check -- caught instead by the
+        // scanner refusing a "keyword" that is not `[A-Za-z0-9_]+`.
+        for dsn in [
+            "alice:hunter2@db.internal/harvest?sslmode=require",
+            "postgres://alice:hunter2@db/harvest",
+        ] {
+            let label = migrate_target_label(dsn, 3);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label}"
+            );
+        }
     }
 
     #[test]
