@@ -665,9 +665,14 @@ pub enum CliError {
     /// The report itself is already printed; this only signals the exit code.
     /// Exit code is `1` — "determined: not migrated", as distinct from the
     /// exit-`2` gates that mean "could not determine".
+    // The remedy names the flags on purpose: this gate reports on exactly the
+    // sets it was handed, so a bare `harvest migrate run` after a `--check`
+    // that carried `--include-dir` would apply the embedded set only, exit 0,
+    // and leave the very migration that failed the gate unapplied.
     #[error(
         "migrate status: {pending} pending migration(s) across {databases} database(s) — \
-         run `harvest migrate run` before rolling replicas"
+         run `harvest migrate run` with the SAME --database-url and --include-dir \
+         flags you passed here, before rolling replicas"
     )]
     MigrationsPending {
         /// Total pending migrations across every inspected database.
@@ -16453,12 +16458,14 @@ mod migrate_cli_tests {
         }
         // Exit 1 = "determined: not migrated", distinct from the exit-2
         // "could not determine" gates.
-        assert_eq!(
-            migrate_pending_gate(&targets)
-                .expect("pending migrations must gate")
-                .exit_code(),
-            1
-        );
+        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
+        assert_eq!(error.exit_code(), 1);
+        // The remedy must carry the flags forward: a bare `run` after a
+        // `--check` with `--include-dir` applies fewer sets than the gate
+        // examined, exits 0, and leaves the gating migration unapplied.
+        let message = error.to_string();
+        assert!(message.contains("--include-dir"), "{message}");
+        assert!(message.contains("--database-url"), "{message}");
     }
 
     #[test]
