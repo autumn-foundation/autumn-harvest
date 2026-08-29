@@ -779,6 +779,86 @@ pub const fn claim_task_query() -> &'static str {
         SELECT * FROM claimed"
 }
 
+/// Resolve the cross-region DR fence binding for a claim (issue #954).
+///
+/// `Some((shard_id, generation))` when this process pinned a generation for the
+/// shard this connection serves; `None` — the overwhelmingly common case —
+/// when DR fencing was never enabled, which is what keeps the unfenced claim
+/// path byte-for-byte unchanged.
+fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
+    use crate::replication::FenceRegistry;
+
+    // Cheap relaxed load; short-circuits before any lock for every deployment
+    // that has not opted in.
+    if !FenceRegistry::is_enabled() {
+        return None;
+    }
+    let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+    let generation = FenceRegistry::expected(shard)?;
+    let resolved = FenceRegistry::resolve_shard(shard)?;
+    Some((resolved.as_i32(), generation.as_i64()))
+}
+
+/// The claim query with the cross-region DR write-authority fence spliced in
+/// (issue #954).
+///
+/// Identical to [`claim_task_query`] plus one `fence` CTE cross-joined into
+/// `candidate`, so a worker whose pinned generation no longer matches the
+/// database selects **zero** candidates and cannot claim work. Binds
+/// `$7` shard id and `$8` pinned generation on top of the base query's
+/// `$1..$6`.
+///
+/// # Why a splice rather than a second literal
+///
+/// The base query is ~130 lines of load-bearing SQL whose every gate is pinned
+/// by a test. Copying it would fork those guarantees the first time either
+/// copy is edited. Splicing derives the fenced form from the base, so the
+/// pause gates, build routing, sticky/session pins and ordering are the *same*
+/// text by construction — asserted by
+/// `fenced_claim_query_preserves_every_unfenced_gate`.
+///
+/// # Why `MATERIALIZED` and `FOR SHARE`
+///
+/// `MATERIALIZED` makes the probe run exactly once per claim rather than being
+/// inlined into the candidate scan's per-row predicate — one primary-key probe,
+/// on a one-row-per-shard table.
+///
+/// `FOR SHARE` is the commit-order barrier. [`crate::replication::bump_generation`]
+/// takes the same row exclusively, so it cannot commit while a claim holds it,
+/// and a claim that starts after the bump commits reads the new generation and
+/// matches nothing. Without it a bump could land between this statement's
+/// snapshot and its commit, and a fenced worker would claim one last task —
+/// which, for an event-sourced engine, is the whole failure mode. Only one row
+/// is ever locked and the bump touches nothing else, so no lock-order cycle is
+/// possible.
+#[must_use]
+pub fn claim_task_query_fenced() -> &'static str {
+    static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        const FENCE_CTE: &str = "WITH fence AS MATERIALIZED ( \
+             SELECT 1 AS ok FROM harvest_shard_generation \
+             WHERE shard_id = $7 AND generation = $8 FOR SHARE \
+         ), ";
+        let base = claim_task_query();
+        let base = base
+            .strip_prefix("WITH ")
+            .expect("claim query starts with WITH");
+        let spliced = format!("{FENCE_CTE}{base}");
+
+        // One anchor, one substitution: `CROSS JOIN worker_info ` appears
+        // exactly once, in `candidate`'s FROM list. Asserting the count before
+        // replacing turns a future edit that duplicates or renames the anchor
+        // into a loud panic at first use instead of a silently unfenced claim.
+        let anchor = "CROSS JOIN worker_info ";
+        assert_eq!(
+            spliced.matches(anchor).count(),
+            1,
+            "claim query fence anchor must appear exactly once"
+        );
+        spliced.replace(anchor, "CROSS JOIN worker_info CROSS JOIN fence ")
+    });
+    &FENCED
+}
+
 /// Atomically claim the highest-priority pending task from the given queues.
 ///
 /// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
@@ -803,7 +883,6 @@ pub const fn claim_task_query() -> &'static str {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines)]
 pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -812,6 +891,48 @@ pub async fn claim_task(
     priority_aging_secs: Option<u32>,
     circuit_breaker_activities: &[String],
     ineligible_activities: &[String],
+) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_on_shard(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task`], told which shard this connection belongs to so the
+/// cross-region DR write-authority fence can be applied (issue #954).
+///
+/// `shard` is the shard the caller's pool serves. `None` means "unknown" and
+/// resolves through [`crate::replication::FenceRegistry`]'s default shard,
+/// which is what a legacy single-pool worker and every non-worker caller pass.
+///
+/// When this process pinned no generation for the resolved shard — every
+/// deployment that has not opted into DR fencing — this issues the byte-for-
+/// byte unchanged pre-#954 statement. When it did, the fenced form applies, and
+/// a worker pinned to a superseded epoch selects zero candidates: it cannot
+/// claim, and the rows it did not claim are untouched (no `attempt` burned, no
+/// state change), so a worker in the region that actually holds authority
+/// picks them up.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn claim_task_on_shard(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -945,7 +1066,17 @@ pub async fn claim_task(
     let claimed: Option<TaskQueueItem> = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<TaskQueueItem>> {
-                let result: Vec<TaskQueueItem> = diesel::sql_query(claim_task_query())
+                // Cross-region DR fence (issue #954). Resolved once, outside
+                // the query, so the unfenced path issues the identical
+                // statement it always did — same text, same plan cache entry.
+                let fence = fence_binding(shard);
+                let query = if fence.is_some() {
+                    claim_task_query_fenced()
+                } else {
+                    claim_task_query()
+                };
+                let mut stmt = diesel::sql_query(query)
+                    .into_boxed::<diesel::pg::Pg>()
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                     .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -957,7 +1088,13 @@ pub async fn claim_task(
                     )
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
                         ineligible_activities,
-                    )
+                    );
+                if let Some((fence_shard, generation)) = fence {
+                    stmt = stmt
+                        .bind::<diesel::sql_types::Integer, _>(fence_shard)
+                        .bind::<diesel::sql_types::BigInt, _>(generation);
+                }
+                let result: Vec<TaskQueueItem> = stmt
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -4701,6 +4838,79 @@ mod tests {
     /// The `$6` capability-miss gate already defends against this with a
     /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
     /// pins the same defence onto the pause gate so it can never be dropped.
+
+    // ── Cross-region DR fencing (issue #954) ───────────────────────────────
+
+    /// The unfenced query is the pre-#954 string, byte for byte.
+    ///
+    /// The 99% of deployments that never enable DR must not pay for it, and
+    /// must not have their query plan cache invalidated by it. This pins the
+    /// "opt-in costs nothing" claim to something CI can check rather than to
+    /// a promise in a doc comment.
+    #[test]
+    fn unfenced_claim_query_never_mentions_the_generation_table() {
+        assert!(
+            !claim_task_query().contains("harvest_shard_generation"),
+            "fencing must be spliced into the FENCED query only"
+        );
+        assert!(
+            !claim_task_query().contains("$7"),
+            "the unfenced query still binds exactly $1..$6"
+        );
+    }
+
+    /// The fenced query differs from the unfenced one by exactly the splice.
+    #[test]
+    fn fenced_claim_query_is_the_base_query_plus_one_fence_cte() {
+        let fenced = claim_task_query_fenced();
+        assert_eq!(
+            fenced.matches("harvest_shard_generation").count(),
+            1,
+            "exactly one generation probe"
+        );
+        assert!(
+            fenced.contains("shard_id = $7"),
+            "shard id binds at $7: {fenced}"
+        );
+        assert!(
+            fenced.contains("generation = $8"),
+            "pinned generation binds at $8: {fenced}"
+        );
+        assert_eq!(
+            fenced.matches("CROSS JOIN fence").count(),
+            1,
+            "the candidate CTE joins the fence exactly once"
+        );
+        // FOR SHARE is the commit-order barrier, not decoration: without it a
+        // fence bump could commit between this statement's snapshot and its
+        // commit, and the claim would slip through.
+        assert!(
+            fenced.contains("FOR SHARE"),
+            "the fence probe must take the row FOR SHARE"
+        );
+    }
+
+    /// Undoing the splice must leave the original query untouched — i.e. the
+    /// two strings really are the same query, so every other guarantee proved
+    /// about `claim_task_query()` (pause gates, build routing, ordering)
+    /// transfers to the fenced form for free.
+    #[test]
+    fn fenced_claim_query_preserves_every_unfenced_gate() {
+        let base = claim_task_query();
+        let fenced = claim_task_query_fenced();
+        for gate in [
+            "required_build_id IS NULL",
+            "paused_queues",
+            "paused_activities",
+            "FOR UPDATE SKIP LOCKED",
+            "sticky_worker_id",
+            "session_id IS NULL",
+        ] {
+            assert!(base.contains(gate), "precondition: base has {gate}");
+            assert!(fenced.contains(gate), "fenced form dropped {gate}");
+        }
+    }
+
     #[test]
     fn claim_query_activity_pause_gate_never_holds_workflow_tasks() {
         let sql = claim_task_query();

@@ -1,0 +1,1056 @@
+//! Cross-region disaster recovery: write-authority fencing and replication-lag
+//! measurement (issue #954).
+//!
+//! Harvest does **not** ship replication. Stock Postgres logical (or physical)
+//! replication moves the bytes to a standby region; this module supplies the
+//! two things stock Postgres cannot: a way to **revoke a region's write
+//! authority**, and a **measured RPO**.
+//!
+//! # The fence
+//!
+//! Each shard's database carries one `harvest_shard_generation` row: a
+//! monotonic epoch for "who is allowed to write here". A worker reads the
+//! generation once, at startup, and pins it for its lifetime
+//! ([`FenceRegistry`]). Two structural checks then use that pinned value:
+//!
+//! * **Claim gate** — [`crate::queue::claim_task`] cross-joins the generation
+//!   row into its candidate CTE. A worker whose pinned generation no longer
+//!   matches the database selects zero candidates: it cannot claim work at
+//!   all. No extra round trip; the check rides the statement that was already
+//!   being issued.
+//! * **Persist assert** — [`assert_fence`] takes the generation row `FOR
+//!   SHARE` at the top of a persist. `FOR SHARE` is the load-bearing detail:
+//!   the fence bump takes the same row exclusively, so it cannot commit while
+//!   any in-flight persist holds it, and any persist that begins after it
+//!   commits observes the new generation and fails. That is a commit-order
+//!   barrier, not a best-effort read — the same technique
+//!   [`crate::queue::claim_task`] already uses for the queue-pause hold.
+//!
+//! Promoting a standby therefore looks like: bump the generation on the new
+//! primary, and every worker still pinned to the old one is structurally
+//! unable to claim or append — it self-fences loudly with
+//! [`crate::error::HarvestError::ShardFenced`] rather than forking a history.
+//!
+//! # What this does NOT do — read this before relying on it
+//!
+//! Fencing is a property of **one database**. It cannot stop a worker in a
+//! partitioned old region from writing to that region's *own*, still-running
+//! Postgres: nothing on the promoted primary can reach it. The fence bites at
+//! exactly two moments, which are the two that decide whether a history forks:
+//!
+//! 1. When a surviving old-region worker reconnects **to the promoted
+//!    primary** (a DSN flip, a DNS failover, a restart) it is rejected.
+//! 2. When the old region is re-seeded from the new primary for fail-back, the
+//!    bumped generation arrives with the data, and every worker still pinned to
+//!    the pre-failover epoch is rejected there too.
+//!
+//! Isolating the old primary's database — demote it, cut it off, or take its
+//! role's connections to zero — remains a **mandatory** operator step, not an
+//! optional one. See `docs/cross-region-dr.md` and
+//! `docs/runbooks/cross-region-failover.md`.
+//!
+//! # Opt-in by construction
+//!
+//! A deployment that never registers a generation pays nothing: [`FenceRegistry`]
+//! reports [`FenceRegistry::is_enabled`] `false`, `claim_task` issues the
+//! byte-for-byte unchanged claim SQL, and [`assert_fence`] issues no statement
+//! at all.
+//!
+//! # Measured RPO
+//!
+//! [`query_replication_status`] reads `pg_stat_replication` and
+//! `pg_replication_slots` on the primary and reduces them to the worst-case
+//! numbers an operator needs at failover time. The reduction is deliberately
+//! pessimistic: an empty standby set, or a standby whose `replay_lag` has not
+//! yet been reported, yields `None` ("unknown"), **never** `0.0`. Reporting a
+//! perfect RPO for replication that is dead is the single most dangerous thing
+//! this module could do.
+
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::types::ShardId;
+
+/// A shard's write-authority epoch.
+///
+/// Monotonic and per-shard. `0` is the value a freshly-migrated database
+/// starts at; every [`bump_generation`] increments it by one and the sequence
+/// travels to the standby with the data, so a promoted standby inherits the
+/// epoch its primary had and continues from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShardGeneration(pub i64);
+
+impl ShardGeneration {
+    /// The epoch a freshly-migrated database is seeded at.
+    pub const INITIAL: Self = Self(0);
+
+    /// The raw epoch value.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ShardGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One connected standby, as reported by `pg_stat_replication` on the primary.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct StandbyLag {
+    /// `pg_stat_replication.state` — `streaming`, `catchup`, `startup`, ...
+    pub state: String,
+    /// `pg_stat_replication.replay_lag` in seconds.
+    ///
+    /// `None` when Postgres has not yet computed one (no feedback round-trip
+    /// has completed). Never coerced to `0.0`: see the module docs.
+    pub replay_lag_seconds: Option<f64>,
+    /// WAL bytes between `pg_current_wal_lsn()` and this standby's `replay_lsn`.
+    pub lag_bytes: Option<i64>,
+}
+
+/// One replication slot, as reported by `pg_replication_slots` on the primary.
+///
+/// Slots outlive their walsender: a disabled subscription or a dead standby
+/// leaves an inactive slot pinning WAL. The time lag is then unknowable from
+/// the primary, but the byte backlog is not — which is why this is tracked
+/// separately from [`StandbyLag`] rather than folded into it.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SlotLag {
+    /// `pg_replication_slots.slot_name`.
+    pub slot_name: String,
+    /// Whether a walsender currently holds the slot.
+    pub active: bool,
+    /// WAL bytes between `pg_current_wal_lsn()` and the slot's
+    /// `confirmed_flush_lsn` (logical) or `restart_lsn` (physical).
+    pub lag_bytes: Option<i64>,
+}
+
+/// What the primary can currently say about replication for one shard.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ReplicationStatus {
+    /// The replication views could not be read — most often because the
+    /// connecting role lacks `pg_monitor`.
+    ///
+    /// Deliberately a *status*, not an error: a missing `GRANT` must degrade
+    /// the RPO signal, never take the sampler down with it.
+    Unavailable {
+        /// Why the read failed, for logs and the admin surface.
+        reason: String,
+    },
+    /// The views were read. Either collection may still be empty — an empty
+    /// `standbys` means replication is **down**, not healthy.
+    Observed {
+        /// Rows from `pg_stat_replication`.
+        standbys: Vec<StandbyLag>,
+        /// Rows from `pg_replication_slots`.
+        slots: Vec<SlotLag>,
+        /// The measured RPO in seconds, from the watermark trail: the age of
+        /// the newest `harvest_replication_heartbeat` row whose `beat_lsn` the
+        /// slowest standby has already consumed.
+        ///
+        /// `None` when no watermark has been consumed yet, when no slot exists,
+        /// or when the sampler has not yet written a beat. Its resolution is
+        /// bounded below by the beat interval: a healthy deployment reports
+        /// somewhere between zero and one interval, never a hard zero.
+        heartbeat_lag_seconds: Option<f64>,
+    },
+}
+
+impl ReplicationStatus {
+    /// The measured RPO in seconds — how much acknowledged work failing over
+    /// right now would lose.
+    ///
+    /// Prefers the watermark trail over `pg_stat_replication.replay_lag`, and
+    /// that precedence is the whole point rather than a tie-break. `replay_lag`
+    /// is derived from the subscriber's reply messages, so a subscriber whose
+    /// apply worker is **stuck** — precisely the incident an RPO number exists
+    /// for — stops replying and leaves `replay_lag` NULL or frozen while real
+    /// data loss accumulates. This was measured, not assumed: blocking a
+    /// subscriber's apply worker grew the byte backlog monotonically while
+    /// `replay_lag` never left NULL.
+    ///
+    /// `None` means unknown, and unknown is not zero. See
+    /// [`Self::max_replay_lag_seconds`].
+    #[must_use]
+    pub fn rpo_seconds(&self) -> Option<f64> {
+        match self {
+            Self::Unavailable { .. } => None,
+            Self::Observed { heartbeat_lag_seconds, .. } => {
+                heartbeat_lag_seconds.or_else(|| self.max_replay_lag_seconds())
+            }
+        }
+    }
+
+    /// Worst-case replay lag across every connected standby, in seconds, as
+    /// Postgres itself reports it.
+    ///
+    /// Exposed alongside [`Self::rpo_seconds`] rather than hidden behind it so
+    /// an operator can see the two disagree — a large watermark RPO next to a
+    /// NULL `replay_lag` is the signature of a stuck apply worker.
+    ///
+    /// `None` means *unknown*, and unknown is the honest answer in three
+    /// distinct situations that all look like "no number": the views were
+    /// unreadable, no standby is connected at all, or no connected standby has
+    /// reported a `replay_lag` yet. Each is a reason to page, and none of them
+    /// is `0.0`.
+    #[must_use]
+    pub fn max_replay_lag_seconds(&self) -> Option<f64> {
+        let Self::Observed { standbys, .. } = self else {
+            return None;
+        };
+        standbys
+            .iter()
+            .filter_map(|s| s.replay_lag_seconds)
+            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+    }
+
+    /// Worst-case WAL backlog in bytes across standbys **and** slots.
+    ///
+    /// Slots are included precisely because they survive the walsender: this
+    /// stays a real number through the disconnection that makes
+    /// [`Self::max_replay_lag_seconds`] unknowable.
+    #[must_use]
+    pub fn max_lag_bytes(&self) -> Option<i64> {
+        let Self::Observed { standbys, slots, .. } = self else {
+            return None;
+        };
+        standbys
+            .iter()
+            .filter_map(|s| s.lag_bytes)
+            .chain(slots.iter().filter_map(|s| s.lag_bytes))
+            .max()
+    }
+
+    /// How many standbys currently have a walsender on the primary.
+    ///
+    /// `0` is the "replication is down" signal the starter alert keys on —
+    /// deliberately *not* expressed as a lag threshold, because a dead standby
+    /// produces no lag reading to threshold.
+    #[must_use]
+    pub fn connected_standbys(&self) -> usize {
+        match self {
+            Self::Unavailable { .. } => 0,
+            Self::Observed { standbys, .. } => standbys.len(),
+        }
+    }
+
+    /// Inactive slots — WAL retained for a standby that is not consuming it.
+    #[must_use]
+    pub fn inactive_slots(&self) -> usize {
+        match self {
+            Self::Unavailable { .. } => 0,
+            Self::Observed { slots, .. } => slots.iter().filter(|s| !s.active).count(),
+        }
+    }
+}
+
+// ── Fence registry ─────────────────────────────────────────────────────────
+
+/// The generations this process pinned at startup, one per shard.
+static PINNED: RwLock<Option<Pinned>> = RwLock::new(None);
+
+/// Fast, lock-free "is fencing on at all" gate.
+///
+/// Every persist consults this. Keeping it an atomic means a deployment that
+/// never enables DR pays one relaxed load per persist rather than an `RwLock`
+/// acquisition.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Default)]
+struct Pinned {
+    generations: BTreeMap<i32, ShardGeneration>,
+    default_shard: Option<ShardId>,
+}
+
+/// Process-global record of the write-authority epoch this process pinned for
+/// each shard.
+///
+/// Populated once by the worker at startup (before its first poll) and never
+/// mutated afterwards. **A worker must never re-read and adopt a newer
+/// generation**: adopting is exactly the split-brain the epoch exists to
+/// prevent, so a bump is only ever resolved by restarting the fleet. That
+/// asymmetry is the whole mechanism, and it is why this is a pin rather than
+/// a cache.
+///
+/// Global rather than threaded through call sites because the persist assert
+/// has to reach 100+ `store::append_events*` call sites; the same shape
+/// [`crate::chaos`] uses for its injection state.
+pub struct FenceRegistry;
+
+impl FenceRegistry {
+    /// Pin `shard` at `generation` for the lifetime of this process.
+    pub fn register(shard: ShardId, generation: ShardGeneration) {
+        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        pinned.generations.insert(shard.as_i32(), generation);
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    /// Set the shard that [`ShardId::UNENCODED`] execution ids resolve to.
+    ///
+    /// Execution ids minted before sharding carry no shard bits. They still
+    /// live in a real database and must still be fenced, so they resolve to
+    /// the pool's default shard exactly as [`crate::shard::ShardedDbPool`]
+    /// routes them.
+    pub fn set_default_shard(shard: ShardId) {
+        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert_with(Pinned::default).default_shard = Some(shard);
+    }
+
+    /// The generation pinned for `shard`, or `None` when this shard is not
+    /// fenced.
+    #[must_use]
+    pub fn expected(shard: ShardId) -> Option<ShardGeneration> {
+        if !Self::is_enabled() {
+            return None;
+        }
+        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.as_ref()?;
+        let key = if shard.is_unencoded() {
+            pinned.default_shard?.as_i32()
+        } else {
+            shard.as_i32()
+        };
+        pinned.generations.get(&key).copied()
+    }
+
+    /// The shard whose fencing row backs `shard`, resolving
+    /// [`ShardId::UNENCODED`] through the default shard.
+    #[must_use]
+    pub fn resolve_shard(shard: ShardId) -> Option<ShardId> {
+        if !shard.is_unencoded() {
+            return Some(shard);
+        }
+        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref()?.default_shard
+    }
+
+    /// Whether any shard is fenced in this process.
+    ///
+    /// The hot-path gate: `false` means every fencing check compiles down to
+    /// this single relaxed load.
+    #[must_use]
+    pub fn is_enabled() -> bool {
+        ENABLED.load(Ordering::Acquire)
+    }
+
+    /// Every pinned `(shard, generation)` pair, for diagnostics and the admin
+    /// surface.
+    #[must_use]
+    pub fn snapshot() -> Vec<(ShardId, ShardGeneration)> {
+        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().map_or_else(Vec::new, |p| {
+            p.generations
+                .iter()
+                .map(|(k, v)| (ShardId::new(*k), *v))
+                .collect()
+        })
+    }
+
+    /// Drop every pin, returning the process to the unfenced default.
+    ///
+    /// For tests and for a CLI process that pinned a generation only to run one
+    /// command. A *worker* must never call this: see the type docs.
+    pub fn clear() {
+        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
+        ENABLED.store(false, Ordering::Release);
+    }
+}
+
+// ── Database surface (feature = "db") ──────────────────────────────────────
+
+#[cfg(feature = "db")]
+mod db {
+    use diesel::sql_types::{BigInt, Bool, Double, Integer, Nullable, Text};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+    use super::{
+        FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag,
+    };
+    use crate::error::{HarvestResult, database_error};
+    use crate::types::ShardId;
+
+    #[derive(diesel::QueryableByName)]
+    struct GenerationRow {
+        #[diesel(sql_type = BigInt)]
+        generation: i64,
+    }
+
+    /// Read the shard's current write-authority epoch, if the row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn current_generation(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<Option<ShardGeneration>> {
+        let rows: Vec<GenerationRow> = diesel::sql_query(
+            "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(rows.into_iter().next().map(|r| ShardGeneration(r.generation)))
+    }
+
+    /// Provision this shard's fencing row if it is absent, and return the
+    /// epoch now in force.
+    ///
+    /// Idempotent, and idempotent in the direction that matters: `ON CONFLICT
+    /// DO NOTHING` means re-provisioning an already-fenced shard **returns**
+    /// its epoch rather than resetting it to zero. A reset would silently hand
+    /// write authority back to the region that was just fenced off, which is
+    /// the single worst thing this function could do — pinned by
+    /// `a_fresh_database_provisions_generation_zero_and_is_idempotent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn ensure_generation_row(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<ShardGeneration> {
+        let rows: Vec<GenerationRow> = diesel::sql_query(
+            "WITH ins AS ( \
+                 INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
+                 VALUES ($1, 0, 'provisioned') \
+                 ON CONFLICT (shard_id) DO NOTHING \
+                 RETURNING generation \
+             ) \
+             SELECT generation FROM ins \
+             UNION ALL \
+             SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 \
+             LIMIT 1",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        rows.into_iter().next().map(|r| ShardGeneration(r.generation)).ok_or_else(|| {
+            crate::error::HarvestError::Database(format!(
+                "harvest_shard_generation row for shard {} could not be provisioned",
+                shard.as_i32()
+            ))
+        })
+    }
+
+    /// Revoke the old region's write authority: bump this shard's epoch.
+    ///
+    /// **This is the fence.** Run it on the promoted primary. Every worker
+    /// still pinned to the previous epoch — anywhere — becomes structurally
+    /// unable to claim tasks or append events against this database, and stops
+    /// with [`crate::error::HarvestError::ShardFenced`] rather than forking a
+    /// history.
+    ///
+    /// It is also a **fleet-stopping** operation: workers in the *new* region
+    /// pinned to the old epoch are fenced too, which is why the runbook's order
+    /// is fence → promote → verify → **start workers**, and why healthy-region
+    /// use is a mistake to be recovered by restarting the fleet, never by
+    /// bumping again.
+    ///
+    /// The `UPDATE` takes the row's exclusive lock, which is what makes
+    /// [`assert_fence`]'s `FOR SHARE` a commit-order barrier rather than a
+    /// racy read: this cannot commit while an in-flight persist holds the row,
+    /// and every persist that starts afterwards sees the new epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure, or
+    /// [`crate::error::HarvestError::NotFound`] when the shard has no fencing
+    /// row to bump (provision it first — bumping a shard that was never
+    /// provisioned would fence nothing while looking like it worked).
+    pub async fn bump_generation(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        reason: &str,
+        actor: &str,
+    ) -> HarvestResult<ShardGeneration> {
+        let rows: Vec<GenerationRow> = diesel::sql_query(
+            "UPDATE harvest_shard_generation \
+             SET generation = generation + 1, fenced_at = NOW(), \
+                 fenced_reason = $2, fenced_by = $3 \
+             WHERE shard_id = $1 \
+             RETURNING generation",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .bind::<Text, _>(reason)
+        .bind::<Text, _>(actor)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        rows.into_iter().next().map(|r| ShardGeneration(r.generation)).ok_or_else(|| {
+            crate::error::HarvestError::NotFound(format!(
+                "no harvest_shard_generation row for shard {} — provision it before fencing",
+                shard.as_i32()
+            ))
+        })
+    }
+
+    /// Assert that this process still holds write authority for `shard`.
+    ///
+    /// Call at the top of a persist. Costs **nothing** — not even a round trip
+    /// — when this process pinned no generation, which is every deployment that
+    /// has not opted into DR fencing.
+    ///
+    /// When it does run it takes the fencing row `FOR SHARE`. Inside a
+    /// transaction that makes the check a commit-order barrier:
+    /// [`bump_generation`]'s exclusive `UPDATE` cannot commit while this
+    /// transaction holds the row, so a persist that passes this check is
+    /// guaranteed to commit *before* the fence takes effect, and one that
+    /// starts after the fence commits observes the new epoch and fails. Called
+    /// outside a transaction the lock is released at statement end, so the
+    /// check is a very tight read rather than a barrier — the claim gate, not
+    /// this assert, is the structural guarantee for work that has not started.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] when the pinned epoch is not
+    /// the database's current one, **including when the row is absent** (fail
+    /// closed). [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_fence(conn: &mut AsyncPgConnection, shard: ShardId) -> HarvestResult<()> {
+        let Some(pinned) = FenceRegistry::expected(shard) else {
+            return Ok(());
+        };
+        let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+
+        let rows: Vec<GenerationRow> = diesel::sql_query(
+            "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 FOR SHARE",
+        )
+        .bind::<Integer, _>(resolved.as_i32())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        let current = rows.into_iter().next().map(|r| r.generation);
+        if current == Some(pinned.as_i64()) {
+            return Ok(());
+        }
+        Err(crate::error::HarvestError::ShardFenced {
+            shard_id: resolved.as_i32(),
+            pinned: pinned.as_i64(),
+            current,
+        })
+    }
+
+    // ── Replication lag ────────────────────────────────────────────────────
+
+    #[derive(diesel::QueryableByName)]
+    struct StandbyRow {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = Nullable<Double>)]
+        replay_lag_seconds: Option<f64>,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        lag_bytes: Option<i64>,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct SlotRow {
+        #[diesel(sql_type = Text)]
+        slot_name: String,
+        #[diesel(sql_type = Bool)]
+        active: bool,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        lag_bytes: Option<i64>,
+    }
+
+    // ── Scoping a cluster-wide view to one shard ───────────────────────
+    //
+    // `pg_replication_slots` and `pg_stat_replication` are CLUSTER-wide, but a
+    // Harvest shard is a *database*. Every query below therefore carries
+    // `(s.database IS NULL OR s.database = current_database())`. Without it a
+    // cluster hosting two shards reports each shard's lag as the worst of both,
+    // and a cluster hosting anything else at all — another application's slot,
+    // a leftover slot from a decommissioned standby — pegs every shard's RPO to
+    // a stranger.
+    //
+    // Logical slots carry their database. Physical slots have `database IS
+    // NULL` because physical replication ships the whole cluster, so they
+    // genuinely do apply to every shard in it and are deliberately kept.
+
+    /// `pg_stat_replication`, reduced to what an RPO reading needs.
+    ///
+    /// Joined to `pg_replication_slots` on `active_pid` purely to inherit the
+    /// database scope — `pg_stat_replication` has no database column of its
+    /// own, so without the join a sibling shard's walsender would be counted as
+    /// this shard's standby.
+    ///
+    /// `replay_lag` is left `NULL` rather than coerced: Postgres reports NULL
+    /// until a feedback round-trip has completed, and "we have not measured
+    /// this standby yet" must not read as "this standby is caught up".
+    const STANDBY_SQL: &str = "SELECT \
+            r.state::text AS state, \
+            EXTRACT(EPOCH FROM r.replay_lag)::double precision AS replay_lag_seconds, \
+            CASE WHEN r.replay_lsn IS NULL THEN NULL \
+                 ELSE (pg_current_wal_lsn() - r.replay_lsn)::bigint END AS lag_bytes \
+         FROM pg_stat_replication r \
+         JOIN pg_replication_slots s ON s.active_pid = r.pid \
+         WHERE (s.database IS NULL OR s.database = current_database())";
+
+    /// `pg_replication_slots`, which outlives the walsender.
+    ///
+    /// Physical slots track `restart_lsn`; logical slots track
+    /// `confirmed_flush_lsn`. `COALESCE` picks whichever the slot has, so one
+    /// query covers both replication styles the topology doc offers.
+    const SLOT_SQL: &str = "SELECT \
+            s.slot_name::text AS slot_name, \
+            s.active, \
+            CASE WHEN COALESCE(s.confirmed_flush_lsn, s.restart_lsn) IS NULL THEN NULL \
+                 ELSE (pg_current_wal_lsn() \
+                       - COALESCE(s.confirmed_flush_lsn, s.restart_lsn))::bigint END AS lag_bytes \
+         FROM pg_replication_slots s \
+         WHERE (s.database IS NULL OR s.database = current_database())";
+
+    /// Write one replication watermark for `shard` and prune the trail.
+    ///
+    /// `(NOW(), pg_current_wal_lsn())` — a wall-clock instant stamped against
+    /// the WAL position current at that instant. [`measure_rpo`] later reads
+    /// the trail backwards from a standby's confirmed position to turn "how far
+    /// behind in bytes" into "how far behind in seconds".
+    ///
+    /// The write is also load-bearing on an **idle** primary: with no other
+    /// traffic, WAL does not advance, the standby has nothing to confirm, and
+    /// any position-based lag reading would drift upward on a perfectly healthy
+    /// system. A beat keeps the position moving so an idle deployment reports a
+    /// live RPO.
+    ///
+    /// `ON CONFLICT DO NOTHING` because the primary key is
+    /// `(shard_id, beat_lsn)`: two beats within a single WAL position are the
+    /// same observation, not a conflict worth failing on.
+    ///
+    /// The prune keeps `retain` of trailing history. That window is the ceiling
+    /// on the lag this can *measure*: a standby further behind than the oldest
+    /// retained watermark reports `None` (unknown) rather than a floor value
+    /// that would understate the loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn record_replication_heartbeat(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        retain: std::time::Duration,
+    ) -> HarvestResult<()> {
+        diesel::sql_query(
+            "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
+             VALUES ($1, pg_current_wal_lsn(), NOW()) \
+             ON CONFLICT (shard_id, beat_lsn) DO NOTHING",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        let retain_secs = i64::try_from(retain.as_secs()).unwrap_or(i64::MAX);
+        diesel::sql_query(
+            "DELETE FROM harvest_replication_heartbeat \
+             WHERE shard_id = $1 AND beat_at < NOW() - make_interval(secs => $2::double precision)",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .bind::<BigInt, _>(retain_secs)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        Ok(())
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct RpoRow {
+        #[diesel(sql_type = Nullable<Double>)]
+        lag_seconds: Option<f64>,
+    }
+
+    /// Measure the RPO for `shard` in seconds from the watermark trail.
+    ///
+    /// The standby position is `MIN(COALESCE(confirmed_flush_lsn, restart_lsn))`
+    /// over every replication slot **scoped to this shard's database**: the
+    /// worst standby sets the RPO, and
+    /// `COALESCE` covers logical (`confirmed_flush_lsn`) and physical
+    /// (`restart_lsn`) slots with one query. An abandoned slot therefore pegs
+    /// the reading — which is correct and not a bug to paper over: an
+    /// abandoned slot is retaining WAL and is exactly the thing an operator
+    /// must be told about. [`ReplicationStatus::inactive_slots`] names it.
+    ///
+    /// `None` — unknown — when there is no slot at all, when no watermark has
+    /// been confirmed yet, or when the standby is further behind than the
+    /// retained trail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn measure_rpo(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<Option<f64>> {
+        let rows: Vec<RpoRow> = diesel::sql_query(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(h.beat_at)))::double precision \
+                 AS lag_seconds \
+             FROM harvest_replication_heartbeat h \
+             WHERE h.shard_id = $1 \
+               AND h.beat_lsn <= ( \
+                   SELECT MIN(COALESCE(s.confirmed_flush_lsn, s.restart_lsn)) \
+                   FROM pg_replication_slots s \
+                   WHERE (s.database IS NULL OR s.database = current_database()) \
+               )",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        // A negative reading is impossible in principle (NOW() is monotonic
+        // relative to a row already committed) but clamps to 0.0 rather than
+        // being emitted as a nonsense negative RPO if the clock is adjusted.
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.lag_seconds)
+            .map(|v| v.max(0.0)))
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct SerialColumn {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        column_name: String,
+        #[diesel(sql_type = Text)]
+        sequence_name: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct SetvalRow {
+        #[diesel(sql_type = BigInt)]
+        value: i64,
+    }
+
+    /// A catalog identifier this module is willing to interpolate into SQL.
+    ///
+    /// Every name here comes from `pg_class`/`information_schema`, not from a
+    /// caller — but `setval` needs the identifier *inline* (it cannot be a bind
+    /// parameter), so the class of values that reaches string formatting is
+    /// narrowed explicitly rather than trusted implicitly. A table created as
+    /// `"weird name"` is skipped and reported rather than quoted-and-hoped.
+    fn is_plain_identifier(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 63
+            && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Advance every sequence to match the data — the mandatory step after
+    /// promoting a **logical** standby.
+    ///
+    /// Logical replication copies rows; it does **not** copy sequence values.
+    /// A promoted logical standby therefore holds a full copy of
+    /// `harvest_events` while `harvest_events_id_seq` still sits where it was
+    /// when the subscription was created, so the new primary's very first
+    /// append collides with an already-replicated primary key. The failure is
+    /// immediate, total, and mystifying if you have not seen it before, which
+    /// is why this ships as a function the runbook calls rather than a sentence
+    /// in the runbook hoping to be read.
+    ///
+    /// Physical (streaming) replicas do not need this — they replicate the WAL
+    /// itself, sequences included — but running it there is harmless: `setval`
+    /// to the value already in force is a no-op.
+    ///
+    /// # Scope
+    ///
+    /// **Every** sequence in the connection's `current_schema()`, not only
+    /// Harvest's. A promoted primary with any stale sequence is broken, and an
+    /// embedder's own tables — replicated by the same `FOR ALL TABLES`
+    /// publication the topology doc prescribes — carry the identical hazard. A
+    /// helper that fixed only `harvest_*` would leave the operator with a
+    /// half-promoted database and no signal. Every sequence it touches is
+    /// returned, so the scope is visible rather than assumed.
+    ///
+    /// Returns each `(sequence, new_value)` pair it set, so the runbook step
+    /// has evidence to paste into the incident log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn advance_sequences_after_promotion(
+        conn: &mut AsyncPgConnection,
+    ) -> HarvestResult<Vec<(String, i64)>> {
+        let columns: Vec<SerialColumn> = diesel::sql_query(
+            "SELECT c.relname::text AS table_name, \
+                    a.attname::text AS column_name, \
+                    s.relname::text AS sequence_name \
+             FROM pg_class s \
+             JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass \
+             JOIN pg_class c ON c.oid = d.refobjid \
+             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid \
+             JOIN pg_namespace n ON n.oid = s.relnamespace \
+             WHERE s.relkind = 'S' \
+               AND d.refclassid = 'pg_class'::regclass \
+               AND d.deptype IN ('a', 'i') \
+               AND n.nspname = current_schema()",
+        )
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        let mut advanced = Vec::with_capacity(columns.len());
+        for col in columns {
+            if !is_plain_identifier(&col.table_name)
+                || !is_plain_identifier(&col.column_name)
+                || !is_plain_identifier(&col.sequence_name)
+            {
+                tracing::warn!(
+                    table = %col.table_name,
+                    sequence = %col.sequence_name,
+                    "skipping sequence advance: identifier is not a plain lowercase identifier"
+                );
+                continue;
+            }
+            // `is_called = true` so the NEXT value handed out is `max + 1`.
+            // `GREATEST(..., 1)` keeps `setval` legal on an empty table, where
+            // `MAX` is NULL and 0 is below the sequence minimum.
+            let sql = format!(
+                "SELECT setval('{seq}', GREATEST((SELECT COALESCE(MAX({col}), 0) FROM {tbl}), 1), \
+                        true)::bigint AS value",
+                seq = col.sequence_name,
+                col = col.column_name,
+                tbl = col.table_name,
+            );
+            let rows: Vec<SetvalRow> = diesel::sql_query(sql)
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+            if let Some(row) = rows.into_iter().next() {
+                advanced.push((col.sequence_name, row.value));
+            }
+        }
+        advanced.sort();
+        Ok(advanced)
+    }
+
+    /// Read this primary's replication position views.
+    ///
+    /// A permission or availability failure is reported as
+    /// [`ReplicationStatus::Unavailable`], not as an `Err`: reading these views
+    /// needs `pg_monitor`, and a deployment that has not run that `GRANT` must
+    /// lose the RPO *signal*, not have its metrics sampler fail. The runbook
+    /// names the grant.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` for a view-read failure — see above. The signature
+    /// stays fallible for future non-degradable failures.
+    pub async fn query_replication_status(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<ReplicationStatus> {
+        let standbys: Vec<StandbyRow> = match diesel::sql_query(STANDBY_SQL).load(conn).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(ReplicationStatus::Unavailable {
+                    reason: format!("pg_stat_replication unreadable: {error}"),
+                });
+            }
+        };
+        let slots: Vec<SlotRow> = match diesel::sql_query(SLOT_SQL).load(conn).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(ReplicationStatus::Unavailable {
+                    reason: format!("pg_replication_slots unreadable: {error}"),
+                });
+            }
+        };
+
+        // A watermark-read failure degrades the same way a view-read failure
+        // does: lose the number, never the sampler.
+        let heartbeat_lag_seconds = measure_rpo(conn, shard).await.unwrap_or(None);
+
+        Ok(ReplicationStatus::Observed {
+            heartbeat_lag_seconds,
+            standbys: standbys
+                .into_iter()
+                .map(|r| StandbyLag {
+                    state: r.state,
+                    replay_lag_seconds: r.replay_lag_seconds,
+                    lag_bytes: r.lag_bytes,
+                })
+                .collect(),
+            slots: slots
+                .into_iter()
+                .map(|r| SlotLag {
+                    slot_name: r.slot_name,
+                    active: r.active,
+                    lag_bytes: r.lag_bytes,
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(feature = "db")]
+pub use db::{
+    advance_sequences_after_promotion, assert_fence, bump_generation, current_generation,
+    ensure_generation_row, measure_rpo, query_replication_status, record_replication_heartbeat,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`FenceRegistry`] is process-global, so the tests that mutate it must
+    /// not interleave with each other under the default parallel harness.
+    static REGISTRY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn standby(state: &str, lag: Option<f64>, bytes: Option<i64>) -> StandbyLag {
+        StandbyLag { state: state.to_string(), replay_lag_seconds: lag, lag_bytes: bytes }
+    }
+
+    fn observed(standbys: Vec<StandbyLag>, slots: Vec<SlotLag>) -> ReplicationStatus {
+        ReplicationStatus::Observed { standbys, slots, heartbeat_lag_seconds: None }
+    }
+
+    // ── RPO source-of-truth precedence ─────────────────────────────────────
+
+    /// The watermark reading wins over `pg_stat_replication.replay_lag`.
+    ///
+    /// Measured against a live pair of databases: with the subscriber's apply
+    /// worker blocked, byte lag grew while `replay_lag` never left NULL,
+    /// because a stuck logical apply worker stops sending the reply messages
+    /// `replay_lag` is derived from. Preferring the watermark is what makes the
+    /// RPO real in the only situation where anyone reads it.
+    #[test]
+    fn the_watermark_reading_wins_over_replay_lag() {
+        let s = ReplicationStatus::Observed {
+            standbys: vec![standby("streaming", Some(0.0), Some(1_000_000))],
+            slots: vec![],
+            heartbeat_lag_seconds: Some(41.5),
+        };
+        assert_eq!(s.rpo_seconds(), Some(41.5));
+    }
+
+    /// With no watermark, `replay_lag` is still better than nothing.
+    #[test]
+    fn replay_lag_is_the_rpo_fallback_when_no_watermark_exists() {
+        let s = ReplicationStatus::Observed {
+            standbys: vec![standby("streaming", Some(2.5), Some(10))],
+            slots: vec![],
+            heartbeat_lag_seconds: None,
+        };
+        assert_eq!(s.rpo_seconds(), Some(2.5));
+    }
+
+    /// Neither source: unknown. Never zero.
+    #[test]
+    fn an_rpo_with_no_source_is_unknown_not_zero() {
+        assert_eq!(observed(vec![], vec![]).rpo_seconds(), None);
+        assert_eq!(
+            ReplicationStatus::Unavailable { reason: "no grant".into() }.rpo_seconds(),
+            None
+        );
+    }
+
+    // ── R6: never report "0 seconds behind" when replication is dead ────────
+    #[test]
+    fn no_standbys_reports_unknown_lag_not_zero() {
+        let s = observed(vec![], vec![]);
+        assert_eq!(s.max_replay_lag_seconds(), None, "an empty standby set must be UNKNOWN, not 0");
+        assert_eq!(s.connected_standbys(), 0);
+    }
+
+    #[test]
+    fn unavailable_reports_unknown_lag() {
+        let s = ReplicationStatus::Unavailable { reason: "permission denied".into() };
+        assert_eq!(s.max_replay_lag_seconds(), None);
+        assert_eq!(s.max_lag_bytes(), None);
+        assert_eq!(s.connected_standbys(), 0);
+    }
+
+    #[test]
+    fn lag_is_the_worst_standby_not_the_best() {
+        let s = observed(
+            vec![
+                standby("streaming", Some(0.5), Some(100)),
+                standby("streaming", Some(12.25), Some(9_000)),
+            ],
+            vec![],
+        );
+        assert_eq!(s.max_replay_lag_seconds(), Some(12.25));
+        assert_eq!(s.max_lag_bytes(), Some(9_000));
+        assert_eq!(s.connected_standbys(), 2);
+    }
+
+    #[test]
+    fn a_connected_standby_with_null_replay_lag_is_not_silently_zero() {
+        // pg_stat_replication.replay_lag is NULL until the first feedback
+        // round-trip. Treating NULL as 0.0 would report a perfect RPO for a
+        // standby we know nothing about.
+        let s = observed(vec![standby("catchup", None, Some(4_096))], vec![]);
+        assert_eq!(s.max_replay_lag_seconds(), None);
+        assert_eq!(s.max_lag_bytes(), Some(4_096));
+        assert_eq!(s.connected_standbys(), 1);
+    }
+
+    #[test]
+    fn slot_bytes_are_counted_when_no_walsender_is_connected() {
+        // A disabled subscription leaves the slot behind with no walsender:
+        // the time lag is genuinely unknowable from the primary, but the byte
+        // backlog is not.
+        let s = observed(
+            vec![],
+            vec![SlotLag { slot_name: "harvest_dr_s0".into(), active: false, lag_bytes: Some(77) }],
+        );
+        assert_eq!(s.max_replay_lag_seconds(), None);
+        assert_eq!(s.max_lag_bytes(), Some(77));
+        assert_eq!(s.connected_standbys(), 0);
+    }
+
+    // ── fence registry ─────────────────────────────────────────────────────
+    #[test]
+    fn registry_round_trips_and_defaults_to_disabled() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        assert!(!FenceRegistry::is_enabled(), "fencing is opt-in");
+        assert_eq!(FenceRegistry::expected(ShardId::new(3)), None);
+
+        FenceRegistry::register(ShardId::new(3), ShardGeneration(7));
+        assert!(FenceRegistry::is_enabled());
+        assert_eq!(FenceRegistry::expected(ShardId::new(3)), Some(ShardGeneration(7)));
+        assert_eq!(FenceRegistry::expected(ShardId::new(4)), None);
+
+        FenceRegistry::clear();
+        assert!(!FenceRegistry::is_enabled());
+    }
+
+    #[test]
+    fn unencoded_execution_shard_resolves_to_the_default_shard() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(2));
+        FenceRegistry::set_default_shard(ShardId::new(0));
+        assert_eq!(
+            FenceRegistry::expected(ShardId::UNENCODED),
+            Some(ShardGeneration(2)),
+            "pre-sharding execution ids must still be fenced via the default shard"
+        );
+        FenceRegistry::clear();
+    }
+}

@@ -168,6 +168,13 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
+    // Cross-region DR write-authority fence (issue #954). A no-op — not even a
+    // round trip — unless this process pinned a shard generation, so a
+    // deployment that never enabled DR sees the pre-#954 path exactly. When it
+    // is on, a worker pinned to a superseded epoch stops here rather than
+    // appending to a history another region now owns.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
+
     if events.is_empty() {
         return Ok(0);
     }
@@ -222,6 +229,14 @@ pub async fn append_events_offloaded(
     if events.is_empty() {
         return Ok(0);
     }
+
+    // Cross-region DR write-authority fence (issue #954). A no-op — not even a
+    // round trip — unless this process pinned a shard generation, so a
+    // deployment that never enabled DR sees the pre-#954 path exactly. When it
+    // is on, a worker pinned to a superseded epoch stops here rather than
+    // appending to a history another region now owns.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
+
 
     let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
@@ -420,6 +435,12 @@ pub async fn append_single_event(
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
+
+    // Cross-region DR write-authority fence (issue #954). Placed before the
+    // execution row lock so a fenced worker releases immediately instead of
+    // holding a lock other regions' workers need. A no-op unless this process
+    // pinned a shard generation.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Lock the parent execution row so that concurrent callers serialise their
     // MAX(event_id) + INSERT pairs — preventing a duplicate-event-id collision

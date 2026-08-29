@@ -280,6 +280,8 @@ pub mod queue_pause;
 /// DB-gated.
 pub mod quota;
 pub mod replay;
+/// Cross-region DR fencing and replication-lag measurement (issue #954).
+pub mod replication;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
 /// Carries the pure, database-free vocabulary shared by the sample export
