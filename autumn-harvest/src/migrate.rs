@@ -449,8 +449,10 @@ pub struct FailedMigration {
     /// `true` when its transaction rolled the whole body back, so the database
     /// is exactly as it was before this migration started. `false` when the
     /// migration declared `run_in_transaction = false`: any statement that
-    /// already succeeded still stands, and a re-run replays the whole body —
-    /// which is why such migrations must be written idempotently.
+    /// already succeeded still stands, and a re-run replays the whole body from
+    /// the start. Whether that is safe depends on the body being idempotent,
+    /// which nothing here can verify — so `false` means "inspect before
+    /// re-running", not "re-run freely".
     pub rolled_back: bool,
 }
 
@@ -689,8 +691,11 @@ async fn apply_one(
 ///   lose the *record* of a migration that did run, which a re-run fixes.
 /// * **A partial failure stays partial.** With no transaction, statements that
 ///   already succeeded are not rolled back. The version is not recorded, so the
-///   next run replays the whole body — write these migrations idempotently
-///   (`IF NOT EXISTS`), exactly as under `diesel migration run`.
+///   next run replays the whole body from the start — safe only if that body is
+///   idempotent (`IF NOT EXISTS`). Nothing here can verify that, and a Diesel
+///   migration set is under no obligation to be, so a failure leaves an
+///   operator to inspect what stands before re-running: exactly the position
+///   `diesel migration run` leaves them in.
 async fn apply_without_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,

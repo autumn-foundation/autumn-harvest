@@ -4861,8 +4861,9 @@ pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String 
                     "rolled back -- this database is as it was before that migration"
                 } else {
                     "NOT rolled back (run_in_transaction = false) -- any statement \
-                     of it that already succeeded still stands; re-run once the \
-                     cause is fixed, it is written to be idempotent"
+                     of it that already succeeded still stands. Inspect what it \
+                     left behind and repair it before deciding whether a re-run \
+                     is safe: nothing here can know the body is idempotent"
                 }
             );
         }
