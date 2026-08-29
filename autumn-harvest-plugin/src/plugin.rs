@@ -2550,8 +2550,16 @@ const HARVEST_MIGRATE_REMEDY: &str =
 /// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
 /// added the table to prevent, since the first poison message then fails its
 /// dead-letter write and redelivers forever.
-const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = "Run `harvest migrate run --database-url <harvest.database.url> \
-     --include-dir autumn-harvest-plugin/migrations/harvest` to apply them.";
+const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Run `harvest migrate run --database-url <harvest.database.url> ",
+    "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
+    // Said out loud because the process logging this is usually a container
+    // with installed binaries and no checkout: unlike Harvest's own set, this
+    // one is NOT embedded in the `harvest` binary, so a workspace-relative
+    // path would send an operator at a directory that does not exist there.
+    "That directory ships in the autumn-harvest-plugin crate source, not in the ",
+    "`harvest` binary, so make it available wherever you run the command."
+);
 
 fn apply_migrations_for_profile(
     profile: &str,
@@ -2624,9 +2632,20 @@ mod migration_remedy_tests {
         // applied, and the operator rolls replicas with
         // `harvest_connector_dead_letters` absent.
         assert!(
-            PLUGIN_HARVEST_MIGRATE_REMEDY
-                .contains("--include-dir autumn-harvest-plugin/migrations/harvest"),
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
             "the plugin-storage warning must name its own migration directory: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("migrations/harvest"),
+            "{PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        // The process logging this is usually a container with no checkout, so
+        // the warning must say where that directory comes from rather than
+        // implying a path relative to the working directory.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("crate source"),
+            "the warning must say where the directory comes from: \
              {PLUGIN_HARVEST_MIGRATE_REMEDY}"
         );
         assert!(
