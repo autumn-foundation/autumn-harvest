@@ -4629,10 +4629,21 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
                 }
             }
         } else {
+            // A bare value ends at whitespace, but `\` escapes the next
+            // character — `password=abc\ def` is one value, and tokio-postgres
+            // parses it that way. Stopping at the escaped space would treat
+            // `def` as the next option's keyword, find no `=` after it, and
+            // abandon the rewrite, leaving a `verify-full` the driver refuses.
             while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                i += 1;
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let escaped = dsn[i + 1..].chars().next().map_or(1, char::len_utf8);
+                    value.push(dsn[i + 1..].chars().next().unwrap_or_default());
+                    i += 1 + escaped;
+                } else {
+                    value.push(dsn[i..].chars().next().unwrap_or_default());
+                    i += dsn[i..].chars().next().map_or(1, char::len_utf8);
+                }
             }
-            value.push_str(&dsn[value_start..i]);
         }
 
         if key == "sslmode" && verify_modes.contains(&value.as_str()) {
@@ -16343,6 +16354,18 @@ mod migrate_cli_tests {
         assert_eq!(rewritten, r"password='a\'b c' sslmode=require");
         let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
         assert_eq!(config.get_password(), Some(b"a'b c".as_slice()));
+    }
+
+    #[test]
+    fn a_backslash_escape_in_a_bare_value_is_understood() {
+        // tokio-postgres honours `\` escapes in unquoted values too, so
+        // `password=abc\ def` is ONE value. Stopping at the escaped space
+        // would take `def` for the next keyword and abandon the rewrite,
+        // leaving a `verify-full` the driver then refuses.
+        let rewritten = normalize_sslmode(r"password=abc\ def sslmode=verify-full");
+        assert_eq!(rewritten, r"password=abc\ def sslmode=require");
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(config.get_password(), Some(b"abc def".as_slice()));
     }
 
     #[test]

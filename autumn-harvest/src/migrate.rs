@@ -624,9 +624,7 @@ pub async fn apply_to_connection(
 ) -> Result<MigrationReport, PartialMigration> {
     validate_versions(scripts)?;
 
-    conn.batch_execute(CREATE_LEDGER_SQL)
-        .await
-        .map_err(|e| HarvestError::Database(format!("cannot create {MIGRATION_LEDGER}: {e}")))?;
+    create_ledger(conn).await?;
 
     let recorded = recorded_versions(conn).await?;
     let plan = build_plan(scripts, &recorded, true);
@@ -675,6 +673,30 @@ pub async fn apply_to_connection(
     }
 
     Ok(report)
+}
+
+/// Create the ledger table, tolerating a concurrent creator.
+///
+/// `CREATE TABLE IF NOT EXISTS` is **not** race-free in Postgres: two sessions
+/// creating the same table at once can leave the loser with a catalog unique
+/// violation (`pg_type_typname_nsp_index`) rather than the "already exists,
+/// skipping" notice. Against a brand-new database that is exactly the moment
+/// two migrators are most likely to collide — and failing there would drop the
+/// loser out before it ever reaches the per-version row contention that makes
+/// the rest of this function safe.
+///
+/// So a failure is not taken at face value: if the ledger exists afterwards,
+/// someone else created it and there is nothing left to do.
+async fn create_ledger(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    let Err(error) = conn.batch_execute(CREATE_LEDGER_SQL).await else {
+        return Ok(());
+    };
+    if ledger_exists(conn).await.unwrap_or(false) {
+        return Ok(());
+    }
+    Err(HarvestError::Database(format!(
+        "cannot create {MIGRATION_LEDGER}: {error}"
+    )))
 }
 
 /// Outcome of one migration's transaction.
