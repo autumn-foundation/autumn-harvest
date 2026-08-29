@@ -460,6 +460,12 @@ impl MigrationPlan {
 ///
 /// [`Display`](std::fmt::Display) delegates to the error, so a caller that only
 /// prints it sees exactly the failure message.
+///
+/// The `apply*` signatures return this **boxed**. It is the `Err` half of a
+/// `Result` whose `Ok` half is one `MigrationReport`, and an `Err` that dwarfs
+/// the `Ok` is paid on the success path too — `clippy::result_large_err`, which
+/// CI denies. Field access is unaffected: `partial.report` and `partial.error`
+/// read through the box.
 #[derive(Debug)]
 pub struct PartialMigration {
     /// Everything applied before the failure, in the order applied.
@@ -477,6 +483,14 @@ impl std::fmt::Display for PartialMigration {
 impl std::error::Error for PartialMigration {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
+    }
+}
+
+impl From<HarvestError> for Box<PartialMigration> {
+    /// So `?` still lifts a plain [`HarvestError`] into the boxed error the
+    /// `apply*` signatures use.
+    fn from(error: HarvestError) -> Self {
+        Self::new(PartialMigration::from(error))
     }
 }
 
@@ -594,7 +608,7 @@ pub async fn plan_on_connection(
 pub async fn apply(
     database_url: &str,
     scripts: &[MigrationScript],
-) -> Result<MigrationReport, PartialMigration> {
+) -> Result<MigrationReport, Box<PartialMigration>> {
     validate_versions(scripts)?;
     let mut conn = connect(database_url).await?;
     apply_to_connection(&mut conn, scripts).await
@@ -621,7 +635,7 @@ pub async fn apply(
 pub async fn apply_to_connection(
     conn: &mut AsyncPgConnection,
     scripts: &[MigrationScript],
-) -> Result<MigrationReport, PartialMigration> {
+) -> Result<MigrationReport, Box<PartialMigration>> {
     validate_versions(scripts)?;
 
     create_ledger(conn).await?;
@@ -664,10 +678,10 @@ pub async fn apply_to_connection(
                     name: script.name.clone(),
                     rolled_back: script.run_in_transaction,
                 });
-                return Err(PartialMigration {
+                return Err(Box::new(PartialMigration {
                     report,
                     error: failure,
-                });
+                }));
             }
         }
     }
