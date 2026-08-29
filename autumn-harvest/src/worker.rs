@@ -1864,6 +1864,249 @@ fn extract_child_timeout_race(
     }
 }
 
+// ── Mixed-kind suspension batches (issue #950) ──────────────────────────────
+
+/// A **heterogeneous** suspension batch: any combination of the four
+/// ctx-managed durable awaitables — activities (fresh dispatch or re-park),
+/// durable timers, signal waits, and child workflows — emitted by one
+/// `futures::join!`/`try_join!` or one `ctx.race()` (issue #950).
+///
+/// Produced by [`extract_mixed_suspension_batch`] and persisted by
+/// [`persist_mixed_suspension_batch`] in a single transaction.
+#[derive(Debug, Default)]
+struct MixedSuspensionBatch {
+    /// Fresh `ScheduleActivity` dispatches, in command-emission order.
+    scheduled_activities: Vec<ScheduledActivityCommand>,
+    /// `WaitForActivity` re-parks for activities already in flight.
+    activity_waits: Vec<ActivityExecId>,
+    /// `StartTimer` durable timers, in command-emission order. More than one is
+    /// allowed (a `join!` of two `ctx.timer`s), unlike
+    /// [`extract_started_timer_for_suspension`].
+    timers: Vec<StartedTimerCommand>,
+    /// `StartChildWorkflow` starts / re-parks, in command-emission order.
+    children: Vec<StartedChildWorkflowCommand>,
+    /// `true` when the batch carries at least one `WaitForSignal`.
+    waits_on_signal: bool,
+}
+
+impl MixedSuspensionBatch {
+    /// `true` when the batch carries no durable wait/dispatch command at all —
+    /// pure bookkeeping, which [`only_bookkeeping_commands`] owns.
+    const fn is_empty(&self) -> bool {
+        self.scheduled_activities.is_empty()
+            && self.activity_waits.is_empty()
+            && self.timers.is_empty()
+            && self.children.is_empty()
+            && !self.waits_on_signal
+    }
+}
+
+/// Classify an arbitrary suspension batch into per-kind buckets (issue #950).
+///
+/// Returns `Some` for **any** batch composed exclusively of the durable
+/// awaitable commands listed on [`MixedSuspensionBatch`] plus the pure
+/// bookkeeping every other extractor already tolerates, and `None` for anything
+/// else.
+///
+/// # Why this is safe to make so permissive
+///
+/// This is deliberately the **last** arm of [`handle_suspended_workflow`]'s
+/// dispatch chain, immediately before the fail-loud `suspended_workflow_error`
+/// path. Every homogeneous shape with its own dedicated persist function
+/// (N activities, N activity waits, one timer, the #476 timer+signal pair, the
+/// #779 `__child_timeout:` child+timer race, N children, N signal waits, one
+/// external activity, a solo mutex acquire) is claimed by its own arm *before*
+/// control reaches here, so those persist byte-for-byte as they always have
+/// (AC6) and this function never shadows them. Anything that does reach here is
+/// a batch that terminally failed the workflow before this issue — so accepting
+/// it is strictly an improvement, and no "at least two distinct kinds" guard is
+/// needed. `legacy_suspension_shapes_are_still_claimed_by_their_own_arms` pins
+/// that ordering.
+///
+/// # Deliberate rejections (fail loud, never silently drop work)
+///
+/// The `match` is exhaustive with an explicit reject arm — there is no
+/// `_ => {}` catch-all — so a command kind added in the future defaults to the
+/// fail-loud path rather than being silently dropped:
+///
+/// - `RunLocalActivity` — an inline local activity resolves *within* this
+///   decision cycle and appends its own terminal, so it cannot be parked
+///   alongside durable waits. Rejected here and reported as a typed error by
+///   [`local_activity_batch_conflict`] (AC8) rather than silently deferring its
+///   siblings.
+/// - `AcquireMutex` — a SOLO durable suspension (issue #691) whose
+///   `MutexGranted` anchor must land at a clean resume cursor.
+/// - `ScheduleExternalActivity` — its `AwaitingExternalCompletion` bookkeeping
+///   and token lifecycle are owned by `persist_scheduled_external_activity`.
+/// - `Complete` / `Fail` / `ContinueAsNew` — terminal outcomes, never a
+///   suspension.
+/// - `SignalExternalWorkflow` / `RequestCancelExternalWorkflow` /
+///   `AwaitExternalWorkflow` — already stripped from the batch by
+///   `split_mixed_signal_batch` before `handle_suspended_workflow` runs; a
+///   residual one here means an unexpected path, so fail loud.
+fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedSuspensionBatch> {
+    let mut batch = MixedSuspensionBatch::default();
+
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input,
+                queue,
+                retry_policy_override,
+                start_to_close_override,
+                session_id,
+                session_worker_id,
+                schedule_to_start_override,
+                ..
+            } => batch.scheduled_activities.push(ScheduledActivityCommand {
+                activity_id: *activity_id,
+                name: name.clone(),
+                input: input.clone(),
+                queue: queue.clone(),
+                retry_policy_override: retry_policy_override.clone(),
+                start_to_close_override: *start_to_close_override,
+                session_id: *session_id,
+                session_worker_id: session_worker_id.clone(),
+                schedule_to_start_override: *schedule_to_start_override,
+            }),
+            WorkflowCommand::WaitForActivity { activity_id, .. } => {
+                batch.activity_waits.push(*activity_id);
+            }
+            WorkflowCommand::StartTimer {
+                timer_id,
+                duration_secs,
+                ..
+            } => batch.timers.push(StartedTimerCommand {
+                timer_id: timer_id.clone(),
+                duration_secs: *duration_secs,
+            }),
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                ..
+            } => batch.children.push(StartedChildWorkflowCommand {
+                child_id: *child_id,
+                workflow_name: workflow_name.clone(),
+                input: input.clone(),
+            }),
+            WorkflowCommand::WaitForSignal { .. } => batch.waits_on_signal = true,
+            // Pure bookkeeping — resolved by the shared pre-suspension steps in
+            // `handle_suspended_workflow`, `plan_timer_lifecycle`,
+            // `build_suspension_events`, `create_detached_child_executions` and
+            // `apply_race_loser_cancellations`, exactly as on every other path.
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
+            // Everything else: not persistable as part of a mixed batch. Fall
+            // through to the fail-loud "unsupported commands" path rather than
+            // silently dropping the command. See the doc comment above.
+            WorkflowCommand::RunLocalActivity { .. }
+            | WorkflowCommand::AcquireMutex { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. } => return None,
+        }
+    }
+
+    (!batch.is_empty()).then_some(batch)
+}
+
+/// Whether a suspension batch is persistable as a **heterogeneous** mixed batch
+/// (issue #950).
+///
+/// A thin public predicate over [`extract_mixed_suspension_batch`] so tests that
+/// only have a `Vec<WorkflowCommand>` (the pure `executor::run_workflow` level,
+/// e.g. `child_fanout_tests`) can assert the batch a workflow emits is one the
+/// worker can persist, without a Postgres round-trip. Returns `false` for a
+/// bookkeeping-only batch and for any batch carrying a command kind the mixed
+/// path deliberately rejects.
+///
+/// This answers "would the mixed arm claim this batch?", not "does this batch
+/// reach the mixed arm?" — a homogeneous batch is claimed by its own earlier arm
+/// and is persistable either way.
+#[must_use]
+pub fn mixed_suspension_batch_is_persistable(commands: &[WorkflowCommand]) -> bool {
+    extract_mixed_suspension_batch(commands).is_some()
+}
+
+/// AC8 (issue #950): report a `RunLocalActivity` co-batched with a sibling
+/// durable wait/dispatch command.
+///
+/// Before this issue, [`extract_run_local_activity`] silently ignored every
+/// sibling command (`_ => {}`), so a
+/// `join!(ctx.local_activity(..), ctx.timer(..))` ran the local activity and
+/// **dropped** the `StartTimer` — the deadline was then armed a whole decision
+/// cycle late, with no error anywhere. An inline local activity resolves within
+/// the decision cycle and appends its own terminal events, so it cannot share a
+/// durable suspension park; joining the two correctly would mean re-entering
+/// the workflow body mid-batch.
+///
+/// The chosen contract is therefore **immediate typed rejection**: returns
+/// `Some(message)` naming the dropped sibling command kinds, which the caller
+/// surfaces as [`HarvestError::Config`]. Returns `None` for a local activity
+/// alone or alongside pure bookkeeping (the supported shape), and for a batch
+/// with no `RunLocalActivity` at all.
+///
+/// External-workflow commands (`SignalExternalWorkflow` /
+/// `RequestCancelExternalWorkflow` / `AwaitExternalWorkflow`) are **not**
+/// conflicts: `split_mixed_signal_batch` resolves them inline, before the local
+/// activity runs, and that composition is already tested.
+fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String> {
+    if !commands
+        .iter()
+        .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }))
+    {
+        return None;
+    }
+
+    let mut conflicts: Vec<&'static str> = commands
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                WorkflowCommand::ScheduleActivity { .. }
+                    | WorkflowCommand::WaitForActivity { .. }
+                    | WorkflowCommand::StartTimer { .. }
+                    | WorkflowCommand::StartChildWorkflow { .. }
+                    | WorkflowCommand::WaitForSignal { .. }
+                    | WorkflowCommand::ScheduleExternalActivity { .. }
+            )
+        })
+        .map(workflow_command_name)
+        .collect();
+    if conflicts.is_empty() {
+        return None;
+    }
+    conflicts.sort_unstable();
+    conflicts.dedup();
+
+    Some(format!(
+        "a local activity cannot share a suspension batch with durable \
+         awaitables ({}); an inline local activity resolves within the decision \
+         cycle and cannot be parked alongside them. Await the local activity \
+         before (or after) the concurrent block, or replace it with a regular \
+         ctx.execute_activity, which composes freely in join!/try_join!/ctx.race() \
+         (issue #950).",
+        conflicts.join(", ")
+    ))
+}
+
 fn extract_single_schedule_external_activity(
     commands: &[WorkflowCommand],
 ) -> Option<ScheduledExternalActivityCommand> {
@@ -7696,23 +7939,110 @@ async fn persist_activity_wait_park(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn persist_scheduled_activities(
+/// Immediately fail any freshly-enqueued session-member activity whose worker
+/// session already left `ACTIVE` (issue #606).
+///
+/// The broken-session scanner only ever revisits `state = 'ACTIVE'` rows, so a
+/// task hard-pinned to an already-broken session would otherwise sit `PENDING`
+/// against a dead or draining host forever with no future recovery path. Fails
+/// each such task with the same `ActivityFailed{SessionBroken}` shape
+/// `break_session_and_fail_members` uses for in-flight tasks, so the workflow
+/// observes `SessionBroken` on its next decision cycle instead of hanging.
+///
+/// `activity_task_ids` is positionally aligned with `scheduled_activities` (the
+/// enqueue order). `next_event_id` is advanced past every appended event.
+/// Returns `true` when at least one failure was synthesized — the caller must
+/// then wake the workflow unconditionally, since nothing external will.
+///
+/// Extracted from [`persist_scheduled_activities`] (issue #950) so the
+/// generalized mixed-batch path enforces the identical guarantee.
+async fn fail_activities_for_broken_sessions(
     conn: &mut AsyncPgConnection,
-    registry: &HandlerRegistry,
-    detached_spawns: DetachedSpawnPersistence<'_>,
-    task_id: uuid::Uuid,
     exec_id: ExecutionId,
-    next_event_id: i32,
-    commands: &[WorkflowCommand],
     scheduled_activities: &[ScheduledActivityCommand],
-    sticky: Option<queue::StickyHint<'_>>,
+    activity_task_ids: &[uuid::Uuid],
+    next_event_id: &mut i32,
+) -> HarvestResult<bool> {
+    let session_ids: std::collections::HashSet<uuid::Uuid> = scheduled_activities
+        .iter()
+        .filter_map(|s| s.session_id.map(|id| id.as_uuid()))
+        .collect();
+    if session_ids.is_empty() {
+        return Ok(false);
+    }
+
+    use crate::schema::harvest_sessions::dsl as sess_dsl;
+    let broken: std::collections::HashMap<uuid::Uuid, String> = sess_dsl::harvest_sessions
+        .filter(sess_dsl::id.eq_any(&session_ids))
+        .filter(sess_dsl::state.ne("ACTIVE"))
+        .select((sess_dsl::id, sess_dsl::broken_reason))
+        .load::<(uuid::Uuid, Option<String>)>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .map(|(id, reason)| {
+            (
+                id,
+                reason.unwrap_or_else(|| "session is no longer ACTIVE".to_string()),
+            )
+        })
+        .collect();
+    if broken.is_empty() {
+        return Ok(false);
+    }
+
+    let mut synthesized = false;
+    for (scheduled, activity_task_id) in scheduled_activities.iter().zip(activity_task_ids.iter()) {
+        let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
+            continue;
+        };
+        let Some(reason) = broken.get(&session_uuid) else {
+            continue;
+        };
+        let failed_event = WorkflowEvent::ActivityFailed {
+            activity_id: scheduled.activity_id,
+            error: reason.clone(),
+            attempt: 1,
+            error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
+            non_retryable: true,
+            details: None,
+        };
+        store::append_events(conn, exec_id, &[failed_event], *next_event_id).await?;
+        *next_event_id = next_event_id.saturating_add(1);
+        queue::fail_task(conn, *activity_task_id, reason).await?;
+        synthesized = true;
+    }
+    Ok(synthesized)
+}
+
+/// The pre-transaction plan for a batch of `ScheduleActivity` commands:
+/// the `ActivityScheduled` events (in `ScheduleActivity` command order), the
+/// fully-resolved [`queue::EnqueueParams`] for each, and the dynamic per-key
+/// rate-limit buckets (issue #699) to lazily register inside the enqueue
+/// transaction.
+///
+/// Extracted verbatim from [`persist_scheduled_activities`] (issue #950) so the
+/// generalized mixed-batch path ([`persist_mixed_suspension_batch`]) resolves an
+/// activity dispatch through the *same* code — queue/retry/timeout defaults,
+/// the #620 builder floor, session pinning, concurrency and rate-limit keys,
+/// and the producer span — rather than a drifting second copy.
+struct ActivityEnqueuePlan {
+    activity_events: Vec<WorkflowEvent>,
+    enqueued: Vec<queue::EnqueueParams>,
+    dynamic_rate_buckets: Vec<(String, f64, f64)>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn build_activity_enqueue_plan(
+    registry: &HandlerRegistry,
+    exec_id: ExecutionId,
+    scheduled_activities: &[ScheduledActivityCommand],
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
-) -> HarvestResult<()> {
+) -> HarvestResult<ActivityEnqueuePlan> {
     // activity_events is built in scheduled_activities order (= ScheduleActivity command order).
     // After the loop we interleave them with marker/detached-spawn events in full command order.
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
@@ -7974,6 +8304,45 @@ async fn persist_scheduled_activities(
         enqueued.push(params);
     }
 
+    Ok(ActivityEnqueuePlan {
+        activity_events,
+        enqueued,
+        dynamic_rate_buckets,
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn persist_scheduled_activities(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    detached_spawns: DetachedSpawnPersistence<'_>,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    commands: &[WorkflowCommand],
+    scheduled_activities: &[ScheduledActivityCommand],
+    sticky: Option<queue::StickyHint<'_>>,
+    execute_span: &tracing::Span,
+    assigned_build_id: Option<&str>,
+    parent_priority: i32,
+    context_headers: Option<&serde_json::Value>,
+    workflow_input: &serde_json::Value,
+) -> HarvestResult<()> {
+    let ActivityEnqueuePlan {
+        activity_events,
+        enqueued,
+        dynamic_rate_buckets,
+    } = build_activity_enqueue_plan(
+        registry,
+        exec_id,
+        scheduled_activities,
+        execute_span,
+        assigned_build_id,
+        parent_priority,
+        context_headers,
+        workflow_input,
+    )?;
+
     let offloader = registry.payload_offloader();
     // `had_wake_requested` closes a race no other check in this function
     // covers (PR #901 review): a signal or admitted update landing while this
@@ -8030,69 +8399,18 @@ async fn persist_scheduled_activities(
             )
             .await?;
 
-            // Worker sessions (issue #606): a member activity's session
-            // may have already left ACTIVE (the broken-session scanner
-            // reclaimed it) in the gap between the workflow's previous
-            // session activity call and this one -- the scanner only
-            // ever revisits `state = 'ACTIVE'` rows, so a freshly
-            // hard-pinned task enqueued here for an already-broken
-            // session would otherwise sit PENDING against a dead or
-            // draining host forever, with no future recovery path.
-            // Immediately fail any such task with the same
-            // ActivityFailed{SessionBroken} shape
-            // `break_session_and_fail_members` uses for in-flight
-            // tasks, so the workflow observes SessionBroken on its next
-            // decision cycle instead of hanging.
-            let session_ids: std::collections::HashSet<uuid::Uuid> = scheduled_activities
-                .iter()
-                .filter_map(|s| s.session_id.map(|id| id.as_uuid()))
-                .collect();
-            let mut synthesized_broken_session_failure = false;
-            if !session_ids.is_empty() {
-                use crate::schema::harvest_sessions::dsl as sess_dsl;
-                let broken: std::collections::HashMap<uuid::Uuid, String> =
-                    sess_dsl::harvest_sessions
-                        .filter(sess_dsl::id.eq_any(&session_ids))
-                        .filter(sess_dsl::state.ne("ACTIVE"))
-                        .select((sess_dsl::id, sess_dsl::broken_reason))
-                        .load::<(uuid::Uuid, Option<String>)>(conn)
-                        .await
-                        .map_err(crate::error::database_error)?
-                        .into_iter()
-                        .map(|(id, reason)| {
-                            (
-                                id,
-                                reason.unwrap_or_else(|| "session is no longer ACTIVE".to_string()),
-                            )
-                        })
-                        .collect();
-
-                if !broken.is_empty() {
-                    for (scheduled, activity_task_id) in
-                        scheduled_activities.iter().zip(activity_task_ids.iter())
-                    {
-                        let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
-                            continue;
-                        };
-                        let Some(reason) = broken.get(&session_uuid) else {
-                            continue;
-                        };
-                        let failed_event = WorkflowEvent::ActivityFailed {
-                            activity_id: scheduled.activity_id,
-                            error: reason.clone(),
-                            attempt: 1,
-                            error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
-                            non_retryable: true,
-                            details: None,
-                        };
-                        store::append_events(conn, exec_id, &[failed_event], race_next_event_id)
-                            .await?;
-                        race_next_event_id = race_next_event_id.saturating_add(1);
-                        queue::fail_task(conn, *activity_task_id, reason).await?;
-                        synthesized_broken_session_failure = true;
-                    }
-                }
-            }
+            // Worker sessions (issue #606): fail any member activity whose
+            // session already left ACTIVE, so the workflow observes
+            // SessionBroken on its next decision cycle instead of hanging on a
+            // task hard-pinned to a dead host.
+            let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+                conn,
+                exec_id,
+                scheduled_activities,
+                &activity_task_ids,
+                &mut race_next_event_id,
+            )
+            .await?;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
@@ -9337,6 +9655,488 @@ async fn persist_child_timeout_race(
         });
     if child_terminal {
         queue::wake_workflow_task(conn, parent_exec_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Persist a **heterogeneous** suspension batch in ONE transaction (issue
+/// #950): activity enqueues, durable timer rows, signal waits and child starts
+/// all commit atomically, and each branch then resolves independently as its
+/// own event arrives.
+///
+/// This is the generalization of the single-shape persist functions
+/// ([`persist_scheduled_activities`], [`persist_started_timer`],
+/// [`persist_all_started_child_workflows`], [`persist_signal_wait_park`],
+/// [`persist_activity_wait_park`]). It reuses their per-kind primitives rather
+/// than reimplementing them:
+///
+/// - activity dispatch resolution → [`build_activity_enqueue_plan`]
+/// - cancellable-timer bookkeeping → [`plan_timer_lifecycle`]
+/// - positional event interleaving → [`build_suspension_events`]
+/// - detached spawns → [`DetachedSpawnPersistence::persist`]
+/// - race-loser teardown → [`apply_race_loser_cancellations`]
+/// - awaited-child row + task creation → [`insert_awaited_child_execution`]
+/// - broken worker sessions → [`fail_activities_for_broken_sessions`]
+///
+/// # Event ordering
+///
+/// Every event is emitted at its own command's emission position through the
+/// shared [`build_suspension_events`], so the replay engine's strictly
+/// positional cursor sees exactly the order the live cycle produced — the same
+/// contract every other suspension path already honours. **No new
+/// `WorkflowEvent` variant and no event-schema change** (AC3).
+///
+/// The whole batch is appended with one [`store::append_events_offloaded`] call
+/// anchored at [`store::next_event_id_for`], which takes the execution row's
+/// `FOR UPDATE` lock. Holding that lock for the rest of the transaction
+/// serialises this append against a concurrent sibling child's
+/// `ChildWorkflowCompleted`/`Failed` append (which uses
+/// [`store::append_single_event`], taking the same lock), so the two can never
+/// collide on `UNIQUE(workflow_exec_id, event_id)`.
+///
+/// # Park semantics (AC4)
+///
+/// One boolean decides the park shape: *does this batch arm a deadline?*
+///
+/// - **Deadline present** (a `StartTimer`, or an `ArmTimer { for_await: true }`
+///   resolved by `plan_timer_lifecycle`): [`queue::reschedule_task`] to the
+///   **earliest** deadline and stamp `activity_name =
+///   'mixed_signal_suspension'`, so the second arm of
+///   `primary_repend_workflow_task_query` pulls the row forward the moment any
+///   *other* branch (an activity completion, a child terminal, a signal)
+///   wakes it — rather than sleeping to the deadline.
+/// - **No deadline**: [`queue::park_workflow_task`], the ordinary parked-RUNNING
+///   shape `wake_workflow_task` targets directly.
+///
+/// Both sub-paths honour the `wake_requested` no-lost-wake machinery: the park
+/// reads-and-clears it inherently, and the reschedule sub-path does so
+/// explicitly via [`queue::take_wake_requested`] (`reschedule_task` alone does
+/// not touch the flag).
+///
+/// After commit, every branch kind that could already be resolved is re-checked
+/// and a self-wake issued if so — pending signals (mirroring
+/// [`persist_signal_wait_park`]), waited-activity terminals (mirroring
+/// [`persist_activity_wait_park`]), and terminal children (mirroring
+/// [`persist_child_timeout_race`]). These re-checks are deliberately
+/// **non-locking** reads performed *after* the transaction: taking child
+/// execution row locks while holding the parent's would invert the
+/// child-completion path's own child → parent lock order.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn persist_mixed_suspension_batch(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    detached_spawns: DetachedSpawnPersistence<'_>,
+    task_id: uuid::Uuid,
+    parent_execution: &WorkflowExecution,
+    commands: &[WorkflowCommand],
+    batch: &MixedSuspensionBatch,
+    sticky: Option<queue::StickyHint<'_>>,
+    execute_span: &tracing::Span,
+    parent_priority: i32,
+) -> HarvestResult<()> {
+    let exec_id = execution_id_from_uuid(parent_execution.id);
+
+    // Capability miss (#804): resolve EVERY handler this batch needs before any
+    // row is written, so a worker missing an activity or child-workflow handler
+    // releases the parent's task for a capable peer instead of terminally
+    // failing an otherwise-healthy execution. `build_activity_enqueue_plan`
+    // raises `HandlerNotRegistered` for an unknown activity; children are
+    // checked here, mirroring `persist_all_started_child_workflows`.
+    for child in &batch.children {
+        if !registry.workflows.contains_key(&child.workflow_name) {
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: child.workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
+            });
+        }
+    }
+
+    let ActivityEnqueuePlan {
+        activity_events,
+        enqueued,
+        dynamic_rate_buckets,
+    } = build_activity_enqueue_plan(
+        registry,
+        exec_id,
+        &batch.scheduled_activities,
+        execute_span,
+        parent_execution.assigned_build_id.as_deref(),
+        parent_priority,
+        parent_execution.context_headers.as_ref(),
+        &parent_execution.input,
+    )?;
+
+    let offloader = registry.payload_offloader();
+    let telemetry = registry.telemetry().clone();
+    let owned_execute_span = execute_span.clone();
+    let shard_id = parent_execution.shard_id;
+
+    let outcome = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        use crate::schema::harvest_task_queue::dsl as queue_dsl;
+        let execute_span = owned_execute_span.clone();
+        let telemetry = telemetry.clone();
+
+        // Take the execution row's FOR UPDATE lock up front (and the true next
+        // event id with it). Held for the rest of the transaction, it serialises
+        // this whole batch against a concurrent sibling terminal's
+        // `append_single_event` on the same history.
+        let mut next_event_id = store::next_event_id_for(conn, exec_id).await?;
+
+        // Cancellable/renewable timer bookkeeping (issue #768) FIRST: the
+        // ArmTimer/CancelTimer row mutations, plus the positional
+        // TimerStarted/TimerCancelled events to interleave below. `armed_deadline`
+        // is the earliest `for_await: true` re-arm deadline, which this park must
+        // respect alongside the batch's own `StartTimer` deadlines.
+        let (mut timer_events, armed_deadline) =
+            plan_timer_lifecycle(conn, exec_id, commands).await?;
+
+        // Resolve each `StartTimer`'s row state and fire instant. An existing
+        // un-fired row means this is an idempotent re-park (the workflow woke on
+        // a sibling branch and re-emitted its still-pending timer): keep the
+        // recorded `fires_at` and emit no second `TimerStarted`.
+        //
+        // Anchor a fresh deadline to the DATABASE clock (`db_clock_now`), not the
+        // worker's: timer due-ness and signal `received_at` both come from
+        // Postgres `NOW()`, so the chronological wake ingest (`merge_wake_events`)
+        // compares instants from a single clock regardless of worker skew.
+        let mut timer_fire_instants: Vec<chrono::DateTime<chrono::Utc>> =
+            Vec::with_capacity(batch.timers.len());
+        let mut new_timer_rows: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        let mut timer_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
+            std::collections::VecDeque::with_capacity(batch.timers.len());
+        for timer in &batch.timers {
+            let existing: Option<HarvestTimer> = harvest_timers::table
+                .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .filter(harvest_timers::fired.eq(false))
+                .first::<HarvestTimer>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let fires_at = if let Some(ref ext) = existing {
+                ext.fires_at
+            } else {
+                let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                let db_now = db_clock_now(conn).await?;
+                let fires_at = db_now + fire_delay;
+                new_timer_rows.push((timer.timer_id.clone(), fires_at));
+                fires_at
+            };
+            timer_fire_instants.push(fires_at);
+            timer_started_events.push_back(existing.is_none().then(|| {
+                WorkflowEvent::TimerStarted {
+                    timer_id: timer.timer_id.clone(),
+                    duration_secs: timer.duration_secs,
+                }
+            }));
+        }
+
+        // Which children are genuinely new? A `StartChildWorkflow` whose row
+        // already exists is an idempotent re-park (a sibling branch woke the
+        // parent while this child is still running): no row, no task, no second
+        // `ChildWorkflowStarted`.
+        let requested_child_ids: Vec<uuid::Uuid> =
+            batch.children.iter().map(|c| c.child_id.as_uuid()).collect();
+        let existing_child_ids: HashSet<uuid::Uuid> = if requested_child_ids.is_empty() {
+            HashSet::new()
+        } else {
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq_any(&requested_child_ids))
+                .select(harvest_workflow_executions::id)
+                .load::<uuid::Uuid>(conn)
+                .await
+                .map_err(crate::error::database_error)?
+                .into_iter()
+                .collect()
+        };
+
+        // ADR-0001 §2.8: a `harvest.child_workflow.start` PRODUCER span per
+        // genuinely new child, parented to this executor cycle's execute span.
+        // `EnteredSpan` is `!Send`, so each span is fully dropped (via
+        // `.in_scope`) before the next `.await`.
+        let mut child_trace_ctxs: std::collections::HashMap<
+            uuid::Uuid,
+            Option<TraceContextCarrier>,
+        > = std::collections::HashMap::new();
+        let mut child_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
+            std::collections::VecDeque::with_capacity(batch.children.len());
+        for child in &batch.children {
+            let is_new = !existing_child_ids.contains(&child.child_id.as_uuid());
+            if is_new {
+                let ctx = tracing::info_span!(
+                    parent: &execute_span,
+                    "harvest.child_workflow.start",
+                    "otel.kind" = "producer",
+                    { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                    { ATTR_EXECUTION_ID } = %child.child_id,
+                    { ATTR_SHARD_ID } = shard_id,
+                )
+                .in_scope(|| telemetry.capture_trace_context());
+                child_trace_ctxs.insert(child.child_id.as_uuid(), ctx);
+            }
+            child_started_events.push_back(is_new.then(|| WorkflowEvent::ChildWorkflowStarted {
+                child_id: child.child_id,
+                workflow_name: child.workflow_name.clone(),
+                input: child.input.clone(),
+            }));
+        }
+
+        // Build the FULL event list in command-emission order. Each per-kind
+        // queue was filled in the same order the extractor walked `commands`, so
+        // popping the front as each command is visited pairs every event with its
+        // own command position. `WaitForActivity` and `WaitForSignal` emit
+        // nothing (their events arrive later, from the resolving branch).
+        let mut activity_iter = activity_events.into_iter();
+        let events = build_suspension_events(commands, &mut timer_events, |cmd| match cmd {
+            WorkflowCommand::ScheduleActivity { .. } => activity_iter.next(),
+            WorkflowCommand::StartTimer { .. } => timer_started_events.pop_front().flatten(),
+            WorkflowCommand::StartChildWorkflow { .. } => child_started_events.pop_front().flatten(),
+            _ => None,
+        });
+        if !events.is_empty() {
+            let inserted =
+                store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
+                    .await?;
+            next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
+        }
+
+        detached_spawns.persist(conn, commands).await?;
+
+        let deferred =
+            apply_race_loser_cancellations(conn, exec_id, commands, &mut next_event_id, registry)
+                .await?;
+
+        // Lazily register any dynamic per-key rate-limit buckets (issue #699) in
+        // the SAME transaction as the enqueue, so the fail-closed claim/dispatch
+        // gate always finds a bucket row (else the task would stall forever).
+        for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
+            queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+        }
+        let mut activity_task_ids = Vec::with_capacity(enqueued.len());
+        for params in &enqueued {
+            activity_task_ids.push(queue::enqueue(conn, params).await?);
+        }
+
+        // Insert the durable rows for genuinely new timers.
+        for (timer_id, fires_at) in &new_timer_rows {
+            let new_timer = NewHarvestTimer {
+                workflow_exec_id: exec_id.as_uuid(),
+                timer_id: timer_id.as_str(),
+                fires_at: *fires_at,
+            };
+            diesel::insert_into(harvest_timers::table)
+                .values(&new_timer)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+
+        // Issue #946: pre-acquire every distinct quota advisory lock this batch
+        // needs, in one deterministic (sorted) order, BEFORE inserting any child
+        // row. Without this, two concurrent parents fanning out to the same
+        // quota-governed keys in OPPOSITE command orders can each hold one key
+        // while waiting on the other -- a wait-for cycle Postgres resolves by
+        // aborting one with a raw `deadlock_detected` error, which is NOT
+        // `QuotaExceeded` and would therefore terminally fail an otherwise-healthy
+        // parent over a transient serialization conflict. `lock_quota_key`'s
+        // `pg_advisory_xact_lock` is re-entrant within one transaction, so
+        // `enforce_quota_admission`'s own later call simply re-acquires what is
+        // already held. The set mirrors exactly what that path would lock.
+        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for child in &batch.children {
+            if existing_child_ids.contains(&child.child_id.as_uuid()) {
+                continue;
+            }
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
+        // Insert the row + enqueue the task for each genuinely new child, through
+        // the same helper the #779 child-timeout race uses (which resolves the
+        // child's OWN registered defaults and enforces its OWN declared quota).
+        for child in &batch.children {
+            if existing_child_ids.contains(&child.child_id.as_uuid()) {
+                continue;
+            }
+            let trace_ctx = child_trace_ctxs
+                .get(&child.child_id.as_uuid())
+                .cloned()
+                .flatten();
+            insert_awaited_child_execution(
+                conn,
+                registry,
+                parent_execution,
+                exec_id,
+                child,
+                trace_ctx,
+            )
+            .await?;
+        }
+
+        // Worker sessions (issue #606): fail any member activity whose session
+        // already left ACTIVE so the workflow observes SessionBroken on its next
+        // decision cycle instead of hanging on a task pinned to a dead host.
+        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+            conn,
+            exec_id,
+            &batch.scheduled_activities,
+            &activity_task_ids,
+            &mut next_event_id,
+        )
+        .await?;
+
+        // ── park ────────────────────────────────────────────────────────────
+        let deadline = timer_fire_instants
+            .iter()
+            .copied()
+            .chain(armed_deadline)
+            .min();
+
+        let had_wake_requested = if let Some(fires_at) = deadline {
+            // Read-and-clear FIRST: `reschedule_task` does not touch
+            // `wake_requested`, so a wake that landed on the still-claimed row
+            // before this transaction took its lock would otherwise be discarded
+            // and the task would sleep to `fires_at`.
+            let had_wake = queue::take_wake_requested(conn, task_id).await?;
+            queue::reschedule_task(conn, task_id, fires_at).await?;
+            // The `mixed_signal_suspension` sentinel is what lets ANY other
+            // branch's wake pull this PENDING row forward before its deadline
+            // (`primary_repend_workflow_task_query`'s second arm). Stamped
+            // unconditionally on this sub-path, so it also covers issue
+            // #678/#1034: when a same-shard external op resolved INLINE this
+            // cycle, the arm-level self-wake in `persist_workflow_outcome`'s
+            // `Suspended` arm re-pends this PENDING row through the same query.
+            // (The no-deadline sub-path parks RUNNING, which that query's FIRST
+            // arm already matches, so no stamp is needed there.)
+            diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+                .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if sticky.is_some() {
+                queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
+            }
+            had_wake
+        } else {
+            queue::park_workflow_task(conn, task_id, sticky).await?
+        };
+
+        Ok((
+            deferred,
+            had_wake_requested,
+            synthesized_broken_session_failure,
+        ))
+    }))
+    .await;
+
+    let (deferred, had_wake_requested, synthesized_broken_session_failure) = match outcome {
+        Ok(v) => v,
+        // A target tenant's quota is an ADMISSION constraint on an unrelated
+        // key, never a genuine failure of THIS parent. The whole transaction
+        // above rolled back (no child rows, no timer rows, no events), so park
+        // and immediately wake the parent: a later poll re-drives the identical
+        // decision cycle from the unchanged recorded history and retries once
+        // the target tenant has capacity. Mirrors the two child persist paths
+        // (issue #946).
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            tracing::warn!(
+                parent_execution_id = %exec_id,
+                workflow_name = %workflow_name,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "quota exceeded spawning a child workflow from a mixed suspension \
+                 batch; parking the parent task to retry once capacity frees up \
+                 rather than failing the parent over an unrelated tenant's quota",
+            );
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    for start in deferred {
+        start.spawn();
+    }
+
+    for timer in &batch.timers {
+        #[allow(clippy::cast_precision_loss)]
+        let duration_secs = timer.duration_secs as f64;
+        registry
+            .telemetry()
+            .metrics
+            .record_timer_started(duration_secs);
+    }
+
+    // ── post-commit self-wake re-checks ─────────────────────────────────────
+    //
+    // Each mirrors the equivalent check on the single-shape path it generalizes.
+    // A branch that resolved in the window between this cycle's history load and
+    // the park's own atomic write called `wake_workflow_task` against a
+    // still-claimed row; `wake_requested` catches most of those, and these
+    // re-checks close the rest. Deliberately non-locking reads run AFTER commit,
+    // so no child row lock is ever taken while the parent's is held (which would
+    // invert the child-completion path's child → parent order).
+    //
+    // Safety: a branch resolving *after* these checks finds the committed row —
+    // parked-RUNNING, or PENDING with the `mixed_signal_suspension` sentinel —
+    // and its own `wake_workflow_task` re-pends it. There is no gap.
+
+    // The synthesized SessionBroken failures are tied to no external wake source
+    // (they were resolved entirely inside the transaction), so the workflow must
+    // be woken unconditionally to observe them.
+    let mut needs_wake = had_wake_requested || synthesized_broken_session_failure;
+
+    if !needs_wake && batch.waits_on_signal {
+        needs_wake = !signal::load_pending_signals(conn, exec_id).await?.is_empty();
+    }
+
+    if !needs_wake && !batch.activity_waits.is_empty() {
+        let history = store::load_history(conn, exec_id).await?;
+        needs_wake = batch
+            .activity_waits
+            .iter()
+            .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
+    }
+
+    if !needs_wake && !batch.children.is_empty() {
+        let child_ids: Vec<uuid::Uuid> =
+            batch.children.iter().map(|c| c.child_id.as_uuid()).collect();
+        let child_states: Vec<String> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq_any(&child_ids))
+            .select(harvest_workflow_executions::state)
+            .load::<String>(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        needs_wake = child_states.iter().any(|s| {
+            matches!(
+                s.as_str(),
+                "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
+            )
+        });
+    }
+
+    if needs_wake {
+        queue::wake_workflow_task(conn, exec_id).await?;
     }
 
     Ok(())
@@ -12730,6 +13530,27 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
+    } else if let Some(mixed) = extract_mixed_suspension_batch(commands) {
+        // Issue #950: the generalized HETEROGENEOUS batch — any combination of
+        // activities, durable timers, signal waits and child workflows from one
+        // `join!`/`try_join!`/`ctx.race()`. Deliberately the LAST arm before the
+        // fail-loud path: every shape above still takes its own dedicated
+        // persist function, so existing histories are byte-for-byte unchanged
+        // (AC6) and this arm only ever claims batches that terminally failed the
+        // workflow before this issue.
+        persist_mixed_suspension_batch(
+            conn,
+            registry,
+            detached_spawns,
+            context.persistence.task.id,
+            context.execution,
+            commands,
+            &mixed,
+            sticky,
+            context.execute_span,
+            context.persistence.task.priority,
+        )
+        .await
     } else {
         let error = suspended_workflow_error(commands);
         fail_suspended_workflow_if_still_claimed(
@@ -14844,6 +15665,24 @@ async fn suspended_command_event_count(
     if should_handle_mutex_acquire(commands) {
         return Ok(bookkeeping_events.saturating_add(1));
     }
+    // Issue #950: the generalized mixed batch appends one `ActivityScheduled`
+    // per fresh activity, one `TimerStarted` per NEW timer row, and one
+    // `ChildWorkflowStarted` per NEW child. Counted conservatively — the
+    // preflight runs before the DB-dependent new-vs-existing resolution, so an
+    // idempotent re-park (which appends nothing for that branch) is still
+    // counted. Over-counting only nudges the history hard-cap check earlier
+    // (DLQ one event early); it can never mask an overflow. Signal waits and
+    // activity re-park waits append nothing. Mirrors the dispatch chain
+    // ordering: checked last, just before the default.
+    if let Some(mixed) = extract_mixed_suspension_batch(commands) {
+        let branch_events = mixed
+            .scheduled_activities
+            .len()
+            .saturating_add(mixed.timers.len())
+            .saturating_add(mixed.children.len());
+        return Ok(bookkeeping_events
+            .saturating_add(u64::try_from(branch_events).unwrap_or(u64::MAX)));
+    }
 
     Ok(update_events.saturating_add(1))
 }
@@ -15577,6 +16416,28 @@ async fn process_workflow_task(
                         .iter()
                         .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
+                // Issue #950 (AC8): a local activity co-batched with a DURABLE
+                // sibling wait (an activity, a timer, a child, a signal) is
+                // rejected with an immediate typed error. Before this, the
+                // sibling commands were silently dropped by
+                // `extract_run_local_activity`, so e.g.
+                // `join!(ctx.local_activity(..), ctx.timer(..))` armed its
+                // deadline a whole decision cycle late with no error anywhere.
+                // Raised BEFORE any of the commits below so a rejected batch
+                // leaves no partial durable trace. See
+                // `local_activity_batch_conflict` for the rationale and the
+                // supported alternatives.
+                if let Some(reason) = local_activity_batch_conflict(&commands) {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(HarvestError::Config(reason)),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                    )
+                    .await;
+                }
                 // Issue #804 (Codex round-19 P2): bail out for a capable peer
                 // BEFORE the five commits below. `run_local_activity_inline`
                 // resolves the handler at its top, so raising here is
@@ -26343,6 +27204,313 @@ mod tests {
             extract_child_timeout_race(&ordinary).is_none(),
             "a child + ordinary (non-`__child_timeout:`) timer must NOT match the \
              child-timeout race"
+        );
+    }
+
+    // ── extract_mixed_suspension_batch (issue #950) ──────────────────────────
+
+    fn mixed_schedule_activity(name: &str) -> WorkflowCommand {
+        WorkflowCommand::ScheduleActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+            queue: String::new(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+        }
+    }
+
+    fn mixed_start_timer(id: &str, secs: u64) -> WorkflowCommand {
+        WorkflowCommand::StartTimer {
+            timer_id: TimerId::new(id),
+            duration_secs: secs,
+            result_tx: oneshot::channel::<()>().0,
+        }
+    }
+
+    fn mixed_wait_signal(name: &str) -> WorkflowCommand {
+        WorkflowCommand::WaitForSignal {
+            signal_name: name.to_string(),
+            result_tx: oneshot::channel::<serde_json::Value>().0,
+        }
+    }
+
+    fn mixed_start_child(name: &str) -> WorkflowCommand {
+        WorkflowCommand::StartChildWorkflow {
+            child_id: ExecutionId::new(),
+            workflow_name: name.to_string(),
+            input: serde_json::json!({}),
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+        }
+    }
+
+    fn mixed_wait_activity() -> WorkflowCommand {
+        WorkflowCommand::WaitForActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+        }
+    }
+
+    /// AC1/AC2 core: every mixed composition named in the issue's success
+    /// metric is accepted by the generalized extractor, with each branch landing
+    /// in its own bucket.
+    #[test]
+    fn extract_mixed_suspension_batch_accepts_the_success_metric_matrix() {
+        // activity × timer
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_schedule_activity("charge"),
+            mixed_start_timer("deadline", 30),
+        ])
+        .expect("activity × timer must be a persistable mixed batch");
+        assert_eq!(batch.scheduled_activities.len(), 1);
+        assert_eq!(batch.timers.len(), 1);
+        assert!(!batch.waits_on_signal);
+
+        // activity × signal
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_schedule_activity("charge"),
+            mixed_wait_signal("abort"),
+        ])
+        .expect("activity × signal must be a persistable mixed batch");
+        assert_eq!(batch.scheduled_activities.len(), 1);
+        assert!(batch.waits_on_signal);
+
+        // child × timer with an ORDINARY (non-`__child_timeout:`) timer id — the
+        // shape `extract_child_timeout_race` deliberately rejects.
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_start_child("settle"),
+            mixed_start_timer("mydeadline", 30),
+        ])
+        .expect("child × ordinary timer must be a persistable mixed batch");
+        assert_eq!(batch.children.len(), 1);
+        assert_eq!(batch.timers.len(), 1);
+
+        // child × signal
+        let batch =
+            extract_mixed_suspension_batch(&[mixed_start_child("settle"), mixed_wait_signal("go")])
+                .expect("child × signal must be a persistable mixed batch");
+        assert_eq!(batch.children.len(), 1);
+        assert!(batch.waits_on_signal);
+
+        // activity × child
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_schedule_activity("charge"),
+            mixed_start_child("settle"),
+        ])
+        .expect("activity × child must be a persistable mixed batch");
+        assert_eq!(batch.scheduled_activities.len(), 1);
+        assert_eq!(batch.children.len(), 1);
+
+        // 3-way activity × timer × signal
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_schedule_activity("charge"),
+            mixed_start_timer("deadline", 30),
+            mixed_wait_signal("abort"),
+        ])
+        .expect("activity × timer × signal must be a persistable mixed batch");
+        assert_eq!(batch.scheduled_activities.len(), 1);
+        assert_eq!(batch.timers.len(), 1);
+        assert!(batch.waits_on_signal);
+    }
+
+    /// AC7: the fan-out "stale re-park leaks into the next suspension batch"
+    /// shape — a `WaitForActivity`/`StartChildWorkflow` re-park alongside an
+    /// unrelated new command — is persistable instead of terminal.
+    #[test]
+    fn extract_mixed_suspension_batch_accepts_the_stale_repark_fanout_shapes() {
+        assert!(
+            extract_mixed_suspension_batch(&[
+                mixed_start_child("still_running"),
+                mixed_schedule_activity("unrelated_activity"),
+            ])
+            .is_some(),
+            "the #601 child fan-out stale re-park + unrelated activity batch must persist"
+        );
+        assert!(
+            extract_mixed_suspension_batch(&[
+                mixed_wait_activity(),
+                mixed_schedule_activity("unrelated_activity"),
+            ])
+            .is_some(),
+            "the #359 activity fan-out stale re-park + unrelated activity batch must persist"
+        );
+    }
+
+    /// Multiple durable timers in one batch (`join!` of two `ctx.timer`s) is
+    /// rejected by `extract_started_timer_for_suspension` today; the mixed path
+    /// takes it and parks at the EARLIEST deadline.
+    #[test]
+    fn extract_mixed_suspension_batch_accepts_parallel_timers() {
+        let batch =
+            extract_mixed_suspension_batch(&[mixed_start_timer("a", 30), mixed_start_timer("b", 5)])
+                .expect("two parallel timers must be persistable");
+        assert_eq!(batch.timers.len(), 2);
+    }
+
+    /// Bookkeeping already tolerated by every other extractor rides along.
+    #[test]
+    fn extract_mixed_suspension_batch_tolerates_bookkeeping() {
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "race:1".to_string(),
+                details: serde_json::json!(2u64),
+            },
+            WorkflowCommand::CancelRaceLosers {
+                activities: vec![crate::types::ActivityExecId::new()],
+                children: vec![],
+                timers: vec![],
+            },
+            mixed_schedule_activity("charge"),
+            mixed_start_timer("deadline", 30),
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id: ExecutionId::new(),
+                workflow_name: "audit".to_string(),
+                input: serde_json::json!({}),
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+        ];
+        assert!(
+            extract_mixed_suspension_batch(&commands).is_some(),
+            "markers, race-loser cancellations and detached spawns must be tolerated"
+        );
+    }
+
+    /// Fail-loud is preserved for every command kind the mixed path does NOT
+    /// know how to persist: a mixed batch must never silently drop work.
+    #[test]
+    fn extract_mixed_suspension_batch_rejects_unsupported_kinds() {
+        let unsupported: Vec<(&str, WorkflowCommand)> = vec![
+            (
+                "AcquireMutex",
+                WorkflowCommand::AcquireMutex {
+                    key: "k".to_string(),
+                    result_tx: oneshot::channel::<i64>().0,
+                },
+            ),
+            (
+                "ScheduleExternalActivity",
+                WorkflowCommand::ScheduleExternalActivity {
+                    activity_id: crate::types::ActivityExecId::new(),
+                    token: crate::types::ExternalActivityToken::new(),
+                    name: "ext".to_string(),
+                    input: serde_json::json!({}),
+                    queue: String::new(),
+                    schedule_to_close_secs: 60,
+                    result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                },
+            ),
+        ];
+        for (label, cmd) in unsupported {
+            let commands = vec![mixed_schedule_activity("charge"), mixed_start_timer("d", 5), cmd];
+            assert!(
+                extract_mixed_suspension_batch(&commands).is_none(),
+                "a co-batched {label} must fall through to the fail-loud path"
+            );
+        }
+    }
+
+    /// A batch with no durable wait/dispatch command at all is not a mixed
+    /// suspension — `only_bookkeeping_commands` owns that case.
+    #[test]
+    fn extract_mixed_suspension_batch_rejects_bookkeeping_only_and_empty() {
+        assert!(extract_mixed_suspension_batch(&[]).is_none());
+        assert!(
+            extract_mixed_suspension_batch(&[WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: serde_json::Value::Null,
+            }])
+            .is_none(),
+            "a bookkeeping-only batch is not a mixed suspension"
+        );
+    }
+
+    /// AC6 (backward compatibility), enforced at the routing level: every batch
+    /// shape that has its own dedicated arm today must still be claimed by that
+    /// arm, so its persistence is byte-for-byte unchanged. The mixed extractor
+    /// is the LAST arm before the fail-loud path, so this is expressed as "the
+    /// legacy predicate still matches" — the dispatcher checks them first.
+    #[test]
+    fn legacy_suspension_shapes_are_still_claimed_by_their_own_arms() {
+        // N ScheduleActivity
+        let acts = vec![mixed_schedule_activity("a"), mixed_schedule_activity("b")];
+        assert!(extract_all_scheduled_activities(&acts).is_some());
+
+        // N WaitForActivity
+        let waits = vec![mixed_wait_activity(), mixed_wait_activity()];
+        assert!(extract_all_activity_waits(&waits).is_some());
+
+        // N StartChildWorkflow
+        let children = vec![mixed_start_child("a"), mixed_start_child("b")];
+        assert!(extract_all_started_child_workflows(&children).is_some());
+
+        // one StartTimer
+        let timer = vec![mixed_start_timer("t", 5)];
+        assert!(extract_started_timer_for_suspension(&timer).is_some());
+
+        // the #476 timer + signal shape
+        let timer_signal = vec![mixed_start_timer("t", 5), mixed_wait_signal("s")];
+        assert!(
+            extract_started_timer_for_suspension(&timer_signal).is_some(),
+            "the #476 timer+signal shape must keep its own arm"
+        );
+
+        // the #779 child-timeout race
+        assert!(extract_child_timeout_race(&child_timeout_batch()).is_some());
+
+        // N WaitForSignal
+        let signals = vec![mixed_wait_signal("a"), mixed_wait_signal("b")];
+        assert!(should_requeue_signal_wait(&signals));
+    }
+
+    /// AC8: a `RunLocalActivity` co-batched with a durable sibling wait is
+    /// rejected with an immediate typed error rather than silently deferring
+    /// (dropping) the sibling.
+    #[test]
+    fn local_activity_mixed_with_durable_waits_is_rejected() {
+        let local = WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "compute".to_string(),
+            input: serde_json::json!({}),
+            start_to_close: None,
+            retry_policy: None,
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        };
+        let commands = vec![local, mixed_start_timer("deadline", 30)];
+        let rejected = local_activity_batch_conflict(&commands)
+            .expect("a local activity beside a durable timer must be rejected");
+        assert!(
+            rejected.contains("StartTimer"),
+            "the typed error must name the dropped sibling command: {rejected}"
+        );
+
+        // A local activity ALONE (or with pure bookkeeping) stays legal.
+        let solo = vec![
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "compute".to_string(),
+                input: serde_json::json!({}),
+                start_to_close: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+            WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: serde_json::Value::Null,
+            },
+        ];
+        assert!(
+            local_activity_batch_conflict(&solo).is_none(),
+            "a solo local activity plus bookkeeping must stay legal"
         );
     }
 

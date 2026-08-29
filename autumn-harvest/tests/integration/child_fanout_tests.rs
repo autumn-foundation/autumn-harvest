@@ -392,8 +392,8 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
     }
 }
 
-/// **Known limitation** (PR #901 review, shared with the pre-existing activity
-/// fan-out from issue #359 -- not introduced by child fan-out): when an
+/// **Resolved by issue #950** (previously a documented known limitation from PR
+/// #901, shared with the pre-existing activity fan-out of issue #359): when an
 /// earlier-slot child is still `ChildInProgress` (started, no terminal
 /// recorded yet) while a later-slot child has a recorded failure,
 /// `try_join_all` polls the earlier slot first during the same sweep that
@@ -405,32 +405,29 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
 /// drops the still-pending future. If the workflow catches the fail-fast
 /// error and pushes a different command (e.g. schedules an activity), both
 /// commands land in the *same* suspension batch: a stale re-park alongside
-/// an unrelated new command. The worker's dispatch logic (`worker.rs`,
-/// `suspended_workflow_error`) only recognizes single-shape suspension
-/// batches, so this mixed batch hits "workflow task suspended with
-/// unsupported commands ...; this command set is not implemented yet" and
-/// fails the workflow outright -- even though the user only handled the
-/// fan-out error and continued normally.
+/// an unrelated new command.
+///
+/// That batch is still emitted (the combinator semantics are unchanged), but it
+/// is no longer fatal: the worker's suspension-persistence layer now persists
+/// an arbitrary MIXED command batch in one transaction
+/// (`extract_mixed_suspension_batch` / `persist_mixed_suspension_batch`), so a
+/// `StartChildWorkflow` re-park sharing a batch with a `ScheduleActivity` is a
+/// benign re-park: the still-running child is recognised as already-started (no
+/// second row, no second `ChildWorkflowStarted`), the new activity is enqueued,
+/// and the workflow is parked to be woken by whichever resolves first. The
+/// pre-#950 outcome -- "workflow task suspended with unsupported commands ...;
+/// this command set is not implemented yet", terminally failing a workflow that
+/// merely caught a fan-out error and continued -- is gone.
 ///
 /// `execute_activity_fan_out_raw` (issue #359) has the identical structure
 /// (`ActivityInProgress` also pushes `WaitForActivity` then suspends before
-/// returning), so this is a pre-existing, shared limitation, not something
-/// introduced by child fan-out. Properly fixing it needs either abandoning
-/// `try_join_all`'s natural poll-all-every-time semantics for a custom
-/// combinator that never touches a sibling slot once the fail-fast winner is
-/// known, or a side-effect-free way to peek "is this child already failed in
-/// history" against the stateful, cursor-based `HistoryMatcher` without
-/// consuming its cursor -- both are large, cross-cutting changes shared with
-/// the activity fan-out primitive, out of scope for issue #601.
+/// returning), so the same fix covers it.
 ///
-/// This test proves the defect at the `WorkflowOutcome` level (a full
-/// worker-level reproduction of the resulting `WorkflowFailed` needs a
-/// DB-backed integration test, since the "unsupported commands" check lives
-/// in `worker.rs`, not the pure `executor::run_workflow` used here): the
-/// commands returned alongside the fail-fast error already contain the
-/// stale `StartChildWorkflow` re-park for the still-pending sibling.
-#[tokio::test]
-async fn child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next_suspension() {
+/// This test asserts the batch's shape at the `WorkflowOutcome` level (a full
+/// worker-level end-to-end proof lives in the DB-backed
+/// `mixed_suspension_tests.rs`, since the dispatch decision lives in
+/// `worker.rs`, not the pure `executor::run_workflow` used here).
+async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
     let exec_id = ExecutionId::new();
     let id_pending = ExecutionId::new();
     let id_fail = ExecutionId::new();
@@ -476,8 +473,8 @@ async fn child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next
             });
             assert!(
                 has_stale_repark,
-                "known limitation: the still-pending sibling's re-park command \
-                 should leak into this suspension batch -- got: {commands:?}"
+                "the still-pending sibling's re-park command rides along in this \
+                 suspension batch -- got: {commands:?}"
             );
             assert!(
                 has_unrelated_activity,
@@ -488,13 +485,21 @@ async fn child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next
                 commands.len(),
                 2,
                 "batch should contain exactly the stale re-park plus the new \
-                 activity -- a worker receiving this mixed batch has no single \
-                 recognized shape to persist it as; got: {commands:?}"
+                 activity; got: {commands:?}"
+            );
+            // Issue #950: this exact `StartChildWorkflow` + `ScheduleActivity`
+            // shape is what the generalized mixed-batch persist path now
+            // accepts. Before #950 it matched NO extractor and the worker
+            // terminally failed the workflow with "unsupported commands".
+            assert!(
+                autumn_harvest::worker::mixed_suspension_batch_is_persistable(&commands),
+                "the mixed stale-re-park batch must be persistable by the worker \
+                 rather than terminally failing the workflow: {commands:?}"
             );
         }
         other => panic!(
-            "expected Suspended with a mixed stale-repark + new-command batch \
-             (known limitation), got: {other:?}"
+            "expected Suspended with a mixed stale-repark + new-command batch, \
+             got: {other:?}"
         ),
     }
 }

@@ -180,6 +180,7 @@ Direct sleeps block the worker task and write nothing to `harvest_events`. After
 | **Disallowed** | `tokio::spawn(async { do_work().await });` |
 | **Disallowed** | `std::thread::spawn(|| heavy_computation());` |
 | **Allowed** | `futures::join!(ctx.execute_activity_raw("a", input, "q"), ctx.execute_activity_raw("b", input, "q"))` |
+| **Allowed** | `futures::join!(ctx.execute_activity_raw("a", input, "q"), ctx.timer("deadline", 30))` — any mix of ctx-managed awaitables (issue #950) |
 | **Allowed** | `#[activity(local = true)]` for lightweight in-process work |
 
 Spawned tasks run outside Harvest supervision: they are not retried, not recorded, and are silently abandoned on worker restart.
@@ -344,6 +345,7 @@ HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break det
 | **Disallowed** | `futures::future::select(fut_a, fut_b).await` (also `select_all` / `select_ok` / `try_select`) |
 | **Allowed** | `ctx.race().timer(Duration::from_secs(60)).signal("approve").run().await?` |
 | **Allowed** | `ctx.race().activity_raw("fetch_a", input, "q").activity_raw("fetch_b", input, "q").run().await?` |
+| **Allowed** | `ctx.race().activity_raw("fetch", input, "q").timer(Duration::from_secs(30)).signal("abort").run().await?` |
 
 HVG010 flags both the select **macros** (`tokio::select!`, `futures::select!`, `futures::select_biased!`) and their function-call siblings, the `futures::future::{select, select_all, select_ok, try_select}` **combinators** (issue #799) — they carry the identical footgun. (Inside an `#[activity]` body `select!` is fine: only the activity's recorded *result* matters, not its internal control flow, so activities may race freely.)
 
@@ -380,7 +382,7 @@ async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, Str
 }
 ```
 
-`ctx.race()` currently supports three shapes in one call: a homogeneous race of activity branches, a homogeneous race of child-workflow branches, or exactly one timer branch paired with exactly one signal branch (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476). Mixing branch kinds (e.g. an activity racing a timer in the same call) is out of scope for this slice and returns `HarvestError::Config` — bound an individual activity with its own `start_to_close`/`schedule_to_close` timeout, or compose a separate `receive_signal_timeout`, to express a deadline-bounded branch instead. See the `WorkflowContext::race` rustdoc for the full determinism contract.
+`ctx.race()` accepts **any combination** of ctx-managed awaitables in one call (issue #950): activities, child workflows, `.timer(..)` deadlines and `.signal(..)` waits compose freely, so hedging a slow activity against a deadline, awaiting a child under a timeout, and listening for an abort signal while an activity runs are all expressible directly. The whole heterogeneous batch is persisted by the worker in one transaction, and each branch resolves independently as its own event arrives. A losing timer's still-armed durable row is deleted by the same `CancelRaceLosers` teardown that cancels a losing activity or child; a losing signal needs no teardown (an undelivered signal stays observable to a later wait). The one exception is an inline **local activity**, which resolves within the decision cycle rather than parking and is rejected with a typed error rather than silently deferring its siblings. The exactly-one-timer + exactly-one-signal pair keeps its dedicated pre-#950 implementation (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476) so histories recorded before #950 replay unchanged — it records the reserved `__signal_timeout:{seq}:{name}` timer id, no `race:{seq}` marker, and fixed role-based winner indices. See the `WorkflowContext::race` rustdoc for the full determinism contract.
 
 #### Guardrail severity
 

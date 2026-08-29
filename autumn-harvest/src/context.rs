@@ -1337,13 +1337,15 @@ enum RaceBranchKind {
         workflow_name: String,
         input: Value,
     },
-    /// Paired with exactly one [`RaceBranchKind::Signal`] branch and no other
-    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
+    /// A durable deadline branch. Composes freely with every other branch kind
+    /// (issue #950); the exactly-one-timer + exactly-one-signal pair keeps its
+    /// dedicated legacy path — see [`RaceBuilder::run`].
     Timer {
         duration_secs: u64,
     },
-    /// Paired with exactly one [`RaceBranchKind::Timer`] branch and no other
-    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
+    /// A signal-arrival branch. Composes freely with every other branch kind
+    /// (issue #950); the exactly-one-timer + exactly-one-signal pair keeps its
+    /// dedicated legacy path — see [`RaceBuilder::run`].
     Signal {
         signal_name: String,
     },
@@ -1362,6 +1364,10 @@ struct RaceDispatch {
     index: usize,
     activity_id: Option<ActivityExecId>,
     child_id: Option<ExecutionId>,
+    /// The reserved `__race:{seq}:{index}` id of a timer branch's durable timer
+    /// (issue #950). `Some` only for [`RaceBranchKind::Timer`] branches; a
+    /// losing timer's still-armed row is deleted via `CancelRaceLosers.timers`.
+    timer_id: Option<TimerId>,
     /// `true` when this branch has never been dispatched before (its command
     /// must carry full scheduling parameters); `false` when it is already in
     /// history and only needs a `WaitForActivity` re-park.
@@ -1372,9 +1378,10 @@ struct RaceDispatch {
 #[derive(Debug, Clone)]
 pub struct RaceWinner {
     /// Index of the winning branch, in the order branches were added to the
-    /// [`RaceBuilder`] -- **except** for the timer+signal shape, where this
-    /// is a fixed role-based index (timer = `0`, signal = `1`) independent of
-    /// `.timer()`/`.signal()` call order; see [`RaceBuilder`]'s docs.
+    /// [`RaceBuilder`] -- **except** for the legacy exactly-one-timer +
+    /// exactly-one-signal shape, where this is a fixed role-based index
+    /// (timer = `0`, signal = `1`) independent of `.timer()`/`.signal()` call
+    /// order; see [`RaceBuilder`]'s docs.
     pub index: usize,
     /// The label attached via [`RaceBuilder::label`], if any.
     pub label: Option<String>,
@@ -1410,28 +1417,37 @@ impl RaceWinner {
 ///   races child workflows; every losing child is durably cancelled via the
 ///   same `cancel_workflow_execution_collect` primitive the external-cancel
 ///   feature uses (issue #492).
-/// - **Exactly one [`Self::timer`] + exactly one [`Self::signal`]**: a thin
-///   wrapper around the fully-tested
+/// - **Any mix of the four kinds** (issue #950): activities, child workflows,
+///   [`Self::timer`] deadlines and [`Self::signal`] waits compose freely in one
+///   call — hedging a slow activity against a deadline, awaiting a child under
+///   a timeout, or listening for an abort signal while an activity runs. The
+///   whole heterogeneous batch is persisted by the worker in **one
+///   transaction**, and every branch resolves independently as its own event
+///   arrives. A timer branch arms a durable timer under the reserved,
+///   deterministic id `__race:{seq}:{index}`; when it loses, that still-armed
+///   row is deleted by the same `CancelRaceLosers` teardown that cancels a
+///   losing activity or child. A losing signal branch needs no teardown — an
+///   undelivered signal simply stays observable to a later wait. A timer
+///   branch's [`RaceWinner::value`] is [`Value::Null`].
+/// - **Exactly one [`Self::timer`] + exactly one [`Self::signal`]**: kept as a
+///   thin wrapper around the fully-tested
 ///   [`WorkflowContext::receive_signal_timeout`]/`wait_for_signal_timeout`
-///   primitive (issue #476). A losing signal simply stays observable to a
-///   later signal wait (nothing to durably cancel); a losing timer's
-///   still-armed durable timer row is removed by the worker exactly as it is
-///   today. Unlike the two homogeneous shapes above, [`RaceWinner::index`]
-///   for this shape is a **fixed, role-based** value (the timer branch is
-///   always `0`, the signal branch is always `1`) rather than each branch's
-///   position in the builder chain — reordering `.timer()`/`.signal()` calls
-///   between deploys can never flip which index an in-flight execution
-///   observes, because the underlying winner determination is itself decided
-///   purely by recorded history order, independent of call order.
+///   primitive (issue #476), so histories recorded before #950 replay
+///   unchanged. This shape records the reserved
+///   `__signal_timeout:{seq}:{name}` timer id and **no** `race:{seq}` open
+///   marker, and [`RaceWinner::index`] is a **fixed, role-based** value (the
+///   timer branch is always `0`, the signal branch is always `1`) rather than
+///   each branch's position in the builder chain — reordering
+///   `.timer()`/`.signal()` calls between deploys can never flip which index
+///   an in-flight execution observes, because the underlying winner
+///   determination is itself decided purely by recorded history order,
+///   independent of call order.
 ///
-/// Mixing branch kinds outside of these three shapes (e.g. racing an activity
-/// against a timer in the same call) returns [`HarvestError::Config`] from
-/// [`Self::run`] — the worker's suspension-persistence layer does not yet
-/// support a fully heterogeneous mixed-command batch (see the crate-level
-/// determinism guide, HVG010, for the rationale). Bound an individual
-/// activity with its own `start_to_close`/`schedule_to_close` timeout, or use
-/// `receive_signal_timeout` directly, to express a deadline-bounded branch
-/// instead.
+/// The only awaitable that cannot join a race is an inline **local activity**:
+/// it resolves within the decision cycle rather than parking, so it is
+/// rejected with a typed error rather than silently deferring its siblings
+/// (issue #950). Arbitrary non-ctx user futures remain outside the determinism
+/// contract (guardrail HVG010).
 ///
 /// # Determinism contract
 ///
@@ -1531,9 +1547,10 @@ impl RaceBuilder<'_> {
         })
     }
 
-    /// Add a durable-timer branch. Must be paired with exactly one
-    /// [`Self::signal`] branch and no other branches — see [`Self::run`].
-    /// `timeout` is rounded **up** to whole seconds.
+    /// Add a durable-timer branch — the deadline arm of a hedged or
+    /// timeout-bounded race. Composes with any other branch kind (issue #950).
+    /// `timeout` is rounded **up** to whole seconds. A timer win resolves to
+    /// [`RaceWinner::value`] `Value::Null`.
     #[must_use]
     pub fn timer(self, timeout: std::time::Duration) -> Self {
         let duration_secs = timeout
@@ -1542,8 +1559,9 @@ impl RaceBuilder<'_> {
         self.push(RaceBranchKind::Timer { duration_secs })
     }
 
-    /// Add a signal branch. Must be paired with exactly one [`Self::timer`]
-    /// branch and no other branches — see [`Self::run`].
+    /// Add a signal branch — e.g. an abort signal interrupting a running
+    /// activity or child workflow. Composes with any other branch kind (issue
+    /// #950). A signal win resolves to the signal's payload.
     #[must_use]
     pub fn signal(self, signal_name: &str) -> Self {
         self.push(RaceBranchKind::Signal {
@@ -1574,9 +1592,7 @@ impl RaceBuilder<'_> {
     ///   [`Self::child_workflow`] branch's input could not be serialized
     ///   (surfaced here rather than silently running the branch with a
     ///   `null` input).
-    /// - [`HarvestError::Config`] if zero branches were added, or if the
-    ///   branch kinds don't form one of the three supported shapes (see the
-    ///   type-level docs).
+    /// - [`HarvestError::Config`] if zero branches were added.
     /// - [`HarvestError::Cancelled`] if the workflow has been cancelled.
     /// - [`HarvestError::NonDeterministic`] if replay disagrees with a
     ///   previously recorded winner or branch count.
@@ -1589,6 +1605,42 @@ impl RaceBuilder<'_> {
     }
 }
 
+/// The live-mode receiving end of one race branch (issue #950).
+///
+/// The four branch kinds park on channels of three different payload types
+/// (`Result<Value, String>` for activities and child workflows, `Value` for a
+/// signal, `()` for a timer), so a mixed race cannot hold a homogeneous
+/// `Vec<oneshot::Receiver<_>>`. Each variant normalises to the same
+/// `Result<Value, String>` the race future yields.
+enum RaceBranchReceiver {
+    /// An activity or child-workflow branch: the worker sends the branch's
+    /// output or its error string.
+    Output(oneshot::Receiver<Result<Value, String>>),
+    /// A signal branch: the worker sends the signal payload.
+    Signal(oneshot::Receiver<Value>),
+    /// A timer branch: the fire carries no value, so it normalises to
+    /// [`Value::Null`] — the same value [`RaceWinner::value`] documents for a
+    /// timer win.
+    Timer(oneshot::Receiver<()>),
+}
+
+impl RaceBranchReceiver {
+    /// Poll this branch, normalising its payload. `Ready(Err(_))` means the
+    /// sender was dropped (the branch will never resolve live).
+    fn poll_normalized(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Result<Value, String>, oneshot::error::RecvError>> {
+        match self {
+            Self::Output(rx) => std::pin::Pin::new(rx).poll(cx),
+            Self::Signal(rx) => std::pin::Pin::new(rx).poll(cx).map(|r| r.map(Ok)),
+            Self::Timer(rx) => std::pin::Pin::new(rx)
+                .poll(cx)
+                .map(|r| r.map(|()| Ok(Value::Null))),
+        }
+    }
+}
+
 /// Live-mode future for `ctx.race()` (issue #600): polls every still-pending
 /// branch receiver in ascending index order on each poll, so a live in-cycle
 /// tie (multiple receivers ready in the same poll) always resolves to the
@@ -1597,7 +1649,7 @@ impl RaceBuilder<'_> {
 /// treated as "will never resolve"; only when every receiver is gone does the
 /// future resolve to [`HarvestError::Cancelled`].
 struct RaceFirstFut {
-    receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)>,
+    receivers: Vec<(usize, RaceBranchReceiver)>,
 }
 
 impl std::future::Future for RaceFirstFut {
@@ -1610,7 +1662,7 @@ impl std::future::Future for RaceFirstFut {
         let this = self.get_mut();
         let mut i = 0;
         while i < this.receivers.len() {
-            match std::pin::Pin::new(&mut this.receivers[i].1).poll(cx) {
+            match this.receivers[i].1.poll_normalized(cx) {
                 std::task::Poll::Ready(Ok(result)) => {
                     let (index, _) = this.receivers.remove(i);
                     return std::task::Poll::Ready(Ok((index, result)));
@@ -2065,6 +2117,30 @@ pub const DEFAULT_SESSION_ACQUISITION_TIMEOUT: std::time::Duration =
 /// "unsupported commands" path so its ordinary timer is never silently left
 /// undeleted on a child-win.
 pub(crate) const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
+
+/// Reserved timer-id prefix for a [`RaceBuilder`] timer branch (issue #950).
+///
+/// A `ctx.race()` timer branch derives its durable timer id as
+/// `{RACE_TIMER_PREFIX}{seq}:{index}` — the race's own sequence number plus the
+/// branch's position in the builder chain. Both are deterministic, so every
+/// replay re-derives the identical id and the recorded `TimerStarted` always
+/// matches; the worker's new-vs-existing row check then makes a re-park (the
+/// workflow woke on a sibling branch while this timer is still pending)
+/// idempotent.
+///
+/// The reserved prefix keeps race timers out of the user timer-id namespace,
+/// mirroring [`CHILD_TIMEOUT_TIMER_PREFIX`] (#779) and the
+/// `__signal_timeout:{seq}:{name}` convention of #476. It is deliberately
+/// DISTINCT from both, so `extract_child_timeout_race` never mistakes a
+/// `race().child_workflow(..).timer(..)` batch for the `spawn_child_workflow_timeout`
+/// primitive (that batch takes the generalized mixed path instead, where a
+/// losing timer is torn down by this race's own `CancelRaceLosers`).
+pub(crate) const RACE_TIMER_PREFIX: &str = "__race:";
+
+/// The deterministic durable timer id for race `seq`'s branch `index`.
+pub(crate) fn race_timer_id(seq: u32, index: usize) -> String {
+    format!("{RACE_TIMER_PREFIX}{seq}:{index}")
+}
 
 /// Saturating `Duration` → milliseconds conversion for error reporting
 /// (a multi-year timeout would otherwise overflow `u64` millis on `as_millis`).
@@ -10227,12 +10303,15 @@ impl WorkflowContext {
             ));
         }
 
-        let all_activity = branches
-            .iter()
-            .all(|b| matches!(b.kind, RaceBranchKind::Activity { .. }));
-        let all_child = branches
-            .iter()
-            .all(|b| matches!(b.kind, RaceBranchKind::ChildWorkflow { .. }));
+        // The #476 exactly-one-timer + exactly-one-signal pair keeps its own
+        // dedicated implementation (issue #950, AC6): it delegates to the
+        // fully-tested `wait_for_signal_timeout` primitive, records the reserved
+        // `__signal_timeout:{seq}:{name}` timer id, records NO `race:{seq}` open
+        // marker, and reports fixed role-based indices. Routing it through the
+        // generalized path below would change all three, so histories recorded
+        // before this issue would no longer replay. Checked BEFORE
+        // `next_race_seq` so the legacy shape does not consume a race sequence
+        // number either.
         let is_timer_signal_pair = branches.len() == 2
             && branches
                 .iter()
@@ -10245,19 +10324,11 @@ impl WorkflowContext {
             return self.race_timer_signal_impl(branches).await;
         }
 
-        if !all_activity && !all_child {
-            return Err(HarvestError::Config(
-                "ctx.race() only supports a homogeneous race of activity branches, a \
-                 homogeneous race of child-workflow branches, or exactly one timer branch \
-                 paired with exactly one signal branch in this release — mixing branch kinds \
-                 (e.g. an activity racing a timer) is out of scope for issue #600's initial \
-                 slice because the worker's suspension-persistence layer does not yet support \
-                 a fully heterogeneous mixed-command batch. Bound an individual activity with \
-                 its own start_to_close/schedule_to_close timeout, or use \
-                 receive_signal_timeout for a signal-or-deadline race, instead."
-                    .to_string(),
-            ));
-        }
+        // Every other combination — including fully heterogeneous ones — is
+        // handled below (issue #950). The worker's suspension-persistence layer
+        // now persists an arbitrary mixed command batch in one transaction
+        // (`persist_mixed_suspension_batch`), so the pre-#950
+        // `HarvestError::Config` rejection for mixed branch kinds is gone.
 
         let seq = self.next_race_seq();
         let count = branches.len();
@@ -10353,6 +10424,7 @@ impl WorkflowContext {
                                 index,
                                 activity_id: Some(activity_id),
                                 child_id: None,
+                                timer_id: None,
                                 is_new: false,
                             });
                         }
@@ -10361,6 +10433,7 @@ impl WorkflowContext {
                                 index,
                                 activity_id: Some(self.next_activity_id()),
                                 child_id: None,
+                                timer_id: None,
                                 is_new: true,
                             });
                         }
@@ -10419,6 +10492,7 @@ impl WorkflowContext {
                                 index,
                                 activity_id: None,
                                 child_id: Some(child_id),
+                                timer_id: None,
                                 is_new: false,
                             });
                         }
@@ -10429,14 +10503,113 @@ impl WorkflowContext {
                                 // Inherit the parent's shard (issue #697 AC4) --
                                 // same rationale as the plain awaited-child path.
                                 child_id: Some(ExecutionId::new_for_shard(self.exec_id.shard())),
+                                timer_id: None,
                                 is_new: true,
                             });
                         }
                         _ => unreachable!("match_child_workflow never returns this variant"),
                     }
                 }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
+                RaceBranchKind::Timer { duration_secs } => {
+                    // Deterministic, reserved id: re-derived identically on every
+                    // replay from the race seq + branch index, so the recorded
+                    // `TimerStarted` always matches and the worker recognises an
+                    // idempotent re-park of the same row. The reserved prefix keeps
+                    // it out of the user timer-id namespace (mirroring #476's
+                    // `__signal_timeout:` and #779's `__child_timeout:`).
+                    let timer_id = race_timer_id(seq, index);
+                    let history_match = self
+                        .match_history(|m| m.match_timer_strict(&timer_id, Some(*duration_secs)));
+                    match history_match {
+                        HistoryMatch::Matched { .. } => {
+                            // Keep ctx.now() in step with the recorded fire, exactly
+                            // as `WorkflowContext::timer` does on its own match.
+                            #[cfg(any(test, feature = "testing"))]
+                            self.advance_timer_clock(*duration_secs);
+                            resolved.push((index, Ok(Value::Null)));
+                        }
+                        HistoryMatch::Diverged {
+                            expected,
+                            actual,
+                            event_index,
+                        } => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} (timer): timer mismatch: \
+                                     expected {expected}, got {actual}"
+                                ),
+                                event_index,
+                                Some(expected),
+                                Some(actual),
+                            ));
+                        }
+                        // NoMatch covers BOTH "never dispatched" and "TimerStarted
+                        // recorded but not yet fired" — the same command
+                        // (`StartTimer`) is correct for each, and the worker's
+                        // new-vs-existing row check makes the re-park idempotent.
+                        HistoryMatch::NoMatch => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: None,
+                                child_id: None,
+                                timer_id: Some(TimerId::new(&timer_id)),
+                                is_new: true,
+                            });
+                        }
+                        other => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} (timer): unexpected history \
+                                     match {other:?}"
+                                ),
+                                None,
+                                Some(format!("TimerStarted({timer_id})")),
+                                Some(format!("{other:?}")),
+                            ));
+                        }
+                    }
+                }
+                RaceBranchKind::Signal { signal_name } => {
+                    match self.match_history(|m| m.match_signal(signal_name)) {
+                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
+                        HistoryMatch::Diverged {
+                            expected,
+                            actual,
+                            event_index,
+                        } => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} ({signal_name}): signal \
+                                     mismatch: expected {expected}, got {actual}"
+                                ),
+                                event_index,
+                                Some(expected),
+                                Some(actual),
+                            ));
+                        }
+                        // A signal branch has no in-flight durable resource: it is
+                        // either already delivered (Matched above) or still waiting.
+                        HistoryMatch::NoMatch => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: None,
+                                child_id: None,
+                                timer_id: None,
+                                is_new: true,
+                            });
+                        }
+                        other => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} ({signal_name}): unexpected \
+                                     history match {other:?}"
+                                ),
+                                None,
+                                Some(format!("SignalReceived({signal_name})")),
+                                Some(format!("{other:?}")),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -10487,9 +10660,9 @@ impl WorkflowContext {
                         });
                     }
                 }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
-                }
+                // Neither a timer nor a signal branch carries an author-supplied
+                // payload, so there is no input to cap-check.
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {}
             }
         }
 
@@ -10509,10 +10682,36 @@ impl WorkflowContext {
         // the race future's poll-order tie-break (lowest index first)
         // matches the documented tie-break used when multiple branches are
         // already resolved by the time a later replay cycle checks them.
-        let mut receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)> =
+        let mut receivers: Vec<(usize, RaceBranchReceiver)> =
             Vec::with_capacity(to_dispatch.len());
         for dispatch in &to_dispatch {
             let branch = &branches[dispatch.index];
+            // A timer branch parks on a `oneshot::Sender<()>` and a signal branch
+            // on a `oneshot::Sender<Value>`, so each kind mints its own channel
+            // inside its arm and normalises through `RaceBranchReceiver`.
+            if let RaceBranchKind::Timer { duration_secs } = &branch.kind {
+                let timer_id = dispatch
+                    .timer_id
+                    .clone()
+                    .expect("timer dispatch always carries a timer_id");
+                let (tx, rx) = oneshot::channel::<()>();
+                self.push_command(WorkflowCommand::StartTimer {
+                    timer_id,
+                    duration_secs: *duration_secs,
+                    result_tx: tx,
+                });
+                receivers.push((dispatch.index, RaceBranchReceiver::Timer(rx)));
+                continue;
+            }
+            if let RaceBranchKind::Signal { signal_name } = &branch.kind {
+                let (tx, rx) = oneshot::channel::<Value>();
+                self.push_command(WorkflowCommand::WaitForSignal {
+                    signal_name: signal_name.clone(),
+                    result_tx: tx,
+                });
+                receivers.push((dispatch.index, RaceBranchReceiver::Signal(rx)));
+                continue;
+            }
             let (tx, rx) = oneshot::channel();
             match &branch.kind {
                 RaceBranchKind::Activity {
@@ -10565,10 +10764,10 @@ impl WorkflowContext {
                     });
                 }
                 RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
+                    unreachable!("timer/signal branches are dispatched above")
                 }
             }
-            receivers.push((dispatch.index, rx));
+            receivers.push((dispatch.index, RaceBranchReceiver::Output(rx)));
         }
 
         let (winner_index, winner_raw) = RaceFirstFut { receivers }.await?;
@@ -10586,9 +10785,12 @@ impl WorkflowContext {
                         &error,
                     ))
                 }
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches only occur in the paired shape")
-                }
+                // A timer fire and a signal delivery carry no error channel:
+                // `RaceBranchReceiver` only ever yields `Ok` for them, so this
+                // arm is reached solely if a future refactor changes that.
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => Err(
+                    HarvestError::Cancelled(format!("race #{seq} branch {winner_index}: {error}")),
+                ),
             },
         };
 
@@ -10644,6 +10846,12 @@ impl WorkflowContext {
 
             let mut activities = Vec::new();
             let mut children = Vec::new();
+            // Issue #950: a losing TIMER branch's still-armed `harvest_timers`
+            // row must be deleted too, or it would fire later against a race
+            // that is already decided (and block retention). A losing SIGNAL
+            // branch needs no teardown — an undelivered signal simply stays
+            // observable to a later wait, exactly as in the #476 pair shape.
+            let mut timers = Vec::new();
             for dispatch in to_dispatch {
                 // Skip the winner: its own progress-frontier events are consumed
                 // by the terminal-settling path (`settle_terminal` /
@@ -10659,6 +10867,9 @@ impl WorkflowContext {
                 if let Some(id) = dispatch.child_id {
                     children.push(id);
                 }
+                if let Some(id) = dispatch.timer_id.clone() {
+                    timers.push(id);
+                }
             }
             // Issue #1126: the loser branches that resolved as `*InProgress`
             // this cycle have their synthetic terminal appended only at persist
@@ -10670,11 +10881,11 @@ impl WorkflowContext {
             // (a plain activity, `ctx.mutex(k).acquire()`, a timer, ...) lands
             // cleanly instead of diverging on the leftover event -> nd-block.
             self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
-            if !activities.is_empty() || !children.is_empty() {
+            if !activities.is_empty() || !children.is_empty() || !timers.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
                     activities,
                     children,
-                    timers: Vec::new(),
+                    timers,
                 });
             }
             winner_index
@@ -24464,17 +24675,39 @@ mod tests {
         assert!(matches!(err, HarvestError::Config(_)));
     }
 
+    /// Issue #950 flipped this from a pinned rejection to a supported shape:
+    /// an activity racing a timer no longer returns `HarvestError::Config`, it
+    /// dispatches both branches and suspends on the mixed batch the worker now
+    /// persists. (Pre-#950 this asserted the `Config` rejection.)
     #[tokio::test]
-    async fn race_rejects_mixed_activity_and_timer_shape() {
-        let ctx = WorkflowContext::new_test();
-        let err = ctx
-            .race()
-            .activity_raw("fetch_a", Value::Null, "default")
-            .timer(std::time::Duration::from_secs(60))
-            .run()
-            .await
-            .unwrap_err();
-        assert!(matches!(err, HarvestError::Config(_)));
+    async fn race_accepts_mixed_activity_and_timer_shape() {
+        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
+        let race_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            race_ctx
+                .race()
+                .activity_raw("fetch_a", Value::Null, "default")
+                .timer(std::time::Duration::from_secs(60))
+                .run()
+                .await
+        });
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+        assert!(
+            timeout_result.is_err(),
+            "an activity-vs-timer race must suspend on its mixed batch, not \
+             return HarvestError::Config"
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                && commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::StartTimer { .. })),
+            "both branches must be dispatched in one batch: {commands:?}"
+        );
     }
 
     /// Regression test (Codex review, PR #902): a payload-cap failure on a
@@ -25293,6 +25526,405 @@ mod tests {
             c,
             WorkflowCommand::CancelRaceLosers { children, .. } if children == &vec![loser_id]
         )));
+        Ok(())
+    }
+
+
+    // ── mixed-kind races (issue #950) ───────────────────────────────────────
+
+    /// AC2: `ctx.race()` accepts mixed branch kinds. On the first live cycle
+    /// every branch is dispatched in one suspension batch — an activity
+    /// schedule, a durable timer, a signal wait and a child start side by side.
+    #[tokio::test]
+    async fn race_mixed_kinds_dispatches_every_branch_in_one_batch() {
+        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
+        let race_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            race_ctx
+                .race()
+                .activity_raw("fetch_quote", Value::Null, "default")
+                .timer(std::time::Duration::from_secs(30))
+                .signal("abort")
+                .child_workflow_raw("settle", Value::Null)
+                .run()
+                .await
+        });
+
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+        assert!(
+            timeout_result.is_err(),
+            "a mixed race with no resolution must suspend, not error"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            matches!(
+                commands.first(),
+                Some(WorkflowCommand::RecordMarker { name, .. }) if name == "race:1"
+            ),
+            "the open marker fixes the branch count: {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                .count(),
+            1,
+            "the activity branch must be scheduled: {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::StartTimer { .. }))
+                .count(),
+            1,
+            "the timer branch must arm a durable timer: {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::WaitForSignal { .. }))
+                .count(),
+            1,
+            "the signal branch must park on a signal wait: {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. }))
+                .count(),
+            1,
+            "the child branch must start a child workflow: {commands:?}"
+        );
+    }
+
+    /// The mixed race's timer branch uses a reserved, deterministic id derived
+    /// from the race seq + branch index, so every replay re-derives the same id
+    /// and the worker's idempotent re-park recognises the existing row.
+    #[tokio::test]
+    async fn race_mixed_timer_branch_uses_a_deterministic_reserved_id() {
+        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
+        let race_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            race_ctx
+                .race()
+                .activity_raw("fetch_quote", Value::Null, "default")
+                .timer(std::time::Duration::from_secs(30))
+                .run()
+                .await
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+
+        let commands = ctx.drain_commands();
+        let timer_id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.clone()),
+                _ => None,
+            })
+            .expect("the timer branch must push a StartTimer");
+        assert_eq!(
+            timer_id.as_str(),
+            "__race:1:1",
+            "race timer ids are `__race:{{seq}}:{{index}}` so they are stable \
+             across replays and never collide with a user timer id"
+        );
+    }
+
+    /// Activity beats the timer: the activity's recorded terminal wins, the
+    /// winner marker is recorded, and the still-armed loser timer is torn down
+    /// durably via `CancelRaceLosers.timers` (the #600 contract, unchanged for
+    /// mixed batches).
+    #[tokio::test]
+    async fn race_mixed_activity_beats_timer_and_cancels_the_loser_timer()
+    -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:1"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"price": 42}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .label("quote")
+            .timer(std::time::Duration::from_secs(30))
+            .label("deadline")
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 0, "the activity branch won");
+        assert_eq!(winner.label.as_deref(), Some("quote"));
+        assert_eq!(winner.value, serde_json::json!({"price": 42}));
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordMarker { name, details }
+                    if name == "race_winner:1" && *details == Value::from(0u64)
+            )),
+            "the winner marker fixes the outcome for every later replay: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { timers, .. }
+                    if timers == &vec![TimerId::new("__race:1:1")]
+            )),
+            "the losing timer's still-armed durable row must be deleted: {commands:?}"
+        );
+        Ok(())
+    }
+
+    /// Timer beats the activity: the timer branch resolves to `Value::Null` and
+    /// the losing activity is durably cancelled.
+    #[tokio::test]
+    async fn race_mixed_timer_beats_activity_and_cancels_the_loser_activity()
+    -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:1"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("__race:1:1"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .timer(std::time::Duration::from_secs(30))
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 1, "the timer branch won");
+        assert_eq!(winner.value, Value::Null, "a timer branch carries no value");
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. }
+                    if activities == &vec![activity_id]
+            )),
+            "the losing activity must be durably cancelled: {commands:?}"
+        );
+        Ok(())
+    }
+
+    /// An abort signal interrupting a running activity — the composition the
+    /// issue calls out as blocked today.
+    #[tokio::test]
+    async fn race_mixed_signal_beats_activity() -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "long_running".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("long_running", Value::Null, "default")
+            .signal("abort")
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 1, "the signal branch won");
+        assert_eq!(winner.value, serde_json::json!({"reason": "user"}));
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, timers, .. }
+                    if activities == &vec![activity_id] && timers.is_empty()
+            )),
+            "a losing signal needs no teardown, but the losing activity does: {commands:?}"
+        );
+        Ok(())
+    }
+
+    /// A child workflow raced against a deadline, with an ORDINARY race timer
+    /// (not the `__child_timeout:` primitive of #779).
+    #[tokio::test]
+    async fn race_mixed_child_workflow_beats_timer() -> Result<(), HarvestError> {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:1"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"settled": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .child_workflow_raw("settle", Value::Null)
+            .timer(std::time::Duration::from_secs(30))
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 0);
+        assert_eq!(winner.value, serde_json::json!({"settled": true}));
+        Ok(())
+    }
+
+    /// AC6: the #476 exactly-one-timer + exactly-one-signal pair keeps its
+    /// dedicated `race_timer_signal_impl` path — same reserved
+    /// `__signal_timeout:{seq}:{name}` id, same fixed role-based indices — so
+    /// in-flight executions recorded before this change replay unchanged.
+    #[tokio::test]
+    async fn race_timer_signal_pair_still_takes_the_legacy_path()
+    -> Result<(), HarvestError> {
+        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
+        let race_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            race_ctx
+                .race()
+                .timer(std::time::Duration::from_secs(300))
+                .signal("approval")
+                .run()
+                .await
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+
+        let commands = ctx.drain_commands();
+        let timer_id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.clone()),
+                _ => None,
+            })
+            .expect("the legacy pair must still push a StartTimer");
+        assert_eq!(
+            timer_id.as_str(),
+            "__signal_timeout:1:approval",
+            "the timer+signal pair must keep the #476 reserved id, NOT the \
+             #950 `__race:` id — otherwise in-flight histories diverge"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "race:1")),
+            "the legacy pair records no `race:{{seq}}` open marker: {commands:?}"
+        );
+        Ok(())
+    }
+
+    /// The branch count recorded in the open marker still guards a code change
+    /// that adds or removes a branch, for mixed races too.
+    #[tokio::test]
+    async fn race_mixed_branch_count_change_is_non_deterministic() {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .timer(std::time::Duration::from_secs(30))
+            .signal("abort")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HarvestError::NonDeterministic { .. }),
+            "growing a mixed race from 2 to 3 branches must be rejected, got {err:?}"
+        );
+    }
+
+    /// A race of a single timer branch is still a valid (degenerate) race and
+    /// must not be mistaken for the legacy timer+signal pair.
+    #[tokio::test]
+    async fn race_single_timer_branch_resolves_on_the_recorded_fire()
+    -> Result<(), HarvestError> {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(1u64),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:0"),
+                duration_secs: 5,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("__race:1:0"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .timer(std::time::Duration::from_secs(5))
+            .run()
+            .await?;
+        assert_eq!(winner.index, 0);
         Ok(())
     }
 

@@ -3264,6 +3264,70 @@ async fn park_workflow_task_inner(
     Ok(row.had_wake_requested)
 }
 
+/// Atomically read **and clear** a workflow task's `wake_requested` flag
+/// (issue #950).
+///
+/// [`park_workflow_task`] already does this as part of the same statement that
+/// parks the row, but the timer sub-path of a suspension parks via
+/// [`reschedule_task`] (`RUNNING` → `PENDING @ fires_at`), which does not touch
+/// the flag. A wake that landed on the still-claimed row *before* this
+/// transaction took its lock is recorded only as `wake_requested = TRUE`, and
+/// would otherwise be silently discarded by the reschedule — leaving the task
+/// asleep until its deadline even though the event it was waiting for already
+/// arrived. The generalized mixed-batch persist path calls this so the flag is
+/// honoured on the reschedule sub-path too.
+///
+/// A wake landing *after* this call blocks on the row lock this statement takes
+/// and is re-evaluated against the committed row, where
+/// [`primary_repend_workflow_task_query`]'s `mixed_signal_suspension` arm pulls
+/// the `PENDING` row forward — so no wake can fall between the two.
+///
+/// Returns `false` when the task row no longer exists.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn take_wake_requested(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<bool> {
+    use diesel::deserialize::QueryableByName;
+    use diesel::sql_types::Bool;
+
+    #[derive(QueryableByName)]
+    struct WakeRequestedRow {
+        #[diesel(sql_type = Bool)]
+        had_wake_requested: bool,
+    }
+
+    let rows: Vec<WakeRequestedRow> = diesel::sql_query(take_wake_requested_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().next().is_some_and(|r| r.had_wake_requested))
+}
+
+/// SQL for [`take_wake_requested`]. Extracted as a `const fn` so the
+/// `candidate`/`updated` CTE split (which captures `wake_requested` before
+/// clearing it) is unit-testable without a database.
+const fn take_wake_requested_query() -> &'static str {
+    "WITH candidate AS ( \
+         SELECT id, wake_requested FROM harvest_task_queue \
+         WHERE id = $1 AND task_type = 'workflow' \
+         FOR UPDATE \
+     ), \
+     updated AS ( \
+         UPDATE harvest_task_queue t \
+         SET wake_requested = FALSE \
+         FROM candidate \
+         WHERE t.id = candidate.id \
+         RETURNING candidate.wake_requested AS had_wake_requested \
+     ) \
+     SELECT had_wake_requested FROM updated"
+}
+
 /// SQL for [`park_workflow_task`] when a sticky hint is supplied. Extracted as
 /// a `const fn` so its shape (the `candidate`/`updated` CTE split that captures
 /// `wake_requested` before clearing it) is unit-testable without a database.
