@@ -170,7 +170,16 @@ the target database:
 
   To gate a deploy without applying anything, `harvest migrate status --check`
   exits non-zero while any migration is still pending (and `harvest migrate run
-  --dry-run` prints the same plan). Do not roll replicas if any command fails.
+  --dry-run` prints the same plan). Give the gate the **same `--include-dir`
+  flags you give `run`** — one that checks fewer sets than the deploy applies
+  can exit 0 with a migration still pending, which is worse than no gate:
+
+  ```bash
+  harvest migrate status --check \
+    --include-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  Do not roll replicas if any command fails.
   See the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
   for the ownership table and complete procedure.
 - **Multi-shard deployments** — each Harvest shard database needs the full set

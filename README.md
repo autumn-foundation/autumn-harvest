@@ -347,6 +347,8 @@ export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
 
 harvest migrate status          # what is applied, what is pending
 harvest migrate status --check  # same, but exits non-zero while anything is pending
+                                # (give it the same --include-dir you give `run`,
+                                #  or it gates on fewer sets than you apply)
 harvest migrate run             # apply every pending migration, in version order
 harvest migrate run --dry-run   # print the plan, change nothing
 
