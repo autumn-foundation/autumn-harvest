@@ -4550,21 +4550,101 @@ pub fn normalize_sslmode(dsn: &str) -> String {
         return url.to_string();
     }
 
-    // libpq keyword form. Only a whole `sslmode=<verify mode>` token is
-    // touched, so a password or path that merely contains the text is safe.
-    dsn.split_inclusive(char::is_whitespace)
-        .map(|token| {
-            let trimmed = token.trim_end();
-            let suffix = &token[trimmed.len()..];
-            match trimmed
-                .strip_prefix("sslmode=")
-                .filter(|mode| VERIFY_MODES.contains(mode))
-            {
-                Some(_) => format!("sslmode=require{suffix}"),
-                None => token.to_string(),
+    rewrite_keyword_dsn(dsn, &VERIFY_MODES)
+}
+
+/// Rewrite the top-level `sslmode` option of a libpq **keyword/value** DSN
+/// (`host=… sslmode=verify-full`), leaving every other byte alone.
+///
+/// Scans the DSN the way libpq reads it — options separated by whitespace,
+/// optional whitespace around `=`, values optionally single-quoted with `\`
+/// escapes — rather than splitting on whitespace. A whitespace split cannot see
+/// quoting, so `password='abc sslmode=verify-full def'` would have had the text
+/// *inside the password* rewritten, corrupting the credential and failing
+/// authentication. It also could not see `sslmode = verify-full`, which libpq
+/// accepts and this now rewrites.
+///
+/// A DSN this cannot scan (an unterminated quote, a missing `=`) is returned
+/// **unchanged**, so tokio-postgres reports its own parse error rather than
+/// this mangling the input first.
+fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
+    let bytes = dsn.as_bytes();
+    let mut out = String::with_capacity(dsn.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Whitespace between options, copied verbatim.
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(&dsn[start..i]);
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Keyword, then `=` with optional whitespace on either side.
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &dsn[key_start..i];
+        let spacing_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            return dsn.to_string();
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(key);
+        out.push_str(&dsn[spacing_start..i]);
+
+        // Value: single-quoted (with `\` escapes) or bare up to whitespace.
+        let value_start = i;
+        let mut value = String::new();
+        if bytes[i] == b'\'' {
+            i += 1;
+            loop {
+                if i >= bytes.len() {
+                    // Unterminated quote: not ours to interpret.
+                    return dsn.to_string();
+                }
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        value.push(dsn[i + 1..].chars().next().unwrap_or_default());
+                        i += 2;
+                    }
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {
+                        value.push(dsn[i..].chars().next().unwrap_or_default());
+                        i += dsn[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
             }
-        })
-        .collect()
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            value.push_str(&dsn[value_start..i]);
+        }
+
+        if key == "sslmode" && verify_modes.contains(&value.as_str()) {
+            out.push_str("require");
+        } else {
+            // Verbatim, quotes and escapes included: only the one option this
+            // function exists for is ever rewritten.
+            out.push_str(&dsn[value_start..i]);
+        }
+    }
+
+    out
 }
 
 /// Render a migration failure without leaking the DSN.
@@ -16118,9 +16198,55 @@ mod migrate_cli_tests {
 
     #[test]
     fn a_password_that_merely_contains_the_text_is_untouched() {
-        // Only a whole `sslmode=<verify mode>` token is rewritten.
+        // Only a whole `sslmode=<verify mode>` option is rewritten.
         let dsn = "host=db.internal password=sslmode=verify-full-not-really sslmode=require";
         assert_eq!(normalize_sslmode(dsn), dsn);
+    }
+
+    #[test]
+    fn a_quoted_value_containing_whitespace_is_never_rewritten_inside() {
+        // A whitespace split cannot see quoting, so it would rewrite the text
+        // INSIDE the password -- corrupting the credential and failing
+        // authentication against a database that was reachable.
+        let dsn = "password='abc sslmode=verify-full def' sslmode=verify-full";
+        let rewritten = normalize_sslmode(dsn);
+        assert_eq!(
+            rewritten, "password='abc sslmode=verify-full def' sslmode=require",
+            "only the top-level option may change"
+        );
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(
+            config.get_password(),
+            Some(b"abc sslmode=verify-full def".as_slice())
+        );
+    }
+
+    #[test]
+    fn spacing_around_the_equals_sign_is_handled() {
+        // libpq accepts it, so a DSN using it must not slip past unrewritten
+        // and then fail to parse.
+        let rewritten = normalize_sslmode("host=db.internal sslmode = verify-full");
+        assert_eq!(rewritten, "host=db.internal sslmode = require");
+        rewritten
+            .parse::<tokio_postgres::Config>()
+            .expect("the rewritten DSN must parse");
+    }
+
+    #[test]
+    fn a_quoted_sslmode_value_is_rewritten_and_an_escaped_password_survives() {
+        let rewritten = normalize_sslmode(r"password='a\'b c' sslmode='verify-ca'");
+        assert_eq!(rewritten, r"password='a\'b c' sslmode=require");
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(config.get_password(), Some(b"a'b c".as_slice()));
+    }
+
+    #[test]
+    fn a_dsn_this_cannot_scan_is_returned_unchanged() {
+        // An unterminated quote is tokio-postgres's error to report, not ours
+        // to paper over by mangling the string first.
+        for dsn in ["password='unterminated sslmode=verify-full", "host"] {
+            assert_eq!(normalize_sslmode(dsn), dsn);
+        }
     }
 
     // ── credential hygiene ──────────────────────────────────────────────────
