@@ -4819,12 +4819,45 @@ pub fn format_migrate_plan_text(heading: &str, targets: &[(String, MigrationPlan
     out
 }
 
+/// A report for a target the run could not even inspect.
+const fn empty_migration_report() -> MigrationReport {
+    MigrationReport {
+        applied: Vec::new(),
+        already_applied: Vec::new(),
+        applied_concurrently: Vec::new(),
+        unrecognized: Vec::new(),
+        failed: None,
+    }
+}
+
+/// One database's outcome in a `migrate run` report.
+#[derive(Debug)]
+pub struct MigrateRunTarget {
+    /// Redacted DSN, or an ordinal label when it could not be redacted.
+    pub database: String,
+    /// What the run did here.
+    pub report: MigrationReport,
+    /// The run never reached a migration on this target: connecting, creating
+    /// the ledger, or reading it failed.
+    ///
+    /// Distinguished because an empty report is otherwise indistinguishable
+    /// from "finished, nothing to do" — a JSON consumer would read `applied:
+    /// []`, `failed: null` on a database the run could not even inspect and
+    /// call it done.
+    pub setup_failed: bool,
+}
+
 /// Human-readable `migrate run` report: one block per database.
 #[must_use]
-pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String {
+pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "harvest migrate run");
-    for (database, report) in targets {
+    for MigrateRunTarget {
+        database,
+        report,
+        setup_failed,
+    } in targets
+    {
         let _ = writeln!(out, "  {database}");
         let _ = writeln!(out, "    applied: {}", report.applied.len());
         for name in &report.applied {
@@ -4852,6 +4885,13 @@ pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String 
                 report.unrecognized.len()
             );
         }
+        if *setup_failed {
+            let _ = writeln!(
+                out,
+                "    FAILED: before any migration ran -- this database could not \
+                 be prepared (see the error below); nothing was applied here"
+            );
+        }
         if let Some(failed) = &report.failed {
             let _ = writeln!(out, "    FAILED: {}", failed.name);
             let _ = writeln!(
@@ -4868,7 +4908,7 @@ pub fn format_migrate_run_text(targets: &[(String, MigrationReport)]) -> String 
             );
         }
     }
-    let applied: usize = targets.iter().map(|(_, r)| r.applied.len()).sum();
+    let applied: usize = targets.iter().map(|t| t.report.applied.len()).sum();
     let _ = write!(
         out,
         "{applied} migration(s) applied across {} database(s)",
@@ -4908,28 +4948,31 @@ pub fn migrate_plan_json(
 /// # Errors
 ///
 /// [`CliError::SerializeResponse`] if the report cannot be serialized.
-pub fn migrate_run_json(targets: &[(String, MigrationReport)]) -> Result<String, CliError> {
+pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError> {
     let body = json!({
         "command": "migrate run",
         "targets": targets
             .iter()
-            .map(|(database, report)| json!({
-                "database": database,
-                "applied": report.applied,
-                "already_applied": report.already_applied,
-                "applied_concurrently": report.applied_concurrently,
-                "unrecognized": report.unrecognized,
+            .map(|target| json!({
+                "database": target.database,
+                "applied": target.report.applied,
+                "already_applied": target.report.already_applied,
+                "applied_concurrently": target.report.applied_concurrently,
+                "unrecognized": target.report.unrecognized,
+                // The run could not prepare this database at all. Without it an
+                // empty report reads as "finished with nothing to do".
+                "setup_failed": target.setup_failed,
                 // `null` on a target that finished. On one that did not, the
                 // migration it stopped on and whether that rolled back -- the
                 // difference between "nothing changed" and "something changed
                 // and the run cannot say what".
-                "failed": report.failed.as_ref().map(|failed| json!({
+                "failed": target.report.failed.as_ref().map(|failed| json!({
                     "name": failed.name,
                     "rolled_back": failed.rolled_back,
                 })),
             }))
             .collect::<Vec<_>>(),
-        "applied_total": targets.iter().map(|(_, r)| r.applied.len()).sum::<usize>(),
+        "applied_total": targets.iter().map(|t| t.report.applied.len()).sum::<usize>(),
     });
     serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
 }
@@ -4975,7 +5018,7 @@ async fn migrate_plans(
 /// is the difference between "re-run the command" and "work out by hand which
 /// databases moved".
 fn report_and_fail(
-    targets: &[(String, MigrationReport)],
+    targets: &[MigrateRunTarget],
     format: MigrateFormat,
     failure: CliError,
 ) -> Result<(), CliError> {
@@ -5063,10 +5106,24 @@ pub async fn run_migrate_run(
         // nothing about the two behind it.
         let mut conn = match connect_for_migration(url, &redacted).await {
             Ok(conn) => conn,
-            Err(failure) => return report_and_fail(&targets, format, failure),
+            Err(failure) => {
+                // Named as a target that never started, rather than omitted:
+                // "absent" would be indistinguishable from the targets after it
+                // that the run simply never reached.
+                targets.push(MigrateRunTarget {
+                    database: redacted,
+                    report: empty_migration_report(),
+                    setup_failed: true,
+                });
+                return report_and_fail(&targets, format, failure);
+            }
         };
         match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
-            Ok(report) => targets.push((redacted, report)),
+            Ok(report) => targets.push(MigrateRunTarget {
+                database: redacted,
+                report,
+                setup_failed: false,
+            }),
             Err(partial) => {
                 let failure = migrate_error(url, &redacted, &partial.error);
                 // The failing target always joins the report, even with nothing
@@ -5074,7 +5131,16 @@ pub async fn run_migrate_run(
                 // part-way leaves changes it cannot list, and "no report at
                 // all" and "nothing happened" must not look the same to the
                 // tooling reading this.
-                targets.push((redacted, partial.report));
+                //
+                // `failed: None` means no migration failed, so the run never
+                // got that far -- the ledger could not be created or read.
+                // Flagged, or an empty report would read as a clean finish.
+                let setup_failed = partial.report.failed.is_none();
+                targets.push(MigrateRunTarget {
+                    database: redacted,
+                    report: partial.report,
+                    setup_failed,
+                });
                 return report_and_fail(&targets, format, failure);
             }
         }
@@ -16209,16 +16275,17 @@ mod migrate_cli_tests {
 
     #[test]
     fn run_text_and_json_report_what_was_applied() {
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            MigrationReport {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
                 applied: vec!["20260801000000_x".to_string()],
                 already_applied: vec!["20260101000000_a".to_string()],
                 applied_concurrently: vec!["20260802000000_y".to_string()],
                 unrecognized: Vec::new(),
                 failed: None,
             },
-        )];
+        }];
 
         let text = format_migrate_run_text(&targets);
         assert!(text.contains("20260801000000_x"), "{text}");
@@ -16247,9 +16314,10 @@ mod migrate_cli_tests {
         // The case that matters: a `run_in_transaction = false` migration that
         // failed part-way left changes it cannot list. An empty report for that
         // target would read as "nothing happened".
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            MigrationReport {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
                 applied: Vec::new(),
                 already_applied: Vec::new(),
                 applied_concurrently: Vec::new(),
@@ -16259,7 +16327,7 @@ mod migrate_cli_tests {
                     rolled_back: false,
                 }),
             },
-        )];
+        }];
 
         let text = format_migrate_run_text(&targets);
         assert!(
@@ -16282,9 +16350,10 @@ mod migrate_cli_tests {
 
     #[test]
     fn a_transactional_failure_says_the_database_is_unchanged() {
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            MigrationReport {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
                 applied: vec!["20260801000000_x".to_string()],
                 already_applied: Vec::new(),
                 applied_concurrently: Vec::new(),
@@ -16294,7 +16363,7 @@ mod migrate_cli_tests {
                     rolled_back: true,
                 }),
             },
-        )];
+        }];
         let text = format_migrate_run_text(&targets);
         assert!(text.contains("rolled back"), "{text}");
         assert!(!text.contains("NOT rolled back"), "{text}");
@@ -16307,21 +16376,50 @@ mod migrate_cli_tests {
     }
 
     #[test]
+    fn a_target_the_run_could_not_prepare_is_not_reported_as_finished() {
+        // Creating or reading the ledger failed, so no migration ever ran: the
+        // report is empty and `failed` is None. Without the flag that is
+        // byte-identical to "finished with nothing to do" -- a JSON consumer
+        // would mark a database the run could not even inspect as done.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: true,
+            report: MigrationReport {
+                applied: Vec::new(),
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("FAILED: before any migration ran"), "{text}");
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["setup_failed"], true);
+        assert!(value["targets"][0]["failed"].is_null());
+    }
+
+    #[test]
     fn a_finished_target_reports_no_failure() {
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            MigrationReport {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
                 applied: vec!["20260801000000_x".to_string()],
                 already_applied: Vec::new(),
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
             },
-        )];
+        }];
         assert!(!format_migrate_run_text(&targets).contains("FAILED"));
         let value: Value =
             serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
         assert!(value["targets"][0]["failed"].is_null());
+        assert_eq!(value["targets"][0]["setup_failed"], false);
     }
 
     // ── the deploy gate ─────────────────────────────────────────────────────
