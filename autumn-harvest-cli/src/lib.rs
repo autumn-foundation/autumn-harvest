@@ -95,6 +95,104 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Cross-region disaster-recovery operator commands (issue #954).
+///
+/// All three talk to shard databases directly, never to the management API:
+/// during a regional failover the management API may be exactly what is down,
+/// and the whole point of the fence is to be reachable when the region is not.
+#[derive(Subcommand, Debug)]
+pub enum DrCommand {
+    /// Report each shard's write-authority epoch and measured RPO.
+    ///
+    /// Read-only, safe at any time, and the first thing to run when deciding
+    /// whether to fail over: it shows the RPO you would be accepting.
+    Status {
+        /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
+        /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
+        /// POSITIONAL index as its shard id.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// **Revoke the old region's write authority**: bump each shard's epoch.
+    ///
+    /// This is the fence. Every worker pinned to the previous epoch — in
+    /// EITHER region — stops. Run it on the promoted primary, on every shard,
+    /// before starting any workers.
+    Fence {
+        /// A shard database DSN. Repeat once per shard.
+        ///
+        /// Supply EVERY shard. Fencing a subset leaves a half-failed-over
+        /// cluster taking live cross-shard traffic, which converts bounded,
+        /// known skew into unbounded skew (see docs/cross-region-dr.md).
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Why this fence is being applied. Recorded in
+        /// `harvest_shard_generation.fenced_reason`.
+        ///
+        /// Required, not optional: an unattributable epoch bump found three
+        /// months later is indistinguishable from a mistake.
+        #[arg(long, value_name = "TEXT", required = true)]
+        reason: String,
+
+        /// Who is applying it. Recorded in `fenced_by`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            env = "HARVEST_ACTOR",
+            default_value = "unknown"
+        )]
+        actor: String,
+
+        /// Acknowledge that this stops every worker pinned to the old epoch.
+        ///
+        /// Deliberately long and unpleasant to type. A fence during a healthy
+        /// week is a fleet-wide outage recovered only by restarting the fleet.
+        #[arg(long = "i-understand-this-stops-the-fleet", required = true)]
+        confirm: bool,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// Finish promoting a standby: advance every sequence to match the data.
+    ///
+    /// **Required after promoting a LOGICAL standby.** Logical replication
+    /// copies rows but not sequence values, so a promoted logical standby holds
+    /// every replicated `harvest_events` row while `harvest_events_id_seq`
+    /// still sits where it started — and the new primary's first append dies on
+    /// a duplicate key.
+    ///
+    /// A separate verb from `fence` on purpose: folding it in would let an
+    /// operator fence a shard and never advance its sequences, and discover it
+    /// only when the first workflow tried to make progress. Harmless and
+    /// idempotent on a physical replica, which replicates sequences already.
+    Promote {
+        /// A promoted shard database DSN. Repeat once per shard.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+}
+
+/// Output format for `harvest dr`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DrFormat {
+    /// Human-readable table.
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
 /// `harvest backup` subcommands (issue #943).
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
@@ -970,6 +1068,17 @@ enum Commands {
         #[command(subcommand)]
         command: BuildRoutingCommand,
     },
+    /// Cross-region disaster-recovery operations: inspect the RPO, apply the
+    /// failover fence, finish a promotion (issue #954).
+    ///
+    /// Talks to shard databases directly, never to the management API — during
+    /// a regional failover the management API may be exactly what is down.
+    /// See `docs/runbooks/cross-region-failover.md`.
+    Dr {
+        #[command(subcommand)]
+        command: DrCommand,
+    },
+
     /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
     ///
     /// Read-only against every supplied scratch database: each connection is
@@ -2938,6 +3047,9 @@ impl Cli {
             Commands::Backup { .. } => {
                 unreachable!("Backup handles its own execution locally")
             }
+            Commands::Dr { .. } => {
+                unreachable!("Dr handles its own execution locally")
+            }
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
@@ -3046,6 +3158,13 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *probe_limit,
         )
         .await;
+    }
+
+    // `dr` talks to shard databases directly, not to the management API: a
+    // regional failover is precisely when the management API may be
+    // unreachable (mirrors `backup verify`).
+    if let Commands::Dr { command } = &cli.command {
+        return run_dr(command).await;
     }
 
     // det-check is read-only local source analysis: no HTTP, handled entirely
@@ -4218,6 +4337,304 @@ pub async fn run_backup_verify(
     }
 
     backup_verify_gate(&report).map_or(Ok(()), Err)
+}
+
+// ── harvest dr: cross-region disaster recovery (issue #954) ─────────────────
+
+/// One shard's DR state, as `harvest dr status` reports it.
+///
+/// Serialized by hand rather than by `serde::Serialize`: this crate depends on
+/// `serde_json` but not on `serde` itself, and one small projection is a better
+/// trade than a new dependency.
+#[derive(Debug)]
+struct DrShardStatus {
+    shard_id: i32,
+    /// Redacted — a DSN can embed a password.
+    dsn: String,
+    reachable: bool,
+    unreachable_reason: Option<String>,
+    /// `None` when this shard has never been provisioned, which means fencing
+    /// is not yet in force there.
+    generation: Option<i64>,
+    /// The measured RPO. **`None` means UNKNOWN, not zero** — see
+    /// `docs/cross-region-dr.md`. Serialized as an explicit JSON `null` so a
+    /// consumer cannot mistake absence for a value of `0`.
+    rpo_seconds: Option<f64>,
+    lag_bytes: Option<i64>,
+    connected_standbys: usize,
+    inactive_slots: usize,
+}
+
+impl DrShardStatus {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "shard_id": self.shard_id,
+            "dsn": self.dsn,
+            "reachable": self.reachable,
+            "unreachable_reason": self.unreachable_reason,
+            "generation": self.generation,
+            // Explicit null, never 0: see the field docs.
+            "rpo_seconds": self.rpo_seconds,
+            "lag_bytes": self.lag_bytes,
+            "connected_standbys": self.connected_standbys,
+            "inactive_slots": self.inactive_slots,
+        })
+    }
+}
+
+async fn dr_connect(
+    dsn: &str,
+) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
+    use autumn_harvest::diesel_async::AsyncConnection as _;
+    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
+        .await
+        .map_err(|e| {
+            CliError::InvalidInput(format!(
+                "cannot connect to {}: {e}",
+                autumn_harvest::backup_verify::redact_dsn(dsn)
+            ))
+        })
+}
+
+/// Run a `harvest dr` subcommand.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidInput`] for an unparseable or unreachable shard
+/// target, and propagates database errors from the fence and promote paths.
+/// `status` never fails on an unreachable shard: it reports the shard as
+/// unreachable and carries on, because during an incident a partial answer
+/// about the shards you *can* reach is the answer you need.
+pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
+    match command {
+        DrCommand::Status { shards, format } => run_dr_status(shards, *format).await,
+        DrCommand::Fence {
+            shards,
+            reason,
+            actor,
+            confirm,
+            format,
+        } => run_dr_fence(shards, reason, actor, *confirm, *format).await,
+        DrCommand::Promote { shards, format } => run_dr_promote(shards, *format).await,
+    }
+}
+
+async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+    use autumn_harvest::replication::{current_generation, query_replication_status};
+    use autumn_harvest::types::ShardId;
+
+    let targets = parse_shard_targets(shards)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let shard = ShardId::new(target.shard_id);
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        let mut conn = match dr_connect(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(DrShardStatus {
+                    shard_id: target.shard_id,
+                    dsn: redacted,
+                    reachable: false,
+                    unreachable_reason: Some(error.to_string()),
+                    generation: None,
+                    rpo_seconds: None,
+                    lag_bytes: None,
+                    connected_standbys: 0,
+                    inactive_slots: 0,
+                });
+                continue;
+            }
+        };
+        let generation = current_generation(&mut conn, shard)
+            .await
+            .ok()
+            .flatten()
+            .map(autumn_harvest::replication::ShardGeneration::as_i64);
+        let status = query_replication_status(&mut conn, shard).await.ok();
+        out.push(DrShardStatus {
+            shard_id: target.shard_id,
+            dsn: redacted,
+            reachable: true,
+            unreachable_reason: None,
+            generation,
+            rpo_seconds: status
+                .as_ref()
+                .and_then(autumn_harvest::replication::ReplicationStatus::rpo_seconds),
+            lag_bytes: status
+                .as_ref()
+                .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
+            connected_standbys: status.as_ref().map_or(
+                0,
+                autumn_harvest::replication::ReplicationStatus::connected_standbys,
+            ),
+            inactive_slots: status.as_ref().map_or(
+                0,
+                autumn_harvest::replication::ReplicationStatus::inactive_slots,
+            ),
+        });
+    }
+
+    match format {
+        DrFormat::Json => {
+            let payload: Vec<serde_json::Value> = out.iter().map(DrShardStatus::to_json).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
+            );
+        }
+        DrFormat::Text => print!("{}", format_dr_status_text(&out)),
+    }
+    Ok(())
+}
+
+/// Render `harvest dr status` as a table.
+///
+/// Pure, so the "unknown is not zero" rendering is testable without a database.
+/// An unknown RPO prints `unknown`, never `0.0s`: a dead standby that reads as
+/// a perfect RPO is the most dangerous line this table could print.
+fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{:<6} {:<11} {:>10} {:>12} {:>10} {:>10}  DSN",
+        "SHARD", "GENERATION", "RPO", "LAG BYTES", "STANDBYS", "IDLE SLOTS",
+    );
+    for r in rows {
+        if !r.reachable {
+            let _ = writeln!(
+                s,
+                "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
+                r.shard_id, "UNREACHABLE", "-", "-", "-", "-", r.dsn
+            );
+            continue;
+        }
+        let generation = r
+            .generation
+            .map_or_else(|| "unfenced".to_string(), |g| g.to_string());
+        let rpo = r
+            .rpo_seconds
+            .map_or_else(|| "unknown".to_string(), |v| format!("{v:.1}s"));
+        let bytes = r
+            .lag_bytes
+            .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+        let _ = writeln!(
+            s,
+            "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
+            r.shard_id, generation, rpo, bytes, r.connected_standbys, r.inactive_slots, r.dsn
+        );
+    }
+    if rows
+        .iter()
+        .any(|r| r.reachable && r.connected_standbys == 0)
+    {
+        let _ = writeln!(
+            s,
+            "\nWARNING: a shard has no connected standby. Its RPO is unbounded and growing; \
+             `unknown` above means UNMEASURABLE, not zero."
+        );
+    }
+    s
+}
+
+async fn run_dr_fence(
+    shards: &[String],
+    reason: &str,
+    actor: &str,
+    confirm: bool,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    use autumn_harvest::replication::{bump_generation, ensure_generation_row};
+    use autumn_harvest::types::ShardId;
+
+    // clap marks the flag `required`, so this is belt-and-braces for a
+    // programmatic caller — but the cost of getting it wrong is a fleet.
+    if !confirm {
+        return Err(CliError::InvalidInput(
+            "refusing to fence without --i-understand-this-stops-the-fleet".to_string(),
+        ));
+    }
+
+    let targets = parse_shard_targets(shards)?;
+    let mut results = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let shard = ShardId::new(target.shard_id);
+        let mut conn = dr_connect(&target.dsn).await?;
+        // Provision first so fencing a shard that never ran a DR-enabled
+        // worker still works: without a row there is nothing to bump, and a
+        // fence that silently no-ops is worse than one that errors.
+        ensure_generation_row(&mut conn, shard)
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+        let generation = bump_generation(&mut conn, shard, reason, actor)
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+        results.push(serde_json::json!({
+            "shard_id": target.shard_id,
+            "generation": generation.as_i64(),
+            "reason": reason,
+            "actor": actor,
+        }));
+    }
+
+    match format {
+        DrFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&results)
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?
+        ),
+        DrFormat::Text => {
+            for r in &results {
+                println!(
+                    "shard {} fenced at generation {}",
+                    r["shard_id"], r["generation"]
+                );
+            }
+            println!(
+                "\nEvery worker pinned to the previous generation is now unable to claim or \
+                 persist and will stop. Restart the fleet against this region; never re-pin a \
+                 fenced worker in place."
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+    use autumn_harvest::replication::advance_sequences_after_promotion;
+
+    let targets = parse_shard_targets(shards)?;
+    let mut results = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let mut conn = dr_connect(&target.dsn).await?;
+        let advanced = advance_sequences_after_promotion(&mut conn)
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+        results.push(serde_json::json!({
+            "shard_id": target.shard_id,
+            "sequences_advanced": advanced
+                .iter()
+                .map(|(name, value)| serde_json::json!({ "sequence": name, "set_to": value }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    match format {
+        DrFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&results)
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?
+        ),
+        DrFormat::Text => {
+            for r in &results {
+                let seqs = r["sequences_advanced"].as_array().map_or(0, Vec::len);
+                println!("shard {}: {seqs} sequence(s) advanced", r["shard_id"]);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── harvest schema: payload-schema contract gate (issue #794) ───────────────

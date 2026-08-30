@@ -29,6 +29,10 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_no_capable_worker",
     "harvest_capability_miss_never_offered",
     "harvest_capability_miss_release_sustained",
+    // Issue #954 — cross-region DR.
+    "harvest_replication_down",
+    "harvest_replication_lag_high",
+    "harvest_shard_fenced",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -37,6 +41,10 @@ const REQUIRED_DRILLS: &[&str] = &[
     "stale-worker-fleet",
     "missed-schedule",
     "shard-unready",
+    // Issue #954 — the replication half of the cross-region failover drill.
+    // The full failover procedure lives in
+    // docs/runbooks/cross-region-failover.md; this is the alerting rehearsal.
+    "replication-stalled",
 ];
 
 const REQUIRED_RUNBOOK_SUBSECTIONS: &[&str] = &[
@@ -85,6 +93,12 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_workflow_history_bloat_total",
     "harvest_scanner_tick_total",
     "harvest_task_capability_miss_total",
+    // Issue #954 — cross-region DR.
+    "harvest_replication_lag_seconds",
+    "harvest_replication_lag_bytes",
+    "harvest_replication_standbys",
+    "harvest_shard_generation",
+    "harvest_shard_fenced_total",
 ];
 
 #[test]
@@ -265,6 +279,65 @@ fn every_alert_links_to_a_complete_runbook_section() {
             );
         }
     }
+}
+
+/// The replication-down alert must key on the standby count, not on lag.
+///
+/// A dead standby produces **no lag reading at all** — the lag series is
+/// deliberately absent rather than `0`, because a dead standby reported as a
+/// perfect RPO is the most dangerous number this feature could publish. An
+/// alert written as `harvest_replication_lag_seconds > N` therefore stays
+/// silent through exactly the outage it was written for. Pin the shape.
+#[test]
+fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_replication_down"))
+        .expect("replication-down alert must exist");
+    let expr = rule["prometheus"]["expressions"][0]["expr"]
+        .as_str()
+        .expect("must carry a PromQL expression");
+    assert!(
+        expr.contains("harvest_replication_standbys"),
+        "the replication-down alert must key on the standby gauge: {expr}"
+    );
+    assert!(
+        !expr.contains("harvest_replication_lag_seconds"),
+        "the replication-down alert must NOT depend on a lag series that is absent \
+         precisely when replication is down: {expr}"
+    );
+    let description = rule["description"].as_str().expect("description");
+    assert!(
+        description.contains("unknown") || description.contains("absent"),
+        "the description must explain that the lag series goes ABSENT, not to zero: \
+         {description}"
+    );
+}
+
+/// A fenced worker never recovers on its own.
+#[test]
+fn the_fenced_alert_says_the_condition_is_not_self_healing() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_shard_fenced"))
+        .expect("shard-fenced alert must exist");
+    let description = rule["description"].as_str().expect("description");
+    assert!(
+        description.contains("restart"),
+        "the fenced alert must say the fix is restarting the fleet: {description}"
+    );
+    let runbook = read_doc("docs/runbooks/harvest-alerts.md");
+    let section = markdown_section(&runbook, "harvest_shard_fenced")
+        .expect("shard-fenced runbook section must exist");
+    let lower = section.to_lowercase();
+    assert!(
+        lower.contains("never") && (lower.contains("re-pin") || lower.contains("adopt")),
+        "the runbook must forbid re-pinning a fenced worker in place"
+    );
 }
 
 #[test]

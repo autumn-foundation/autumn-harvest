@@ -1170,6 +1170,116 @@
         "GET /api/harvest/admin/queue-coverage (issue #774 \u2014 confirm the queue has any live worker at all)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_capability_miss_release_sustained"
+    },
+    {
+      "id": "harvest_replication_down",
+      "status": "enforceable",
+      "signal_source": "harvest.replication.standbys{shard}, emitted per shard by the DR sampler from pg_stat_replication scoped to that shard's database (issue #954).",
+      "default_threshold": "Page when harvest_replication_standbys is 0 for any shard for two sampler intervals. Ticket when a replication slot is inactive but a standby is still connected.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "A shard has no connected standby, so cross-region DR is not protecting it: the RPO is unbounded and growing, and failing over now would lose everything since the standby stopped consuming. This is deliberately NOT a lag threshold. The lag series is absent, not zero, when the RPO is unknown - reporting a dead standby as a perfect RPO would be the most dangerous number this feature could publish - so a lag-based alert stays silent through exactly this outage. Retained WAL also accumulates on the primary until it runs out of disk.",
+      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
+      "dependencies": [
+        {
+          "ref": "#954",
+          "status": "shipped",
+          "surface": "harvest.replication.standbys and harvest dr status"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Keyed on the standby gauge, never on lag: the lag series goes absent when replication is down.",
+        "expressions": [
+          {
+            "name": "harvest_replication_down",
+            "expr": "min by (shard) (harvest_replication_standbys) == 0",
+            "for": "2m"
+          },
+          {
+            "name": "harvest_replication_wal_backlog",
+            "expr": "max by (shard) (harvest_replication_lag_bytes) > 1073741824",
+            "for": "15m"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest dr status --shard <id>=<dsn> -o json",
+        "SELECT slot_name, active, pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_down"
+    },
+    {
+      "id": "harvest_replication_lag_high",
+      "status": "enforceable",
+      "signal_source": "harvest.replication.lag_seconds{shard} - the measured RPO, derived from the LSN watermark trail (issue #954).",
+      "default_threshold": "Ticket when the measured RPO exceeds 60s for 10 minutes on any shard. Page when it exceeds your documented RPO budget. Both are starter defaults: the only correct threshold is the loss the business has agreed to accept.",
+      "severity": "ticket",
+      "owner_persona": "platform team",
+      "description": "A shard's standby is falling behind, so the amount of acknowledged work a failover would lose is growing. At failover time the number is literal: up to `lag` seconds of confirmed work is gone, and per the at-least-once contract side effects from that window may re-execute on the new primary. Rising lag with a healthy standby count usually means a slow standby, a long-running transaction on the subscriber, or a stalled apply worker - compare against pg_stat_replication.replay_lag, which goes NULL for a stuck logical apply worker while this metric keeps measuring.",
+      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
+      "dependencies": [
+        {
+          "ref": "#954",
+          "status": "shipped",
+          "surface": "harvest.replication.lag_seconds and harvest dr status"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Pair with harvest_replication_down: this alert can only fire while a lag reading exists at all.",
+        "expressions": [
+          {
+            "name": "harvest_replication_lag_high",
+            "expr": "max by (shard) (harvest_replication_lag_seconds) > 60",
+            "for": "10m"
+          },
+          {
+            "name": "harvest_replication_shard_generation_skew",
+            "expr": "max(harvest_shard_generation) - min(harvest_shard_generation) > 0",
+            "for": "15m"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest dr status --shard <id>=<dsn> -o json",
+        "SELECT application_name, state, replay_lag FROM pg_stat_replication"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_lag_high"
+    },
+    {
+      "id": "harvest_shard_fenced",
+      "status": "enforceable",
+      "signal_source": "harvest.shard.fenced{shard}, incremented once by a worker immediately before it stops because its pinned write-authority generation was superseded (issue #954).",
+      "default_threshold": "Page on any increase. There is no benign rate.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "A worker was fenced off a shard and stopped: that database's write-authority generation moved past the epoch the worker pinned at startup. During a planned failover this is expected for the old fleet, and the fix is to restart workers against the region that now holds authority. Outside a failover it means a generation was bumped on a healthy shard, which stops every worker pinned to the old epoch and is recovered only by restarting the fleet - never by re-pinning a worker in place, which would re-admit a worker the promoted region just evicted. The condition is not self-healing: a fenced worker does not retry.",
+      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
+      "dependencies": [
+        {
+          "ref": "#954",
+          "status": "shipped",
+          "surface": "harvest.shard.fenced, harvest.shard.generation, harvest dr fence"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Also watch harvest_shard_generation for skew: shards fail over independently, and a split generation across shards means a half-failed-over cluster.",
+        "expressions": [
+          {
+            "name": "harvest_shard_fenced",
+            "expr": "sum by (shard) (increase(harvest_shard_fenced_total[5m])) > 0",
+            "for": "0m"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest dr status --shard <id>=<dsn> -o json",
+        "harvest worker health --output json",
+        "SELECT shard_id, generation, fenced_at, fenced_by, fenced_reason FROM harvest_shard_generation"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_shard_fenced"
     }
   ]
 }

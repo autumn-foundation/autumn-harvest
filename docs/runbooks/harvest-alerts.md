@@ -2571,3 +2571,205 @@ terminally failed. Escalate to the team owning the deploy if
 `GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
 supposed to be live — a handler was removed while in-flight work still needed
 it, and those executions cannot make progress until it is redeployed.
+
+## harvest_replication_down
+
+**What to do when a shard has no connected standby:** cross-region DR is not
+protecting that shard. The RPO is unbounded and growing, a failover right now
+would lose everything since the standby stopped consuming, and the WAL the
+abandoned slot retains accumulates on the primary until it exhausts the disk.
+
+This alert keys on `harvest_replication_standbys{shard} == 0`, **not** on a lag
+threshold, and that is load-bearing. `harvest.replication.lag_seconds` is
+deliberately **absent** rather than `0` when the RPO is unknown — a dead standby
+reported as a perfect RPO is the most dangerous number the DR feature could
+publish — so an alert written as `lag_seconds > N` produces no series and stays
+silent through exactly this outage. `harvest.replication.lag_bytes` *does* stay
+real, because a slot pins WAL whether or not a walsender is attached; that is
+your severity signal here.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. `connected_standbys: 0` with
+   a growing `lag_bytes` confirms it.
+2. On the primary: `SELECT slot_name, active, pg_current_wal_lsn() -
+   COALESCE(confirmed_flush_lsn, restart_lsn) AS backlog FROM
+   pg_replication_slots;` An `active = false` slot with a growing backlog is an
+   abandoned standby.
+3. On the standby: is the subscription enabled?
+   `SELECT subname, subenabled FROM pg_subscription;` Check the standby's log
+   for apply-worker errors — a constraint violation or a missing table stops
+   apply permanently and the slot then just accumulates.
+4. Check the standby host itself: disk full, out of memory, restarted, or the
+   network path from standby to primary broken.
+
+### Likely causes
+
+- The subscription was disabled (often by a `DISABLE` during maintenance that
+  was never re-enabled).
+- The apply worker is failing permanently: a schema mismatch after a migration
+  was applied to the primary but not the standby (logical replication carries
+  no DDL).
+- The standby host is down, out of disk, or unable to reach the primary.
+- The slot was created and then never consumed — a half-finished DR setup.
+- The `pg_monitor` grant was revoked, so the views read as unavailable. This
+  looks like `0` standbys and is a configuration problem, not an outage.
+
+### False positives
+
+- A deliberate maintenance window on the standby. Expected, and still worth the
+  page: the RPO really is unbounded for its duration.
+- A single sampler interval during a standby restart. The `for: 2m` window
+  covers a normal restart.
+- A deployment that never configured DR at all. If a shard has no standby by
+  design, silence this alert for that shard explicitly rather than letting it
+  become background noise everyone ignores.
+
+### Safe actions
+
+- Re-enable the subscription: `ALTER SUBSCRIPTION <name> ENABLE;`
+- Apply any missing migrations to the standby, then re-enable.
+- If the standby is unrecoverable, **drop the slot** to stop WAL accumulation:
+  `SELECT pg_drop_replication_slot('<name>');` This gives up DR for that shard
+  until you rebuild it — say so explicitly — but a primary that runs out of WAL
+  space is a full outage rather than a lost safety net.
+- Rebuild the standby from a fresh base backup or a fresh `copy_data = true`
+  subscription.
+
+### Escalation criteria
+
+Escalate to the platform team owning the DR topology when the backlog passes
+the primary's WAL headroom, when the standby cannot be recovered in place, or
+when this shard is under an RPO commitment and DR has been down long enough to
+breach it. If a regional failure occurs while this is firing, the failover will
+proceed with an **unmeasured** loss — say so in the incident channel rather
+than recording "RPO: 0", and follow `docs/runbooks/cross-region-failover.md`.
+
+## harvest_replication_lag_high
+
+**What to do when the measured RPO is growing:** the standby is falling behind,
+so the amount of acknowledged work a failover would lose is growing with it.
+The number is literal: at failover, up to `lag` seconds of confirmed work is
+gone, and per Harvest's at-least-once contract, side effects from that window
+may re-execute on the new primary.
+
+A large `harvest.replication.lag_seconds` next to a `NULL`
+`pg_stat_replication.replay_lag` is the signature of a **stuck apply worker**.
+That combination is not a contradiction: `replay_lag` is computed from the
+subscriber's reply messages, so a subscriber whose apply worker is blocked stops
+replying and the column goes blind, while Harvest's watermark trail — computed
+on the primary from a position the standby confirmed — keeps measuring.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json` for the per-shard RPO and
+   byte backlog.
+2. On the primary: `SELECT application_name, state, replay_lag FROM
+   pg_stat_replication;` Compare with step 1 — a `NULL` here beside a large RPO
+   means apply is stuck, not slow.
+3. On the standby, look for a long-running transaction or a lock the apply
+   worker is waiting on: `SELECT pid, state, wait_event_type, wait_event,
+   query FROM pg_stat_activity;` A reporting query holding a lock on a
+   replicated table blocks apply completely.
+4. Check standby I/O and CPU. A standby on smaller hardware than its primary
+   falls behind under write bursts and never catches up.
+
+### Likely causes
+
+- A long-running query or an idle-in-transaction session on the standby holding
+  a lock the apply worker needs.
+- The standby is under-provisioned relative to the primary's write rate.
+- A large bulk write on the primary (a backfill, a retention sweep, a batch
+  start) that the single-threaded logical apply worker cannot keep pace with.
+- Network throughput between regions, especially with a burst of large payloads.
+- The sampler interval is set very high, so the reported number is coarse. The
+  RPO's resolution floor is one sampler interval.
+
+### False positives
+
+- A brief spike during a known bulk operation. Correlate with
+  `harvest_workflow_started_total` and your own backfill schedule.
+- A value between zero and one sampler interval on a healthy system. That is
+  the resolution floor, not lag.
+- A generation-skew alert firing *during* a planned failover. Skew is expected
+  while shards are being promoted; it is only a problem if it persists after
+  the failover is complete.
+
+### Safe actions
+
+- Terminate the blocking session on the standby:
+  `SELECT pg_terminate_backend(<pid>);`
+- Reduce write pressure: pause a backfill, lower a batch-start rate, or defer a
+  retention sweep.
+- Raise the standby's resources.
+- Do **not** "fix" the alert by widening the threshold. The threshold should be
+  the RPO the business agreed to accept; if the real lag exceeds it, the
+  exposure is real.
+
+### Escalation criteria
+
+Escalate when the measured RPO exceeds the documented RPO budget for more than
+one business hour, when it is rising monotonically with no identified cause, or
+when a failover is being considered while it is elevated — the RPO reported at
+that moment is the loss being accepted, and that is a decision for the service
+owner, not for on-call.
+
+## harvest_shard_fenced
+
+**What to do when a worker was fenced:** the shard's write-authority generation
+moved past the epoch that worker pinned at startup, so another region holds
+write authority now. The worker stopped rather than appending to a history it no
+longer owns. This is the cross-region DR fence working exactly as designed —
+the question is only whether the fence was intentional.
+
+### Triage steps
+
+1. Is a failover in progress? If yes, this is expected for the **old** fleet and
+   the remaining work is `docs/runbooks/cross-region-failover.md` step 4:
+   restart workers against the region that now holds authority.
+2. If no: `SELECT shard_id, generation, fenced_at, fenced_by, fenced_reason
+   FROM harvest_shard_generation;` The row records who bumped it and why.
+3. `harvest dr status --shard <id>=<dsn> -o json` across every shard. Compare
+   generations: if they differ, some shards were fenced and some were not,
+   which is a half-failed-over cluster.
+4. `harvest worker health --output json` — expect the fenced workers to be
+   absent or stale. They stopped; they are not slow.
+
+### Likely causes
+
+- A planned failover, with the old fleet still running.
+- A `harvest dr fence` run against the wrong shard, the wrong region, or during
+  a healthy week.
+- A worker restarted against the **old** region after a failover, pinning an
+  epoch that was already superseded.
+- A fail-back where the old region was re-seeded (correctly) from the new
+  primary, bringing the newer epoch with it, while a surviving worker there was
+  never restarted.
+
+### False positives
+
+None. A fence is always a real loss of write authority. It can be *expected* —
+during a failover it is the intended outcome — but it is never spurious, and
+the count never decays on its own.
+
+### Safe actions
+
+- Restart the fenced workers against the region that currently holds authority,
+  with `dr_fencing` still enabled. They pin the current epoch at startup.
+- If the fence was a mistake, the recovery is still to **restart the fleet**.
+  Generations only go up; there is no un-bump, and bumping again does not undo
+  anything — it fences the fleet a second time.
+- **Never** re-pin or adopt the new epoch in a running worker. That would
+  re-admit a worker the promoted region just evicted, which is precisely the
+  split-brain the epoch exists to prevent.
+- Verify no fenced worker wrote anything: a fenced claim burns no attempt and a
+  fenced append writes nothing, so its tasks should still be `PENDING` and
+  claimable by the region that holds authority.
+
+### Escalation criteria
+
+Escalate immediately when no failover was planned — an unexplained generation
+bump means someone has write authority you did not grant. Escalate when
+generations are skewed across shards outside a failover window, and when fenced
+workers keep reappearing after restart (they are being pointed at a region that
+no longer holds authority — fix the DSN or DNS, not the worker).
