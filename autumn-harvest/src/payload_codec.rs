@@ -743,8 +743,25 @@ impl PayloadCodecs {
                 None
             };
         };
-        if parts.kid.is_some() || codec.codec_id() == parts.codec_id {
+        if codec.codec_id() == parts.codec_id {
             return Some(codec);
+        }
+        if parts.kid.is_some() {
+            // An EXPLICIT kid resolved to a registered key, but the envelope
+            // names a different algorithm than that key is registered with. It
+            // is malformed -- corrupted, imported from elsewhere, or crafted --
+            // and there is no safe reading of it. Decoding under the key's own
+            // codec anyway is the exact hazard this function's doc names: an
+            // unauthenticated codec returns plausible-but-wrong bytes instead
+            // of failing, and the sweep re-encrypts that garbage under the
+            // active key, destroying the payload permanently.
+            //
+            // Falling back to the codec_id map would be just as wrong: the
+            // envelope named a KEY, and resolving it through a codec unrelated
+            // to that key is the confusion being rejected. Fail cleanly, so
+            // strict decode raises `UnknownCodecKey` and lossy decode leaves a
+            // bounded marker.
+            return None;
         }
         // Kid-less, and the legacy entry is for a DIFFERENT codec than this
         // envelope names. Defer to the codec_id map, which knows the right one.
@@ -2292,6 +2309,50 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_keyed_envelope_naming_the_wrong_codec_is_refused() {
+        // Codex round 8 (P2). The round-2 fix required the codec_id to match
+        // for KID-LESS envelopes and left the keyed branch short-circuiting on
+        // `parts.kid.is_some()`, so an explicit kid that resolved was decoded
+        // without ever checking the algorithm the envelope named.
+        //
+        // That is the hazard `resolve_decoder`'s own doc describes: an
+        // unauthenticated codec returns plausible-but-wrong bytes rather than
+        // failing, and the sweep then re-encrypts that garbage under the active
+        // key -- silently and permanently destroying the payload. `XorCodec`
+        // is exactly such a codec: it never fails, it just returns different
+        // bytes, which is why it can stand in for the real thing here.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs.set_active_key("k1").expect("activate k1");
+
+        let encoded = codecs
+            .encode_event(&started(json!({"secret": "value"})))
+            .expect("encode");
+        let mut tampered = encoded;
+        let field = tampered
+            .get_mut("data")
+            .and_then(|d| d.get_mut("input"))
+            .expect("input envelope");
+        // Same registered kid, a codec_id the key is not registered with.
+        field["codec_id"] = json!("not-the-registered-codec");
+
+        assert!(
+            codecs.decode_event(tampered.clone()).is_err(),
+            "a keyed envelope naming a different codec must fail, not decode \
+             under the key's own algorithm"
+        );
+
+        // And the lossy path degrades to a bounded marker rather than handing
+        // workflow code the wrong plaintext.
+        let mut lossy = tampered;
+        let outcome = codecs.decode_value_lossy(&mut lossy);
+        assert_eq!(outcome.failed, 1, "the mismatch is counted as undecodable");
+        assert_eq!(outcome.decoded, 0);
     }
 
     #[test]

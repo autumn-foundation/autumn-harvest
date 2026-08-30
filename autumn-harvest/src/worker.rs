@@ -939,7 +939,7 @@ impl HandlerRegistry {
     /// Every event write and every history read in the worker resolves its
     /// codecs through here, so the two can never disagree.
     #[must_use]
-    pub fn payload_codecs(&self) -> &crate::payload_codec::PayloadCodecs {
+    pub const fn payload_codecs(&self) -> &crate::payload_codec::PayloadCodecs {
         &self.payload_codecs
     }
 
@@ -7373,6 +7373,11 @@ async fn notify_progress_from_commands(
 /// best-effort (progress is disposable).
 const PROGRESS_MAX_CHUNKS_PER_CYCLE: usize = 10_000;
 
+// Issue #1243: the codec registry pushed this one past the pedantic
+// argument limit. The alternative -- bundling the existing parameters
+// into a struct -- is a wider refactor than routing codecs warrants,
+// and worker.rs already carries this allow on thirteen siblings.
+#[allow(clippy::too_many_arguments)]
 async fn persist_signal_wait_park(
     conn: &mut AsyncPgConnection,
     detached_spawns: DetachedSpawnPersistence<'_>,
@@ -7582,6 +7587,11 @@ async fn process_mutex_releases_from_commands(
 /// - `Enqueued` → park capturing `had_wake_requested`; post-commit self-wake if a
 ///   racing releaser's wake was captured OR the caller is now grantable-head.
 #[allow(clippy::too_many_lines)]
+// Issue #1243: the codec registry pushed this one past the pedantic
+// argument limit. The alternative -- bundling the existing parameters
+// into a struct -- is a wider refactor than routing codecs warrants,
+// and worker.rs already carries this allow on thirteen siblings.
+#[allow(clippy::too_many_arguments)]
 async fn persist_mutex_acquire_park(
     conn: &mut AsyncPgConnection,
     detached_spawns: DetachedSpawnPersistence<'_>,
@@ -10963,6 +10973,11 @@ async fn record_session_acquire_schedule_to_start_timeout(
 /// capacity, or sessions are disabled): reschedules the task with a
 /// randomized backoff so it can be claimed by a different worker with a
 /// free slot, without consuming a retry attempt.
+// Issue #1243: the codec registry pushed this one past the pedantic
+// argument limit. The alternative -- bundling the existing parameters
+// into a struct -- is a wider refactor than routing codecs warrants,
+// and worker.rs already carries this allow on thirteen siblings.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_acquire(
     pool: &DbPool,
     task: &TaskQueueItem,
