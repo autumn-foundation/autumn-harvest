@@ -12749,6 +12749,11 @@ pub struct ActivityContext {
     /// `run_transactional` must encode through the same registry the worker
     /// writes and replays with. Defaults to identity, so a context built
     /// without one behaves exactly as before.
+    ///
+    /// `db`-gated because its only reader is that commit, which is itself
+    /// `db`-gated: without the feature there is no transactional write path and
+    /// the field would be dead.
+    #[cfg(feature = "db")]
     payload_codecs: crate::payload_codec::PayloadCodecs,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     /// Read via `header()` / `headers()`. Empty for activities dispatched before
@@ -12903,6 +12908,7 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            #[cfg(feature = "db")]
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
@@ -12956,6 +12962,7 @@ impl ActivityContext {
             previous_failure: None,
             max_attempts: None,
             transactional_state: None,
+            #[cfg(feature = "db")]
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
@@ -12993,6 +13000,7 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            #[cfg(feature = "db")]
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
@@ -13283,7 +13291,9 @@ impl ActivityContext {
     ///
     /// `ActivityCompleted.output` is payload-bearing, so the inline commit in
     /// [`Self::run_transactional`] has to encode through the same registry the
-    /// worker writes and replays with.
+    /// worker writes and replays with. `db`-gated alongside that commit and the
+    /// field it sets.
+    #[cfg(feature = "db")]
     #[must_use]
     pub(crate) fn with_payload_codecs(
         mut self,
