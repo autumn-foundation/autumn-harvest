@@ -10978,6 +10978,11 @@ async fn record_session_acquire_schedule_to_start_timeout(
 // into a struct -- is a wider refactor than routing codecs warrants,
 // and worker.rs already carries this allow on thirteen siblings.
 #[allow(clippy::too_many_arguments)]
+// Issue #1243: the codec registry pushed this one past the pedantic
+// limit. Bundling the existing parameters into a struct is a wider
+// refactor than routing codecs warrants, and worker.rs already carries
+// this allow on more than a dozen siblings.
+#[allow(clippy::too_many_lines)]
 async fn handle_session_acquire(
     pool: &DbPool,
     task: &TaskQueueItem,
@@ -12132,6 +12137,11 @@ async fn persist_scheduled_external_activity(
     Ok(())
 }
 
+// Issue #1243: the codec registry pushed this one past the pedantic
+// limit. Bundling the existing parameters into a struct is a wider
+// refactor than routing codecs warrants, and worker.rs already carries
+// this allow on more than a dozen siblings.
+#[allow(clippy::too_many_arguments)]
 async fn persist_bookkeeping_and_requeue_workflow(
     conn: &mut AsyncPgConnection,
     detached_spawns: DetachedSpawnPersistence<'_>,
@@ -18018,6 +18028,11 @@ pub async fn refund_capability_miss_rate_limit_token(
 /// `WorkflowFailed` and moves the task to the DLQ exactly as any other terminal
 /// failure does) and returns the error, so nothing about the terminal contract
 /// changes — only its *reason* string and the delay before reaching it.
+// Issue #1243: the codec registry pushed this one past the pedantic
+// limit. Bundling the existing parameters into a struct is a wider
+// refactor than routing codecs warrants, and worker.rs already carries
+// this allow on more than a dozen siblings.
+#[allow(clippy::too_many_arguments)]
 async fn handle_capability_miss(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -18687,6 +18702,11 @@ pub enum TerminalWriteOutcome {
 /// Propagates any database error; the transaction rolls back, so a failed
 /// terminal write never leaves a partially-failed run.
 #[doc(hidden)]
+// Issue #1243: the codec registry pushed this one past the pedantic
+// limit. Bundling the existing parameters into a struct is a wider
+// refactor than routing codecs warrants, and worker.rs already carries
+// this allow on more than a dozen siblings.
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_terminal_failure_if_still_claimed<F>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
