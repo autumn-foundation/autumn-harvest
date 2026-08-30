@@ -1063,7 +1063,7 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
         .expect("row");
     // Business data that merely *looks* like an envelope.
     data["data"]["input"] = json!({
-        "_harvest_codec_envelope": 1,
+        "_harvest_codec_envelope": 2,
         "codec_id": "xor",
         "data": "AAAA",
         "something_else": true,
@@ -1089,6 +1089,72 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
             .expect("sweep"),
         0,
         "and must not be swept either"
+    );
+}
+
+/// The SQL census must agree with Rust that a four-key **version 1** value is
+/// plaintext, not an envelope — otherwise it would count business data that the
+/// sweep can never convert and block retirement forever.
+#[tokio::test]
+async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "v1_business").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let mut data: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("row");
+    // Exactly what a pre-#948 identity deployment could legitimately have
+    // stored as business plaintext.
+    data["data"]["input"] = json!({
+        "_harvest_codec_envelope": 1,
+        "codec_id": "xor",
+        "data": "AAAA",
+        "kid": "k1",
+    });
+    diesel::update(harvest_events::table.find(row_id))
+        .set(harvest_events::event_data.eq(&data))
+        .execute(&mut conn)
+        .await
+        .expect("update");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        0,
+        "four-key version-1 plaintext must not be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        0,
+        "and must not be rewritten"
     );
 }
 
@@ -1412,7 +1478,7 @@ async fn a_crafted_key_id_in_stored_input_is_not_counted() {
         .await
         .expect("row");
     data["data"]["input"] = json!({
-        "_harvest_codec_envelope": 1,
+        "_harvest_codec_envelope": 2,
         "codec_id": "xor",
         "data": "AAAA",
         "kid": "A".repeat(4096),

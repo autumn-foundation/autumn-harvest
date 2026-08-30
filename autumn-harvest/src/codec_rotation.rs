@@ -312,25 +312,32 @@ mod db {
     /// `tests/integration/codec_rotation_db_tests.rs` pins the two together.
     const ENVELOPE_PREDICATE: &str = "
               jsonb_typeof(f.value) = 'object'
-          AND f.value -> '_harvest_codec_envelope' = '1'::jsonb
-          -- jsonb compares numbers as `numeric`, so the line above alone also
-          -- accepts 1.0 -- which serde_json's `as_i64` rejects. Pin the text
-          -- form too, so Postgres and Rust classify byte-identically.
-          AND f.value ->> '_harvest_codec_envelope' = '1'
           AND jsonb_typeof(f.value -> 'codec_id') = 'string'
           AND jsonb_typeof(f.value -> 'data') = 'string'
-          -- Exactly 3 keys, or exactly 4 with a string `kid` that satisfies the
-          -- same charset/length rule `validate_key_id` applies in Rust (an
-          -- out-of-charset `kid` is not an envelope on either side, so crafted
-          -- workflow input cannot inject census rows).
-          AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value))
-              = CASE WHEN jsonb_typeof(f.value -> 'kid') = 'string'
-                          AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$'
-                     THEN 4 ELSE 3 END
           AND (
-                  jsonb_typeof(f.value -> 'kid') IS NULL
-               OR (jsonb_typeof(f.value -> 'kid') = 'string'
-                   AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$')
+                  -- Version 1: exactly three keys, no `kid`. Every pre-#948
+                  -- envelope, and every envelope written while the legacy key
+                  -- is active.
+                  (
+                      f.value -> '_harvest_codec_envelope' = '1'::jsonb
+                      -- jsonb compares numbers as `numeric`, so the line above
+                      -- alone also accepts 1.0 -- which serde_json's `as_i64`
+                      -- rejects. Pin the text form too, so Postgres and Rust
+                      -- classify byte-identically.
+                  AND f.value ->> '_harvest_codec_envelope' = '1'
+                  AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 3
+                  )
+               OR
+                  -- Version 2: exactly four keys, the fourth a `kid` satisfying
+                  -- the same charset/length rule `validate_key_id` applies in
+                  -- Rust (so crafted workflow input cannot inject census rows).
+                  (
+                      f.value -> '_harvest_codec_envelope' = '2'::jsonb
+                  AND f.value ->> '_harvest_codec_envelope' = '2'
+                  AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 4
+                  AND jsonb_typeof(f.value -> 'kid') = 'string'
+                  AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$'
+                  )
               )";
 
     #[derive(diesel::QueryableByName)]
@@ -868,7 +875,9 @@ mod db {
                     {
                         Ok(n) => total += n,
                         Err(e) => {
-                            tracing::error!("[codec_rotation] sweep failed on shard {shard:?}: {e}")
+                            tracing::error!(
+                                "[codec_rotation] sweep failed on shard {shard:?}: {e}"
+                            );
                         }
                     }
                 }
