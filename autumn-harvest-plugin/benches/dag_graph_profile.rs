@@ -750,18 +750,22 @@ fn build_dag() -> DagDefinition {
 
 // ── Event history construction ──────────────────────────────────────────
 
-/// Task indices that feed a signal-gate node's upstream (see `build_dag`'s
-/// `n_gate0`..`n_gate3`). Gate reachability is checked BEFORE resolution
-/// (`gate_status`/`task_reach`): an upstream that fails, is condition-skipped,
-/// or is never reached makes the default `AllSuccess` trigger rule report
-/// `SkippedByTrigger`/`NotReached`, so the gate itself is classified `Pending`
-/// regardless of any `SignalReceived`/`TimerFired` recorded for it. These
-/// indices are forced to a plain first-attempt success below (overriding the
-/// generic `idx % 5` pattern) so every gate is actually *reached*, and the
-/// signal/timer events pushed for it below are genuinely exercised rather
-/// than being dead weight a broken upstream chain never lets `gate_status`
-/// read (issue #690 review, Codex).
-const GATE_UPSTREAM_INDICES: [usize; 8] = [9, 14, 12, 17, 15, 20, 18, 23];
+/// Last task index of the "backbone" -- root through layer2 -- that always
+/// succeeds on the first attempt, unconditionally.
+///
+/// A DAG-blind per-index outcome pattern can generate a history the real
+/// walker could never produce: e.g. marking the sole root "never reached"
+/// while every other node (all transitively downstream of it) still gets
+/// scheduled/completed/failed events regardless (issue #690 review, Codex).
+/// [`build_events`] instead tracks, per task, whether its own upstreams are
+/// all `done` (§ below) and skips generating any event at all for an
+/// unreachable task. The backbone exists so that tracking has a real,
+/// populated foundation to test against: every gate (layer3) is guaranteed
+/// reachable, so its scripted signal/timer/left-unresolved resolution below
+/// is genuinely exercised rather than short-circuited to `Pending` by a
+/// broken upstream chain, and layer4 onward has a real upstream population
+/// to be reachability-tested against instead of starting from nothing.
+const BACKBONE_END: usize = 24;
 
 /// Build a realistic recorded history for `def`: a mix of succeeded, failed,
 /// multi-attempt-retried, condition-skipped (#482), and never-reached
@@ -772,6 +776,19 @@ const GATE_UPSTREAM_INDICES: [usize; 8] = [9, 14, 12, 17, 15, 20, 18, 23];
 /// *current* node's own activity name, the shape `is_compensation_dispatch`'s
 /// exclusion exists for (a later DAG definition introducing a forward node
 /// named after an older definition's compensator).
+///
+/// Reachability-consistent by construction (issue #690 review, Codex): a
+/// task's outcome is only ever generated when `task.upstreams` are all
+/// `done` -- true for a genuinely succeeded activity (first attempt or after
+/// retry) or a gate that resolved to `TaskStatus::Succeeded` (signal-won, or
+/// timer-won with `GateTimeoutAction::Continue` -- both gates here use
+/// `Continue`). An unreachable task (an upstream failed, was condition-
+/// skipped, was itself unreachable, or is a gate still `Waiting`) gets no
+/// events at all, exactly like the real walker would never have dispatched
+/// it. This is why `gate_2`/`gate_3` being left deliberately unresolved
+/// (`Waiting`, not `done`) legitimately makes their own downstream layer4
+/// nodes unreachable too -- a real DAG paused on two unanswered approval
+/// gates has exactly this shape, half its next layer genuinely pending.
 fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     let tasks = def.tasks();
     let mut events: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
@@ -784,46 +801,84 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
 
     push(&mut t, &mut events, workflow_started());
 
+    // `done[idx]` -- whether task `idx`'s recorded outcome counts as "done"
+    // for the default `AllSuccess` trigger rule every node in this fixture
+    // uses. See the function doc comment.
+    let mut done = vec![false; tasks.len()];
     let mut gate_seen: usize = 0;
+    let mut activity_seq: usize = 0;
+
     for (idx, task) in tasks.iter().enumerate() {
         if let Some(gate) = &task.signal {
-            match gate_seen % 4 {
-                // gate_0 (plain signal_gate): resolved by a matching signal.
-                0 => push(&mut t, &mut events, signal_received(&gate.signal_name)),
-                // gate_1 (signal_gate_with_timeout): resolved by the race timer
-                // firing before any signal arrives.
-                1 => push(&mut t, &mut events, gate_timer_fired(1, &gate.signal_name)),
-                // gate_2 (plain signal_gate) and gate_3 (signal_gate_with_timeout):
-                // both left unresolved — `waiting` on a live run, the deadline
-                // (where one exists) not yet fired either.
-                _ => {}
+            let reachable = task.upstreams.iter().all(|&u| done[u]);
+            if reachable {
+                match gate_seen % 4 {
+                    // gate_0 (plain signal_gate): resolved by a matching signal.
+                    0 => {
+                        push(&mut t, &mut events, signal_received(&gate.signal_name));
+                        done[idx] = true;
+                    }
+                    // gate_1 (signal_gate_with_timeout, Continue-on-timeout):
+                    // resolved by the race timer firing before any signal
+                    // arrives -- a `TimedOut` node status that still counts as
+                    // `TaskStatus::Succeeded` for downstream trigger-rule
+                    // purposes, because the gate's `on_timeout` is `Continue`.
+                    1 => {
+                        push(&mut t, &mut events, gate_timer_fired(1, &gate.signal_name));
+                        done[idx] = true;
+                    }
+                    // gate_2 (plain signal_gate) and gate_3 (signal_gate_with_timeout):
+                    // both left unresolved — `waiting` on a live run, the deadline
+                    // (where one exists) not yet fired either. Not `done`:
+                    // nothing downstream of either can be reachable.
+                    _ => {}
+                }
             }
+            // The rotation advances regardless of reachability so `gate_seen`
+            // always identifies the *intended* scenario (gate_0/1/2/3) by
+            // position, independent of whether this particular gate turned
+            // out reachable.
             gate_seen += 1;
             continue;
         }
 
-        if GATE_UPSTREAM_INDICES.contains(&idx) {
-            // Forced success so every downstream gate is actually reached
-            // (see `GATE_UPSTREAM_INDICES`'s doc comment).
+        if idx <= BACKBONE_END {
             let id = ActivityExecId::new();
             push(&mut t, &mut events, sched(&task.activity_name, id));
             push(&mut t, &mut events, activity_started(id));
             push(&mut t, &mut events, completed(id));
+            done[idx] = true;
             continue;
         }
 
-        match idx % 5 {
-            // Never reached: no events at all.
-            0 => {}
-            // Succeeded on the first attempt.
-            1 => {
+        let reachable = task.upstreams.iter().all(|&u| done[u]);
+        if !reachable {
+            // No real walker would ever have dispatched this node: no events.
+            continue;
+        }
+
+        match activity_seq % 6 {
+            // Succeeded on the first attempt (half of reachable activities).
+            0..=2 => {
                 let id = ActivityExecId::new();
                 push(&mut t, &mut events, sched(&task.activity_name, id));
                 push(&mut t, &mut events, activity_started(id));
                 push(&mut t, &mut events, completed(id));
+                done[idx] = true;
             }
-            // Failed (terminal, retry-exhausting failure).
-            2 => {
+            // Succeeded after a genuine activity-level retry: two
+            // `ActivityStarted` claims (the original + one requeue) before
+            // the final `ActivityCompleted`, same `activity_id` throughout.
+            3 => {
+                let id = ActivityExecId::new();
+                push(&mut t, &mut events, sched(&task.activity_name, id));
+                push(&mut t, &mut events, activity_started(id));
+                push(&mut t, &mut events, activity_started(id));
+                push(&mut t, &mut events, completed(id));
+                done[idx] = true;
+            }
+            // Failed (terminal, retry-exhausting failure). Not `done`.
+            4 => {
                 let id = ActivityExecId::new();
                 push(&mut t, &mut events, sched(&task.activity_name, id));
                 push(&mut t, &mut events, activity_started(id));
@@ -834,32 +889,23 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
                 );
             }
             // Condition-skipped (#482): a `dag_skip` marker, no dispatch.
-            3 => push(
+            // Not `done`.
+            _ => push(
                 &mut t,
                 &mut events,
                 skip_marker_full(idx, &task.activity_name, &task.upstreams),
             ),
-            // Succeeded after a genuine activity-level retry: two
-            // `ActivityStarted` claims (the original + one requeue) before
-            // the final `ActivityCompleted`, same `activity_id` throughout.
-            4 => {
-                let id = ActivityExecId::new();
-                push(&mut t, &mut events, sched(&task.activity_name, id));
-                push(&mut t, &mut events, activity_started(id));
-                push(&mut t, &mut events, activity_started(id));
-                push(&mut t, &mut events, completed(id));
-            }
-            _ => unreachable!(),
         }
+        activity_seq += 1;
     }
 
     // A couple of issue #780 compensator dispatches under their own
     // (non-reused) names, naming forward nodes that were actually dispatched
-    // above (`t001` succeeded, `t002` failed) — these grow the
-    // `dispatched_activity_names` set realistically but, since `undo_t001`/
-    // `undo_t002` are not themselves node names in this DAG, `latest_scheduled`
-    // short-circuits on `name == node` before ever reaching
-    // `is_compensation_dispatch` for them.
+    // above (`t001`/`t002` are both in the backbone, so both genuinely
+    // dispatched and succeeded) — these grow the `dispatched_activity_names`
+    // set realistically but, since `undo_t001`/`undo_t002` are not themselves
+    // node names in this DAG, `latest_scheduled` short-circuits on
+    // `name == node` before ever reaching `is_compensation_dispatch` for them.
     push(
         &mut t,
         &mut events,
