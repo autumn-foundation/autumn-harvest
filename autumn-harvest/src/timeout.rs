@@ -3423,14 +3423,33 @@ pub async fn enforce_timeouts_once(
     // connection would park forever on a single-connection pool (deadpool is
     // configured with no acquisition timeout), wedging every later resident of
     // this tick as well as rotation itself.
-    count += crate::codec_rotation::sweep_codec_reencryption(
+    //
+    // Isolated from the rest of the pass on purpose: a rotation failure is
+    // logged and skipped, never propagated. Rotation is new and optional; the
+    // durable-mutex lease reclamation below is neither, and a workflow waiting
+    // on a lease this pass would have freed stays stuck for as long as the
+    // sweep keeps failing. Missing grants on `harvest_codec_rotation_cursor`
+    // or on `UPDATE harvest_events` are exactly the kind of persistent,
+    // deployment-shaped failure that repeats identically every tick, so
+    // propagating would not be a transient blip — it would take mutex
+    // reclamation down on that shard indefinitely. A new feature must not be
+    // able to break an old one by failing.
+    match crate::codec_rotation::sweep_codec_reencryption(
         conn,
         shard_assignments,
         payload_codecs,
         codec_rotation_batch_size,
         metrics,
     )
-    .await?;
+    .await
+    {
+        Ok(swept) => count += swept,
+        Err(e) => tracing::warn!(
+            error = %e,
+            "codec re-encryption sweep failed; continuing with the remaining \
+             timeout-pass residents"
+        ),
+    }
     // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
     // each freed key's new head of line. Shard-local: it runs against this
     // connection's own database (like `enforce_broken_sessions`), and is a no-op

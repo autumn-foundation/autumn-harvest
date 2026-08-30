@@ -1508,6 +1508,67 @@ async fn retirement_refuses_an_unregistered_key_id() {
 /// AC4's "resident of the existing scanner cadence" half: the sweep must
 /// actually run from `enforce_timeouts_once`, not only when called directly.
 #[tokio::test]
+async fn a_failing_sweep_does_not_strand_the_later_timeout_residents() {
+    // Codex round 5 (P1): the sweep runs before `reclaim_expired_leases_and_wake`
+    // in `enforce_timeouts_once`. Propagating its error would return from the
+    // pass early, so a PERSISTENT rotation failure -- missing grants on the
+    // cursor table or on `UPDATE harvest_events`, which repeat identically
+    // every tick -- would stop expired durable-mutex leases being reclaimed on
+    // that shard, stranding the workflows waiting on them. Rotation is new and
+    // optional; mutex reclamation is neither, and a new feature must not be
+    // able to break an old one by failing.
+    //
+    // Breaking the cursor table's SCHEMA (rather than dropping it) is what
+    // makes this test target the sweep alone: `cursor_table_present` still
+    // reports true, so the sweep proceeds and fails on the column, while every
+    // other resident of the pass is untouched.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "sweep_failure_isolation").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    diesel::sql_query("ALTER TABLE harvest_codec_rotation_cursor DROP COLUMN rows_reencrypted")
+        .execute(&mut conn)
+        .await
+        .expect("break the cursor table for the sweep only");
+
+    // The pass must still succeed: the sweep's failure is logged and skipped.
+    autumn_harvest::timeout::enforce_timeouts_once(
+        &mut conn,
+        &NoOpMetrics,
+        std::time::Duration::from_secs(5),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+        &codecs,
+        100,
+    )
+    .await
+    .expect("a failing rotation sweep must not fail the whole timeout pass");
+
+    // And the row is genuinely unconverted -- proving the sweep really did
+    // fail, so the Ok above is isolation and not an accidental no-op.
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(
+        kid_of(&rows[0], "input"),
+        Some("k1".to_string()),
+        "the sweep must have failed, leaving the row on the old key"
+    );
+}
+
+#[tokio::test]
 async fn the_sweep_runs_as_a_resident_of_the_timeout_scanner() {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
