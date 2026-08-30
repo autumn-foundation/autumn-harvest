@@ -805,6 +805,58 @@ async fn the_promotion_runs_inside_a_transaction_so_its_timeout_applies() {
     );
 }
 
+/// The subscription conninfo must address the server, not the test client.
+///
+/// Regression guard for the CI-only failure that the three two-region tests hit
+/// the first time they ever ran under Docker: the conninfo was built from the
+/// *client-side* URL, so it carried the host-mapped port (`localhost:33624`).
+/// `CREATE SUBSCRIPTION` dials the publisher from inside the server, where that
+/// port does not exist, and every two-region test died with "could not connect
+/// to the publisher ... Connection refused".
+///
+/// It passed on a host-installed Postgres because there the client port and the
+/// server port are the same number, which is exactly why no local run could
+/// catch it. This test creates that divergence deliberately by passing a URL
+/// whose port is wrong, and asserts the conninfo ignores it.
+#[tokio::test]
+async fn the_subscription_conninfo_uses_the_servers_own_port_not_the_clients() {
+    let (url, _db) = require_db!("conninfo");
+    let mut conn = connect(&url).await;
+
+    // A port the server is certainly NOT listening on, standing in for the
+    // host-mapped port a container publishes.
+    let lying_url = "postgres://postgres@localhost:1/postgres";
+    let conninfo = server_side_conninfo(&mut conn, lying_url, "somedb").await;
+
+    assert!(
+        !conninfo.contains("port=1 "),
+        "the conninfo must not carry the client-side port; got {conninfo:?}"
+    );
+    assert!(
+        conninfo.contains("host=127.0.0.1"),
+        "the conninfo must dial loopback explicitly — `localhost` resolved to ::1 in CI, which \
+         a server not listening on IPv6 refuses; got {conninfo:?}"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Port {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        port: String,
+    }
+    let actual = diesel::sql_query("SELECT current_setting('port') AS port")
+        .load::<Port>(&mut conn)
+        .await
+        .expect("read port")
+        .into_iter()
+        .next()
+        .expect("one row")
+        .port;
+    assert!(
+        conninfo.contains(&format!("port={actual}")),
+        "the conninfo must carry the server's own port ({actual}); got {conninfo:?}"
+    );
+}
+
 // ── AC4 / AC6(c): measured RPO ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -1027,22 +1079,47 @@ fn dr_worker_config() -> autumn_harvest::worker::WorkerRuntimeConfig {
 }
 
 // ── The two-"region" topology, over real logical replication ───────────────
+/// Build a libpq conninfo string that **the server itself** can use to reach
+/// the publisher database.
+///
+/// The host and port are deliberately NOT taken from `url`. `url` is the
+/// *client-side* address, and under testcontainers that is a host-mapped port
+/// (`localhost:33624`) which exists only on the Docker host. `CREATE
+/// SUBSCRIPTION` makes Postgres dial the publisher from inside its own network
+/// namespace, where that port is closed — the subscription then fails with
+/// "could not connect to the publisher ... Connection refused". Both "regions"
+/// are databases in one instance, so the address the server needs is its own:
+/// loopback on the port it is actually listening on, which it can be asked for.
+///
+/// `127.0.0.1` rather than `localhost` on purpose: `localhost` resolved to
+/// `::1` in CI, and a server not listening on IPv6 refuses that even when the
+/// port is right.
+async fn server_side_conninfo(conn: &mut AsyncPgConnection, url: &str, db: &str) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct Port {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        port: String,
+    }
 
-/// Turn a `postgres://` URL into the libpq keyword form `CREATE SUBSCRIPTION`
-/// wants, retargeted at `db`.
-fn libpq_conninfo(url: &str, db: &str) -> String {
+    let port = diesel::sql_query("SELECT current_setting('port') AS port")
+        .load::<Port>(conn)
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map_or_else(|| "5432".to_string(), |r| r.port);
+
     let rest = url
         .trim_start_matches("postgres://")
         .trim_start_matches("postgresql://");
-    let (userinfo, after_at) = rest.split_once('@').unwrap_or(("postgres", rest));
+    // Only the credentials are taken from `url`; the address comes from the
+    // server itself, above.
+    let userinfo = rest.split_once('@').map_or("postgres", |(u, _)| u);
     let (user, password) = userinfo
         .split_once(':')
         .map_or((userinfo, None), |(u, p)| (u, Some(p)));
-    let authority = after_at.split(['/', '?']).next().unwrap_or(after_at);
-    let (host, port) = authority.split_once(':').unwrap_or((authority, "5432"));
     use std::fmt::Write as _;
 
-    let mut conninfo = format!("host={host} port={port} user={user} dbname={db}");
+    let mut conninfo = format!("host=127.0.0.1 port={port} user={user} dbname={db}");
     if let Some(pw) = password {
         let _ = write!(conninfo, " password={pw}");
     }
@@ -1132,7 +1209,7 @@ async fn two_regions(tag: &str) -> Option<Regions> {
         .await
         .expect("create slot");
 
-    let conninfo = libpq_conninfo(&admin, &primary_db);
+    let conninfo = server_side_conninfo(&mut a, &admin, &primary_db).await;
     let mut b = connect(&standby_url).await;
     b.batch_execute(&format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION '{conninfo}' PUBLICATION harvest_dr \
