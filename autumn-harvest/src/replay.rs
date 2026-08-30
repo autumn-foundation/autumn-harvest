@@ -4362,7 +4362,7 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
-        self.match_signal_inner(signal_name, false)
+        self.match_signal_inner(signal_name, None)
     }
 
     /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
@@ -4384,15 +4384,25 @@ impl HistoryMatcher {
     /// branch also cannot hang the workflow on a never-arriving signal: some
     /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
     /// outcome for every later replay.
-    pub fn match_race_signal(&mut self, signal_name: &str) -> HistoryMatch {
-        self.match_signal_inner(signal_name, true)
+    /// `settle_marker` is this race's own `race_winner:{seq}` marker name; it
+    /// **bounds** the scan. A `SignalReceived` recorded at or after that marker
+    /// was delivered once the race had already resolved, so it cannot be this
+    /// branch's resolution — it belongs to a later waiter. Without the bound a
+    /// *losing* signal branch would scan to end-of-history and silently consume
+    /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
+    /// a signal already delivered.
+    pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, Some(settle_marker))
     }
 
+    /// `tolerate_interleaved` carries the race's settlement-marker name when the
+    /// caller is a `ctx.race()` branch, and is `None` for a solo
+    /// `wait_for_signal`.
     #[allow(clippy::too_many_lines)]
     fn match_signal_inner(
         &mut self,
         signal_name: &str,
-        tolerate_interleaved: bool,
+        tolerate_interleaved: Option<&str>,
     ) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
@@ -4651,17 +4661,37 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 other => {
-                    if first_interleaved_command.is_some() {
-                        return HistoryMatch::NoMatch;
-                    }
                     // Issue #950: inside a race, an unrecognised event is a
                     // sibling branch's own command/terminal, not a divergence —
                     // cross it as an interleaved command (so a later win rewinds
-                    // the cursor to it for its own claimer) and keep scanning.
-                    if tolerate_interleaved {
+                    // the cursor to it for its own claimer) and keep scanning,
+                    // bounded by the race's own settlement marker.
+                    //
+                    // Checked BEFORE the `is_some()` early-return below. That
+                    // guard is what makes the SOLO wait stop after one crossed
+                    // event, and since this arm is what SETS
+                    // `first_interleaved_command`, ordering it second would let a
+                    // race branch cross exactly one event and then bail — while
+                    // the normal shape is two (`ActivityScheduled` +
+                    // `ActivityStarted`) before the signal.
+                    if let Some(settle_marker) = tolerate_interleaved {
+                        // A signal recorded at or after this race's
+                        // `race_winner:{seq}` marker was delivered AFTER the race
+                        // resolved, so it cannot be this branch's resolution — it
+                        // belongs to a later waiter. Stop rather than consume it.
+                        if matches!(
+                            other,
+                            WorkflowEvent::MarkerRecorded { name, .. }
+                                if name.as_str() == settle_marker
+                        ) {
+                            return HistoryMatch::NoMatch;
+                        }
                         first_interleaved_command.get_or_insert(scan_cursor);
                         scan_cursor += 1;
                         continue;
+                    }
+                    if first_interleaved_command.is_some() {
+                        return HistoryMatch::NoMatch;
                     }
                     return HistoryMatch::Diverged {
                         expected: format!("SignalReceived({signal_name})"),
@@ -4690,7 +4720,7 @@ impl HistoryMatcher {
         // "this branch lost" outcome, so the stray-interleaved divergence guard
         // above does not apply to it — see `match_race_signal`.
         if let Some(first) = first_interleaved_command
-            && !tolerate_interleaved
+            && tolerate_interleaved.is_none()
         {
             return HistoryMatch::Diverged {
                 expected: format!("SignalReceived({signal_name})"),
@@ -6745,6 +6775,25 @@ impl HistoryMatcher {
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in
     /// both cases safe to call speculatively.
+    /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
+    /// after the current cursor (issue #950).
+    ///
+    /// A **pure read**: unlike [`Self::peek_u64_marker`] it consumes nothing and
+    /// never moves the cursor, so it is safe to call mid-decision (e.g. between
+    /// a race's branch checks) where a consuming peek would steal the marker
+    /// from the settling step that owns it.
+    #[must_use]
+    pub fn has_unconsumed_marker(&self, marker_name: &str) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name)
+            })
+    }
+
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;

@@ -24,7 +24,13 @@
 //! | 7 | activity × timer × signal (3-way) | activity |
 //!
 //! plus `futures::join!` wait-**all** over an activity and a durable timer
-//! (AC1), and a one-transaction atomicity assertion.
+//! (AC1), parallel timers parking at the earliest deadline, and the AC8
+//! local-activity rejection failing loudly with **no partial durable trace**.
+//!
+//! The one-transaction property itself is structural — everything durable is
+//! inside a single `conn.transaction` in `persist_mixed_suspension_batch` — and
+//! what these tests observe of it is that both branches of a batch always land
+//! together, and that a rejected batch leaves nothing behind.
 //!
 //! The deterministic-replay half of the success metric (1,000 randomized
 //! event-order replays per composition, 0 divergences) lives in
@@ -121,6 +127,17 @@ fn slow_activity(_ctx: &autumn_harvest::ActivityContext, _input: Value) -> ActFu
 }
 
 type ActFuture = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>;
+
+/// An `ActivityInfo` registered as an INLINE local activity (`is_local: true`).
+fn local_act_info(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+) -> ActivityInfo {
+    ActivityInfo {
+        is_local: true,
+        ..act_info(name, handler)
+    }
+}
 
 // ── Child workflows ────────────────────────────────────────────────────────
 
@@ -271,6 +288,84 @@ fn parent_three_way(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     })
 }
 
+/// 4b: child × a SHORT deadline, so the deadline wins over a hanging child.
+fn parent_child_vs_short_timer(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .child_workflow_raw("hanging_child", serde_json::json!({"n": 1}))
+            .label("child")
+            .timer(std::time::Duration::from_secs(2))
+            .label("deadline")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "index": winner.index,
+            "label": winner.label,
+            "value": winner.value,
+        }))
+    })
+}
+
+/// Two durable timers in one batch — the batch must park at the EARLIEST.
+fn parent_two_timers(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .timer(std::time::Duration::from_secs(2))
+            .label("short")
+            .timer(std::time::Duration::from_secs(300))
+            .label("long")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "label": winner.label}))
+    })
+}
+
+/// 7b: the three-way race with a SLOW activity and a FAR deadline, so only the
+/// signal branch can resolve it.
+fn parent_three_way_slow(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("slow_activity", serde_json::json!({"n": 1}), "default")
+            .label("work")
+            .timer(std::time::Duration::from_secs(300))
+            .label("deadline")
+            .signal("abort")
+            .label("abort")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "index": winner.index,
+            "label": winner.label,
+            "value": winner.value,
+        }))
+    })
+}
+
+/// AC8: an inline local activity joined with a durable timer — the shape that
+/// silently dropped the timer before issue #950.
+fn parent_local_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let (local, timer) = futures::join!(
+            ctx.execute_local_activity_raw(
+                "compute_local",
+                serde_json::json!({"n": 1}),
+                None,
+                None
+            ),
+            ctx.timer("deadline", 30),
+        );
+        let local = local.map_err(|e| e.to_string())?;
+        timer.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"local": local}))
+    })
+}
+
 /// AC1 wait-**all**: `futures::join!` over an activity AND a durable timer.
 /// Both branches must resolve; the workflow completes only when each has.
 fn parent_join_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
@@ -386,9 +481,14 @@ async fn activity_beats_timer_in_a_mixed_batch() {
         history.events
     );
 
+    // `CancelRaceLosers` -> `queue::delete_pending_timer` DELETES the unfired
+    // row, so the correct assertion is that no row survives — `all(|t| t.fired)`
+    // would be vacuously true on an empty set and would also pass if the timer
+    // had never been armed at all, which is the very thing this batch exists to
+    // do. The `TimerStarted` assertion above proves it WAS armed.
     let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
     assert!(
-        timers.iter().all(|t| t.fired),
+        timers.is_empty(),
         "the losing timer's still-armed durable row must be deleted on the \
          activity win, never left to fire against a decided race: {timers:?}"
     );
@@ -555,9 +655,11 @@ async fn child_beats_timer_in_a_mixed_batch() {
         history.events
     );
 
+    // Deleted, not merely marked fired — see the note in the activity×timer
+    // test above.
     let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
     assert!(
-        timers.iter().all(|t| t.fired),
+        timers.is_empty(),
         "the losing deadline row must be torn down: {timers:?}"
     );
 }
@@ -789,5 +891,231 @@ async fn join_of_an_activity_and_a_timer_resolves_both_branches() {
             .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
         "join! must have armed AND fired the durable timer: {:?}",
         history.events
+    );
+}
+
+/// Composition 4b — child × timer, **timer wins**: the issue's headline user
+/// story ("awaiting a child workflow under a deadline"). The child hangs past
+/// the 2s deadline, so the timer branch wins and the still-running child is
+/// durably cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timer_beats_child_in_a_mixed_batch() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![
+            wf_info("e2e_test_workflow", parent_child_vs_short_timer),
+            wf_info("hanging_child", hanging_child),
+        ],
+        vec![],
+    );
+    let worker = build_runtime_worker("worker-950-timer-child", 4, 2, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("index").cloned(),
+        Some(serde_json::json!(1)),
+        "the deadline must win over a hanging child: {output}"
+    );
+
+    let children = load_child_executions_from_url(&database_url, exec_id).await;
+    assert_eq!(children.len(), 1, "exactly one child was started");
+    assert_eq!(
+        children[0].state, "CANCELLED",
+        "the over-deadline child must be durably cancelled, never left running: {:?}",
+        children[0]
+    );
+}
+
+/// Two durable timers in ONE batch park the task at the **earliest** deadline,
+/// not the latest. `extract_started_timer_for_suspension` rejects a
+/// multi-timer batch, so this shape only exists on the generalized path.
+///
+/// Load-bearing by construction: the long branch is 300s and
+/// `wait_for_execution_state` gives up after 10s, so a park that took the
+/// max (or the wrong timer's) deadline fails this test by timing out rather
+/// than by a wrong assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_timers_park_at_the_earliest_deadline() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info("e2e_test_workflow", parent_two_timers)],
+        vec![],
+    );
+    let worker = build_runtime_worker("worker-950-parallel-timers", 4, 2, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("index").cloned(),
+        Some(serde_json::json!(0)),
+        "the 2s branch must win over the 300s branch: {output}"
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let armed = history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+        .count();
+    assert_eq!(
+        armed, 2,
+        "BOTH timers must be armed in the one batch: {:?}",
+        history.events
+    );
+}
+
+/// Composition 7b — the three-way batch resolved by its **signal** branch, so
+/// the signal wait is load-bearing rather than decoration: the activity is slow
+/// and the deadline is far away, leaving the delivered signal as the only way
+/// this workflow can complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_way_mixed_batch_resolved_by_its_signal_branch() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info("e2e_test_workflow", parent_three_way_slow)],
+        vec![act_info("slow_activity", slow_activity)],
+    );
+    let worker = build_runtime_worker("worker-950-three-way-signal", 4, 2, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    deliver_signal_when_parked(
+        &database_url,
+        exec_id,
+        "abort",
+        serde_json::json!({"reason": "user"}),
+    )
+    .await;
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("index").cloned(),
+        Some(serde_json::json!(2)),
+        "the signal branch must win the three-way race: {output}"
+    );
+    assert_eq!(
+        output.get("value").cloned(),
+        Some(serde_json::json!({"reason": "user"})),
+        "the signal payload must surface as the winner value"
+    );
+
+    // All three branches were persisted in the one batch: the activity enqueue,
+    // the durable deadline row, and the signal park.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+            && history
+                .events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            && history
+                .events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::SignalReceived { .. })),
+        "activity, timer and signal branches must all appear: {:?}",
+        history.events
+    );
+}
+
+/// AC8: a `RunLocalActivity` co-batched with a durable sibling wait terminally
+/// fails the execution with a typed error naming the conflict — and leaves
+/// **no partial durable trace**: the sibling timer is not armed, the sibling
+/// activity is not enqueued, and no branch event is recorded.
+///
+/// Before this issue the batch "succeeded": `extract_run_local_activity`
+/// silently dropped the siblings, so the deadline was armed a whole decision
+/// cycle late with no error anywhere. This test pins the behaviour change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_co_batched_with_a_timer_fails_loudly_and_leaves_no_trace() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info(
+            "e2e_test_workflow",
+            parent_local_activity_and_timer,
+        )],
+        vec![local_act_info("compute_local", fast_activity)],
+    );
+    let worker = build_runtime_worker("worker-950-local-conflict", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let error = parent.error.unwrap_or_default();
+    assert!(
+        error.contains("local activity cannot share a suspension batch"),
+        "the failure must be the typed AC8 rejection, not a generic \
+         'unsupported commands' error: {error}"
+    );
+    assert!(
+        error.contains("StartTimer"),
+        "the error must name the sibling command that would have been dropped: {error}"
+    );
+
+    // No partial durable trace: the rejection is raised before any of the
+    // cycle's persistence steps run.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        history.events.iter().all(|e| !matches!(
+            e,
+            WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+        )),
+        "a rejected batch must record no branch event at all: {:?}",
+        history.events
+    );
+    let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
+    assert!(
+        timers.is_empty(),
+        "a rejected batch must arm no durable timer row: {timers:?}"
     );
 }

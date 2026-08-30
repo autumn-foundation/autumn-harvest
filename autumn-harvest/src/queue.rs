@@ -3282,7 +3282,8 @@ async fn park_workflow_task_inner(
 /// [`primary_repend_workflow_task_query`]'s `mixed_signal_suspension` arm pulls
 /// the `PENDING` row forward — so no wake can fall between the two.
 ///
-/// Returns `false` when the task row no longer exists.
+/// Returns `true` only when the flag was set; `false` both when it was already
+/// clear and when the task row no longer exists.
 ///
 /// # Errors
 ///
@@ -5672,6 +5673,44 @@ mod tests {
              release_task_for_capability_miss_query's AfterHandler phase, which \
              resets crash_strikes for the identical 'the body reached a conclusion \
              on this worker' reason (Codex review round 4 of #1182)",
+        );
+    }
+
+    /// [`take_wake_requested`]'s SQL must read `wake_requested` under the row
+    /// lock and return the **pre-update** value, exactly like the park queries —
+    /// a plain `UPDATE ... RETURNING wake_requested` would return the
+    /// just-cleared `FALSE` and silently swallow every wake it exists to catch.
+    #[test]
+    fn take_wake_requested_query_captures_the_flag_before_clearing_it() {
+        let sql = take_wake_requested_query();
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "must lock the row before reading wake_requested, closing the gap with \
+             wake_workflow_task's fallback UPDATE",
+        );
+        assert!(sql.contains("SELECT id, wake_requested FROM harvest_task_queue"));
+        assert!(
+            sql.contains("wake_requested = FALSE"),
+            "must clear the flag as part of the same statement that reads it",
+        );
+        assert!(
+            sql.contains("RETURNING candidate.wake_requested AS had_wake_requested"),
+            "must return the PRE-update value (from the candidate CTE), not the \
+             just-cleared post-update value",
+        );
+        // Deliberately NOT filtered on `state = 'RUNNING'` (unlike the park
+        // queries): this runs from inside the persist transaction against a row
+        // this worker already holds claimed, and on the reschedule sub-path it is
+        // called either side of the `RUNNING` -> `PENDING` transition. Scoped to
+        // workflow rows so it can never touch an activity task.
+        assert!(
+            sql.contains("task_type = 'workflow'"),
+            "must be scoped to workflow task rows",
+        );
+        assert!(
+            !sql.contains("state = 'RUNNING'"),
+            "must NOT require RUNNING: the reschedule sub-path calls this around \
+             the state transition itself",
         );
     }
 

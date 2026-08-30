@@ -10564,6 +10564,14 @@ fn activity_vs_timer_timer_wins() -> Vec<WorkflowEvent> {
                 timer_id: race_timer(1),
                 duration_secs: 30,
             },
+            // The losing activity really was picked up by a worker before the
+            // deadline fired: its in-flight progress frontier straddles the
+            // winner's terminal (issue #1126). `permute_mixed_history` moves it
+            // to either side across the sweep.
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-a"),
+            },
             WorkflowEvent::TimerFired {
                 timer_id: race_timer(1),
             },
@@ -10841,6 +10849,10 @@ fn three_way_signal_wins() -> Vec<WorkflowEvent> {
                 timer_id: race_timer(1),
                 duration_secs: 30,
             },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-a"),
+            },
             WorkflowEvent::SignalReceived {
                 signal_name: "abort".to_string(),
                 payload: serde_json::json!({"reason": "user"}),
@@ -10976,12 +10988,123 @@ async fn mixed_compositions_each_replay_succeeded() {
     }
 }
 
-/// Issue #950 success metric: ≥ 6 mixed compositions each replay
+/// Randomly permute the **event-arrival order** of a recorded mixed-race
+/// history, staying inside the space of histories the engine can actually
+/// record.
+///
+/// Two things in a mixed-batch history are NOT arrival order and must be held
+/// fixed, or the permutation manufactures a history no worker could ever write
+/// and the resulting "divergence" is the replay engine correctly rejecting it:
+///
+/// - **The dispatch block.** Every branch's `ActivityScheduled` / `TimerStarted`
+///   / `ChildWorkflowStarted` is written by `build_suspension_events` in command
+///   emission order — one atomic batch, always in branch order. Reordering it is
+///   a *code* change (the workflow declared its branches differently), which
+///   replay is supposed to flag.
+/// - **Which branch terminal is first.** The winner is decided by recorded
+///   history order and pinned by the `race_winner:{seq}` marker, so moving a
+///   different branch's terminal ahead of it describes a different race, not a
+///   different arrival order.
+///
+/// What genuinely varies, and is what this permutes:
+///
+/// - where each losing branch's in-flight **progress** event (`ActivityStarted`)
+///   lands — before the winner's terminal, or after it, straddling the matcher
+///   cursor (the issue #1126 `consume_race_loser_frontier` case), and
+/// - the relative order of the losing branches' teardown terminals, which the
+///   worker appends once the winner is known.
+fn permute_mixed_history(events: &[WorkflowEvent], seed: u64) -> Vec<WorkflowEvent> {
+    const fn is_dispatch(e: &WorkflowEvent) -> bool {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+        )
+    }
+    const fn is_progress(e: &WorkflowEvent) -> bool {
+        matches!(
+            e,
+            WorkflowEvent::ActivityStarted { .. } | WorkflowEvent::ActivityHeartbeat { .. }
+        )
+    }
+    fn is_loser_teardown(e: &WorkflowEvent) -> bool {
+        match e {
+            WorkflowEvent::ActivityFailed { error, .. }
+            | WorkflowEvent::ChildWorkflowFailed { error, .. } => {
+                error.contains("lost race to a sibling branch")
+            }
+            _ => false,
+        }
+    }
+
+    let open_at = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("race:")))
+        .expect("fixture always records the open marker");
+    let winner_at = events
+        .iter()
+        .position(
+            |e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("race_winner:")),
+        )
+        .expect("fixture always records the winner marker");
+
+    let window = &events[open_at + 1..winner_at];
+    let dispatches: Vec<WorkflowEvent> =
+        window.iter().filter(|e| is_dispatch(e)).cloned().collect();
+    let progress: Vec<WorkflowEvent> = window.iter().filter(|e| is_progress(e)).cloned().collect();
+    let winner_terminal: Vec<WorkflowEvent> = window
+        .iter()
+        .filter(|e| !is_dispatch(e) && !is_progress(e) && !is_loser_teardown(e))
+        .cloned()
+        .collect();
+    let mut teardowns: Vec<WorkflowEvent> = window
+        .iter()
+        .filter(|e| is_loser_teardown(e))
+        .cloned()
+        .collect();
+
+    // Deterministic LCG (no RNG dependency), mirroring the sweep's own.
+    let mut state = seed | 1;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) as usize
+    };
+    if teardowns.len() > 1 {
+        for i in (1..teardowns.len()).rev() {
+            teardowns.swap(i, next() % (i + 1));
+        }
+    }
+    let progress_before_win = next() % 2 == 0;
+
+    let mut out = Vec::with_capacity(events.len());
+    out.extend_from_slice(&events[..=open_at]);
+    out.extend(dispatches);
+    if progress_before_win {
+        out.extend(progress.iter().cloned());
+        out.extend(winner_terminal);
+    } else {
+        out.extend(winner_terminal);
+        out.extend(progress.iter().cloned());
+    }
+    out.extend(teardowns);
+    out.extend_from_slice(&events[winner_at..]);
+    out
+}
+
+/// Issue #950 success metric: >= 6 mixed compositions each replay
 /// deterministically across **1,000 randomized event-arrival orderings** with
 /// **0 divergences** (the #476/#779 precedent). Each iteration picks a
-/// composition and a recorded winner pseudo-randomly; the winner is fixed by
-/// the `race_winner:{seq}` marker, so a divergence here would mean replay
-/// re-derived the outcome from arrival timing rather than from history.
+/// composition and a recorded winner, then permutes that history's arrival
+/// order via [`permute_mixed_history`] — where each losing branch's in-flight
+/// progress event lands relative to the winner's terminal, and the order the
+/// losers are torn down in.
+///
+/// Every iteration replays the permuted history **twice** and requires the two
+/// reports to agree: "replays deterministically" is a statement about
+/// reproducibility, which a single replay per ordering cannot establish.
 #[tokio::test]
 async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
     let matrix = mixed_success_metric_matrix();
@@ -10989,6 +11112,8 @@ async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
     let mut seed: u64 = 0x5DEE_CE66;
     let mut divergences: Vec<String> = Vec::new();
     let mut covered: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut distinct_orderings: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for i in 0..1_000 {
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         let pick = (seed >> 16) as usize % matrix.len();
@@ -10996,27 +11121,56 @@ async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
         let fixture = fixtures[(seed >> 8) as usize % fixtures.len()];
         covered.insert(name);
 
-        let report = WorkflowReplayer::new()
+        let events = permute_mixed_history(&fixture(), seed);
+        // Fingerprint the ORDERING (event type names only — the ids are fresh
+        // per fixture call and would make every iteration trivially distinct).
+        distinct_orderings.insert(format!(
+            "{name}|{}",
+            events
+                .iter()
+                .map(WorkflowEvent::type_name)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+
+        let first = WorkflowReplayer::new()
             .register_fn(*name, *handler)
-            .replay_from_events(fixture())
+            .replay_from_events(events.clone())
             .await;
-        if !matches!(report.status, ReplayStatus::ReplaySucceeded) {
-            divergences.push(format!("iteration {i} ({name}): {report}"));
+        let second = WorkflowReplayer::new()
+            .register_fn(*name, *handler)
+            .replay_from_events(events)
+            .await;
+        if !matches!(first.status, ReplayStatus::ReplaySucceeded) {
+            divergences.push(format!("iteration {i} ({name}): {first}"));
+        } else if format!("{:?}", first.status) != format!("{:?}", second.status) {
+            divergences.push(format!(
+                "iteration {i} ({name}) is not reproducible: {first} vs {second}"
+            ));
         }
     }
     assert!(
         divergences.is_empty(),
-        "0 divergences required across 1,000 randomized replays, got \
-         {}:\n{}",
+        "0 divergences required across 1,000 randomized replays, got {}:\n{}",
         divergences.len(),
         divergences.join("\n")
     );
-    // Guard the sweep against silently degenerating to one composition: the
-    // success metric is about the MATRIX, not a single shape.
+    // Guard the sweep against silently degenerating: it must cover every
+    // composition, AND the permutation must actually produce more orderings than
+    // there are hand-written fixtures (otherwise "randomized orderings" would be
+    // an empty claim).
     assert_eq!(
         covered.len(),
         matrix.len(),
         "the sweep must exercise every composition, only covered {covered:?}"
+    );
+    let fixture_count: usize = matrix.iter().map(|(_, _, f)| f.len()).sum();
+    assert!(
+        distinct_orderings.len() > fixture_count,
+        "the sweep must explore MORE distinct event orderings ({}) than there are \
+         hand-written fixtures ({fixture_count}) — otherwise it is replaying the \
+         same histories 1,000 times, not sweeping arrival orders",
+        distinct_orderings.len()
     );
 }
 

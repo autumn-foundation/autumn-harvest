@@ -49,10 +49,19 @@ downstream node, and as `.map_activity(f).over(&gate)`.
 
 ## 2. Level isolation (the highest-risk design point)
 
-The worker's `should_requeue_signal_wait` requires **homogeneous** suspension
+The worker's `should_requeue_signal_wait` required **homogeneous** suspension
 batches: a `WaitForSignal` command must not share a batch with a level's
 `ScheduleActivity` dispatches. Therefore **a gate must occupy its own singleton
 execution level.**
+
+> **Update (issue #950).** The worker now persists a heterogeneous
+> `WaitForSignal` + `ScheduleActivity` batch in one transaction
+> (`persist_mixed_suspension_batch`), so this constraint is no longer a
+> correctness requirement. The singleton-level post-pass is **retained
+> deliberately**: it is the recorded execution shape of every DAG already in
+> flight, and collapsing a gate back into its level would change the command
+> order those histories replay against. Removing it is a separate, opt-in
+> change behind its own versioning gate.
 
 Implemented as a post-pass in `DagBuilder::build()` after Kahn levelling: only
 when the DAG contains ≥1 gate, each Kahn level is split into

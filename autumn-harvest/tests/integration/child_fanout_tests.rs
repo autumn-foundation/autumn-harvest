@@ -427,6 +427,7 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
 /// worker-level end-to-end proof lives in the DB-backed
 /// `mixed_suspension_tests.rs`, since the dispatch decision lives in
 /// `worker.rs`, not the pure `executor::run_workflow` used here).
+#[tokio::test]
 async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
     let exec_id = ExecutionId::new();
     let id_pending = ExecutionId::new();
@@ -492,7 +493,7 @@ async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
             // accepts. Before #950 it matched NO extractor and the worker
             // terminally failed the workflow with "unsupported commands".
             assert!(
-                autumn_harvest::worker::mixed_suspension_batch_is_persistable(&commands),
+                autumn_harvest::worker::suspension_batch_is_persistable(&commands),
                 "the mixed stale-re-park batch must be persistable by the worker \
                  rather than terminally failing the workflow: {commands:?}"
             );
