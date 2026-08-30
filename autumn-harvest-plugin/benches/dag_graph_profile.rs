@@ -26,27 +26,30 @@
 //! 4-way fan-in — not a degenerate flat chain. `total tasks = 93` (89
 //! activities + 4 gates), matching the "tens to ~100+ nodes" realism bar.
 //!
-//! The paired event history mixes every classification path `build_run_graph`
-//! exercises: succeeded activities, failed activities, activities with a
-//! genuine multi-attempt retry (repeated `ActivityStarted` before
-//! `ActivityCompleted`), `dag_skip:{idx}` condition-skip markers (issue
-//! #482), never-reached (pending) activities, gates resolved by
-//! `SignalReceived`, gates resolved by a race-timer `TimerFired` (issue
-//! #476/#746), and gates left unresolved (`waiting`, since the run's
-//! `exec_state` is `RUNNING`, a live/non-terminal state). Every gate's
-//! upstreams are forced to succeed ([`GATE_UPSTREAM_INDICES`]) so
-//! `gate_status`'s reachability check (checked *before* resolution) actually
-//! lets each gate reach its intended `SignalReceived`/`TimerFired`/unresolved
-//! outcome, rather than every gate reporting `Pending` regardless of what is
-//! recorded for it (issue #690 review, Codex). A handful of issue #780
-//! **compensator** dispatches (the `dag_compensate` envelope) are also mixed
-//! in — including one recorded under a *current node's own name*
-//! (`t001`, compensating a different dispatched node), which is what actually
-//! exercises `dispatched_activity_names`'s purpose: excluding a compensation
-//! dispatch from that node's own `latest_scheduled`/`node_outcome` selection
-//! (a compensator name that is not itself a current node name, like the
-//! other two dispatches here, never reaches that exclusion at all — it fails
-//! the leading `name == node` check first).
+//! The paired event history is reachability-consistent by construction (see
+//! [`build_events`]'s doc comment): a task only ever receives outcome events
+//! when its declared upstreams have all resolved successfully, exactly what
+//! the real unified-DAG walker would (not) have dispatched. It mixes every
+//! classification path `build_run_graph` exercises: succeeded activities,
+//! failed activities, activities with a genuine multi-attempt retry (repeated
+//! `ActivityStarted` before `ActivityCompleted`), `dag_skip:{idx}`
+//! condition-skip markers (issue #482), never-reached (pending) activities,
+//! a gate resolved by `SignalReceived`, a gate resolved by a race-timer
+//! `TimerStarted`/`TimerFired` pair (issue #476/#746), a second signal-resolved
+//! gate, and exactly one gate -- the last in execution-level order -- left
+//! genuinely unresolved (`waiting`, since the run's `exec_state` is
+//! `RUNNING`, a live/non-terminal state; only one gate can ever be mid-await
+//! in a real run, since the walker processes execution levels strictly
+//! sequentially and a gate always occupies its own singleton level). A
+//! handful of issue #780 **compensator** dispatches (the `dag_compensate`
+//! envelope) are also mixed in — including one recorded under a *current
+//! node's own name* (`t001`, compensating a different dispatched node), which
+//! is what actually exercises `dispatched_activity_names`'s purpose:
+//! excluding a compensation dispatch from that node's own
+//! `latest_scheduled`/`node_outcome` selection (a compensator name that is
+//! not itself a current node name, like the other two dispatches here, never
+//! reaches that exclusion at all — it fails the leading `name == node` check
+//! first).
 //!
 //! # Running
 //!
@@ -69,7 +72,9 @@
 
 use std::time::Duration;
 
-use autumn_harvest::dag::{DagBuilder, DagDefinition, DagTaskRef, GateTimeoutAction};
+use autumn_harvest::dag::{
+    DagBuilder, DagDefinition, DagSignalGate, DagTaskRef, GateTimeoutAction,
+};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, TimerId, WorkerId};
 use autumn_harvest_plugin::dag_graph::build_run_graph;
@@ -260,6 +265,20 @@ fn signal_received(signal_name: &str) -> WorkflowEvent {
     WorkflowEvent::SignalReceived {
         signal_name: signal_name.to_string(),
         payload: serde_json::json!({ "approved": true }),
+    }
+}
+
+/// The `WorkflowCommand::StartTimer` `context::wait_for_signal_timeout`
+/// always records before a bounded gate's race can be won by the deadline --
+/// a `TimerFired` with no preceding `TimerStarted` for the same `timer_id`
+/// is a history the real walker can never produce (issue #690 review,
+/// Codex): the only path that omits `TimerStarted` is a signal already
+/// buffered when the race starts, and that path is `SignalWon`, not
+/// `TimerWon`.
+fn gate_timer_started(seq: usize, signal_name: &str, duration_secs: u64) -> WorkflowEvent {
+    WorkflowEvent::TimerStarted {
+        timer_id: TimerId::new(format!("__signal_timeout:{seq}:{signal_name}")),
+        duration_secs,
     }
 }
 
@@ -781,14 +800,19 @@ const BACKBONE_END: usize = 24;
 /// task's outcome is only ever generated when `task.upstreams` are all
 /// `done` -- true for a genuinely succeeded activity (first attempt or after
 /// retry) or a gate that resolved to `TaskStatus::Succeeded` (signal-won, or
-/// timer-won with `GateTimeoutAction::Continue` -- both gates here use
-/// `Continue`). An unreachable task (an upstream failed, was condition-
-/// skipped, was itself unreachable, or is a gate still `Waiting`) gets no
-/// events at all, exactly like the real walker would never have dispatched
-/// it. This is why `gate_2`/`gate_3` being left deliberately unresolved
-/// (`Waiting`, not `done`) legitimately makes their own downstream layer4
-/// nodes unreachable too -- a real DAG paused on two unanswered approval
-/// gates has exactly this shape, half its next layer genuinely pending.
+/// timer-won with `GateTimeoutAction::Continue` -- both timeout-bearing gates
+/// here use `Continue`). An unreachable task (an upstream failed, was
+/// condition-skipped, was itself unreachable, or is the one gate still
+/// `Waiting`) gets no events at all, exactly like the real walker would never
+/// have dispatched it. This is why `gate_3` being left deliberately
+/// unresolved (`Waiting`, not `done`) legitimately makes its own downstream
+/// layer4 nodes unreachable too -- a real DAG paused on an unanswered
+/// approval gate has exactly this shape, part of its next layer genuinely
+/// pending. Only ONE gate is ever left `Waiting`, and it must be the last one
+/// in level order (see [`push_gate_resolution`]'s doc comment): the real
+/// unified-DAG walker processes execution levels strictly sequentially, and a
+/// signal gate always occupies its own singleton level, so at most one gate
+/// can be genuinely mid-`.await` in any one recorded run.
 fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     let tasks = def.tasks();
     let mut events: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
@@ -812,27 +836,7 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
         if let Some(gate) = &task.signal {
             let reachable = task.upstreams.iter().all(|&u| done[u]);
             if reachable {
-                match gate_seen % 4 {
-                    // gate_0 (plain signal_gate): resolved by a matching signal.
-                    0 => {
-                        push(&mut t, &mut events, signal_received(&gate.signal_name));
-                        done[idx] = true;
-                    }
-                    // gate_1 (signal_gate_with_timeout, Continue-on-timeout):
-                    // resolved by the race timer firing before any signal
-                    // arrives -- a `TimedOut` node status that still counts as
-                    // `TaskStatus::Succeeded` for downstream trigger-rule
-                    // purposes, because the gate's `on_timeout` is `Continue`.
-                    1 => {
-                        push(&mut t, &mut events, gate_timer_fired(1, &gate.signal_name));
-                        done[idx] = true;
-                    }
-                    // gate_2 (plain signal_gate) and gate_3 (signal_gate_with_timeout):
-                    // both left unresolved — `waiting` on a live run, the deadline
-                    // (where one exists) not yet fired either. Not `done`:
-                    // nothing downstream of either can be reachable.
-                    _ => {}
-                }
+                done[idx] = push_gate_resolution(&mut t, &mut events, gate, gate_seen % 4);
             }
             // The rotation advances regardless of reachability so `gate_seen`
             // always identifies the *intended* scenario (gate_0/1/2/3) by
@@ -932,6 +936,59 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     );
 
     events
+}
+
+/// Resolve one already-*reached* signal gate per its rotating `scenario`
+/// (`gate_seen % 4`, one of the four gates in `build_dag`), pushing whatever
+/// events that resolution implies. Returns whether the gate counts as `done`.
+///
+/// * `0 | 2` (`gate_0`, `gate_2` -- both plain `signal_gate`): resolved by a
+///   matching signal.
+/// * `1` (`gate_1`, `signal_gate_with_timeout`, `GateTimeoutAction::Continue`):
+///   resolved by the race timer firing before any signal arrives -- a
+///   `TimedOut` node status that still counts as `TaskStatus::Succeeded` for
+///   downstream trigger-rule purposes, since `on_timeout` is `Continue`.
+///   `TimerStarted` must precede `TimerFired` for the same `timer_id`:
+///   `context::wait_for_signal_timeout` always arms the deadline via
+///   `StartTimer` before it can be won by a timeout (issue #690 review,
+///   Codex) -- the only path that skips `TimerStarted` is a signal already
+///   buffered when the race starts, which resolves `SignalWon`, not this one.
+/// * `_` (`gate_3`, `signal_gate_with_timeout`): left unresolved -- `waiting`
+///   on a live run, its deadline not yet fired either. Not `done`.
+///
+/// `gate_2` is deliberately **not** left waiting like `gate_3`, even though
+/// an earlier revision left both unresolved: the real unified-DAG walker
+/// processes execution levels strictly sequentially and a signal gate always
+/// occupies its own singleton level (`run_unified_dag`,
+/// `debug_assert_eq!(level.len(), 1, ...)`), so at most ONE gate can ever be
+/// genuinely `Waiting` in one recorded run -- whichever is earliest in level
+/// order among the unresolved ones. Two simultaneously-`Waiting` gates is a
+/// history no real walker can produce (issue #690 review, Codex): reaching
+/// `gate_3`'s level requires `gate_2`'s `.await` to have already resolved,
+/// one way or another.
+fn push_gate_resolution(
+    t: &mut i64,
+    events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>,
+    gate: &DagSignalGate,
+    scenario: usize,
+) -> bool {
+    let push =
+        |t: &mut i64, events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>, ev: WorkflowEvent| {
+            events.push((ts(*t), ev));
+            *t += 1;
+        };
+    match scenario {
+        0 | 2 => {
+            push(t, events, signal_received(&gate.signal_name));
+            true
+        }
+        1 => {
+            push(t, events, gate_timer_started(1, &gate.signal_name, 300));
+            push(t, events, gate_timer_fired(1, &gate.signal_name));
+            true
+        }
+        _ => false,
+    }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
