@@ -108,6 +108,31 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
     codecs.active_codec_id().is_none_or(|id| id == "identity")
 }
 
+/// A bounded category for a per-row sweep failure, safe to put in a log line.
+///
+/// The failure text itself is NOT loggable. A decode error here originates in
+/// an **embedder-supplied** `PayloadCodec`, so its `CodecError` message is
+/// arbitrary text this crate does not control and cannot bound — it may carry
+/// key material or plaintext diagnostics the codec author included for local
+/// debugging and never expected in a production log.
+///
+/// The lossy read path already made this decision: every failure it can hit
+/// becomes one of the fixed `UNDECODABLE_REASON_*` strings rather than the
+/// codec's own message. The sweep runs over the same rows with the same codecs
+/// and has no reason to be laxer. What makes the line actionable is the row id
+/// and the key ids, both of which are bounded and stay.
+#[cfg(feature = "db")]
+const fn sweep_error_kind(error: &HarvestError) -> &'static str {
+    match error {
+        HarvestError::UnknownCodecKey { .. } => "unknown_key",
+        HarvestError::UnknownPayloadCodec { .. } => "unknown_codec",
+        HarvestError::Serialization(_) => "invalid_json",
+        HarvestError::Database(_) => "database",
+        HarvestError::Config(_) => "codec_error",
+        _ => "other",
+    }
+}
+
 /// Re-encode every payload-bearing field of one serialized event that carries a
 /// **non-active** codec key id, leaving everything else byte-identical.
 ///
@@ -679,16 +704,19 @@ mod db {
                 Err(error) => {
                     unresolved += 1;
                     // Bounded and content-free: the row id, the operator-chosen
-                    // key ids the row references, and the typed error's own
-                    // rendering. Never a payload, never ciphertext. Naming the
-                    // key ids is what makes the log actionable — the usual
-                    // cause is a key dropped from the registry before its rows
-                    // were converted, and this says which one to put back.
+                    // key ids the row references, and a fixed category for the
+                    // failure. Never a payload, never ciphertext — and never
+                    // the error's own text, which for a decode failure comes
+                    // from an embedder-supplied codec and is unbounded (see
+                    // `sweep_error_kind`). Naming the key ids is what makes the
+                    // log actionable — the usual cause is a key dropped from
+                    // the registry before its rows were converted, and this
+                    // says which one to put back.
                     tracing::warn!(
                         event_row_id = row.id,
                         shard_id,
                         key_ids = ?super::event_key_ids(&original),
-                        error = %error,
+                        error_kind = super::sweep_error_kind(&error),
                         "codec re-encryption skipped: the event row could not be decoded"
                     );
                 }

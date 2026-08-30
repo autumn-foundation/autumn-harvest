@@ -4885,6 +4885,7 @@ mod tests {
     /// The config field is gone, so the two cannot disagree by construction.
     /// This pins that the builder's codecs reach the registry, which is now the
     /// single source for both responsibilities.
+    #[cfg(feature = "db")]
     #[test]
     fn the_builder_installs_one_codec_registry_on_the_handler_registry() {
         use crate::payload_codec::IdentityCodec;
