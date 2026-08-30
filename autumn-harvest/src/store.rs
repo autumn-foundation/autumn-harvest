@@ -168,16 +168,14 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
-    // Cross-region DR write-authority fence (issue #954). A no-op — not even a
-    // round trip — unless this process pinned a shard generation, so a
-    // deployment that never enabled DR sees the pre-#954 path exactly. When it
-    // is on, a worker pinned to a superseded epoch stops here rather than
-    // appending to a history another region now owns.
-    crate::replication::assert_fence(conn, exec_id.shard()).await?;
-
     if events.is_empty() {
         return Ok(0);
     }
+
+    // Cross-region DR write-authority fence (issue #954). Below the empty-append
+    // early return: an empty append writes nothing, so there is nothing to
+    // fence, and checking above it turned a pure `Ok(0)` into a round trip.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
@@ -230,13 +228,6 @@ pub async fn append_events_offloaded(
         return Ok(0);
     }
 
-    // Cross-region DR write-authority fence (issue #954). A no-op — not even a
-    // round trip — unless this process pinned a shard generation, so a
-    // deployment that never enabled DR sees the pre-#954 path exactly. When it
-    // is on, a worker pinned to a superseded epoch stops here rather than
-    // appending to a history another region now owns.
-    crate::replication::assert_fence(conn, exec_id.shard()).await?;
-
     let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     for row in &mut rows {
@@ -250,6 +241,15 @@ pub async fn append_events_offloaded(
     // permanently invisible to the GC sweep).
     let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
         async |conn| {
+            // Cross-region DR write-authority fence (issue #954), inside the
+            // transaction and *after* the offload upload above. Checking before
+            // the upload was doubly wrong: the check's `ACCESS SHARE` was
+            // released before the INSERT ever began (so it was not a barrier at
+            // all on an autocommit caller), and on a transactional caller it
+            // held the lock across an unbounded network upload — so an operator
+            // fencing during an incident queued behind the slowest payload PUT.
+            crate::replication::assert_fence(conn, exec_id.shard()).await?;
+
             let inserted = diesel::insert_into(harvest_events::table)
                 .values(&rows)
                 .execute(conn)
@@ -435,10 +435,9 @@ pub async fn append_single_event(
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    // Cross-region DR write-authority fence (issue #954). Placed before the
-    // execution row lock so a fenced worker releases immediately instead of
-    // holding a lock other regions' workers need. A no-op unless this process
-    // pinned a shard generation.
+    // Cross-region DR fence (see `replication::assert_fence`), before the
+    // execution row lock so a fenced worker releases immediately rather than
+    // holding a lock the region that now owns this data needs.
     crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Lock the parent execution row so that concurrent callers serialise their

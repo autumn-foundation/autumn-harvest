@@ -788,14 +788,15 @@ pub const fn claim_task_query() -> &'static str {
 fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
     use crate::replication::FenceRegistry;
 
-    // Cheap relaxed load; short-circuits before any lock for every deployment
+    // One acquire load; short-circuits before any lock for every deployment
     // that has not opted in.
     if !FenceRegistry::is_enabled() {
         return None;
     }
+    // One registry call, so the `UNENCODED` → default-shard rule lives in
+    // `replication` alone and the hot path takes one read lock, not two.
     let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
-    let generation = FenceRegistry::expected(shard)?;
-    let resolved = FenceRegistry::resolve_shard(shard)?;
+    let (resolved, generation) = FenceRegistry::binding(shard)?;
     Some((resolved.as_i32(), generation.as_i64()))
 }
 
@@ -817,26 +818,33 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
 /// text by construction — asserted by
 /// `fenced_claim_query_preserves_every_unfenced_gate`.
 ///
-/// # Why `MATERIALIZED` and `FOR SHARE`
+/// # Why `MATERIALIZED`, and where the barrier actually comes from
 ///
 /// `MATERIALIZED` makes the probe run exactly once per claim rather than being
-/// inlined into the candidate scan's per-row predicate — one primary-key probe,
-/// on a one-row-per-shard table.
+/// inlined into the candidate scan's per-row predicate. It reads one page of a
+/// one-row-per-shard table, and on a generation mismatch the plan short-circuits
+/// before `harvest_task_queue` is touched at all (measured: 7 buffers against
+/// 890 on the matching path).
 ///
-/// `FOR SHARE` is the commit-order barrier. [`crate::replication::bump_generation`]
-/// takes the same row exclusively, so it cannot commit while a claim holds it,
-/// and a claim that starts after the bump commits reads the new generation and
-/// matches nothing. Without it a bump could land between this statement's
-/// snapshot and its commit, and a fenced worker would claim one last task —
-/// which, for an event-sourced engine, is the whole failure mode. Only one row
-/// is ever locked and the bump touches nothing else, so no lock-order cycle is
-/// possible.
+/// The probe is a **plain read**, deliberately not `SELECT ... FOR SHARE`. The
+/// commit-order barrier comes from the `ACCESS SHARE` table lock Postgres takes
+/// for the read automatically: [`crate::replication::bump_generation`] holds
+/// `ACCESS EXCLUSIVE` on the same table, which conflicts, so it cannot commit
+/// while this claim transaction is open and a claim starting afterwards reads
+/// the new generation and matches nothing.
+///
+/// A shared *row* lock would have been the obvious choice and is the wrong one:
+/// there is exactly one row per shard and every claim in the fleet touches it,
+/// so two concurrent `FOR SHARE` holders force a `MultiXactId` — a
+/// `XLOG_MULTIXACT_CREATE_ID` WAL record plus SLRU traffic per claim, and the
+/// same 8 KB heap page dirtied fleet-wide on every claim. See
+/// `bump_generation` for the full argument.
 #[must_use]
 pub fn claim_task_query_fenced() -> &'static str {
     static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         const FENCE_CTE: &str = "WITH fence AS MATERIALIZED ( \
              SELECT 1 AS ok FROM harvest_shard_generation \
-             WHERE shard_id = $7 AND generation = $8 FOR SHARE \
+             WHERE shard_id = $7 AND generation = $8 \
          ), ";
         let base = claim_task_query();
         let base = base
@@ -1066,38 +1074,51 @@ pub async fn claim_task_on_shard(
     let claimed: Option<TaskQueueItem> = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<TaskQueueItem>> {
-                // Cross-region DR fence (issue #954). Resolved once, outside
-                // the query, so the unfenced path issues the identical
-                // statement it always did — same text, same plan cache entry.
-                let fence = fence_binding(shard);
-                let query = if fence.is_some() {
-                    claim_task_query_fenced()
-                } else {
-                    claim_task_query()
-                };
-                let mut stmt = diesel::sql_query(query)
-                    .into_boxed::<diesel::pg::Pg>()
-                    .bind::<diesel::sql_types::Text, _>(worker_id)
-                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                    .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                        aging_secs_i64,
-                    )
-                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                        circuit_breaker_activities,
-                    )
-                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                        ineligible_activities,
-                    );
-                if let Some((fence_shard, generation)) = fence {
-                    stmt = stmt
-                        .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                        .bind::<diesel::sql_types::BigInt, _>(generation);
+                // Cross-region DR fence (issue #954). Two fully separate
+                // arms rather than one boxed builder: `BoxedSqlQuery::bind`
+                // heap-allocates per bind and dispatches dynamically, and the
+                // unfenced arm — which is every deployment that has not opted
+                // into DR — must not pay for a feature it does not use on the
+                // engine's hottest statement.
+                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
+                    None => {
+                        diesel::sql_query(claim_task_query())
+                            .bind::<diesel::sql_types::Text, _>(worker_id)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                aging_secs_i64,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                circuit_breaker_activities,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                ineligible_activities,
+                            )
+                            .load(conn)
+                            .await
+                    }
+                    Some((fence_shard, generation)) => {
+                        diesel::sql_query(claim_task_query_fenced())
+                            .bind::<diesel::sql_types::Text, _>(worker_id)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                aging_secs_i64,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                circuit_breaker_activities,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                ineligible_activities,
+                            )
+                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
+                            .bind::<diesel::sql_types::BigInt, _>(generation)
+                            .load(conn)
+                            .await
+                    }
                 }
-                let result: Vec<TaskQueueItem> = stmt
-                    .load(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
                     return Ok(None);
@@ -4866,12 +4887,14 @@ mod tests {
             1,
             "the candidate CTE joins the fence exactly once"
         );
-        // FOR SHARE is the commit-order barrier, not decoration: without it a
-        // fence bump could commit between this statement's snapshot and its
-        // commit, and the claim would slip through.
+        // The probe must stay a PLAIN read. A shared row lock here would make
+        // every claim in the fleet a `MultiXactId` producer on the single
+        // one-row-per-shard table; the barrier comes from `bump_generation`'s
+        // ACCESS EXCLUSIVE table lock conflicting with the ACCESS SHARE this
+        // read takes implicitly. See `claim_task_query_fenced`.
         assert!(
-            fenced.contains("FOR SHARE"),
-            "the fence probe must take the row FOR SHARE"
+            !fenced.contains("FOR SHARE"),
+            "the fence probe must not take a row lock: {fenced}"
         );
     }
 

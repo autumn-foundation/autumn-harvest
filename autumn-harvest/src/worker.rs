@@ -19166,18 +19166,20 @@ fn spawn_worker_slot_sampler(
 ///
 /// One task, three jobs, all on the same cadence and all per shard:
 ///
-/// 1. **Beat.** Write a replication watermark — a wall-clock instant stamped
+/// 1. **Self-fence.** Re-check this worker's pinned generation. On a mismatch
+///    the worker has lost write authority for that shard: count it, say so at
+///    `ERROR`, and shut the whole worker down. **First**, before the beat: the
+///    watermark is a write, and a worker that has just been fenced must not be
+///    the one still writing to the promoted primary's tables.
+/// 2. **Beat.** Write a replication watermark — a wall-clock instant stamped
 ///    against the current WAL position. This is what lets a standby's byte
 ///    position be translated into a measured RPO, and it keeps WAL moving on an
 ///    idle primary so an idle deployment reports a live RPO instead of a
 ///    spuriously growing one.
-/// 2. **Measure.** Read the replication views and emit the RPO gauges. The lag
+/// 3. **Measure.** Read the replication views and emit the RPO gauges. The lag
 ///    gauge is emitted **only when the RPO is actually known**; the standby
 ///    count is emitted always, because `0` is the "replication is down" signal
 ///    and a lag gauge cannot express it.
-/// 3. **Self-fence.** Re-check this worker's pinned generation. On a mismatch
-///    the worker has lost write authority for that shard: count it, say so at
-///    `ERROR`, and shut the whole worker down.
 ///
 /// # Why the whole worker, and not just that shard
 ///
@@ -19194,7 +19196,7 @@ fn spawn_worker_slot_sampler(
 /// from, which is exactly the split-brain the epoch exists to prevent.
 #[cfg(feature = "db")]
 fn spawn_replication_sampler(
-    sharded_pool: crate::shard::ShardedDbPool,
+    targets: Vec<(crate::types::ShardId, DbPool)>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
@@ -19210,7 +19212,8 @@ fn spawn_replication_sampler(
                 break;
             }
 
-            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+            for (shard_id, shard_pool) in &targets {
+                let shard_id = *shard_id;
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
                 let Ok(mut conn) = shard_pool.get().await else {
                     // A pool that cannot be reached is already covered by the
@@ -19218,6 +19221,40 @@ fn spawn_replication_sampler(
                     // second alarm for the same condition.
                     continue;
                 };
+
+                match crate::replication::assert_fence(&mut conn, shard_id).await {
+                    Ok(()) => {}
+                    Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: fenced,
+                        pinned,
+                        current,
+                    }) => {
+                        telemetry.metrics.record_shard_fenced(shard_u16);
+                        tracing::error!(
+                            shard_id = fenced,
+                            pinned_generation = pinned,
+                            current_generation = ?current,
+                            "FENCED: this worker is pinned to a superseded shard generation and \
+                             another region now holds write authority. Shutting down. Do NOT \
+                             restart against the old region — see \
+                             docs/runbooks/cross-region-failover.md"
+                        );
+                        cancel.cancel();
+                        return;
+                    }
+                    Err(error) => {
+                        // A transient failure to *read* the fence is not a
+                        // fence. Fencing is enforced structurally in the claim
+                        // and persist paths regardless, so the safe response
+                        // here is to log and retry next tick rather than take a
+                        // healthy fleet down on a blip.
+                        tracing::warn!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "DR fence re-check failed; the claim and persist gates still apply"
+                        );
+                    }
+                }
 
                 if let Err(error) = crate::replication::record_replication_heartbeat(
                     &mut conn,
@@ -19270,40 +19307,6 @@ fn spawn_replication_sampler(
                     telemetry
                         .metrics
                         .record_shard_generation(shard_u16, generation.as_i64());
-                }
-
-                match crate::replication::assert_fence(&mut conn, shard_id).await {
-                    Ok(()) => {}
-                    Err(crate::error::HarvestError::ShardFenced {
-                        shard_id: fenced,
-                        pinned,
-                        current,
-                    }) => {
-                        telemetry.metrics.record_shard_fenced(shard_u16);
-                        tracing::error!(
-                            shard_id = fenced,
-                            pinned_generation = pinned,
-                            current_generation = ?current,
-                            "FENCED: this worker is pinned to a superseded shard generation and \
-                             another region now holds write authority. Shutting down. Do NOT \
-                             restart against the old region — see \
-                             docs/runbooks/cross-region-failover.md"
-                        );
-                        cancel.cancel();
-                        return;
-                    }
-                    Err(error) => {
-                        // A transient failure to *read* the fence is not a
-                        // fence. Fencing is enforced structurally in the claim
-                        // and persist paths regardless, so the safe response
-                        // here is to log and retry next tick rather than take a
-                        // healthy fleet down on a blip.
-                        tracing::warn!(
-                            shard_id = %shard_id.as_i32(),
-                            error = %error,
-                            "DR fence re-check failed; the claim and persist gates still apply"
-                        );
-                    }
                 }
             }
         }
@@ -19509,6 +19512,18 @@ pub struct Worker {
     pub registry: Arc<HandlerRegistry>,
     /// Set of activities that this worker cannot run because of unsatisfied requirements (issue #382).
     pub ineligible_activities: Vec<String>,
+    /// This worker's cross-region DR settings (issue #954), snapshotted at
+    /// construction.
+    ///
+    /// Read here rather than from [`crate::replication::dr_config`] at `run()`
+    /// time on purpose. That global is published by
+    /// `From<WorkerConfig> for WorkerRuntimeConfig`, so *any* later conversion
+    /// of a default `WorkerConfig` anywhere in the process — a second worker, a
+    /// runner, a test helper — would overwrite it with `fencing: false` while
+    /// `effective_config` still reported `true`, and this worker would run
+    /// completely unfenced with no signal. Snapshotting binds the value to the
+    /// conversion that produced *this* worker's config.
+    dr: crate::replication::DrConfig,
     /// Bounds concurrent workflow task executions.
     workflow_semaphore: Arc<Semaphore>,
     /// Bounds concurrent activity task executions.
@@ -20297,6 +20312,7 @@ impl Worker {
             config,
             registry,
             ineligible_activities,
+            dr: crate::replication::dr_config(),
             workflow_semaphore: workflow_parts.semaphore,
             activity_semaphore: activity_parts.semaphore,
             workflow_permit_total: workflow_parts.permit_total,
@@ -21162,32 +21178,28 @@ impl Worker {
     async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
         use crate::replication::FenceRegistry;
 
-        if !crate::replication::dr_config().fencing {
+        if !self.dr.fencing {
             return true;
         }
 
-        // `(shard, pool)` for every shard this worker can reach. A legacy
-        // single-pool worker has no shard identity, so it pins under the shard
-        // its assignments name (or `ShardId::new(0)`) and registers that as the
-        // default, which is what `ShardId::UNENCODED` execution ids resolve to.
-        let targets: Vec<(crate::types::ShardId, DbPool)> =
-            self.config.sharded_pool.as_ref().map_or_else(
-                || {
-                    // UFCS: diesel's blanket `RunQueryDsl::first` is in scope
-                    // in this module and shadows `slice::first` on a `Vec`.
-                    let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments)
-                        .copied()
-                        .unwrap_or_else(|| crate::types::ShardId::new(0));
-                    vec![(shard, fallback_pool.clone())]
-                },
-                |sp| {
-                    sp.iter_shards()
-                        .map(|(id, pool)| (id, pool.clone()))
-                        .collect()
-                },
+        let Some((targets, default_shard)) = self.dr_fence_targets(fallback_pool) else {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                "dr_fencing is enabled but this worker has no shard identity: no sharded pool and \
+                 no shard assignments, so there is no shard number an operator could address it \
+                 by with `harvest dr fence`. Refusing to start rather than pinning a fabricated \
+                 shard 0."
             );
+            return false;
+        };
 
-        let default_shard = <[(crate::types::ShardId, DbPool)]>::first(&targets).map(|(id, _)| *id);
+        // Built locally and published in ONE write below. Registering shard by
+        // shard would leave a partially-published, `ENABLED = true` registry
+        // with no default shard behind on a mid-loop failure — under which
+        // `expected(UNENCODED)` returns `None` and every pre-sharding execution
+        // id in the process silently persists UNFENCED.
+        let mut pinned: Vec<(crate::types::ShardId, crate::replication::ShardGeneration)> =
+            Vec::with_capacity(targets.len());
         for (shard_id, pool) in &targets {
             let mut conn = match pool.get().await {
                 Ok(conn) => conn,
@@ -21204,7 +21216,7 @@ impl Worker {
             };
             match crate::replication::ensure_generation_row(&mut conn, *shard_id).await {
                 Ok(generation) => {
-                    FenceRegistry::register(*shard_id, generation);
+                    pinned.push((*shard_id, generation));
                     tracing::info!(
                         worker_id = %self.config.worker_id,
                         shard_id = %shard_id.as_i32(),
@@ -21224,10 +21236,48 @@ impl Worker {
                 }
             }
         }
-        if let Some(shard) = default_shard {
-            FenceRegistry::set_default_shard(shard);
-        }
+        FenceRegistry::publish(&pinned, default_shard);
         true
+    }
+
+    /// The `(shard, pool)` set this worker fences, and the shard that
+    /// [`crate::types::ShardId::UNENCODED`] execution ids resolve to.
+    ///
+    /// `None` means this worker has no shard identity at all and so cannot be
+    /// fenced coherently — see `pin_dr_generations`.
+    ///
+    /// The default shard is [`crate::shard::ShardedDbPool::default_shard`], not
+    /// the numerically lowest member. `ShardedDbPool::from_map` accepts any
+    /// member as its default and `pool_for_execution` routes unencoded ids
+    /// there, so taking `min(shard_ids)` instead would make `assert_fence`
+    /// query the wrong shard's row against the default shard's *database*,
+    /// find nothing, and fail closed — a permanent spurious fence on every
+    /// execution id minted before sharding.
+    #[cfg(feature = "db")]
+    fn dr_fence_targets(
+        &self,
+        fallback_pool: &DbPool,
+    ) -> Option<(Vec<(crate::types::ShardId, DbPool)>, crate::types::ShardId)> {
+        if let Some(sp) = self.config.sharded_pool.as_ref() {
+            let targets: Vec<(crate::types::ShardId, DbPool)> = sp
+                .iter_shards()
+                .map(|(id, pool)| (id, pool.clone()))
+                .collect();
+            if targets.is_empty() {
+                return None;
+            }
+            return Some((targets, sp.default_shard()));
+        }
+        // No sharded pool: this worker's single database is whichever shard its
+        // assignments name. An empty list is NOT collapsed to shard 0 — that is
+        // the fabrication `resolve_shard_assignments` deliberately refuses to
+        // make, and here it would pin a `shard_id = 0` row into a database whose
+        // logical shard is numbered something else, so an operator's
+        // `harvest dr fence --shard 7=...` would bump a different row and fence
+        // nothing at all.
+        // UFCS: diesel's blanket `RunQueryDsl::first` shadows `slice::first`.
+        let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments).copied()?;
+        Some((vec![(shard, fallback_pool.clone())], shard))
     }
 
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
@@ -21602,21 +21652,27 @@ impl Worker {
         // authority. Neither may be silently switched off by a deployment that
         // simply has no metrics sink.
         #[cfg(feature = "db")]
-        let replication_sampler = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .filter(|_| crate::replication::dr_config().fencing)
-            .map(|sp| {
-                let dr = crate::replication::dr_config();
+        let replication_sampler = if self.dr.fencing {
+            // Every deployment shape, not just sharded ones. Gating this on
+            // `sharded_pool.is_some()` left the DOCUMENTED single-database
+            // configuration — `.with_dr_fencing(true)` and nothing else — with
+            // the claim gate and the persist assert but no watermark beat (so
+            // the RPO reads `unknown` forever) and no self-fence check (so a
+            // fenced worker never stops, keeps heartbeating fleet coverage, and
+            // polls silently claiming nothing: the exact state this sampler's
+            // docs say must never exist).
+            self.dr_fence_targets(pool).map(|(targets, _)| {
                 spawn_replication_sampler(
-                    sp.clone(),
+                    targets,
                     self.shutdown.clone(),
                     self.registry.telemetry().clone(),
-                    dr.sample_interval,
-                    dr.watermark_retain,
+                    self.dr.sample_interval,
+                    self.dr.watermark_retain,
                 )
-            });
+            })
+        } else {
+            None
+        };
         #[cfg(not(feature = "db"))]
         let replication_sampler: Option<tokio::task::JoinHandle<()>> = None;
 

@@ -51,8 +51,29 @@ infrastructure layer — this is the step the engine cannot do for you:
 ```sql
 -- On the old primary, if you can still reach it:
 ALTER ROLE harvest CONNECTION LIMIT 0;
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'harvest';
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+ WHERE usename = 'harvest' AND backend_type = 'client backend';
 ```
+
+The `backend_type = 'client backend'` filter is not incidental: if replication
+connects as the same role, an unfiltered terminate kills the **walsender** too
+and severs the stream you are about to drain. `CONNECTION LIMIT 0` does not
+affect existing connections (and does not apply to superusers), which is why
+the terminate follows it rather than replacing it.
+
+**If the old primary is reachable, drain before promoting.** Once writes are
+cut, the standby will catch up in seconds, and the RPO you were about to accept
+drops to approximately zero:
+
+```bash
+# Poll until lag_bytes reaches 0 and stays there, then continue to step 2.
+harvest dr status --shard 0=postgres://harvest@standby-b/harvest_shard0
+```
+
+Skip this only when the old primary is genuinely unreachable. Every second of
+lag you promote past is acknowledged work lost **and** — per the at-least-once
+contract — side effects that may run a second time. Draining is the cheapest
+RPO reduction available and it costs a minute.
 
 If you cannot reach it, cut it off at the network (security group, firewall) or
 demote it. **Do not skip this because "the region is down"** — "down" from your
@@ -90,11 +111,23 @@ the same value. A shard still at the old epoch is not fenced.
 
 ### 2. Promote the standby
 
-**Logical replication** — on each standby database:
+**Logical replication** — on each standby database, in this order:
 
 ```sql
+ALTER SUBSCRIPTION harvest_dr_shard0 DISABLE;
+ALTER SUBSCRIPTION harvest_dr_shard0 SET (slot_name = NONE);
 DROP SUBSCRIPTION harvest_dr_shard0;
 ```
+
+All three steps, and in that order. A bare `DROP SUBSCRIPTION` connects to the
+**publisher** to drop the remote slot — so in the regional outage this runbook
+exists for, it blocks or errors and you are stuck at step 2 with the clock
+running. `SET (slot_name = NONE)` detaches the subscription from the remote slot
+first, making the drop purely local.
+
+The orphaned slot stays on the old primary. If that region ever comes back,
+drop it there (`SELECT pg_drop_replication_slot('harvest_dr_shard0');`) or it
+pins WAL forever — see `harvest_replication_down` in the alert runbook.
 
 **Physical replication:**
 
@@ -185,8 +218,16 @@ And, because Harvest's execution contract is **at-least-once**:
 > need an idempotency key; this is the same contract that already governs
 > retries, not a new one — the failover just makes the window a known size.
 
-Read the number **before** you fail over. `harvest dr status` reports it per
-shard, and it is the loss you are choosing to accept.
+Read the number **before** you fail over — while the old region's fleet is
+still running. `harvest dr status` reports it per shard, and it is the loss you
+are choosing to accept.
+
+The watermark trail is written by the workers, so once the fleet is stopped the
+trail stops advancing and the reported RPO grows with the outage rather than
+with the replication lag. A reading taken on the promoted primary *after* step 4
+of this runbook is therefore about the fleet's downtime, not about data loss.
+Capture the number at decision time and record it; do not re-read it later and
+treat it as the same quantity.
 
 ### A missing number is worse than a large one
 
@@ -237,7 +278,18 @@ promote region A, verify, and start workers there. The fence bump increments the
 epoch again — generations only ever go up, so a fail-back does not "restore"
 generation N, it advances to N+2.
 
-**4. Restart every worker.** Including any that never stopped. A worker pinned
+**4. Restore region A's connection limit.** Step 1 of the original failover
+set `ALTER ROLE harvest CONNECTION LIMIT 0` on region A. That lives in
+`pg_authid`, which is **cluster-global and not carried by replication**, so
+re-seeding region A does not undo it — its workers simply cannot connect, mid
+cut-over, with both regions now unavailable:
+
+```sql
+-- On region A, before starting its workers:
+ALTER ROLE harvest CONNECTION LIMIT -1;
+```
+
+**5. Restart every worker.** Including any that never stopped. A worker pinned
 to an epoch two bumps ago is fenced and stopped; a worker pinned to the current
 one is fine; a worker that was somehow never fenced is the one to worry about,
 and restarting it removes the question.

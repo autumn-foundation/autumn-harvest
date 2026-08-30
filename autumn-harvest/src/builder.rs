@@ -3666,6 +3666,32 @@ impl WorkerConfig {
         self
     }
 
+    /// Set how much trailing watermark history the DR sampler keeps
+    /// (issue #954).
+    ///
+    /// See [`WorkerConfig::replication_watermark_retain`] — this is the ceiling
+    /// on the replication lag that can be *measured*, so a deployment expecting
+    /// to ride out long standby stalls should raise it.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default()
+    ///     .with_replication_watermark_retain(Duration::from_secs(6 * 3600));
+    /// assert_eq!(
+    ///     config.replication_watermark_retain,
+    ///     Duration::from_secs(6 * 3600)
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn with_replication_watermark_retain(mut self, retain: Duration) -> Self {
+        self.replication_watermark_retain = retain;
+        self
+    }
+
     /// Set the DR sampler cadence (issue #954).
     ///
     /// See [`WorkerConfig::replication_sample_interval`] — this is both the

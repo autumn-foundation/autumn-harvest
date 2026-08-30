@@ -2592,10 +2592,14 @@ your severity signal here.
 
 1. `harvest dr status --shard <id>=<dsn> -o json`. `connected_standbys: 0` with
    a growing `lag_bytes` confirms it.
-2. On the primary: `SELECT slot_name, active, pg_current_wal_lsn() -
+2. On the primary, **scoped to this shard's database**:
+   `SELECT slot_name, database, active, pg_current_wal_lsn() -
    COALESCE(confirmed_flush_lsn, restart_lsn) AS backlog FROM
-   pg_replication_slots;` An `active = false` slot with a growing backlog is an
-   abandoned standby.
+   pg_replication_slots WHERE database = current_database() OR database IS NULL;`
+   An `active = false` slot with a growing backlog is an abandoned standby.
+   The `WHERE` clause is load-bearing: `pg_replication_slots` is **cluster-wide**
+   and one cluster can host several shard databases, so an unscoped listing
+   shows you a sibling shard's slots alongside your own.
 3. On the standby: is the subscription enabled?
    `SELECT subname, subenabled FROM pg_subscription;` Check the standby's log
    for apply-worker errors — a constraint violation or a missing table stops
@@ -2627,14 +2631,33 @@ your severity signal here.
 
 ### Safe actions
 
-- Re-enable the subscription: `ALTER SUBSCRIPTION <name> ENABLE;`
+- Re-enable the subscription: `ALTER SUBSCRIPTION <name> ENABLE;` This is the
+  fix for the most common cause (a maintenance `DISABLE` that was never undone)
+  and it costs seconds.
 - Apply any missing migrations to the standby, then re-enable.
-- If the standby is unrecoverable, **drop the slot** to stop WAL accumulation:
-  `SELECT pg_drop_replication_slot('<name>');` This gives up DR for that shard
-  until you rebuild it — say so explicitly — but a primary that runs out of WAL
-  space is a full outage rather than a lost safety net.
 - Rebuild the standby from a fresh base backup or a fresh `copy_data = true`
   subscription.
+
+### Destructive — last resort only
+
+`SELECT pg_drop_replication_slot('<name>');` is **irreversible** and is not a
+safe action. Dropping a slot ends DR for that shard until the standby is
+rebuilt from scratch, and converts a five-second `ALTER SUBSCRIPTION ... ENABLE`
+into a multi-hour re-seed if the standby was merely disabled.
+
+Preconditions, all of them:
+
+1. You have confirmed the slot's `database` matches the affected shard. An
+   unscoped listing will show sibling shards' slots, and destroying one of those
+   ends a **healthy** shard's DR with no way to repair it short of a rebuild.
+2. You have established the standby is genuinely unrecoverable, not disabled.
+3. You have accepted that this shard has no DR until it is rebuilt, and said so
+   in the incident channel.
+
+The one situation that justifies it: retained WAL is about to exhaust the
+primary's disk. A primary that runs out of WAL space is a full outage, which is
+worse than a lost safety net — but that is a trade to make deliberately, not a
+"safe action".
 
 ### Escalation criteria
 
@@ -2668,9 +2691,12 @@ on the primary from a position the standby confirmed — keeps measuring.
    pg_stat_replication;` Compare with step 1 — a `NULL` here beside a large RPO
    means apply is stuck, not slow.
 3. On the standby, look for a long-running transaction or a lock the apply
-   worker is waiting on: `SELECT pid, state, wait_event_type, wait_event,
-   query FROM pg_stat_activity;` A reporting query holding a lock on a
-   replicated table blocks apply completely.
+   worker is waiting on: `SELECT pid, state, wait_event_type, wait_event, query
+   FROM pg_stat_activity WHERE backend_type = 'client backend';` A reporting
+   query holding a lock on a replicated table blocks apply completely. The
+   `backend_type` filter matters before you terminate anything: the logical
+   apply worker and the walreceiver are in that view too, and killing them is
+   the opposite of the fix.
 4. Check standby I/O and CPU. A standby on smaller hardware than its primary
    falls behind under write bursts and never catches up.
 

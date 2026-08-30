@@ -66,6 +66,15 @@
 //! perfect RPO for replication that is dead is the single most dangerous thing
 //! this module could do.
 
+/// How long [`bump_generation`] waits for the fencing table's exclusive lock
+/// before giving up.
+///
+/// Long enough to ride out an ordinary in-flight persist, short enough that an
+/// operator under RTO pressure gets an actionable `lock_timeout` error rather
+/// than a hang — while it waits, it is itself blocking every claim and persist
+/// queued behind it.
+const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
+
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,11 +88,21 @@ use crate::types::ShardId;
 /// travels to the standby with the data, so a promoted standby inherits the
 /// epoch its primary had and continues from there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ShardGeneration(pub i64);
+pub struct ShardGeneration(i64);
 
 impl ShardGeneration {
     /// The epoch a freshly-migrated database is seeded at.
     pub const INITIAL: Self = Self(0);
+
+    /// Wrap a raw epoch value.
+    ///
+    /// The field is private to match [`ShardId`]'s newtype convention: a
+    /// generation only ever originates from the database, so there is no reason
+    /// for a caller to reach past the constructor.
+    #[must_use]
+    pub const fn new(generation: i64) -> Self {
+        Self(generation)
+    }
 
     /// The raw epoch value.
     #[must_use]
@@ -271,8 +290,12 @@ impl ReplicationStatus {
 ///
 /// Published by `From<WorkerConfig> for WorkerRuntimeConfig`, which is the
 /// single choke point every worker's configuration passes through.
+// Deliberately NOT `#[non_exhaustive]`: that attribute forbids external
+// struct-expression construction entirely — including `..Default::default()` —
+// so no downstream crate could ever build one to hand to the public
+// `set_dr_config`. Every field is `pub` and the type is `Copy`; growing it is a
+// breaking change we accept in exchange for the setter being usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct DrConfig {
     /// Whether write-authority fencing is enabled for this process.
     pub fencing: bool,
@@ -304,6 +327,18 @@ static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
 /// registry it governs is process-global too, so there is no coherent
 /// per-worker answer.
 pub fn set_dr_config(config: DrConfig) {
+    let mut config = config;
+    // Mirrors `crate::mutex::set_mutex_lease_ttl`, which rejects degenerate
+    // durations for the same reason: a zero interval turns the sampler's
+    // `tokio::time::sleep(interval)` into a hot loop issuing several queries
+    // per iteration per shard, against the database a failover depends on.
+    if config.sample_interval.is_zero() {
+        tracing::warn!(
+            "replication_sample_interval of zero would spin the DR sampler; using {:?}",
+            DrConfig::default().sample_interval
+        );
+        config.sample_interval = DrConfig::default().sample_interval;
+    }
     let mut guard = DR_CONFIG
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -330,7 +365,7 @@ static PINNED: RwLock<Option<Pinned>> = RwLock::new(None);
 /// Fast, lock-free "is fencing on at all" gate.
 ///
 /// Every persist consults this. Keeping it an atomic means a deployment that
-/// never enables DR pays one relaxed load per persist rather than an `RwLock`
+/// never enables DR pays one acquire load per persist rather than an `RwLock`
 /// acquisition.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -372,6 +407,34 @@ impl FenceRegistry {
         ENABLED.store(true, Ordering::Release);
     }
 
+    /// Publish a complete set of pins in **one** write.
+    ///
+    /// The whole registry becomes visible at once, default shard included.
+    /// [`Self::register`] plus a trailing [`Self::set_default_shard`] is not
+    /// equivalent: a startup that failed partway through that sequence left
+    /// `ENABLED` true with a partial map and *no* default shard, under which
+    /// [`Self::expected`] returns `None` for [`ShardId::UNENCODED`] and every
+    /// pre-sharding execution id in the process silently persists **unfenced**.
+    /// A worker pins every shard it can reach or none of them, so it publishes
+    /// once.
+    pub fn publish(pins: &[(ShardId, ShardGeneration)], default_shard: ShardId) {
+        {
+            let mut guard = PINNED
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pinned = guard.get_or_insert_with(Pinned::default);
+            for (shard, generation) in pins {
+                pinned.generations.insert(shard.as_i32(), *generation);
+            }
+            pinned.default_shard = Some(default_shard);
+            drop(guard);
+        }
+        // Published only after the map AND the default shard are visible, so a
+        // reader that observes `is_enabled()` can never find a half-built
+        // registry.
+        ENABLED.store(true, Ordering::Release);
+    }
+
     /// Set the shard that [`ShardId::UNENCODED`] execution ids resolve to.
     ///
     /// Execution ids minted before sharding carry no shard bits. They still
@@ -408,6 +471,35 @@ impl FenceRegistry {
         found
     }
 
+    /// The `(shard, generation)` this process is pinned to for `shard`, in one
+    /// lock acquisition.
+    ///
+    /// The claim hot path's entry point. Resolving the shard and reading its
+    /// generation separately would take the read lock twice and put the
+    /// `UNENCODED` → default-shard rule in two modules.
+    #[must_use]
+    pub fn binding(shard: ShardId) -> Option<(ShardId, ShardGeneration)> {
+        if !Self::is_enabled() {
+            return None;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().and_then(|pinned| {
+            let resolved = if shard.is_unencoded() {
+                pinned.default_shard?
+            } else {
+                shard
+            };
+            pinned
+                .generations
+                .get(&resolved.as_i32())
+                .map(|g| (resolved, *g))
+        });
+        drop(guard);
+        found
+    }
+
     /// The shard whose fencing row backs `shard`, resolving
     /// [`ShardId::UNENCODED`] through the default shard.
     #[must_use]
@@ -426,7 +518,7 @@ impl FenceRegistry {
     /// Whether any shard is fenced in this process.
     ///
     /// The hot-path gate: `false` means every fencing check compiles down to
-    /// this single relaxed load.
+    /// this single acquire load.
     #[must_use]
     pub fn is_enabled() -> bool {
         ENABLED.load(Ordering::Acquire)
@@ -465,14 +557,69 @@ impl FenceRegistry {
     }
 }
 
+// ── SQL identifier quoting ─────────────────────────────────────────────────
+
+/// Quote a Postgres identifier for inline interpolation.
+///
+/// `setval` takes its target as a `regclass` *name*, and a table name cannot be
+/// a bind parameter, so [`advance_sequences_after_promotion`] has to build SQL
+/// by concatenation. Quoting is therefore the security boundary and it must be
+/// **complete**, not a best-effort screen.
+///
+/// An earlier revision screened instead: it accepted only `[a-z_][a-z0-9_]*`
+/// and silently skipped everything else. That was wrong in both directions —
+/// an embedder on a `PascalCase` ORM schema had *every* sequence skipped while
+/// the command reported success, and a perfectly ordinary table named `user` or
+/// `order` passed the screen and then failed as a bare keyword in the generated
+/// SQL. Doubling embedded quotes inside `"…"` is the complete, universal escape
+/// for a Postgres identifier, so there is nothing left to screen for and
+/// nothing to skip.
+///
+/// Note this is *not* the whole defence: the catalog query that feeds it also
+/// restricts the owning relation to `relkind IN ('r','p')`. A sequence can be
+/// `OWNED BY` a **view** column, and `FROM <view>` would execute that view's
+/// query — including any volatile function in it — on the operator's
+/// high-privilege DR connection. No amount of quoting addresses that; the
+/// relation-kind filter does.
+#[must_use]
+fn quote_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('"');
+    for c in name.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Schema-qualify a quoted identifier.
+///
+/// Qualification is load-bearing, not tidiness: `pg_temp` is searched *ahead
+/// of* the resolved `search_path` for relation lookups while
+/// `current_schema()` still reports `public`, so an unqualified `FROM t` can
+/// silently resolve to a session-local temp table and set a sequence from the
+/// wrong data — producing exactly the duplicate-key outage
+/// [`advance_sequences_after_promotion`] exists to prevent, with no error.
+/// A qualified name is immune.
+#[must_use]
+fn qualified(schema: &str, name: &str) -> String {
+    format!("{}.{}", quote_ident(schema), quote_ident(name))
+}
+
 // ── Database surface (feature = "db") ──────────────────────────────────────
 
 #[cfg(feature = "db")]
 mod db {
     use diesel::sql_types::{BigInt, Bool, Double, Integer, Nullable, Text};
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
-    use super::{FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag};
+    use super::{
+        BUMP_LOCK_TIMEOUT_MS, FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag,
+        StandbyLag, qualified, quote_ident,
+    };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
 
@@ -580,19 +727,37 @@ mod db {
         reason: &str,
         actor: &str,
     ) -> HarvestResult<ShardGeneration> {
-        let rows: Vec<GenerationRow> = diesel::sql_query(
-            "UPDATE harvest_shard_generation \
-             SET generation = generation + 1, fenced_at = NOW(), \
-                 fenced_reason = $2, fenced_by = $3 \
-             WHERE shard_id = $1 \
-             RETURNING generation",
+        let reason = reason.to_string();
+        let actor = actor.to_string();
+        let shard_id = shard.as_i32();
+        let rows: Vec<GenerationRow> = Box::pin(
+            conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+                diesel::sql_query(format!(
+                    "SET LOCAL lock_timeout = '{BUMP_LOCK_TIMEOUT_MS}ms'"
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+                diesel::sql_query("LOCK TABLE harvest_shard_generation IN ACCESS EXCLUSIVE MODE")
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                diesel::sql_query(
+                    "UPDATE harvest_shard_generation \
+                     SET generation = generation + 1, fenced_at = NOW(), \
+                         fenced_reason = $2, fenced_by = $3 \
+                     WHERE shard_id = $1 \
+                     RETURNING generation",
+                )
+                .bind::<Integer, _>(shard_id)
+                .bind::<Text, _>(reason)
+                .bind::<Text, _>(actor)
+                .load(conn)
+                .await
+                .map_err(database_error)
+            }),
         )
-        .bind::<Integer, _>(shard.as_i32())
-        .bind::<Text, _>(reason)
-        .bind::<Text, _>(actor)
-        .load(conn)
-        .await
-        .map_err(database_error)?;
+        .await?;
 
         rows.into_iter()
             .next()
@@ -689,10 +854,17 @@ mod db {
 
     /// `pg_stat_replication`, reduced to what an RPO reading needs.
     ///
-    /// Joined to `pg_replication_slots` on `active_pid` purely to inherit the
+    /// LEFT-joined to `pg_replication_slots` on `active_pid` to inherit the
     /// database scope — `pg_stat_replication` has no database column of its
     /// own, so without the join a sibling shard's walsender would be counted as
     /// this shard's standby.
+    ///
+    /// **LEFT**, not INNER, and that is load-bearing: a physical standby
+    /// configured without `primary_slot_name` (WAL archiving, `wal_keep_size`)
+    /// is a supported topology and appears in `pg_stat_replication` with **no
+    /// slot row at all**. An inner join dropped it, `connected_standbys()`
+    /// returned `0` — the value documented as "replication is down" — and the
+    /// starter alert paged permanently on perfectly healthy replication.
     ///
     /// `replay_lag` is left `NULL` rather than coerced: Postgres reports NULL
     /// until a feedback round-trip has completed, and "we have not measured
@@ -703,8 +875,10 @@ mod db {
             CASE WHEN r.replay_lsn IS NULL THEN NULL \
                  ELSE (pg_current_wal_lsn() - r.replay_lsn)::bigint END AS lag_bytes \
          FROM pg_stat_replication r \
-         JOIN pg_replication_slots s ON s.active_pid = r.pid \
-         WHERE (s.database IS NULL OR s.database = current_database())";
+         LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid \
+         WHERE s.slot_name IS NULL \
+            OR s.database IS NULL \
+            OR s.database = current_database()";
 
     /// `pg_replication_slots`, which outlives the walsender.
     ///
@@ -775,6 +949,12 @@ mod db {
     }
 
     #[derive(diesel::QueryableByName)]
+    struct StandbyPositionRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        position: Option<String>,
+    }
+
+    #[derive(diesel::QueryableByName)]
     struct RpoRow {
         #[diesel(sql_type = Nullable<Double>)]
         lag_seconds: Option<f64>,
@@ -782,18 +962,34 @@ mod db {
 
     /// Measure the RPO for `shard` in seconds from the watermark trail.
     ///
-    /// The standby position is `MIN(COALESCE(confirmed_flush_lsn, restart_lsn))`
-    /// over every replication slot **scoped to this shard's database**: the
-    /// worst standby sets the RPO, and
-    /// `COALESCE` covers logical (`confirmed_flush_lsn`) and physical
-    /// (`restart_lsn`) slots with one query. An abandoned slot therefore pegs
-    /// the reading — which is correct and not a bug to paper over: an
-    /// abandoned slot is retaining WAL and is exactly the thing an operator
-    /// must be told about. [`ReplicationStatus::inactive_slots`] names it.
+    /// Two steps, deliberately not one query.
     ///
-    /// `None` — unknown — when there is no slot at all, when no watermark has
-    /// been confirmed yet, or when the standby is further behind than the
-    /// retained trail.
+    /// **Step 1 — the standby's position.** `MIN(COALESCE(confirmed_flush_lsn,
+    /// restart_lsn))` over every replication slot scoped to this shard's
+    /// database — the worst standby sets the RPO, and `COALESCE` covers logical
+    /// (`confirmed_flush_lsn`) and physical (`restart_lsn`) slots with one
+    /// query. **A slot with no position at all makes the whole reading
+    /// unknown**, because SQL's `MIN` skips NULLs: without the explicit
+    /// `bool_or(... IS NULL)` guard, a slot that has consumed *nothing* is
+    /// dropped from the reduction and the healthy standby's small lag is
+    /// reported as the fleet's RPO. That is precisely the "report a perfect RPO
+    /// for replication that is dead" outcome this module exists to avoid.
+    ///
+    /// An abandoned slot therefore pegs the reading, which is correct and not
+    /// a bug to paper over: an abandoned slot is retaining WAL and is exactly
+    /// what an operator must be told about. [`ReplicationStatus::inactive_slots`]
+    /// names it.
+    ///
+    /// **Step 2 — the watermark.** Only issued when step 1 produced a position.
+    /// Doing it in one statement meant that with no slot the predicate was
+    /// never true and the index scan walked the *entire* retained trail to
+    /// return nothing (measured: 200k rows, 2646 buffers, 22 ms) — on every
+    /// sampler tick of every worker of a deployment that has not finished
+    /// wiring up replication.
+    ///
+    /// `None` — unknown — when there is no slot, when a slot has no position,
+    /// when no watermark has been confirmed, or when the standby is further
+    /// behind than the retained trail.
     ///
     /// # Errors
     ///
@@ -802,24 +998,44 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
     ) -> HarvestResult<Option<f64>> {
-        let rows: Vec<RpoRow> = diesel::sql_query(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(h.beat_at)))::double precision \
-                 AS lag_seconds \
-             FROM harvest_replication_heartbeat h \
-             WHERE h.shard_id = $1 \
-               AND h.beat_lsn <= ( \
-                   SELECT MIN(COALESCE(s.confirmed_flush_lsn, s.restart_lsn)) \
-                   FROM pg_replication_slots s \
-                   WHERE (s.database IS NULL OR s.database = current_database()) \
-               )",
+        let positions: Vec<StandbyPositionRow> = diesel::sql_query(
+            "SELECT CASE \
+                        WHEN COUNT(*) = 0 THEN NULL \
+                        WHEN bool_or(COALESCE(s.confirmed_flush_lsn, s.restart_lsn) IS NULL) \
+                            THEN NULL \
+                        ELSE MIN(COALESCE(s.confirmed_flush_lsn, s.restart_lsn))::text \
+                    END AS position \
+             FROM pg_replication_slots s \
+             WHERE (s.database IS NULL OR s.database = current_database())",
         )
-        .bind::<Integer, _>(shard.as_i32())
         .load(conn)
         .await
         .map_err(database_error)?;
 
-        // A negative reading is impossible in principle (NOW() is monotonic
-        // relative to a row already committed) but clamps to 0.0 rather than
+        let Some(position) = positions.into_iter().next().and_then(|r| r.position) else {
+            return Ok(None);
+        };
+
+        // Ordered by `beat_lsn` and `LIMIT 1`, so this is a single descending
+        // probe of the `(shard_id, beat_lsn)` primary key rather than an
+        // aggregate over the trail. Beats are inserted co-monotone in
+        // `(beat_lsn, beat_at)`, so the newest consumed LSN is also the newest
+        // consumed instant.
+        let rows: Vec<RpoRow> = diesel::sql_query(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision AS lag_seconds \
+             FROM harvest_replication_heartbeat h \
+             WHERE h.shard_id = $1 AND h.beat_lsn <= $2::pg_lsn \
+             ORDER BY h.beat_lsn DESC \
+             LIMIT 1",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .bind::<Text, _>(position)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+        // A negative reading is impossible in principle (`NOW()` is monotonic
+        // relative to a row already committed) but clamps to `0.0` rather than
         // being emitted as a nonsense negative RPO if the clock is adjusted.
         Ok(rows
             .into_iter()
@@ -828,17 +1044,16 @@ mod db {
             .map(|v| v.max(0.0)))
     }
 
-    /// A `(table, column, sequence)` triple from the catalog.
-    ///
-    /// The `_name` suffixes are the catalog's own vocabulary and are kept
-    /// verbatim so the struct reads like the query that fills it.
-    #[allow(clippy::struct_field_names)]
     #[derive(diesel::QueryableByName)]
     struct SerialColumn {
+        #[diesel(sql_type = Text)]
+        table_schema: String,
         #[diesel(sql_type = Text)]
         table_name: String,
         #[diesel(sql_type = Text)]
         column_name: String,
+        #[diesel(sql_type = Text)]
+        sequence_schema: String,
         #[diesel(sql_type = Text)]
         sequence_name: String,
     }
@@ -847,22 +1062,6 @@ mod db {
     struct SetvalRow {
         #[diesel(sql_type = BigInt)]
         value: i64,
-    }
-
-    /// A catalog identifier this module is willing to interpolate into SQL.
-    ///
-    /// Every name here comes from `pg_class`/`information_schema`, not from a
-    /// caller — but `setval` needs the identifier *inline* (it cannot be a bind
-    /// parameter), so the class of values that reaches string formatting is
-    /// narrowed explicitly rather than trusted implicitly. A table created as
-    /// `"weird name"` is skipped and reported rather than quoted-and-hoped.
-    fn is_plain_identifier(name: &str) -> bool {
-        !name.is_empty()
-            && name.len() <= 63
-            && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     }
 
     /// Advance every sequence to match the data — the mandatory step after
@@ -883,16 +1082,34 @@ mod db {
     ///
     /// # Scope
     ///
-    /// **Every** sequence in the connection's `current_schema()`, not only
-    /// Harvest's. A promoted primary with any stale sequence is broken, and an
-    /// embedder's own tables — replicated by the same `FOR ALL TABLES`
-    /// publication the topology doc prescribes — carry the identical hazard. A
-    /// helper that fixed only `harvest_*` would leave the operator with a
-    /// half-promoted database and no signal. Every sequence it touches is
-    /// returned, so the scope is visible rather than assumed.
+    /// **Every** sequence whose owning relation is an ordinary or partitioned
+    /// table in the connection's `current_schema()`, not only Harvest's. A
+    /// promoted primary with any stale sequence is broken, and an embedder's
+    /// own tables — replicated by the same `FOR ALL TABLES` publication the
+    /// topology doc prescribes — carry the identical hazard. A helper that
+    /// fixed only `harvest_*` would leave the operator with a half-promoted
+    /// database and no signal. Every sequence it touches is returned, so the
+    /// scope is visible rather than assumed.
     ///
-    /// Returns each `(sequence, new_value)` pair it set, so the runbook step
-    /// has evidence to paste into the incident log.
+    /// # Why the relation-kind filter is a security control
+    ///
+    /// `relkind IN ('r','p')` is **not** tidiness. A sequence can be
+    /// `ALTER SEQUENCE ... OWNED BY <view>.<column>`, and Postgres accepts it.
+    /// Without the filter a view reaches the `FROM {tbl}` below and its query
+    /// body — including any volatile function in it — **executes** on the
+    /// operator's DR connection, which is the highest-privilege connection
+    /// anyone opens all quarter, during an incident, on a command whose output
+    /// nobody is reading closely. Anyone with `CREATE` in the schema can plant
+    /// that view months in advance; the `FOR ALL TABLES` publication even
+    /// replicates it to the standby. Identifier quoting does not help, because
+    /// the attacker's names are already ordinary identifiers.
+    ///
+    /// Names are quoted with [`quote_ident`] and schema-qualified with
+    /// [`qualified`] — see those for why screening and unqualified names were
+    /// both wrong.
+    ///
+    /// Returns each `(qualified sequence, new_value)` pair it set, so the
+    /// runbook step has evidence to paste into the incident log.
     ///
     /// # Errors
     ///
@@ -901,18 +1118,22 @@ mod db {
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Vec<(String, i64)>> {
         let columns: Vec<SerialColumn> = diesel::sql_query(
-            "SELECT c.relname::text AS table_name, \
-                    a.attname::text AS column_name, \
-                    s.relname::text AS sequence_name \
+            "SELECT tn.nspname::text AS table_schema, \
+                    c.relname::text  AS table_name, \
+                    a.attname::text  AS column_name, \
+                    sn.nspname::text AS sequence_schema, \
+                    s.relname::text  AS sequence_name \
              FROM pg_class s \
              JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass \
              JOIN pg_class c ON c.oid = d.refobjid \
              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid \
-             JOIN pg_namespace n ON n.oid = s.relnamespace \
+             JOIN pg_namespace sn ON sn.oid = s.relnamespace \
+             JOIN pg_namespace tn ON tn.oid = c.relnamespace \
              WHERE s.relkind = 'S' \
                AND d.refclassid = 'pg_class'::regclass \
                AND d.deptype IN ('a', 'i') \
-               AND n.nspname = current_schema()",
+               AND c.relkind IN ('r', 'p') \
+               AND sn.nspname = current_schema()",
         )
         .load(conn)
         .await
@@ -920,33 +1141,28 @@ mod db {
 
         let mut advanced = Vec::with_capacity(columns.len());
         for col in columns {
-            if !is_plain_identifier(&col.table_name)
-                || !is_plain_identifier(&col.column_name)
-                || !is_plain_identifier(&col.sequence_name)
-            {
-                tracing::warn!(
-                    table = %col.table_name,
-                    sequence = %col.sequence_name,
-                    "skipping sequence advance: identifier is not a plain lowercase identifier"
-                );
-                continue;
-            }
             // `is_called = true` so the NEXT value handed out is `max + 1`.
             // `GREATEST(..., 1)` keeps `setval` legal on an empty table, where
-            // `MAX` is NULL and 0 is below the sequence minimum.
+            // `MAX` is NULL and `0` is below the sequence minimum.
+            //
+            // `setval`'s first argument is `regclass`, i.e. a *name* rather
+            // than a relation reference, so the schema-qualified identifier is
+            // passed as a single-quoted literal with any `'` doubled.
+            let seq = qualified(&col.sequence_schema, &col.sequence_name);
             let sql = format!(
-                "SELECT setval('{seq}', GREATEST((SELECT COALESCE(MAX({col}), 0) FROM {tbl}), 1), \
+                "SELECT setval('{seq_literal}', \
+                        GREATEST((SELECT COALESCE(MAX({col}), 0) FROM {tbl}), 1), \
                         true)::bigint AS value",
-                seq = col.sequence_name,
-                col = col.column_name,
-                tbl = col.table_name,
+                seq_literal = seq.replace('\'', "''"),
+                col = quote_ident(&col.column_name),
+                tbl = qualified(&col.table_schema, &col.table_name),
             );
             let rows: Vec<SetvalRow> = diesel::sql_query(sql)
                 .load(conn)
                 .await
                 .map_err(database_error)?;
             if let Some(row) = rows.into_iter().next() {
-                advanced.push((col.sequence_name, row.value));
+                advanced.push((seq, row.value));
             }
         }
         advanced.sort();
@@ -1154,6 +1370,37 @@ mod tests {
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), Some(77));
         assert_eq!(s.connected_standbys(), 0);
+    }
+
+    // ── promotion: identifier quoting ──────────────────────────────────────
+
+    /// Catalog identifiers go into `setval` SQL inline (they cannot be bind
+    /// parameters), so they must be *quoted*, not merely *screened*.
+    ///
+    /// An earlier revision screened with a lowercase-only predicate and
+    /// silently skipped anything else. That was wrong twice over: an embedder
+    /// on a `PascalCase` ORM schema (Prisma, `TypeORM`, EF Core) had **every**
+    /// sequence skipped while `harvest dr promote` reported success, and an
+    /// ordinary table named `user` or `order` passed the screen and then blew
+    /// up as a bare keyword in the generated SQL.
+    #[test]
+    fn identifiers_are_quoted_not_screened() {
+        assert_eq!(quote_ident("harvest_events"), "\"harvest_events\"");
+        assert_eq!(quote_ident("User"), "\"User\"");
+        // Reserved words are ordinary identifiers once quoted.
+        assert_eq!(quote_ident("user"), "\"user\"");
+        assert_eq!(quote_ident("order"), "\"order\"");
+        // A quote inside an identifier is doubled, which is the complete
+        // escape for a Postgres quoted identifier.
+        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    #[test]
+    fn qualified_names_are_schema_pinned() {
+        assert_eq!(
+            qualified("public", "harvest_events"),
+            "\"public\".\"harvest_events\""
+        );
     }
 
     // ── fence registry ─────────────────────────────────────────────────────

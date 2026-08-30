@@ -42,6 +42,10 @@ use futures::FutureExt as _;
 
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 static DB_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -57,8 +61,59 @@ async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
     REGISTRY_SERIAL.lock().await
 }
 
-fn admin_url() -> Option<String> {
-    std::env::var("HARVEST_TEST_DATABASE_URL").ok()
+/// The shared Postgres these tests create their per-test databases on.
+///
+/// Prefers a caller-supplied `HARVEST_TEST_DATABASE_URL`; otherwise starts one
+/// throwaway container for the whole suite (CI's path). The container is
+/// started with **`wal_level = logical`**, which is not the image default and
+/// without which the three replication tests below would silently skip — i.e.
+/// AC6(b) and AC6(c) would be permanently unproven while CI stayed green. That
+/// is the single most important line in this file.
+///
+/// One container for the suite, not one per test: `pg_replication_slots` and
+/// `pg_stat_replication` are cluster-wide, and the module under test scopes
+/// every query to `current_database()` precisely so several shard databases can
+/// share a cluster. Sharing one here therefore exercises that scoping rather
+/// than dodging it — but it is also why the suite must run `--test-threads=1`
+/// (the manifest's `linux` osclass supplies that).
+static SHARED_PG: tokio::sync::OnceCell<Option<SharedPg>> = tokio::sync::OnceCell::const_new();
+
+struct SharedPg {
+    admin_url: String,
+    /// Kept alive for the process; dropping it stops the container.
+    _container: Option<ContainerAsync<Postgres>>,
+}
+
+async fn shared_pg() -> Option<&'static SharedPg> {
+    SHARED_PG
+        .get_or_init(|| async {
+            if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+                return Some(SharedPg {
+                    admin_url: url,
+                    _container: None,
+                });
+            }
+            let container = Postgres::default()
+                .with_tag("16")
+                // `wal_level=logical` is required for `CREATE PUBLICATION` to
+                // produce anything. The image default is `replica`.
+                .with_cmd(["postgres", "-c", "wal_level=logical"])
+                .start()
+                .await
+                .ok()?;
+            let host = container.get_host().await.ok()?;
+            let port = container.get_host_port_ipv4(5432).await.ok()?;
+            Some(SharedPg {
+                admin_url: format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+                _container: Some(container),
+            })
+        })
+        .await
+        .as_ref()
+}
+
+async fn admin_url() -> Option<String> {
+    shared_pg().await.map(|pg| pg.admin_url.clone())
 }
 
 fn with_db_name(base: &str, db: &str) -> String {
@@ -80,7 +135,7 @@ async fn connect(url: &str) -> AsyncPgConnection {
 
 /// Create a freshly-migrated database and return `(url, db_name)`.
 async fn fresh_db(tag: &str) -> Option<(String, String)> {
-    let admin = admin_url()?;
+    let admin = admin_url().await?;
     let mut conn = connect(&admin).await;
     let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
     let db = format!("dr_{tag}_{}_{n}", std::process::id());
@@ -102,7 +157,15 @@ macro_rules! require_db {
         match fresh_db($tag).await {
             Some(v) => v,
             None => {
-                eprintln!("skipping: HARVEST_TEST_DATABASE_URL not set");
+                // Reached only when neither a caller-supplied
+                // `HARVEST_TEST_DATABASE_URL` nor Docker is available. Loud on
+                // purpose: a silently-skipping suite that claims to prove an
+                // acceptance criterion is worse than no suite.
+                eprintln!(
+                    "SKIPPED {}: no HARVEST_TEST_DATABASE_URL and no usable Docker — this suite \
+                     proved NOTHING",
+                    $tag
+                );
                 return;
             }
         }
@@ -129,7 +192,11 @@ async fn a_fresh_database_provisions_generation_zero_and_is_idempotent() {
     let again = ensure_generation_row(&mut conn, ShardId::new(0))
         .await
         .expect("re-provision");
-    assert_eq!(again, ShardGeneration(1), "provisioning must be idempotent");
+    assert_eq!(
+        again,
+        ShardGeneration::new(1),
+        "provisioning must be idempotent"
+    );
 }
 
 #[tokio::test]
@@ -144,19 +211,19 @@ async fn bump_is_monotonic_and_records_who_and_why() {
         bump_generation(&mut conn, ShardId::new(2), "failover to eu-west", "oncall")
             .await
             .unwrap(),
-        ShardGeneration(1)
+        ShardGeneration::new(1)
     );
     assert_eq!(
         bump_generation(&mut conn, ShardId::new(2), "second", "oncall")
             .await
             .unwrap(),
-        ShardGeneration(2)
+        ShardGeneration::new(2)
     );
     assert_eq!(
         current_generation(&mut conn, ShardId::new(2))
             .await
             .unwrap(),
-        Some(ShardGeneration(2))
+        Some(ShardGeneration::new(2))
     );
 
     #[derive(diesel::QueryableByName)]
@@ -186,7 +253,7 @@ async fn assert_fence_rejects_a_stale_generation_and_names_both_epochs() {
         .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
     FenceRegistry::set_default_shard(ShardId::new(0));
 
     // Still current: the assert is a no-op.
@@ -245,7 +312,7 @@ async fn a_missing_generation_row_fences_a_pinned_worker() {
     // Pinned, but the row this worker pinned against is gone — a restore from a
     // backup taken before DR was enabled, or a hand-edited database. Fail
     // closed: a pinned worker with nothing to check against must stop.
-    FenceRegistry::register(ShardId::new(0), ShardGeneration(3));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(3));
     let err = assert_fence(&mut conn, ShardId::new(0))
         .await
         .expect_err("a pinned worker must fail closed when the row is absent");
@@ -279,7 +346,7 @@ async fn a_fenced_worker_cannot_persist_events() {
     .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
     FenceRegistry::set_default_shard(ShardId::new(0));
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
@@ -334,7 +401,7 @@ async fn a_fenced_worker_cannot_claim_tasks() {
         .expect("enqueue");
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
     FenceRegistry::set_default_shard(ShardId::new(0));
 
     // Current epoch: the claim succeeds exactly as it did before #954.
@@ -395,6 +462,174 @@ async fn a_fenced_worker_cannot_claim_tasks() {
     FenceRegistry::clear();
 }
 
+/// The fence bump is a **commit-order barrier**, not a racy read.
+///
+/// This is the property the whole mechanism rests on: a persist that passes the
+/// fence check must be guaranteed to commit *before* the fence takes effect, so
+/// there is never a "one last append" from a worker that has just lost write
+/// authority. The barrier is `bump_generation`'s `ACCESS EXCLUSIVE` table lock
+/// conflicting with the `ACCESS SHARE` that `assert_fence`'s plain read takes
+/// implicitly — deliberately not a shared row lock, which on a
+/// one-row-per-shard table would make every claim in the fleet a MultiXactId
+/// producer.
+#[tokio::test]
+async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("barrier");
+    let mut setup = connect(&url).await;
+    ensure_generation_row(&mut setup, ShardId::new(0))
+        .await
+        .unwrap();
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+
+    // Session A: open a transaction and pass the fence check. Its ACCESS SHARE
+    // on harvest_shard_generation is now held until A commits.
+    let mut a = connect(&url).await;
+    a.batch_execute("BEGIN").await.expect("begin");
+    assert_fence(&mut a, ShardId::new(0))
+        .await
+        .expect("the pinned epoch is current");
+
+    // Session B: bump. It must BLOCK behind A rather than committing underneath
+    // it. `bump_generation` carries a 5s lock_timeout, so a broken barrier
+    // shows up as an immediate success and a working one as a timeout error.
+    let mut b = connect(&url).await;
+    let bump = bump_generation(&mut b, ShardId::new(0), "barrier probe", "test").await;
+    let err = bump.expect_err("the bump must not commit while a persist holds the fence");
+    assert!(
+        err.to_string().contains("lock timeout") || err.to_string().contains("lock_timeout"),
+        "expected the bump to block on the fence table lock, got: {err}"
+    );
+
+    // A commits; the bump now succeeds, and a persist starting afterwards is
+    // fenced.
+    a.batch_execute("COMMIT").await.expect("commit");
+    let generation = bump_generation(&mut b, ShardId::new(0), "barrier probe", "test")
+        .await
+        .expect("the bump proceeds once the holder commits");
+    assert_eq!(generation, ShardGeneration::new(1));
+    let err = assert_fence(&mut setup, ShardId::new(0))
+        .await
+        .expect_err("a persist beginning after the bump must observe the new epoch");
+    assert!(matches!(
+        err,
+        autumn_harvest::error::HarvestError::ShardFenced { .. }
+    ));
+    FenceRegistry::clear();
+}
+
+/// A sequence owned by a **view** must never reach the promotion helper.
+///
+/// `ALTER SEQUENCE s OWNED BY <view>.<col>` is accepted by Postgres. Without a
+/// `relkind` filter the helper would emit `... FROM <view>`, executing that
+/// view's query — including any volatile function in it — on the operator's
+/// high-privilege DR connection, during an incident, on a command whose output
+/// nobody reads closely. Anyone with `CREATE` in the schema can plant it months
+/// ahead, and the prescribed `FOR ALL TABLES` publication replicates it to the
+/// standby too.
+#[tokio::test]
+async fn promotion_never_executes_a_view_that_owns_a_sequence() {
+    let (url, _db) = require_db!("viewown");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE TABLE dr_probe_marker (hit int);
+         CREATE FUNCTION dr_probe_fire() RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$
+           BEGIN INSERT INTO dr_probe_marker VALUES (1); RETURN 1; END $$;
+         CREATE VIEW dr_probe_view AS SELECT dr_probe_fire() AS id;
+         CREATE SEQUENCE dr_probe_seq;
+         ALTER SEQUENCE dr_probe_seq OWNED BY dr_probe_view.id;",
+    )
+    .await
+    .expect("plant the view-owned sequence");
+
+    let advanced = autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion must succeed, having simply skipped the view");
+    assert!(
+        !advanced
+            .iter()
+            .any(|(name, _)| name.contains("dr_probe_seq")),
+        "a view-owned sequence must never be advanced: {advanced:?}"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct C {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<C> = diesel::sql_query("SELECT COUNT(*) AS n FROM dr_probe_marker")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.into_iter().next().map_or(-1, |c| c.n),
+        0,
+        "the view's body must NOT have been executed"
+    );
+}
+
+/// Identifiers that are not plain lowercase must be advanced, not skipped.
+///
+/// An earlier revision screened identifiers instead of quoting them: an
+/// embedder on a `PascalCase` ORM schema had **every** sequence silently skipped
+/// while `harvest dr promote` reported success, and an ordinary table named
+/// `user` or `order` passed the screen and then failed as a bare keyword.
+#[tokio::test]
+async fn promotion_advances_reserved_word_and_mixed_case_relations() {
+    let (url, _db) = require_db!("quoting");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE TABLE \"user\" (id BIGSERIAL PRIMARY KEY);
+         CREATE TABLE \"order\" (id BIGSERIAL PRIMARY KEY);
+         CREATE TABLE \"MixedCase\" (\"Id\" BIGSERIAL PRIMARY KEY);
+         INSERT INTO \"user\" DEFAULT VALUES;
+         INSERT INTO \"user\" DEFAULT VALUES;
+         INSERT INTO \"order\" DEFAULT VALUES;
+         INSERT INTO \"MixedCase\" DEFAULT VALUES;",
+    )
+    .await
+    .expect("seed awkwardly-named relations");
+
+    // Rewind every sequence, exactly as an un-replicated logical standby would
+    // have them.
+    conn.batch_execute(
+        "SELECT setval('\"user_id_seq\"', 1, false);
+         SELECT setval('\"order_id_seq\"', 1, false);
+         SELECT setval('\"MixedCase_Id_seq\"', 1, false);",
+    )
+    .await
+    .expect("rewind sequences");
+
+    let advanced = autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion must handle quoted identifiers");
+    for expected in ["user_id_seq", "order_id_seq", "MixedCase_Id_seq"] {
+        assert!(
+            advanced.iter().any(|(name, _)| name.contains(expected)),
+            "{expected} must have been advanced, got {advanced:?}"
+        );
+    }
+
+    // And the advance is real: the next value must clear the existing rows.
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        v: i64,
+    }
+    let rows: Vec<N> = diesel::sql_query("SELECT nextval('\"user_id_seq\"') AS v")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.into_iter().next().map_or(0, |n| n.v),
+        3,
+        "the next id must be max(id) + 1, not a duplicate"
+    );
+}
+
 // ── AC4 / AC6(c): measured RPO ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -415,6 +650,138 @@ async fn replication_status_on_a_primary_with_no_standby_is_not_a_zero_rpo() {
         "a primary with no standby has an UNKNOWN RPO, never 0"
     );
     assert!(matches!(status, ReplicationStatus::Observed { .. }));
+}
+
+// ── The worker lifecycle: pin at startup, self-fence, stop ─────────────────
+
+/// A DR-enabled worker pins at startup, and a fence stops it.
+///
+/// The claim gate and the persist assert are proven above at the SQL layer;
+/// this covers the half that only exists at runtime — `pin_dr_generations`
+/// (which must run *before* fleet registration and the first poll),
+/// `spawn_replication_sampler`'s self-fence check, the `harvest.shard.fenced`
+/// counter, and the worker actually shutting down rather than idling forever
+/// claiming nothing.
+///
+/// Deliberately a **single-pool** worker with no `ShardedDbPool`: that is the
+/// deployment shape the topology doc documents (`.with_dr_fencing(true)` and
+/// nothing else), and an earlier revision gated the sampler on
+/// `sharded_pool.is_some()` — so exactly this configuration got the claim gate
+/// but never beat a watermark, never measured an RPO, and never stopped when
+/// fenced.
+#[tokio::test]
+async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("workerfence");
+
+    // A non-zero shard, so a regression that fabricates shard 0 fails here.
+    let shard = ShardId::new(3);
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
+        fencing: true,
+        sample_interval: std::time::Duration::from_millis(300),
+        watermark_retain: std::time::Duration::from_secs(3600),
+    });
+
+    let fenced_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let telemetry = std::sync::Arc::new(
+        autumn_harvest::telemetry::TelemetryConfig::builder()
+            .metrics(std::sync::Arc::new(FenceCounter {
+                fenced: std::sync::Arc::clone(&fenced_count),
+            }))
+            .build(),
+    );
+    let registry = std::sync::Arc::new(
+        autumn_harvest::worker::HandlerRegistry::with_state_and_telemetry(
+            Vec::new(),
+            Vec::new(),
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        ),
+    );
+
+    let mut config = dr_worker_config();
+    config.shard_assignments = vec![shard];
+    let worker = autumn_harvest::worker::Worker::new(config, registry).expect("worker builds");
+
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { worker.run(&pool).await });
+
+    // Pinning happens before registration and the first poll, so both the row
+    // and the published registry appear within moments of startup.
+    let pin_url = url.clone();
+    eventually(
+        "the worker to pin its generation",
+        std::time::Duration::from_secs(30),
+        || {
+            let url = pin_url.clone();
+            async move {
+                let mut conn = connect(&url).await;
+                matches!(current_generation(&mut conn, shard).await, Ok(Some(_)))
+                    && FenceRegistry::expected(shard).is_some()
+            }
+        },
+    )
+    .await;
+
+    // Fence it, as the promoted primary would.
+    {
+        let mut conn = connect(&url).await;
+        bump_generation(&mut conn, shard, "worker lifecycle drill", "test")
+            .await
+            .expect("bump");
+    }
+
+    // `run()` returning is the observable proof that the worker stopped.
+    // Idling forever while claiming nothing is the failure mode this asserts
+    // against, so a timeout here is a real failure, not flake.
+    tokio::time::timeout(std::time::Duration::from_secs(60), run)
+        .await
+        .expect("a fenced worker must shut down, not idle claiming nothing")
+        .expect("worker task must not panic");
+
+    // UFCS: diesel's blanket `RunQueryDsl::load` shadows `AtomicU64::load`
+    // through the `Arc` deref in this module.
+    assert!(
+        std::sync::atomic::AtomicU64::load(&fenced_count, std::sync::atomic::Ordering::SeqCst) > 0,
+        "the worker must record harvest.shard.fenced before stopping — an operator's only \\
+         signal that a fleet is pinned to a superseded epoch"
+    );
+
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+}
+
+/// Counts `harvest.shard.fenced`; every other metric is the default no-op.
+#[derive(Debug)]
+struct FenceCounter {
+    fenced: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for FenceCounter {
+    fn record_shard_fenced(&self, _shard: u16) {
+        self.fenced
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn dr_pool(url: &str) -> autumn_harvest::worker::DbPool {
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url,
+        );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool build")
+}
+
+fn dr_worker_config() -> autumn_harvest::worker::WorkerRuntimeConfig {
+    autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_dr_fencing(true)
+            .with_replication_sample_interval(std::time::Duration::from_millis(300)),
+    )
 }
 
 // ── The two-"region" topology, over real logical replication ───────────────
@@ -491,11 +858,11 @@ async fn wal_level_is_logical(url: &str) -> bool {
 
 /// Build the two-region topology, or `None` when the server cannot host it.
 async fn two_regions(tag: &str) -> Option<Regions> {
-    let admin = admin_url()?;
+    let admin = admin_url().await?;
     if !wal_level_is_logical(&admin).await {
         eprintln!(
-            "skipping {tag}: server is not configured with wal_level=logical, so stock logical \
-             replication cannot be exercised"
+            "SKIPPED {tag}: server is not configured with wal_level=logical, so stock logical \
+             replication cannot be exercised and this test proved NOTHING"
         );
         return None;
     }
@@ -546,7 +913,13 @@ macro_rules! require_regions {
     ($tag:literal) => {
         match two_regions($tag).await {
             Some(v) => v,
-            None => return,
+            None => {
+                eprintln!(
+                    "SKIPPED {}: no two-region topology available — this test proved NOTHING",
+                    $tag
+                );
+                return;
+            }
         }
     };
 }
@@ -849,7 +1222,7 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
     let promoted_gen = bump_generation(&mut b, shard, "failover drill", "oncall")
         .await
         .map_err(|e| e.to_string())?;
-    assert_eq!(promoted_gen, ShardGeneration(1));
+    assert_eq!(promoted_gen, ShardGeneration::new(1));
 
     // Sequences are NOT replicated by logical replication. Without this the
     // new primary's `harvest_events_id_seq` still sits at 1 and the first
@@ -866,7 +1239,7 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
 
     // ── A surviving region-A worker, pinned to the pre-failover epoch. ────
     FenceRegistry::clear();
-    FenceRegistry::register(shard, ShardGeneration(0));
+    FenceRegistry::register(shard, ShardGeneration::new(0));
     FenceRegistry::set_default_shard(shard);
 
     let stale_claim = autumn_harvest::queue::claim_task_on_shard(
