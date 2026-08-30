@@ -15,7 +15,7 @@
 //! implementation in `queue.rs`.
 //!
 //! Compile-checked only in this sandbox (no Docker/testcontainers available),
-//! matching the #543/#544/#601 precedent documented in CLAUDE.md.
+//! matching the #543/#544/#601 precedent documented in docs/shipped-work.md.
 #![cfg(feature = "db")]
 
 use autumn_harvest::queue::{EnqueueParams, TaskType};
