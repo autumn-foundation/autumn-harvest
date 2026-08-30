@@ -492,6 +492,14 @@ async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
             // shape is what the generalized mixed-batch persist path now
             // accepts. Before #950 it matched NO extractor and the worker
             // terminally failed the workflow with "unsupported commands".
+            //
+            // `autumn_harvest::worker` is gated behind the `db` feature, while
+            // this file is not, so the assertion is gated to match — CI runs the
+            // integration target under `--no-default-features --features testing`
+            // for the docs guards, where the module does not exist. The
+            // assertions above (which pin the emitted batch shape) still run
+            // under every feature set.
+            #[cfg(feature = "db")]
             assert!(
                 autumn_harvest::worker::suspension_batch_is_persistable(&commands),
                 "the mixed stale-re-park batch must be persistable by the worker \
