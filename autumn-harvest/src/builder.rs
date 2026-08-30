@@ -2187,14 +2187,6 @@ impl HarvestBuilder {
             .unwrap_or(worker_config.unknown_target_grace_window);
         worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
-        // Issue #948: the worker's background re-encryption sweep must read the
-        // SAME codec registry the builder configured — not a fresh default,
-        // which would hold no keys and silently sweep nothing. This is the one
-        // choke point every built runtime passes through, so a runner cannot
-        // forget to wire it. The registry's rotation state is shared across
-        // clones, so a later `set_active_key` still reaches the running worker.
-        worker_config.payload_codecs = self.payload_codecs.clone();
-
         let usage_window_ceiling = self
             .usage_window_ceiling
             .unwrap_or_else(crate::usage::default_usage_window_ceiling);
@@ -3396,22 +3388,6 @@ pub struct WorkerConfig {
     /// keyed codec is registered, so this costs nothing on a deployment that has
     /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
     pub codec_rotation_batch_size: i64,
-    /// The payload-codec registry this worker's background sweeps read
-    /// (issue #948).
-    ///
-    /// Wired from `BuiltHarvest::payload_codecs()` by the runner/plugin. The
-    /// rotation half of the registry is shared across clones, so flipping the
-    /// active key is observed by an already-running worker with no restart.
-    ///
-    /// **[`HarvestBuilder::build`] owns this field and overwrites whatever is
-    /// here with the builder's registry.** That is deliberate and one-way: the
-    /// sweep reading a registry with no keys does nothing at all, silently, so
-    /// the builder — the single choke point every built runtime passes through
-    /// — is the one place that decides. Configure codecs with
-    /// [`HarvestBuilder::payload_codec`] / [`HarvestBuilder::payload_codec_key`]
-    /// rather than by setting this on a [`WorkerConfig`] you hand to
-    /// [`HarvestBuilder::worker`]; a value set there does not survive `build()`.
-    pub payload_codecs: PayloadCodecs,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -3555,7 +3531,6 @@ impl Default for WorkerConfig {
             sharded_pool: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
-            payload_codecs: PayloadCodecs::default(),
         }
     }
 }
@@ -4897,41 +4872,35 @@ mod tests {
         assert!(worker_config.queues.contains(&"default".to_string()));
     }
 
-    /// `build()` owns `WorkerConfig::payload_codecs`: a registry set on a
-    /// caller-supplied `WorkerConfig` does not survive, and the builder's wins
-    /// (issue #948).
+    /// The worker has exactly ONE codec registry, and it is the handler
+    /// registry's (issues #948, #1243).
     ///
-    /// The precedence is one-way on purpose. A sweep whose registry holds no
-    /// keys does nothing *silently*, so the builder — the single choke point
-    /// every built runtime passes through — decides, and a runner cannot half-
-    /// wire rotation by configuring one of the two surfaces. This pins the
-    /// direction so it cannot be inverted by accident; the setter that used to
-    /// invite the mistake is gone.
+    /// There were briefly two: `WorkerRuntimeConfig::payload_codecs` drove the
+    /// re-encryption sweep while `HandlerRegistry::payload_codecs` drove writes
+    /// and replay, and `Worker::new` reconciled nothing. Configuring only the
+    /// handler registry silently disabled rotation; configuring only the config
+    /// let the sweep rewrite ciphertext that replay could not then read, which
+    /// surfaces to workflow code as raw envelope data. Neither failure is loud.
+    ///
+    /// The config field is gone, so the two cannot disagree by construction.
+    /// This pins that the builder's codecs reach the registry, which is now the
+    /// single source for both responsibilities.
     #[test]
-    fn build_overwrites_a_worker_supplied_payload_codec_registry() {
-        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
-
-        // A registry the caller puts on the WorkerConfig, holding a key.
-        let caller_side = PayloadCodecs::default();
-        caller_side
-            .register_key("caller-key", std::sync::Arc::new(IdentityCodec))
-            .expect("register caller key");
-        assert!(caller_side.has_keyed_codecs());
+    fn the_builder_installs_one_codec_registry_on_the_handler_registry() {
+        use crate::payload_codec::IdentityCodec;
 
         let built = HarvestBuilder::new()
-            .worker(WorkerConfig {
-                payload_codecs: caller_side,
-                ..WorkerConfig::default()
-            })
+            .payload_codec_key("k1", IdentityCodec)
             .build();
 
-        let effective = built.worker_config().payload_codecs.clone();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
         assert!(
-            !effective
+            registry
+                .payload_codecs()
                 .registered_key_ids()
-                .contains(&"caller-key".to_string()),
-            "the caller's WorkerConfig registry must not survive build(); \
-             configure codecs on the builder instead"
+                .contains(&"k1".to_string()),
+            "the builder's registry must reach the handler registry, which is \
+             what the sweep, the writes and replay all read"
         );
     }
 

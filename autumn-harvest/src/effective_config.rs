@@ -341,7 +341,6 @@ impl WorkerConfigView {
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
             // `GET /admin/codec/rotation` (issue #948), never from here.
-            payload_codecs: _,
         } = worker;
 
         Self {

@@ -508,7 +508,6 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -4161,7 +4160,6 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
     // Worker with a build_id
     let config = WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
-        payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
         worker_id: "nd-worker-1".to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,

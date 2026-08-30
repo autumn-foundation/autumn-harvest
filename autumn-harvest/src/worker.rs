@@ -236,11 +236,6 @@ pub struct WorkerRuntimeConfig {
     /// Per-shard, per-tick batch size for the lazy payload-codec re-encryption
     /// sweep (issue #948). `0` disables it.
     pub codec_rotation_batch_size: i64,
-    /// Payload-codec registry read by the re-encryption sweep (issue #948).
-    ///
-    /// Its rotation state is shared across clones, so a key flip reaches an
-    /// already-running worker without a restart.
-    pub payload_codecs: crate::payload_codec::PayloadCodecs,
 }
 
 impl WorkerRuntimeConfig {
@@ -432,7 +427,6 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             slot_tuner: cfg.slot_tuner,
             max_concurrent_sessions: cfg.max_concurrent_sessions,
             codec_rotation_batch_size: cfg.codec_rotation_batch_size,
-            payload_codecs: cfg.payload_codecs,
         }
     }
 }
@@ -21533,7 +21527,7 @@ impl Worker {
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
                     *shard,
-                    self.config.payload_codecs.clone(),
+                    self.registry.payload_codecs().clone(),
                     self.config.codec_rotation_batch_size,
                 )
             })
@@ -21550,7 +21544,7 @@ impl Worker {
                     worker_stale_secs,
                     self.registry.telemetry().clone(),
                     *shard,
-                    self.config.payload_codecs.clone(),
+                    self.registry.payload_codecs().clone(),
                 )
             })
             .collect();
@@ -24085,7 +24079,6 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
-            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
         }
     }
 
@@ -24905,7 +24898,6 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
-            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

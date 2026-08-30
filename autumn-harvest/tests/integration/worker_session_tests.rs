@@ -828,7 +828,6 @@ mod db_tests {
                 Worker::new(
                     autumn_harvest::worker::WorkerRuntimeConfig {
                         codec_rotation_batch_size: 0,
-                        payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                         worker_id: worker_id.to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,

@@ -477,7 +477,6 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: "heartbeat-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -717,7 +716,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: "uncooperative-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -892,7 +890,6 @@ async fn activity_exits_early_on_workflow_cancellation() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: "ac-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -1061,7 +1058,6 @@ async fn activity_without_cancellation_check_completes_normally() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
                 worker_id: "no-hb-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
