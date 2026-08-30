@@ -25794,6 +25794,316 @@ mod tests {
         Ok(())
     }
 
+    // ── ADVERSARIAL REVIEW PROBES (temporary) ─────────────────────────────
+
+    /// PROBE A: signal branch declared FIRST, activity sibling has BOTH its
+    /// ActivityScheduled and ActivityStarted recorded before the SignalReceived.
+    #[tokio::test]
+    async fn probe_a_signal_first_two_interleaved_events() -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "long_running".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .signal("abort")
+            .activity_raw("long_running", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 0, "the signal branch won live");
+        Ok(())
+    }
+
+    /// PROBE A2: same, but signal declared LAST and TWO activity siblings.
+    #[tokio::test]
+    async fn probe_a2_two_activities_then_signal() -> Result<(), HarvestError> {
+        let a = ActivityExecId::new();
+        let b = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(3u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: a,
+                name: "fetch_a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: b,
+                name: "fetch_b".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: a,
+                worker_id: crate::types::WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: b,
+                worker_id: crate::types::WorkerId::new("w"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .signal("abort")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 2, "the signal branch won live");
+        Ok(())
+    }
+
+    /// PROBE B: a LOSING signal branch must not steal a LATER wait's signal.
+    #[tokio::test]
+    async fn probe_b_losing_signal_branch_steals_later_wait() -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(0u64),
+            },
+            // The later, independent wait_for_signal's own delivery.
+            WorkflowEvent::SignalReceived {
+                signal_name: "go".to_string(),
+                payload: serde_json::json!({"n": 7}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .activity_raw("fetch", Value::Null, "default")
+            .signal("go")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 0, "the activity won and the marker says so");
+
+        // Now the workflow's SEPARATE, later wait for the same signal name.
+        let later = ctx.match_history(|m| m.match_signal("go"));
+        assert!(
+            matches!(later, HistoryMatch::Matched { .. }),
+            "the later independent wait_for_signal(\"go\") must still see its own \
+             delivered signal, got {later:?}"
+        );
+        Ok(())
+    }
+
+    /// PROBE C: a push handler for the same name racing a mixed-race signal branch.
+    #[tokio::test]
+    async fn probe_c_push_handler_steals_race_signal() -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "long_running".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(1u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        ctx.register_signal_handler_raw("abort", |_v| {});
+        let res = ctx
+            .race()
+            .activity_raw("long_running", Value::Null, "default")
+            .signal("abort")
+            .run()
+            .await;
+        assert!(
+            res.is_ok(),
+            "the recorded winner (signal branch 1) must re-resolve on replay, got {res:?}"
+        );
+        assert_eq!(res.unwrap().index, 1);
+        Ok(())
+    }
+
+    /// PROBE D: two timer branches in one race — distinct ids, distinct events.
+    #[tokio::test]
+    async fn probe_d_two_timer_branches() -> Result<(), HarvestError> {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:0"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("__race:1:1"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .timer(std::time::Duration::from_secs(30))
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await?;
+        assert_eq!(winner.index, 1, "the 60s timer fired first in history");
+        Ok(())
+    }
+
+    /// PROBE E: timer branch FIRST in the builder chain, activity second.
+    #[tokio::test]
+    async fn probe_e_timer_branch_first() -> Result<(), HarvestError> {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:0"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"ok": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner = ctx
+            .race()
+            .timer(std::time::Duration::from_secs(30))
+            .activity_raw("fetch", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 1);
+        Ok(())
+    }
+
+    /// PROBE F: re-entering the same race in a LOOP — seq increments.
+    #[tokio::test]
+    async fn probe_f_race_in_a_loop_timer_ids() -> Result<(), HarvestError> {
+        let a1 = ActivityExecId::new();
+        let a2 = ActivityExecId::new();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: a1,
+                name: "fetch".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:1:1"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: a1,
+                output: serde_json::json!(1),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(0u64),
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: TimerId::new("__race:1:1"),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race:2".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: a2,
+                name: "fetch".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__race:2:1"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: a2,
+                output: serde_json::json!(2),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        for expected in [serde_json::json!(1), serde_json::json!(2)] {
+            let w = ctx
+                .race()
+                .activity_raw("fetch", Value::Null, "default")
+                .timer(std::time::Duration::from_secs(30))
+                .run()
+                .await?;
+            assert_eq!(w.index, 0);
+            assert_eq!(w.value, expected);
+        }
+        Ok(())
+    }
+
     /// A child workflow raced against a deadline, with an ORDINARY race timer
     /// (not the `__child_timeout:` primitive of #779).
     #[tokio::test]

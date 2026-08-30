@@ -2027,6 +2027,34 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
     (!batch.is_empty()).then_some(batch)
 }
 
+/// Report a `timer_id` carried by **two or more** `StartTimer` commands in the
+/// same batch (issue #950).
+///
+/// `harvest_timers` has no unique index on `(workflow_exec_id, timer_id)`, and
+/// the mixed path resolves each `StartTimer`'s new-vs-existing state against the
+/// rows visible when the transaction opened — so two same-id `StartTimer`s
+/// (`join!(ctx.timer("x", 5), ctx.timer("x", 10))`, an author error) would both
+/// read "no existing row", insert **two** durable rows for one logical timer,
+/// and record two `TimerStarted` events. The workflow would then be woken twice
+/// and replay would have two events for one id.
+///
+/// The single-timer paths cannot hit this (`extract_started_timer_for_suspension`
+/// rejects a batch with more than one `StartTimer`), so this guard is specific to
+/// the generalized path. Fail loud with a typed error naming the id, mirroring
+/// `same_batch_uncancelled_arm_start_collision`'s treatment of the analogous
+/// cancellable-vs-classic collision, rather than silently double-arming.
+fn duplicate_start_timer_id(commands: &[WorkflowCommand]) -> Option<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for cmd in commands {
+        if let WorkflowCommand::StartTimer { timer_id, .. } = cmd
+            && !seen.insert(timer_id.as_str())
+        {
+            return Some(timer_id.to_string());
+        }
+    }
+    None
+}
+
 /// Whether a suspension batch is persistable as a **heterogeneous** mixed batch
 /// (issue #950).
 ///
@@ -9738,6 +9766,17 @@ async fn persist_mixed_suspension_batch(
 ) -> HarvestResult<()> {
     let exec_id = execution_id_from_uuid(parent_execution.id);
 
+    // Two `StartTimer`s for one id would arm two durable rows and record two
+    // `TimerStarted` events for one logical timer. Reject before anything is
+    // written, so the batch leaves no partial durable trace.
+    if let Some(timer_id) = duplicate_start_timer_id(commands) {
+        return Err(HarvestError::Config(format!(
+            "timer id '{timer_id}' is started twice in one suspension batch — a \
+             concurrent block must give each ctx.timer/sleep_until call a distinct \
+             id (issue #950)"
+        )));
+    }
+
     // Capability miss (#804): resolve EVERY handler this batch needs before any
     // row is written, so a worker missing an activity or child-workflow handler
     // releases the parent's task for a capable peer instead of terminally
@@ -9971,8 +10010,17 @@ async fn persist_mixed_suspension_batch(
         // Insert the row + enqueue the task for each genuinely new child, through
         // the same helper the #779 child-timeout race uses (which resolves the
         // child's OWN registered defaults and enforces its OWN declared quota).
+        // `inserted_children` dedupes WITHIN this batch as well as against rows
+        // that already existed: a fan-out that emitted the same `child_id` twice
+        // would otherwise attempt two inserts of one primary key and abort the
+        // whole transaction. Skipping the repeat matches the documented
+        // "children whose child_id already exists are silently skipped"
+        // idempotent-re-park contract of `persist_all_started_child_workflows`.
+        let mut inserted_children: HashSet<uuid::Uuid> = HashSet::new();
         for child in &batch.children {
-            if existing_child_ids.contains(&child.child_id.as_uuid()) {
+            if existing_child_ids.contains(&child.child_id.as_uuid())
+                || !inserted_children.insert(child.child_id.as_uuid())
+            {
                 continue;
             }
             let trace_ctx = child_trace_ctxs
@@ -27482,6 +27530,32 @@ mod tests {
         // N WaitForSignal
         let signals = vec![mixed_wait_signal("a"), mixed_wait_signal("b")];
         assert!(should_requeue_signal_wait(&signals));
+    }
+
+    /// Two `StartTimer`s for one id in a single batch would arm two durable
+    /// `harvest_timers` rows (there is no unique index on
+    /// `(workflow_exec_id, timer_id)`) and record two `TimerStarted` events for
+    /// one logical timer. Reject loudly instead.
+    #[test]
+    fn duplicate_start_timer_id_in_one_batch_is_reported() {
+        let dup = vec![
+            mixed_start_timer("x", 5),
+            mixed_schedule_activity("charge"),
+            mixed_start_timer("x", 10),
+        ];
+        assert_eq!(
+            duplicate_start_timer_id(&dup).as_deref(),
+            Some("x"),
+            "a same-id StartTimer pair must be reported"
+        );
+
+        // Distinct ids (the ordinary parallel-timer case) are fine.
+        let distinct = vec![mixed_start_timer("a", 5), mixed_start_timer("b", 10)];
+        assert!(
+            duplicate_start_timer_id(&distinct).is_none(),
+            "distinct parallel timers must not be rejected"
+        );
+        assert!(duplicate_start_timer_id(&[]).is_none());
     }
 
     /// AC8: a `RunLocalActivity` co-batched with a durable sibling wait is
