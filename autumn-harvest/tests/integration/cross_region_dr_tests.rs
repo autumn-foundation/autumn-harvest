@@ -848,12 +848,11 @@ async fn wal_level_is_logical(url: &str) -> bool {
         diesel::sql_query("SELECT current_setting('wal_level') AS wal_level")
             .load(&mut conn)
             .await;
-    rows.map(|r| {
+    rows.is_ok_and(|r| {
         r.into_iter()
             .next()
             .is_some_and(|s| s.wal_level == "logical")
     })
-    .unwrap_or(false)
 }
 
 /// Build the two-region topology, or `None` when the server cannot host it.
