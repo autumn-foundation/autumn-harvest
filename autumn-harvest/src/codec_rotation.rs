@@ -898,6 +898,50 @@ mod db {
         NotConfirmed,
     }
 
+    /// The four preconditions that are decidable *without* touching the
+    /// database, split out of [`retire_codec_key`] so the gate itself reads as
+    /// census-then-verdict.
+    ///
+    /// Each one is a refusal to report a vacuous success: retiring the active
+    /// key, proving zero over no shards at all, proving zero for a key this
+    /// process never registered, or trusting a census whose blind spots
+    /// nobody has attested are covered.
+    fn validate_retirement_request(
+        expected_shards: &[crate::types::ShardId],
+        codecs: &PayloadCodecs,
+        key_id: &str,
+        fence: FleetWriteFence,
+    ) -> HarvestResult<()> {
+        if codecs.active_key_id() == key_id {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is the active key and cannot be retired; \
+                 activate a different key first"
+            )));
+        }
+        if expected_shards.is_empty() {
+            return Err(HarvestError::Config(format!(
+                "cannot retire codec key id {key_id:?}: no shards were supplied to inspect, so \
+                 zero remaining rows cannot be established"
+            )));
+        }
+        if codecs.codec_for_key(key_id).is_none() {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is not registered; retiring it would report success \
+                 without having proved anything about the rows that reference it"
+            )));
+        }
+        if fence == FleetWriteFence::NotConfirmed {
+            return Err(HarvestError::Config(format!(
+                "cannot retire codec key id {key_id:?}: no fleet write fence was attested. A \
+                 zero census only proves no row references the key *right now* on the shards \
+                 this process can reach; it cannot see another worker that still holds the key \
+                 active, nor an append that encoded under it and has not committed yet. \
+                 Confirm both fleet-wide, then pass FleetWriteFence::ConfirmedByOperator"
+            )));
+        }
+        Ok(())
+    }
+
     /// Retire a codec key, refusing unless **every** expected shard proves it
     /// holds zero rows referencing it (issue #948, AC6).
     ///
@@ -936,33 +980,7 @@ mod db {
         key_id: &str,
         fence: FleetWriteFence,
     ) -> HarvestResult<()> {
-        if codecs.active_key_id() == key_id {
-            return Err(HarvestError::Config(format!(
-                "codec key id {key_id:?} is the active key and cannot be retired; \
-                 activate a different key first"
-            )));
-        }
-        if expected_shards.is_empty() {
-            return Err(HarvestError::Config(format!(
-                "cannot retire codec key id {key_id:?}: no shards were supplied to inspect, so \
-                 zero remaining rows cannot be established"
-            )));
-        }
-        if codecs.codec_for_key(key_id).is_none() {
-            return Err(HarvestError::Config(format!(
-                "codec key id {key_id:?} is not registered; retiring it would report success \
-                 without having proved anything about the rows that reference it"
-            )));
-        }
-        if fence == FleetWriteFence::NotConfirmed {
-            return Err(HarvestError::Config(format!(
-                "cannot retire codec key id {key_id:?}: no fleet write fence was attested. A \
-                 zero census only proves no row references the key *right now* on the shards \
-                 this process can reach; it cannot see another worker that still holds the key \
-                 active, nor an append that encoded under it and has not committed yet. \
-                 Confirm both fleet-wide, then pass FleetWriteFence::ConfirmedByOperator"
-            )));
-        }
+        validate_retirement_request(expected_shards, codecs, key_id, fence)?;
         // Fail closed on an INCOMPLETE list, not just an unreachable shard. A
         // caller that passes a stale or process-local subset would otherwise get
         // a vacuous `Ok` while whole shards were never censused -- and the
