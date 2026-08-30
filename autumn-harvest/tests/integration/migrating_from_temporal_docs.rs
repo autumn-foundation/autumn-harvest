@@ -449,7 +449,24 @@ fn repository_issue_refs() -> BTreeSet<u32> {
     const TEXT_EXTENSIONS: [&str; 6] = ["rs", "md", "sql", "toml", "json", "yml"];
 
     fn collect(path: &Path, refs: &mut BTreeSet<u32>) {
-        if path.is_dir() {
+        // `symlink_metadata` does NOT follow links, so a symlinked directory is
+        // never descended into; `Path::is_dir` would.
+        //
+        // This is about a deterministic scan set, NOT about preventing a hang.
+        // A self-referential link was measured: the kernel caps symlink
+        // resolution at 40 levels, so `read_dir` fails with `ELOOP` and the
+        // `else { return }` above ends the recursion — 0.33s, no hang. What
+        // skipping links does buy is that the set of files this guard reads is
+        // exactly the tracked tree, with nothing counted twice through an
+        // alias, so the record it verifies citations against cannot be widened
+        // by a link someone adds later.
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.is_dir() {
             if path
                 .file_name()
                 .is_some_and(|n| n == "target" || n == ".git")
