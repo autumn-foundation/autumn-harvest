@@ -572,8 +572,16 @@ impl PayloadCodecs {
         if first {
             guard.active = key_id.to_string();
         }
-        drop(guard);
+        // Publish the mirror while STILL holding the write guard. Storing it
+        // after `drop(guard)` leaves it unordered against the map mutation, so
+        // a concurrent `retire_key_local` that removed the last key can compute
+        // `false`, lose the race to this insert, and then overwrite this `true`
+        // -- leaving a non-empty registry advertising itself as empty, which
+        // makes `resolve_decoder` skip the keyed lookup and encoding fall back
+        // to the default codec. Under the lock, the two stores are ordered by
+        // the same mutex that orders the map.
         self.any_keys.store(true, Ordering::Release);
+        drop(guard);
         Ok(())
     }
 
@@ -678,8 +686,11 @@ impl PayloadCodecs {
         }
         guard.keys.remove(key_id);
         let any_left = !guard.keys.is_empty();
-        drop(guard);
+        // Under the guard, for the reason spelled out in `register_key`: the
+        // mirror and the map must be mutated inside the same critical section
+        // or a concurrent registration can be undone by this store.
         self.any_keys.store(any_left, Ordering::Release);
+        drop(guard);
         Ok(())
     }
 
@@ -2392,5 +2403,49 @@ mod tests {
             .expect("retire the inactive key");
         assert_eq!(codecs.registered_key_ids(), vec!["k2".to_string()]);
         assert!(codecs.codec_for_key("k1").is_none());
+    }
+
+    /// The `any_keys` mirror must be published **under** the map lock.
+    ///
+    /// It is a lock-free fast path for `has_keyed_codecs`, so a stale `false`
+    /// makes `resolve_decoder` skip the keyed lookup entirely and encoding fall
+    /// back to the default codec — a non-empty keyed registry behaving as if it
+    /// were empty. Storing it after `drop(guard)` leaves the store unordered
+    /// with respect to the map mutation, so two writers can interleave:
+    /// a retirement removes the last key and computes `false`, a registration
+    /// then inserts and stores `true`, and the retirement's delayed store
+    /// overwrites it with `false`.
+    ///
+    /// Source-level because the hazard is *statement order* across two
+    /// functions, which no single-threaded assertion can observe: the race
+    /// window is a few instructions wide and would make a timing test flaky in
+    /// both directions.
+    #[test]
+    fn the_key_presence_mirror_is_published_under_the_lock() {
+        let src = include_str!("payload_codec.rs");
+        for func in ["pub fn register_key(", "pub fn retire_key_local("] {
+            let start = src
+                .find(func)
+                .expect("both key-mutating functions must exist");
+            let body = &src[start..];
+            let end = body[1..].find("\n    /// ").map_or(body.len(), |o| o + 1);
+            let body = &body[..end];
+
+            // Match the STATEMENTS, not the prose: the comments below each of
+            // these lines discuss `drop(guard)` by name, and a bare substring
+            // search finds the explanation before the code it explains.
+            let store = body
+                .find("self.any_keys.store(")
+                .expect("each key-mutating function must publish the presence mirror");
+            let unlock = body
+                .find("drop(guard);")
+                .expect("each key-mutating function must release the write guard");
+            assert!(
+                store < unlock,
+                "{func}: the any_keys store must happen BEFORE drop(guard), or it is \
+                 unordered against the map mutation and a concurrent register/retire \
+                 pair can leave the mirror disagreeing with a non-empty map"
+            );
+        }
     }
 }
