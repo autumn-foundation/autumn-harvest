@@ -7,8 +7,8 @@
 //! 1. the guide and its worked example both exist, and the guide covers the
 //!    required ground — every required section, and at least 25
 //!    concept-mapping table rows (issue #947 AC1's literal minimum);
-//! 2. every `#NNN` issue citation inside the guide actually appears in
-//!    `CLAUDE.md` — the repository's own record of what has shipped — so a
+//! 2. every `#NNN` issue citation inside the guide actually appears somewhere
+//!    the repository publishes — `CHANGELOG.md` or the `docs/` tree — so a
 //!    claim can never cite a number nobody can verify (issue #947 AC1's
 //!    "verifiable in under a minute" bar, and the "no unshipped capability
 //!    presented as shipped" bar);
@@ -184,19 +184,64 @@ fn concept_mapping_table_has_at_least_25_rows() {
     );
 }
 
+/// Every published Markdown file under `docs/`, plus `CHANGELOG.md`.
+///
+/// `GUIDE_PATH` is excluded deliberately: the guide verifying its own
+/// citations would make this guard vacuous.
+fn published_record() -> String {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+
+    let guide = workspace_path(GUIDE_PATH);
+    let mut files = vec![workspace_path("CHANGELOG.md")];
+    walk(&workspace_path("docs"), &mut files);
+
+    files
+        .iter()
+        .filter(|path| **path != guide)
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The shipped-work record is what the repository publishes, not `CLAUDE.md`.
+///
+/// This guard used to read `CLAUDE.md`, back when the 0.6.0 collation sweep
+/// kept a verbatim phase list there. Commit 562c781 trimmed that file to
+/// repository instructions, which is what it is for. No test should depend on
+/// `CLAUDE.md`: it is agent instructions, free to be rewritten, and pinning
+/// tests to it turns editing it into a broken build.
+///
+/// `CHANGELOG.md` alone is not a sufficient replacement — collation condenses
+/// each fragment to one bullet, and twelve issues the guide cites survive only
+/// in the `docs/` tree (for example #600, #785 and #799 in
+/// `docs/workflow-determinism-guide.md`). The bar this guard enforces is
+/// "verifiable in under a minute", and anything the repository publishes meets
+/// it, so the record is the changelog plus the docs tree.
 #[test]
-fn every_cited_issue_number_appears_in_claude_md() {
+fn every_cited_issue_number_appears_in_the_published_record() {
     let guide = read_doc(GUIDE_PATH);
-    let claude_md = read_doc("CLAUDE.md");
 
     let cited = issue_refs(&guide);
-    let known = issue_refs(&claude_md);
+    let known = issue_refs(&published_record());
 
     let unverifiable: Vec<u32> = cited.difference(&known).copied().collect();
     assert!(
         unverifiable.is_empty(),
-        "migration guide cites issue number(s) not found anywhere in CLAUDE.md, so they \
-         cannot be verified against the repository's own shipped-work record: {unverifiable:?}"
+        "migration guide cites issue number(s) found nowhere in CHANGELOG.md or the docs/ \
+         tree, so they cannot be verified against anything the repository publishes: \
+         {unverifiable:?}"
     );
     assert!(
         !cited.is_empty(),
