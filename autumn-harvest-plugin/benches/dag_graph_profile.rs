@@ -33,12 +33,20 @@
 //! #482), never-reached (pending) activities, gates resolved by
 //! `SignalReceived`, gates resolved by a race-timer `TimerFired` (issue
 //! #476/#746), and gates left unresolved (`waiting`, since the run's
-//! `exec_state` is `RUNNING`, a live/non-terminal state). A handful of
-//! issue #780 **compensator** dispatches (the `dag_compensate` envelope) are
-//! also mixed in against already-dispatched forward nodes, so
-//! `dispatched_activity_names`'s actual purpose — excluding compensator
-//! dispatches from a forward node's `latest_scheduled`/`node_outcome`
-//! selection — is genuinely exercised, not merely present as dead weight.
+//! `exec_state` is `RUNNING`, a live/non-terminal state). Every gate's
+//! upstreams are forced to succeed ([`GATE_UPSTREAM_INDICES`]) so
+//! `gate_status`'s reachability check (checked *before* resolution) actually
+//! lets each gate reach its intended `SignalReceived`/`TimerFired`/unresolved
+//! outcome, rather than every gate reporting `Pending` regardless of what is
+//! recorded for it (issue #690 review, Codex). A handful of issue #780
+//! **compensator** dispatches (the `dag_compensate` envelope) are also mixed
+//! in — including one recorded under a *current node's own name*
+//! (`t001`, compensating a different dispatched node), which is what actually
+//! exercises `dispatched_activity_names`'s purpose: excluding a compensation
+//! dispatch from that node's own `latest_scheduled`/`node_outcome` selection
+//! (a compensator name that is not itself a current node name, like the
+//! other two dispatches here, never reaches that exclusion at all — it fails
+//! the leading `name == node` check first).
 //!
 //! # Running
 //!
@@ -742,12 +750,28 @@ fn build_dag() -> DagDefinition {
 
 // ── Event history construction ──────────────────────────────────────────
 
+/// Task indices that feed a signal-gate node's upstream (see `build_dag`'s
+/// `n_gate0`..`n_gate3`). Gate reachability is checked BEFORE resolution
+/// (`gate_status`/`task_reach`): an upstream that fails, is condition-skipped,
+/// or is never reached makes the default `AllSuccess` trigger rule report
+/// `SkippedByTrigger`/`NotReached`, so the gate itself is classified `Pending`
+/// regardless of any `SignalReceived`/`TimerFired` recorded for it. These
+/// indices are forced to a plain first-attempt success below (overriding the
+/// generic `idx % 5` pattern) so every gate is actually *reached*, and the
+/// signal/timer events pushed for it below are genuinely exercised rather
+/// than being dead weight a broken upstream chain never lets `gate_status`
+/// read (issue #690 review, Codex).
+const GATE_UPSTREAM_INDICES: [usize; 8] = [9, 14, 12, 17, 15, 20, 18, 23];
+
 /// Build a realistic recorded history for `def`: a mix of succeeded, failed,
 /// multi-attempt-retried, condition-skipped (#482), and never-reached
 /// (pending) activities; gates resolved by signal, resolved by race-timer
 /// timeout (#476/#746), and left unresolved (`waiting`, since the harness
-/// runs with a live `exec_state`); plus a couple of issue #780 compensator
-/// dispatches against already-dispatched forward nodes.
+/// runs with a live `exec_state`); plus issue #780 compensator dispatches
+/// against already-dispatched forward nodes -- including one that reuses a
+/// *current* node's own activity name, the shape `is_compensation_dispatch`'s
+/// exclusion exists for (a later DAG definition introducing a forward node
+/// named after an older definition's compensator).
 fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     let tasks = def.tasks();
     let mut events: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
@@ -775,6 +799,16 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
                 _ => {}
             }
             gate_seen += 1;
+            continue;
+        }
+
+        if GATE_UPSTREAM_INDICES.contains(&idx) {
+            // Forced success so every downstream gate is actually reached
+            // (see `GATE_UPSTREAM_INDICES`'s doc comment).
+            let id = ActivityExecId::new();
+            push(&mut t, &mut events, sched(&task.activity_name, id));
+            push(&mut t, &mut events, activity_started(id));
+            push(&mut t, &mut events, completed(id));
             continue;
         }
 
@@ -819,11 +853,13 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
         }
     }
 
-    // A couple of issue #780 compensator dispatches, naming forward nodes
-    // that were actually dispatched above (`t001` succeeded, `t002` failed)
-    // — the exact shape `dispatched_activity_names`/`is_compensation_dispatch`
-    // exist to exclude from those forward nodes' own `latest_scheduled`/
-    // `node_outcome` selection.
+    // A couple of issue #780 compensator dispatches under their own
+    // (non-reused) names, naming forward nodes that were actually dispatched
+    // above (`t001` succeeded, `t002` failed) — these grow the
+    // `dispatched_activity_names` set realistically but, since `undo_t001`/
+    // `undo_t002` are not themselves node names in this DAG, `latest_scheduled`
+    // short-circuits on `name == node` before ever reaching
+    // `is_compensation_dispatch` for them.
     push(
         &mut t,
         &mut events,
@@ -833,6 +869,20 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
         &mut t,
         &mut events,
         compensator_sched("undo_t002", "t002", ActivityExecId::new()),
+    );
+    // The exclusion-exercising case (issue #690 review, Codex): a compensator
+    // dispatch recorded under a *current node's own name* (`t001`), rolling
+    // back a different, already-dispatched node (`t002`). Recorded after
+    // `t001`'s genuine forward dispatch above, so `latest_scheduled(events,
+    // "t001", ...)`'s reverse scan meets this envelope first, must recognize
+    // it as a compensation dispatch via `is_compensation_dispatch`, skip it,
+    // and keep walking back to the real forward `ActivityScheduled` for
+    // `t001` — exactly the cross-definition node-name-reuse scenario the
+    // exclusion exists for.
+    push(
+        &mut t,
+        &mut events,
+        compensator_sched("t001", "t002", ActivityExecId::new()),
     );
 
     events
