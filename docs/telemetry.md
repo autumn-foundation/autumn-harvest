@@ -331,6 +331,7 @@ metric is emitted in the source code.
 | `harvest.shard.dispatched` | Counter | `worker.rs` — the poll loop, once per dispatched task (issue #961). The shard-dimension twin of `harvest.queue.dispatched`: confirms the live dispatch split across a multi-shard worker's assigned shards, i.e. that a deep backlog on one shard is not starving its siblings. Emitted by the poll loop rather than `dispatch_task` because a task row carries no `shard_id` column — "which shard" *is* "which pool", and only the poll loop knows which pool it claimed from |
 | `harvest.replication.lag_seconds` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). The **measured RPO**: how many seconds of acknowledged work a failover to the standby region would lose right now, from the age of the newest `harvest_replication_heartbeat` watermark the slowest standby has confirmed. **The series is ABSENT, not zero, when the RPO is unknown** (no standby, no slot, or a standby further behind than the retained trail) — a dead standby reported as `0` reads as a perfect RPO. Alert on `harvest.replication.standbys == 0` for "down"; alert on this for "slow" |
 | `harvest.replication.lag_bytes` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). Worst-case WAL backlog. Survives a disconnected standby (a slot pins WAL with no walsender), so it stays real when the time lag is unknowable; also the disk-pressure signal for an abandoned slot |
+| `harvest.replication.observable` | Gauge | `worker.rs` — the DR sampler, per shard, on **every** tick (issue #954). `1` while the shard's replication views are readable, `0` when they are not (usually a missing `GRANT pg_monitor`). Exists because a Prometheus gauge keeps exporting its last value: withholding the RPO and standby gauges does not make them stale, it freezes them at the last healthy reading. This is the signal that says the others cannot be trusted right now |
 | `harvest.replication.standbys` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). Live walsenders. `0` means replication is **down** for that shard: the RPO is unbounded and growing. Always emitted, `0` included — `0` is the signal |
 | `harvest.shard.generation` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). The write-authority epoch the shard's database reports. Its value is uninteresting; its **skew across shards** is the point, since shards fail over independently |
 | `harvest.shard.fenced` | Counter | `worker.rs` — the DR sampler, once immediately before a worker stops because its pinned generation was superseded (issue #954). Never self-healing: a fenced worker is recovered by restarting it, never by re-pinning |
@@ -396,6 +397,7 @@ metric is emitted in the source code.
 | `harvest.replication.lag_seconds` | `shard` |
 | `harvest.replication.lag_bytes` | `shard` |
 | `harvest.replication.standbys` | `shard` |
+| `harvest.replication.observable` | `shard` |
 | `harvest.shard.generation` | `shard` |
 | `harvest.shard.fenced` | `shard` |
 | `harvest.task.capability_miss` | `queue`, `task_type` (`workflow\|activity`), `outcome` (`released\|escalated\|escalated_never_offered`) |

@@ -2799,3 +2799,71 @@ bump means someone has write authority you did not grant. Escalate when
 generations are skewed across shards outside a failover window, and when fenced
 workers keep reappearing after restart (they are being pointed at a region that
 no longer holds authority — fix the DSN or DNS, not the worker).
+
+## harvest_replication_unobservable
+
+**What to do when a shard's replication views cannot be read:** the RPO and
+standby count for that shard are **unknown** — not zero, and not evidence that
+replication is down. Replication itself may be perfectly healthy; what has been
+lost is the ability to see it. Almost always a missing `GRANT pg_monitor` on
+the role Harvest connects as.
+
+This is a ticket rather than a page for that reason, but it is not cosmetic. A
+Prometheus gauge keeps exporting its last value until something changes it, so
+while `harvest.replication.observable` is `0` the RPO, standby-count and
+backlog panels are **frozen at their last healthy reading** rather than
+reflecting reality. Harvest deliberately withholds those gauges instead of
+publishing zeros — a zero standby count would page on-call for a permissions
+problem — and this signal is what tells a dashboard that the silence means
+"cannot see", not "nothing to report".
+
+`harvest_replication_down` is gated on `observable == 1`, so the two rules are
+mutually exclusive and neither can fire on a stale reading.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. The affected shard reports
+   `unreadable` for standbys and carries an explicit `replication_error`.
+2. Read that error. `permission denied for view pg_stat_replication` is the
+   common case.
+3. Confirm the role's membership:
+   `SELECT pg_has_role(current_user, 'pg_monitor', 'member');`
+4. If the grant is present, check whether the DSN points where you think — a
+   shard pointed at a replica or a pooler that rewrites the session can produce
+   the same symptom.
+
+### Likely causes
+
+- `GRANT pg_monitor TO harvest` was never run, or was lost when the role was
+  recreated during a migration or a restore.
+- The deployment connects through a connection pooler in a mode that does not
+  preserve the expected role.
+- A managed-Postgres provider that restricts `pg_stat_replication` to its own
+  monitoring role.
+- The DSN was repointed at a database whose role differs from the primary's.
+
+### False positives
+
+- A single tick during a role change or a failover, where the connection is
+  re-established as a different role. The `for: 10m` window covers that.
+- A deployment that has not enabled DR at all but did enable `dr_fencing`: the
+  sampler runs and finds nothing to read. Silence this shard explicitly rather
+  than letting it become background noise.
+
+### Safe actions
+
+- `GRANT pg_monitor TO <harvest role>;` — the fix in the overwhelming majority
+  of cases, and it takes effect on the next connection.
+- Repoint the DSN if the shard is aimed at the wrong database.
+- Nothing here touches replication itself; all of it is read-permission
+  configuration.
+
+### Escalation criteria
+
+Escalate when this shard is under an RPO commitment and the grant cannot be
+made (a managed provider that will not expose the views): the commitment cannot
+be *measured*, which is a contractual problem rather than an operational one,
+and it should be recorded as accepted risk rather than left firing. Escalate
+immediately if a failover is being considered while this is firing — the RPO
+you would be accepting is unmeasured, and that must be said out loud in the
+incident channel rather than recorded as zero.

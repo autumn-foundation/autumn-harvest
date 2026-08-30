@@ -155,6 +155,50 @@ fn the_runbook_orders_fence_before_promote_before_verify_before_workers() {
     );
 }
 
+/// A physical standby is read-only until it is promoted.
+///
+/// `harvest dr fence` issues `LOCK TABLE` and `UPDATE`, so the literal
+/// fence-then-promote order works only for a **logical** standby (an ordinary
+/// writable database). On the physical topology the command simply fails, and
+/// an operator following the runbook is stuck at step 2 with the clock running.
+/// The runbook has to say so, and the safety argument has to survive the
+/// reordering — it does, because it rests on nothing writing before the fence,
+/// and workers do not start until step 4.
+#[test]
+fn the_runbook_defers_the_fence_past_promotion_for_physical_standbys() {
+    let rb = runbook();
+    let lower = rb.to_lowercase();
+    assert!(
+        lower.contains("read-only until"),
+        "the runbook must say a physical standby cannot be written to before promotion"
+    );
+    // The deferred bump must actually appear in the promote step, not merely be
+    // described in prose.
+    let promote = rb
+        .find("### 2.")
+        .and_then(|start| {
+            rb[start..]
+                .find("### 3.")
+                .map(|end| &rb[start..start + end])
+        })
+        .expect("step 2 must exist");
+    assert!(
+        promote.contains("pg_ctl promote"),
+        "step 2 must carry the physical promotion command"
+    );
+    assert!(
+        promote.contains("harvest dr fence"),
+        "step 2 must carry the deferred fence for the physical topology, not just mention it: \
+         {promote}"
+    );
+    // And the safety argument must be stated, not left implicit.
+    assert!(
+        lower.contains("workers do not start until step 4")
+            || lower.contains("no worker starts until step 4"),
+        "the runbook must explain why deferring the fence is still safe"
+    );
+}
+
 #[test]
 fn the_runbook_documents_fail_back() {
     let rb = runbook();

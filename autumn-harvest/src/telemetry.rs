@@ -320,6 +320,27 @@ pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions"
 /// available from `pg_stat_replication` directly.
 pub const METRIC_REPLICATION_LAG_SECONDS: &str = "harvest.replication.lag_seconds";
 
+/// Gauge: `1` while a shard's replication views are readable, `0` when they
+/// are not (issue #954).
+///
+/// Exists because **a Prometheus gauge keeps exporting its last value until it
+/// is changed** — so simply declining to emit the RPO and standby gauges when
+/// the views become unreadable does not make those series stale, it freezes
+/// them at their last healthy reading and an unobservable shard goes on looking
+/// fine indefinitely.
+///
+/// The two options that do not work: emitting `0` standbys on an unreadable
+/// view pages on-call for what is almost always a missing `GRANT pg_monitor`,
+/// and emitting nothing leaves the stale value in place. So availability is
+/// published as its own signal, and the other DR gauges are withheld while it
+/// is `0`.
+///
+/// Alerting: require `harvest_replication_observable == 1` on the
+/// replication-down rule so it cannot fire on a stale reading, and alert on
+/// `== 0` separately — that is a configuration problem, not an outage.
+/// Labelled `{shard}`.
+pub const METRIC_REPLICATION_OBSERVABLE: &str = "harvest.replication.observable";
+
 /// Gauge: worst-case WAL backlog in bytes for a shard (issue #954).
 ///
 /// The byte companion to [`METRIC_REPLICATION_LAG_SECONDS`], and the signal
@@ -2570,6 +2591,17 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, seconds);
     }
 
+    /// Whether a shard's replication views are readable (issue #954).
+    ///
+    /// Emitted on **every** sampler tick, `0` included — it is the one DR
+    /// signal that must never go stale, because it is what tells a dashboard
+    /// that the others have.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_OBSERVABLE`].
+    fn record_replication_observable(&self, shard: u16, observable: bool) {
+        let _ = (shard, observable);
+    }
+
     /// Worst-case WAL backlog in bytes for a shard (issue #954).
     ///
     /// Maps to the gauge [`METRIC_REPLICATION_LAG_BYTES`].
@@ -4173,6 +4205,7 @@ mod tests {
         // is deliberately NOT a label (ADR-0001 §7).
         let rec = NoOpMetrics;
         rec.record_replication_lag_seconds(0, 12.5);
+        rec.record_replication_observable(0, false);
         rec.record_replication_lag_bytes(0, 4_096);
         rec.record_replication_standbys(0, 1);
         rec.record_shard_generation(0, 7);

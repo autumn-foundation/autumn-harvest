@@ -23,11 +23,24 @@ Companion documents:
 ## The order is the safety argument
 
 ```
-1. FENCE + ISOLATE   revoke the old region's write authority
+1. ISOLATE + FENCE   cut the old region off; revoke its write authority
 2. PROMOTE           stop replicating; advance sequences
 3. VERIFY            prove the promoted data is resumable
 4. START WORKERS     only now
 ```
+
+**One topology-dependent wrinkle in step 1.** A **logical** standby is an
+ordinary writable database, so it can be fenced before it is promoted, and the
+order above is literal. A **physical** standby is read-only until
+`pg_ctl promote` — `harvest dr fence` issues `LOCK TABLE` and `UPDATE`, so it
+would simply fail there. On that topology the order is *isolate → promote →
+fence*, and step 1 below says so.
+
+The safety property is identical either way, because it does not depend on
+fencing preceding promotion. It depends on **nothing writing before the fence
+is in place**: the old region is isolated in step 1, and no worker starts until
+step 4. What must never happen is starting workers against a database whose
+generation has not been bumped.
 
 Every reordering is a known failure:
 
@@ -43,7 +56,7 @@ shard.
 
 ---
 
-### 1. Fence and isolate the old region
+### 1. Isolate the old region, and fence
 
 First, stop the old region's database from accepting writes. Do this at the
 infrastructure layer — this is the step the engine cannot do for you:
@@ -80,7 +93,10 @@ demote it. **Do not skip this because "the region is down"** — "down" from you
 vantage point and "partitioned" look identical, and the difference is whether
 old-region workers are still committing.
 
-Then bump the write-authority epoch on every standby you are about to promote:
+Then bump the write-authority epoch. **Logical replication only at this point**
+— on a physical standby this command belongs immediately after `pg_ctl promote`
+in step 2, because a physical standby is read-only until then and the `UPDATE`
+would fail:
 
 ```bash
 harvest dr fence \
@@ -105,7 +121,11 @@ events, and stops with `ShardFenced`, incrementing
 > commands rather than embedding credentials — the examples here are written
 > that way deliberately.
 
-Confirm every shard moved:
+On the physical topology, run this same command at the end of step 2 instead,
+before step 3. Either way it must complete on **every** shard before any worker
+starts.
+
+Confirm every shard moved (after step 2 on the physical topology):
 
 ```bash
 harvest dr status --shard 0=... --shard 1=... -o json
@@ -139,6 +159,22 @@ pins WAL forever — see `harvest_replication_down` in the alert runbook.
 ```bash
 pg_ctl promote -D /var/lib/postgresql/data
 ```
+
+**Then fence immediately**, before anything else — this is step 1's bump,
+deferred to here because the standby only became writable a moment ago:
+
+```bash
+harvest dr fence \
+  --shard 0=postgres://harvest@standby-b/harvest_shard0 \
+  --shard 1=postgres://harvest@standby-b/harvest_shard1 \
+  --reason "region A outage 2026-08-30, INC-1234" \
+  --i-understand-this-stops-the-fleet
+```
+
+Nothing has started writing yet — workers do not start until step 4 — so the
+window between promotion and fencing is closed by procedure, not by luck. Do
+not run step 3 until `harvest dr status` shows every shard's generation
+increased.
 
 Then, **for logical standbys, advance the sequences** — this is mandatory, not
 housekeeping:

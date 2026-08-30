@@ -1126,14 +1126,34 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
     ) -> HarvestResult<WatermarkReading> {
+        // Position precedence, and each rung is load-bearing:
+        //
+        //   1. `s.confirmed_flush_lsn` — LOGICAL slots. The position the
+        //      subscriber has durably confirmed, which is the conservative and
+        //      correct answer for an RPO.
+        //   2. `r.replay_lsn` — PHYSICAL standbys, via the walsender. Physical
+        //      slots leave `confirmed_flush_lsn` NULL.
+        //   3. `s.restart_lsn` — a physical slot with no walsender attached.
+        //
+        // `restart_lsn` is deliberately LAST and never preferred: it is the
+        // oldest WAL the slot still needs *retained*, not the standby's replay
+        // position, and it can sit far behind a fully caught-up standby. Using
+        // it as the progress signal reported an inflated RPO for the physical
+        // topology this feature claims to support. It remains the right input
+        // for the byte backlog (`SLOT_SQL`), which is a retention and
+        // disk-pressure signal — that is exactly what `restart_lsn` measures.
         let positions: Vec<StandbyPositionRow> = diesel::sql_query(
             "SELECT CASE \
                         WHEN COUNT(*) = 0 THEN NULL \
-                        WHEN bool_or(COALESCE(s.confirmed_flush_lsn, s.restart_lsn) IS NULL) \
-                            THEN NULL \
-                        ELSE MIN(COALESCE(s.confirmed_flush_lsn, s.restart_lsn))::text \
+                        WHEN bool_or( \
+                            COALESCE(s.confirmed_flush_lsn, r.replay_lsn, s.restart_lsn) IS NULL \
+                        ) THEN NULL \
+                        ELSE MIN( \
+                            COALESCE(s.confirmed_flush_lsn, r.replay_lsn, s.restart_lsn) \
+                        )::text \
                     END AS position \
              FROM pg_replication_slots s \
+             LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
              WHERE (s.database IS NULL OR s.database = current_database())",
         )
         .load(conn)

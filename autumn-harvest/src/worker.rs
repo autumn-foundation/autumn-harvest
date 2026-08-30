@@ -19230,120 +19230,158 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                let shard_id = *shard_id;
-                let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-                let Ok(mut conn) = shard_pool.get().await else {
-                    // A pool that cannot be reached is already covered by the
-                    // worker's own liveness signals; a DR sample is not worth a
-                    // second alarm for the same condition.
-                    continue;
-                };
-
-                match crate::replication::assert_fence(&mut conn, shard_id).await {
-                    Ok(()) => {}
-                    Err(crate::error::HarvestError::ShardFenced {
-                        shard_id: fenced,
-                        pinned,
-                        current,
-                    }) => {
-                        telemetry.metrics.record_shard_fenced(shard_u16);
-                        tracing::error!(
-                            shard_id = fenced,
-                            pinned_generation = pinned,
-                            current_generation = ?current,
-                            "FENCED: this worker is pinned to a superseded shard generation and \
-                             another region now holds write authority. Shutting down. Do NOT \
-                             restart against the old region — see \
-                             docs/runbooks/cross-region-failover.md"
-                        );
-                        cancel.cancel();
-                        return;
-                    }
-                    Err(error) => {
-                        // A transient failure to *read* the fence is not a
-                        // fence. Fencing is enforced structurally in the claim
-                        // and persist paths regardless, so the safe response
-                        // here is to log and retry next tick rather than take a
-                        // healthy fleet down on a blip.
-                        tracing::warn!(
-                            shard_id = %shard_id.as_i32(),
-                            error = %error,
-                            "DR fence re-check failed; the claim and persist gates still apply"
-                        );
-                    }
-                }
-
-                if let Err(error) = crate::replication::record_replication_heartbeat(
-                    &mut conn,
-                    shard_id,
-                    watermark_retain,
-                )
-                .await
+                if sample_one_shard(*shard_id, shard_pool, &telemetry, watermark_retain).await
+                    == ShardSample::Fenced
                 {
-                    tracing::debug!(
-                        shard_id = %shard_id.as_i32(),
-                        error = %error,
-                        "replication watermark write failed"
-                    );
-                }
-
-                match crate::replication::query_replication_status(&mut conn, shard_id).await {
-                    Ok(crate::replication::ReplicationStatus::Unavailable { reason }) => {
-                        // The views could not be read — almost always a missing
-                        // `GRANT pg_monitor`. Emit NOTHING: reporting zero
-                        // standbys here would page on-call with "replication is
-                        // down" for a configuration gap, and the topology doc
-                        // promises this degrades the signal, not the engine.
-                        // A stale series is the honest representation of "we
-                        // cannot see".
-                        tracing::warn!(
-                            shard_id = %shard_id.as_i32(),
-                            reason = %reason,
-                            "replication views unreadable; RPO signal unavailable for this shard \
-                             (a `GRANT pg_monitor` is usually what is missing)"
-                        );
-                    }
-                    Ok(status) => {
-                        // Always emitted once the views ARE readable: `0`
-                        // standbys is the signal that replication is down, and
-                        // no lag value can carry it.
-                        telemetry.metrics.record_replication_standbys(
-                            shard_u16,
-                            status.connected_standbys() as u64,
-                        );
-                        if let Some(bytes) = status.max_lag_bytes() {
-                            telemetry
-                                .metrics
-                                .record_replication_lag_bytes(shard_u16, bytes);
-                        }
-                        // Emitted ONLY when known. Publishing 0.0 for "unknown"
-                        // would read as a perfect RPO for replication that is
-                        // dead — see METRIC_REPLICATION_LAG_SECONDS.
-                        if let Some(seconds) = status.rpo_seconds() {
-                            telemetry
-                                .metrics
-                                .record_replication_lag_seconds(shard_u16, seconds);
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(
-                            shard_id = %shard_id.as_i32(),
-                            error = %error,
-                            "replication status query failed"
-                        );
-                    }
-                }
-
-                if let Ok(Some(generation)) =
-                    crate::replication::current_generation(&mut conn, shard_id).await
-                {
-                    telemetry
-                        .metrics
-                        .record_shard_generation(shard_u16, generation.as_i64());
+                    cancel.cancel();
+                    return;
                 }
             }
         }
     })
+}
+
+/// What one shard's DR sample concluded.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardSample {
+    /// Sampled (or skipped for an unreachable pool); keep going.
+    Continue,
+    /// This worker has lost write authority for the shard. The caller stops
+    /// the **whole** worker — see `spawn_replication_sampler`.
+    Fenced,
+}
+
+/// One shard's DR sample: self-fence check, watermark beat, gauges.
+///
+/// Split out of the sampler loop only because that loop outgrew the line
+/// budget; the ordering commentary that matters lives here, with the steps it
+/// describes.
+#[cfg(feature = "db")]
+async fn sample_one_shard(
+    shard_id: crate::types::ShardId,
+    shard_pool: &DbPool,
+    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+    watermark_retain: Duration,
+) -> ShardSample {
+    let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
+    let Ok(mut conn) = shard_pool.get().await else {
+        // A pool that cannot be reached is already covered by the worker's own
+        // liveness signals; a DR sample is not worth a second alarm for the
+        // same condition.
+        return ShardSample::Continue;
+    };
+    match crate::replication::assert_fence(&mut conn, shard_id).await {
+        Ok(()) => {}
+        Err(crate::error::HarvestError::ShardFenced {
+            shard_id: fenced,
+            pinned,
+            current,
+        }) => {
+            telemetry.metrics.record_shard_fenced(shard_u16);
+            tracing::error!(
+                shard_id = fenced,
+                pinned_generation = pinned,
+                current_generation = ?current,
+                "FENCED: this worker is pinned to a superseded shard generation and \
+                 another region now holds write authority. Shutting down. Do NOT \
+                 restart against the old region — see \
+                 docs/runbooks/cross-region-failover.md"
+            );
+            return ShardSample::Fenced;
+        }
+        Err(error) => {
+            // A transient failure to *read* the fence is not a
+            // fence. Fencing is enforced structurally in the claim
+            // and persist paths regardless, so the safe response
+            // here is to log and retry next tick rather than take a
+            // healthy fleet down on a blip.
+            tracing::warn!(
+                shard_id = %shard_id.as_i32(),
+                error = %error,
+                "DR fence re-check failed; the claim and persist gates still apply"
+            );
+        }
+    }
+
+    if let Err(error) =
+        crate::replication::record_replication_heartbeat(&mut conn, shard_id, watermark_retain)
+            .await
+    {
+        tracing::debug!(
+            shard_id = %shard_id.as_i32(),
+            error = %error,
+            "replication watermark write failed"
+        );
+    }
+
+    match crate::replication::query_replication_status(&mut conn, shard_id).await {
+        Ok(crate::replication::ReplicationStatus::Unavailable { reason }) => {
+            // The views could not be read — almost always a missing
+            // `GRANT pg_monitor`. Emit NOTHING: reporting zero
+            // standbys here would page on-call with "replication is
+            // down" for a configuration gap, and the topology doc
+            // promises this degrades the signal, not the engine.
+            // A stale series is the honest representation of "we
+            // cannot see".
+            // A Prometheus gauge keeps exporting its last value
+            // until it is changed, so declining to emit the RPO and
+            // standby gauges does NOT make them stale — it freezes
+            // them at the last healthy reading and the shard goes on
+            // looking fine. The availability signal is what breaks
+            // that: the others stay withheld (emitting `0` standbys
+            // would page for a missing GRANT), and this says why.
+            telemetry
+                .metrics
+                .record_replication_observable(shard_u16, false);
+            tracing::warn!(
+                shard_id = %shard_id.as_i32(),
+                reason = %reason,
+                "replication views unreadable; RPO signal unavailable for this shard \
+                 (a `GRANT pg_monitor` is usually what is missing)"
+            );
+        }
+        Ok(status) => {
+            telemetry
+                .metrics
+                .record_replication_observable(shard_u16, true);
+            // Always emitted once the views ARE readable: `0`
+            // standbys is the signal that replication is down, and
+            // no lag value can carry it.
+            telemetry
+                .metrics
+                .record_replication_standbys(shard_u16, status.connected_standbys() as u64);
+            if let Some(bytes) = status.max_lag_bytes() {
+                telemetry
+                    .metrics
+                    .record_replication_lag_bytes(shard_u16, bytes);
+            }
+            // Emitted ONLY when known. Publishing 0.0 for "unknown"
+            // would read as a perfect RPO for replication that is
+            // dead — see METRIC_REPLICATION_LAG_SECONDS.
+            if let Some(seconds) = status.rpo_seconds() {
+                telemetry
+                    .metrics
+                    .record_replication_lag_seconds(shard_u16, seconds);
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                shard_id = %shard_id.as_i32(),
+                error = %error,
+                "replication status query failed"
+            );
+        }
+    }
+
+    if let Ok(Some(generation)) = crate::replication::current_generation(&mut conn, shard_id).await
+    {
+        telemetry
+            .metrics
+            .record_shard_generation(shard_u16, generation.as_i64());
+    }
+
+    ShardSample::Continue
 }
 
 /// Spawn the stranded-work sampler (issue #522).

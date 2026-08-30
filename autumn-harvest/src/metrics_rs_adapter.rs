@@ -381,6 +381,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(seconds);
     }
 
+    fn record_replication_observable(&self, shard: u16, observable: bool) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_OBSERVABLE,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(if observable { 1.0 } else { 0.0 });
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_replication_lag_bytes(&self, shard: u16, bytes: i64) {
         gauge!(

@@ -33,6 +33,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_replication_down",
     "harvest_replication_lag_high",
     "harvest_shard_fenced",
+    "harvest_replication_unobservable",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -97,6 +98,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
+    "harvest_replication_observable",
     "harvest_shard_generation",
     "harvest_shard_fenced_total",
 ];

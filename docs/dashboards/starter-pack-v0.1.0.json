@@ -5832,6 +5832,55 @@
         }
       ],
       "description": "Alert: harvest_shard_fenced (docs/runbooks/harvest-alerts.md#harvest_shard_fenced) Workers that stopped because their pinned generation was superseded. Expected for the old fleet during a planned failover; outside one it means a generation was bumped on a healthy shard. Recovered only by restarting the fleet \u2014 never by re-pinning a worker."
+    },
+    {
+      "id": 946,
+      "type": "timeseries",
+      "title": "Replication observable (0 = the other DR panels are STALE)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 142
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (shard) (harvest_replication_observable{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_replication_unobservable (docs/runbooks/harvest-alerts.md#harvest_replication_unobservable) Whether this shard's replication views can be read at all \u2014 usually a GRANT pg_monitor question. Read this panel FIRST: a Prometheus gauge keeps exporting its last value, so while this is 0 the RPO, standby-count and backlog panels above are frozen at their last healthy reading rather than reflecting reality."
     }
   ]
 }
