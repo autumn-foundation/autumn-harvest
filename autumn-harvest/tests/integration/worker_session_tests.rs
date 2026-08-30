@@ -505,9 +505,13 @@ mod db_tests {
         let (exec_id, session_id, activity_id, task_id) =
             setup_active_session(&mut conn, "worker-ghost", far_future).await;
 
-        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
-            .await
-            .expect("enforce_broken_sessions");
+        let failed = sessions::enforce_broken_sessions(
+            &mut conn,
+            60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+        .expect("enforce_broken_sessions");
         assert_eq!(failed, 1, "exactly one member task should be failed");
 
         assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
@@ -543,9 +547,13 @@ mod db_tests {
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-alive", far_future).await;
 
-        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
-            .await
-            .expect("enforce_broken_sessions");
+        let failed = sessions::enforce_broken_sessions(
+            &mut conn,
+            60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+        .expect("enforce_broken_sessions");
         assert_eq!(failed, 0, "a healthy session must not be touched");
 
         assert_eq!(session_state(&mut conn, session_id).await, "ACTIVE");
@@ -563,9 +571,13 @@ mod db_tests {
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-alive", already_expired).await;
 
-        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
-            .await
-            .expect("enforce_broken_sessions");
+        let failed = sessions::enforce_broken_sessions(
+            &mut conn,
+            60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+        .expect("enforce_broken_sessions");
         assert_eq!(failed, 1);
 
         assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
@@ -583,9 +595,13 @@ mod db_tests {
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-draining", far_future).await;
 
-        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
-            .await
-            .expect("enforce_broken_sessions");
+        let failed = sessions::enforce_broken_sessions(
+            &mut conn,
+            60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+        .expect("enforce_broken_sessions");
         assert_eq!(failed, 1);
 
         assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
@@ -608,9 +624,13 @@ mod db_tests {
         .await
         .expect("record_session_completed");
 
-        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
-            .await
-            .expect("enforce_broken_sessions");
+        let failed = sessions::enforce_broken_sessions(
+            &mut conn,
+            60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+        .expect("enforce_broken_sessions");
         assert_eq!(failed, 0);
         assert_eq!(session_state(&mut conn, session_id).await, "COMPLETED");
         // The task row is untouched by the scanner; it may still be PENDING

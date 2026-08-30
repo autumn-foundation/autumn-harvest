@@ -3397,7 +3397,9 @@ pub async fn enforce_timeouts_once(
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
-    count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
+    count +=
+        crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
+            .await?;
     // Sweep expired request-scoped start-idempotency claims (issue #808). Best
     // effort table growth control; the reserve upsert overwrites an expired row
     // in place regardless, so correctness does not depend on this running.

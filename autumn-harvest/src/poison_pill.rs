@@ -237,6 +237,9 @@ mod scanner {
         exec_id: ExecutionId,
         error: &str,
         metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
+        // Issue #1243: `WorkflowFailed` carries `details`, a payload-bearing
+        // field, so this write encodes through the configured registry.
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<(
         Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
         Vec<DeferredTriggerStart>,
@@ -291,11 +294,12 @@ mod scanner {
         }
 
         let history = crate::store::load_history(conn, exec_id).await?;
-        crate::store::append_events(
+        crate::store::append_events_with_codecs(
             conn,
             exec_id,
             &[WorkflowEvent::workflow_failed(error.to_string())],
             history.next_event_id,
+            codecs,
         )
         .await?;
         diesel::update(
@@ -389,6 +393,8 @@ mod scanner {
         new_strikes: i32,
         worker_stale_secs: i64,
         metrics: &dyn MetricsRecorder,
+        // Issue #1243: forwarded to the owning-workflow failure write.
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<bool> {
         use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
         use crate::schema::harvest_task_queue::dsl;
@@ -487,6 +493,7 @@ mod scanner {
                             execution_id_from_uuid(exec_uuid),
                             &error,
                             Some(metrics),
+                            codecs,
                         )
                         .await?
                     }
@@ -582,6 +589,9 @@ mod scanner {
         threshold: i32,
         worker_stale_secs: i64,
         metrics: &dyn MetricsRecorder,
+        // Issue #1243: forwarded to the quarantine path, whose
+        // `WorkflowFailed` carries a payload-bearing `details` field.
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
         // Clamp once at the entry point so neither the SQL interval arithmetic
         // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
@@ -603,8 +613,15 @@ mod scanner {
             let new_strikes = task.crash_strikes.saturating_add(1);
             match quarantine_decision(new_strikes, threshold) {
                 ReclaimAction::Quarantine => {
-                    if quarantine_orphan(conn, &task, new_strikes, worker_stale_secs, metrics)
-                        .await?
+                    if quarantine_orphan(
+                        conn,
+                        &task,
+                        new_strikes,
+                        worker_stale_secs,
+                        metrics,
+                        codecs,
+                    )
+                    .await?
                     {
                         summary.quarantined += 1;
                     }
@@ -634,6 +651,8 @@ mod scanner {
         threshold: i32,
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+        // Issue #1243: forwarded to the sharded spawner.
+        payload_codecs: crate::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()> {
         spawn_poison_pill_reclaimer_for_shard(
             pool,
@@ -643,6 +662,7 @@ mod scanner {
             worker_stale_secs,
             telemetry,
             None,
+            payload_codecs,
         )
     }
 
@@ -657,6 +677,10 @@ mod scanner {
     ///
     /// Pass `None` for a process-wide loop or a single-shard deployment.
     #[must_use]
+    // Issue #1243: the codec registry pushed this spawner past the
+    // pedantic argument limit; its parameters are already a flat
+    // shard-runtime bundle and restructuring them is out of scope here.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_poison_pill_reclaimer_for_shard(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
         cancel: CancellationToken,
@@ -665,6 +689,10 @@ mod scanner {
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
         shard: Option<crate::types::ShardId>,
+        // Issue #1243: owned so it can move into the spawned loop. The
+        // registry's rotation state is shared across clones, so a later
+        // `set_active_key` still reaches this long-lived task.
+        payload_codecs: crate::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()> {
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace. The
@@ -689,6 +717,7 @@ mod scanner {
                             threshold,
                             worker_stale_secs,
                             &*telemetry.metrics,
+                            &payload_codecs,
                         )
                         .await
                         {

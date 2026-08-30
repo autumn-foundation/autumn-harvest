@@ -734,6 +734,9 @@ async fn break_session_and_fail_members(
     conn: &mut diesel_async::AsyncPgConnection,
     session_id: crate::types::SessionId,
     reason: BrokenSessionReason,
+    // Issue #1243: `ActivityFailed` carries `details`, a payload-bearing field,
+    // so this write encodes through the configured registry like every other.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -815,8 +818,14 @@ async fn break_session_and_fail_members(
                 non_retryable: true,
                 details: None,
             };
-            crate::store::append_events(conn, exec_id, &[failed_event], history.next_event_id)
-                .await?;
+            crate::store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[failed_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
             crate::queue::fail_task(conn, task.id, &reason.to_string()).await?;
             crate::queue::wake_workflow_task(conn, exec_id).await?;
             failed += 1;
@@ -844,6 +853,8 @@ async fn break_session_and_fail_members(
 pub async fn enforce_broken_sessions(
     conn: &mut diesel_async::AsyncPgConnection,
     worker_stale_secs: i64,
+    // Issue #1243: forwarded to the member-failure write below.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use diesel_async::RunQueryDsl;
 
@@ -860,7 +871,7 @@ pub async fn enforce_broken_sessions(
             continue;
         };
         let session_id = crate::types::SessionId::from_uuid(candidate.id);
-        total += break_session_and_fail_members(conn, session_id, reason).await?;
+        total += break_session_and_fail_members(conn, session_id, reason, codecs).await?;
     }
     Ok(total)
 }

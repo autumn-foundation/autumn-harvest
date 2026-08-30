@@ -366,6 +366,7 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
         60,
         telemetry,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
     );
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::PoisonPill),
@@ -482,6 +483,7 @@ fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
         i32,
         i64,
         std::sync::Arc<autumn_harvest::telemetry::TelemetryConfig>,
+        autumn_harvest::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()>;
 
     let _: TimeoutCheckerFn = timeout::spawn_timeout_checker;

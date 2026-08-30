@@ -11546,13 +11546,15 @@ async fn process_activity_task(
             per_activity.max(registry.max_activity_result_bytes)
         });
     #[cfg(feature = "db")]
-    let ctx = ctx.with_transactional_state(TransactionalState {
-        pool: pool.clone(),
-        exec_id,
-        activity_id,
-        task_id: task.id,
-        max_result_bytes: effective_result_cap,
-    });
+    let ctx = ctx
+        .with_payload_codecs(registry.payload_codecs().clone())
+        .with_transactional_state(TransactionalState {
+            pool: pool.clone(),
+            exec_id,
+            activity_id,
+            task_id: task.id,
+            max_result_bytes: effective_result_cap,
+        });
 
     let telemetry = registry.telemetry().clone();
     // ADR-0001 §3: restore the producer's trace context so the activity span
@@ -21548,6 +21550,7 @@ impl Worker {
                     worker_stale_secs,
                     self.registry.telemetry().clone(),
                     *shard,
+                    self.config.payload_codecs.clone(),
                 )
             })
             .collect();
