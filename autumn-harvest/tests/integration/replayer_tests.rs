@@ -11346,9 +11346,13 @@ async fn mixed_join_signal_and_child_replays() {
 
 /// The in-flight frontier: the sibling activity has run but the signal has NOT
 /// arrived. This is a healthy **suspend** — the workflow re-parks on the signal
-/// — not a divergence. It is the case the round-13 stray-`TimerStarted` guard
-/// (issue #768) must keep diverging on for a TIMER sibling while allowing an
-/// activity/child sibling to park.
+/// — not a divergence.
+///
+/// A TIMER sibling in the same position must park too (Codex round 3; see
+/// `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`).
+/// What round 13 (issue #768) still requires is that a stray command NOTHING in
+/// the decision claims nd-blocks — which is now decided at the end of the cycle
+/// rather than inside the scan.
 #[tokio::test]
 async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() {
     let activity_id = ActivityExecId::new();
@@ -11377,6 +11381,146 @@ async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() 
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "an undelivered signal beside a resolved activity sibling is a healthy \
          suspend, not a divergence:\n{report}"
+    );
+}
+
+/// `join!` of a signal wait, a durable TIMER and an activity — the three-way
+/// AC1 composition, signal polled first so the persisted batch records
+/// `TimerStarted` + `ActivityScheduled` and nothing for the signal wait.
+fn mixed_join_signal_timer_and_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, timer, activity) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.timer("deadline", 30),
+            ctx.execute_activity_raw("step", Value::Null, "default"),
+        );
+        signal.map_err(|e| e.to_string())?;
+        timer.map_err(|e| e.to_string())?;
+        activity.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Codex round 3, P1: the FIRST wake of a mixed batch that contains a durable
+/// timer beside a signal wait must be a healthy suspend, not a divergence.
+///
+/// `join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` persists `TimerStarted`
+/// and nothing for the signal wait. On the next drive the signal is polled
+/// first, its scan crosses that `TimerStarted`, and before this fix the crossed
+/// timer set `stray_timer_command` — so the end-of-scan round-13 guard (#768)
+/// returned `Diverged` and nd-blocked an advertised AC1 composition on its very
+/// first wake, immediately after #950 made the batch persistable.
+///
+/// The timer here belongs to THIS decision (the sibling branch emits
+/// `StartTimer("t")` in the same cycle and `match_timer_strict` claims the
+/// event), which is what separates it from the orphan timer that
+/// `interleaved_sibling_signal_stray_timer_started_still_diverges` pins.
+#[tokio::test]
+async fn mixed_join_signal_and_timer_parks_before_either_branch_resolves() {
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t"),
+            duration_secs: 5,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "signal_and_user_timer",
+            signal_wait_with_user_timer_workflow,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "signal_and_user_timer",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a mixed batch's own armed timer beside an undelivered signal is a \
+         healthy suspend — the round-13 stray-timer guard must not fire on a \
+         timer this decision itself arms:\n{report}"
+    );
+}
+
+/// The three-way shape Codex named verbatim: signal + timer + activity, sampled
+/// at the frontier where the batch has just been persisted and no branch has
+/// resolved.
+#[tokio::test]
+async fn mixed_join_signal_timer_and_activity_parks_at_the_persistence_frontier() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("deadline"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "join_signal_timer_activity",
+            mixed_join_signal_timer_and_activity,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_timer_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the three-way join!(signal, timer, activity) must park on its first \
+         wake, not nd-block:\n{report}"
+    );
+}
+
+/// The same three-way shape one step further along: the activity has completed
+/// and the timer is still armed, but the signal has not arrived. The signal
+/// scan now crosses `TimerStarted`, `ActivityScheduled` AND `ActivityCompleted`.
+#[tokio::test]
+async fn mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("deadline"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "join_signal_timer_activity",
+            mixed_join_signal_timer_and_activity,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_timer_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a resolved activity sibling beside a still-armed timer and an \
+         undelivered signal is still a healthy suspend:\n{report}"
     );
 }
 

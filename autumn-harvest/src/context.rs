@@ -20788,8 +20788,28 @@ mod tests {
         assert!(ctx.drain_commands().is_empty());
     }
 
+    /// A `wait_for_signal` over a history carrying a stray, unconsumed
+    /// `TimerStarted` PARKS, leaving the stray event unclaimed for the
+    /// executor's end-of-cycle authority to nd-block on.
+    ///
+    /// This used to return `HarvestError::NonDeterministic` synchronously.
+    /// Issue #950 moved the verdict, because at match time the scan cannot tell
+    /// a stray timer from the timer of a `join!(wait_for_signal, ctx.timer)`
+    /// mixed batch whose sibling branch has not been polled yet — deciding early
+    /// nd-blocked that advertised composition on its first wake (Codex round 3
+    /// on PR #1245). The signal scan is a lookahead; a lookahead must not return
+    /// a verdict on events it merely passed over.
+    ///
+    /// This mirrors the choice already made for `wait_for_signal_timeout`'s
+    /// strict-`Suspended` arm (see the `has_non_lifecycle_unconsumed` comment in
+    /// `wait_for_signal_timeout`), which likewise re-parks and defers to
+    /// `history_has_unconsumed_events` run once after the whole `join!` is
+    /// polled. The end-to-end outcome is unchanged and is pinned by the
+    /// integration test
+    /// `interleaved_sibling_signal_stray_timer_started_still_diverges`, which
+    /// asserts the replay is reported as non-determinism.
     #[tokio::test]
-    async fn wait_for_signal_returns_nondeterministic_on_diverged_history() {
+    async fn wait_for_signal_parks_and_leaves_a_stray_timer_for_the_cycle_guard() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -20804,13 +20824,27 @@ mod tests {
             },
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let result = ctx.wait_for_signal("my-signal").await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            HarvestError::NonDeterministic { .. }
-        ));
+        // The wait must PARK, not resolve either way. Racing it against a
+        // timeout is the assertion: a synchronous error (the old behaviour) or a
+        // spurious value would both complete here.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ctx.wait_for_signal("my-signal"),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "the wait must park on the undelivered signal, not resolve: {parked:?}"
+        );
+
+        // ...and the stray timer must still be unclaimed, which is exactly what
+        // the executor's suspend-time guard keys on to fail the workflow.
+        assert!(
+            ctx.history_has_unconsumed_events(),
+            "the stray TimerStarted must be left unconsumed so the end-of-cycle \
+             guard nd-blocks the run instead of parking it forever"
+        );
     }
 
     #[tokio::test]

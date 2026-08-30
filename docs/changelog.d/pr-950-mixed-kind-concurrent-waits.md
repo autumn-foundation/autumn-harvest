@@ -61,8 +61,9 @@ batch.
   stray-interleaved-event divergence relaxed for a race branch only. A race
   branch's signal that never arrived is the normal "this branch lost" outcome,
   and its siblings legitimately record their own events around it; neither is a
-  divergence. The solo `wait_for_signal` guard (issue #768 round 13) is
-  untouched. The scan is **bounded by the race's own `race_winner:{seq}`
+  divergence. The round-13 park-forever protection (issue #768) still holds —
+  see the round-3 note below for where it is now enforced. The scan is
+  **bounded by the race's own `race_winner:{seq}`
   marker**, so a *losing* signal branch can never consume a `SignalReceived`
   delivered after the race resolved — that signal belongs to a later
   `ctx.wait_for_signal`, which would otherwise park on a signal already
@@ -122,11 +123,7 @@ first by `join!` — treated that recorded event as a divergence. The interleave
 sets now mirror `match_timer_strict` / `scan_activity_terminal`: sibling
 commands (`ActivityScheduled`, `ChildWorkflowStarted`, `LocalActivityScheduled`,
 markers, side-effects) are crossed as interleaved commands with rewind, and
-their progress/terminal events are crossed transparently. The round-13
-park-forever guard (issue #768) is preserved exactly by tracking a crossed
-TIMER/detached-spawn command separately from the rewind cursor: a stray one of
-those with no resolving signal still diverges, while an activity or child
-sibling is an ordinary "the signal has not arrived yet" park.
+their progress/terminal events are crossed transparently.
 
 The strict/canary replay frontier test needed the same widening
 (`check_strict_replay_signal_no_match`): "the cursor is at end of history" is
@@ -136,6 +133,45 @@ reported a healthy in-flight park as a false non-determinism and blocked
 deploys. The frontier question that actually holds is whether any matching
 signal remains available at all — mirroring the #779 fix, which exempted the
 child-timeout race's `InProgress` arm for the same reason.
+
+**The signal scan stops guessing about crossed commands (Codex round 3, P1).**
+Round 1 left the TIMER sibling on a different rule from the activity/child
+sibling: a crossed `TimerStarted` still flagged the round-13 park-forever hazard
+(issue #768) and diverged at end of scan. That rule is only correct when no
+supported batch can put a timer of the CURRENT decision at that position — and
+this PR is what makes one:
+`join!(ctx.wait_for_signal("go"), ctx.timer("t", 30), ctx.execute_activity(..))`
+persists `TimerStarted` + `ActivityScheduled`, then nd-blocks on its first wake,
+because `join!` polls the signal first and its scan crosses the timer the very
+next branch is about to claim. An advertised AC1 composition, broken immediately
+after being made persistable.
+
+The two histories — a sibling timer of this decision, and a genuinely stray one
+left by code that no longer runs — are **not distinguishable at scan time**, and
+cannot be: the scan runs before the sibling branches are polled, so the
+information that separates them (does anything in this decision claim the event?)
+does not exist yet. The signal scan is a lookahead, and a lookahead must not
+return a verdict on events it merely passed over. So the timer/cancel/detached
+variants now join the activity/child arm under one rule — cross
+non-consumingly, park — and the verdict moves to the end of the cycle, where
+`executor.rs` already fails the workflow when `history_has_unconsumed_events()`.
+A stray command is still unclaimed there; a mixed batch's is not. This is the
+choice already made for `wait_for_signal_timeout`'s strict-`Suspended` arm, for
+the same reason.
+
+Round 13's protection is preserved in **outcome**, not in mechanism, and the
+existing end-to-end pin
+(`interleaved_sibling_signal_stray_timer_started_still_diverges`) still asserts
+the replay is reported as non-determinism.
+
+**Behaviour change worth noting:** `ctx.wait_for_signal` no longer returns
+`HarvestError::NonDeterministic` *synchronously* for a history carrying a stray
+unconsumed timer — it parks, and the run is nd-blocked at the end of the
+decision cycle instead. The workflow outcome is identical; only the moment of
+detection moves. Code that drives a `WorkflowContext` directly (rather than
+through the executor) and expected that synchronous error will now see the wait
+park, so it needs the executor's cycle boundary — or an explicit
+`history_has_unconsumed_events()` check — to observe the divergence.
 
 **Invariants.** **Zero new `WorkflowEvent` variants and no migration** — the
 batch composes existing events (`ActivityScheduled`, `TimerStarted`,
@@ -182,7 +218,12 @@ Pre-existing parked tasks need no migration.
   healthy suspend rather than a false non-determinism. Plain
   `join!(wait_for_signal, activity)` and `join!(wait_for_signal, child)` replay
   for both arrival orders, and the same shape parked with the signal
-  undelivered is a healthy canary suspend. The sweep genuinely
+  undelivered is a healthy canary suspend. A signal wait joined with a durable
+  TIMER parks on its first wake at three sampling points — before either branch
+  resolves, at the persistence frontier of the three-way
+  `join!(signal, timer, activity)`, and after the activity sibling has resolved
+  with the timer still armed — while the stray-timer pin keeps diverging. The
+  sweep genuinely
   permutes: it moves each losing branch's in-flight progress event to either
   side of the winner's terminal (the #1126 straddling-frontier case) and
   shuffles the teardown order, holding fixed only what is not arrival order —
