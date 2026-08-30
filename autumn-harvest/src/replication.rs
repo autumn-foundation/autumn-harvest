@@ -66,20 +66,22 @@
 //! perfect RPO for replication that is dead is the single most dangerous thing
 //! this module could do.
 
-/// How long [`bump_generation`] waits for the fencing table's exclusive lock
+/// How long `bump_generation` waits for the fencing table's exclusive lock
 /// before giving up.
 ///
 /// Long enough to ride out an ordinary in-flight persist, short enough that an
 /// operator under RTO pressure gets an actionable `lock_timeout` error rather
 /// than a hang — while it waits, it is itself blocking every claim and persist
 /// queued behind it.
+#[cfg(feature = "db")]
 const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
 
-/// Per-statement ceiling for [`advance_sequences_after_promotion`].
+/// Per-statement ceiling for `advance_sequences_after_promotion`.
 ///
 /// Generous, because a `MAX(col)` over a large un-indexed serial column on a
 /// cold standby is legitimately slow — but bounded, because this runs inside a
 /// 15-minute RTO budget and an unbounded hang is indistinguishable from a wedge.
+#[cfg(feature = "db")]
 const PROMOTE_STATEMENT_TIMEOUT_MS: u64 = 120_000;
 
 use std::collections::BTreeMap;
@@ -588,6 +590,7 @@ impl FenceRegistry {
 /// query — including any volatile function in it — on the operator's
 /// high-privilege DR connection. No amount of quoting addresses that; the
 /// relation-kind filter does.
+#[cfg(feature = "db")]
 #[must_use]
 fn quote_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
@@ -609,8 +612,9 @@ fn quote_ident(name: &str) -> String {
 /// `current_schema()` still reports `public`, so an unqualified `FROM t` can
 /// silently resolve to a session-local temp table and set a sequence from the
 /// wrong data — producing exactly the duplicate-key outage
-/// [`advance_sequences_after_promotion`] exists to prevent, with no error.
+/// `advance_sequences_after_promotion` exists to prevent, with no error.
 /// A qualified name is immune.
+#[cfg(feature = "db")]
 #[must_use]
 fn qualified(schema: &str, name: &str) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(name))
@@ -1506,6 +1510,11 @@ mod tests {
     }
 
     // ── promotion: identifier quoting ──────────────────────────────────────
+    //
+    // `db`-gated with the helpers themselves: without that feature — which is
+    // how `autumn-harvest-sqlite` builds this crate — they are not compiled,
+    // and CI's `clippy -p autumn-harvest-sqlite -- -D warnings` fails the build
+    // on the unused items.
 
     /// Catalog identifiers go into `setval` SQL inline (they cannot be bind
     /// parameters), so they must be *quoted*, not merely *screened*.
@@ -1516,6 +1525,7 @@ mod tests {
     /// sequence skipped while `harvest dr promote` reported success, and an
     /// ordinary table named `user` or `order` passed the screen and then blew
     /// up as a bare keyword in the generated SQL.
+    #[cfg(feature = "db")]
     #[test]
     fn identifiers_are_quoted_not_screened() {
         assert_eq!(quote_ident("harvest_events"), "\"harvest_events\"");
@@ -1528,6 +1538,7 @@ mod tests {
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn qualified_names_are_schema_pinned() {
         assert_eq!(
