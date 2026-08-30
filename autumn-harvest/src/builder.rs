@@ -3140,6 +3140,15 @@ pub struct WorkerConfig {
     /// floor value that would understate the loss. Only used when
     /// [`Self::dr_fencing`] is set. Default: 1 hour.
     pub replication_watermark_retain: Duration,
+    /// Slot-name prefix identifying this shard's DR replication (issue #954).
+    ///
+    /// Defaults to `harvest_dr`, matching the setup SQL in
+    /// `docs/cross-region-dr.md`. Without a prefix filter every walsender for
+    /// the shard's database counts as a DR standby — including an unrelated
+    /// logical-decoding consumer such as a CDC pipeline — and a shard whose
+    /// real cross-region subscriber had disconnected would report itself
+    /// protected. Only used when [`Self::dr_fencing`] is set.
+    pub replication_slot_prefix: String,
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -3493,6 +3502,7 @@ impl Default for WorkerConfig {
             dr_fencing: false,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
+            replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -3689,6 +3699,27 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_replication_watermark_retain(mut self, retain: Duration) -> Self {
         self.replication_watermark_retain = retain;
+        self
+    }
+
+    /// Set the slot-name prefix identifying this shard's DR replication
+    /// (issue #954).
+    ///
+    /// See [`WorkerConfig::replication_slot_prefix`]. Set this when your slots
+    /// are not named `harvest_dr*`; leaving it wrong makes an unrelated
+    /// walsender read as a healthy DR standby.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_replication_slot_prefix("dr_eu");
+    /// assert_eq!(config.replication_slot_prefix, "dr_eu");
+    /// ```
+    #[must_use]
+    pub fn with_replication_slot_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.replication_slot_prefix = prefix.into();
         self
     }
 

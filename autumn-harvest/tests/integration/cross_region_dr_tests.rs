@@ -49,6 +49,18 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 static DB_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Sampler cadence these tests beat at.
+///
+/// Near-zero on purpose: the beat is now rate-limited to one write per shard
+/// per half-interval, and a test that wants several distinct watermarks in
+/// quick succession must not be throttled by that gate.
+const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The slot-name prefix the tests create their DR slots with — the same
+/// `harvest_dr` the topology doc's setup SQL prescribes and the code defaults
+/// to. Anything not carrying it is deliberately NOT counted as a DR standby.
+const DR_PREFIX: &str = autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX;
+
 /// [`FenceRegistry`] is process-global; every test that pins a generation must
 /// hold this so a sibling test cannot observe a half-built registry.
 /// Async-aware, because the guard is deliberately held across `.await`s: the
@@ -732,6 +744,7 @@ async fn the_watermark_beat_leaves_no_advisory_lock_behind() {
             &mut conn,
             shard,
             std::time::Duration::from_secs(3600),
+            BEAT_INTERVAL,
         )
         .await
         .expect("beat");
@@ -749,6 +762,7 @@ async fn the_watermark_beat_leaves_no_advisory_lock_behind() {
         &mut other,
         shard,
         std::time::Duration::from_secs(3600),
+        BEAT_INTERVAL,
     )
     .await
     .expect("a second connection must still be able to take the beat");
@@ -797,7 +811,7 @@ async fn the_promotion_runs_inside_a_transaction_so_its_timeout_applies() {
 async fn replication_status_on_a_primary_with_no_standby_is_not_a_zero_rpo() {
     let (url, _db) = require_db!("norepl");
     let mut conn = connect(&url).await;
-    let status = query_replication_status(&mut conn, ShardId::new(0))
+    let status = query_replication_status(&mut conn, ShardId::new(0), DR_PREFIX)
         .await
         .expect("query");
     assert_eq!(
@@ -811,6 +825,72 @@ async fn replication_status_on_a_primary_with_no_standby_is_not_a_zero_rpo() {
         "a primary with no standby has an UNKNOWN RPO, never 0"
     );
     assert!(matches!(status, ReplicationStatus::Observed { .. }));
+}
+
+/// An unrelated logical-decoding consumer must not read as a DR standby.
+///
+/// A shard database can legitimately host a CDC pipeline's slot alongside its
+/// DR subscription. Counting every walsender for the database meant that if the
+/// real cross-region subscriber disconnected, `connected_standbys()` stayed
+/// non-zero, `harvest dr status` reported the shard protected, and
+/// `harvest_replication_down` never fired — the most dangerous false negative
+/// this feature has, because it is silent and it is wrong in the safe-looking
+/// direction.
+#[tokio::test]
+async fn a_non_dr_slot_is_not_counted_as_a_dr_standby() {
+    let (url, _db) = require_db!("cdcslot");
+    let mut conn = connect(&url).await;
+
+    // A CDC-style logical slot with a name that is nothing to do with DR.
+    let slot = format!("cdc_pipeline_{}", std::process::id());
+    diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create the non-DR slot");
+
+    let status = query_replication_status(&mut conn, ShardId::new(0), DR_PREFIX)
+        .await
+        .expect("status");
+    assert_eq!(
+        status.connected_standbys(),
+        0,
+        "a CDC slot must not be counted as a DR standby"
+    );
+    assert_eq!(
+        status.inactive_slots(),
+        0,
+        "and it must not appear in the DR slot inventory either: {status:?}"
+    );
+    assert_eq!(
+        status.max_lag_bytes(),
+        None,
+        "its WAL backlog is not this shard's DR backlog"
+    );
+
+    // Sanity: the same query DOES see a slot carrying the DR prefix, so the
+    // assertions above are about the filter and not about an empty database.
+    let dr_slot = format!("{DR_PREFIX}_cdcprobe_{}", std::process::id());
+    diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+        .bind::<diesel::sql_types::Text, _>(dr_slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create the DR slot");
+    let status = query_replication_status(&mut conn, ShardId::new(0), DR_PREFIX)
+        .await
+        .expect("status");
+    assert_eq!(
+        status.inactive_slots(),
+        1,
+        "the DR-prefixed slot must be visible: {status:?}"
+    );
+
+    for name in [slot, dr_slot] {
+        let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+            .bind::<diesel::sql_types::Text, _>(name)
+            .execute(&mut conn)
+            .await;
+    }
 }
 
 // ── The worker lifecycle: pin at startup, self-fence, stop ─────────────────
@@ -842,6 +922,7 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
         fencing: true,
         sample_interval: std::time::Duration::from_millis(300),
         watermark_retain: std::time::Duration::from_secs(3600),
+        slot_prefix: DR_PREFIX.to_string(),
     });
 
     let fenced_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1030,7 +1111,7 @@ async fn two_regions(tag: &str) -> Option<Regions> {
     let (standby_url, _standby_db) = fresh_db(&format!("{tag}b")).await?;
 
     let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-    let slot = format!("dr_slot_{}_{n}", std::process::id());
+    let slot = format!("{DR_PREFIX}_slot_{}_{n}", std::process::id());
     let sub = format!("dr_sub_{}_{n}", std::process::id());
 
     let mut a = connect(&primary_url).await;
@@ -1134,7 +1215,7 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
 
     // Healthy: beats are confirmed by the standby within a beat or two.
     for _ in 0..3 {
-        record_replication_heartbeat(&mut a, shard, retain)
+        record_replication_heartbeat(&mut a, shard, retain, BEAT_INTERVAL)
             .await
             .map_err(|e| e.to_string())?;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1147,10 +1228,10 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
             let url = primary_url.clone();
             async move {
                 let mut conn = connect(&url).await;
-                let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
+                let _ = record_replication_heartbeat(&mut conn, shard, retain, BEAT_INTERVAL).await;
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 matches!(
-                    measure_rpo(&mut conn, shard).await,
+                    measure_rpo(&mut conn, shard, DR_PREFIX).await,
                     Ok(WatermarkReading::Measured(v)) if v < 5.0
                 )
             }
@@ -1172,13 +1253,13 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
     let stall_started = std::time::Instant::now();
     let injected = std::time::Duration::from_secs(12);
     while stall_started.elapsed() < injected {
-        record_replication_heartbeat(&mut a, shard, retain)
+        record_replication_heartbeat(&mut a, shard, retain, BEAT_INTERVAL)
             .await
             .map_err(|e| e.to_string())?;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let independently_measured = stall_started.elapsed().as_secs_f64();
-    let reported = match measure_rpo(&mut a, shard)
+    let reported = match measure_rpo(&mut a, shard, DR_PREFIX)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -1207,7 +1288,7 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
     // …and the reading is honest about *which* source it came from: with apply
     // blocked, Postgres' own replay_lag is blind, which is the whole reason the
     // watermark trail exists.
-    let status = autumn_harvest::replication::query_replication_status(&mut a, shard)
+    let status = autumn_harvest::replication::query_replication_status(&mut a, shard, DR_PREFIX)
         .await
         .map_err(|e| e.to_string())?;
     let rpo = status.rpo_seconds().ok_or("status must carry the RPO")?;
@@ -1235,10 +1316,10 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
             let url = primary_url.clone();
             async move {
                 let mut conn = connect(&url).await;
-                let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
+                let _ = record_replication_heartbeat(&mut conn, shard, retain, BEAT_INTERVAL).await;
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 matches!(
-                    measure_rpo(&mut conn, shard).await,
+                    measure_rpo(&mut conn, shard, DR_PREFIX).await,
                     Ok(WatermarkReading::Measured(v)) if v < 5.0
                 )
             }
@@ -1269,6 +1350,7 @@ async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
                 &mut a,
                 shard,
                 std::time::Duration::from_secs(3600),
+                BEAT_INTERVAL,
             )
             .await
             .expect("beat");
@@ -1282,17 +1364,20 @@ async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
                 let url = primary_url.clone();
                 async move {
                     let mut conn = connect(&url).await;
-                    autumn_harvest::replication::query_replication_status(&mut conn, shard)
-                        .await
-                        .is_ok_and(|s| s.connected_standbys() == 0)
+                    autumn_harvest::replication::query_replication_status(
+                        &mut conn, shard, DR_PREFIX,
+                    )
+                    .await
+                    .is_ok_and(|s| s.connected_standbys() == 0)
                 }
             },
         )
         .await;
 
-        let status = autumn_harvest::replication::query_replication_status(&mut a, shard)
-            .await
-            .expect("status");
+        let status =
+            autumn_harvest::replication::query_replication_status(&mut a, shard, DR_PREFIX)
+                .await
+                .expect("status");
         assert_eq!(status.connected_standbys(), 0, "the standby is gone");
         assert_eq!(
             status.max_replay_lag_seconds(),

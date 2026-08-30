@@ -113,6 +113,16 @@ pub enum DrCommand {
         #[arg(long = "shard", value_name = "DSN", required = true)]
         shards: Vec<String>,
 
+        /// Slot-name prefix identifying this shard's DR replication.
+        ///
+        /// Must match the workers' `replication_slot_prefix`. Without a prefix
+        /// every walsender for the database would count as a DR standby —
+        /// including an unrelated logical-decoding consumer such as a CDC
+        /// pipeline — so a shard whose real cross-region subscriber had
+        /// disconnected would report itself protected.
+        #[arg(long, value_name = "PREFIX", default_value = "harvest_dr")]
+        slot_prefix: String,
+
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
         format: DrFormat,
@@ -4484,7 +4494,11 @@ async fn dr_connect_read_only(
 /// about the shards you *can* reach is the answer you need.
 pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
     match command {
-        DrCommand::Status { shards, format } => run_dr_status(shards, *format).await,
+        DrCommand::Status {
+            shards,
+            slot_prefix,
+            format,
+        } => run_dr_status(shards, slot_prefix, *format).await,
         DrCommand::Fence {
             shards,
             reason,
@@ -4498,7 +4512,11 @@ pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
     }
 }
 
-async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+async fn run_dr_status(
+    shards: &[String],
+    slot_prefix: &str,
+    format: DrFormat,
+) -> Result<(), CliError> {
     use autumn_harvest::replication::{current_generation, query_replication_status};
     use autumn_harvest::types::ShardId;
 
@@ -4532,7 +4550,9 @@ async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliErr
             Ok(None) => (None, None),
             Err(error) => (None, Some(error.to_string())),
         };
-        let status = query_replication_status(&mut conn, shard).await.ok();
+        let status = query_replication_status(&mut conn, shard, slot_prefix)
+            .await
+            .ok();
         out.push(DrShardStatus {
             shard_id: target.shard_id,
             dsn: redacted,

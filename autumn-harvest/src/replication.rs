@@ -356,7 +356,7 @@ impl ReplicationStatus {
 // so no downstream crate could ever build one to hand to the public
 // `set_dr_config`. Every field is `pub` and the type is `Copy`; growing it is a
 // breaking change we accept in exchange for the setter being usable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrConfig {
     /// Whether write-authority fencing is enabled for this process.
     pub fencing: bool,
@@ -365,6 +365,20 @@ pub struct DrConfig {
     pub sample_interval: std::time::Duration,
     /// Trailing watermark retention: the ceiling on measurable lag.
     pub watermark_retain: std::time::Duration,
+    /// Slot-name prefix identifying **this shard's DR replication**.
+    ///
+    /// Without it, every walsender for the shard's database counts as a DR
+    /// standby — including an unrelated logical-decoding consumer such as a CDC
+    /// pipeline. A shard with CDC attached would then report itself protected
+    /// while its actual cross-region subscriber was disconnected, and
+    /// `harvest_replication_down` would never fire: the most dangerous possible
+    /// false negative for this feature.
+    ///
+    /// Defaults to `harvest_dr`, which is the naming the topology doc's setup
+    /// SQL prescribes (`harvest_dr_shard0`, ...). Deployments that name their
+    /// slots otherwise must set this — including physical ones, whose slot
+    /// should carry the same prefix.
+    pub slot_prefix: String,
 }
 
 impl Default for DrConfig {
@@ -374,9 +388,13 @@ impl Default for DrConfig {
             fencing: false,
             sample_interval: std::time::Duration::from_secs(15),
             watermark_retain: std::time::Duration::from_secs(3600),
+            slot_prefix: DEFAULT_DR_SLOT_PREFIX.to_string(),
         }
     }
 }
+
+/// The slot-name prefix `docs/cross-region-dr.md`'s setup SQL prescribes.
+pub const DEFAULT_DR_SLOT_PREFIX: &str = "harvest_dr";
 
 static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
 
@@ -413,7 +431,7 @@ pub fn dr_config() -> DrConfig {
     let guard = DR_CONFIG
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let found = guard.unwrap_or_default();
+    let found = guard.clone().unwrap_or_default();
     drop(guard);
     found
 }
@@ -992,17 +1010,25 @@ mod db {
 
     /// `pg_stat_replication`, reduced to what an RPO reading needs.
     ///
-    /// LEFT-joined to `pg_replication_slots` on `active_pid` to inherit the
-    /// database scope — `pg_stat_replication` has no database column of its
-    /// own, so without the join a sibling shard's walsender would be counted as
-    /// this shard's standby.
+    /// Two ways for a walsender to be recognised as **this shard's DR sender**,
+    /// because the two supported topologies identify themselves differently.
     ///
-    /// **LEFT**, not INNER, and that is load-bearing: a physical standby
-    /// configured without `primary_slot_name` (WAL archiving, `wal_keep_size`)
-    /// is a supported topology and appears in `pg_stat_replication` with **no
-    /// slot row at all**. An inner join dropped it, `connected_standbys()`
-    /// returned `0` — the value documented as "replication is down" — and the
-    /// starter alert paged permanently on perfectly healthy replication.
+    /// * It holds a slot for this database whose name carries the DR prefix.
+    ///   `pg_stat_replication` has no database column of its own, so the join
+    ///   is also what stops a sibling shard's walsender being counted here.
+    /// * It holds **no slot at all** and its `application_name` carries the
+    ///   prefix. A physical standby configured without `primary_slot_name`
+    ///   (WAL archiving, `wal_keep_size`) is a supported topology and appears
+    ///   in `pg_stat_replication` with no slot row; an inner join dropped it,
+    ///   `connected_standbys()` returned `0` — the value documented as
+    ///   "replication is down" — and the starter alert paged permanently on
+    ///   healthy replication.
+    ///
+    /// The prefix is what makes this a *DR* count rather than a walsender
+    /// count. Without it an unrelated logical-decoding consumer — a CDC
+    /// pipeline, say — reads as a connected standby, and a shard whose real
+    /// cross-region subscriber had disconnected would report itself protected
+    /// while `harvest_replication_down` stayed silent.
     ///
     /// `replay_lag` is left `NULL` rather than coerced: Postgres reports NULL
     /// until a feedback round-trip has completed, and "we have not measured
@@ -1014,9 +1040,12 @@ mod db {
                  ELSE (pg_current_wal_lsn() - r.replay_lsn)::bigint END AS lag_bytes \
          FROM pg_stat_replication r \
          LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid \
-         WHERE s.slot_name IS NULL \
-            OR s.database IS NULL \
-            OR s.database = current_database()";
+         WHERE ( \
+                 s.slot_name IS NOT NULL \
+                 AND (s.database IS NULL OR s.database = current_database()) \
+                 AND s.slot_name LIKE $1 || '%' \
+               ) \
+            OR (s.slot_name IS NULL AND r.application_name LIKE $1 || '%')";
 
     /// `pg_replication_slots`, which outlives the walsender.
     ///
@@ -1030,7 +1059,8 @@ mod db {
                  ELSE (pg_current_wal_lsn() \
                        - COALESCE(s.confirmed_flush_lsn, s.restart_lsn))::bigint END AS lag_bytes \
          FROM pg_replication_slots s \
-         WHERE (s.database IS NULL OR s.database = current_database())";
+         WHERE (s.database IS NULL OR s.database = current_database()) \
+           AND s.slot_name LIKE $1 || '%'";
 
     /// Write one replication watermark for `shard` and prune the trail.
     ///
@@ -1049,6 +1079,12 @@ mod db {
     /// `(shard_id, beat_lsn)`: two beats within a single WAL position are the
     /// same observation, not a conflict worth failing on.
     ///
+    /// `interval` is the sampler cadence, and it is what makes the beat rate
+    /// **per shard** rather than per worker: a beat is written only when the
+    /// newest one is older than half an interval. The advisory lock alone would
+    /// only stop simultaneous writers, so staggered workers would each still
+    /// beat once per interval and the trail would scale with fleet size.
+    ///
     /// The prune keeps `retain` of trailing history. That window is the ceiling
     /// on the lag this can *measure*: a standby further behind than the oldest
     /// retained watermark reports `None` (unknown) rather than a floor value
@@ -1061,8 +1097,11 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
         retain: std::time::Duration,
+        interval: std::time::Duration,
     ) -> HarvestResult<()> {
         let retain_secs = i64::try_from(retain.as_secs()).unwrap_or(i64::MAX);
+        // Half an interval of slack (see the INSERT's predicate).
+        let min_gap_secs = interval.as_secs_f64() / 2.0;
         let shard_id = shard.as_i32();
 
         Box::pin(
@@ -1096,12 +1135,34 @@ mod db {
                     return Ok(());
                 }
 
+                // The lock alone only prevents SIMULTANEOUS writers. Workers
+                // sampling on staggered schedules each take it uncontended a
+                // moment apart, so without this predicate every worker still
+                // writes and prunes once per interval and the trail scales with
+                // fleet size — the exact cost the lock was added to remove.
+                //
+                // `WHERE NOT EXISTS (a beat newer than one interval)` makes the
+                // cadence per SHARD rather than per worker: the first sampler
+                // to arrive in a window writes, the rest no-op. Enforced in the
+                // statement rather than in Rust because the fleet has no shared
+                // clock, and Postgres' `NOW()` is the one all of them agree on.
+                //
+                // Half an interval of slack, so ordinary scheduling jitter does
+                // not skip a window outright and halve the effective cadence.
                 diesel::sql_query(
                     "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
-                     VALUES ($1, pg_current_wal_lsn(), NOW()) \
+                     SELECT $1, pg_current_wal_lsn(), NOW() \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM harvest_replication_heartbeat h \
+                         WHERE h.shard_id = $1 \
+                           AND h.beat_at > NOW() \
+                               - make_interval(secs => $3::double precision) \
+                     ) \
                      ON CONFLICT (shard_id, beat_lsn) DO NOTHING",
                 )
                 .bind::<Integer, _>(shard_id)
+                .bind::<BigInt, _>(retain_secs)
+                .bind::<Double, _>(min_gap_secs)
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
@@ -1200,6 +1261,7 @@ mod db {
     pub async fn measure_rpo(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
+        slot_prefix: &str,
     ) -> HarvestResult<WatermarkReading> {
         // Position precedence, and each rung is load-bearing:
         //
@@ -1229,8 +1291,10 @@ mod db {
                     END AS position \
              FROM pg_replication_slots s \
              LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
-             WHERE (s.database IS NULL OR s.database = current_database())",
+             WHERE (s.database IS NULL OR s.database = current_database()) \
+               AND s.slot_name LIKE $1 || '%'",
         )
+        .bind::<Text, _>(slot_prefix)
         .load(conn)
         .await
         .map_err(database_error)?;
@@ -1483,8 +1547,13 @@ mod db {
     pub async fn query_replication_status(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
+        slot_prefix: &str,
     ) -> HarvestResult<ReplicationStatus> {
-        let standbys: Vec<StandbyRow> = match diesel::sql_query(STANDBY_SQL).load(conn).await {
+        let standbys: Vec<StandbyRow> = match diesel::sql_query(STANDBY_SQL)
+            .bind::<Text, _>(slot_prefix)
+            .load(conn)
+            .await
+        {
             Ok(rows) => rows,
             Err(error) => {
                 return Ok(ReplicationStatus::Unavailable {
@@ -1492,7 +1561,11 @@ mod db {
                 });
             }
         };
-        let slots: Vec<SlotRow> = match diesel::sql_query(SLOT_SQL).load(conn).await {
+        let slots: Vec<SlotRow> = match diesel::sql_query(SLOT_SQL)
+            .bind::<Text, _>(slot_prefix)
+            .load(conn)
+            .await
+        {
             Ok(rows) => rows,
             Err(error) => {
                 return Ok(ReplicationStatus::Unavailable {
@@ -1503,7 +1576,7 @@ mod db {
 
         // A watermark-read failure degrades the same way a view-read failure
         // does: lose the number, never the sampler.
-        let heartbeat = measure_rpo(conn, shard)
+        let heartbeat = measure_rpo(conn, shard, slot_prefix)
             .await
             .unwrap_or(WatermarkReading::Unknown);
 

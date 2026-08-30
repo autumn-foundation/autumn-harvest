@@ -149,6 +149,12 @@ pub struct WorkerConfigView {
     /// Trailing watermark retention, milliseconds — the ceiling on measurable
     /// replication lag (issue #954).
     pub replication_watermark_retain_ms: u64,
+    /// Slot-name prefix identifying this shard's DR replication (issue #954).
+    ///
+    /// Worth reading back from a live fleet: a prefix that matches nothing
+    /// reports the shard as having no standby, and a prefix that is too broad
+    /// counts an unrelated walsender as one.
+    pub replication_slot_prefix: String,
     /// Maximum workflow start delay, milliseconds.
     pub max_workflow_start_delay_ms: u64,
     /// Grace window before cross-workflow signaling fails for an unknown target, milliseconds.
@@ -332,6 +338,7 @@ impl WorkerConfigView {
             dr_fencing,
             replication_sample_interval,
             replication_watermark_retain,
+            replication_slot_prefix,
             max_workflow_start_delay,
             unknown_target_grace_window,
             poison_pill_threshold,
@@ -387,6 +394,7 @@ impl WorkerConfigView {
             dr_fencing: *dr_fencing,
             replication_sample_interval_ms: dur_ms(*replication_sample_interval),
             replication_watermark_retain_ms: dur_ms(*replication_watermark_retain),
+            replication_slot_prefix: replication_slot_prefix.clone(),
             max_workflow_start_delay_ms: dur_ms(*max_workflow_start_delay),
             unknown_target_grace_window_ms: dur_ms(*unknown_target_grace_window),
             poison_pill_threshold: *poison_pill_threshold,

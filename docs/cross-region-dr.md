@@ -125,6 +125,20 @@ CREATE SUBSCRIPTION harvest_dr_shard0
 > slot creation waits for older transactions to end, so it would wait for
 > itself. Across two real instances you can let it create its own slot.
 
+> **The `harvest_dr` prefix in those slot names is load-bearing, not cosmetic.**
+> Harvest identifies *its* replication by slot-name prefix
+> (`replication_slot_prefix`, default `harvest_dr`). Without that filter every
+> walsender for the shard's database would count as a DR standby — including an
+> unrelated logical-decoding consumer such as a CDC pipeline — so a shard whose
+> real cross-region subscriber had disconnected would report itself protected
+> and `harvest_replication_down` would never fire. Name your slots with the
+> prefix, or set the knob to whatever you did name them.
+>
+> A **physical** standby configured without `primary_slot_name` has no slot to
+> match, so give it `application_name=harvest_dr_shard0` in its
+> `primary_conninfo` — Harvest falls back to `application_name` for exactly
+> that case.
+
 The role Harvest connects as needs `pg_monitor` to read the replication views:
 
 ```sql

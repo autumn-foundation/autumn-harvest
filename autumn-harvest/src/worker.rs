@@ -394,6 +394,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             fencing: cfg.dr_fencing,
             sample_interval: cfg.replication_sample_interval,
             watermark_retain: cfg.replication_watermark_retain,
+            slot_prefix: cfg.replication_slot_prefix.clone(),
         });
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
@@ -19218,6 +19219,7 @@ fn spawn_replication_sampler(
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
     watermark_retain: Duration,
+    slot_prefix: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -19230,7 +19232,15 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                if sample_one_shard(*shard_id, shard_pool, &telemetry, watermark_retain).await
+                if sample_one_shard(
+                    *shard_id,
+                    shard_pool,
+                    &telemetry,
+                    watermark_retain,
+                    interval,
+                    &slot_prefix,
+                )
+                .await
                     == ShardSample::Fenced
                 {
                     cancel.cancel();
@@ -19263,6 +19273,8 @@ async fn sample_one_shard(
     shard_pool: &DbPool,
     telemetry: &Arc<crate::telemetry::TelemetryConfig>,
     watermark_retain: Duration,
+    sample_interval: Duration,
+    slot_prefix: &str,
 ) -> ShardSample {
     let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
     let Ok(mut conn) = shard_pool.get().await else {
@@ -19304,9 +19316,13 @@ async fn sample_one_shard(
         }
     }
 
-    if let Err(error) =
-        crate::replication::record_replication_heartbeat(&mut conn, shard_id, watermark_retain)
-            .await
+    if let Err(error) = crate::replication::record_replication_heartbeat(
+        &mut conn,
+        shard_id,
+        watermark_retain,
+        sample_interval,
+    )
+    .await
     {
         tracing::debug!(
             shard_id = %shard_id.as_i32(),
@@ -19315,7 +19331,7 @@ async fn sample_one_shard(
         );
     }
 
-    match crate::replication::query_replication_status(&mut conn, shard_id).await {
+    match crate::replication::query_replication_status(&mut conn, shard_id, slot_prefix).await {
         Ok(crate::replication::ReplicationStatus::Unavailable { reason }) => {
             // The views could not be read — almost always a missing
             // `GRANT pg_monitor`. Emit NOTHING: reporting zero
@@ -21743,6 +21759,7 @@ impl Worker {
                     self.registry.telemetry().clone(),
                     self.dr.sample_interval,
                     self.dr.watermark_retain,
+                    self.dr.slot_prefix.clone(),
                 )
             })
         } else {
@@ -24900,6 +24917,7 @@ mod tests {
     fn worker_config_from_builder() {
         let builder_cfg = WorkerConfig {
             dr_fencing: false,
+            replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
             queues: vec!["email".to_string(), "billing".to_string()],
