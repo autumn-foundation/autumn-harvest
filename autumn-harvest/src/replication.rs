@@ -931,78 +931,91 @@ mod db {
         shard: ShardId,
         retain: std::time::Duration,
     ) -> HarvestResult<()> {
-        // One writer per shard per tick, whatever the fleet size. Every worker
-        // runs this sampler (each also needs its own self-fence check), so
-        // without the gate a 200-worker fleet writes 200 watermarks and 200
-        // prunes per tick per shard — and the trail then holds `N x retention`
-        // rows rather than the `retention` the migration comment assumes,
-        // which is also what `measure_rpo` has to scan.
-        //
-        // `try` and session-scoped: a worker that loses the race simply skips
-        // the beat this tick and still runs its own fence check and gauges.
-        // A crashed holder's lock is released with its session.
-        if !try_lock_heartbeat(conn, shard).await? {
-            return Ok(());
-        }
-
-        diesel::sql_query(
-            "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
-             VALUES ($1, pg_current_wal_lsn(), NOW()) \
-             ON CONFLICT (shard_id, beat_lsn) DO NOTHING",
-        )
-        .bind::<Integer, _>(shard.as_i32())
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-
         let retain_secs = i64::try_from(retain.as_secs()).unwrap_or(i64::MAX);
-        diesel::sql_query(
-            "DELETE FROM harvest_replication_heartbeat \
-             WHERE shard_id = $1 AND beat_at < NOW() - make_interval(secs => $2::double precision)",
-        )
-        .bind::<Integer, _>(shard.as_i32())
-        .bind::<BigInt, _>(retain_secs)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+        let shard_id = shard.as_i32();
 
-        unlock_heartbeat(conn, shard).await
+        Box::pin(
+            conn.transaction::<(), crate::error::HarvestError, _>(async move |conn| {
+                // One writer per shard per tick, whatever the fleet size. Every
+                // worker runs this sampler (each also needs its own self-fence
+                // check), so without the gate a 200-worker fleet writes 200
+                // watermarks and 200 prunes per tick per shard — and the trail
+                // then holds `N x retention` rows rather than the `retention`
+                // the migration comment assumes, which is also what
+                // `measure_rpo` has to scan.
+                //
+                // **`_xact_` is load-bearing.** A session-scoped
+                // `pg_try_advisory_lock` is released only by an explicit
+                // unlock, so any `?` between acquire and release leaks it — and
+                // on a pooled connection it then leaks *permanently*: every
+                // other sampler skips its beat forever, re-acquiring on the
+                // same session only bumps the lock count, and the measured RPO
+                // goes stale during exactly the database trouble it exists to
+                // measure. A transaction-scoped lock is released by the commit
+                // *and* by the rollback, so there is no error path to get wrong.
+                let locked: Vec<LockRow> =
+                    diesel::sql_query("SELECT pg_try_advisory_xact_lock($1) AS locked")
+                        .bind::<BigInt, _>(heartbeat_lock_key(shard_id))
+                        .load(conn)
+                        .await
+                        .map_err(database_error)?;
+                if !locked.into_iter().next().is_some_and(|r| r.locked) {
+                    // Another worker holds the beat this tick. Its own fence
+                    // check and gauges still ran; only the write is skipped.
+                    return Ok(());
+                }
+
+                diesel::sql_query(
+                    "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
+                     VALUES ($1, pg_current_wal_lsn(), NOW()) \
+                     ON CONFLICT (shard_id, beat_lsn) DO NOTHING",
+                )
+                .bind::<Integer, _>(shard_id)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+                diesel::sql_query(
+                    "DELETE FROM harvest_replication_heartbeat \
+                     WHERE shard_id = $1 \
+                       AND beat_at < NOW() - make_interval(secs => $2::double precision)",
+                )
+                .bind::<Integer, _>(shard_id)
+                .bind::<BigInt, _>(retain_secs)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+                Ok(())
+            }),
+        )
+        .await
     }
 
-    /// Advisory-lock class for the per-shard watermark writer.
+    /// The single-argument advisory key for a shard's watermark writer.
     ///
-    /// Arbitrary and stable; paired with the shard id so two shards never
-    /// contend. Chosen high enough not to collide with the `hashtext`-derived
-    /// keys the claim path uses for concurrency keys.
-    const HEARTBEAT_LOCK_CLASS: i32 = 0x0954;
+    /// **Single-argument by requirement, not preference.** `queue_pause` owns
+    /// the two-argument `(classid, objid)` keyspace outright — its keys spend
+    /// all 64 bits on a SHA-256 of the queue name and reserve no class id, so a
+    /// second user there could silently stall queue dispatch. That ownership is
+    /// enforced by `queue_pause::tests::queue_pause_owns_the_two_argument_advisory_keyspace`,
+    /// which walks every other source file in the crate.
+    ///
+    /// The single-argument space is shared with the concurrency-key locks, but
+    /// those are `hashtext(key)::bigint` and `hashtext` returns `int4` — so
+    /// they occupy only `i32::MIN..=i32::MAX`. Shifting the issue number into
+    /// the high word puts these keys far outside that range, so a collision is
+    /// impossible by construction rather than by luck. The shard id occupies
+    /// the low word, so two shards never contend with each other either.
+    #[allow(clippy::cast_sign_loss)]
+    pub(super) const fn heartbeat_lock_key(shard_id: i32) -> i64 {
+        (954_i64 << 32) | (shard_id as u32 as i64)
+    }
 
     #[derive(diesel::QueryableByName)]
     struct LockRow {
         #[diesel(sql_type = Bool)]
         locked: bool,
-    }
-
-    async fn try_lock_heartbeat(
-        conn: &mut AsyncPgConnection,
-        shard: ShardId,
-    ) -> HarvestResult<bool> {
-        let rows: Vec<LockRow> = diesel::sql_query("SELECT pg_try_advisory_lock($1, $2) AS locked")
-            .bind::<Integer, _>(HEARTBEAT_LOCK_CLASS)
-            .bind::<Integer, _>(shard.as_i32())
-            .load(conn)
-            .await
-            .map_err(database_error)?;
-        Ok(rows.into_iter().next().is_some_and(|r| r.locked))
-    }
-
-    async fn unlock_heartbeat(conn: &mut AsyncPgConnection, shard: ShardId) -> HarvestResult<()> {
-        diesel::sql_query("SELECT pg_advisory_unlock($1, $2)")
-            .bind::<Integer, _>(HEARTBEAT_LOCK_CLASS)
-            .bind::<Integer, _>(shard.as_i32())
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-        Ok(())
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1172,6 +1185,30 @@ mod db {
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure.
     pub async fn advance_sequences_after_promotion(
+        conn: &mut AsyncPgConnection,
+    ) -> HarvestResult<Vec<(String, i64)>> {
+        Box::pin(
+            conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+                advance_sequences_in_transaction(conn).await
+            }),
+        )
+        .await
+    }
+
+    /// The body of [`advance_sequences_after_promotion`], inside a transaction.
+    ///
+    /// The transaction exists for `SET LOCAL`, which Postgres **ignores** —
+    /// with only a `WARNING` — outside a transaction block. Verified: issued
+    /// standalone, `statement_timeout` reads back as `0`, so the ceiling this
+    /// function documents was silently absent and a `MAX()` scan on a large or
+    /// blocked table could hang the promotion past the RTO budget with no
+    /// signal.
+    ///
+    /// It does **not** make the promotion atomic, and must not be described as
+    /// if it did: `setval` is explicitly non-transactional in Postgres, so a
+    /// rollback does not rewind the sequences already advanced. The returned
+    /// list remains the record of what actually changed.
+    async fn advance_sequences_in_transaction(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Vec<(String, i64)>> {
         // Promotion sits on the RTO critical path and `MAX(col)` on a serial
@@ -1439,6 +1476,33 @@ mod tests {
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), Some(77));
         assert_eq!(s.connected_standbys(), 0);
+    }
+
+    // ── advisory keyspace ──────────────────────────────────────────────────
+
+    /// The watermark lock must not collide with the concurrency-key locks it
+    /// shares the single-argument advisory keyspace with.
+    ///
+    /// Those are `hashtext(key)::bigint`, and `hashtext` returns `int4`, so
+    /// they can only land in `i32::MIN..=i32::MAX`. Keeping these keys strictly
+    /// above that range makes a collision impossible by construction — and this
+    /// pins it, because the alternative failure is a DR sampler silently
+    /// blocking a workflow's concurrency-key claim.
+    #[cfg(feature = "db")]
+    #[test]
+    fn heartbeat_lock_keys_sit_outside_the_concurrency_key_range() {
+        for shard in [0_i32, 1, 7, 255, i32::MAX] {
+            let key = super::db::heartbeat_lock_key(shard);
+            assert!(
+                key > i64::from(i32::MAX),
+                "shard {shard} key {key} falls inside the hashtext keyspace"
+            );
+        }
+        // Distinct per shard, so two shards never contend for one beat.
+        assert_ne!(
+            super::db::heartbeat_lock_key(0),
+            super::db::heartbeat_lock_key(1)
+        );
     }
 
     // ── promotion: identifier quoting ──────────────────────────────────────

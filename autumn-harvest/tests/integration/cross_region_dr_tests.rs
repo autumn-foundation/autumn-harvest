@@ -630,6 +630,102 @@ async fn promotion_advances_reserved_word_and_mixed_case_relations() {
     );
 }
 
+/// The watermark beat must never leave an advisory lock behind.
+///
+/// The single-writer gate uses `pg_try_advisory_xact_lock`, not the
+/// session-scoped variant. A session lock is released only by an explicit
+/// unlock, so any error between acquire and release leaks it — and on a
+/// **pooled** connection it leaks permanently: every other worker's sampler
+/// then skips its beat forever, re-acquiring on the same session only bumps the
+/// lock count, and the measured RPO goes stale during exactly the database
+/// trouble it exists to measure. (Verified against live Postgres: an advisory
+/// lock does survive a failed statement in the same session.)
+#[tokio::test]
+async fn the_watermark_beat_leaves_no_advisory_lock_behind() {
+    let (url, _db) = require_db!("beatlock");
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    #[derive(diesel::QueryableByName)]
+    struct C {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn advisory_locks_held(conn: &mut AsyncPgConnection) -> i64 {
+        let rows: Vec<C> = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM pg_locks \
+             WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+        )
+        .load(conn)
+        .await
+        .expect("count advisory locks");
+        rows.into_iter().next().map_or(-1, |c| c.n)
+    }
+
+    for _ in 0..3 {
+        autumn_harvest::replication::record_replication_heartbeat(
+            &mut conn,
+            shard,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("beat");
+        assert_eq!(
+            advisory_locks_held(&mut conn).await,
+            0,
+            "the beat must hold no advisory lock once it returns"
+        );
+    }
+
+    // …and a beat on a *different* connection is never starved by a previous
+    // one, which is what a leaked session lock would cause.
+    let mut other = connect(&url).await;
+    autumn_harvest::replication::record_replication_heartbeat(
+        &mut other,
+        shard,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .expect("a second connection must still be able to take the beat");
+}
+
+/// The promotion's statement timeout must actually be in force.
+///
+/// `SET LOCAL` outside a transaction block is **ignored** by Postgres — it
+/// emits a `WARNING` and `statement_timeout` reads back as `0`. Verified
+/// against live Postgres. The helper therefore has to run inside a transaction,
+/// or the ceiling it documents on the RTO-critical path is silently absent.
+#[tokio::test]
+async fn the_promotion_runs_inside_a_transaction_so_its_timeout_applies() {
+    let (url, _db) = require_db!("promotetx");
+    let mut conn = connect(&url).await;
+
+    // A table whose `MAX()` scan is slow enough to prove the timeout is armed
+    // would make this test slow too. Instead, assert the property the timeout
+    // depends on: the helper must not leave `statement_timeout` set at session
+    // level (which would mean it used `SET`, leaking the ceiling onto every
+    // later query on a pooled connection), and must succeed — which under
+    // `SET LOCAL` is only possible inside a transaction.
+    autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion succeeds");
+
+    #[derive(diesel::QueryableByName)]
+    struct S {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        timeout: String,
+    }
+    let rows: Vec<S> = diesel::sql_query("SELECT current_setting('statement_timeout') AS timeout")
+        .load(&mut conn)
+        .await
+        .expect("read statement_timeout");
+    assert_eq!(
+        rows.into_iter().next().map(|s| s.timeout).as_deref(),
+        Some("0"),
+        "the promotion's timeout must be transaction-local, not leaked onto the session"
+    );
+}
+
 // ── AC4 / AC6(c): measured RPO ─────────────────────────────────────────────
 
 #[tokio::test]

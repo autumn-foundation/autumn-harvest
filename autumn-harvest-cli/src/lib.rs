@@ -4394,8 +4394,18 @@ struct DrShardStatus {
     /// consumer cannot mistake absence for a value of `0`.
     rpo_seconds: Option<f64>,
     lag_bytes: Option<i64>,
-    connected_standbys: usize,
-    inactive_slots: usize,
+    /// `None` when the replication views could not be read at all.
+    ///
+    /// Distinct from `Some(0)`, and the distinction is the point: `0` is the
+    /// definitive "this shard has no standby, its RPO is unbounded", while
+    /// `None` is "the role cannot read `pg_stat_replication` — most likely a
+    /// missing `GRANT pg_monitor`". Collapsing the second into the first
+    /// printed a categorical no-standby warning for a permissions gap, to an
+    /// operator deciding whether to fail over.
+    connected_standbys: Option<usize>,
+    inactive_slots: Option<usize>,
+    /// Why the replication views were unreadable, when they were.
+    replication_error: Option<String>,
 }
 
 impl DrShardStatus {
@@ -4412,6 +4422,7 @@ impl DrShardStatus {
             "lag_bytes": self.lag_bytes,
             "connected_standbys": self.connected_standbys,
             "inactive_slots": self.inactive_slots,
+            "replication_error": self.replication_error,
         })
     }
 }
@@ -4500,8 +4511,9 @@ async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliErr
                     generation_error: None,
                     rpo_seconds: None,
                     lag_bytes: None,
-                    connected_standbys: 0,
-                    inactive_slots: 0,
+                    connected_standbys: None,
+                    inactive_slots: None,
+                    replication_error: None,
                 });
                 continue;
             }
@@ -4525,14 +4537,34 @@ async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliErr
             lag_bytes: status
                 .as_ref()
                 .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
-            connected_standbys: status.as_ref().map_or(
-                0,
-                autumn_harvest::replication::ReplicationStatus::connected_standbys,
-            ),
-            inactive_slots: status.as_ref().map_or(
-                0,
-                autumn_harvest::replication::ReplicationStatus::inactive_slots,
-            ),
+            // `Unavailable` is carried through as `None` rather than counted as
+            // zero standbys: "we cannot see" and "there is nothing there" are
+            // opposite answers to a failover decision.
+            connected_standbys: status.as_ref().and_then(|st| {
+                matches!(
+                    st,
+                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
+                )
+                .then(|| st.connected_standbys())
+            }),
+            inactive_slots: status.as_ref().and_then(|st| {
+                matches!(
+                    st,
+                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
+                )
+                .then(|| st.inactive_slots())
+            }),
+            // `ReplicationStatus` is `#[non_exhaustive]`, so this matches the
+            // two variants it cares about and treats anything else as
+            // observable — a future variant must opt in to being reported as an
+            // outage rather than inherit it.
+            replication_error: match status.as_ref() {
+                Some(autumn_harvest::replication::ReplicationStatus::Unavailable { reason }) => {
+                    Some(reason.clone())
+                }
+                None => Some("replication views could not be queried".to_string()),
+                Some(_) => None,
+            },
         });
     }
 
@@ -4588,20 +4620,42 @@ fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
         let bytes = r
             .lag_bytes
             .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+        // `unreadable`, never `0`: `0` is the definitive "there is no standby
+        // here", and printing it for a role that simply cannot read
+        // `pg_stat_replication` tells an operator mid-failover that DR is down
+        // when the truth is that it is unobservable.
+        let standbys = r
+            .connected_standbys
+            .map_or_else(|| "unreadable".to_string(), |n| n.to_string());
+        let slots = r
+            .inactive_slots
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
         let _ = writeln!(
             s,
             "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
-            r.shard_id, generation, rpo, bytes, r.connected_standbys, r.inactive_slots, r.dsn
+            r.shard_id, generation, rpo, bytes, standbys, slots, r.dsn
         );
     }
     if rows
         .iter()
-        .any(|r| r.reachable && r.connected_standbys == 0)
+        .any(|r| r.reachable && r.connected_standbys == Some(0))
     {
         let _ = writeln!(
             s,
             "\nWARNING: a shard has no connected standby. Its RPO is unbounded and growing; \
              `unknown` above means UNMEASURABLE, not zero."
+        );
+    }
+    // Deliberately a separate, differently-worded line from the warning above.
+    if rows
+        .iter()
+        .any(|r| r.reachable && r.replication_error.is_some())
+    {
+        let _ = writeln!(
+            s,
+            "\nNOTE: a shard's replication views could not be read (usually a missing \
+             `GRANT pg_monitor`), so its standby count and RPO are UNKNOWN — not zero, and not \
+             evidence that replication is down."
         );
     }
     s
