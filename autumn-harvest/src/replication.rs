@@ -75,6 +75,13 @@
 /// queued behind it.
 const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
 
+/// Per-statement ceiling for [`advance_sequences_after_promotion`].
+///
+/// Generous, because a `MAX(col)` over a large un-indexed serial column on a
+/// cold standby is legitimately slow — but bounded, because this runs inside a
+/// 15-minute RTO budget and an unbounded hang is indistinguishable from a wedge.
+const PROMOTE_STATEMENT_TIMEOUT_MS: u64 = 120_000;
+
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -617,8 +624,8 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
-        BUMP_LOCK_TIMEOUT_MS, FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag,
-        StandbyLag, qualified, quote_ident,
+        BUMP_LOCK_TIMEOUT_MS, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus,
+        ShardGeneration, SlotLag, StandbyLag, qualified, quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -924,6 +931,20 @@ mod db {
         shard: ShardId,
         retain: std::time::Duration,
     ) -> HarvestResult<()> {
+        // One writer per shard per tick, whatever the fleet size. Every worker
+        // runs this sampler (each also needs its own self-fence check), so
+        // without the gate a 200-worker fleet writes 200 watermarks and 200
+        // prunes per tick per shard — and the trail then holds `N x retention`
+        // rows rather than the `retention` the migration comment assumes,
+        // which is also what `measure_rpo` has to scan.
+        //
+        // `try` and session-scoped: a worker that loses the race simply skips
+        // the beat this tick and still runs its own fence check and gauges.
+        // A crashed holder's lock is released with its session.
+        if !try_lock_heartbeat(conn, shard).await? {
+            return Ok(());
+        }
+
         diesel::sql_query(
             "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
              VALUES ($1, pg_current_wal_lsn(), NOW()) \
@@ -945,6 +966,42 @@ mod db {
         .await
         .map_err(database_error)?;
 
+        unlock_heartbeat(conn, shard).await
+    }
+
+    /// Advisory-lock class for the per-shard watermark writer.
+    ///
+    /// Arbitrary and stable; paired with the shard id so two shards never
+    /// contend. Chosen high enough not to collide with the `hashtext`-derived
+    /// keys the claim path uses for concurrency keys.
+    const HEARTBEAT_LOCK_CLASS: i32 = 0x0954;
+
+    #[derive(diesel::QueryableByName)]
+    struct LockRow {
+        #[diesel(sql_type = Bool)]
+        locked: bool,
+    }
+
+    async fn try_lock_heartbeat(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<bool> {
+        let rows: Vec<LockRow> = diesel::sql_query("SELECT pg_try_advisory_lock($1, $2) AS locked")
+            .bind::<Integer, _>(HEARTBEAT_LOCK_CLASS)
+            .bind::<Integer, _>(shard.as_i32())
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(rows.into_iter().next().is_some_and(|r| r.locked))
+    }
+
+    async fn unlock_heartbeat(conn: &mut AsyncPgConnection, shard: ShardId) -> HarvestResult<()> {
+        diesel::sql_query("SELECT pg_advisory_unlock($1, $2)")
+            .bind::<Integer, _>(HEARTBEAT_LOCK_CLASS)
+            .bind::<Integer, _>(shard.as_i32())
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1117,6 +1174,18 @@ mod db {
     pub async fn advance_sequences_after_promotion(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Vec<(String, i64)>> {
+        // Promotion sits on the RTO critical path and `MAX(col)` on a serial
+        // column with no index is a full sequential scan of a cold table on a
+        // freshly promoted standby. Bound it: a timeout names the table it gave
+        // up on, which an operator can act on; an unbounded hang inside a
+        // 15-minute RTO budget cannot be distinguished from a wedge.
+        diesel::sql_query(format!(
+            "SET LOCAL statement_timeout = '{PROMOTE_STATEMENT_TIMEOUT_MS}ms'"
+        ))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
         let columns: Vec<SerialColumn> = diesel::sql_query(
             "SELECT tn.nspname::text AS table_schema, \
                     c.relname::text  AS table_name, \

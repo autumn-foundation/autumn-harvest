@@ -100,6 +100,11 @@ events, and stops with `ShardFenced`, incrementing
 > the promoted region just evicted would silently rejoin the fleet, which is
 > exactly the split-brain the epoch exists to prevent.
 
+> **DSNs on the command line are visible to every local user via `ps`, and they
+> land in shell history.** Use passwordless DSNs plus `~/.pgpass` for these
+> commands rather than embedding credentials — the examples here are written
+> that way deliberately.
+
 Confirm every shard moved:
 
 ```bash
@@ -154,6 +159,12 @@ the incident log.
 
 Harmless and idempotent on a physical replica, which replicates sequences
 already. Run it either way rather than remembering which kind you have.
+
+How long it takes scales with your largest **un-indexed** serial column:
+`MAX(col)` is an index scan on a primary key but a full sequential scan
+otherwise, on a cold standby. Each statement is bounded at two minutes and will
+name the table it gave up on. Measure this during the quarterly drill rather
+than discovering it inside the RTO budget.
 
 ### 3. Verify the promoted region is resumable
 

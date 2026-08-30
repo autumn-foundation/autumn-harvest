@@ -5574,6 +5574,264 @@
           "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
         }
       ]
+    },
+    {
+      "id": 940,
+      "type": "row",
+      "title": "Cross-region DR (issue #954)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 125
+      },
+      "panels": []
+    },
+    {
+      "id": 941,
+      "type": "timeseries",
+      "title": "Measured RPO (seconds of acknowledged work a failover would lose)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (shard) (harvest_replication_lag_seconds{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_replication_lag_high (docs/runbooks/harvest-alerts.md#harvest_replication_lag_high) The RPO per shard. A MISSING series means the RPO is UNKNOWN, not zero \u2014 no standby, no slot, or a standby further behind than the retained watermark trail. Pair with the connected-standbys panel: this one says 'slow', that one says 'down'."
+    },
+    {
+      "id": 942,
+      "type": "timeseries",
+      "title": "Connected standbys (0 = replication is DOWN)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (shard) (harvest_replication_standbys{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_replication_down (docs/runbooks/harvest-alerts.md#harvest_replication_down) Live walsenders per shard. 0 means DR is not protecting that shard: the RPO is unbounded and growing, and the lag panel above is silent rather than alarming, which is why this is the 'replication is broken' signal."
+    },
+    {
+      "id": 943,
+      "type": "timeseries",
+      "title": "WAL backlog",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (shard) (harvest_replication_lag_bytes{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Worst-case WAL bytes a standby has not consumed. Survives a disconnected standby (a slot pins WAL with no walsender), so it stays real when the time lag is unknowable \u2014 and it is the disk-pressure signal for an abandoned slot."
+    },
+    {
+      "id": 944,
+      "type": "timeseries",
+      "title": "Shard write-authority generation (watch for SKEW)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (shard) (harvest_shard_generation{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "The fencing epoch each shard's database reports. The value is uninteresting; the SKEW is the point \u2014 shards fail over independently, so lines at different heights mean a half-failed-over cluster."
+    },
+    {
+      "id": 945,
+      "type": "timeseries",
+      "title": "Workers fenced (never self-healing)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 142
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard) (increase(harvest_shard_fenced_total{shard=~\"$shard\"}[$__rate_interval]))",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_shard_fenced (docs/runbooks/harvest-alerts.md#harvest_shard_fenced) Workers that stopped because their pinned generation was superseded. Expected for the old fleet during a planned failover; outside one it means a generation was bumped on a healthy shard. Recovered only by restarting the fleet \u2014 never by re-pinning a worker."
     }
   ]
 }

@@ -296,6 +296,19 @@ reports a live RPO instead of a lag that drifts upward on a healthy system.
 Resolution is bounded below by the sampler interval: a healthy deployment
 reports somewhere between zero and one interval.
 
+Two properties worth knowing before you read the number:
+
+- **The trail is written by the workers.** One worker per shard per tick holds a
+  Postgres advisory lock and writes the watermark, so fleet size does not
+  multiply the writes — but a shard with *no* running workers stops beating, and
+  its reported RPO then grows with the outage rather than with the replication
+  lag. A reading taken after the fleet is stopped is about downtime, not data
+  loss.
+- **An unreadable view emits nothing.** Without `pg_monitor` the sampler logs a
+  warning and skips every DR gauge for that shard rather than publishing zeros.
+  A stale series is the honest representation of "we cannot see"; a zero would
+  page on-call with "replication is down" for a missing `GRANT`.
+
 ---
 
 ## Multi-shard skew

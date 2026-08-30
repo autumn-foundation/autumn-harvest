@@ -19271,9 +19271,25 @@ fn spawn_replication_sampler(
                 }
 
                 match crate::replication::query_replication_status(&mut conn, shard_id).await {
+                    Ok(crate::replication::ReplicationStatus::Unavailable { reason }) => {
+                        // The views could not be read — almost always a missing
+                        // `GRANT pg_monitor`. Emit NOTHING: reporting zero
+                        // standbys here would page on-call with "replication is
+                        // down" for a configuration gap, and the topology doc
+                        // promises this degrades the signal, not the engine.
+                        // A stale series is the honest representation of "we
+                        // cannot see".
+                        tracing::warn!(
+                            shard_id = %shard_id.as_i32(),
+                            reason = %reason,
+                            "replication views unreadable; RPO signal unavailable for this shard \
+                             (a `GRANT pg_monitor` is usually what is missing)"
+                        );
+                    }
                     Ok(status) => {
-                        // Always emitted: `0` standbys is the signal that
-                        // replication is down, and no lag value can carry it.
+                        // Always emitted once the views ARE readable: `0`
+                        // standbys is the signal that replication is down, and
+                        // no lag value can carry it.
                         telemetry.metrics.record_replication_standbys(
                             shard_u16,
                             status.connected_standbys() as u64,
