@@ -238,7 +238,7 @@ fn started(input: Value) -> WorkflowEvent {
     }
 }
 
-fn completed(output: Value) -> WorkflowEvent {
+const fn completed(output: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowCompleted { output }
 }
 
