@@ -101,6 +101,9 @@ impl ReencryptOutcome {
 /// mean walking stored history and replacing ciphertext with plaintext, which
 /// is a crypto-shredding-in-reverse operation nobody asked for. The sweep
 /// refuses to do it and reports zero work instead.
+///
+/// Only the sweep consults this, and the sweep only exists under `db`.
+#[cfg(feature = "db")]
 fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
     codecs.active_codec_id().is_none_or(|id| id == "identity")
 }
