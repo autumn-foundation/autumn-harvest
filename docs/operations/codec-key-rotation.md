@@ -37,17 +37,32 @@ history onto the new key.
 
 ## Wiring it up
 
-> **Read this first.** On the current engine, *no production write path applies
-> a configured `PayloadCodec` at all* — `store::append_events` (and therefore
-> every worker append) encodes with the identity registry, and the worker
-> replays with it too. The configured registry reaches only the read paths
-> (`WorkflowHandleClient`, the management API), which is what ADR-0003's issue
-> #608 addendum plumbed. Until that is fixed, registering a keyed codec
-> encrypts nothing new, the sweep finds nothing to convert, and this runbook
-> describes a rotation that rotates an empty set. It is an ADR-0003 write-path
-> defect rather than a rotation defect, and it is tracked separately;
-> `store::append_events_with_codecs` is the codec-aware seam it will be fixed
-> through.
+> **Read this first — which writes are codec-aware.** Issue #1243 is partly
+> landed, so the answer differs by path. Be precise about this before you plan
+> a rotation, because it decides what the sweep will actually find.
+>
+> **Codec-aware today** — these encode under the configured registry, and the
+> worker replays with the *same* registry, so a mixed-key history round-trips:
+>
+> - every write the worker's task-processing path issues: activity results and
+>   failures, workflow completions and failures, timers, child workflows,
+>   signals, DLQ and quarantine writes;
+> - `ActivityCompleted.output` committed inline by `ctx.run_transactional`;
+> - `ActivityFailed.details` from a broken session;
+> - `WorkflowFailed.details` from the poison-pill reclaimer.
+>
+> **Still identity-only** — `execution.rs`'s start paths, so
+> `WorkflowStarted.input` is stored in the clear even with a keyed codec
+> configured. That is the *first* event of every execution and often the most
+> sensitive payload in it, so treat rotation as incomplete until #1243 closes:
+> the sweep converts the rest of the history, and a start input written before
+> the fix stays plaintext (the sweep never newly encrypts plaintext, by
+> design). It is an ADR-0003 write-path defect rather than a rotation defect.
+>
+> Nothing here is blocked by that gap — every rotation primitive operates
+> correctly on whatever the write path stores, and the census counts only what
+> is genuinely encoded — but a green retirement gate says nothing about start
+> inputs, and neither does a completed sweep.
 
 ```rust
 use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;

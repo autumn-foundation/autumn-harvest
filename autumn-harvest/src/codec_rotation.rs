@@ -597,6 +597,11 @@ mod db {
     /// # Errors
     ///
     /// Propagates database failures. A per-row codec failure is not an error.
+    // The batch loop, the unresolved-vs-complete decision and the
+    // cursor-churn guard are one transaction's worth of reasoning; splitting
+    // them would hide the fact that the cursor written at the end depends on
+    // what every branch above decided.
+    #[allow(clippy::too_many_lines)]
     pub async fn sweep_codec_reencryption_once(
         conn: &mut AsyncPgConnection,
         shard_id: i32,

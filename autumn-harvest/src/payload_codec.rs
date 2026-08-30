@@ -214,9 +214,26 @@ impl<'a> CodecEnvelopeParts<'a> {
 /// carrying a `kid`, a keyed version without one, a non-string or malformed
 /// `kid`, five keys. That preserves the pre-#948 strictness against
 /// near-envelopes (offload envelopes, erase tombstones, business data carrying
-/// its own `codec_id` field) — and, critically, keeps a four-key **version 1**
-/// value classified as plaintext exactly as it was before, so nothing a prior
-/// release could legitimately have stored is reinterpreted as ciphertext.
+/// its own `codec_id` field), and keeps a four-key **version 1** value
+/// classified as plaintext exactly as it was before.
+///
+/// # The one shape this does reinterpret
+///
+/// A pre-#948 reader rejected version 2 outright, so business data shaped
+/// *exactly* like a version-2 envelope — those four keys, integer `2` under the
+/// discriminator, a `kid` passing [`validate_key_id`] — was stored and read back
+/// as plaintext, and is now classified as ciphertext. Replay then fails with
+/// `UnknownCodecKey`, or, if a key with that id happens to be registered,
+/// decodes to garbage the sweep would re-encrypt permanently.
+///
+/// Bumping the version moved this collision rather than removing it: the
+/// envelope is *structurally* indistinguishable from user data that happens to
+/// match, and no choice of version number changes that. Eliminating it needs a
+/// representation user data cannot coincide with, which is an ADR-0003 envelope
+/// change rather than a rotation one. Tracked separately; the probability is
+/// remote (four exact keys under a deliberately obscure discriminator) but the
+/// guarantee is **not** unconditional, and this comment previously claimed it
+/// was.
 fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
     let version = obj.get(CODEC_ENVELOPE_KEY).and_then(Value::as_i64)?;
