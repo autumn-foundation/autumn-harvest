@@ -25,7 +25,11 @@
 //! message when the server is not configured for it; the fencing tests do not
 //! depend on replication at all and always run.
 #![cfg(feature = "db")]
-#![allow(clippy::doc_markdown, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::items_after_statements
+)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -43,12 +47,14 @@ static DB_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// [`FenceRegistry`] is process-global; every test that pins a generation must
 /// hold this so a sibling test cannot observe a half-built registry.
-static REGISTRY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Async-aware, because the guard is deliberately held across `.await`s: the
+/// whole point is to keep a sibling test from observing a half-built registry
+/// while this one is mid-scenario.
+static REGISTRY_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
-    REGISTRY_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    REGISTRY_SERIAL.lock().await
 }
 
 fn admin_url() -> Option<String> {
@@ -60,7 +66,10 @@ fn with_db_name(base: &str, db: &str) -> String {
         .split_once('?')
         .map_or((base, None), |(b, q)| (b, Some(q)));
     let prefix = base.rsplit_once('/').map_or(base, |(p, _)| p);
-    query.map_or_else(|| format!("{prefix}/{db}"), |q| format!("{prefix}/{db}?{q}"))
+    query.map_or_else(
+        || format!("{prefix}/{db}"),
+        |q| format!("{prefix}/{db}?{q}"),
+    )
 }
 
 async fn connect(url: &str) -> AsyncPgConnection {
@@ -127,7 +136,9 @@ async fn a_fresh_database_provisions_generation_zero_and_is_idempotent() {
 async fn bump_is_monotonic_and_records_who_and_why() {
     let (url, _db) = require_db!("bump");
     let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(2)).await.unwrap();
+    ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
 
     assert_eq!(
         bump_generation(&mut conn, ShardId::new(2), "failover to eu-west", "oncall")
@@ -142,7 +153,9 @@ async fn bump_is_monotonic_and_records_who_and_why() {
         ShardGeneration(2)
     );
     assert_eq!(
-        current_generation(&mut conn, ShardId::new(2)).await.unwrap(),
+        current_generation(&mut conn, ShardId::new(2))
+            .await
+            .unwrap(),
         Some(ShardGeneration(2))
     );
 
@@ -165,26 +178,36 @@ async fn bump_is_monotonic_and_records_who_and_why() {
 
 #[tokio::test]
 async fn assert_fence_rejects_a_stale_generation_and_names_both_epochs() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("assert");
     let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(0)).await.unwrap();
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
 
     FenceRegistry::clear();
     FenceRegistry::register(ShardId::new(0), ShardGeneration(0));
     FenceRegistry::set_default_shard(ShardId::new(0));
 
     // Still current: the assert is a no-op.
-    assert_fence(&mut conn, ShardId::new(0)).await.expect("current epoch passes");
+    assert_fence(&mut conn, ShardId::new(0))
+        .await
+        .expect("current epoch passes");
 
     // The promoted primary fences the old region.
-    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall").await.unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
 
     let err = assert_fence(&mut conn, ShardId::new(0))
         .await
         .expect_err("a pinned-stale worker must be rejected");
     match err {
-        autumn_harvest::error::HarvestError::ShardFenced { shard_id, pinned, current } => {
+        autumn_harvest::error::HarvestError::ShardFenced {
+            shard_id,
+            pinned,
+            current,
+        } => {
             assert_eq!(shard_id, 0);
             assert_eq!(pinned, 0);
             assert_eq!(current, Some(1));
@@ -196,11 +219,15 @@ async fn assert_fence_rejects_a_stale_generation_and_names_both_epochs() {
 
 #[tokio::test]
 async fn an_unregistered_process_is_never_fenced() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("optout");
     let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(0)).await.unwrap();
-    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall").await.unwrap();
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
 
     FenceRegistry::clear();
     // No pin => fencing is off => the assert issues no statement and passes.
@@ -211,7 +238,7 @@ async fn an_unregistered_process_is_never_fenced() {
 
 #[tokio::test]
 async fn a_missing_generation_row_fences_a_pinned_worker() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("missingrow");
     let mut conn = connect(&url).await;
     FenceRegistry::clear();
@@ -233,10 +260,12 @@ async fn a_missing_generation_row_fences_a_pinned_worker() {
 
 #[tokio::test]
 async fn a_fenced_worker_cannot_persist_events() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("persist");
     let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(0)).await.unwrap();
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     diesel::sql_query(
@@ -252,7 +281,9 @@ async fn a_fenced_worker_cannot_persist_events() {
     FenceRegistry::clear();
     FenceRegistry::register(ShardId::new(0), ShardGeneration(0));
     FenceRegistry::set_default_shard(ShardId::new(0));
-    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall").await.unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
 
     let event = autumn_harvest::event::WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
@@ -286,10 +317,12 @@ async fn a_fenced_worker_cannot_persist_events() {
 
 #[tokio::test]
 async fn a_fenced_worker_cannot_claim_tasks() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("claim");
     let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(0)).await.unwrap();
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
 
     let params = autumn_harvest::queue::EnqueueParams::new(
         "q-dr",
@@ -324,7 +357,9 @@ async fn a_fenced_worker_cannot_claim_tasks() {
         .execute(&mut conn)
         .await
         .unwrap();
-    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall").await.unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
 
     let after = autumn_harvest::queue::claim_task_on_shard(
         &mut conn,
@@ -353,7 +388,10 @@ async fn a_fenced_worker_cannot_claim_tasks() {
         .await
         .unwrap();
     assert_eq!(rows[0].state, "PENDING");
-    assert_eq!(rows[0].attempt, 1, "the fenced attempt must not burn a retry");
+    assert_eq!(
+        rows[0].attempt, 1,
+        "the fenced attempt must not burn a retry"
+    );
     FenceRegistry::clear();
 }
 
@@ -387,15 +425,19 @@ fn libpq_conninfo(url: &str, db: &str) -> String {
     let rest = url
         .trim_start_matches("postgres://")
         .trim_start_matches("postgresql://");
-    let (userinfo, hostpart) = rest.split_once('@').unwrap_or(("postgres", rest));
-    let (user, password) = userinfo.split_once(':').map_or((userinfo, None), |(u, p)| (u, Some(p)));
-    let hostport = hostpart.split(['/', '?']).next().unwrap_or(hostpart);
-    let (host, port) = hostport.split_once(':').unwrap_or((hostport, "5432"));
-    let mut s = format!("host={host} port={port} user={user} dbname={db}");
+    let (userinfo, after_at) = rest.split_once('@').unwrap_or(("postgres", rest));
+    let (user, password) = userinfo
+        .split_once(':')
+        .map_or((userinfo, None), |(u, p)| (u, Some(p)));
+    let authority = after_at.split(['/', '?']).next().unwrap_or(after_at);
+    let (host, port) = authority.split_once(':').unwrap_or((authority, "5432"));
+    use std::fmt::Write as _;
+
+    let mut conninfo = format!("host={host} port={port} user={user} dbname={db}");
     if let Some(pw) = password {
-        s.push_str(&format!(" password={pw}"));
+        let _ = write!(conninfo, " password={pw}");
     }
-    s
+    conninfo
 }
 
 /// A primary ("region A") and a standby ("region B") wired with stock logical
@@ -439,8 +481,12 @@ async fn wal_level_is_logical(url: &str) -> bool {
         diesel::sql_query("SELECT current_setting('wal_level') AS wal_level")
             .load(&mut conn)
             .await;
-    rows.map(|r| r.into_iter().next().is_some_and(|s| s.wal_level == "logical"))
-        .unwrap_or(false)
+    rows.map(|r| {
+        r.into_iter()
+            .next()
+            .is_some_and(|s| s.wal_level == "logical")
+    })
+    .unwrap_or(false)
 }
 
 /// Build the two-region topology, or `None` when the server cannot host it.
@@ -487,7 +533,13 @@ async fn two_regions(tag: &str) -> Option<Regions> {
     .await
     .expect("subscription");
 
-    Some(Regions { primary_url, primary_db, standby_url, slot, sub })
+    Some(Regions {
+        primary_url,
+        primary_db,
+        standby_url,
+        slot,
+        sub,
+    })
 }
 
 macro_rules! require_regions {
@@ -549,19 +601,25 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
 
     // Healthy: beats are confirmed by the standby within a beat or two.
     for _ in 0..3 {
-        record_replication_heartbeat(&mut a, shard, retain).await.map_err(|e| e.to_string())?;
+        record_replication_heartbeat(&mut a, shard, retain)
+            .await
+            .map_err(|e| e.to_string())?;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     let primary_url = regions.primary_url.clone();
-    eventually("a healthy RPO reading", std::time::Duration::from_secs(30), || {
-        let url = primary_url.clone();
-        async move {
-            let mut conn = connect(&url).await;
-            let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
-        }
-    })
+    eventually(
+        "a healthy RPO reading",
+        std::time::Duration::from_secs(30),
+        || {
+            let url = primary_url.clone();
+            async move {
+                let mut conn = connect(&url).await;
+                let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
+            }
+        },
+    )
     .await;
 
     // Inject lag: hold ACCESS EXCLUSIVE on a replicated table so the
@@ -578,7 +636,9 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
     let stall_started = std::time::Instant::now();
     let injected = std::time::Duration::from_secs(12);
     while stall_started.elapsed() < injected {
-        record_replication_heartbeat(&mut a, shard, retain).await.map_err(|e| e.to_string())?;
+        record_replication_heartbeat(&mut a, shard, retain)
+            .await
+            .map_err(|e| e.to_string())?;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let independently_measured = stall_started.elapsed().as_secs_f64();
@@ -606,7 +666,9 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
     let rpo = status.rpo_seconds().ok_or("status must carry the RPO")?;
     if (rpo - reported).abs() > 2.0 {
         blocker.batch_execute("ROLLBACK").await.ok();
-        return Err(format!("status RPO {rpo} disagrees with measure_rpo {reported}"));
+        return Err(format!(
+            "status RPO {rpo} disagrees with measure_rpo {reported}"
+        ));
     }
     if status.max_lag_bytes().unwrap_or(0) <= 0 {
         blocker.batch_execute("ROLLBACK").await.ok();
@@ -614,17 +676,24 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
     }
 
     // Release the stall; the RPO must recover, not stay latched.
-    blocker.batch_execute("ROLLBACK").await.map_err(|e| e.to_string())?;
+    blocker
+        .batch_execute("ROLLBACK")
+        .await
+        .map_err(|e| e.to_string())?;
     let primary_url = regions.primary_url.clone();
-    eventually("the RPO to recover after the stall clears", std::time::Duration::from_secs(60), || {
-        let url = primary_url.clone();
-        async move {
-            let mut conn = connect(&url).await;
-            let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
-        }
-    })
+    eventually(
+        "the RPO to recover after the stall clears",
+        std::time::Duration::from_secs(60),
+        || {
+            let url = primary_url.clone();
+            async move {
+                let mut conn = connect(&url).await;
+                let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
+            }
+        },
+    )
     .await;
 
     Ok(())
@@ -656,15 +725,19 @@ async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
         }
 
         let primary_url = regions.primary_url.clone();
-        eventually("the walsender to disappear", std::time::Duration::from_secs(30), || {
-            let url = primary_url.clone();
-            async move {
-                let mut conn = connect(&url).await;
-                autumn_harvest::replication::query_replication_status(&mut conn, shard)
-                    .await
-                    .is_ok_and(|s| s.connected_standbys() == 0)
-            }
-        })
+        eventually(
+            "the walsender to disappear",
+            std::time::Duration::from_secs(30),
+            || {
+                let url = primary_url.clone();
+                async move {
+                    let mut conn = connect(&url).await;
+                    autumn_harvest::replication::query_replication_status(&mut conn, shard)
+                        .await
+                        .is_ok_and(|s| s.connected_standbys() == 0)
+                }
+            },
+        )
         .await;
 
         let status = autumn_harvest::replication::query_replication_status(&mut a, shard)
@@ -680,7 +753,11 @@ async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
             status.max_lag_bytes().unwrap_or(0) > 0,
             "the slot still pins WAL, so the byte backlog is knowable and must be reported"
         );
-        assert_eq!(status.inactive_slots(), 1, "the abandoned slot must be visible");
+        assert_eq!(
+            status.inactive_slots(),
+            1,
+            "the abandoned slot must be visible"
+        );
         assert_ne!(
             status.rpo_seconds(),
             Some(0.0),
@@ -699,7 +776,7 @@ async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
 
 #[tokio::test]
 async fn a_promoted_standby_resumes_in_flight_work_and_rejects_the_old_region() {
-    let _serial = registry_guard();
+    let _serial = registry_guard().await;
     let regions = require_regions!("promote");
     let result = promotion_body(&regions).await;
     regions.teardown().await;
@@ -712,7 +789,9 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
     let mut a = connect(&regions.primary_url).await;
 
     // ── Region A is live: an in-flight workflow with a pending task. ───────
-    ensure_generation_row(&mut a, shard).await.map_err(|e| e.to_string())?;
+    ensure_generation_row(&mut a, shard)
+        .await
+        .map_err(|e| e.to_string())?;
     let exec_id = ExecutionId::new_for_shard(shard);
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
@@ -740,18 +819,25 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
         autumn_harvest::queue::TaskType::Workflow,
         serde_json::json!({}),
     );
-    autumn_harvest::queue::enqueue(&mut a, &params).await.map_err(|e| e.to_string())?;
+    autumn_harvest::queue::enqueue(&mut a, &params)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // ── Replication carries it to region B. ───────────────────────────────
     let standby_url = regions.standby_url.clone();
-    eventually("the in-flight workflow to reach region B", std::time::Duration::from_secs(60), || {
-        let url = standby_url.clone();
-        async move {
-            count_on(&url, "SELECT COUNT(*) AS n FROM harvest_events").await == 1
-                && count_on(&url, "SELECT COUNT(*) AS n FROM harvest_task_queue").await == 1
-                && count_on(&url, "SELECT COUNT(*) AS n FROM harvest_shard_generation").await == 1
-        }
-    })
+    eventually(
+        "the in-flight workflow to reach region B",
+        std::time::Duration::from_secs(60),
+        || {
+            let url = standby_url.clone();
+            async move {
+                count_on(&url, "SELECT COUNT(*) AS n FROM harvest_events").await == 1
+                    && count_on(&url, "SELECT COUNT(*) AS n FROM harvest_task_queue").await == 1
+                    && count_on(&url, "SELECT COUNT(*) AS n FROM harvest_shard_generation").await
+                        == 1
+            }
+        },
+    )
     .await;
 
     // ── Region A is gone. Promote B: stop replicating, then FENCE. ────────
@@ -772,7 +858,9 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     assert!(
-        advanced.iter().any(|(name, _)| name.contains("harvest_events_id_seq")),
+        advanced
+            .iter()
+            .any(|(name, _)| name.contains("harvest_events_id_seq")),
         "the promotion helper must advance harvest_events' sequence; advanced: {advanced:?}"
     );
 
@@ -825,7 +913,9 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
     if claim.is_none() {
-        return Err("the promoted region's worker must be able to claim the replicated task".into());
+        return Err(
+            "the promoted region's worker must be able to claim the replicated task".into(),
+        );
     }
 
     let done = autumn_harvest::event::WorkflowEvent::WorkflowCompleted {
@@ -836,9 +926,15 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
         .map_err(|e| format!("the promoted region must be able to append: {e}"))?;
 
     // ── No fork: exactly one continuous history, extended not branched. ───
-    let n = count_on(&regions.standby_url, "SELECT COUNT(*) AS n FROM harvest_events").await;
+    let n = count_on(
+        &regions.standby_url,
+        "SELECT COUNT(*) AS n FROM harvest_events",
+    )
+    .await;
     if n != 2 {
-        return Err(format!("expected a single 2-event history on the new primary, found {n}"));
+        return Err(format!(
+            "expected a single 2-event history on the new primary, found {n}"
+        ));
     }
     let forks = count_on(
         &regions.standby_url,

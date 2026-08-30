@@ -280,8 +280,6 @@ pub mod queue_pause;
 /// DB-gated.
 pub mod quota;
 pub mod replay;
-/// Cross-region DR fencing and replication-lag measurement (issue #954).
-pub mod replication;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
 /// Carries the pure, database-free vocabulary shared by the sample export
@@ -289,6 +287,8 @@ pub mod replication;
 /// CLI bundle writer, and [`testing::ReplayVerifier::replay_bundle`], so the
 /// bundle wire shape cannot drift between producer and consumer.
 pub mod replay_sample;
+/// Cross-region DR fencing and replication-lag measurement (issue #954).
+pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;

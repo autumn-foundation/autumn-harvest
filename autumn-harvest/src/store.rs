@@ -237,7 +237,6 @@ pub async fn append_events_offloaded(
     // appending to a history another region now owns.
     crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
-
     let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     for row in &mut rows {

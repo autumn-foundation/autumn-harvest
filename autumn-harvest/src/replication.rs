@@ -182,9 +182,10 @@ impl ReplicationStatus {
     pub fn rpo_seconds(&self) -> Option<f64> {
         match self {
             Self::Unavailable { .. } => None,
-            Self::Observed { heartbeat_lag_seconds, .. } => {
-                heartbeat_lag_seconds.or_else(|| self.max_replay_lag_seconds())
-            }
+            Self::Observed {
+                heartbeat_lag_seconds,
+                ..
+            } => heartbeat_lag_seconds.or_else(|| self.max_replay_lag_seconds()),
         }
     }
 
@@ -208,7 +209,9 @@ impl ReplicationStatus {
         standbys
             .iter()
             .filter_map(|s| s.replay_lag_seconds)
-            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+            .fold(None, |acc: Option<f64>, v| {
+                Some(acc.map_or(v, |a| a.max(v)))
+            })
     }
 
     /// Worst-case WAL backlog in bytes across standbys **and** slots.
@@ -218,7 +221,10 @@ impl ReplicationStatus {
     /// [`Self::max_replay_lag_seconds`] unknowable.
     #[must_use]
     pub fn max_lag_bytes(&self) -> Option<i64> {
-        let Self::Observed { standbys, slots, .. } = self else {
+        let Self::Observed {
+            standbys, slots, ..
+        } = self
+        else {
             return None;
         };
         standbys
@@ -234,7 +240,7 @@ impl ReplicationStatus {
     /// deliberately *not* expressed as a lag threshold, because a dead standby
     /// produces no lag reading to threshold.
     #[must_use]
-    pub fn connected_standbys(&self) -> usize {
+    pub const fn connected_standbys(&self) -> usize {
         match self {
             Self::Unavailable { .. } => 0,
             Self::Observed { standbys, .. } => standbys.len(),
@@ -249,6 +255,71 @@ impl ReplicationStatus {
             Self::Observed { slots, .. } => slots.iter().filter(|s| !s.active).count(),
         }
     }
+}
+
+// ── Process-global DR configuration ────────────────────────────────────────
+
+/// The DR knobs, published once per process.
+///
+/// These live beside [`FenceRegistry`] rather than on `WorkerRuntimeConfig`
+/// for the reason `crate::mutex::set_mutex_lease_ttl` does: the runtime config
+/// is constructed literally at ~50 call sites, and three new required fields
+/// would be 50 mechanical edits obscuring the change that matters. It is also
+/// the more coherent home — the pin these knobs govern is *already* process-
+/// global, because the persist assert has to reach 100+ `append_events` call
+/// sites without a config in hand.
+///
+/// Published by `From<WorkerConfig> for WorkerRuntimeConfig`, which is the
+/// single choke point every worker's configuration passes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrConfig {
+    /// Whether write-authority fencing is enabled for this process.
+    pub fencing: bool,
+    /// DR sampler cadence: the RPO's resolution floor and the bound on
+    /// fence-detection latency.
+    pub sample_interval: std::time::Duration,
+    /// Trailing watermark retention: the ceiling on measurable lag.
+    pub watermark_retain: std::time::Duration,
+}
+
+impl Default for DrConfig {
+    /// Fencing **off**, which is byte-for-byte the pre-#954 runtime.
+    fn default() -> Self {
+        Self {
+            fencing: false,
+            sample_interval: std::time::Duration::from_secs(15),
+            watermark_retain: std::time::Duration::from_secs(3600),
+        }
+    }
+}
+
+static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
+
+/// Publish this process's DR configuration.
+///
+/// Called from `From<WorkerConfig> for WorkerRuntimeConfig`. Last write wins;
+/// a process running two workers with different DR settings is a
+/// misconfiguration this deliberately does not try to paper over — the
+/// registry it governs is process-global too, so there is no coherent
+/// per-worker answer.
+pub fn set_dr_config(config: DrConfig) {
+    let mut guard = DR_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(config);
+    drop(guard);
+}
+
+/// This process's DR configuration, or the fencing-off default.
+#[must_use]
+pub fn dr_config() -> DrConfig {
+    let guard = DR_CONFIG
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let found = guard.unwrap_or_default();
+    drop(guard);
+    found
 }
 
 // ── Fence registry ─────────────────────────────────────────────────────────
@@ -287,9 +358,17 @@ pub struct FenceRegistry;
 impl FenceRegistry {
     /// Pin `shard` at `generation` for the lifetime of this process.
     pub fn register(shard: ShardId, generation: ShardGeneration) {
-        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pinned = guard.get_or_insert_with(Pinned::default);
-        pinned.generations.insert(shard.as_i32(), generation);
+        {
+            let mut guard = PINNED
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pinned = guard.get_or_insert_with(Pinned::default);
+            pinned.generations.insert(shard.as_i32(), generation);
+            drop(guard);
+        }
+        // Published only after the map is visible and the lock is released, so
+        // a reader that observes `is_enabled() == true` can never then find an
+        // empty registry.
         ENABLED.store(true, Ordering::Release);
     }
 
@@ -300,8 +379,11 @@ impl FenceRegistry {
     /// the pool's default shard exactly as [`crate::shard::ShardedDbPool`]
     /// routes them.
     pub fn set_default_shard(shard: ShardId) {
-        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get_or_insert_with(Pinned::default).default_shard = Some(shard);
+        drop(guard);
     }
 
     /// The generation pinned for `shard`, or `None` when this shard is not
@@ -311,14 +393,19 @@ impl FenceRegistry {
         if !Self::is_enabled() {
             return None;
         }
-        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pinned = guard.as_ref()?;
-        let key = if shard.is_unencoded() {
-            pinned.default_shard?.as_i32()
-        } else {
-            shard.as_i32()
-        };
-        pinned.generations.get(&key).copied()
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().and_then(|pinned| {
+            let key = if shard.is_unencoded() {
+                pinned.default_shard?.as_i32()
+            } else {
+                shard.as_i32()
+            };
+            pinned.generations.get(&key).copied()
+        });
+        drop(guard);
+        found
     }
 
     /// The shard whose fencing row backs `shard`, resolving
@@ -328,8 +415,12 @@ impl FenceRegistry {
         if !shard.is_unencoded() {
             return Some(shard);
         }
-        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref()?.default_shard
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().and_then(|p| p.default_shard);
+        drop(guard);
+        found
     }
 
     /// Whether any shard is fenced in this process.
@@ -345,13 +436,17 @@ impl FenceRegistry {
     /// surface.
     #[must_use]
     pub fn snapshot() -> Vec<(ShardId, ShardGeneration)> {
-        let guard = PINNED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().map_or_else(Vec::new, |p| {
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = guard.as_ref().map_or_else(Vec::new, |p| {
             p.generations
                 .iter()
                 .map(|(k, v)| (ShardId::new(*k), *v))
                 .collect()
-        })
+        });
+        drop(guard);
+        snapshot
     }
 
     /// Drop every pin, returning the process to the unfenced default.
@@ -359,8 +454,13 @@ impl FenceRegistry {
     /// For tests and for a CLI process that pinned a generation only to run one
     /// command. A *worker* must never call this: see the type docs.
     pub fn clear() {
-        let mut guard = PINNED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = None;
+        {
+            let mut guard = PINNED
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = None;
+            drop(guard);
+        }
         ENABLED.store(false, Ordering::Release);
     }
 }
@@ -372,9 +472,7 @@ mod db {
     use diesel::sql_types::{BigInt, Bool, Double, Integer, Nullable, Text};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-    use super::{
-        FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag,
-    };
+    use super::{FenceRegistry, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag};
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
 
@@ -400,7 +498,10 @@ mod db {
         .load(conn)
         .await
         .map_err(database_error)?;
-        Ok(rows.into_iter().next().map(|r| ShardGeneration(r.generation)))
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|r| ShardGeneration(r.generation)))
     }
 
     /// Provision this shard's fencing row if it is absent, and return the
@@ -437,12 +538,15 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        rows.into_iter().next().map(|r| ShardGeneration(r.generation)).ok_or_else(|| {
-            crate::error::HarvestError::Database(format!(
-                "harvest_shard_generation row for shard {} could not be provisioned",
-                shard.as_i32()
-            ))
-        })
+        rows.into_iter()
+            .next()
+            .map(|r| ShardGeneration(r.generation))
+            .ok_or_else(|| {
+                crate::error::HarvestError::Database(format!(
+                    "harvest_shard_generation row for shard {} could not be provisioned",
+                    shard.as_i32()
+                ))
+            })
     }
 
     /// Revoke the old region's write authority: bump this shard's epoch.
@@ -490,12 +594,15 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        rows.into_iter().next().map(|r| ShardGeneration(r.generation)).ok_or_else(|| {
-            crate::error::HarvestError::NotFound(format!(
-                "no harvest_shard_generation row for shard {} — provision it before fencing",
-                shard.as_i32()
-            ))
-        })
+        rows.into_iter()
+            .next()
+            .map(|r| ShardGeneration(r.generation))
+            .ok_or_else(|| {
+                crate::error::HarvestError::NotFound(format!(
+                    "no harvest_shard_generation row for shard {} — provision it before fencing",
+                    shard.as_i32()
+                ))
+            })
     }
 
     /// Assert that this process still holds write authority for `shard`.
@@ -721,6 +828,11 @@ mod db {
             .map(|v| v.max(0.0)))
     }
 
+    /// A `(table, column, sequence)` triple from the catalog.
+    ///
+    /// The `_name` suffixes are the catalog's own vocabulary and are kept
+    /// verbatim so the struct reads like the query that fills it.
+    #[allow(clippy::struct_field_names)]
     #[derive(diesel::QueryableByName)]
     struct SerialColumn {
         #[diesel(sql_type = Text)]
@@ -921,11 +1033,19 @@ mod tests {
     }
 
     fn standby(state: &str, lag: Option<f64>, bytes: Option<i64>) -> StandbyLag {
-        StandbyLag { state: state.to_string(), replay_lag_seconds: lag, lag_bytes: bytes }
+        StandbyLag {
+            state: state.to_string(),
+            replay_lag_seconds: lag,
+            lag_bytes: bytes,
+        }
     }
 
     fn observed(standbys: Vec<StandbyLag>, slots: Vec<SlotLag>) -> ReplicationStatus {
-        ReplicationStatus::Observed { standbys, slots, heartbeat_lag_seconds: None }
+        ReplicationStatus::Observed {
+            standbys,
+            slots,
+            heartbeat_lag_seconds: None,
+        }
     }
 
     // ── RPO source-of-truth precedence ─────────────────────────────────────
@@ -963,7 +1083,10 @@ mod tests {
     fn an_rpo_with_no_source_is_unknown_not_zero() {
         assert_eq!(observed(vec![], vec![]).rpo_seconds(), None);
         assert_eq!(
-            ReplicationStatus::Unavailable { reason: "no grant".into() }.rpo_seconds(),
+            ReplicationStatus::Unavailable {
+                reason: "no grant".into()
+            }
+            .rpo_seconds(),
             None
         );
     }
@@ -972,13 +1095,19 @@ mod tests {
     #[test]
     fn no_standbys_reports_unknown_lag_not_zero() {
         let s = observed(vec![], vec![]);
-        assert_eq!(s.max_replay_lag_seconds(), None, "an empty standby set must be UNKNOWN, not 0");
+        assert_eq!(
+            s.max_replay_lag_seconds(),
+            None,
+            "an empty standby set must be UNKNOWN, not 0"
+        );
         assert_eq!(s.connected_standbys(), 0);
     }
 
     #[test]
     fn unavailable_reports_unknown_lag() {
-        let s = ReplicationStatus::Unavailable { reason: "permission denied".into() };
+        let s = ReplicationStatus::Unavailable {
+            reason: "permission denied".into(),
+        };
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), None);
         assert_eq!(s.connected_standbys(), 0);
@@ -1016,7 +1145,11 @@ mod tests {
         // backlog is not.
         let s = observed(
             vec![],
-            vec![SlotLag { slot_name: "harvest_dr_s0".into(), active: false, lag_bytes: Some(77) }],
+            vec![SlotLag {
+                slot_name: "harvest_dr_s0".into(),
+                active: false,
+                lag_bytes: Some(77),
+            }],
         );
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), Some(77));
@@ -1033,7 +1166,10 @@ mod tests {
 
         FenceRegistry::register(ShardId::new(3), ShardGeneration(7));
         assert!(FenceRegistry::is_enabled());
-        assert_eq!(FenceRegistry::expected(ShardId::new(3)), Some(ShardGeneration(7)));
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(3)),
+            Some(ShardGeneration(7))
+        );
         assert_eq!(FenceRegistry::expected(ShardId::new(4)), None);
 
         FenceRegistry::clear();

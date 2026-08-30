@@ -137,6 +137,18 @@ pub struct WorkerConfigView {
     pub query_timeout_ms: u64,
     /// Priority-aging period in seconds (`null` = aging disabled).
     pub priority_aging_secs: Option<u32>,
+    /// Whether cross-region DR write-authority fencing is enabled (issue #954).
+    ///
+    /// The single most consequential DR setting to be able to read back from a
+    /// running fleet: with it off, a failover fence does not bite on this
+    /// worker at all.
+    pub dr_fencing: bool,
+    /// DR sampler cadence, milliseconds — the RPO's resolution floor and the
+    /// bound on fence-detection latency (issue #954).
+    pub replication_sample_interval_ms: u64,
+    /// Trailing watermark retention, milliseconds — the ceiling on measurable
+    /// replication lag (issue #954).
+    pub replication_watermark_retain_ms: u64,
     /// Maximum workflow start delay, milliseconds.
     pub max_workflow_start_delay_ms: u64,
     /// Grace window before cross-workflow signaling fails for an unknown target, milliseconds.
@@ -268,6 +280,11 @@ impl WorkerConfigView {
     /// [`sharded_pool_configured`]: Self::sharded_pool_configured
     /// [`sharded_pool_shard_count`]: Self::sharded_pool_shard_count
     #[must_use]
+    // The body is one exhaustive destructure plus one field-for-field mapping,
+    // so the line count is the size of `WorkerConfig`, not of any control flow.
+    // Splitting it would mean splitting the `..`-free pattern that IS the #695
+    // coverage guard, which is the one thing this function must not do.
+    #[allow(clippy::too_many_lines)]
     pub fn from_worker_config_with_resolved_sharding(
         worker: &WorkerConfig,
         poll_interval: Duration,
@@ -312,6 +329,9 @@ impl WorkerConfigView {
             deployment_name,
             query_timeout,
             priority_aging_secs,
+            dr_fencing,
+            replication_sample_interval,
+            replication_watermark_retain,
             max_workflow_start_delay,
             unknown_target_grace_window,
             poison_pill_threshold,
@@ -364,6 +384,9 @@ impl WorkerConfigView {
             deployment_name: deployment_name.clone(),
             query_timeout_ms: dur_ms(*query_timeout),
             priority_aging_secs: *priority_aging_secs,
+            dr_fencing: *dr_fencing,
+            replication_sample_interval_ms: dur_ms(*replication_sample_interval),
+            replication_watermark_retain_ms: dur_ms(*replication_watermark_retain),
             max_workflow_start_delay_ms: dur_ms(*max_workflow_start_delay),
             unknown_target_grace_window_ms: dur_ms(*unknown_target_grace_window),
             poison_pill_threshold: *poison_pill_threshold,

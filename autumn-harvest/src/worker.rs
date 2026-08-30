@@ -370,6 +370,15 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         // `start_idempotency::set_purge_window_secs` threads a duration knob
         // without a new field on every call site.
         crate::mutex::set_mutex_lease_ttl(cfg.mutex_lease_ttl);
+        // Same pattern, same reason (issue #954): publish the DR knobs to the
+        // process-global they govern rather than adding three required fields
+        // to a struct built literally at ~50 call sites. See
+        // `crate::replication::DrConfig`.
+        crate::replication::set_dr_config(crate::replication::DrConfig {
+            fencing: cfg.dr_fencing,
+            sample_interval: cfg.replication_sample_interval,
+            watermark_retain: cfg.replication_watermark_retain,
+        });
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
             && lock.is_none()
@@ -19153,6 +19162,154 @@ fn spawn_worker_slot_sampler(
     })
 }
 
+/// Spawn the cross-region DR sampler (issue #954).
+///
+/// One task, three jobs, all on the same cadence and all per shard:
+///
+/// 1. **Beat.** Write a replication watermark — a wall-clock instant stamped
+///    against the current WAL position. This is what lets a standby's byte
+///    position be translated into a measured RPO, and it keeps WAL moving on an
+///    idle primary so an idle deployment reports a live RPO instead of a
+///    spuriously growing one.
+/// 2. **Measure.** Read the replication views and emit the RPO gauges. The lag
+///    gauge is emitted **only when the RPO is actually known**; the standby
+///    count is emitted always, because `0` is the "replication is down" signal
+///    and a lag gauge cannot express it.
+/// 3. **Self-fence.** Re-check this worker's pinned generation. On a mismatch
+///    the worker has lost write authority for that shard: count it, say so at
+///    `ERROR`, and shut the whole worker down.
+///
+/// # Why the whole worker, and not just that shard
+///
+/// A fence means another region owns this data now. Continuing to poll sibling
+/// shards would leave a half-live worker whose fleet membership, capability
+/// evidence and session state are all still advertised — and, on a
+/// single-shard deployment, indistinguishable from a healthy one. Stopping is
+/// also what makes the failover runbook's "old-region workers self-fence on
+/// reconnect" a fact rather than a hope. A worker that has stopped is loudly
+/// visible; a worker that is quietly claiming nothing is not.
+///
+/// The pin is **never** refreshed from the database. Adopting the new
+/// generation would let a stale worker rejoin the fleet it was just evicted
+/// from, which is exactly the split-brain the epoch exists to prevent.
+#[cfg(feature = "db")]
+fn spawn_replication_sampler(
+    sharded_pool: crate::shard::ShardedDbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+    watermark_retain: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+                let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
+                let Ok(mut conn) = shard_pool.get().await else {
+                    // A pool that cannot be reached is already covered by the
+                    // worker's own liveness signals; a DR sample is not worth a
+                    // second alarm for the same condition.
+                    continue;
+                };
+
+                if let Err(error) = crate::replication::record_replication_heartbeat(
+                    &mut conn,
+                    shard_id,
+                    watermark_retain,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        shard_id = %shard_id.as_i32(),
+                        error = %error,
+                        "replication watermark write failed"
+                    );
+                }
+
+                match crate::replication::query_replication_status(&mut conn, shard_id).await {
+                    Ok(status) => {
+                        // Always emitted: `0` standbys is the signal that
+                        // replication is down, and no lag value can carry it.
+                        telemetry.metrics.record_replication_standbys(
+                            shard_u16,
+                            status.connected_standbys() as u64,
+                        );
+                        if let Some(bytes) = status.max_lag_bytes() {
+                            telemetry
+                                .metrics
+                                .record_replication_lag_bytes(shard_u16, bytes);
+                        }
+                        // Emitted ONLY when known. Publishing 0.0 for "unknown"
+                        // would read as a perfect RPO for replication that is
+                        // dead — see METRIC_REPLICATION_LAG_SECONDS.
+                        if let Some(seconds) = status.rpo_seconds() {
+                            telemetry
+                                .metrics
+                                .record_replication_lag_seconds(shard_u16, seconds);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "replication status query failed"
+                        );
+                    }
+                }
+
+                if let Ok(Some(generation)) =
+                    crate::replication::current_generation(&mut conn, shard_id).await
+                {
+                    telemetry
+                        .metrics
+                        .record_shard_generation(shard_u16, generation.as_i64());
+                }
+
+                match crate::replication::assert_fence(&mut conn, shard_id).await {
+                    Ok(()) => {}
+                    Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: fenced,
+                        pinned,
+                        current,
+                    }) => {
+                        telemetry.metrics.record_shard_fenced(shard_u16);
+                        tracing::error!(
+                            shard_id = fenced,
+                            pinned_generation = pinned,
+                            current_generation = ?current,
+                            "FENCED: this worker is pinned to a superseded shard generation and \
+                             another region now holds write authority. Shutting down. Do NOT \
+                             restart against the old region — see \
+                             docs/runbooks/cross-region-failover.md"
+                        );
+                        cancel.cancel();
+                        return;
+                    }
+                    Err(error) => {
+                        // A transient failure to *read* the fence is not a
+                        // fence. Fencing is enforced structurally in the claim
+                        // and persist paths regardless, so the safe response
+                        // here is to log and retry next tick rather than take a
+                        // healthy fleet down on a blip.
+                        tracing::warn!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "DR fence re-check failed; the claim and persist gates still apply"
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Spawn the stranded-work sampler (issue #522).
 ///
 /// Iterates every shard visible through the pool (not just the shards this
@@ -19491,6 +19648,10 @@ struct WorkerMonitoringHandles {
     workflow_active_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Cross-region DR sampler (issue #954): replication watermark beat,
+    /// measured-RPO gauges, and this worker's periodic self-fence check.
+    /// `Some` only when `dr_fencing` is enabled and a sharded pool exists.
+    replication_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
     /// itself no-ops when metrics are disabled); `None` without `db`.
     schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
@@ -20569,6 +20730,12 @@ impl Worker {
         // `default_pool`.
         let shard_pools_for_pressure: Vec<DbPool> =
             shard_targets.iter().map(|(_, p)| p.clone()).collect();
+        // Fence FIRST: pinning must precede fleet registration and the first
+        // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
+        if !self.pin_dr_generations(default_pool).await {
+            self.shutdown.cancel();
+            return;
+        }
         let monitors = self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure);
         let heartbeat_cancel = CancellationToken::new();
 
@@ -20671,6 +20838,7 @@ impl Worker {
                     .poll_once(
                         &shard_targets[idx].1,
                         shard_acquire_bound(true, self.config.poll_interval),
+                        Some(shard_targets[idx].0),
                     )
                     .await
                 {
@@ -20812,6 +20980,11 @@ impl Worker {
         {
             tracing::warn!(error = %error, "stranded-work sampler failed during shutdown");
         }
+        if let Some(handle) = monitors.replication_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "DR replication sampler failed during shutdown");
+        }
         if let Some(handle) = monitors.schedule_overdue_sampler
             && let Err(error) = handle.await
         {
@@ -20886,6 +21059,13 @@ impl Worker {
         // its poll loop: the heartbeat is what retries and eventually clears it,
         // and the poll loop must observe that clearing to resume claiming. See
         // `may_claim_tasks` for why an unregistered worker must not claim.
+        // Fence FIRST: pinning must precede fleet registration and the first
+        // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
+        if !self.pin_dr_generations(pool).await {
+            self.shutdown.cancel();
+            return;
+        }
+
         let registration_pending =
             Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
 
@@ -20959,6 +21139,97 @@ impl Worker {
     // other sampler in this function is unaffected and keeps using `pool`
     // alone, matching the pre-existing single-default-pool pattern
     // documented below.
+    /// Pin this worker's cross-region DR write-authority epoch for every shard
+    /// it can reach (issue #954).
+    ///
+    /// Runs **before** the worker registers in the fleet or claims anything, so
+    /// there is no window in which a DR-enabled worker is unfenced. For each
+    /// shard it provisions the `harvest_shard_generation` row if absent and
+    /// pins whatever epoch is in force; from then on the claim gate and the
+    /// persist assert compare against that pinned value.
+    ///
+    /// # Fail closed
+    ///
+    /// If a shard's epoch cannot be read, this **refuses to start the worker**
+    /// rather than running unfenced. An operator who asked for `dr_fencing`
+    /// asked for a guarantee, and a worker that silently downgraded to
+    /// "no fencing today" because of a startup blip is worse than one that does
+    /// not start: the blip is visible and a supervisor retries it, whereas the
+    /// silent downgrade is discovered during a failover.
+    ///
+    /// A no-op when `dr_fencing` is off — no statement is issued.
+    #[cfg(feature = "db")]
+    async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
+        use crate::replication::FenceRegistry;
+
+        if !crate::replication::dr_config().fencing {
+            return true;
+        }
+
+        // `(shard, pool)` for every shard this worker can reach. A legacy
+        // single-pool worker has no shard identity, so it pins under the shard
+        // its assignments name (or `ShardId::new(0)`) and registers that as the
+        // default, which is what `ShardId::UNENCODED` execution ids resolve to.
+        let targets: Vec<(crate::types::ShardId, DbPool)> =
+            self.config.sharded_pool.as_ref().map_or_else(
+                || {
+                    // UFCS: diesel's blanket `RunQueryDsl::first` is in scope
+                    // in this module and shadows `slice::first` on a `Vec`.
+                    let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments)
+                        .copied()
+                        .unwrap_or_else(|| crate::types::ShardId::new(0));
+                    vec![(shard, fallback_pool.clone())]
+                },
+                |sp| {
+                    sp.iter_shards()
+                        .map(|(id, pool)| (id, pool.clone()))
+                        .collect()
+                },
+            );
+
+        let default_shard = <[(crate::types::ShardId, DbPool)]>::first(&targets).map(|(id, _)| *id);
+        for (shard_id, pool) in &targets {
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::error!(
+                        worker_id = %self.config.worker_id,
+                        shard_id = %shard_id.as_i32(),
+                        error = %error,
+                        "dr_fencing is enabled but this shard's connection could not be \
+                         acquired; refusing to start unfenced"
+                    );
+                    return false;
+                }
+            };
+            match crate::replication::ensure_generation_row(&mut conn, *shard_id).await {
+                Ok(generation) => {
+                    FenceRegistry::register(*shard_id, generation);
+                    tracing::info!(
+                        worker_id = %self.config.worker_id,
+                        shard_id = %shard_id.as_i32(),
+                        generation = generation.as_i64(),
+                        "pinned shard write-authority generation for cross-region DR fencing"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        worker_id = %self.config.worker_id,
+                        shard_id = %shard_id.as_i32(),
+                        error = %error,
+                        "dr_fencing is enabled but this shard's generation could not be \
+                         provisioned or read; refusing to start unfenced"
+                    );
+                    return false;
+                }
+            }
+        }
+        if let Some(shard) = default_shard {
+            FenceRegistry::set_default_shard(shard);
+        }
+        true
+    }
+
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn spawn_monitoring_tasks(
         &self,
@@ -21319,6 +21590,36 @@ impl Worker {
             )
         });
 
+        // Cross-region DR sampler (issue #954): measured RPO + this worker's
+        // periodic self-fence check. Only started when the operator opted into
+        // `dr_fencing` AND a sharded pool is available; a deployment that has
+        // not opted in spawns nothing and pays nothing.
+        //
+        // Deliberately NOT gated on `metrics.is_enabled()`, unlike the samplers
+        // around it: two of its three jobs are correctness, not observability.
+        // The watermark beat is what makes an RPO measurable at all, and the
+        // self-fence check is what stops a worker that has lost write
+        // authority. Neither may be silently switched off by a deployment that
+        // simply has no metrics sink.
+        #[cfg(feature = "db")]
+        let replication_sampler = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .filter(|_| crate::replication::dr_config().fencing)
+            .map(|sp| {
+                let dr = crate::replication::dr_config();
+                spawn_replication_sampler(
+                    sp.clone(),
+                    self.shutdown.clone(),
+                    self.registry.telemetry().clone(),
+                    dr.sample_interval,
+                    dr.watermark_retain,
+                )
+            });
+        #[cfg(not(feature = "db"))]
+        let replication_sampler: Option<tokio::task::JoinHandle<()>> = None;
+
         // Stranded-work sampler (issue #522): emits a gauge per shard showing
         // how many claimable tasks have no live covering worker. Iterates ALL
         // shards visible through the pool (not just assigned shards) so an
@@ -21383,6 +21684,7 @@ impl Worker {
             workflow_active_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
+            replication_sampler,
             schedule_overdue_sampler,
             queue_pause_sampler,
             slot_tuners,
@@ -21478,7 +21780,11 @@ impl Worker {
             }
 
             if self
-                .poll_once(pool, shard_acquire_bound(false, self.config.poll_interval))
+                .poll_once(
+                    pool,
+                    shard_acquire_bound(false, self.config.poll_interval),
+                    shard,
+                )
                 .await
             {
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
@@ -21644,6 +21950,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "stranded-work sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.replication_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "DR replication sampler failed during shutdown"
             );
         }
         if let Some(handle) = monitors.schedule_overdue_sampler
@@ -21924,7 +22239,12 @@ impl Worker {
     /// several shards in sequence, so an exhausted pool on one shard cannot
     /// park the loop and strand its peers -- see `shard_acquire_bound`.
     #[allow(clippy::too_many_lines)]
-    async fn poll_once(&self, pool: &DbPool, acquire_bound: Option<Duration>) -> bool {
+    async fn poll_once(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -21963,7 +22283,7 @@ impl Worker {
 
             for queue_name in &ordered {
                 let single_queue = std::slice::from_ref(queue_name);
-                match queue::claim_task(
+                match queue::claim_task_on_shard(
                     &mut conn,
                     single_queue,
                     &self.config.worker_id,
@@ -21971,6 +22291,7 @@ impl Worker {
                     self.config.priority_aging_secs,
                     circuit_breaker_activities,
                     &self.ineligible_activities,
+                    shard,
                 )
                 .await
                 {
@@ -22004,7 +22325,7 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task(
+        match queue::claim_task_on_shard(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
@@ -22012,6 +22333,7 @@ impl Worker {
             self.config.priority_aging_secs,
             circuit_breaker_activities,
             &self.ineligible_activities,
+            shard,
         )
         .await
         {
@@ -24445,6 +24767,9 @@ mod tests {
     #[test]
     fn worker_config_from_builder() {
         let builder_cfg = WorkerConfig {
+            dr_fencing: false,
+            replication_sample_interval: Duration::from_secs(15),
+            replication_watermark_retain: Duration::from_secs(3600),
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
             shard_notification_database_urls: Vec::new(),

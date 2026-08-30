@@ -4824,21 +4824,6 @@ mod tests {
              claim path; got:\n{sql}"
         );
     }
-
-    /// **A paused activity must never hold a workflow task.**
-    ///
-    /// `harvest_task_queue.activity_name` is `Nullable<Text>`: workflow tasks
-    /// carry `NULL`. In SQL, `NULL = ANY(array)` is `NULL`, and `NOT NULL` is
-    /// `NULL` — which is not `TRUE`, so a bare
-    /// `NOT (activity_name = ANY(paused))` silently filters out **every
-    /// workflow task in the fleet** the instant any one activity is paused.
-    /// That is a total orchestration outage produced by a surgical containment
-    /// control — the exact inverse of this feature's purpose.
-    ///
-    /// The `$6` capability-miss gate already defends against this with a
-    /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
-    /// pins the same defence onto the pause gate so it can never be dropped.
-
     // ── Cross-region DR fencing (issue #954) ───────────────────────────────
 
     /// The unfenced query is the pre-#954 string, byte for byte.
@@ -4910,6 +4895,20 @@ mod tests {
             assert!(fenced.contains(gate), "fenced form dropped {gate}");
         }
     }
+
+    /// **A paused activity must never hold a workflow task.**
+    ///
+    /// `harvest_task_queue.activity_name` is `Nullable<Text>`: workflow tasks
+    /// carry `NULL`. In SQL, `NULL = ANY(array)` is `NULL`, and `NOT NULL` is
+    /// `NULL` — which is not `TRUE`, so a bare
+    /// `NOT (activity_name = ANY(paused))` silently filters out **every
+    /// workflow task in the fleet** the instant any one activity is paused.
+    /// That is a total orchestration outage produced by a surgical containment
+    /// control — the exact inverse of this feature's purpose.
+    ///
+    /// The `$6` capability-miss gate already defends against this with a
+    /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
+    /// pins the same defence onto the pause gate so it can never be dropped.
 
     #[test]
     fn claim_query_activity_pause_gate_never_holds_workflow_tasks() {
