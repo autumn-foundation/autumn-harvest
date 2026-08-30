@@ -29,7 +29,7 @@ function.
 
 ### Harness correction (post-review)
 
-A GitHub Codex review of the PR that introduced this harness caught five
+A GitHub Codex review of the PR that introduced this harness caught six
 realism gaps in the fixture across several review rounds, all now fixed and
 reflected in every number on this page:
 
@@ -119,6 +119,20 @@ reflected in every number on this page:
    (`a_compensation_dispatch_is_not_read_as_a_same_named_forward_node` et
    al.), which don't need this fixture's history to be internally consistent
    with a *different* run's terminal-failure state.
+6. **The condition-skip markers had no configured condition to justify them,
+   found in the next review round.** The real walker only records a
+   `dag_skip:{idx}` marker for `DagDispatchDecision::SkipByCondition`, which
+   requires the task to actually carry a `.condition(...)` predicate --
+   `build_dag` never called `.condition(...)` on any task, so the five
+   `dag_skip` markers the fixture recorded for its condition-skipped
+   activities were events the real walker could never have produced for
+   those specific (condition-less) tasks either. Fixed by giving every
+   layer4-onward activity task a `.condition(|_ups| true)` predicate in
+   `build_dag` (the closure's return value is never actually evaluated by
+   this fixture -- only its *presence* on the task matters, since
+   `dag_graph.rs`'s classification logic reads recorded history events, not
+   `DagTask::condition`, confirmed by grep before making the change), making
+   every `dag_skip` marker this fixture records structurally legitimate.
 
 Fixes 1 and 3 interact: the reachability tracking that fix 3 introduces is
 also what fix 1's gate resolutions now rely on (a gate is reachable only
@@ -130,13 +144,14 @@ status is one a real walker could produce: 51 succeeded, 5 failed, 5
 skipped, 1 gate timed-out (counts as succeeded downstream), 31 legitimately
 pending (upstream failure/skip cascades; nothing left genuinely waiting).
 
-None of these five gaps invalidated the fix itself (all five bugs are in
+None of these six gaps invalidated the fix itself (all six bugs are in
 the harness, not in code paths this change touches), but they did mean the
 workload's realism claims overstated what the fixture actually exercised.
-The numbers below are from the fully corrected harness; event count moved
-from the original 202 (211 after fix 2, 111 after fix 3, 137 after fix 4,
-175 after fix 5), since each round's reachability model dispatches a
-different subset of the 93 tasks than the one before it.
+The numbers below are from the fully corrected harness; event count stayed
+at 175 across fix 6 (it only adds DAG-definition metadata, not new
+events) -- moving from the original 202 (211 after fix 2, 111 after fix 3,
+137 after fix 4, 175 after fix 5), since each round's reachability model
+dispatches a different subset of the 93 tasks than the one before it.
 
 ## Profile
 
@@ -151,15 +166,15 @@ callgrind_annotate --threshold=98 cg.out
 Baseline (unmodified `HEAD`, fully corrected harness):
 
 ```
-859,917,847 (100.0%)  PROGRAM TOTALS
+859,563,149 (100.0%)  PROGRAM TOTALS
 
-178,149,502 (20.72%)  __memcmp_avx2_movbe [libc]
+183,316,418 (21.33%)  __memcmp_avx2_movbe [libc]
 120,528,000 (14.02%)  alloc::collections::btree::map::BTreeMap<K,V,A>::bulk_build_from_sorted_iter
- 88,587,300 (10.30%)  <alloc::vec::Vec<T> as SpecFromIter<T,I>>::from_iter
+ 88,587,300 (10.31%)  <alloc::vec::Vec<T> as SpecFromIter<T,I>>::from_iter
  59,557,500 ( 6.93%)  <core::iter::adapters::map::Map<I,F> as Iterator>::fold
- 59,538,600 ( 6.92%)  core::slice::sort::stable::drift::sort
+ 59,538,600 ( 6.93%)  core::slice::sort::stable::drift::sort
  54,343,800 ( 6.32%)  <alloc::collections::btree::map::BTreeMap<K,V,A> as Drop>::drop
- 41,224,408 ( 4.79%)  malloc.c:_int_malloc
+ 39,645,628 ( 4.61%)  malloc.c:_int_free
  37,469,100 ( 4.36%)  autumn_harvest_plugin::dag_retry::node_outcome
  11,293,500 ( 1.31%)  autumn_harvest_plugin::dag_graph::has_skip_marker
 ```
@@ -173,8 +188,8 @@ than under their own names: `__memcmp_avx2_movbe` +
 `BTreeMap::bulk_build_from_sorted_iter` +
 `<Vec<T> as SpecFromIter<T,I>>::from_iter` +
 `<Map<I,F> as Iterator>::fold` + `core::slice::sort::stable::drift::sort` +
-`<BTreeMap<K,V,A> as Drop>::drop` alone sum to **65.20%** of total
-instructions (560,704,702 / 859,917,847) -- comfortably clearing the
+`<BTreeMap<K,V,A> as Drop>::drop` alone sum to **65.83%** of total
+instructions (565,871,618 / 859,563,149) -- comfortably clearing the
 >=5%-of-workload floor -- with `node_outcome`'s and `has_skip_marker`'s own
 (untouched-by-this-fix) self-costs shown separately above for the
 before/after comparison below.
@@ -272,11 +287,11 @@ declaration, differing only by the `dag_graph.rs` diff above, same
 
 | | Instructions (Ir) |
 |---|---|
-| Before | 859,917,847 |
-| After  | 577,184,777 |
-| **Reduction** | **282,733,070 (32.88%)** |
+| Before | 859,563,149 |
+| After  | 579,419,985 |
+| **Reduction** | **280,143,164 (32.59%)** |
 
-Clears the >=5% floor by ~6.6x.
+Clears the >=5% floor by ~6.5x.
 
 The after-trace's flat profile shows `node_outcome`'s self-cost unchanged at
 **37,469,100** Ir and `has_skip_marker`'s at **11,293,500** Ir -- both
@@ -285,22 +300,22 @@ confirmation that nothing in `dag_retry.rs` (untouched by this change) or in
 the parts of `dag_graph.rs` this change doesn't touch shifted:
 
 ```
-577,184,777 (100.0%)  PROGRAM TOTALS
+579,419,985 (100.0%)  PROGRAM TOTALS
 
-117,138,828 (20.29%)  __memcmp_avx2_movbe [libc]
- 63,504,000 (11.00%)  BTreeMap::bulk_build_from_sorted_iter
- 63,231,600 (10.96%)  <Map<I,F> as Iterator>::fold
- 46,980,900 ( 8.14%)  <Vec<T> as SpecFromIter<T,I>>::from_iter
- 37,469,100 ( 6.49%)  autumn_harvest_plugin::dag_retry::node_outcome   <- unchanged
- 34,083,185 ( 5.91%)  malloc.c:_int_malloc
- 31,369,800 ( 5.43%)  core::slice::sort::stable::drift::sort
- 11,293,500 ( 1.96%)  autumn_harvest_plugin::dag_graph::has_skip_marker   <- unchanged
+119,125,920 (20.56%)  __memcmp_avx2_movbe [libc]
+ 63,504,000 (10.96%)  BTreeMap::bulk_build_from_sorted_iter
+ 63,231,600 (10.91%)  <Map<I,F> as Iterator>::fold
+ 46,980,900 ( 8.11%)  <Vec<T> as SpecFromIter<T,I>>::from_iter
+ 37,469,100 ( 6.47%)  autumn_harvest_plugin::dag_retry::node_outcome   <- unchanged
+ 34,254,097 ( 5.91%)  malloc.c:_int_malloc
+ 31,369,800 ( 5.41%)  core::slice::sort::stable::drift::sort
+ 11,293,500 ( 1.95%)  autumn_harvest_plugin::dag_graph::has_skip_marker   <- unchanged
 ```
 
 The `BTreeSet`-construction family (`memcmp` + `bulk_build_from_sorted_iter`
 + `Vec::from_iter` + `Map::fold` + `sort` + `Drop`, the same lines the
 baseline profile above attributes to the two `dispatched_activity_names`
-call sites) drops from 65.20% of a larger total to a smaller share of a
+call sites) drops from 65.83% of a larger total to a smaller share of a
 smaller total -- exactly the shape of "one of two redundant call sites
 removed, the other (`node_outcome`'s) left at its original, now
 proportionally larger, cost".
@@ -309,8 +324,8 @@ proportionally larger, cost".
 
 | dhat | Before | After | Reduction |
 |---|---|---|---|
-| Total blocks | 816,477 | 526,077 | 290,400 (**35.57%**) |
-| Total bytes  | 198,406,051 | 113,081,251 | 85,324,800 (**43.01%**) |
+| Total blocks | 816,541 | 526,141 | 290,400 (**35.56%**) |
+| Total bytes  | 198,407,075 | 113,082,275 | 85,324,800 (**43.00%**) |
 
 Both independently clear the alternate >=10%-allocation floor as well as the
 primary Ir floor.
