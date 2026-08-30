@@ -30,26 +30,25 @@
 //! [`build_events`]'s doc comment): a task only ever receives outcome events
 //! when its declared upstreams have all resolved successfully, exactly what
 //! the real unified-DAG walker would (not) have dispatched. It mixes every
-//! classification path `build_run_graph` exercises: succeeded activities,
-//! failed activities, activities with a genuine multi-attempt retry (repeated
-//! `ActivityStarted` before `ActivityCompleted`), `dag_skip:{idx}`
-//! condition-skip markers (issue #482), never-reached (pending) activities,
-//! a gate resolved by `SignalReceived`, a gate resolved by a race-timer
-//! `TimerStarted`/`TimerFired` pair (issue #476/#746), a second signal-resolved
-//! gate, and exactly one gate -- the last in execution-level order -- left
-//! genuinely unresolved (`waiting`, since the run's `exec_state` is
-//! `RUNNING`, a live/non-terminal state; only one gate can ever be mid-await
-//! in a real run, since the walker processes execution levels strictly
-//! sequentially and a gate always occupies its own singleton level). A
-//! handful of issue #780 **compensator** dispatches (the `dag_compensate`
-//! envelope) are also mixed in — including one recorded under a *current
-//! node's own name* (`t001`, compensating a different dispatched node), which
-//! is what actually exercises `dispatched_activity_names`'s purpose:
-//! excluding a compensation dispatch from that node's own
-//! `latest_scheduled`/`node_outcome` selection (a compensator name that is
-//! not itself a current node name, like the other two dispatches here, never
-//! reaches that exclusion at all — it fails the leading `name == node` check
-//! first).
+//! classification path `build_run_graph` exercises for a non-gate node:
+//! succeeded activities, failed activities, activities with a genuine
+//! multi-attempt retry (repeated `ActivityStarted` before
+//! `ActivityCompleted`), `dag_skip:{idx}` condition-skip markers (issue
+//! #482), and never-reached (pending) activities. All four gates resolve --
+//! two by `SignalReceived`, one by a race-timer `TimerStarted`/`TimerFired`
+//! pair (issue #476/#746), one by a signal arriving before its own deadline
+//! -- rather than any being left genuinely `Waiting`: the real unified-DAG
+//! walker processes execution levels strictly sequentially and a gate always
+//! occupies its own singleton level, so a `Waiting` gate would stall the
+//! walker at that level and prevent every later level (not just nodes that
+//! declare it as an upstream) from ever being reached at all, which would
+//! collapse this fixture's later layers to a handful of `Pending` nodes with
+//! no events. This workload does not include issue #780 compensator
+//! dispatches: those require the whole DAG run to have failed terminally,
+//! which is inconsistent with the live, still-progressing `RUNNING` history
+//! here (issue #690 review, Codex). `is_compensation_dispatch`'s exclusion
+//! is instead covered by `dag_graph.rs`'s own unit tests (e.g.
+//! `a_compensation_dispatch_is_not_read_as_a_same_named_forward_node`).
 //!
 //! # Running
 //!
@@ -179,7 +178,7 @@ fn t088() {}
 
 // ── Event fixture helpers ───────────────────────────────────────────────
 // Same idioms as `dag_graph.rs`'s own `mod tests` (`sched`, `completed`,
-// `failed`, `activity_started`, `skip_marker_full`, `compensator_sched`).
+// `failed`, `activity_started`, `skip_marker_full`).
 
 fn ts(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
@@ -200,27 +199,6 @@ fn sched(name: &str, id: ActivityExecId) -> WorkflowEvent {
         activity_id: id,
         name: name.to_string(),
         input: Value::Null,
-        queue: "default".to_string(),
-    }
-}
-
-/// A compensator dispatch exactly as issue #780's `unwind_dag_compensations`
-/// records it: the compensator's own activity name, plus the three-key
-/// envelope naming the **forward node** being rolled back. Exercises the
-/// exact exclusion `dispatched_activity_names` exists for.
-fn compensator_sched(
-    compensator_name: &str,
-    compensates_node: &str,
-    id: ActivityExecId,
-) -> WorkflowEvent {
-    WorkflowEvent::ActivityScheduled {
-        activity_id: id,
-        name: compensator_name.to_string(),
-        input: serde_json::json!({
-            "dag_compensate": compensates_node,
-            "input": Value::Null,
-            "output": Value::Null,
-        }),
         queue: "default".to_string(),
     }
 }
@@ -780,39 +758,39 @@ fn build_dag() -> DagDefinition {
 /// all `done` (§ below) and skips generating any event at all for an
 /// unreachable task. The backbone exists so that tracking has a real,
 /// populated foundation to test against: every gate (layer3) is guaranteed
-/// reachable, so its scripted signal/timer/left-unresolved resolution below
-/// is genuinely exercised rather than short-circuited to `Pending` by a
-/// broken upstream chain, and layer4 onward has a real upstream population
-/// to be reachability-tested against instead of starting from nothing.
+/// reachable, so its scripted resolution below is genuinely exercised rather
+/// than short-circuited to `Pending` by a broken upstream chain, and layer4
+/// onward has a real upstream population to be reachability-tested against
+/// instead of starting from nothing.
 const BACKBONE_END: usize = 24;
 
 /// Build a realistic recorded history for `def`: a mix of succeeded, failed,
 /// multi-attempt-retried, condition-skipped (#482), and never-reached
-/// (pending) activities; gates resolved by signal, resolved by race-timer
-/// timeout (#476/#746), and left unresolved (`waiting`, since the harness
-/// runs with a live `exec_state`); plus issue #780 compensator dispatches
-/// against already-dispatched forward nodes -- including one that reuses a
-/// *current* node's own activity name, the shape `is_compensation_dispatch`'s
-/// exclusion exists for (a later DAG definition introducing a forward node
-/// named after an older definition's compensator).
+/// (pending) activities, plus all four gates resolved (two by signal, one by
+/// race-timer timeout (#476/#746), one by a signal beating its own deadline).
 ///
 /// Reachability-consistent by construction (issue #690 review, Codex): a
 /// task's outcome is only ever generated when `task.upstreams` are all
 /// `done` -- true for a genuinely succeeded activity (first attempt or after
-/// retry) or a gate that resolved to `TaskStatus::Succeeded` (signal-won, or
-/// timer-won with `GateTimeoutAction::Continue` -- both timeout-bearing gates
-/// here use `Continue`). An unreachable task (an upstream failed, was
-/// condition-skipped, was itself unreachable, or is the one gate still
-/// `Waiting`) gets no events at all, exactly like the real walker would never
-/// have dispatched it. This is why `gate_3` being left deliberately
-/// unresolved (`Waiting`, not `done`) legitimately makes its own downstream
-/// layer4 nodes unreachable too -- a real DAG paused on an unanswered
-/// approval gate has exactly this shape, part of its next layer genuinely
-/// pending. Only ONE gate is ever left `Waiting`, and it must be the last one
-/// in level order (see [`push_gate_resolution`]'s doc comment): the real
-/// unified-DAG walker processes execution levels strictly sequentially, and a
-/// signal gate always occupies its own singleton level, so at most one gate
-/// can be genuinely mid-`.await` in any one recorded run.
+/// retry) or any of the four gates, all of which resolve to
+/// `TaskStatus::Succeeded` (`push_gate_resolution` always returns `done`).
+/// An unreachable task (an upstream failed, was condition-skipped, or was
+/// itself unreachable) gets no events at all, exactly like the real walker
+/// would never have dispatched it.
+///
+/// No gate is left genuinely `Waiting` (issue #690 review, Codex, a later
+/// round): the real unified-DAG walker processes execution levels strictly
+/// sequentially and a signal gate always occupies its own singleton level,
+/// so an unresolved gate would stall the walker there -- and since every
+/// level after it (not merely nodes that declare it as an upstream) then
+/// never runs, that would collapse the entire remainder of this DAG
+/// (layer4 onward, five sixths of its tasks) to `Pending` with no events,
+/// which is correct but far too sparse a workload to be useful here. This
+/// fixture also carries no issue #780 compensator dispatches: those require
+/// the whole DAG run to have failed terminally, which cannot coexist with
+/// the `RUNNING`, still-progressing history a fully-resolved-gates run
+/// implies. `is_compensation_dispatch`'s exclusion is instead covered by
+/// `dag_graph.rs`'s own unit tests.
 fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     let tasks = def.tasks();
     let mut events: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
@@ -903,48 +881,19 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
         activity_seq += 1;
     }
 
-    // A couple of issue #780 compensator dispatches under their own
-    // (non-reused) names, naming forward nodes that were actually dispatched
-    // above (`t001`/`t002` are both in the backbone, so both genuinely
-    // dispatched and succeeded) — these grow the `dispatched_activity_names`
-    // set realistically but, since `undo_t001`/`undo_t002` are not themselves
-    // node names in this DAG, `latest_scheduled` short-circuits on
-    // `name == node` before ever reaching `is_compensation_dispatch` for them.
-    push(
-        &mut t,
-        &mut events,
-        compensator_sched("undo_t001", "t001", ActivityExecId::new()),
-    );
-    push(
-        &mut t,
-        &mut events,
-        compensator_sched("undo_t002", "t002", ActivityExecId::new()),
-    );
-    // The exclusion-exercising case (issue #690 review, Codex): a compensator
-    // dispatch recorded under a *current node's own name* (`t001`), rolling
-    // back a different, already-dispatched node (`t002`). Recorded after
-    // `t001`'s genuine forward dispatch above, so `latest_scheduled(events,
-    // "t001", ...)`'s reverse scan meets this envelope first, must recognize
-    // it as a compensation dispatch via `is_compensation_dispatch`, skip it,
-    // and keep walking back to the real forward `ActivityScheduled` for
-    // `t001` — exactly the cross-definition node-name-reuse scenario the
-    // exclusion exists for.
-    push(
-        &mut t,
-        &mut events,
-        compensator_sched("t001", "t002", ActivityExecId::new()),
-    );
-
     events
 }
 
 /// Resolve one already-*reached* signal gate per its rotating `scenario`
 /// (`gate_seen % 4`, one of the four gates in `build_dag`), pushing whatever
-/// events that resolution implies. Returns whether the gate counts as `done`.
+/// events that resolution implies. Always returns `true` (`done`): every
+/// gate in this fixture resolves -- none is left genuinely `Waiting` (issue
+/// #690 review, Codex; see [`build_events`]'s doc comment for why).
 ///
-/// * `0 | 2` (`gate_0`, `gate_2` -- both plain `signal_gate`): resolved by a
-///   matching signal.
-/// * `1` (`gate_1`, `signal_gate_with_timeout`, `GateTimeoutAction::Continue`):
+/// * `0 | 2 | 3` (`gate_0`, `gate_2` -- plain `signal_gate` -- and `gate_3`,
+///   `signal_gate_with_timeout`, resolved by its signal arriving before the
+///   deadline): resolved by a matching signal.
+/// * `_` (`gate_1`, `signal_gate_with_timeout`, `GateTimeoutAction::Continue`):
 ///   resolved by the race timer firing before any signal arrives -- a
 ///   `TimedOut` node status that still counts as `TaskStatus::Succeeded` for
 ///   downstream trigger-rule purposes, since `on_timeout` is `Continue`.
@@ -953,19 +902,6 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
 ///   `StartTimer` before it can be won by a timeout (issue #690 review,
 ///   Codex) -- the only path that skips `TimerStarted` is a signal already
 ///   buffered when the race starts, which resolves `SignalWon`, not this one.
-/// * `_` (`gate_3`, `signal_gate_with_timeout`): left unresolved -- `waiting`
-///   on a live run, its deadline not yet fired either. Not `done`.
-///
-/// `gate_2` is deliberately **not** left waiting like `gate_3`, even though
-/// an earlier revision left both unresolved: the real unified-DAG walker
-/// processes execution levels strictly sequentially and a signal gate always
-/// occupies its own singleton level (`run_unified_dag`,
-/// `debug_assert_eq!(level.len(), 1, ...)`), so at most ONE gate can ever be
-/// genuinely `Waiting` in one recorded run -- whichever is earliest in level
-/// order among the unresolved ones. Two simultaneously-`Waiting` gates is a
-/// history no real walker can produce (issue #690 review, Codex): reaching
-/// `gate_3`'s level requires `gate_2`'s `.await` to have already resolved,
-/// one way or another.
 fn push_gate_resolution(
     t: &mut i64,
     events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>,
@@ -978,16 +914,20 @@ fn push_gate_resolution(
             *t += 1;
         };
     match scenario {
-        0 | 2 => {
+        // gate_0, gate_2 (plain `signal_gate`) and gate_3
+        // (`signal_gate_with_timeout`, resolved by its signal arriving
+        // before the deadline): all resolved by a matching signal.
+        0 | 2 | 3 => {
             push(t, events, signal_received(&gate.signal_name));
             true
         }
-        1 => {
+        // gate_1 (`signal_gate_with_timeout`): resolved by the race timer
+        // firing before any signal arrives.
+        _ => {
             push(t, events, gate_timer_started(1, &gate.signal_name, 300));
             push(t, events, gate_timer_fired(1, &gate.signal_name));
             true
         }
-        _ => false,
     }
 }
 
