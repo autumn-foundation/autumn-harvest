@@ -279,8 +279,8 @@ pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 
 #[cfg(feature = "db")]
 pub use db::{
-    CodecRotationCursor, ShardRotationProgress, compare_and_swap_event, count_rows_by_key_id,
-    load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption,
+    CodecRotationCursor, FleetWriteFence, ShardRotationProgress, compare_and_swap_event,
+    count_rows_by_key_id, load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption,
     sweep_codec_reencryption_once,
 };
 
@@ -860,6 +860,44 @@ mod db {
         sweep_codec_reencryption_once(conn, shard_id, codecs, batch_limit, metrics).await
     }
 
+    /// Operator attestation that no writer anywhere in the fleet can still
+    /// encode a payload under the key being retired.
+    ///
+    /// # Why the census cannot establish this on its own
+    ///
+    /// [`PayloadCodecs`] is a **per-process** registry: `set_active_key` on one
+    /// worker is invisible to every other worker. The census counts rows that
+    /// are *committed and visible* on the shards this process can reach, at one
+    /// instant. Neither of the two ways a new old-key row can still appear is
+    /// observable to it:
+    ///
+    /// 1. **Another live writer.** A worker that has not yet been told to
+    ///    activate the new key keeps encoding under the old one, and will do so
+    ///    again a millisecond after the census reads zero.
+    /// 2. **An in-flight append.** A transaction that already encoded its
+    ///    payload under the old key, but has not committed, is invisible to the
+    ///    census and becomes visible immediately afterwards.
+    ///
+    /// In either case the gate would have removed the decoder from this
+    /// process's registry — and, if the operator took `Ok` as licence to
+    /// destroy the key material, the row is unreadable for good.
+    ///
+    /// So the gate demands the half it cannot prove. Establishing the fence is
+    /// a deployment-level act (roll the new active key to every worker, then
+    /// drain or await in-flight appends); this crate does not coordinate the
+    /// fleet and does not pretend to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FleetWriteFence {
+        /// The caller has confirmed **both** that no process in the fleet holds
+        /// this key active and that every append already encoded under it has
+        /// settled. The census still has to come back zero on top of this.
+        ConfirmedByOperator,
+        /// No such confirmation. The gate refuses regardless of the census —
+        /// a zero it cannot trust is exactly the case this whole type exists
+        /// to stop being reported as success.
+        NotConfirmed,
+    }
+
     /// Retire a codec key, refusing unless **every** expected shard proves it
     /// holds zero rows referencing it (issue #948, AC6).
     ///
@@ -870,14 +908,25 @@ mod db {
     /// incident. An empty `expected_shards` proves nothing and is refused for
     /// the same reason.
     ///
+    /// A zero census is **necessary but not sufficient**, so `fence` supplies
+    /// the other half: see [`FleetWriteFence`] for why a per-process registry
+    /// cannot observe another worker still writing under the key, nor an
+    /// uncommitted append about to become visible. Passing
+    /// [`FleetWriteFence::NotConfirmed`] refuses the retirement outright — use
+    /// `GET /admin/codec/rotation` to watch the counts without asserting
+    /// anything.
+    ///
     /// On success the key is dropped from this process's in-memory registry via
     /// [`PayloadCodecs::retire_key_local`]; disposing of the key *material* is
-    /// the embedder's business (this crate never holds it).
+    /// the embedder's business (this crate never holds it). Read
+    /// `docs/operations/codec-key-rotation.md` before you do: an `Ok` here is
+    /// scoped to `harvest_events`, not to every place a codec envelope can sit.
     ///
     /// # Errors
     ///
-    /// - [`HarvestError::Config`] when `key_id` is the active key, or when
-    ///   `expected_shards` is empty.
+    /// - [`HarvestError::Config`] when `key_id` is the active key, when
+    ///   `expected_shards` is empty, when `key_id` is not registered, or when
+    ///   `fence` is [`FleetWriteFence::NotConfirmed`].
     /// - [`HarvestError::CodecKeyRetirementBlocked`] naming the per-shard
     ///   remaining count (or unreadability) of every blocking shard.
     pub async fn retire_codec_key(
@@ -885,6 +934,7 @@ mod db {
         expected_shards: &[crate::types::ShardId],
         codecs: &PayloadCodecs,
         key_id: &str,
+        fence: FleetWriteFence,
     ) -> HarvestResult<()> {
         if codecs.active_key_id() == key_id {
             return Err(HarvestError::Config(format!(
@@ -902,6 +952,15 @@ mod db {
             return Err(HarvestError::Config(format!(
                 "codec key id {key_id:?} is not registered; retiring it would report success \
                  without having proved anything about the rows that reference it"
+            )));
+        }
+        if fence == FleetWriteFence::NotConfirmed {
+            return Err(HarvestError::Config(format!(
+                "cannot retire codec key id {key_id:?}: no fleet write fence was attested. A \
+                 zero census only proves no row references the key *right now* on the shards \
+                 this process can reach; it cannot see another worker that still holds the key \
+                 active, nor an append that encoded under it and has not committed yet. \
+                 Confirm both fleet-wide, then pass FleetWriteFence::ConfirmedByOperator"
             )));
         }
         // Fail closed on an INCOMPLETE list, not just an unreachable shard. A

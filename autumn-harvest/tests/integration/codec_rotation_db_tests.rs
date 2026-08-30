@@ -40,7 +40,7 @@
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::codec_rotation::{
-    load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption_once,
+    FleetWriteFence, load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption_once,
 };
 use autumn_harvest::erase::erasure_tombstone;
 use autumn_harvest::error::HarvestError;
@@ -866,9 +866,15 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
     let sharded = ShardedDbPool::single(pool);
     let shards = [ShardId::new(0)];
 
-    let err = retire_codec_key(&sharded, &shards, &codecs, "k1")
-        .await
-        .expect_err("retirement must be refused while a row remains");
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("retirement must be refused while a row remains");
     match err {
         HarvestError::CodecKeyRetirementBlocked { key_id, remaining } => {
             assert_eq!(key_id, "k1");
@@ -888,9 +894,74 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
         .await
         .expect("sweep");
 
-    retire_codec_key(&sharded, &shards, &codecs, "k1")
-        .await
-        .expect("retirement must succeed at exactly zero remaining rows");
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect("retirement must succeed at exactly zero remaining rows");
+    assert!(codecs.codec_for_key("k1").is_none());
+}
+
+#[tokio::test]
+async fn retirement_is_refused_without_an_attested_fleet_write_fence() {
+    // Codex round 3 (P1): a zero census is necessary but NOT sufficient. The
+    // registry is per-process, so the census cannot see (a) another worker that
+    // still holds the old key active and will encode under it a millisecond
+    // later, or (b) an append that already encoded under the old key and has
+    // not committed yet. Either makes a new old-key row appear *after* the gate
+    // reported zero and dropped the decoder.
+    //
+    // The gate therefore demands the half it cannot prove. This pins that an
+    // otherwise-perfect retirement -- zero rows, key registered, every shard
+    // supplied and reachable -- is still refused without the attestation, so
+    // the unprovable half can never be skipped by accident.
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    codecs.set_active_key("k2").expect("flip");
+
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    // Nothing was ever written under k1: the census is a genuine zero.
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+    )
+    .await
+    .expect_err("a zero census alone must not authorise retirement");
+    match err {
+        HarvestError::Config(msg) => {
+            assert!(
+                msg.contains("fleet write fence"),
+                "the refusal must name the missing fence, got {msg:?}"
+            );
+        }
+        other => panic!("expected Config, got {other:?}"),
+    }
+    assert!(
+        codecs.codec_for_key("k1").is_some(),
+        "a refused retirement must not drop the decoder"
+    );
+
+    // The same call, with the fence attested, succeeds -- proving the refusal
+    // above was the fence and nothing else.
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect("zero rows plus an attested fence retires the key");
     assert!(codecs.codec_for_key("k1").is_none());
 }
 
@@ -906,9 +977,15 @@ async fn retirement_fails_closed_on_an_unreachable_shard() {
     // Shard 0 is reachable and empty; shard 7 has no pool in this process.
     let shards = [ShardId::new(0), ShardId::new(7)];
 
-    let err = retire_codec_key(&sharded, &shards, &codecs, "k1")
-        .await
-        .expect_err("an unreadable shard must block retirement");
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("an unreadable shard must block retirement");
     match err {
         HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
             assert_eq!(remaining.len(), 1);
@@ -932,9 +1009,15 @@ async fn retirement_with_no_shards_to_inspect_is_refused() {
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
 
-    let err = retire_codec_key(&sharded, &[], &codecs, "k1")
-        .await
-        .expect_err("proving nothing must not be treated as proving zero");
+    let err = retire_codec_key(
+        &sharded,
+        &[],
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("proving nothing must not be treated as proving zero");
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
 }
 
@@ -945,9 +1028,15 @@ async fn the_active_key_can_never_be_retired() {
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
 
-    let err = retire_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k1")
-        .await
-        .expect_err("k1 is active");
+    let err = retire_codec_key(
+        &sharded,
+        &[ShardId::new(0)],
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("k1 is active");
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
 }
 
@@ -1343,9 +1432,15 @@ async fn retirement_fails_closed_when_a_shards_census_errors() {
 
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
-    let err = retire_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k1")
-        .await
-        .expect_err("a failed census must block retirement");
+    let err = retire_codec_key(
+        &sharded,
+        &[ShardId::new(0)],
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("a failed census must block retirement");
     match err {
         HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
             assert_eq!(remaining.len(), 1);
@@ -1375,9 +1470,15 @@ async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
     let sharded = ShardedDbPool::single(pool);
 
     // Shard 0 exists in the pool but is not in the supplied list.
-    let err = retire_codec_key(&sharded, &[ShardId::new(9)], &codecs, "k1")
-        .await
-        .expect_err("an incomplete shard list must block retirement");
+    let err = retire_codec_key(
+        &sharded,
+        &[ShardId::new(9)],
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("an incomplete shard list must block retirement");
     assert!(
         matches!(err, HarvestError::CodecKeyRetirementBlocked { .. }),
         "{err:?}"
@@ -1392,9 +1493,15 @@ async fn retirement_refuses_an_unregistered_key_id() {
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
 
-    let err = retire_codec_key(&sharded, &[ShardId::new(0)], &codecs, "never-registered")
-        .await
-        .expect_err("an unregistered key proves nothing");
+    let err = retire_codec_key(
+        &sharded,
+        &[ShardId::new(0)],
+        &codecs,
+        "never-registered",
+        FleetWriteFence::ConfirmedByOperator,
+    )
+    .await
+    .expect_err("an unregistered key proves nothing");
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
 }
 

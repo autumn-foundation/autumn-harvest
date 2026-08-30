@@ -567,6 +567,30 @@ impl PayloadCodecs {
     /// registry, there is no restart-ordering window in which a clone taken
     /// before the flip keeps writing under the old key.
     ///
+    /// # ⚠️ Rollout ordering: upgrade every reader before you activate
+    ///
+    /// Activating a **non-legacy** key switches new writes to envelope version
+    /// 2 ([`CODEC_ENVELOPE_VERSION_KEYED`]), which carries a `kid` and so has
+    /// four keys instead of three. A reader built before issue #948 recognises
+    /// an envelope only as *exactly three keys with version 1*, and its decoder
+    /// returns anything else **unchanged**:
+    ///
+    /// ```text
+    /// let Some(parts) = codec_envelope_parts(payload) else { return Ok(payload.clone()) };
+    /// ```
+    ///
+    /// So a pre-#948 worker does not reject a version-2 envelope loudly — it
+    /// hands the raw `{_harvest_codec_envelope, codec_id, kid, data}` object to
+    /// workflow code as if it were the payload. That is silent wrong data, not
+    /// an error.
+    ///
+    /// Therefore: **deploy the version-2-capable binary to every reader in the
+    /// fleet first, and only then activate a keyed codec.** While the legacy
+    /// key is active no `kid` is written and envelopes stay version 1, so the
+    /// upgrade itself is safe to roll out in any order — it is the *activation*
+    /// that must come last. This crate cannot enforce the ordering: it has no
+    /// fleet-wide view of which binaries are running.
+    ///
     /// # Errors
     ///
     /// [`HarvestError::Config`] when `key_id` is not registered. The active key

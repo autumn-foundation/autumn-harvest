@@ -55,6 +55,12 @@ skipped as having no ciphertext, and plaintext is never newly encrypted. None of
 the three carries a rotatable key id, so none of them counts toward
 rows-remaining and none can block retirement forever.
 
+**Rollout ordering.** Registering keys is safe at any time — while the legacy
+key is active, envelopes stay version 1 and byte-identical to a pre-#948
+deployment. *Activating* a keyed codec switches new writes to envelope version
+2, which a pre-#948 reader passes through unchanged rather than rejecting, so
+every reader must be upgraded before any activation. See the runbook.
+
 **Retirement gate.** `retire_codec_key` refuses with a typed
 `HarvestError::CodecKeyRetirementBlocked` naming the remaining count per shard
 while any row references the key, and succeeds only at exactly zero everywhere.

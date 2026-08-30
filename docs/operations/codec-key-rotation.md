@@ -132,21 +132,80 @@ has stalled shows as
 ## Retiring the old key
 
 ```rust
+use autumn_harvest::codec_rotation::FleetWriteFence;
+
 autumn_harvest::codec_rotation::retire_codec_key(
     &sharded_pool,
     &expected_shards,
     &codecs,
     CODEC_LEGACY_KEY_ID,
+    // Only after the three steps in "Retirement needs a fleet write fence" below.
+    FleetWriteFence::ConfirmedByOperator,
 ).await?;
 ```
 
 It refuses with `HarvestError::CodecKeyRetirementBlocked` naming the remaining
 count **per shard** while any row is left, and succeeds only at exactly zero
-everywhere. It is **fail-closed** in three separate ways, all deliberate:
+everywhere. It is **fail-closed** in five separate ways, all deliberate:
 
 - a shard with no connection pool in this process blocks retirement;
 - a shard whose census errors blocks retirement;
-- an empty shard list is refused outright — proving nothing is not proving zero.
+- an empty shard list is refused outright — proving nothing is not proving zero;
+- a shard list that omits a shard this process can see is refused;
+- an unattested `FleetWriteFence` is refused however clean the census is.
+
+### ⚠️ Retirement needs a fleet write fence, and the census cannot supply it
+
+`retire_codec_key` takes a `FleetWriteFence`, and passing
+`FleetWriteFence::NotConfirmed` refuses the retirement no matter how clean the
+census is. This is not ceremony. `PayloadCodecs` is a **per-process** registry:
+`set_active_key` on one worker is invisible to every other worker, and the
+census only sees rows that are committed and visible, at one instant, on the
+shards this process can reach. Two things it therefore cannot see:
+
+1. **Another live writer.** A worker that has not yet been rolled onto the new
+   active key is still encoding under the old one, and will write another
+   old-key row a millisecond after your census read zero.
+2. **An in-flight append.** A transaction that already encoded its payload
+   under the old key but has not committed is invisible to the census, and
+   becomes visible immediately after it.
+
+In both cases the gate would have returned `Ok` and dropped the decoder, and a
+row exists that this process can no longer read. If you took that `Ok` as
+licence to destroy the key material, it is unreadable permanently.
+
+**Establish the fence before you attest it:**
+
+1. Roll the new active key to **every** worker in the fleet (not just the one
+   you are running the gate from) and confirm the rollout completed.
+2. Let in-flight appends drain — wait past your longest activity/append
+   timeout, or stop writers outright.
+3. Confirm the census reads zero, via `GET /admin/codec/rotation`, and that it
+   *stays* zero across that drain window.
+
+Only then pass `FleetWriteFence::ConfirmedByOperator`. Harvest does not
+coordinate the fleet and does not pretend to — the attestation is you saying
+you did the three steps above.
+
+### ⚠️ Upgrade every reader before activating a keyed codec
+
+Activating a non-legacy key switches new writes to **envelope version 2** (four
+keys, carrying `kid`). A reader built before issue #948 recognises an envelope
+only as exactly three keys with version 1, and its decoder returns anything
+else *unchanged* rather than rejecting it. A pre-#948 worker therefore hands the
+raw envelope object to workflow code as if it were the payload — silent wrong
+data, not a loud failure.
+
+So the deployment order is not optional:
+
+1. Deploy the #948-capable binary to **every** reader in the fleet.
+2. Confirm the rollout completed.
+3. *Then* activate a keyed codec.
+
+Registering keys is safe at any point: while the legacy key is active no `kid`
+is written and envelopes stay version 1, byte-identical to what a pre-#948
+deployment stores. It is the **activation** that must come last. Harvest cannot
+enforce this — it has no fleet-wide view of which binaries are running.
 
 ### ⚠️ What "zero" does and does not authorise
 
