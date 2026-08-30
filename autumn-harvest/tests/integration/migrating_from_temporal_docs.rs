@@ -7,9 +7,9 @@
 //! 1. the guide and its worked example both exist, and the guide covers the
 //!    required ground — every required section, and at least 25
 //!    concept-mapping table rows (issue #947 AC1's literal minimum);
-//! 2. every `#NNN` issue citation inside the guide actually appears in
-//!    `CLAUDE.md` — the repository's own record of what has shipped — so a
-//!    claim can never cite a number nobody can verify (issue #947 AC1's
+//! 2. every `#NNN` issue citation inside the guide actually appears somewhere
+//!    in the repository — the engine source, the docs, or `CHANGELOG.md` — so
+//!    a claim can never cite a number nobody can verify (issue #947 AC1's
 //!    "verifiable in under a minute" bar, and the "no unshipped capability
 //!    presented as shipped" bar);
 //! 3. the guide is linked from every place a reader would look for it:
@@ -184,19 +184,34 @@ fn concept_mapping_table_has_at_least_25_rows() {
     );
 }
 
+/// Every issue the guide cites must be traceable to real work in this
+/// repository.
+///
+/// The record scanned is the engine source, `docs/`, and `CHANGELOG.md` — the
+/// places shipped work actually leaves a trace. This guard used to read
+/// `CLAUDE.md` instead, on the theory that its phase list was "the
+/// repository's own record of what has shipped". That coupled a CI gate to an
+/// agent-guidance document: `562c781` trimmed `CLAUDE.md` to 19 lines and this
+/// guard began reporting all 45 citations as unverifiable, on `trunk-dev` and
+/// on every branch based on it, while the citations themselves were fine —
+/// each of the ten the changelog alone misses is referenced across one to
+/// twenty source files. **No test in this repository should read `CLAUDE.md`.**
+///
+/// The source tree is also the stronger record: it cannot be trimmed without
+/// deleting the code the citation describes.
 #[test]
-fn every_cited_issue_number_appears_in_claude_md() {
+fn every_cited_issue_number_appears_in_the_repository() {
     let guide = read_doc(GUIDE_PATH);
-    let claude_md = read_doc("CLAUDE.md");
 
     let cited = issue_refs(&guide);
-    let known = issue_refs(&claude_md);
+    let known = repository_issue_refs();
 
     let unverifiable: Vec<u32> = cited.difference(&known).copied().collect();
     assert!(
         unverifiable.is_empty(),
-        "migration guide cites issue number(s) not found anywhere in CLAUDE.md, so they \
-         cannot be verified against the repository's own shipped-work record: {unverifiable:?}"
+        "migration guide cites issue number(s) found nowhere in the engine source, \
+         docs/, or CHANGELOG.md, so they cannot be verified against real shipped \
+         work: {unverifiable:?}"
     );
     assert!(
         !cited.is_empty(),
@@ -421,6 +436,55 @@ fn section_body<'a>(doc: &'a str, heading: &str) -> &'a str {
     let after_heading = &doc[start + heading.len()..];
     let end = after_heading.find("\n## ").unwrap_or(after_heading.len());
     &after_heading[..end]
+}
+
+/// Issue numbers referenced anywhere in the repository's durable record.
+///
+/// Deliberately excludes the guide itself (it must not vouch for its own
+/// citations) and `CLAUDE.md` (see the guard above). Only text-bearing files
+/// are read, and `target/` is skipped, so a build tree cannot smuggle a number
+/// into the set.
+fn repository_issue_refs() -> BTreeSet<u32> {
+    const ROOTS: [&str; 3] = ["autumn-harvest/src", "docs", "CHANGELOG.md"];
+    const TEXT_EXTENSIONS: [&str; 6] = ["rs", "md", "sql", "toml", "json", "yml"];
+
+    fn collect(path: &Path, refs: &mut BTreeSet<u32>) {
+        if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n == ".git")
+            {
+                return;
+            }
+            let Ok(entries) = fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                collect(&entry.path(), refs);
+            }
+            return;
+        }
+
+        if path.ends_with(GUIDE_PATH) || path.file_name().is_some_and(|n| n == "CLAUDE.md") {
+            return;
+        }
+        let is_text = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| TEXT_EXTENSIONS.contains(&e));
+        if !is_text {
+            return;
+        }
+        if let Ok(text) = fs::read_to_string(path) {
+            refs.extend(issue_refs(&text));
+        }
+    }
+
+    let mut refs = BTreeSet::new();
+    for root in ROOTS {
+        collect(&workspace_path(root), &mut refs);
+    }
+    refs
 }
 
 fn issue_refs(text: &str) -> BTreeSet<u32> {

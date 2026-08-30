@@ -44,27 +44,37 @@ fn performance_doc_path() -> PathBuf {
 /// `CLAUDE.md`'s phase list (verbatim) and then deletes it, so the fragment
 /// path stopped existing and every guard below panicked on the read. The
 /// verbatim copy is the one these guards need — a condensed bullet no longer
-/// carries the per-gate figures they cross-check — so they now read the phase
-/// entry out of `CLAUDE.md` instead.
+/// carries the per-gate figures they cross-check — so they were repointed at
+/// `CLAUDE.md`.
+///
+/// That was the wrong home: it coupled a CI gate to an agent-guidance document
+/// nothing warned you not to edit. When `562c781` trimmed `CLAUDE.md` from
+/// 10 629 lines to 19, these six guards began failing on `trunk-dev` itself and
+/// on every PR branched from it, and because `Lint` fails the whole `Test` job
+/// is skipped. The entry now lives in `docs/performance-claim-benchmark.md`, a
+/// file these guards own, so neither `CLAUDE.md` nor the fragment lifecycle can
+/// break them again. **No test in this repository should read `CLAUDE.md`.**
 const RELEASED_PERF_ENTRY_MARKER: &str =
     "- **Tooling** — Task-claim / enqueue throughput benchmark";
 
-fn claude_md_path() -> PathBuf {
-    repo_root().join("CLAUDE.md")
+fn released_perf_entry_path() -> PathBuf {
+    repo_root().join("docs/performance-claim-benchmark.md")
 }
 
-/// The released performance narrative, extracted from `CLAUDE.md`'s phase list.
+/// The released performance narrative, extracted from
+/// `docs/performance-claim-benchmark.md`.
 ///
 /// Scoped to the single entry rather than handing the guards the whole file:
-/// several of them ban a superseded phrasing, and an unscoped read would let an
-/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
+/// several of them ban a superseded phrasing, and an unscoped read would let
+/// unrelated prose elsewhere in the file trip — or mask — a check. The scoping
+/// is also what keeps this decoupled from the file's own preamble.
 fn released_perf_entry() -> String {
-    let text = read_normalized(&claude_md_path());
+    let text = read_normalized(&released_perf_entry_path());
     let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
         panic!(
-            "CLAUDE.md must contain the claim-benchmark phase entry \
-             (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
-             cross-check the published tables against it"
+            "docs/performance-claim-benchmark.md must contain the claim-benchmark \
+             entry (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance \
+             guards cross-check the published tables against it"
         )
     });
     let rest = &text[start + RELEASED_PERF_ENTRY_MARKER.len()..];
@@ -1235,16 +1245,16 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
     ];
 
     // Pairs of (label, already-extracted text) rather than (label, path): the
-    // released entry is one item inside a 10 000-line `CLAUDE.md`, so handing
-    // this loop that whole file would let an unrelated entry's "28%" trip — or
-    // mask — the scan below.
+    // released entry is one item inside `docs/performance-claim-benchmark.md`,
+    // so handing this loop that whole file would let the preamble's or an
+    // unrelated passage's "28%" trip — or mask — the scan below.
     for (label, source) in [
         (
             "docs/performance.md",
             read_normalized(&performance_doc_path()),
         ),
         (
-            "the released performance entry in CLAUDE.md",
+            "the released performance entry in docs/performance-claim-benchmark.md",
             released_perf_entry(),
         ),
     ] {
