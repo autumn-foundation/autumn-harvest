@@ -497,6 +497,65 @@ async fn a_zero_batch_size_disables_the_sweep() {
 }
 
 #[tokio::test]
+async fn a_converted_shard_stops_rewriting_its_cursor_every_tick() {
+    // Codex round 9 (P2). On a fully-converted shard the batch query returns
+    // nothing, the pass is already stamped complete, and the computed cursor is
+    // byte-identical to the stored one -- but the sweep upserted it anyway on
+    // every scanner tick. For a deployment that simply keeps a keyed codec
+    // configured that is unbounded WAL and dead tuples per shard, and an
+    // `updated_at` that reads as freshly active while no work is happening.
+    //
+    // `updated_at` is the observable: it moves only when the row is actually
+    // written, so it is the thing to pin.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "cursor_churn").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    // First pass converts the row and completes.
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first sweep");
+    let first = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor written");
+    assert!(
+        first.completed_at.is_some(),
+        "a pass that converted everything must be stamped complete"
+    );
+
+    // A later tick over a converted shard must not touch the row at all.
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("idle sweep");
+    let second = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor still there");
+
+    assert_eq!(
+        first.updated_at, second.updated_at,
+        "an idle tick on a converted shard must not rewrite the cursor; \
+         updated_at moving means the row was upserted for nothing"
+    );
+    assert_eq!(first.last_event_id, second.last_event_id);
+    assert_eq!(first.rows_reencrypted, second.rows_reencrypted);
+}
+
+#[tokio::test]
 async fn re_running_the_sweep_rewrites_nothing() {
     // AC4: idempotent.
     let (url, _c) = setup_isolated_db().await;

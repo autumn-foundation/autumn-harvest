@@ -637,6 +637,7 @@ mod db {
         .await
         .map_err(database_error)?;
 
+        let batch_len = rows.len();
         let reached_end = i64::try_from(rows.len()).unwrap_or(i64::MAX) < batch_limit;
         let highest_id = rows.last().map_or(resume_from, |row| row.id);
 
@@ -718,16 +719,32 @@ mod db {
             (highest_id, unresolved_total, None)
         };
 
-        write_cursor(
-            conn,
-            shard_id,
-            &active_key_id,
-            next_last_event_id,
-            rows_reencrypted_total,
-            next_unresolved,
-            next_completed_at,
-        )
-        .await?;
+        // Steady state on a converted shard: the pass is already complete and
+        // this tick fetched nothing new. Re-upserting the identical row would
+        // refresh `updated_at` on every scanner tick, forever, generating WAL
+        // and dead tuples per shard for a deployment that simply keeps a keyed
+        // codec configured -- and making the cursor read as freshly active
+        // while doing no work, which is exactly backwards for an operator
+        // watching it.
+        let cursor_unchanged = batch_len == 0
+            && resumed.is_some_and(|cursor| {
+                cursor.completed_at.is_some()
+                    && cursor.last_event_id == next_last_event_id
+                    && cursor.unresolved_rows == next_unresolved
+                    && cursor.rows_reencrypted == rows_reencrypted_total
+            });
+        if !cursor_unchanged {
+            write_cursor(
+                conn,
+                shard_id,
+                &active_key_id,
+                next_last_event_id,
+                rows_reencrypted_total,
+                next_unresolved,
+                next_completed_at,
+            )
+            .await?;
+        }
 
         if rewritten > 0 {
             metrics.record_codec_reencrypted(

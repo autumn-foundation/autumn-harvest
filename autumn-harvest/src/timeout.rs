@@ -3445,7 +3445,13 @@ pub async fn enforce_timeouts_once(
     )
     .await
     {
-        Ok(swept) => count += swept,
+        // Deliberately NOT folded into `count`. That value is the
+        // timeout-enforcement total: the caller logs `warn!("enforced timed-out
+        // tasks")` whenever it is non-zero, and embedders read it as "this many
+        // tasks timed out". Adding rotation rewrites to it makes every
+        // productive sweep tick claim a timeout that never happened. Rotation
+        // reports itself through `harvest.codec.reencrypted` instead.
+        Ok(_swept) => {}
         Err(e) => tracing::warn!(
             error = %e,
             "codec re-encryption sweep failed; continuing with the remaining \
