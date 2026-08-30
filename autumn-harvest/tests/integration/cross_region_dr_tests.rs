@@ -34,8 +34,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::replication::{
-    FenceRegistry, ReplicationStatus, ShardGeneration, assert_fence, bump_generation,
-    current_generation, ensure_generation_row, query_replication_status,
+    FenceRegistry, ReplicationStatus, ShardGeneration, WatermarkReading, assert_fence,
+    bump_generation, current_generation, ensure_generation_row, query_replication_status,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use futures::FutureExt as _;
@@ -571,6 +571,71 @@ async fn promotion_never_executes_a_view_that_owns_a_sequence() {
     );
 }
 
+/// Promotion must never rewind a sequence that is already ahead of its table.
+///
+/// A sequence legitimately sits ahead of `MAX(col)` after cached values, a
+/// rolled-back transaction, or deleted rows — and a *physical* replica
+/// replicates sequences already, which is why the docs call this command a
+/// harmless no-op there. Setting it to `MAX(col)` unconditionally would rewind
+/// it and start re-issuing ids the database has already handed out: a
+/// duplicate-key outage caused by the very command that exists to prevent one.
+#[tokio::test]
+async fn promotion_never_rewinds_a_sequence_that_is_ahead_of_its_table() {
+    let (url, _db) = require_db!("seqahead");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE TABLE dr_ahead (id BIGSERIAL PRIMARY KEY);
+         INSERT INTO dr_ahead DEFAULT VALUES;
+         INSERT INTO dr_ahead DEFAULT VALUES;
+         DELETE FROM dr_ahead WHERE id = 2;",
+    )
+    .await
+    .expect("seed a sequence ahead of MAX(id)");
+
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        v: i64,
+    }
+    async fn scalar(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
+        let rows: Vec<N> = diesel::sql_query(sql).load(conn).await.expect("scalar");
+        rows.into_iter().next().map_or(-1, |n| n.v)
+    }
+
+    // Precondition: MAX = 1 while the sequence has already issued 2.
+    assert_eq!(
+        scalar(&mut conn, "SELECT COALESCE(MAX(id), 0) AS v FROM dr_ahead").await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_ahead_id_seq') AS v"
+        )
+        .await,
+        2
+    );
+
+    autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion");
+
+    assert_eq!(
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_ahead_id_seq') AS v"
+        )
+        .await,
+        2,
+        "the sequence must be left where it was, not rewound to MAX(id)"
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT nextval('dr_ahead_id_seq') AS v").await,
+        3,
+        "the next id must not collide with one already issued"
+    );
+}
+
 /// Identifiers that are not plain lowercase must be advanced, not skipped.
 ///
 /// An earlier revision screened identifiers instead of quoting them: an
@@ -1084,7 +1149,10 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
                 let mut conn = connect(&url).await;
                 let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
+                matches!(
+                    measure_rpo(&mut conn, shard).await,
+                    Ok(WatermarkReading::Measured(v)) if v < 5.0
+                )
             }
         },
     )
@@ -1110,10 +1178,21 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let independently_measured = stall_started.elapsed().as_secs_f64();
-    let reported = measure_rpo(&mut a, shard)
+    let reported = match measure_rpo(&mut a, shard)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or("RPO must be measurable while replication is stalled")?;
+    {
+        WatermarkReading::Measured(v) => v,
+        // A stall shorter than the retained trail must stay a MEASUREMENT: the
+        // floor is for a standby that has fallen off the end of the trail
+        // entirely, which a 12s stall against an hour of retention is not.
+        other => {
+            blocker.batch_execute("ROLLBACK").await.ok();
+            return Err(format!(
+                "a stall well inside the retention window must be measured exactly, got {other:?}"
+            ));
+        }
+    };
 
     // The issue's success metric: within ±5s of an independent measurement.
     let delta = (reported - independently_measured).abs();
@@ -1158,7 +1237,10 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
                 let mut conn = connect(&url).await;
                 let _ = record_replication_heartbeat(&mut conn, shard, retain).await;
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                matches!(measure_rpo(&mut conn, shard).await, Ok(Some(v)) if v < 5.0)
+                matches!(
+                    measure_rpo(&mut conn, shard).await,
+                    Ok(WatermarkReading::Measured(v)) if v < 5.0
+                )
             }
         },
     )

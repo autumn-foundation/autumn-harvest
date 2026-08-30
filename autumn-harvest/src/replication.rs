@@ -179,16 +179,43 @@ pub enum ReplicationStatus {
         standbys: Vec<StandbyLag>,
         /// Rows from `pg_replication_slots`.
         slots: Vec<SlotLag>,
-        /// The measured RPO in seconds, from the watermark trail: the age of
-        /// the newest `harvest_replication_heartbeat` row whose `beat_lsn` the
-        /// slowest standby has already consumed.
+        /// What the watermark trail can say about the RPO.
         ///
-        /// `None` when no watermark has been consumed yet, when no slot exists,
-        /// or when the sampler has not yet written a beat. Its resolution is
-        /// bounded below by the beat interval: a healthy deployment reports
-        /// somewhere between zero and one interval, never a hard zero.
-        heartbeat_lag_seconds: Option<f64>,
+        /// Resolution is bounded below by the beat interval: a healthy
+        /// deployment reports somewhere between zero and one interval, never a
+        /// hard zero.
+        heartbeat: WatermarkReading,
     },
+}
+
+/// What the watermark trail can say about a shard's RPO.
+///
+/// Three states, not `Option<f64>`, because two of the "no number" cases mean
+/// opposite things and collapsing them is dangerous: a trail the standby has
+/// fallen off the end of means the RPO is **huge**, while a trail with nothing
+/// confirmed yet means it is merely **unmeasured**.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum WatermarkReading {
+    /// The age of the newest watermark the slowest standby has confirmed.
+    Measured(f64),
+    /// The standby is further behind than the **whole retained trail**, so the
+    /// true RPO is at least `floor_seconds` and unbounded above.
+    ///
+    /// This must never fall back to `pg_stat_replication.replay_lag`. That
+    /// column freezes for a stuck logical apply worker, and a stuck apply
+    /// worker is precisely how a trail gets exhausted — so the fallback would
+    /// replace a known-enormous RPO with a small stale one, at the moment an
+    /// operator is deciding whether to fail over.
+    BeyondTrail {
+        /// The age of the *oldest* retained watermark: a lower bound.
+        floor_seconds: f64,
+    },
+    /// Nothing to say yet — no slot, no beat written, or the first beat not
+    /// yet confirmed. Distinct from [`Self::BeyondTrail`]: here `replay_lag` is
+    /// a legitimate fallback, because a standby that has consumed nothing has
+    /// not stalled mid-apply.
+    Unknown,
 }
 
 impl ReplicationStatus {
@@ -206,15 +233,40 @@ impl ReplicationStatus {
     ///
     /// `None` means unknown, and unknown is not zero. See
     /// [`Self::max_replay_lag_seconds`].
+    ///
+    /// When the standby has fallen off the end of the retained trail this
+    /// returns the **lower bound** rather than `None`: an absent series alarms
+    /// on nothing, and `standbys` is still non-zero there, so the shard would
+    /// page on neither signal. The floor is at least the retention window,
+    /// which clears any sane threshold — it understates the number while
+    /// telling the truth about the severity. [`Self::rpo_is_lower_bound`]
+    /// distinguishes the two.
     #[must_use]
     pub fn rpo_seconds(&self) -> Option<f64> {
         match self {
             Self::Unavailable { .. } => None,
-            Self::Observed {
-                heartbeat_lag_seconds,
-                ..
-            } => heartbeat_lag_seconds.or_else(|| self.max_replay_lag_seconds()),
+            Self::Observed { heartbeat, .. } => match heartbeat {
+                WatermarkReading::Measured(seconds) => Some(*seconds),
+                WatermarkReading::BeyondTrail { floor_seconds } => Some(*floor_seconds),
+                WatermarkReading::Unknown => self.max_replay_lag_seconds(),
+            },
         }
+    }
+
+    /// Whether [`Self::rpo_seconds`] is an exact reading or only a lower bound.
+    ///
+    /// An operator deciding whether to fail over needs the difference:
+    /// "42 seconds" and "at least an hour, we cannot see how much more" are
+    /// different decisions.
+    #[must_use]
+    pub const fn rpo_is_lower_bound(&self) -> bool {
+        matches!(
+            self,
+            Self::Observed {
+                heartbeat: WatermarkReading::BeyondTrail { .. },
+                ..
+            }
+        )
     }
 
     /// Worst-case replay lag across every connected standby, in seconds, as
@@ -629,7 +681,7 @@ mod db {
 
     use super::{
         BUMP_LOCK_TIMEOUT_MS, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus,
-        ShardGeneration, SlotLag, StandbyLag, qualified, quote_ident,
+        ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified, quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1032,6 +1084,8 @@ mod db {
     struct RpoRow {
         #[diesel(sql_type = Nullable<Double>)]
         lag_seconds: Option<f64>,
+        #[diesel(sql_type = Nullable<Double>)]
+        oldest_seconds: Option<f64>,
     }
 
     /// Measure the RPO for `shard` in seconds from the watermark trail.
@@ -1071,7 +1125,7 @@ mod db {
     pub async fn measure_rpo(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
-    ) -> HarvestResult<Option<f64>> {
+    ) -> HarvestResult<WatermarkReading> {
         let positions: Vec<StandbyPositionRow> = diesel::sql_query(
             "SELECT CASE \
                         WHEN COUNT(*) = 0 THEN NULL \
@@ -1087,20 +1141,30 @@ mod db {
         .map_err(database_error)?;
 
         let Some(position) = positions.into_iter().next().and_then(|r| r.position) else {
-            return Ok(None);
+            return Ok(WatermarkReading::Unknown);
         };
 
-        // Ordered by `beat_lsn` and `LIMIT 1`, so this is a single descending
-        // probe of the `(shard_id, beat_lsn)` primary key rather than an
-        // aggregate over the trail. Beats are inserted co-monotone in
-        // `(beat_lsn, beat_at)`, so the newest consumed LSN is also the newest
-        // consumed instant.
+        // One query, two answers, so the two cannot disagree across a round
+        // trip: the age of the newest CONSUMED watermark (the reading), and the
+        // age of the OLDEST retained one (the floor, used only when nothing has
+        // been consumed but the trail is non-empty — i.e. the standby has
+        // fallen off the end of it).
+        //
+        // Both are single index probes on `(shard_id, beat_lsn)` /
+        // `(shard_id, beat_at DESC)`; neither aggregates the trail.
         let rows: Vec<RpoRow> = diesel::sql_query(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision AS lag_seconds \
-             FROM harvest_replication_heartbeat h \
-             WHERE h.shard_id = $1 AND h.beat_lsn <= $2::pg_lsn \
-             ORDER BY h.beat_lsn DESC \
-             LIMIT 1",
+            "SELECT ( \
+                 SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
+                 FROM harvest_replication_heartbeat h \
+                 WHERE h.shard_id = $1 AND h.beat_lsn <= $2::pg_lsn \
+                 ORDER BY h.beat_lsn DESC LIMIT 1 \
+             ) AS lag_seconds, \
+             ( \
+                 SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
+                 FROM harvest_replication_heartbeat h \
+                 WHERE h.shard_id = $1 \
+                 ORDER BY h.beat_at ASC LIMIT 1 \
+             ) AS oldest_seconds",
         )
         .bind::<Integer, _>(shard.as_i32())
         .bind::<Text, _>(position)
@@ -1108,14 +1172,25 @@ mod db {
         .await
         .map_err(database_error)?;
 
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(WatermarkReading::Unknown);
+        };
+
         // A negative reading is impossible in principle (`NOW()` is monotonic
         // relative to a row already committed) but clamps to `0.0` rather than
         // being emitted as a nonsense negative RPO if the clock is adjusted.
-        Ok(rows
-            .into_iter()
-            .next()
-            .and_then(|r| r.lag_seconds)
-            .map(|v| v.max(0.0)))
+        Ok(match (row.lag_seconds, row.oldest_seconds) {
+            (Some(lag), _) => WatermarkReading::Measured(lag.max(0.0)),
+            // Nothing consumed, but the trail is NOT empty: the standby is
+            // behind every watermark we still hold. The RPO is at least the
+            // oldest one's age — which is at least the retention window — and
+            // unbounded above.
+            (None, Some(oldest)) => WatermarkReading::BeyondTrail {
+                floor_seconds: oldest.max(0.0),
+            },
+            // No trail at all: the sampler has not written a beat yet.
+            (None, None) => WatermarkReading::Unknown,
+        })
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1151,8 +1226,11 @@ mod db {
     /// in the runbook hoping to be read.
     ///
     /// Physical (streaming) replicas do not need this — they replicate the WAL
-    /// itself, sequences included — but running it there is harmless: `setval`
-    /// to the value already in force is a no-op.
+    /// itself, sequences included — and running it there is harmless *because*
+    /// the target is `GREATEST(MAX(col), last_value, 1)` rather than
+    /// `MAX(col)`: a sequence already ahead of its table's maximum is left
+    /// where it is, never rewound. See the statement below for why "ahead of
+    /// MAX" is an ordinary, expected state rather than corruption.
     ///
     /// # Scope
     ///
@@ -1259,9 +1337,25 @@ mod db {
             // than a relation reference, so the schema-qualified identifier is
             // passed as a single-quoted literal with any `'` doubled.
             let seq = qualified(&col.sequence_schema, &col.sequence_name);
+            // `pg_sequence_last_value` is inside the GREATEST for a reason: a
+            // sequence can legitimately sit AHEAD of `MAX(col)` — cached
+            // values, a rolled-back transaction, deleted rows — and a physical
+            // replica replicates sequences already, so on that topology this
+            // command is meant to be a no-op. Without it `setval` would
+            // *rewind* the sequence and start re-issuing ids the database has
+            // already handed out: a duplicate-key outage caused by the very
+            // command that exists to prevent one. Measured on live Postgres:
+            // insert two rows, delete the second, and MAX is 1 while
+            // last_value is 2.
+            //
+            // NULL until the sequence has been called at least once, hence the
+            // COALESCE.
             let sql = format!(
                 "SELECT setval('{seq_literal}', \
-                        GREATEST((SELECT COALESCE(MAX({col}), 0) FROM {tbl}), 1), \
+                        GREATEST( \
+                            (SELECT COALESCE(MAX({col}), 0) FROM {tbl}), \
+                            COALESCE(pg_sequence_last_value('{seq_literal}'), 0), \
+                            1), \
                         true)::bigint AS value",
                 seq_literal = seq.replace('\'', "''"),
                 col = quote_ident(&col.column_name),
@@ -1314,10 +1408,12 @@ mod db {
 
         // A watermark-read failure degrades the same way a view-read failure
         // does: lose the number, never the sampler.
-        let heartbeat_lag_seconds = measure_rpo(conn, shard).await.unwrap_or(None);
+        let heartbeat = measure_rpo(conn, shard)
+            .await
+            .unwrap_or(WatermarkReading::Unknown);
 
         Ok(ReplicationStatus::Observed {
-            heartbeat_lag_seconds,
+            heartbeat,
             standbys: standbys
                 .into_iter()
                 .map(|r| StandbyLag {
@@ -1370,7 +1466,7 @@ mod tests {
         ReplicationStatus::Observed {
             standbys,
             slots,
-            heartbeat_lag_seconds: None,
+            heartbeat: WatermarkReading::Unknown,
         }
     }
 
@@ -1388,9 +1484,40 @@ mod tests {
         let s = ReplicationStatus::Observed {
             standbys: vec![standby("streaming", Some(0.0), Some(1_000_000))],
             slots: vec![],
-            heartbeat_lag_seconds: Some(41.5),
+            heartbeat: WatermarkReading::Measured(41.5),
         };
         assert_eq!(s.rpo_seconds(), Some(41.5));
+        assert!(!s.rpo_is_lower_bound());
+    }
+
+    /// A standby that has fallen off the end of the retained trail must NOT
+    /// fall back to `replay_lag`.
+    ///
+    /// `replay_lag` freezes for a stuck logical apply worker, and a stuck apply
+    /// worker is precisely how a trail gets exhausted — so the fallback would
+    /// replace a known-enormous RPO with a small stale one, at the moment an
+    /// operator is deciding whether to fail over. The floor is reported
+    /// instead: it clears any threshold, so the shard still pages, and it is
+    /// flagged as a lower bound rather than passed off as a measurement.
+    #[test]
+    fn an_exhausted_trail_reports_its_floor_not_a_stale_replay_lag() {
+        let s = ReplicationStatus::Observed {
+            // A frozen, reassuringly small replay_lag — the trap.
+            standbys: vec![standby("streaming", Some(0.4), Some(9_000_000))],
+            slots: vec![],
+            heartbeat: WatermarkReading::BeyondTrail {
+                floor_seconds: 3_600.0,
+            },
+        };
+        assert_eq!(
+            s.rpo_seconds(),
+            Some(3_600.0),
+            "the floor must win over a frozen replay_lag"
+        );
+        assert!(
+            s.rpo_is_lower_bound(),
+            "the caller must be able to tell a bound from a measurement"
+        );
     }
 
     /// With no watermark, `replay_lag` is still better than nothing.
@@ -1399,9 +1526,10 @@ mod tests {
         let s = ReplicationStatus::Observed {
             standbys: vec![standby("streaming", Some(2.5), Some(10))],
             slots: vec![],
-            heartbeat_lag_seconds: None,
+            heartbeat: WatermarkReading::Unknown,
         };
         assert_eq!(s.rpo_seconds(), Some(2.5));
+        assert!(!s.rpo_is_lower_bound());
     }
 
     /// Neither source: unknown. Never zero.

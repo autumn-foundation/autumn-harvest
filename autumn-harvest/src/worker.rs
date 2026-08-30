@@ -233,6 +233,22 @@ pub struct WorkerRuntimeConfig {
     /// Advertised worker-session capacity (issue #606). `0` (the default)
     /// means sessions are disabled on this worker.
     pub max_concurrent_sessions: i32,
+    /// Whether this worker enforces cross-region DR write-authority fencing
+    /// (issue #954). See [`crate::builder::WorkerConfig::dr_fencing`].
+    ///
+    /// **On the struct, not on the process-global beside the other two DR
+    /// knobs, and that asymmetry is deliberate.** A runtime config can be built
+    /// and *stored* long before `Worker::new` consumes it — the plugin's
+    /// `PreparedHarvestRuntime` does exactly that — so any unrelated
+    /// `WorkerConfig::default()` conversion in between would overwrite a
+    /// last-writer-wins global and this worker would snapshot `false`: silently
+    /// unfenced, while `effective_config` still reported DR enabled. That is
+    /// the worst failure this feature has, so the flag travels with the
+    /// conversion that produced it.
+    ///
+    /// The cadence and retention knobs stay on the global: racing them changes
+    /// only sampler timing, never whether the fence is enforced.
+    pub dr_fencing: bool,
 }
 
 impl WorkerRuntimeConfig {
@@ -420,6 +436,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             deployment_name: cfg.deployment_name,
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
+            dr_fencing: cfg.dr_fencing,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
             capability_miss_max_redeliveries: cfg.capability_miss_max_redeliveries,
@@ -19528,17 +19545,12 @@ pub struct Worker {
     pub registry: Arc<HandlerRegistry>,
     /// Set of activities that this worker cannot run because of unsatisfied requirements (issue #382).
     pub ineligible_activities: Vec<String>,
-    /// This worker's cross-region DR settings (issue #954), snapshotted at
-    /// construction.
+    /// This worker's DR sampler cadence and watermark retention (issue #954).
     ///
-    /// Read here rather than from [`crate::replication::dr_config`] at `run()`
-    /// time on purpose. That global is published by
-    /// `From<WorkerConfig> for WorkerRuntimeConfig`, so *any* later conversion
-    /// of a default `WorkerConfig` anywhere in the process — a second worker, a
-    /// runner, a test helper — would overwrite it with `fencing: false` while
-    /// `effective_config` still reported `true`, and this worker would run
-    /// completely unfenced with no signal. Snapshotting binds the value to the
-    /// conversion that produced *this* worker's config.
+    /// Snapshotted at construction from the process-global. Only the *timing*
+    /// knobs live there — whether fencing is enforced at all rides on
+    /// [`WorkerRuntimeConfig::dr_fencing`], because that one cannot tolerate a
+    /// last-writer-wins race. See that field.
     dr: crate::replication::DrConfig,
     /// Bounds concurrent workflow task executions.
     workflow_semaphore: Arc<Semaphore>,
@@ -21194,7 +21206,7 @@ impl Worker {
     async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
         use crate::replication::FenceRegistry;
 
-        if !self.dr.fencing {
+        if !self.config.dr_fencing {
             return true;
         }
 
@@ -21668,7 +21680,7 @@ impl Worker {
         // authority. Neither may be silently switched off by a deployment that
         // simply has no metrics sink.
         #[cfg(feature = "db")]
-        let replication_sampler = if self.dr.fencing {
+        let replication_sampler = if self.config.dr_fencing {
             // Every deployment shape, not just sharded ones. Gating this on
             // `sharded_pool.is_some()` left the DOCUMENTED single-database
             // configuration — `.with_dr_fencing(true)` and nothing else — with
@@ -24024,6 +24036,7 @@ mod tests {
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
+            dr_fencing: false,
             worker_id: "test-worker-1".to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -25023,6 +25036,7 @@ mod tests {
     #[test]
     fn worker_rejects_invalid_config() {
         let cfg = WorkerRuntimeConfig {
+            dr_fencing: false,
             queues: vec![],
             ..default_runtime_config()
         };
@@ -25587,6 +25601,7 @@ mod tests {
             .continue_as_new_threshold();
 
         let cfg = WorkerRuntimeConfig {
+            dr_fencing: false,
             max_workflow_history_events: Some(threshold + 1),
             ..default_runtime_config()
         };
@@ -26917,6 +26932,7 @@ mod tests {
         labels.insert("gpu".to_string(), "true".to_string());
         labels.insert("region".to_string(), "eu-west-1".to_string());
         let cfg = WorkerRuntimeConfig {
+            dr_fencing: false,
             labels,
             ..default_runtime_config()
         };

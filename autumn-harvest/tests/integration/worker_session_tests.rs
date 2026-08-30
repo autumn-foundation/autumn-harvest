@@ -807,6 +807,7 @@ mod db_tests {
             std::sync::Arc::new(
                 Worker::new(
                     autumn_harvest::worker::WorkerRuntimeConfig {
+                        dr_fencing: false,
                         worker_id: worker_id.to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,

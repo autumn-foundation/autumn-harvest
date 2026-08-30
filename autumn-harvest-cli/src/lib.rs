@@ -4393,6 +4393,13 @@ struct DrShardStatus {
     /// `docs/cross-region-dr.md`. Serialized as an explicit JSON `null` so a
     /// consumer cannot mistake absence for a value of `0`.
     rpo_seconds: Option<f64>,
+    /// Whether `rpo_seconds` is an exact reading or only a **lower bound**.
+    ///
+    /// `true` when the standby has fallen behind the whole retained watermark
+    /// trail: the RPO is at least the reported value and unbounded above.
+    /// "42 seconds" and "at least an hour, we cannot see how much more" are
+    /// different failover decisions, so the table renders the second as `≥`.
+    rpo_is_lower_bound: bool,
     lag_bytes: Option<i64>,
     /// `None` when the replication views could not be read at all.
     ///
@@ -4419,6 +4426,7 @@ impl DrShardStatus {
             "generation_error": self.generation_error,
             // Explicit null, never 0: see the field docs.
             "rpo_seconds": self.rpo_seconds,
+            "rpo_is_lower_bound": self.rpo_is_lower_bound,
             "lag_bytes": self.lag_bytes,
             "connected_standbys": self.connected_standbys,
             "inactive_slots": self.inactive_slots,
@@ -4510,6 +4518,7 @@ async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliErr
                     generation: None,
                     generation_error: None,
                     rpo_seconds: None,
+                    rpo_is_lower_bound: false,
                     lag_bytes: None,
                     connected_standbys: None,
                     inactive_slots: None,
@@ -4534,6 +4543,9 @@ async fn run_dr_status(shards: &[String], format: DrFormat) -> Result<(), CliErr
             rpo_seconds: status
                 .as_ref()
                 .and_then(autumn_harvest::replication::ReplicationStatus::rpo_seconds),
+            rpo_is_lower_bound: status
+                .as_ref()
+                .is_some_and(autumn_harvest::replication::ReplicationStatus::rpo_is_lower_bound),
             lag_bytes: status
                 .as_ref()
                 .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
@@ -4614,9 +4626,18 @@ fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
                 "unfenced".to_string()
             }
         });
-        let rpo = r
-            .rpo_seconds
-            .map_or_else(|| "unknown".to_string(), |v| format!("{v:.1}s"));
+        let rpo = r.rpo_seconds.map_or_else(
+            || "unknown".to_string(),
+            |v| {
+                if r.rpo_is_lower_bound {
+                    // The standby is behind the whole retained trail, so this
+                    // is a floor. Printing it bare would read as a measurement.
+                    format!(">={v:.0}s")
+                } else {
+                    format!("{v:.1}s")
+                }
+            },
+        );
         let bytes = r
             .lag_bytes
             .map_or_else(|| "unknown".to_string(), |v| v.to_string());
