@@ -240,14 +240,47 @@ pub async fn append_events_offloaded(
     start_id: i32,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<usize> {
+    append_events_offloaded_with_codecs(
+        conn,
+        exec_id,
+        events,
+        start_id,
+        offloader,
+        &DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// Append events through both the codec and the offloader (issues #948, #1243).
+///
+/// Composition order is the one ADR-0003 fixes and issue #524 assumes: **encode
+/// first, then offload.** The codec turns a payload into ciphertext; the
+/// offloader then decides whether that ciphertext is large enough to move out
+/// of line, leaving a reference envelope behind. Reversing the two would hand
+/// the codec a reference envelope to encrypt, orphaning the blob and leaving a
+/// row whose payload cannot be resolved without the key — which is why the
+/// rotation sweep skips offload envelopes rather than re-encoding them.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if either INSERT fails, a
+/// codec error if encoding fails, or a payload-store error if offload fails.
+pub async fn append_events_offloaded_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let Some(offloader) = offloader else {
-        return append_events(conn, exec_id, events, start_id).await;
+        return append_events_with_codecs(conn, exec_id, events, start_id, codecs).await;
     };
     if events.is_empty() {
         return Ok(0);
     }
 
-    let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+    let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     for row in &mut rows {
         let refs = offloader.offload_event_value(&mut row.event_data).await?;

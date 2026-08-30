@@ -1121,6 +1121,7 @@ impl BuiltHarvest {
                 .map(|d| d.name.to_string()),
         )
         .with_payload_offloader(self.payload_offloader.clone())
+        .with_payload_codecs(self.payload_codecs.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
@@ -1203,6 +1204,7 @@ impl BuiltHarvest {
                 .map(|d| d.name.to_string()),
         )
         .with_payload_offloader(self.payload_offloader.clone())
+        .with_payload_codecs(self.payload_codecs.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),

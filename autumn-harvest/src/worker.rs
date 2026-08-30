@@ -564,6 +564,18 @@ pub struct HandlerRegistry {
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Payload-codec registry (ADR-0003, issue #1243).
+    ///
+    /// Rides on the registry for the same reason the offloader does: it must
+    /// be reachable from every event write and every history read, and the
+    /// registry is the one handle already threaded through all of them.
+    /// Defaults to the identity registry, so a deployment that configures no
+    /// codec stores exactly the bytes it did before.
+    ///
+    /// Write and read must share this value. Encoding on write while replay
+    /// decodes with a different registry hands ciphertext envelopes to
+    /// workflow code — which is precisely the bug #1243 records.
+    payload_codecs: crate::payload_codec::PayloadCodecs,
     /// Ordered activity execution interceptor chain (issue #680). Index 0 is
     /// the OUTERMOST wrapper. Empty (the default) = no interceptors, and the
     /// dispatch path takes a zero-overhead direct handler call.
@@ -750,6 +762,7 @@ impl HandlerRegistry {
             max_workflow_execution_timeout: None,
             dag_workflow_names: std::collections::HashSet::new(),
             payload_offloader: None,
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
             wasm_activities: HashMap::new(),
@@ -912,6 +925,22 @@ impl HandlerRegistry {
     #[must_use]
     pub fn payload_offloader_arc(&self) -> Option<Arc<crate::payload_store::PayloadOffloader>> {
         self.payload_offloader.clone()
+    }
+
+    /// Attach the payload-codec registry (ADR-0003, issue #1243).
+    #[must_use]
+    pub fn with_payload_codecs(mut self, codecs: crate::payload_codec::PayloadCodecs) -> Self {
+        self.payload_codecs = codecs;
+        self
+    }
+
+    /// Borrow the configured payload-codec registry (issue #1243).
+    ///
+    /// Every event write and every history read in the worker resolves its
+    /// codecs through here, so the two can never disagree.
+    #[must_use]
+    pub fn payload_codecs(&self) -> &crate::payload_codec::PayloadCodecs {
+        &self.payload_codecs
     }
 
     /// Install the ordered activity execution interceptor chain (issue #680).
@@ -1120,6 +1149,7 @@ impl std::fmt::Debug for HandlerRegistry {
                 &self.max_workflow_execution_timeout,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
+            .field("payload_codecs", &"configured")
             .field(
                 "activity_interceptor_count",
                 &self.activity_interceptors.len(),
@@ -2353,6 +2383,9 @@ async fn persist_external_signal_inline(
     items: Vec<SignalBatchItem>,
     next_event_id: &mut i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Vec<WorkflowEvent>> {
     let start_next = *next_event_id;
 
@@ -2423,7 +2456,7 @@ async fn persist_external_signal_inline(
             for item in items {
                 match item {
                     SignalBatchItem::Marker(event) => {
-                        store::append_events(conn, exec_id, std::slice::from_ref(&event), next)
+                        store::append_events_with_codecs(conn, exec_id, std::slice::from_ref(&event), next, codecs)
                             .await?;
                         next += 1;
                         new_events.push(event);
@@ -2437,11 +2470,12 @@ async fn persist_external_signal_inline(
                                 payload: run.payload.clone(),
                                 idempotency_key: run.idempotency_key.clone(),
                             };
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&requested),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2565,11 +2599,12 @@ async fn persist_external_signal_inline(
                         };
 
                         if let Some(terminal) = terminal_opt {
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&terminal),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2582,11 +2617,12 @@ async fn persist_external_signal_inline(
                                 cancel_id: run.cancel_id,
                                 target: run.target.clone(),
                             };
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&requested),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2700,11 +2736,12 @@ async fn persist_external_signal_inline(
                         };
 
                         if let Some(terminal) = terminal_opt {
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&terminal),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2717,11 +2754,12 @@ async fn persist_external_signal_inline(
                                 await_id: run.await_id,
                                 target: run.target,
                             };
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&requested),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2792,11 +2830,12 @@ async fn persist_external_signal_inline(
                         };
 
                         if let Some(terminal) = terminal_opt {
-                            store::append_events(
+                            store::append_events_with_codecs(
                                 conn,
                                 exec_id,
                                 std::slice::from_ref(&terminal),
                                 next,
+                                codecs,
                             )
                             .await?;
                             next += 1;
@@ -2994,10 +3033,13 @@ async fn append_frontier_resolution(
     events: &[WorkflowEvent],
     event_start: i32,
     frontier: FrontierAccounting<'_>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let owned: Vec<WorkflowEvent> = events.to_vec();
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        store::append_events(conn, exec_id, &owned, event_start).await?;
+        store::append_events_with_codecs(conn, exec_id, &owned, event_start, codecs).await?;
         queue::reset_capability_misses_after_inline_progress(
             conn,
             frontier.task_id,
@@ -3143,7 +3185,14 @@ async fn run_local_activity_inline(
         let events = prefix_events.clone();
         let event_start = *next_event_id;
         Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-            store::append_events(conn, exec_id, &events, event_start).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &events,
+                event_start,
+                registry.payload_codecs(),
+            )
+            .await?;
             detached_spawns.persist(conn, &detached_commands).await
         }))
         .await?;
@@ -3301,6 +3350,7 @@ async fn run_local_activity_inline(
                     std::slice::from_ref(&completed_event),
                     *next_event_id,
                     frontier,
+                    registry.payload_codecs(),
                 )
                 .await?;
                 *next_event_id += 1;
@@ -3353,11 +3403,12 @@ async fn run_local_activity_inline(
                     let final_pair_would_exceed_cap = history_event_hard_cap
                         .is_some_and(|cap| current_count.saturating_add(2) > cap);
                     if final_pair_would_exceed_cap {
-                        store::append_events(
+                        store::append_events_with_codecs(
                             conn,
                             exec_id,
                             std::slice::from_ref(&failed_event),
                             *next_event_id,
+                            registry.payload_codecs(),
                         )
                         .await?;
                         *next_event_id += 1;
@@ -3388,6 +3439,7 @@ async fn run_local_activity_inline(
                         &terminal_pair,
                         *next_event_id,
                         frontier,
+                        registry.payload_codecs(),
                     )
                     .await?;
                     *next_event_id += i32::try_from(terminal_pair.len())
@@ -3411,11 +3463,12 @@ async fn run_local_activity_inline(
 
                 // Non-terminal attempt: record the failure, optionally sleep,
                 // and loop to the next attempt.
-                store::append_events(
+                store::append_events_with_codecs(
                     conn,
                     exec_id,
                     std::slice::from_ref(&failed_event),
                     *next_event_id,
+                    registry.payload_codecs(),
                 )
                 .await?;
                 *next_event_id += 1;
@@ -3835,6 +3888,9 @@ async fn append_activity_started_if_pending(
     exec_id: ExecutionId,
     activity_name: &str,
     worker_id: &str,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<StartedActivity>> {
     Box::pin(
         conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
@@ -3856,7 +3912,14 @@ async fn append_activity_started_if_pending(
                 activity_id,
                 worker_id: WorkerId::new(worker_id),
             };
-            store::append_events(conn, exec_id, &[started_event], history.next_event_id).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[started_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
             Ok(Some(StartedActivity {
                 activity_id,
                 workflow_id: execution.workflow_id,
@@ -6270,14 +6333,24 @@ async fn persist_workflow_completion(
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            store::append_events_offloaded(conn, exec_id, &[event], next_event_id, offloader)
-                .await?;
+            store::append_events_offloaded_with_codecs(
+                conn,
+                exec_id,
+                &[event],
+                next_event_id,
+                offloader,
+                codecs,
+            )
+            .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
@@ -6349,6 +6422,9 @@ async fn persist_workflow_failure(
     // Priority from the current task so the retry inherits the same queue priority
     // and is not silently demoted behind normal work (issue #523 P2).
     priority: crate::types::Priority,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(bool, (ExecutionId, Option<String>))> {
     let error = error.to_string();
     // Decode the typed failure envelope once (issue #767). A legacy `Err(String)`
@@ -6457,11 +6533,12 @@ async fn persist_workflow_failure(
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
-            store::append_events(
+            store::append_events_with_codecs(
                 conn,
                 exec_id,
                 &[WorkflowEvent::workflow_failed_typed(&decoded)],
                 next_event_id,
+                codecs,
             )
             .await?;
             update_workflow_execution_failed(
@@ -6669,6 +6746,9 @@ async fn persist_update_result_commands(
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
     next_event_id: &mut i32,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let events: Vec<WorkflowEvent> = commands
         .iter()
@@ -6695,7 +6775,7 @@ async fn persist_update_result_commands(
         .checked_add(i32::try_from(events.len()).unwrap_or(i32::MAX))
         .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
 
-    store::append_events(conn, exec_id, &events, *next_event_id).await?;
+    store::append_events_with_codecs(conn, exec_id, &events, *next_event_id, codecs).await?;
     *next_event_id = advanced_event_id;
     Ok(())
 }
@@ -7301,6 +7381,9 @@ async fn persist_signal_wait_park(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let registry = detached_spawns.registry;
     // Park the workflow task (state=RUNNING, worker cleared) so it is not
@@ -7330,7 +7413,8 @@ async fn persist_signal_wait_park(
                 plan_timer_lifecycle(conn, exec_id, commands).await?;
             let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
             let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
-            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &marker_events, next_event_id, codecs)
+                .await?;
             detached_spawns.persist(conn, commands).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
             let deferred = apply_race_loser_cancellations(
@@ -7506,6 +7590,9 @@ async fn persist_mutex_acquire_park(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     enum MutexParkOutcome {
         Granted {
@@ -7555,7 +7642,8 @@ async fn persist_mutex_acquire_park(
                 plan_timer_lifecycle(conn, exec_id, commands).await?;
             let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
             let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
-            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &marker_events, next_event_id, codecs)
+                .await?;
             detached_spawns.persist(conn, commands).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
             let deferred = apply_race_loser_cancellations(
@@ -8015,8 +8103,15 @@ async fn persist_scheduled_activities(
                 }
             });
             let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-            store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
-                .await?;
+            store::append_events_offloaded_with_codecs(
+                conn,
+                exec_id,
+                &events,
+                next_event_id,
+                offloader,
+                registry.payload_codecs(),
+            )
+            .await?;
             detached_spawns.persist(conn, commands).await?;
             // Lazily register any dynamic per-key rate-limit buckets (issue
             // #699) in the same transaction as the enqueue so the fail-closed
@@ -8095,8 +8190,14 @@ async fn persist_scheduled_activities(
                             non_retryable: true,
                             details: None,
                         };
-                        store::append_events(conn, exec_id, &[failed_event], race_next_event_id)
-                            .await?;
+                        store::append_events_with_codecs(
+                            conn,
+                            exec_id,
+                            &[failed_event],
+                            race_next_event_id,
+                            registry.payload_codecs(),
+                        )
+                        .await?;
                         race_next_event_id = race_next_event_id.saturating_add(1);
                         queue::fail_task(conn, *activity_task_id, reason).await?;
                         synthesized_broken_session_failure = true;
@@ -8149,6 +8250,9 @@ async fn persist_started_timer(
     // query — the wake itself no longer happens here. A pure timer sleep threads
     // the empty default: no stamp, no false-wake, and never a blanket history scan.
     resolved_inline_external: &ResolvedExternalIds,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
@@ -8228,7 +8332,7 @@ async fn persist_started_timer(
         let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
 
         if has_events {
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
         }
         detached_spawns.persist(conn, commands).await?;
 
@@ -8745,12 +8849,13 @@ async fn persist_all_started_child_workflows(
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await?;
-            store::append_events_offloaded(
+            store::append_events_offloaded_with_codecs(
                 conn,
                 child.child_id,
                 &[child_started_event],
                 0,
                 registry.payload_offloader(),
+                registry.payload_codecs(),
             )
             .await?;
             queue::enqueue(conn, &params).await?;
@@ -9061,12 +9166,13 @@ async fn insert_awaited_child_execution(
         Some(registry.telemetry().metrics.as_ref()),
     )
     .await?;
-    store::append_events_offloaded(
+    store::append_events_offloaded_with_codecs(
         conn,
         child.child_id,
         &[child_started_event],
         0,
         registry.payload_offloader(),
+        registry.payload_codecs(),
     )
     .await?;
     queue::enqueue(conn, &params).await?;
@@ -9413,6 +9519,9 @@ pub async fn ingest_due_timers_and_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
     use diesel::dsl::sql;
@@ -9459,7 +9568,7 @@ pub async fn ingest_due_timers_and_signals(
     let events = merge_wake_events(timer_entries, signal_entries);
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        store::append_events(conn, exec_id, &events, next_event_id).await?;
+        store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
         if !timer_row_ids.is_empty() {
             diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
                 .set(dsl::fired.eq(true))
@@ -9554,8 +9663,11 @@ pub async fn ingest_wake_events_or_requeue(
     sticky_timeout: Duration,
     exec_id: ExecutionId,
     next_event_id: i32,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<(Vec<TimerId>, Vec<String>)>> {
-    match ingest_due_timers_and_signals(conn, exec_id, next_event_id).await {
+    match ingest_due_timers_and_signals(conn, exec_id, next_event_id, codecs).await {
         Ok(pair) => Ok(Some(pair)),
         Err(e) if e.is_event_id_unique_violation() => {
             requeue_parent_on_transient_ingest_conflict(
@@ -9593,9 +9705,12 @@ async fn fail_task_and_execution(
     task: &TaskQueueItem,
     worker_id: &str,
     error: &str,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let preloaded = preload_failure_history(conn, task).await;
-    fail_task_and_execution_with_history(conn, task, worker_id, error, preloaded).await
+    fail_task_and_execution_with_history(conn, task, worker_id, error, preloaded, codecs).await
 }
 
 /// The history read [`fail_task_and_execution`] needs, resolved ahead of the
@@ -9671,6 +9786,9 @@ pub async fn fail_task_and_execution_with_history(
     worker_id: &str,
     error: &str,
     preloaded: PreloadedFailureHistory,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let (exec_id, next_event_id) = match preloaded {
         PreloadedFailureHistory::NoExecution => {
@@ -9699,6 +9817,7 @@ pub async fn fail_task_and_execution_with_history(
         None,
         None,
         crate::types::Priority::default(),
+        codecs,
     )
     .await
     .map(|_| ())
@@ -9711,6 +9830,9 @@ async fn finalize_activity_completion(
     activity_id: ActivityExecId,
     output: serde_json::Value,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(());
@@ -9732,12 +9854,13 @@ async fn finalize_activity_completion(
         if state != "RUNNING" {
             return Ok(());
         }
-        store::append_events_offloaded(
+        store::append_events_offloaded_with_codecs(
             conn,
             exec_id,
             &[completion_event],
             history.next_event_id,
             offloader,
+            codecs,
         )
         .await?;
         queue::complete_task(conn, task.id, output).await?;
@@ -9768,6 +9891,9 @@ async fn finalize_activity_failure(
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
     error: &str,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(());
@@ -9819,7 +9945,14 @@ async fn finalize_activity_failure(
             }
             return Ok(());
         }
-        store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[failed_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
@@ -10010,6 +10143,9 @@ async fn persist_child_workflow_completion(
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
@@ -10018,7 +10154,8 @@ async fn persist_child_workflow_completion(
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let output = output.clone();
-            store::append_events(conn, exec_id, &[event], next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
+                .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
@@ -10058,6 +10195,9 @@ async fn persist_child_workflow_failure(
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     // Decode the child's typed failure envelope once (issue #767). The child's own
     // `WorkflowFailed` event carries the full typed fields; its `execution.error`
@@ -10071,7 +10211,14 @@ async fn persist_child_workflow_failure(
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let raw_error = error.to_string();
             let message = decoded.message.clone();
-            store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[workflow_failure],
+                next_event_id,
+                codecs,
+            )
+            .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &message, nd_details)
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
@@ -10284,7 +10431,7 @@ async fn create_detached_child_executions(
         // Note: the ChildWorkflowSpawnedDetached event for the PARENT history is
         // written by the caller's pre_suspension_events_from_commands batch so
         // that it appears at the correct position relative to RecordMarker events.
-        store::append_events(
+        store::append_events_with_codecs(
             conn,
             *child_id,
             &[WorkflowEvent::WorkflowStarted {
@@ -10295,6 +10442,7 @@ async fn create_detached_child_executions(
                 scheduled_time: None, // child workflows are not scheduler-fired
             }],
             0,
+            registry.payload_codecs(),
         )
         .await?;
 
@@ -10528,6 +10676,9 @@ async fn record_schedule_to_close_activity_timeout(
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
     retry_delay: chrono::Duration,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ScheduleToCloseTimeoutOutcome> {
     let error = HarvestError::Timeout {
         timeout_type: crate::error::TimeoutType::ScheduleToClose,
@@ -10561,7 +10712,14 @@ async fn record_schedule_to_close_activity_timeout(
                 activity_id,
                 timeout_type: crate::error::TimeoutType::ScheduleToClose,
             };
-            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[timeout_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(ScheduleToCloseTimeoutOutcome::Handled)
@@ -10585,6 +10743,9 @@ async fn handle_activity_result(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
     retry_after_ceiling: Duration,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
@@ -10602,9 +10763,19 @@ async fn handle_activity_result(
                     ),
                 )
                 .into_error_payload();
-                return finalize_activity_failure(conn, task, exec_id, activity_id, &error).await;
+                return finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs)
+                    .await;
             }
-            finalize_activity_completion(conn, task, exec_id, activity_id, output, offloader).await
+            finalize_activity_completion(
+                conn,
+                task,
+                exec_id,
+                activity_id,
+                output,
+                offloader,
+                codecs,
+            )
+            .await
         }
         Err(error) => {
             // Issue #782: emit the panic counter once per panicking attempt
@@ -10617,7 +10788,8 @@ async fn handle_activity_result(
                 metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
             }
             let delay_result = next_retry_delay(task, &error, retry_policy, retry_after_ceiling);
-            let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
+            let delay =
+                fail_execution_on_error(conn, task, worker_id, delay_result, codecs).await?;
 
             if let Some(delay) = delay {
                 // Pre-retry deadline check (issue #378): if the schedule_to_close
@@ -10635,6 +10807,7 @@ async fn handle_activity_result(
                         exec_id,
                         activity_id,
                         delay,
+                        codecs,
                     )
                     .await?
                     {
@@ -10668,7 +10841,7 @@ async fn handle_activity_result(
                 return result;
             }
 
-            finalize_activity_failure(conn, task, exec_id, activity_id, &error).await
+            finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs).await
         }
     }
 }
@@ -10740,6 +10913,9 @@ async fn record_session_acquire_schedule_to_start_timeout(
     task: &TaskQueueItem,
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let error = HarvestError::Timeout {
         timeout_type: crate::error::TimeoutType::ScheduleToStart,
@@ -10763,7 +10939,14 @@ async fn record_session_acquire_schedule_to_start_timeout(
             activity_id,
             timeout_type: crate::error::TimeoutType::ScheduleToStart,
         };
-        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[timeout_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
@@ -10788,6 +10971,9 @@ async fn handle_session_acquire(
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -10807,7 +10993,7 @@ async fn handle_session_acquire(
         .and_then(|s| s.parse::<crate::types::SessionId>().ok())
     else {
         let error = "session-acquire task input is not a valid SessionId".to_string();
-        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
+        fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
 
@@ -10839,6 +11025,7 @@ async fn handle_session_acquire(
             task,
             exec_id,
             activity_id,
+            codecs,
         )
         .await;
     }
@@ -10907,8 +11094,15 @@ async fn handle_session_acquire(
                     ),
                 ),
             );
-            return finalize_activity_failure(&mut conn, task, exec_id, activity_id, &payload)
-                .await;
+            return finalize_activity_failure(
+                &mut conn,
+                task,
+                exec_id,
+                activity_id,
+                &payload,
+                codecs,
+            )
+            .await;
         }
         Err(error) => {
             // Failed to durably record the session -- release the slot just
@@ -10919,7 +11113,7 @@ async fn handle_session_acquire(
             // a crash between the DB error and this line).
             crate::sessions::release_session_slot(session_slots_in_use, session_id);
             let msg = error.to_string();
-            fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
+            fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
             return Err(error);
         }
     };
@@ -10940,7 +11134,7 @@ async fn handle_session_acquire(
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
     let output = serde_json::json!(actual_host);
-    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
+    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
 }
 
 /// Handle the internal session-release activity (issue #606), dispatched by
@@ -10955,6 +11149,9 @@ async fn handle_session_release(
     worker_id: &str,
     exec_id: ExecutionId,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -10974,13 +11171,13 @@ async fn handle_session_release(
         .and_then(|s| s.parse::<crate::types::SessionId>().ok())
     else {
         let error = "session-release task input is not a valid SessionId".to_string();
-        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
+        fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
 
     if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
         let msg = error.to_string();
-        fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
+        fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
     }
 
@@ -10990,7 +11187,7 @@ async fn handle_session_release(
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
-    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
+    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -11030,11 +11227,20 @@ async fn process_activity_task(
             max_concurrent_sessions,
             session_slots_in_use,
             registry.telemetry().metrics.as_ref(),
+            registry.payload_codecs(),
         )
         .await;
     }
     if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
-        return handle_session_release(pool, task, worker_id, exec_id, session_slots_in_use).await;
+        return handle_session_release(
+            pool,
+            task,
+            worker_id,
+            exec_id,
+            session_slots_in_use,
+            registry.payload_codecs(),
+        )
+        .await;
     }
 
     let Some(activity) = registry.activities.get(activity_name) else {
@@ -11122,11 +11328,23 @@ async fn process_activity_task(
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        let started_result =
-            append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
-                .await;
-        let Some(started) =
-            fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
+        let started_result = append_activity_started_if_pending(
+            &mut conn,
+            task,
+            exec_id,
+            activity_name,
+            worker_id,
+            registry.payload_codecs(),
+        )
+        .await;
+        let Some(started) = fail_execution_on_error(
+            &mut conn,
+            task,
+            worker_id,
+            started_result,
+            registry.payload_codecs(),
+        )
+        .await?
         else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
@@ -11207,8 +11425,14 @@ async fn process_activity_task(
         );
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let retry_policy_result = configured_retry_policy(task);
-        let retry_policy =
-            fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+        let retry_policy = fail_execution_on_error(
+            &mut conn,
+            task,
+            worker_id,
+            retry_policy_result,
+            registry.payload_codecs(),
+        )
+        .await?;
         return handle_activity_result(
             &mut conn,
             task,
@@ -11222,6 +11446,7 @@ async fn process_activity_task(
             registry.payload_offloader(),
             telemetry.metrics.as_ref(),
             registry.retry_after_ceiling,
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -11625,8 +11850,14 @@ async fn process_activity_task(
     // Finalization phase: re-acquire a connection now that the handler is done.
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
     let retry_policy_result = configured_retry_policy(task);
-    let retry_policy =
-        fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+    let retry_policy = fail_execution_on_error(
+        &mut conn,
+        task,
+        worker_id,
+        retry_policy_result,
+        registry.payload_codecs(),
+    )
+    .await?;
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
@@ -11720,6 +11951,7 @@ async fn process_activity_task(
         registry.payload_offloader(),
         telemetry.metrics.as_ref(),
         registry.retry_after_ceiling,
+        registry.payload_codecs(),
     )
     .await
 }
@@ -11734,6 +11966,9 @@ async fn persist_scheduled_external_activity(
     commands: &[WorkflowCommand],
     scheduled: &ScheduledExternalActivityCommand,
     sticky: Option<queue::StickyHint<'_>>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // If the token is already registered the awaiting event was already
     // appended by a prior run.  A workflow woken by a signal while still
@@ -11847,7 +12082,7 @@ async fn persist_scheduled_external_activity(
                 }
             });
             let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
             detached_spawns.persist(conn, commands).await?;
             external_task::record_external_task(
                 conn,
@@ -11890,6 +12125,9 @@ async fn persist_bookkeeping_and_requeue_workflow(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let registry = detached_spawns.registry;
 
@@ -11907,7 +12145,7 @@ async fn persist_bookkeeping_and_requeue_workflow(
         let events = pre_suspension_events_from_commands(commands, &mut timer_events);
         let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
         if !events.is_empty() {
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
         }
         detached_spawns.persist(conn, commands).await?;
         let mut race_next_event_id = next_event_id.saturating_add(events_len);
@@ -12081,8 +12319,14 @@ pub async fn apply_race_loser_cancellations(
     }
 
     if !synthetic_events.is_empty() {
-        let inserted =
-            store::append_events(conn, exec_id, &synthetic_events, *next_event_id).await?;
+        let inserted = store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &synthetic_events,
+            *next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
         *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
     }
 
@@ -12522,6 +12766,7 @@ async fn handle_suspended_workflow(
         context.persistence.exec_id,
         commands,
         &mut context.persistence.next_event_id,
+        registry.payload_codecs(),
     )
     .await
     {
@@ -12530,6 +12775,7 @@ async fn handle_suspended_workflow(
             context.persistence.task,
             context.persistence.worker_id,
             Err(e),
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -12543,6 +12789,7 @@ async fn handle_suspended_workflow(
             context.persistence.task,
             context.persistence.worker_id,
             Err(e),
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -12556,6 +12803,7 @@ async fn handle_suspended_workflow(
             context.persistence.task,
             context.persistence.worker_id,
             Err(e),
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -12591,6 +12839,7 @@ async fn handle_suspended_workflow(
             context.persistence.task,
             context.persistence.worker_id,
             Err(e),
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -12611,6 +12860,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             sticky,
+            registry.payload_codecs(),
         )
         .await
     } else if only_bookkeeping_commands(commands) {
@@ -12622,6 +12872,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             sticky,
+            registry.payload_codecs(),
         )
         .await
     } else if let Some(scheduled) = extract_all_scheduled_activities(commands) {
@@ -12691,6 +12942,7 @@ async fn handle_suspended_workflow(
             &timer,
             sticky,
             &context.resolved_inline_external,
+            registry.payload_codecs(),
         )
         .await;
         if res.is_ok() {
@@ -12724,6 +12976,7 @@ async fn handle_suspended_workflow(
             commands,
             &scheduled,
             sticky,
+            registry.payload_codecs(),
         )
         .await
     } else if should_handle_mutex_acquire(commands) {
@@ -12738,6 +12991,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             sticky,
+            registry.payload_codecs(),
         )
         .await
     } else {
@@ -12749,6 +13003,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
+            registry.payload_codecs(),
         )
         .await
     };
@@ -12778,6 +13033,7 @@ async fn handle_suspended_workflow(
         context.persistence.task,
         context.persistence.worker_id,
         result,
+        registry.payload_codecs(),
     )
     .await
 }
@@ -12787,6 +13043,9 @@ async fn fail_execution_on_error<T>(
     task: &TaskQueueItem,
     worker_id: &str,
     result: HarvestResult<T>,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<T> {
     let error = match result {
         Ok(val) => return Ok(val),
@@ -12808,7 +13067,7 @@ async fn fail_execution_on_error<T>(
     if error.suspended_claim_ambiguous().is_some() {
         return Err(error);
     }
-    fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+    fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
     Err(error)
 }
 
@@ -12988,6 +13247,9 @@ pub async fn fail_suspended_workflow_if_still_claimed(
     next_event_id: i32,
     worker_id: &str,
     error: &str,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let preloaded = PreloadedFailureHistory::Loaded {
         exec_id,
@@ -13001,6 +13263,7 @@ pub async fn fail_suspended_workflow_if_still_claimed(
         preloaded,
         None,
         |_| {},
+        codecs,
     )
     .await?;
     match write {
@@ -13033,9 +13296,12 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     result: HarvestResult<T>,
     workflow_panic_strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
     exec_id: uuid::Uuid,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<T> {
     apply_panic_strike_clear_for_failure(workflow_panic_strikes, exec_id, &result);
-    fail_execution_on_error(conn, task, worker_id, result).await
+    fail_execution_on_error(conn, task, worker_id, result, codecs).await
 }
 
 async fn load_task_execution(
@@ -13058,15 +13324,14 @@ async fn load_workflow_replay_state(
     exec_id: ExecutionId,
     sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
+    // Issue #1243: replay MUST decode with the same registry the write path
+    // encoded under. Passing the identity registry here while writes are
+    // encrypted hands ciphertext envelopes straight to workflow code.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<(store::EventHistory, Vec<TimerId>, Vec<String>)>> {
-    let history_result = store::load_history_inflated(
-        conn,
-        exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-        offloader,
-    )
-    .await;
-    let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
+    let history_result = store::load_history_inflated(conn, exec_id, codecs, offloader).await;
+    let initial_history =
+        fail_execution_on_error(conn, task, worker_id, history_result, codecs).await?;
 
     // Single chronological ingest: due timer fires and pending signals are
     // appended in occurrence order (signal received before a deadline lands
@@ -13080,21 +13345,16 @@ async fn load_workflow_replay_state(
         sticky_timeout,
         exec_id,
         initial_history.next_event_id,
+        codecs,
     )
     .await?
     else {
         return Ok(None);
     };
 
-    let final_history_result = store::load_history_inflated(
-        conn,
-        exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-        offloader,
-    )
-    .await;
+    let final_history_result = store::load_history_inflated(conn, exec_id, codecs, offloader).await;
     let final_history =
-        fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
+        fail_execution_on_error(conn, task, worker_id, final_history_result, codecs).await?;
     Ok(Some((final_history, timers_fired, signals_delivered)))
 }
 
@@ -13117,6 +13377,8 @@ async fn prepare_workflow_task_with_cache(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     sticky_timeout: Duration,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
+    // Issue #1243: see `load_workflow_replay_state`.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -13147,12 +13409,12 @@ async fn prepare_workflow_task_with_cache(
             conn,
             exec_id,
             cached_state.next_event_id,
-            &crate::payload_codec::PayloadCodecs::default(),
+            codecs,
             offloader,
         )
         .await;
         let existing_delta =
-            fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
+            fail_execution_on_error(conn, task, worker_id, existing_delta_result, codecs).await?;
 
         // Single chronological ingest of due timers + pending signals (see
         // merge_wake_events for the occurrence-order contract). A transient
@@ -13165,6 +13427,7 @@ async fn prepare_workflow_task_with_cache(
             sticky_timeout,
             exec_id,
             existing_delta.next_event_id,
+            codecs,
         )
         .await?
         else {
@@ -13176,12 +13439,12 @@ async fn prepare_workflow_task_with_cache(
             conn,
             exec_id,
             existing_delta.next_event_id,
-            &crate::payload_codec::PayloadCodecs::default(),
+            codecs,
             offloader,
         )
         .await;
         let after_ingest =
-            fail_execution_on_error(conn, task, worker_id, after_ingest_result).await?;
+            fail_execution_on_error(conn, task, worker_id, after_ingest_result, codecs).await?;
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -13202,9 +13465,16 @@ async fn prepare_workflow_task_with_cache(
     } else {
         // Cache miss path: full history load. A transient event-id conflict
         // re-drives the task (issue #779), surfaced here as `None`.
-        let Some((history, timers_fired, signals_delivered)) =
-            load_workflow_replay_state(conn, task, worker_id, exec_id, sticky_timeout, offloader)
-                .await?
+        let Some((history, timers_fired, signals_delivered)) = load_workflow_replay_state(
+            conn,
+            task,
+            worker_id,
+            exec_id,
+            sticky_timeout,
+            offloader,
+            codecs,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -13236,6 +13506,9 @@ async fn reject_child_continue_as_new(
     conn: &mut AsyncPgConnection,
     persistence: &WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
         return Ok(false);
@@ -13256,6 +13529,7 @@ async fn reject_child_continue_as_new(
             None,
             None,
             crate::types::Priority::default(),
+            codecs,
         )
         .await?;
     } else {
@@ -13269,6 +13543,7 @@ async fn reject_child_continue_as_new(
             error,
             None,
             None,
+            codecs,
         )
         .await?;
     }
@@ -13384,6 +13659,7 @@ async fn check_continue_as_new_type<'a>(
         None,
         None,
         crate::types::Priority::default(),
+        registry.payload_codecs(),
     )
     .await?;
     Ok(ContinueAsNewTypeCheck::Rejected)
@@ -13870,7 +14146,9 @@ async fn persist_workflow_continue_as_new(
 
     let offloader = registry.payload_offloader();
 
-    if reject_child_continue_as_new(conn, &persistence, execution).await? {
+    if reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
+        .await?
+    {
         return Ok(());
     }
 
@@ -14041,6 +14319,7 @@ async fn persist_workflow_continue_as_new(
             None,
             None,
             crate::types::Priority::default(),
+            registry.payload_codecs(),
         )
         .await?;
         return Ok(());
@@ -14131,8 +14410,15 @@ async fn persist_workflow_continue_as_new(
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         // Append the terminal continued-as-new marker to the old run.
-        store::append_events_offloaded(conn, exec_id, &[continued_event], next_event_id, offloader)
-            .await?;
+        store::append_events_offloaded_with_codecs(
+            conn,
+            exec_id,
+            &[continued_event],
+            next_event_id,
+            offloader,
+            registry.payload_codecs(),
+        )
+        .await?;
 
         // Seal the old execution. The CHECK constraint allows this state
         // value as of the continue-as-new migration; the partial unique
@@ -14175,7 +14461,15 @@ async fn persist_workflow_continue_as_new(
             .await
             .map_err(crate::error::database_error)?;
 
-        store::append_events_offloaded(conn, new_exec_id, &[started_event], 0, offloader).await?;
+        store::append_events_offloaded_with_codecs(
+            conn,
+            new_exec_id,
+            &[started_event],
+            0,
+            offloader,
+            registry.payload_codecs(),
+        )
+        .await?;
         // Record the carried-forward blob reference for the successor so the
         // blob survives until the successor is also retained (issue #524).
         if let Some(ref carried) = carried_lcr_ref {
@@ -14247,6 +14541,7 @@ async fn persist_workflow_outcome(
                 parent_id,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
+                registry.payload_codecs(),
             )
             .await?;
             Ok((false, vec![res]))
@@ -14262,6 +14557,7 @@ async fn persist_workflow_outcome(
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
+                registry.payload_codecs(),
             )
             .await?;
             if update_schedule_counter {
@@ -14294,6 +14590,7 @@ async fn persist_workflow_outcome(
                 &error,
                 non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
+                registry.payload_codecs(),
             )
             .await?;
             if update_schedule_counter {
@@ -14336,6 +14633,7 @@ async fn persist_workflow_outcome(
                     .concurrency_cap
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
+                registry.payload_codecs(),
             )
             .await?;
             if update_schedule_counter && !retry_scheduled {
@@ -14408,7 +14706,7 @@ async fn persist_workflow_outcome(
                 new_workflow_type,
             )
             .await;
-            fail_execution_on_error(conn, task, worker_id, result)
+            fail_execution_on_error(conn, task, worker_id, result, registry.payload_codecs())
                 .await
                 .map(|()| (false, vec![(exec_id, Some(workflow_name))]))
         }
@@ -14531,8 +14829,14 @@ async fn persist_terminal_outcome_commands(
     Vec<crate::completion_trigger::DeferredTriggerStart>,
 )> {
     let mut next_event_id = persistence.next_event_id;
-    persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
-        .await?;
+    persist_update_result_commands(
+        conn,
+        persistence.exec_id,
+        pending_cmds,
+        &mut next_event_id,
+        registry.payload_codecs(),
+    )
+    .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
@@ -14561,7 +14865,14 @@ async fn persist_terminal_outcome_commands(
         plan_timer_lifecycle(conn, persistence.exec_id, pending_cmds).await?;
     let pre_terminal = pre_suspension_events_from_commands(pending_cmds, &mut timer_events);
     if !pre_terminal.is_empty() {
-        store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            persistence.exec_id,
+            &pre_terminal,
+            next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
         next_event_id = next_event_id
             .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
             .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
@@ -14868,6 +15179,9 @@ async fn move_workflow_to_dlq_for_history_cap(
     parent_exec_id: Option<ExecutionId>,
     reason: DeadLetterReason,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let reason = reason.to_string();
 
@@ -14899,11 +15213,12 @@ async fn move_workflow_to_dlq_for_history_cap(
                 },
             )
             .await?;
-            store::append_events(
+            store::append_events_with_codecs(
                 conn,
                 exec_id,
                 &[WorkflowEvent::workflow_failed(reason.clone())],
                 next_event_id,
+                codecs,
             )
             .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None).await?;
@@ -15203,6 +15518,7 @@ async fn fail_workflow_for_history_cap(
         execution.parent_id.map(execution_id_from_uuid),
         reason,
         Some(telemetry.metrics.as_ref()),
+        registry.payload_codecs(),
     )
     .await?;
 
@@ -15293,6 +15609,7 @@ async fn process_workflow_task(
         &workflow_cache,
         sticky_timeout,
         registry.payload_offloader(),
+        registry.payload_codecs(),
     )
     .await?
     else {
@@ -15665,6 +15982,7 @@ async fn process_workflow_task(
                             signal_items,
                             &mut next_event_id,
                             &*telemetry.metrics,
+                            registry.payload_codecs(),
                         )
                         .await
                         {
@@ -15677,6 +15995,7 @@ async fn process_workflow_task(
                                     Err::<(), _>(e),
                                     workflow_panic_strikes,
                                     prepared.exec_id.as_uuid(),
+                                    registry.payload_codecs(),
                                 )
                                 .await;
                             }
@@ -15765,6 +16084,7 @@ async fn process_workflow_task(
                             Err::<(), _>(e),
                             workflow_panic_strikes,
                             prepared.exec_id.as_uuid(),
+                            registry.payload_codecs(),
                         )
                         .await;
                     }
@@ -15882,6 +16202,7 @@ async fn process_workflow_task(
                     prepared.exec_id,
                     &commands,
                     &mut next_event_id,
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -15892,6 +16213,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -15915,6 +16237,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -15928,6 +16251,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -15956,6 +16280,7 @@ async fn process_workflow_task(
                     items,
                     &mut next_event_id,
                     &*telemetry.metrics,
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -15968,6 +16293,7 @@ async fn process_workflow_task(
                             Err::<(), _>(e),
                             workflow_panic_strikes,
                             prepared.exec_id.as_uuid(),
+                            registry.payload_codecs(),
                         )
                         .await;
                     }
@@ -16130,6 +16456,7 @@ async fn process_workflow_task(
                     prepared.exec_id,
                     &commands,
                     &mut next_event_id,
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -16140,6 +16467,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -16163,6 +16491,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -16176,6 +16505,7 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
                     )
                     .await;
                 }
@@ -16216,6 +16546,7 @@ async fn process_workflow_task(
                     signal_items,
                     &mut next_event_id,
                     &*telemetry.metrics,
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -16228,6 +16559,7 @@ async fn process_workflow_task(
                             Err::<(), _>(e),
                             workflow_panic_strikes,
                             prepared.exec_id.as_uuid(),
+                            registry.payload_codecs(),
                         )
                         .await;
                     }
@@ -16507,7 +16839,14 @@ async fn process_workflow_task(
         {
             Ok(count) => count,
             Err(error) => {
-                return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
+                return fail_execution_on_error(
+                    conn,
+                    task,
+                    worker_id,
+                    Err::<(), _>(error),
+                    registry.payload_codecs(),
+                )
+                .await;
             }
         }
     } else {
@@ -16518,8 +16857,14 @@ async fn process_workflow_task(
             match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
                 Ok(count) => count,
                 Err(error) => {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error))
-                        .await;
+                    return fail_execution_on_error(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(error),
+                        registry.payload_codecs(),
+                    )
+                    .await;
                 }
             }
         }
@@ -17067,7 +17412,14 @@ async fn process_workflow_task(
                 {
                     return Ok(());
                 }
-                return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
+                return fail_execution_on_error(
+                    conn,
+                    task,
+                    worker_id,
+                    Err::<(), _>(error),
+                    registry.payload_codecs(),
+                )
+                .await;
             }
             return Err(error);
         }
@@ -17362,6 +17714,7 @@ async fn process_task(
             &frontier_reset_committed,
             std::sync::atomic::Ordering::Relaxed,
         ),
+        registry.payload_codecs(),
     )
     .await;
     // An escalation terminally failed the execution, so its #782 strike entry
@@ -17660,6 +18013,9 @@ async fn handle_capability_miss(
     // Issue #804 (Codex round-22 P2): did this dispatch commit a frontier
     // reset? See `frontier_miss_state` for why this replaces a DB re-read.
     frontier_reset_committed: bool,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Give back the rate-limit token this claim spent (issue #804, Codex
     // round-11 P2). Unconditional here, before the release-vs-escalate branch,
@@ -17748,7 +18104,9 @@ async fn handle_capability_miss(
             .await
         }
         CapabilityMissAction::Escalate => {
-            match escalate_capability_miss(conn, ctx, policy, frontier_reset_committed).await? {
+            match escalate_capability_miss(conn, ctx, policy, frontier_reset_committed, codecs)
+                .await?
+            {
                 Some(outcome) => Ok(outcome),
                 // Withdrawn at the commit boundary: the row must still leave
                 // this worker's hands, or it would sit `RUNNING` under a LIVE
@@ -18322,6 +18680,9 @@ pub async fn commit_terminal_failure_if_still_claimed<F>(
     preloaded: PreloadedFailureHistory,
     escalation: Option<EscalationCommit<'_>>,
     before_write: F,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<TerminalWriteOutcome>
 where
     F: Fn(Option<&CapabilityMissResolution>) + Send + Sync,
@@ -18391,7 +18752,8 @@ where
                 _ => error.clone(),
             };
             before_write(fresh.as_ref());
-            fail_task_and_execution_with_history(conn, task, worker_id, &error, preloaded).await?;
+            fail_task_and_execution_with_history(conn, task, worker_id, &error, preloaded, codecs)
+                .await?;
             Ok(TerminalWriteOutcome::Committed(fresh))
         }),
     )
@@ -18412,6 +18774,9 @@ async fn escalate_capability_miss(
     ctx: CapabilityMissCtx<'_>,
     policy: CapabilityMissPolicy,
     frontier_reset_committed: bool,
+    // Issue #1243: configured codecs, so this write encodes under the
+    // same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<TaskDispatchOutcome>> {
     let CapabilityMissCtx {
         task,
@@ -18516,6 +18881,7 @@ async fn escalate_capability_miss(
             );
             metrics.record_task_capability_miss(&task.queue_name, &task.task_type, label);
         },
+        codecs,
     )
     .await?;
     let (resolution, cause) = match write {
@@ -22366,6 +22732,10 @@ impl Worker {
                                     &workflow_name_str,
                                     &queue_name_str,
                                     &*telemetry.telemetry().metrics,
+                                    // Same registry this dispatch replays with:
+                                    // `telemetry` is the Arc<HandlerRegistry>
+                                    // captured above (issue #1243).
+                                    telemetry.payload_codecs(),
                                 )
                                 .await;
                             }
@@ -22554,6 +22924,9 @@ pub async fn quarantine_workflow_task_timeout(
     workflow_name: &str,
     queue_name: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -22715,11 +23088,12 @@ pub async fn quarantine_workflow_task_timeout(
 
                     let exec_id = execution_id_from_uuid(exec_uuid);
                     let history = crate::store::load_history(conn, exec_id).await?;
-                    crate::store::append_events(
+                    crate::store::append_events_with_codecs(
                         conn,
                         exec_id,
                         &[WorkflowEvent::workflow_failed(error_msg.clone())],
                         history.next_event_id,
+                        codecs,
                     )
                     .await?;
                     // update_workflow_execution_failed only transitions RUNNING
