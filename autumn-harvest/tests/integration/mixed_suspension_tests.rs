@@ -287,10 +287,7 @@ fn parent_join_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFut
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn registry(
-    workflows: Vec<WorkflowInfo>,
-    activities: Vec<ActivityInfo>,
-) -> Arc<HandlerRegistry> {
+fn registry(workflows: Vec<WorkflowInfo>, activities: Vec<ActivityInfo>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(workflows, activities))
 }
 
@@ -309,7 +306,8 @@ async fn deliver_signal_when_parked(
         let dispatched = history.events.iter().any(|e| {
             matches!(
                 e,
-                WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::ChildWorkflowStarted { .. }
+                WorkflowEvent::ActivityScheduled { .. }
+                    | WorkflowEvent::ChildWorkflowStarted { .. }
             )
         });
         if dispatched {
@@ -364,7 +362,10 @@ async fn activity_beats_timer_in_a_mixed_batch() {
         Some(serde_json::json!(0)),
         "the activity branch must win: {output}"
     );
-    assert_eq!(output.get("label").cloned(), Some(serde_json::json!("work")));
+    assert_eq!(
+        output.get("label").cloned(),
+        Some(serde_json::json!("work"))
+    );
 
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(

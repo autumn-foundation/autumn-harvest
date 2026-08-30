@@ -7963,6 +7963,8 @@ async fn fail_activities_for_broken_sessions(
     activity_task_ids: &[uuid::Uuid],
     next_event_id: &mut i32,
 ) -> HarvestResult<bool> {
+    use crate::schema::harvest_sessions::dsl as sess_dsl;
+
     let session_ids: std::collections::HashSet<uuid::Uuid> = scheduled_activities
         .iter()
         .filter_map(|s| s.session_id.map(|id| id.as_uuid()))
@@ -7971,7 +7973,6 @@ async fn fail_activities_for_broken_sessions(
         return Ok(false);
     }
 
-    use crate::schema::harvest_sessions::dsl as sess_dsl;
     let broken: std::collections::HashMap<uuid::Uuid, String> = sess_dsl::harvest_sessions
         .filter(sess_dsl::id.eq_any(&session_ids))
         .filter(sess_dsl::state.ne("ACTIVE"))
@@ -9837,8 +9838,11 @@ async fn persist_mixed_suspension_batch(
         // already exists is an idempotent re-park (a sibling branch woke the
         // parent while this child is still running): no row, no task, no second
         // `ChildWorkflowStarted`.
-        let requested_child_ids: Vec<uuid::Uuid> =
-            batch.children.iter().map(|c| c.child_id.as_uuid()).collect();
+        let requested_child_ids: Vec<uuid::Uuid> = batch
+            .children
+            .iter()
+            .map(|c| c.child_id.as_uuid())
+            .collect();
         let existing_child_ids: HashSet<uuid::Uuid> = if requested_child_ids.is_empty() {
             HashSet::new()
         } else {
@@ -9892,7 +9896,9 @@ async fn persist_mixed_suspension_batch(
         let events = build_suspension_events(commands, &mut timer_events, |cmd| match cmd {
             WorkflowCommand::ScheduleActivity { .. } => activity_iter.next(),
             WorkflowCommand::StartTimer { .. } => timer_started_events.pop_front().flatten(),
-            WorkflowCommand::StartChildWorkflow { .. } => child_started_events.pop_front().flatten(),
+            WorkflowCommand::StartChildWorkflow { .. } => {
+                child_started_events.pop_front().flatten()
+            }
             _ => None,
         });
         if !events.is_empty() {
@@ -10107,7 +10113,9 @@ async fn persist_mixed_suspension_batch(
     let mut needs_wake = had_wake_requested || synthesized_broken_session_failure;
 
     if !needs_wake && batch.waits_on_signal {
-        needs_wake = !signal::load_pending_signals(conn, exec_id).await?.is_empty();
+        needs_wake = !signal::load_pending_signals(conn, exec_id)
+            .await?
+            .is_empty();
     }
 
     if !needs_wake && !batch.activity_waits.is_empty() {
@@ -10119,8 +10127,11 @@ async fn persist_mixed_suspension_batch(
     }
 
     if !needs_wake && !batch.children.is_empty() {
-        let child_ids: Vec<uuid::Uuid> =
-            batch.children.iter().map(|c| c.child_id.as_uuid()).collect();
+        let child_ids: Vec<uuid::Uuid> = batch
+            .children
+            .iter()
+            .map(|c| c.child_id.as_uuid())
+            .collect();
         let child_states: Vec<String> = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::id.eq_any(&child_ids))
             .select(harvest_workflow_executions::state)
@@ -15680,8 +15691,9 @@ async fn suspended_command_event_count(
             .len()
             .saturating_add(mixed.timers.len())
             .saturating_add(mixed.children.len());
-        return Ok(bookkeeping_events
-            .saturating_add(u64::try_from(branch_events).unwrap_or(u64::MAX)));
+        return Ok(
+            bookkeeping_events.saturating_add(u64::try_from(branch_events).unwrap_or(u64::MAX))
+        );
     }
 
     Ok(update_events.saturating_add(1))
@@ -27345,9 +27357,11 @@ mod tests {
     /// takes it and parks at the EARLIEST deadline.
     #[test]
     fn extract_mixed_suspension_batch_accepts_parallel_timers() {
-        let batch =
-            extract_mixed_suspension_batch(&[mixed_start_timer("a", 30), mixed_start_timer("b", 5)])
-                .expect("two parallel timers must be persistable");
+        let batch = extract_mixed_suspension_batch(&[
+            mixed_start_timer("a", 30),
+            mixed_start_timer("b", 5),
+        ])
+        .expect("two parallel timers must be persistable");
         assert_eq!(batch.timers.len(), 2);
     }
 
@@ -27405,7 +27419,11 @@ mod tests {
             ),
         ];
         for (label, cmd) in unsupported {
-            let commands = vec![mixed_schedule_activity("charge"), mixed_start_timer("d", 5), cmd];
+            let commands = vec![
+                mixed_schedule_activity("charge"),
+                mixed_start_timer("d", 5),
+                cmd,
+            ];
             assert!(
                 extract_mixed_suspension_batch(&commands).is_none(),
                 "a co-batched {label} must fall through to the fail-loud path"

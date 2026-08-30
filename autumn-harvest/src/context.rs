@@ -10570,7 +10570,11 @@ impl WorkflowContext {
                     }
                 }
                 RaceBranchKind::Signal { signal_name } => {
-                    match self.match_history(|m| m.match_signal(signal_name)) {
+                    // `match_race_signal`, not `match_signal`: a race branch
+                    // whose signal never arrived is the normal "this branch
+                    // lost" outcome and its siblings legitimately record their
+                    // own events around it, so neither is a divergence (#950).
+                    match self.match_history(|m| m.match_race_signal(signal_name)) {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Diverged {
                             expected,
@@ -10682,8 +10686,7 @@ impl WorkflowContext {
         // the race future's poll-order tie-break (lowest index first)
         // matches the documented tie-break used when multiple branches are
         // already resolved by the time a later replay cycle checks them.
-        let mut receivers: Vec<(usize, RaceBranchReceiver)> =
-            Vec::with_capacity(to_dispatch.len());
+        let mut receivers: Vec<(usize, RaceBranchReceiver)> = Vec::with_capacity(to_dispatch.len());
         for dispatch in &to_dispatch {
             let branch = &branches[dispatch.index];
             // A timer branch parks on a `oneshot::Sender<()>` and a signal branch
@@ -25529,7 +25532,6 @@ mod tests {
         Ok(())
     }
 
-
     // ── mixed-kind races (issue #950) ───────────────────────────────────────
 
     /// AC2: `ctx.race()` accepts mixed branch kinds. On the first live cycle
@@ -25681,7 +25683,7 @@ mod tests {
             commands.iter().any(|c| matches!(
                 c,
                 WorkflowCommand::RecordMarker { name, details }
-                    if name == "race_winner:1" && *details == Value::from(0u64)
+                    if name == "race_winner:1" && *details == serde_json::json!(0u64)
             )),
             "the winner marker fixes the outcome for every later replay: {commands:?}"
         );
@@ -25836,8 +25838,7 @@ mod tests {
     /// `__signal_timeout:{seq}:{name}` id, same fixed role-based indices — so
     /// in-flight executions recorded before this change replay unchanged.
     #[tokio::test]
-    async fn race_timer_signal_pair_still_takes_the_legacy_path()
-    -> Result<(), HarvestError> {
+    async fn race_timer_signal_pair_still_takes_the_legacy_path() -> Result<(), HarvestError> {
         let ctx = std::sync::Arc::new(WorkflowContext::new_test());
         let race_ctx = ctx.clone();
         let handle = tokio::spawn(async move {
@@ -25865,9 +25866,9 @@ mod tests {
              #950 `__race:` id — otherwise in-flight histories diverge"
         );
         assert!(
-            !commands
-                .iter()
-                .any(|c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "race:1")),
+            !commands.iter().any(
+                |c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "race:1")
+            ),
             "the legacy pair records no `race:{{seq}}` open marker: {commands:?}"
         );
         Ok(())
@@ -25902,8 +25903,7 @@ mod tests {
     /// A race of a single timer branch is still a valid (degenerate) race and
     /// must not be mistaken for the legacy timer+signal pair.
     #[tokio::test]
-    async fn race_single_timer_branch_resolves_on_the_recorded_fire()
-    -> Result<(), HarvestError> {
+    async fn race_single_timer_branch_resolves_on_the_recorded_fire() -> Result<(), HarvestError> {
         let events = vec![
             race_started_event(),
             WorkflowEvent::MarkerRecorded {

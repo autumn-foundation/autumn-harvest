@@ -3306,7 +3306,10 @@ pub async fn take_wake_requested(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(rows.into_iter().next().is_some_and(|r| r.had_wake_requested))
+    Ok(rows
+        .into_iter()
+        .next()
+        .is_some_and(|r| r.had_wake_requested))
 }
 
 /// SQL for [`take_wake_requested`]. Extracted as a `const fn` so the

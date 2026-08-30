@@ -4362,6 +4362,38 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, false)
+    }
+
+    /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
+    ///
+    /// Identical scanning, with one difference: an interleaved event this scan
+    /// does not recognise never diverges — it is crossed as a sibling command
+    /// and the scan continues, and reaching the end of history without the
+    /// signal returns [`HistoryMatch::NoMatch`] rather than a divergence.
+    ///
+    /// `match_signal`'s divergence-on-stray-event behaviour exists for a *solo*
+    /// `wait_for_signal`: if the workflow expected a signal at this cursor and
+    /// history holds something else, that is a real code/history disagreement,
+    /// and parking on a signal that will never arrive would hang the workflow
+    /// forever (issue #768 round 13). Inside a `ctx.race()` neither premise
+    /// holds. Sibling branches legitimately record their own dispatch and
+    /// terminal events around this one — that is the whole point of a mixed
+    /// batch — and a signal branch that simply lost the race has **no recorded
+    /// event at all**, which is the normal outcome, not a divergence. A race
+    /// branch also cannot hang the workflow on a never-arriving signal: some
+    /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
+    /// outcome for every later replay.
+    pub fn match_race_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn match_signal_inner(
+        &mut self,
+        signal_name: &str,
+        tolerate_interleaved: bool,
+    ) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
             .iter()
@@ -4622,6 +4654,15 @@ impl HistoryMatcher {
                     if first_interleaved_command.is_some() {
                         return HistoryMatch::NoMatch;
                     }
+                    // Issue #950: inside a race, an unrecognised event is a
+                    // sibling branch's own command/terminal, not a divergence —
+                    // cross it as an interleaved command (so a later win rewinds
+                    // the cursor to it for its own claimer) and keep scanning.
+                    if tolerate_interleaved {
+                        first_interleaved_command.get_or_insert(scan_cursor);
+                        scan_cursor += 1;
+                        continue;
+                    }
                     return HistoryMatch::Diverged {
                         expected: format!("SignalReceived({signal_name})"),
                         actual: Self::actual_event_name(other),
@@ -4645,7 +4686,12 @@ impl HistoryMatcher {
         // / #603 nd-block) rather than push a `WaitForSignal` command and park
         // the workflow forever on a signal that will never arrive
         // (round 13 regression fix, issue #768).
-        if let Some(first) = first_interleaved_command {
+        // Issue #950: a race branch's signal that never arrived is the normal
+        // "this branch lost" outcome, so the stray-interleaved divergence guard
+        // above does not apply to it — see `match_race_signal`.
+        if let Some(first) = first_interleaved_command
+            && !tolerate_interleaved
+        {
             return HistoryMatch::Diverged {
                 expected: format!("SignalReceived({signal_name})"),
                 actual: Self::actual_event_name(&self.events[first]),
