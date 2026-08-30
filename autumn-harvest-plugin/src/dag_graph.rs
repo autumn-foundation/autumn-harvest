@@ -98,6 +98,8 @@
 //! indistinguishable from `pending` via history alone — which is acceptable per
 //! the issue's AC7 wording, which targets #482 data-dependent branches.
 
+use std::collections::BTreeSet;
+
 use autumn_harvest::dag::{DagDefinition, DagTask, GateTimeoutAction};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::TaskStatus;
@@ -246,8 +248,18 @@ fn is_live_state(exec_state: &str) -> bool {
 /// `status` (from `node_outcome`) and the timing/attempts/error this selects
 /// describing the same attempt — without it a name-reused node would report
 /// `pending` alongside the old compensation's timestamps.
-fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, ActivityExecId)> {
-    let dispatched = crate::dag_retry::dispatched_activity_names(events);
+///
+/// `dispatched` is [`crate::dag_retry::dispatched_activity_names`] over the
+/// same `events` — the caller's job to compute, since it depends only on
+/// `events` and is identical across every node in one `build_run_graph` call
+/// ([`build_run_graph`] computes it once and threads it down here rather than
+/// this function rebuilding it — an O(events) scan plus a fresh `BTreeSet`
+/// allocation — on every single node).
+fn latest_scheduled(
+    events: &[WorkflowEvent],
+    node: &str,
+    dispatched: &BTreeSet<&str>,
+) -> Option<(usize, ActivityExecId)> {
     events.iter().enumerate().rev().find_map(|(idx, event)| {
         if let WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -256,7 +268,7 @@ fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, Acti
             ..
         } = event
         {
-            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &dispatched))
+            (name == node && !crate::dag_retry::is_compensation_dispatch(input, dispatched))
                 .then_some((idx, *activity_id))
         } else {
             None
@@ -437,6 +449,12 @@ pub fn build_run_graph(
         .iter()
         .map(|(_, event)| event.clone())
         .collect();
+    // `latest_scheduled`'s issue #780 compensator exclusion needs the set of
+    // dispatched activity names — computed once here (it depends only on
+    // `events`, identical for every node below) and threaded down through
+    // `classify`, instead of `latest_scheduled` rebuilding it (an O(events)
+    // scan plus a fresh `BTreeSet` allocation) on every node in the loop.
+    let dispatched = crate::dag_retry::dispatched_activity_names(&events);
     let tasks = def.tasks();
 
     tasks
@@ -482,6 +500,7 @@ pub fn build_run_graph(
                 &node_name,
                 &task.upstreams,
                 &events,
+                &dispatched,
                 timestamped_events,
                 exec_state,
             );
@@ -773,13 +792,14 @@ fn resolved_upstream_status(
 /// [`DagNodeStatus::Cancelled`], [`DagNodeStatus::Skipped`] vs
 /// [`DagNodeStatus::Pending`]) are the only places history-plus-run-state adds
 /// information beyond the base outcome.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn classify(
     base: NodeOutcome,
     task_index: usize,
     node_name: &str,
     upstreams: &[usize],
     events: &[WorkflowEvent],
+    dispatched: &BTreeSet<&str>,
     timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
     exec_state: &str,
 ) -> (
@@ -820,7 +840,7 @@ fn classify(
     let mut error = None;
     let mut attempts: u32 = 0;
 
-    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name) {
+    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name, dispatched) {
         let (started_count, latest_started_idx) = started_attempts(events, activity_id);
         // A scheduled node has made at least one attempt: the engine appends an
         // `ActivityStarted` per claim, so `started_count` is the true attempt
