@@ -813,19 +813,38 @@ mod db {
         Ok(())
     }
 
-    /// Run one sweep batch on every assigned shard (issue #948).
+    /// Run one sweep batch for the shard this connection already serves
+    /// (issue #948).
     ///
-    /// Folded into [`crate::timeout::enforce_timeouts_once`], mirroring the
-    /// shard fan-out shape of the throttle / debounce / start-idempotency
-    /// sweeps: a shard whose pool cannot be reached is logged and skipped, never
-    /// fatal to the tick.
+    /// Folded into [`crate::timeout::enforce_timeouts_once`], and deliberately
+    /// **shard-local** — it sweeps through the connection it is handed and never
+    /// acquires another.
+    ///
+    /// That is not just an optimisation, it is a deadlock fix.
+    /// `spawn_timeout_checker_for_shard` holds its shard pool's connection for
+    /// the whole `enforce_timeouts_once` call. Harvest configures no deadpool
+    /// `Timeouts`, so every `pool.get().await` is an **unbounded** wait (see
+    /// `worker::shard_acquire_bound`) — a sweep that reached back into the same
+    /// pool for a second connection would park forever on a single-connection
+    /// pool, wedging not just rotation but every later resident of that tick:
+    /// timeout enforcement, broken-session reclaim, mutex-lease reclaim, and the
+    /// scanner-liveness heartbeat.
+    ///
+    /// Shard-local costs nothing in coverage: a multi-shard worker spawns one
+    /// timeout checker per assigned shard (`monitor_shard_scope` narrows each to
+    /// its own), so every shard is swept by its own checker on its own
+    /// connection. Unlike the throttle / debounce / start-idempotency residents,
+    /// this sweep has no cross-shard work to route — a row is rewritten on the
+    /// shard that stores it.
+    ///
+    /// `shard_assignments` is used only to attribute progress to the right shard
+    /// id; the connection decides which rows are actually swept.
     ///
     /// # Errors
     ///
-    /// Propagates database failures from a reachable shard.
+    /// Propagates database failures.
     pub async fn sweep_codec_reencryption(
         conn: &mut AsyncPgConnection,
-        sharded_pool: &Option<crate::shard::ShardedDbPool>,
         shard_assignments: &[crate::types::ShardId],
         codecs: &PayloadCodecs,
         batch_limit: i64,
@@ -834,71 +853,8 @@ mod db {
         if batch_limit <= 0 || !codecs.has_keyed_codecs() || active_key_would_decrypt(codecs) {
             return Ok(0);
         }
-        let mut total = 0usize;
-        match sharded_pool {
-            Some(sp) if !shard_assignments.is_empty() => {
-                for shard in shard_assignments {
-                    let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
-                        // Assigned but with no pool in this process (mid a
-                        // shard-add rollout). Logged rather than skipped
-                        // silently: its rows stay on the retired key, and an
-                        // operator watching rows_remaining refuse to fall needs
-                        // to know why.
-                        tracing::warn!(
-                            "[codec_rotation] shard {shard:?} is assigned but has no connection \
-                             pool in this process; its rows are not being swept"
-                        );
-                        continue;
-                    };
-                    let mut shard_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(
-                                "[codec_rotation] failed to get connection to shard {shard:?}: {e:?}"
-                            );
-                            continue;
-                        }
-                    };
-                    // Best-effort per shard. Propagating would abort the WHOLE
-                    // timeout tick -- timeout enforcement, broken-session
-                    // reclaim, mutex-lease reclaim, for every shard -- because
-                    // one shard's sweep failed. The rotation simply does not
-                    // advance there, which the admin read makes visible.
-                    match sweep_codec_reencryption_once(
-                        &mut shard_conn,
-                        shard.as_i32(),
-                        codecs,
-                        batch_limit,
-                        metrics,
-                    )
-                    .await
-                    {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            tracing::error!(
-                                "[codec_rotation] sweep failed on shard {shard:?}: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {
-                // Unsharded (or no explicit assignment): attribute progress to
-                // the shard this connection actually serves when we know it,
-                // rather than assuming 0 -- otherwise the admin read fans out
-                // over the router's shards and finds no cursor row.
-                let shard_id = shard_assignments.first().map_or(0, |s| s.as_i32());
-                match sweep_codec_reencryption_once(conn, shard_id, codecs, batch_limit, metrics)
-                    .await
-                {
-                    Ok(n) => total += n,
-                    Err(e) => {
-                        tracing::error!("[codec_rotation] sweep failed on shard {shard_id}: {e}");
-                    }
-                }
-            }
-        }
-        Ok(total)
+        let shard_id = shard_assignments.first().map_or(0, |s| s.as_i32());
+        sweep_codec_reencryption_once(conn, shard_id, codecs, batch_limit, metrics).await
     }
 
     /// Retire a codec key, refusing unless **every** expected shard proves it

@@ -3418,9 +3418,13 @@ pub async fn enforce_timeouts_once(
     //
     // Returns without issuing a statement unless a keyed codec is registered,
     // so a deployment that has never rotated pays nothing for it.
+    // Shard-local by design: it sweeps THIS connection's shard through THIS
+    // connection. Reaching back into the same shard pool for a second
+    // connection would park forever on a single-connection pool (deadpool is
+    // configured with no acquisition timeout), wedging every later resident of
+    // this tick as well as rotation itself.
     count += crate::codec_rotation::sweep_codec_reencryption(
         conn,
-        sharded_pool,
         shard_assignments,
         payload_codecs,
         codec_rotation_batch_size,

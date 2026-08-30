@@ -680,17 +680,27 @@ impl PayloadCodecs {
     /// Resolve the codec that can decode an envelope's `(codec_id, kid)` pair.
     ///
     /// Resolution order:
-    /// 1. the keyed registry under the envelope's effective key id (its `kid`,
-    ///    or [`CODEC_LEGACY_KEY_ID`] when it carries none);
-    /// 2. for a **kid-less** envelope only, the pre-#948 `codec_id` map — so a
-    ///    deployment using today's [`PayloadCodecs::register`] /
-    ///    [`PayloadCodecs::set_default`] API keeps decoding its own history
-    ///    verbatim after adopting rotation.
     ///
-    /// An envelope that names an explicit `kid` deliberately does **not** fall
-    /// back to the `codec_id` map: two keys share a `codec_id` during a
-    /// rotation, so that fallback would decode with the wrong key material and
-    /// produce garbage instead of a clean failure.
+    /// - An envelope naming an explicit `kid` resolves **only** through the
+    ///   keyed registry, by exact key id. It deliberately does not fall back to
+    ///   the `codec_id` map: two keys share a `codec_id` during a rotation, so
+    ///   that fallback would decode with the wrong key material and produce
+    ///   garbage instead of a clean failure.
+    /// - A **kid-less** envelope resolves to the [`CODEC_LEGACY_KEY_ID`] entry
+    ///   *only when that entry's own `codec_id` matches the envelope's*,
+    ///   otherwise through the pre-#948 `codec_id` map — so a deployment using
+    ///   today's [`PayloadCodecs::register`] / [`PayloadCodecs::set_default`]
+    ///   API keeps decoding its own history verbatim after adopting rotation.
+    ///
+    /// That `codec_id` match on the legacy entry is load-bearing. Kid-less
+    /// history can span *several* codec ids — an embedder who migrated
+    /// `"aes-v1"` to `"aes-v2"` before rotation existed has both in the
+    /// `codec_id` map. Letting the legacy keyed entry win unconditionally would
+    /// decode every one of those rows with whichever codec happened to be
+    /// registered under `legacy`: the wrong algorithm and the wrong key. An
+    /// unauthenticated codec can return plausible-but-wrong bytes rather than
+    /// failing, and the sweep would then re-encrypt that garbage under the
+    /// active key — silently and permanently destroying the payload.
     fn resolve_decoder(&self, parts: &CodecEnvelopeParts<'_>) -> Option<Arc<dyn PayloadCodec>> {
         // Bind and release the guard before touching `self.codecs`, so the
         // rotation lock is never held across the fallback lookup.
@@ -700,13 +710,21 @@ impl PayloadCodecs {
         } else {
             None
         };
-        if keyed.is_some() {
-            return keyed;
+        let Some(codec) = keyed else {
+            // No keyed entry for this key id. A kid-less envelope may still
+            // resolve through the pre-#948 map.
+            return if parts.kid.is_none() {
+                self.codecs.get(parts.codec_id).map(Arc::clone)
+            } else {
+                None
+            };
+        };
+        if parts.kid.is_some() || codec.codec_id() == parts.codec_id {
+            return Some(codec);
         }
-        if parts.kid.is_none() {
-            return self.codecs.get(parts.codec_id).map(Arc::clone);
-        }
-        None
+        // Kid-less, and the legacy entry is for a DIFFERENT codec than this
+        // envelope names. Defer to the codec_id map, which knows the right one.
+        self.codecs.get(parts.codec_id).map(Arc::clone)
     }
 
     /// Encode payload-bearing fields inside an event into codec envelopes.
@@ -2120,6 +2138,60 @@ mod tests {
                 })),
                 "kid {bad:?} must not be accepted from storage"
             );
+        }
+    }
+
+    #[test]
+    fn a_kidless_envelope_prefers_the_codec_it_actually_names() {
+        // Kid-less history can span several codec ids -- an embedder who
+        // migrated "reverse" to "xor" before rotation existed has both in the
+        // codec_id map. Registering the CURRENT pre-rotation codec under
+        // `legacy` must not make it win for envelopes naming the other one:
+        // that decodes with the wrong algorithm and key, and an unauthenticated
+        // codec returns plausible-but-wrong bytes rather than failing -- which
+        // the sweep would then re-encrypt under the active key, destroying the
+        // payload permanently.
+        let mut writer = PayloadCodecs::default();
+        writer.set_default(Arc::new(ReverseCodec));
+        let old_history = writer
+            .encode_event(&started(json!({"era": "reverse"})))
+            .expect("encode under the older codec");
+        assert_eq!(old_history["data"]["input"]["codec_id"], "reverse");
+
+        // The reader: "reverse" still registered by codec_id, and the CURRENT
+        // pre-rotation codec ("xor") registered under the legacy key id.
+        let mut codecs = PayloadCodecs::default();
+        codecs.register(Arc::new(ReverseCodec));
+        codecs
+            .register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+            .expect("register legacy");
+
+        match codecs.decode_event(old_history).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(
+                    input,
+                    json!({"era": "reverse"}),
+                    "a kid-less envelope must be decoded by the codec it NAMES, not by \
+                     whatever happens to sit under the legacy key id"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // And the legacy entry still wins when it IS the named codec.
+        let legacy_history = {
+            let w = PayloadCodecs::default();
+            w.register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+                .expect("register legacy");
+            w.encode_event(&started(json!({"era": "xor"})))
+                .expect("encode")
+        };
+        assert_eq!(legacy_history["data"]["input"]["codec_id"], "xor");
+        match codecs.decode_event(legacy_history).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, json!({"era": "xor"}));
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 
