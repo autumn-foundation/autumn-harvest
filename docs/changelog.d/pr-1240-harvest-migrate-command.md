@@ -101,16 +101,18 @@ Also fixed: the plugin's non-`dev` warning on a dedicated Harvest database said
 chapter, operations guide, sharding runbook and 0.6.0 upgrade guide all point at
 the new command.
 
-Tests: 25 unit tests in `src/migrate.rs` (version extraction, plan
-classification, directory reading, embedded-set/bundle agreement, and the
-metadata parser's parity with Diesel — what it accepts, and eleven files it
-refuses), 34 CLI tests (argument mapping, `--include-dir` loading and collision refusal,
-text/JSON rendering, the `--check` gate's counts and exit code, DSN redaction,
-`sslmode` normalization), and a new
-Docker-backed suite `migrate_tests` (fresh-database apply, idempotent re-run,
-`plan` writing nothing, an extra set applying alongside the embedded one, a
-failing migration rolling back with its ledger row and the run resuming after a
-fix, a `CREATE INDEX CONCURRENTLY` migration applying under
-`run_in_transaction = false` and a failing one staying unrecorded, and an
-unrecognized ledger row surviving). No new `WorkflowEvent` variant, no
-migration.
+Tests: 26 unit tests in `src/migrate.rs` (version extraction — including a
+multibyte prefix that fits `VARCHAR(50)` in characters though not in bytes —
+plan classification, directory reading, embedded-set/bundle agreement, and the
+metadata parser's parity with Diesel: what it accepts, and eleven files it
+refuses), 38 CLI tests (argument mapping, `--include-dir` loading and collision
+refusal, text/JSON rendering including partial and setup failures, the `--check`
+gate's counts, exit code and remedy, DSN redaction and target labelling, and
+`sslmode` normalization over both DSN forms with quoting and escapes), and a new
+Docker-backed suite `migrate_tests` of 7 tests (fresh-database apply, idempotent
+re-run, `plan` writing nothing, an extra set applying alongside the embedded one,
+a failing migration rolling back with its ledger row and the run resuming after a
+fix, a self-conflicting body failing rather than skipping, a `CREATE INDEX
+CONCURRENTLY` migration applying under `run_in_transaction = false` and a failing
+one staying unrecorded, and an unrecognized ledger row surviving). No new
+`WorkflowEvent` variant, no migration.
