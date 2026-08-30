@@ -11380,6 +11380,86 @@ async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() 
     );
 }
 
+/// A **solo** `ctx.wait_for_signal` — no sibling awaitable at all.
+fn solo_wait_for_signal<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let payload = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": payload}))
+    })
+}
+
+/// Codex round 2, P1-B: a deploy that REPLACES a recorded activity with a lone
+/// `wait_for_signal` must still be caught, not silently parked forever.
+///
+/// The history was recorded by code that ran an activity; the new code runs only
+/// a signal wait. `match_signal` now crosses the stale `ActivityScheduled`
+/// instead of diverging on it (issue #950, so a mixed batch's sibling does not
+/// false-diverge), which raised the question of whether this stale-command case
+/// still fails loudly. It does: the stale events are never claimed by anything,
+/// so the executor's suspend-time `history_has_unconsumed_events` guard fires.
+/// The divergence moves from the matcher to the end of the cycle; it does not
+/// disappear.
+#[tokio::test]
+async fn solo_signal_wait_over_a_stale_recorded_activity_still_diverges() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "old_step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("solo_signal", solo_wait_for_signal)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        !matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a solo wait_for_signal over a stale recorded activity must NOT be \
+         reported as a healthy replay — it would park forever on a signal that \
+         will never arrive:\n{report}"
+    );
+}
+
+/// The same stale-command shape under the deploy CANARY, which uses the relaxed
+/// `check_strict_replay_signal_no_match` frontier. The canary must not bless it
+/// either.
+#[tokio::test]
+async fn solo_signal_wait_over_a_stale_recorded_activity_is_not_a_healthy_canary() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "old_step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("solo_signal", solo_wait_for_signal)
+        .replay_canary_snapshot(make_snapshot("solo_signal", ExecutionId::new(), events))
+        .await;
+    assert!(
+        !matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the canary must not bless a stale recorded activity replaced by a lone \
+         signal wait:\n{report}"
+    );
+}
+
 /// An in-flight mixed race sampled at the recorded-history frontier (both
 /// branches dispatched, neither resolved) is a healthy suspend, not a false
 /// non-determinism — the canary case #779 pinned for its own shape.

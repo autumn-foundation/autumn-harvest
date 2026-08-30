@@ -15813,22 +15813,52 @@ async fn suspended_command_event_count(
     }
     // Issue #950: the generalized mixed batch appends one `ActivityScheduled`
     // per fresh activity, one `TimerStarted` per NEW timer row, and one
-    // `ChildWorkflowStarted` per NEW child. Counted conservatively — the
-    // preflight runs before the DB-dependent new-vs-existing resolution, so an
-    // idempotent re-park (which appends nothing for that branch) is still
-    // counted. Over-counting only nudges the history hard-cap check earlier
-    // (DLQ one event early); it can never mask an overflow. Signal waits and
-    // activity re-park waits append nothing. Mirrors the dispatch chain
-    // ordering: checked last, just before the default.
+    // `ChildWorkflowStarted` per NEW child. Signal waits and activity re-park
+    // waits append nothing. Mirrors the dispatch chain ordering: checked last,
+    // just before the default.
+    //
+    // New-vs-existing is resolved against the DB here, exactly as the
+    // homogeneous timer and child arms above do — NOT by taking the vector
+    // lengths (Codex round 2, P1). `persist_mixed_suspension_batch` emits those
+    // events only for genuinely new rows, so on a RE-PARK (one branch woke the
+    // parent; the siblings are re-emitted and already exist) a length-based
+    // count claims events this decision will not append, and it does so on every
+    // cycle for the life of the park rather than once. Every sibling arm already
+    // pays for this resolution precisely because over-counting a hard cap is not
+    // a safe direction to be wrong in; this arm was the only one that did not.
+    //
+    // Honest note on evidence: this is a consistency fix, not one backed by a
+    // reproducing test. The over-count's magnitude is bounded by roughly the
+    // real history size (each re-emitted branch also has a recorded dispatch
+    // event behind it), so a cap that the true history stays under is one the
+    // inflated count generally also stays under — no cleanly-constructible
+    // `event_hard_cap` value separates the two for the shapes reachable today.
+    // The fix stands on correctness and on matching the sibling arms.
     if let Some(mixed) = extract_mixed_suspension_batch(commands) {
-        let branch_events = mixed
-            .scheduled_activities
-            .len()
-            .saturating_add(mixed.timers.len())
-            .saturating_add(mixed.children.len());
-        return Ok(
-            bookkeeping_events.saturating_add(u64::try_from(branch_events).unwrap_or(u64::MAX))
-        );
+        // A fresh `ScheduleActivity` always appends its `ActivityScheduled`.
+        let mut branch_events = u64::try_from(mixed.scheduled_activities.len()).unwrap_or(u64::MAX);
+        branch_events = branch_events
+            .saturating_add(new_child_workflow_event_count(conn, &mixed.children).await?);
+        if let Some(exec_uuid) = workflow_exec_id {
+            for timer in &mixed.timers {
+                let existing: Option<HarvestTimer> = harvest_timers::table
+                    .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+                    .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                    .filter(harvest_timers::fired.eq(false))
+                    .first::<HarvestTimer>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                branch_events = branch_events.saturating_add(u64::from(existing.is_none()));
+            }
+        } else {
+            // No execution id to resolve against (the pure-preflight caller):
+            // fall back to counting every timer, as the homogeneous timer arm
+            // does in the same situation.
+            branch_events =
+                branch_events.saturating_add(u64::try_from(mixed.timers.len()).unwrap_or(u64::MAX));
+        }
+        return Ok(bookkeeping_events.saturating_add(branch_events));
     }
 
     Ok(update_events.saturating_add(1))
@@ -27766,7 +27796,12 @@ mod tests {
         ];
         let batch = extract_mixed_suspension_batch(&commands).expect("a mixed batch");
         // The arm in `suspended_command_event_count` counts exactly these three
-        // buckets on top of `pre_suspension_event_count`'s bookkeeping.
+        // buckets on top of `pre_suspension_event_count`'s bookkeeping — but it
+        // resolves the timer and child buckets against the DB first, since
+        // `persist_mixed_suspension_batch` emits their events only for genuinely
+        // NEW rows (Codex round 2, P1: taking the vector lengths inflated the
+        // prospective count on every re-park). This assertion is therefore the
+        // UPPER bound, with every branch fresh.
         let branch_events =
             batch.scheduled_activities.len() + batch.timers.len() + batch.children.len();
         assert_eq!(
