@@ -80,8 +80,20 @@ drops to approximately zero:
 
 ```bash
 # Poll until lag_bytes reaches 0 and stays there, then continue to step 2.
-harvest dr status --shard 0=postgres://harvest@standby-b/harvest_shard0
+# NOTE the DSN: this is the OLD PRIMARY, not the standby.
+harvest dr status --shard 0=postgres://harvest@primary-a/harvest_shard0
 ```
+
+`pg_stat_replication` and `pg_replication_slots` are **primary-side** views:
+they describe the standbys a database is feeding, not the upstream a database
+is following. Pointed at the standby, `harvest dr status` reports no connected
+standby and an unknown lag — it would never converge to zero and you could not
+tell draining from broken. The drain check only works against the region you
+are draining *from*, which is also the only region that can answer it.
+
+(If the old primary is unreachable, you cannot run this check at all — skip
+straight to step 2 and accept the RPO you last observed. That is the whole
+reason this step is conditional.)
 
 Skip this only when the old primary is genuinely unreachable. Every second of
 lag you promote past is acknowledged work lost **and** — per the at-least-once

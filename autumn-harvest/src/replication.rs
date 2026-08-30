@@ -436,6 +436,34 @@ struct Pinned {
     default_shard: Option<ShardId>,
 }
 
+/// A [`FenceRegistry::publish`] rejected because the shard is already pinned at
+/// a different generation.
+///
+/// The fencing unit is the process: a worker started after a fence must not be
+/// able to re-authorize a worker the fence already stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinConflict {
+    /// The shard whose pin was already set.
+    pub shard_id: i32,
+    /// The generation this process is already pinned to.
+    pub pinned: i64,
+    /// The generation the rejected publish tried to install.
+    pub attempted: i64,
+}
+
+impl std::fmt::Display for PinConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shard {} is already pinned to generation {} in this process; refusing to re-pin it \
+             to {}. A process cannot host workers at two different write-authority epochs — \
+             re-pinning would hand authority back to a worker the fence already stopped. Restart \
+             the process.",
+            self.shard_id, self.pinned, self.attempted
+        )
+    }
+}
+
 /// Process-global record of the write-authority epoch this process pinned for
 /// each shard.
 ///
@@ -478,12 +506,58 @@ impl FenceRegistry {
     /// pre-sharding execution id in the process silently persists **unfenced**.
     /// A worker pins every shard it can reach or none of them, so it publishes
     /// once.
-    pub fn publish(pins: &[(ShardId, ShardGeneration)], default_shard: ShardId) {
+    ///
+    /// # A pin is immutable once published
+    ///
+    /// Publishing a *different* generation for a shard this process has already
+    /// pinned is **refused**, and that refusal is the whole "never adopt a newer
+    /// epoch" invariant made structural rather than documented.
+    ///
+    /// Without it, a process hosting more than one worker had a hole straight
+    /// through the fence: a worker started *after* a fence would publish the new
+    /// generation, overwrite the shared pin, and the already-running worker —
+    /// the one the fence was for — would read the replacement in both its claim
+    /// gate and its persist assert and silently **regain write authority**. It
+    /// would go on appending to a history another region owns, which is exactly
+    /// the split-brain this module exists to prevent.
+    ///
+    /// So the fencing unit is the **process**, not the worker, and the error
+    /// says so: a process cannot host workers at two different epochs, and the
+    /// remedy is to restart it. Re-publishing the *same* generation is fine and
+    /// idempotent — that is two workers covering the same shards at the same
+    /// epoch, which is ordinary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the conflicting `(shard, already pinned, attempted)` when a shard
+    /// is already pinned at a different generation. The caller must refuse to
+    /// start; nothing is published.
+    pub fn publish(
+        pins: &[(ShardId, ShardGeneration)],
+        default_shard: ShardId,
+    ) -> Result<(), PinConflict> {
         {
             let mut guard = PINNED
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pinned = guard.get_or_insert_with(Pinned::default);
+
+            // Validate every pin BEFORE mutating any of them, so a rejected
+            // publish leaves the running workers' registry exactly as it was.
+            for (shard, generation) in pins {
+                if let Some(existing) = pinned.generations.get(&shard.as_i32())
+                    && *existing != *generation
+                {
+                    let conflict = PinConflict {
+                        shard_id: shard.as_i32(),
+                        pinned: existing.as_i64(),
+                        attempted: generation.as_i64(),
+                    };
+                    drop(guard);
+                    return Err(conflict);
+                }
+            }
+
             for (shard, generation) in pins {
                 pinned.generations.insert(shard.as_i32(), *generation);
             }
@@ -494,6 +568,7 @@ impl FenceRegistry {
         // reader that observes `is_enabled()` can never find a half-built
         // registry.
         ENABLED.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Set the shard that [`ShardId::UNENCODED`] execution ids resolve to.
@@ -1628,6 +1703,83 @@ mod tests {
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), Some(77));
         assert_eq!(s.connected_standbys(), 0);
+    }
+
+    /// A published pin is immutable: a later worker cannot re-authorize an
+    /// earlier one.
+    ///
+    /// Without this, a process hosting two workers had a hole straight through
+    /// the fence — a worker started *after* a fence publishes the new
+    /// generation, overwrites the shared pin, and the already-running worker
+    /// reads the replacement in its claim gate and persist assert and silently
+    /// regains write authority over a database another region owns.
+    #[test]
+    fn a_published_pin_cannot_be_overwritten_with_a_different_generation() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+
+        FenceRegistry::publish(
+            &[(ShardId::new(0), ShardGeneration::new(4))],
+            ShardId::new(0),
+        )
+        .expect("first publish");
+
+        // Idempotent: two workers covering the same shard at the same epoch.
+        FenceRegistry::publish(
+            &[(ShardId::new(0), ShardGeneration::new(4))],
+            ShardId::new(0),
+        )
+        .expect("re-publishing the same generation is ordinary");
+
+        // A worker started after a fence must be refused, not admitted.
+        let conflict = FenceRegistry::publish(
+            &[(ShardId::new(0), ShardGeneration::new(5))],
+            ShardId::new(0),
+        )
+        .expect_err("re-pinning to a newer generation must be refused");
+        assert_eq!(conflict.shard_id, 0);
+        assert_eq!(conflict.pinned, 4);
+        assert_eq!(conflict.attempted, 5);
+
+        // And the running worker's pin is untouched — it stays fenced.
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(0)),
+            Some(ShardGeneration::new(4))
+        );
+        FenceRegistry::clear();
+    }
+
+    /// A rejected publish must not partially apply.
+    #[test]
+    fn a_rejected_publish_leaves_every_other_pin_untouched() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::publish(
+            &[(ShardId::new(0), ShardGeneration::new(4))],
+            ShardId::new(0),
+        )
+        .expect("first publish");
+
+        // Shard 1 is new and would be accepted; shard 0 conflicts. The whole
+        // publish must be refused rather than half-applied.
+        FenceRegistry::publish(
+            &[
+                (ShardId::new(1), ShardGeneration::new(9)),
+                (ShardId::new(0), ShardGeneration::new(5)),
+            ],
+            ShardId::new(0),
+        )
+        .expect_err("a conflicting publish must be refused wholesale");
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(1)),
+            None,
+            "the non-conflicting pin must not have been installed"
+        );
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(0)),
+            Some(ShardGeneration::new(4))
+        );
+        FenceRegistry::clear();
     }
 
     // ── advisory keyspace ──────────────────────────────────────────────────

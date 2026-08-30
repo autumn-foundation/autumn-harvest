@@ -21302,7 +21302,16 @@ impl Worker {
                 }
             }
         }
-        FenceRegistry::publish(&pinned, default_shard);
+        if let Err(conflict) = FenceRegistry::publish(&pinned, default_shard) {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                shard_id = conflict.shard_id,
+                already_pinned = conflict.pinned,
+                attempted = conflict.attempted,
+                "refusing to start: {conflict}"
+            );
+            return false;
+        }
         true
     }
 

@@ -383,8 +383,12 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
     let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
-    let body = top_level_fn_body(&queue_src, "claim_task")
-        .expect("queue.rs must define `pub async fn claim_task(`");
+    // `claim_task_on_shard`, not `claim_task`: issue #954 made the latter a thin
+    // wrapper that delegates, so the claim transaction — and every statement
+    // this guard exists to keep the docs honest about — lives in the former.
+    // The guard follows the transaction, which is what it was always about.
+    let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
+        .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
 
     let mut called: Vec<&str> = Vec::new();
     for (idx, _) in body.match_indices("crate::queue_pause::") {

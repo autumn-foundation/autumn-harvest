@@ -4682,38 +4682,32 @@ fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
     s
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_dr_fence(
-    shards: &[String],
-    reason: &str,
-    actor: &str,
-    confirm: bool,
+/// Phase 1 of `harvest dr fence`: validate every shard, mutate nothing.
+///
+/// A fence that dies partway leaves a HALF-FENCED cluster — the state the
+/// runbook names as the worst possible one, because live cross-shard traffic
+/// then turns bounded skew into unbounded skew — and during a regional failover
+/// an unreachable shard is the *expected* condition, not the exceptional one.
+/// So every failure that can be found without writing is found here, before
+/// anything is written.
+async fn dr_fence_preflight(
+    targets: &[autumn_harvest::backup_verify::ShardTarget],
     provision: bool,
     force: bool,
-    format: DrFormat,
-) -> Result<(), CliError> {
-    use autumn_harvest::replication::{bump_generation, ensure_generation_row};
+) -> Result<
+    Vec<(
+        i32,
+        autumn_harvest::types::ShardId,
+        autumn_harvest::diesel_async::AsyncPgConnection,
+    )>,
+    CliError,
+> {
+    use autumn_harvest::replication::{current_generation, ensure_generation_row};
     use autumn_harvest::types::ShardId;
 
-    // clap marks the flag `required`, so this is belt-and-braces for a
-    // programmatic caller — but the cost of getting it wrong is a fleet.
-    if !confirm {
-        return Err(CliError::InvalidInput(
-            "refusing to fence without --i-understand-this-stops-the-fleet".to_string(),
-        ));
-    }
-
-    let targets = parse_shard_targets(shards)?;
-
-    // ── Phase 1: reach every shard and check every precondition, mutating
-    // nothing. A fence that dies partway leaves a HALF-FENCED cluster — the
-    // state the runbook names as the worst possible one, because live
-    // cross-shard traffic then turns bounded skew into unbounded skew — and
-    // during a regional failover an unreachable shard is the *expected*
-    // condition, not the exceptional one. So every failure that can be found
     // without writing is found before anything is written.
     let mut conns = Vec::with_capacity(targets.len());
-    for target in &targets {
+    for target in targets {
         let shard = ShardId::new(target.shard_id);
         let mut conn = dr_connect(&target.dsn).await?;
         let posture = dr_write_posture(&mut conn).await?;
@@ -4732,9 +4726,57 @@ async fn run_dr_fence(
             ensure_generation_row(&mut conn, shard)
                 .await
                 .map_err(|e| dr_error(target.shard_id, &e))?;
+        } else if current_generation(&mut conn, shard)
+            .await
+            .map_err(|e| dr_error(target.shard_id, &e))?
+            .is_none()
+        {
+            // Preflight the row's existence here rather than letting
+            // `bump_generation` return NotFound in phase 2. A missing row is a
+            // fully discoverable input error — almost always a wrong shard id,
+            // since an unprefixed `--shard <dsn>` takes its POSITIONAL index —
+            // and discovering it after earlier shards were already bumped
+            // produces precisely the half-fenced cluster this two-phase
+            // structure exists to prevent.
+            return Err(CliError::InvalidInput(format!(
+                "shard {} has no harvest_shard_generation row at {}, so there is nothing to \
+                 fence: no worker has ever pinned it. This is usually a wrong shard id — an \
+                 unprefixed `--shard <dsn>` takes its positional index as the shard id, so \
+                 prefix explicitly as `<id>=<dsn>`. Pass --provision to create the row and fence \
+                 it anyway. No shard has been fenced.",
+                target.shard_id,
+                autumn_harvest::backup_verify::redact_dsn(&target.dsn),
+            )));
         }
         conns.push((target.shard_id, shard, conn));
     }
+
+    Ok(conns)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dr_fence(
+    shards: &[String],
+    reason: &str,
+    actor: &str,
+    confirm: bool,
+    provision: bool,
+    force: bool,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    use autumn_harvest::replication::bump_generation;
+
+    // clap marks the flag `required`, so this is belt-and-braces for a
+    // programmatic caller — but the cost of getting it wrong is a fleet.
+    if !confirm {
+        return Err(CliError::InvalidInput(
+            "refusing to fence without --i-understand-this-stops-the-fleet".to_string(),
+        ));
+    }
+
+    let targets = parse_shard_targets(shards)?;
+
+    let mut conns = dr_fence_preflight(&targets, provision, force).await?;
 
     // ── Phase 2: bump. `bump_generation` returns NotFound for a shard with no
     // row, which is deliberately NOT papered over with a provisioning call —
