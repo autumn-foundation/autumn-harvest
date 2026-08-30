@@ -220,19 +220,29 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
 /// evaluation is an indexed lookup, not a table scan) -- but it is needed in
 /// two places: the `SELECT` list (to report `event_count` to the caller) and
 /// the `WHERE` clause (to filter on it, since a `SELECT`-list alias is not
-/// visible to the `WHERE` clause that filters the same query). Extracted
-/// verbatim from `enforce_workflow_history_ceiling`'s inline literal with no
-/// behavior change, so it can be pinned by a unit test and captured by
-/// `tests/integration/history_ceiling_claim_tests.rs` -- see
-/// `docs/performance-history-ceiling.md` for the buffer-cost writeup and the
-/// fix this baseline sits ahead of.
+/// visible to the `WHERE` clause that filters the same query). Writing the
+/// subquery out twice makes Postgres evaluate it twice per row: once to
+/// filter, once more (for surviving rows) to project -- confirmed by
+/// `EXPLAIN`, see `docs/performance-history-ceiling.md`. A plain
+/// derived-table wrap (`SELECT ... FROM (SELECT ..., count) sub WHERE
+/// sub.count >= $1`) does not fix this -- Postgres pulls the subquery up
+/// into the outer query and re-duplicates the correlated expression at each
+/// reference site, reproducing the identical two-`SubPlan` shape (also
+/// confirmed by `EXPLAIN` while evaluating this fix). A `MATERIALIZED` CTE
+/// opts out of that pull-up, so the count is computed exactly once per
+/// RUNNING row and both the `SELECT` list and the `WHERE` clause read the
+/// same computed column.
 #[must_use]
 pub const fn workflow_history_ceiling_query() -> &'static str {
-    "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
-     (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
-     FROM harvest_workflow_executions \
-     WHERE state = 'RUNNING' \
-     AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1"
+    "WITH oversized_candidates AS MATERIALIZED (\
+         SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+             (SELECT COUNT(*) FROM harvest_events \
+              WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+         FROM harvest_workflow_executions \
+         WHERE state = 'RUNNING') \
+     SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, event_count \
+     FROM oversized_candidates \
+     WHERE event_count >= $1"
 }
 
 /// SQL query to find RUNNING workflow executions that have exceeded either their
@@ -4233,8 +4243,33 @@ mod tests {
             "should consult the durable event log"
         );
         assert!(
-            sql.contains(">= $1"),
+            sql.contains("event_count >= $1"),
             "should filter on the operator-supplied ceiling bind"
+        );
+    }
+
+    /// The correlated `harvest_events` event-count subquery must appear
+    /// exactly once in `workflow_history_ceiling_query()` -- one
+    /// `MATERIALIZED` CTE definition, referenced (not re-evaluated) by both
+    /// the reported `event_count` column and the `WHERE event_count >= $1`
+    /// filter. Two occurrences would mean the query regressed to evaluating
+    /// the correlated `COUNT(*)` once per RUNNING row for the filter and
+    /// again, separately, for the projection -- exactly the shape
+    /// `docs/performance-history-ceiling.md` measures and fixes.
+    #[test]
+    fn workflow_history_ceiling_query_counts_events_exactly_once_per_row() {
+        let sql = workflow_history_ceiling_query();
+        assert_eq!(
+            sql.matches("SELECT COUNT(*) FROM harvest_events").count(),
+            1,
+            "the correlated event-count subquery must be written exactly \
+             once; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("MATERIALIZED"),
+            "the event-count CTE must be MATERIALIZED so Postgres cannot \
+             pull it up and re-duplicate the correlated subquery at each \
+             reference site (SELECT list + WHERE clause); got:\n{sql}"
         );
     }
 

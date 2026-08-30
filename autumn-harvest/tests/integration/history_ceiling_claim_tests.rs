@@ -8,12 +8,12 @@
 //! The query needs each RUNNING execution's durable `harvest_events` row
 //! count in two places -- the `SELECT` list (to report it) and the `WHERE`
 //! clause (to filter on it, since a `SELECT`-list alias is not visible to the
-//! `WHERE` clause of the same query). It currently gets there by writing the
-//! correlated `COUNT(*)` subquery out twice, which Postgres evaluates
-//! independently at each site -- so every RUNNING row pays for the count
-//! twice. This commit adds only the harness and the baseline evidence for
-//! that shape, no fix -- see `docs/performance-history-ceiling.md` (added
-//! alongside the fix in a follow-up commit) for the full writeup.
+//! `WHERE` clause of the same query). The pre-fix query wrote the correlated
+//! `COUNT(*)` subquery out twice to get both; Postgres evaluates each
+//! occurrence independently, so every RUNNING row paid for the count twice.
+//! The fix wraps it in a `MATERIALIZED` CTE so the count is computed once per
+//! row and read twice. See `docs/performance-history-ceiling.md` for the full
+//! writeup this file's evidence-capture test regenerates.
 //!
 //! Two tests:
 //! - [`enforce_workflow_history_ceiling_terminates_only_oversized_running_rows`]
@@ -26,8 +26,13 @@
 //!   production-shaped fixture into a throwaway database
 //!   ([`claim_bench_support::db::setup_bench_db`]), then captures
 //!   `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)` and a
-//!   `pg_stat_statements` snapshot for the current (pre-fix)
-//!   `workflow_history_ceiling_query()`.
+//!   `pg_stat_statements` snapshot for both the pre-fix query (hardcoded
+//!   below, byte-for-byte what the previous commit's baseline measured) and
+//!   the current `workflow_history_ceiling_query()`, against the identical
+//!   fixture in the identical run -- and asserts the two produce
+//!   byte-identical result sets (same executions, same reported
+//!   `event_count`), the equivalence proof this rewrite's correctness rests
+//!   on.
 
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
@@ -38,6 +43,16 @@ use autumn_harvest::timeout::{enforce_workflow_history_ceiling, workflow_history
 use autumn_harvest::types::ExecutionId;
 
 use crate::integration_e2e::{insert_workflow_execution_with_id, setup_test_database_url_or_env};
+
+/// The exact query `workflow_history_ceiling_query()` replaced. Kept here
+/// verbatim (not reconstructed) so the evidence-capture test's "before" half
+/// is byte-for-byte what the previous commit measured, not a paraphrase that
+/// could drift.
+const BEFORE_SQL: &str = "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+     (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+     FROM harvest_workflow_executions \
+     WHERE state = 'RUNNING' \
+     AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1";
 
 #[derive(QueryableByName, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OversizedRow {
@@ -299,10 +314,71 @@ async fn explain_and_result_set(
     (plan_text, rows)
 }
 
-/// Regenerates `docs/perf-artifacts/history-ceiling-scanner/before-*`:
-/// `EXPLAIN` and a `pg_stat_statements` snapshot for the query as it stands
-/// in this commit (pre-fix). `#[ignore]`d -- seeds ~4,000,000 rows and takes
-/// well over a minute; not part of the default suite.
+/// Runs `sql` once (`EXPLAIN` + a plain execution), writes its `EXPLAIN`
+/// plan, a `pg_stat_statements` snapshot, and its result set to
+/// `{label}-*` files under `out_dir`, and returns the sorted result rows for
+/// the caller's own equivalence check.
+async fn capture(
+    conn: &mut AsyncPgConnection,
+    out_dir: &std::path::Path,
+    label: &str,
+    sql: &str,
+) -> Vec<OversizedRow> {
+    diesel::sql_query("SELECT pg_stat_statements_reset()")
+        .execute(conn)
+        .await
+        .ok(); // best-effort; absent extension must not fail the capture
+
+    let (plan_text, rows) = explain_and_result_set(conn, sql).await;
+
+    std::fs::write(
+        out_dir.join(format!("{label}-history-ceiling.explain.txt")),
+        format!(
+            "-- {label}: workflow_history_ceiling_query() @ \
+             {FIXTURE_TOTAL_EXECUTIONS} executions ({FIXTURE_RUNNING_EXECUTIONS} RUNNING), \
+             ceiling={CEILING} --\n{plan_text}\n"
+        ),
+    )
+    .expect("write explain artifact");
+
+    let stats: Vec<StatRow> = diesel::sql_query(
+        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+         (shared_blks_hit + shared_blks_read) AS total_buffers \
+         FROM pg_stat_statements \
+         WHERE query LIKE '%harvest_workflow_executions%harvest_events%' \
+         ORDER BY total_buffers DESC LIMIT 5",
+    )
+    .load(conn)
+    .await
+    .unwrap_or_default();
+    std::fs::write(
+        out_dir.join(format!("{label}-pg_stat_statements.txt")),
+        format!("{stats:#?}\n"),
+    )
+    .expect("write pg_stat_statements artifact");
+
+    std::fs::write(
+        out_dir.join(format!("{label}-result-rows.txt")),
+        format!(
+            "rows={}\n{}\n",
+            rows.len(),
+            rows.iter()
+                .map(|r| format!("{} {}", r.id, r.event_count))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .expect("write result-set artifact");
+
+    eprintln!("captured '{label}': {} oversized rows", rows.len());
+    rows
+}
+
+/// Regenerates `docs/perf-artifacts/history-ceiling-scanner/`: before/after
+/// `EXPLAIN`, a `pg_stat_statements` snapshot for each, and a result-set
+/// equivalence check between the two query forms against the identical
+/// fixture. `#[ignore]`d -- seeds ~4,000,000 rows and takes well over a
+/// minute; not part of the default suite.
 ///
 /// Needs `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a
 /// reachable Docker daemon for `claim_bench_support::db::setup_bench_db`'s
@@ -331,53 +407,26 @@ async fn zz_capture_history_ceiling_claim_evidence() {
     let mut conn = db::connect(&bench.url).await;
     seed_production_shaped_fixture(&mut conn).await;
 
-    diesel::sql_query("SELECT pg_stat_statements_reset()")
-        .execute(&mut conn)
-        .await
-        .ok(); // best-effort; absent extension must not fail the capture
+    let after_sql = workflow_history_ceiling_query();
+    assert_ne!(
+        after_sql, BEFORE_SQL,
+        "the current query text is identical to the hardcoded pre-fix text -- \
+         update BEFORE_SQL (or this assertion) before trusting this capture"
+    );
 
-    let sql = workflow_history_ceiling_query();
-    let (plan_text, rows) = explain_and_result_set(&mut conn, sql).await;
+    let before_rows = capture(&mut conn, &out_dir, "before", BEFORE_SQL).await;
+    let after_rows = capture(&mut conn, &out_dir, "after", after_sql).await;
 
-    std::fs::write(
-        out_dir.join("before-history-ceiling.explain.txt"),
-        format!(
-            "-- before: workflow_history_ceiling_query() @ \
-             {FIXTURE_TOTAL_EXECUTIONS} executions ({FIXTURE_RUNNING_EXECUTIONS} RUNNING), \
-             ceiling={CEILING} --\n{plan_text}\n"
-        ),
-    )
-    .expect("write explain artifact");
+    assert_eq!(
+        before_rows, after_rows,
+        "before/after query forms must return byte-identical result sets \
+         (same executions flagged, same reported event_count) against the \
+         same fixture -- this is the correctness proof the rewrite depends on"
+    );
+    eprintln!(
+        "equivalence confirmed: before and after agree on all {} oversized rows",
+        before_rows.len()
+    );
 
-    let stats: Vec<StatRow> = diesel::sql_query(
-        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
-         (shared_blks_hit + shared_blks_read) AS total_buffers \
-         FROM pg_stat_statements \
-         WHERE query LIKE '%harvest_workflow_executions%harvest_events%' \
-         ORDER BY total_buffers DESC LIMIT 5",
-    )
-    .load(&mut conn)
-    .await
-    .unwrap_or_default();
-    std::fs::write(
-        out_dir.join("before-pg_stat_statements.txt"),
-        format!("{stats:#?}\n"),
-    )
-    .expect("write pg_stat_statements artifact");
-
-    std::fs::write(
-        out_dir.join("before-result-rows.txt"),
-        format!(
-            "rows={}\n{}\n",
-            rows.len(),
-            rows.iter()
-                .map(|r| format!("{} {}", r.id, r.event_count))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    )
-    .expect("write result-set artifact");
-
-    eprintln!("captured 'before': {} oversized rows", rows.len());
     eprintln!("== done. Artifacts in {} ==", out_dir.display());
 }
