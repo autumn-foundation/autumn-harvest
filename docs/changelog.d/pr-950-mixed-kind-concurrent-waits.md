@@ -173,6 +173,30 @@ through the executor) and expected that synchronous error will now see the wait
 park, so it needs the executor's cycle boundary — or an explicit
 `history_has_unconsumed_events()` check — to observe the divergence.
 
+**The AC8 conflict list was incomplete (Codex round 4, P2).** The rejection
+listed the six obvious durable awaitables and missed two that also reach the
+local-activity dispatch arm:
+
+- `ArmTimer { for_await: true }` — what `TimerHandle::await_fire()` emits. It is
+  the one and only arm that inserts the `harvest_timers` row and makes a
+  cancellable timer fire-eligible, and it parks, so it is a durable await rather
+  than bookkeeping. Unlisted, `join!(ctx.local_activity(..), handle.await_fire())`
+  entered the local-activity path and `extract_run_local_activity`'s `_ => {}`
+  catch-all dropped the arm — the deadline then started a whole decision cycle
+  late, which is precisely the silent defer AC8 exists to eliminate.
+- `AwaitExternalWorkflow` (issue #757) — "the command suspends the caller",
+  reaches the same arm unguarded, and was equally unlisted. Dropped, it is worse
+  than a late deadline: no `ExternalAwaitRequested` is appended, so the caller
+  parks on an await it never registered.
+
+A `for_await: false` arm stays legal and is deliberately not listed: a fresh
+`ctx.start_timer`/`reset` records `TimerStarted`, inserts no row and never
+suspends, so it composes beside a local activity. `AcquireMutex` is also absent
+by design — the dispatch arm already refuses to claim a batch containing one
+(issue #691), so it never reaches the check and falls through to the fail-loud
+generic path; the rustdoc now says so, since its absence otherwise reads as the
+same kind of omission this round fixed.
+
 **Invariants.** **Zero new `WorkflowEvent` variants and no migration** — the
 batch composes existing events (`ActivityScheduled`, `TimerStarted`,
 `SignalReceived`, `ChildWorkflowStarted`, …) at their command-emission positions
@@ -187,7 +211,10 @@ Pre-existing parked tasks need no migration.
   its reject matrix (**every** kind in the reject arm, not a sample),
   bookkeeping tolerance asserted on the resolved buckets rather than
   `is_some`, the history-cap event-count arm, the duplicate-`StartTimer`-id
-  guard, and the local-activity conflict report. AC6's ordering invariant is
+  guard, and the local-activity conflict report — including the awaited
+  cancellable timer and the external await, with the non-awaiting
+  `ArmTimer { for_await: false }` pinned as still legal so the rejection cannot
+  creep into bookkeeping. AC6's ordering invariant is
   pinned by a source-level assertion that the mixed arm is the LAST arm of the
   dispatch chain — the extractors matching proves nothing about routing, and
   the mixed extractor is a superset of most legacy shapes, so a reorder would

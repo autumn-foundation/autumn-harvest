@@ -2116,6 +2116,10 @@ pub fn suspension_batch_is_persistable(commands: &[WorkflowCommand]) -> bool {
 /// `RequestCancelExternalWorkflow` / `AwaitExternalWorkflow`) are **not**
 /// conflicts: `split_mixed_signal_batch` resolves them inline, before the local
 /// activity runs, and that composition is already tested.
+///
+/// `AcquireMutex` is deliberately absent: the dispatch arm that calls this
+/// already refuses to claim a batch containing one (issue #691), so such a batch
+/// never reaches here — it falls through to the fail-loud generic path instead.
 fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String> {
     if !commands
         .iter()
@@ -2135,6 +2139,22 @@ fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String>
                     | WorkflowCommand::StartChildWorkflow { .. }
                     | WorkflowCommand::WaitForSignal { .. }
                     | WorkflowCommand::ScheduleExternalActivity { .. }
+                    // `TimerHandle::await_fire()` (issue #768). The ONLY arm
+                    // that inserts the `harvest_timers` row and makes a
+                    // cancellable timer fire-eligible, and it parks — so it is a
+                    // durable await, not bookkeeping. A `for_await: false` arm
+                    // (a fresh `start_timer`/`reset`) records `TimerStarted`,
+                    // inserts no row and never suspends, so it composes legally
+                    // beside a local activity and is deliberately NOT listed
+                    // (Codex round 4 P2, issue #950).
+                    | WorkflowCommand::ArmTimer {
+                        for_await: true, ..
+                    }
+                    // `ctx.await_external_workflow` (issue #757) — "the command
+                    // suspends the caller". Dropped silently it is worse than a
+                    // late deadline: no `ExternalAwaitRequested` is appended, so
+                    // the caller parks on an await it never registered.
+                    | WorkflowCommand::AwaitExternalWorkflow { .. }
             )
         })
         .map(workflow_command_name)
@@ -27920,6 +27940,89 @@ mod tests {
         assert!(
             local_activity_batch_conflict(&solo).is_none(),
             "a solo local activity plus bookkeeping must stay legal"
+        );
+    }
+
+    /// Codex round 4, P2: `TimerHandle::await_fire()` is a durable await that
+    /// emits `ArmTimer { for_await: true }` — the ONE path that inserts the
+    /// `harvest_timers` row and makes a cancellable timer fire-eligible — and
+    /// then parks. Joined with a local activity it must be rejected like every
+    /// other durable sibling.
+    ///
+    /// Without this it slipped through the conflict list into the
+    /// local-activity path, whose `_ => {}` catch-all dropped it: the row was
+    /// never inserted, and after the local activity resolved the next replay
+    /// re-emitted the arm, starting the deadline a whole decision cycle late
+    /// with no error anywhere. That is exactly the silent defer AC8 exists to
+    /// eliminate.
+    ///
+    /// A `for_await: false` arm is deliberately NOT a conflict: a fresh
+    /// `ctx.start_timer` / `reset` arm is bookkeeping that records
+    /// `TimerStarted` and inserts no row, it never suspends, and it composes
+    /// legally beside a local activity.
+    #[test]
+    fn local_activity_beside_an_awaited_cancellable_timer_is_rejected() {
+        let local = || WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "compute".to_string(),
+            input: serde_json::json!({}),
+            start_to_close: None,
+            retry_policy: None,
+            result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        };
+
+        let awaited = vec![
+            local(),
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: true,
+            },
+        ];
+        let rejected = local_activity_batch_conflict(&awaited)
+            .expect("a local activity beside an AWAITED cancellable timer must be rejected");
+        assert!(
+            rejected.contains("ArmTimer"),
+            "the typed error must name the dropped sibling command: {rejected}"
+        );
+
+        // The fresh (non-awaiting) arm is bookkeeping, not a durable await.
+        let fresh = vec![
+            local(),
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("idle"),
+                duration_secs: 300,
+                for_await: false,
+            },
+        ];
+        assert!(
+            local_activity_batch_conflict(&fresh).is_none(),
+            "a fresh start_timer arm never suspends and must stay legal beside a \
+             local activity"
+        );
+
+        // Same defect class, found while fixing the above: `AwaitExternalWorkflow`
+        // suspends the caller too, reaches this arm unguarded, and was equally
+        // unlisted. Dropped silently it is worse than a late deadline — no
+        // `ExternalAwaitRequested` is appended, so the caller parks on an await it
+        // never registered.
+        let external = vec![
+            local(),
+            WorkflowCommand::AwaitExternalWorkflow {
+                await_id: crate::types::ExternalAwaitId::new(),
+                target: ExecutionId::new(),
+                result_tx: oneshot::channel::<Result<(), String>>().0,
+                already_requested: false,
+            },
+        ];
+        let rejected = local_activity_batch_conflict(&external)
+            .expect("a local activity beside a durable external await must be rejected");
+        assert!(
+            rejected.contains("AwaitExternalWorkflow"),
+            "the typed error must name the dropped sibling command: {rejected}"
         );
     }
 
