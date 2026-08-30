@@ -110,6 +110,33 @@ path does. This mattered here because #950 newly routes traffic onto
 `StartTimer` plus signal waits, a shape `extract_started_timer_for_suspension`
 claims.
 
+**Full mixed-batch parity for the plain signal wait (Codex round 1, P1).**
+`match_signal` — the matcher a plain `ctx.wait_for_signal` uses, distinct from
+the race path's `match_race_signal` — tolerated only a TIMER sibling; issue
+#1071 scoped the rest out because no batch could pair a signal wait with an
+activity or a child. This PR makes exactly that batch persistable, so the gap
+became reachable: `join!(ctx.wait_for_signal("go"), ctx.execute_activity(..))`
+persisted correctly and then **nd-blocked on its first wake**, because the batch
+records only the sibling's `ActivityScheduled` and the signal wait — polled
+first by `join!` — treated that recorded event as a divergence. The interleaved
+sets now mirror `match_timer_strict` / `scan_activity_terminal`: sibling
+commands (`ActivityScheduled`, `ChildWorkflowStarted`, `LocalActivityScheduled`,
+markers, side-effects) are crossed as interleaved commands with rewind, and
+their progress/terminal events are crossed transparently. The round-13
+park-forever guard (issue #768) is preserved exactly by tracking a crossed
+TIMER/detached-spawn command separately from the rewind cursor: a stray one of
+those with no resolving signal still diverges, while an activity or child
+sibling is an ordinary "the signal has not arrived yet" park.
+
+The strict/canary replay frontier test needed the same widening
+(`check_strict_replay_signal_no_match`): "the cursor is at end of history" is
+the wrong question for a signal wait in a mixed batch, because the sibling's
+events are legitimately unconsumed ahead of it. The deploy canary would have
+reported a healthy in-flight park as a false non-determinism and blocked
+deploys. The frontier question that actually holds is whether any matching
+signal remains available at all — mirroring the #779 fix, which exempted the
+child-timeout race's `InProgress` arm for the same reason.
+
 **Invariants.** **Zero new `WorkflowEvent` variants and no migration** — the
 batch composes existing events (`ActivityScheduled`, `TimerStarted`,
 `SignalReceived`, `ChildWorkflowStarted`, …) at their command-emission positions
@@ -152,7 +179,10 @@ Pre-existing parked tasks need no migration.
   directions, **1,000 randomized event-arrival orderings with 0 divergences**
   (the #476/#779 success-metric precedent), `join!` replays identically for both
   arrival orders, and an in-flight mixed race at the recorded frontier is a
-  healthy suspend rather than a false non-determinism. The sweep genuinely
+  healthy suspend rather than a false non-determinism. Plain
+  `join!(wait_for_signal, activity)` and `join!(wait_for_signal, child)` replay
+  for both arrival orders, and the same shape parked with the signal
+  undelivered is a healthy canary suspend. The sweep genuinely
   permutes: it moves each losing branch's in-flight progress event to either
   side of the winner's terminal (the #1126 straddling-frontier case) and
   shuffles the teardown order, holding fixed only what is not arrival order —

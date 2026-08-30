@@ -4420,6 +4420,15 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_command = None;
+        // Round-13 (issue #768) tracks a crossed TIMER / detached-spawn command
+        // SEPARATELY from the rewind cursor: a stray one of those with no
+        // resolving signal must diverge (parking would wait forever on a signal
+        // that will never arrive), while a crossed ACTIVITY or CHILD sibling from
+        // a mixed batch (issue #950) is an ordinary "the signal has not arrived
+        // yet" park. Before #950 the two shared one variable, so the guard could
+        // not tell them apart — and every activity/child sibling fell through to
+        // the `other =>` divergence arm below.
+        let mut stray_timer_command = None;
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
@@ -4507,6 +4516,68 @@ impl HistoryMatcher {
                 | WorkflowEvent::TimerCancelled { .. }
                 | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    stray_timer_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Issue #950: a race branch's scan stops at its OWN settlement
+                // marker. This arm MUST precede the generic sibling-command arm
+                // below, which also matches `MarkerRecorded` and would otherwise
+                // swallow the bound — letting a losing signal branch scan past
+                // the resolved race and consume a signal belonging to a later
+                // `ctx.wait_for_signal`.
+                WorkflowEvent::MarkerRecorded { name, .. }
+                    if tolerate_interleaved == Some(name.as_str()) =>
+                {
+                    return HistoryMatch::NoMatch;
+                }
+                // Issue #950: an interleaved sibling COMMAND from a mixed
+                // suspension batch — `join!(ctx.wait_for_signal(..),
+                // ctx.execute_activity(..))` records the sibling's
+                // `ActivityScheduled` and nothing for the signal wait, so on the
+                // next drive this scan starts ON that event. Cross it as an
+                // interleaved command (rewind to it on a win, so its own matcher
+                // claims it in program order) and keep scanning for the awaited
+                // signal. Deliberately does NOT set `stray_timer_command`: an
+                // activity or child sibling with no resolving signal is a normal
+                // park, not the round-13 park-forever hazard.
+                //
+                // This completes the "full mixed-batch parity for the signal
+                // wait" that issue #1071 scoped out; the sets mirror
+                // `match_timer_strict` / `scan_activity_terminal`.
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Progress and terminal events of those concurrent siblings —
+                // and a foreign timer's fire (a sibling deadline that fired
+                // before the awaited signal arrived, e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same batch whose
+                // `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`, issue #1071 manifestation #3) — are
+                // transparent to this scan. Cross them NON-CONSUMINGLY, leaving
+                // each for its own matcher to claim, and keep scanning for the
+                // awaited signal. The same treatment `match_timer_strict` and
+                // `scan_activity_terminal` give their sibling terminals; keep the
+                // three sets in sync (issue #1071 / #950).
+                //
+                // None of these set `stray_timer_command`, so the round-13
+                // park-forever guard below is untouched: it fires on an
+                // interleaved timer COMMAND with no resolving signal, and a lone
+                // `TimerStarted` still diverges.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
                 // ExternalSignal event triplets can appear before SignalReceived
@@ -4636,30 +4707,6 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // A foreign timer's fire — a sibling deadline timer that fired
-                // before the awaited signal arrived (e.g. a concurrent
-                // `receive_signal_timeout`/`ctx.timer` in the same suspension
-                // batch, whose `TimerFired` is recorded ahead of the delivered
-                // `SignalReceived`) — is transparent to the signal scan. Cross
-                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
-                // keep scanning for the awaited signal (issue #1071
-                // manifestation #3). This does NOT set `first_interleaved_command`,
-                // so the round-13 stray-`TimerStarted` park-forever guard below
-                // (an interleaved timer with NO resolving signal → diverge) is
-                // untouched: a lone `TimerStarted` still diverges.
-                //
-                // DELIBERATE PARTIAL SCOPE (issue #1071): only the TIMER sibling
-                // is tolerated in `match_signal` — the sole case the issue's
-                // three comments name. An interleaved activity/child/local-activity
-                // sibling in a `join!(wait_for_signal, activity)` mixed batch is
-                // NOT crossed here and still falls through to `other =>` as a
-                // divergence. Full mixed-batch parity for the signal wait is out
-                // of scope; the fuller interleaved sets live in
-                // `match_timer_strict` / `scan_activity_terminal` /
-                // `match_signal_or_timer`.
-                WorkflowEvent::TimerFired { .. } => {
-                    scan_cursor += 1;
-                }
                 other => {
                     // Issue #950: inside a race, an unrecognised event is a
                     // sibling branch's own command/terminal, not a divergence —
@@ -4674,18 +4721,9 @@ impl HistoryMatcher {
                     // race branch cross exactly one event and then bail — while
                     // the normal shape is two (`ActivityScheduled` +
                     // `ActivityStarted`) before the signal.
-                    if let Some(settle_marker) = tolerate_interleaved {
-                        // A signal recorded at or after this race's
-                        // `race_winner:{seq}` marker was delivered AFTER the race
-                        // resolved, so it cannot be this branch's resolution — it
-                        // belongs to a later waiter. Stop rather than consume it.
-                        if matches!(
-                            other,
-                            WorkflowEvent::MarkerRecorded { name, .. }
-                                if name.as_str() == settle_marker
-                        ) {
-                            return HistoryMatch::NoMatch;
-                        }
+                    // The settlement-marker bound is applied by its own arm
+                    // above, ahead of the sibling-command arm.
+                    if tolerate_interleaved.is_some() {
                         first_interleaved_command.get_or_insert(scan_cursor);
                         scan_cursor += 1;
                         continue;
@@ -4719,7 +4757,7 @@ impl HistoryMatcher {
         // Issue #950: a race branch's signal that never arrived is the normal
         // "this branch lost" outcome, so the stray-interleaved divergence guard
         // above does not apply to it — see `match_race_signal`.
-        if let Some(first) = first_interleaved_command
+        if let Some(first) = stray_timer_command
             && tolerate_interleaved.is_none()
         {
             return HistoryMatch::Diverged {
@@ -6775,6 +6813,39 @@ impl HistoryMatcher {
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in
     /// both cases safe to call speculatively.
+    /// Whether any unclaimed `SignalReceived { signal_name }` remains — either
+    /// already stashed in `pending_signals`, or still unconsumed at/after the
+    /// current cursor (issue #950).
+    ///
+    /// A **pure read**: consumes nothing and never moves the cursor. Used by the
+    /// strict/canary replay frontier test for a signal wait, where "cursor at end
+    /// of history" is the wrong question: a mixed suspension batch legitimately
+    /// leaves a SIBLING branch's events unconsumed ahead of the cursor while the
+    /// signal wait itself has nothing to match. What actually distinguishes a
+    /// healthy in-flight park from a real divergence is whether a matching signal
+    /// is still available anywhere.
+    #[must_use]
+    pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
+        if self
+            .pending_signals
+            .iter()
+            .any(|(name, _, _)| name == signal_name)
+        {
+            return true;
+        }
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(
+                        e,
+                        WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                    )
+            })
+    }
+
     /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
     /// after the current cursor (issue #950).
     ///

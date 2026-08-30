@@ -11190,6 +11190,196 @@ async fn mixed_join_replays_succeeded_for_both_arrival_orders() {
     }
 }
 
+/// `join!` of a **plain** signal wait and an activity — the wait-all form AC1
+/// advertises, and the one shape `match_signal` (not `match_race_signal`)
+/// resolves. `futures::join!` polls in declaration order, so the
+/// `WaitForSignal` command is pushed first and the batch records only the
+/// sibling's `ActivityScheduled`; on the next drive `wait_for_signal` is polled
+/// first and its scan starts ON that interleaved event.
+fn mixed_join_signal_and_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, activity) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.execute_activity_raw("step", Value::Null, "default"),
+        );
+        let signal = signal.map_err(|e| e.to_string())?;
+        let activity = activity.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": signal, "activity": activity}))
+    })
+}
+
+/// `join!` of a plain signal wait and a CHILD workflow — same shape, child
+/// sibling.
+fn mixed_join_signal_and_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, child) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.spawn_child_workflow_raw("settle", Value::Null),
+        );
+        let signal = signal.map_err(|e| e.to_string())?;
+        let child = child.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": signal, "child": child}))
+    })
+}
+
+/// Codex round 1, P1: a plain `join!(wait_for_signal, execute_activity)` must
+/// replay to completion. The sibling's `ActivityScheduled` (and its terminal)
+/// sit between the cursor and the eventual `SignalReceived`, and `match_signal`
+/// previously treated an interleaved activity/child event as a **divergence** —
+/// the composition this PR advertises would have nd-blocked on its first wake
+/// instead of completing.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_last() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "activity": {"done": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a plain join! of a signal wait and an activity must replay:\n{report}"
+    );
+}
+
+/// The same shape with the signal recorded BEFORE the sibling's terminal — the
+/// signal branch resolves first and the activity is still in flight.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_first() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "activity": {"done": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "signal-first arrival order must replay too:\n{report}"
+    );
+}
+
+/// A CHILD sibling, not an activity — the other half of the P1.
+#[tokio::test]
+async fn mixed_join_signal_and_child_replays() {
+    let child_id = ExecutionId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "settle".to_string(),
+            input: Value::Null,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"settled": true}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "child": {"settled": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_child", mixed_join_signal_and_child)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a plain join! of a signal wait and a child workflow must replay:\n{report}"
+    );
+}
+
+/// The in-flight frontier: the sibling activity has run but the signal has NOT
+/// arrived. This is a healthy **suspend** — the workflow re-parks on the signal
+/// — not a divergence. It is the case the round-13 stray-`TimerStarted` guard
+/// (issue #768) must keep diverging on for a TIMER sibling while allowing an
+/// activity/child sibling to park.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an undelivered signal beside a resolved activity sibling is a healthy \
+         suspend, not a divergence:\n{report}"
+    );
+}
+
 /// An in-flight mixed race sampled at the recorded-history frontier (both
 /// branches dispatched, neither resolved) is a healthy suspend, not a false
 /// non-determinism — the canary case #779 pinned for its own shape.

@@ -3020,6 +3020,28 @@ impl WorkflowContext {
         Ok(())
     }
 
+    /// [`check_strict_replay_no_match`](Self::check_strict_replay_no_match) for a
+    /// signal wait (issue #950).
+    ///
+    /// The generic check treats "the cursor is at end of history" as the canary
+    /// frontier. That is the wrong question for a signal wait inside a MIXED
+    /// suspension batch: `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`
+    /// records only the sibling's events, so when the deploy canary samples the
+    /// parked execution the signal branch has nothing to match while the
+    /// sibling's `ActivityScheduled`/`ActivityCompleted` are still unconsumed
+    /// ahead of the cursor — a healthy in-flight park reported as a false
+    /// non-determinism, which would block a deploy.
+    ///
+    /// The frontier question that actually holds for a signal wait is whether
+    /// any matching signal remains available at all. Mirrors the #779 fix, which
+    /// exempted the child-timeout race's `InProgress` arm for the same reason.
+    fn check_strict_replay_signal_no_match(&self, signal_name: &str) -> HarvestResult<()> {
+        if self.canary_mode && !self.match_history(|m| m.has_unconsumed_signal(signal_name)) {
+            return Ok(());
+        }
+        self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))
+    }
+
     fn match_history<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
@@ -8152,7 +8174,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))?;
+                self.check_strict_replay_signal_no_match(signal_name)?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {

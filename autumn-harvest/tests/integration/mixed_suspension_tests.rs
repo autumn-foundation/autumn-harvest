@@ -366,6 +366,23 @@ fn parent_local_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFu
     })
 }
 
+/// AC1 wait-**all** with a SIGNAL branch: `join!` of a plain
+/// `ctx.wait_for_signal` and an activity. `futures::join!` polls in declaration
+/// order, so the `WaitForSignal` command is pushed first and the batch records
+/// only the sibling's `ActivityScheduled` — the shape Codex round 1 flagged as
+/// nd-blocking on its first wake.
+fn parent_join_signal_and_activity(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let (signal, activity) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.execute_activity_raw("fast_activity", serde_json::json!({"n": 1}), "default"),
+        );
+        let signal = signal.map_err(|e| e.to_string())?;
+        let activity = activity.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": signal, "activity": activity}))
+    })
+}
+
 /// AC1 wait-**all**: `futures::join!` over an activity AND a durable timer.
 /// Both branches must resolve; the workflow completes only when each has.
 fn parent_join_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
@@ -1117,5 +1134,66 @@ async fn local_activity_co_batched_with_a_timer_fails_loudly_and_leaves_no_trace
     assert!(
         timers.is_empty(),
         "a rejected batch must arm no durable timer row: {timers:?}"
+    );
+}
+
+/// AC1's signal half, end-to-end: `join!(ctx.wait_for_signal(..),
+/// ctx.execute_activity(..))` must complete through a real worker — both
+/// branches resolve independently and the workflow finishes.
+///
+/// Codex round 1 (P1): before the `match_signal` mixed-batch fix this shape
+/// persisted fine and then nd-blocked on its very first wake, because the plain
+/// signal matcher treated the sibling's recorded `ActivityScheduled` as a
+/// divergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_of_a_signal_wait_and_an_activity_resolves_both_branches() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info(
+            "e2e_test_workflow",
+            parent_join_signal_and_activity,
+        )],
+        vec![act_info("fast_activity", fast_activity)],
+    );
+    let worker = build_runtime_worker("worker-950-join-signal", 4, 2, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    deliver_signal_when_parked(&database_url, exec_id, "go", serde_json::json!({"n": 7})).await;
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("signal").cloned(),
+        Some(serde_json::json!({"n": 7})),
+        "the signal branch must have resolved with its payload: {output}"
+    );
+    assert!(
+        output.get("activity").is_some(),
+        "the activity branch must have resolved: {output}"
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+            && history
+                .events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::SignalReceived { .. })),
+        "both branches must be recorded: {:?}",
+        history.events
     );
 }
