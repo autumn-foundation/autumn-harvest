@@ -211,6 +211,30 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
          AND e.state = 'PAUSED')"
 }
 
+/// SQL query behind [`enforce_workflow_history_ceiling`] (issue #493):
+/// RUNNING workflow executions whose durable event count has reached the
+/// operator-configured ceiling.
+///
+/// The per-execution event count is a correlated `COUNT(*)` against
+/// `harvest_events` (served by `idx_harvest_events_exec_last`, so each
+/// evaluation is an indexed lookup, not a table scan) -- but it is needed in
+/// two places: the `SELECT` list (to report `event_count` to the caller) and
+/// the `WHERE` clause (to filter on it, since a `SELECT`-list alias is not
+/// visible to the `WHERE` clause that filters the same query). Extracted
+/// verbatim from `enforce_workflow_history_ceiling`'s inline literal with no
+/// behavior change, so it can be pinned by a unit test and captured by
+/// `tests/integration/history_ceiling_claim_tests.rs` -- see
+/// `docs/performance-history-ceiling.md` for the buffer-cost writeup and the
+/// fix this baseline sits ahead of.
+#[must_use]
+pub const fn workflow_history_ceiling_query() -> &'static str {
+    "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+     (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+     FROM harvest_workflow_executions \
+     WHERE state = 'RUNNING' \
+     AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1"
+}
+
 /// SQL query to find RUNNING workflow executions that have exceeded either their
 /// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
 /// lifetime cap deadline (issue #617).
@@ -3624,17 +3648,11 @@ pub async fn enforce_workflow_history_ceiling(
     }
 
     let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
-    let oversized: Vec<OversizedRow> = diesel::sql_query(
-        "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
-         (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
-         FROM harvest_workflow_executions \
-         WHERE state = 'RUNNING' \
-         AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1",
-    )
-    .bind::<BigInt, _>(ceiling_i64)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let oversized: Vec<OversizedRow> = diesel::sql_query(workflow_history_ceiling_query())
+        .bind::<BigInt, _>(ceiling_i64)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     let count = oversized.len();
 
@@ -4197,6 +4215,27 @@ mod tests {
         // carve-out — see the dedicated test below.)
         assert!(!heartbeat_timeout_query().contains("PAUSED"));
         assert!(!start_to_close_timeout_query().contains("PAUSED"));
+    }
+
+    #[test]
+    fn workflow_history_ceiling_query_references_correct_columns() {
+        let sql = workflow_history_ceiling_query();
+        assert!(
+            sql.contains("FROM harvest_workflow_executions"),
+            "should query harvest_workflow_executions"
+        );
+        assert!(
+            sql.contains("state = 'RUNNING'"),
+            "should filter to RUNNING executions only"
+        );
+        assert!(
+            sql.contains("harvest_events"),
+            "should consult the durable event log"
+        );
+        assert!(
+            sql.contains(">= $1"),
+            "should filter on the operator-supplied ceiling bind"
+        );
     }
 
     #[test]

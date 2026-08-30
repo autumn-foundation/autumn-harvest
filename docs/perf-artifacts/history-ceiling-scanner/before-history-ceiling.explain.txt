@@ -1,0 +1,36 @@
+-- before: workflow_history_ceiling_query() @ 100000 executions (3000 RUNNING), ceiling=5000 --
+Index Scan using idx_harvest_we_non_terminal_wf_name on public.harvest_workflow_executions  (cost=0.28..1938150.44 rows=993 width=246) (actual rows=29 loops=1)
+  Output: harvest_workflow_executions.id, harvest_workflow_executions.workflow_id, harvest_workflow_executions.workflow_name, harvest_workflow_executions.queue_name, harvest_workflow_executions.parent_id, harvest_workflow_executions.parent_close_policy, (SubPlan 1)
+  Filter: ((harvest_workflow_executions.state = 'RUNNING'::text) AND ((SubPlan 2) >= '5000'::bigint))
+  Rows Removed by Filter: 2971
+  Buffers: shared hit=21644 read=6700 dirtied=5753 written=315
+  SubPlan 1
+    ->  Aggregate  (cost=486.92..486.93 rows=1 width=8) (actual rows=1 loops=29)
+          Output: count(*)
+          Buffers: shared hit=3886
+          ->  Bitmap Heap Scan on public.harvest_events  (cost=5.40..486.61 rows=125 width=0) (actual rows=6641 loops=29)
+                Recheck Cond: (harvest_events.workflow_exec_id = harvest_workflow_executions.id)
+                Heap Blocks: exact=2116
+                Buffers: shared hit=3886
+                ->  Bitmap Index Scan on idx_harvest_events_history_page  (cost=0.00..5.37 rows=125 width=0) (actual rows=6641 loops=29)
+                      Index Cond: (harvest_events.workflow_exec_id = harvest_workflow_executions.id)
+                      Buffers: shared hit=1770
+  SubPlan 2
+    ->  Aggregate  (cost=486.92..486.93 rows=1 width=8) (actual rows=1 loops=3000)
+          Output: count(*)
+          Buffers: shared hit=14796 read=6669 dirtied=5753 written=315
+          ->  Bitmap Heap Scan on public.harvest_events harvest_events_1  (cost=5.40..486.61 rows=125 width=0) (actual rows=177 loops=3000)
+                Recheck Cond: (harvest_events_1.workflow_exec_id = harvest_workflow_executions.id)
+                Heap Blocks: exact=8727
+                Buffers: shared hit=14796 read=6669 dirtied=5753 written=315
+                ->  Bitmap Index Scan on idx_harvest_events_history_page  (cost=0.00..5.37 rows=125 width=0) (actual rows=177 loops=3000)
+                      Index Cond: (harvest_events_1.workflow_exec_id = harvest_workflow_executions.id)
+                      Buffers: shared hit=6069 read=6669 written=315
+Query Identifier: 3077854650151308905
+Planning:
+  Buffers: shared hit=159 read=56
+Planning Time: 1.068 ms
+JIT:
+  Functions: 20
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+Execution Time: 197.493 ms

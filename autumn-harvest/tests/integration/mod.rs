@@ -81,6 +81,7 @@ mod force_fail_tests;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
+mod history_ceiling_claim_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
