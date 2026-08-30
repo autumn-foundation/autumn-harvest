@@ -449,13 +449,22 @@ pub fn build_run_graph(
         .iter()
         .map(|(_, event)| event.clone())
         .collect();
+    let tasks = def.tasks();
     // `latest_scheduled`'s issue #780 compensator exclusion needs the set of
     // dispatched activity names — computed once here (it depends only on
     // `events`, identical for every node below) and threaded down through
     // `classify`, instead of `latest_scheduled` rebuilding it (an O(events)
     // scan plus a fresh `BTreeSet` allocation) on every node in the loop.
-    let dispatched = crate::dag_retry::dispatched_activity_names(&events);
-    let tasks = def.tasks();
+    // Only activity (non-gate) nodes ever read `dispatched` (gate nodes take
+    // the early-return branch below and never reach `classify`), so a
+    // gate-only DAG -- which paid nothing for this before the hoist --
+    // skips the O(events) scan entirely rather than paying it unconditionally
+    // for a value nothing will use (issue #690 review, Codex).
+    let dispatched = if tasks.iter().any(|t| t.signal.is_none()) {
+        crate::dag_retry::dispatched_activity_names(&events)
+    } else {
+        BTreeSet::new()
+    };
 
     tasks
         .iter()
@@ -1771,6 +1780,33 @@ mod tests {
             gate.status,
             DagNodeStatus::Succeeded,
             "a gate whose signal has arrived reports `succeeded`"
+        );
+    }
+
+    /// A DAG with no activity nodes at all -- just one root signal gate.
+    fn gate_only_dag() -> DagDefinition {
+        let mut builder = DagBuilder::new();
+        let _gate = builder.signal_gate("approval");
+        builder.build().expect("gate-only dag builds")
+    }
+
+    #[test]
+    fn gate_only_dag_classifies_without_an_activity_node() {
+        // issue #690 review, Codex: `build_run_graph` hoists
+        // `dispatched_activity_names` once per call for the (overwhelmingly
+        // common) case of a DAG with at least one activity node, but must
+        // not pay that scan at all for a DAG with none -- the gate-only
+        // shape exercised here.
+        let def = gate_only_dag();
+        let events = vec![(ts(0), started())];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(nodes.len(), 1);
+        let gate = node(&nodes, "approval");
+        assert_eq!(gate.kind, DagNodeKind::Gate);
+        assert_eq!(
+            gate.status,
+            DagNodeStatus::Waiting,
+            "an un-signalled gate with no upstream on a live run reports `waiting`"
         );
     }
 

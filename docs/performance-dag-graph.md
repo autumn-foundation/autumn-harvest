@@ -170,11 +170,28 @@ while leaving `node_outcome`'s own separate, out-of-scope call to
 * `build_run_graph` computes `dispatched` once, right after building the
   `events` clone, and threads it through `classify` (which gained a matching
   `dispatched: &BTreeSet<&str>` parameter) down to `latest_scheduled`'s one
-  call site:
+  call site -- but only when the DAG actually has an activity node to need
+  it. Gate nodes take an early-return branch above this and never reach
+  `classify`/`latest_scheduled`, so a DAG built entirely from signal gates
+  (a supported shape) paid nothing for `dispatched_activity_names` before
+  this change and must not start paying an unconditional O(events) scan for
+  it now (issue #690 review, Codex):
 
   ```rust
-  let dispatched = crate::dag_retry::dispatched_activity_names(&events);
+  let dispatched = if tasks.iter().any(|t| t.signal.is_none()) {
+      crate::dag_retry::dispatched_activity_names(&events)
+  } else {
+      BTreeSet::new()
+  };
   ```
+
+  The guard is `O(tasks)`, not `O(events)`, so it stays cheap even when it
+  does fire. A new unit test, `gate_only_dag_classifies_without_an_activity_node`,
+  pins the gate-only case correctly reaching `Waiting` on a live run. On this
+  page's own fixture (which has 89 activity nodes) the guard always takes the
+  `dispatched_activity_names` branch, so it does not change any number
+  measured below -- confirmed by re-running the identical harness before and
+  after adding it: 789,692,008 -> 789,695,411 Ir (+3,403, +0.0004%, noise).
 
 `latest_scheduled` is called from exactly one place (`classify`, confirmed
 by grep before making the change), so no other call site needed updating.
@@ -253,8 +270,8 @@ primary Ir floor.
   (`dag_retry.rs` is untouched by this change; this just confirms nothing
   else in the workspace regressed).
 * `cargo test -p autumn-harvest-plugin --lib --features "webhooks,mcp,metrics,connectors,unified-dag-execution"` --
-  **1,233 passed, 0 failed**, including all **39** `dag_graph::tests::*`
-  unit tests, unchanged.
+  **1,234 passed, 0 failed**, including all **40** `dag_graph::tests::*`
+  unit tests (39 unchanged + 1 new, `gate_only_dag_classifies_without_an_activity_node`).
 
 No test's expected value needed to change: `latest_scheduled` receives the
 identical `BTreeSet<&str>` value it used to build internally, just built
