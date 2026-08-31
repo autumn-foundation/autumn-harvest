@@ -2943,7 +2943,24 @@ invisible to detection is growing, and the audit table is growing with it.
 - Raise `audit_export_lease` above the sink's own request timeout if
   `last_error` reports the lease timeout.
 - Add `absent(harvest_audit_export_lag)` as a companion alert — this threshold
-  rule structurally cannot fire when no exporter is running.
+  rule structurally cannot fire when no exporter has *ever* run for a shard in
+  this process's lifetime.
+
+  ⚠️ **`absent()` alone is not sufficient once a shard has reported.** The
+  gauge is only written on a successful observation: if the exporter cannot
+  read the cursor — a failing query, a connection it cannot acquire — the
+  recorder keeps serving the last value it was given, commonly `0`. Prometheus
+  then sees neither a high value nor an absent series while that shard is going
+  unexported, which defeats both alerts. Alert on **staleness** as well, e.g.
+
+  ```promql
+  time() - timestamp(harvest_audit_export_lag) > 600
+  ```
+
+  and treat the `scanner_liveness` health check and `last_error` on
+  `GET /admin/audit-export` as the authoritative "is the exporter working"
+  signals. See autumn-foundation/autumn-harvest#1268 for making the gauge
+  itself carry an explicit unavailable signal.
 
 **Do not reach for the redrive.** `POST /admin/audit-export/redrive` rewinds
 the cursor so already-delivered records are re-exported; it is for **sink-side
