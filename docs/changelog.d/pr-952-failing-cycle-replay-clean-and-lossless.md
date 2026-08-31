@@ -97,6 +97,23 @@ Two knock-on effects of that verdict change, both intended:
   the new field — permitted under the repo's 0.x semver convention, and the
   in-tree readers all go through the new `failure_message()` accessor instead.
 
+### CI follow-up
+
+Two Docker-gated DAG tests still asserted the pre-#952 verdict shape and went red
+on the Linux CI lane: `dag_compensation_tests::failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks`
+and `::fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs`.
+Both matched `ReplayStatus::WorkflowFailed { error, .. }` on a history that ends
+in a terminal `WorkflowFailed`, which is now `ReplaySucceeded` carrying
+`reproduced_failure`. They now assert the *property* — no
+`NonDeterminismDetected`, and `failure_message() == Some("one or more DAG tasks
+failed")` — which holds under either verdict.
+
+The rest of the family named in that test's own comment (`dag_unified_tests`,
+`dag_input_binding_tests`, `dag_mapping_tests`, `dag_signal_gate_tests`,
+`activity_failure_tests`, `retry_after_tests`, `replayer_integration_tests`) was
+audited and is unaffected: those histories carry no terminal event, so they have
+no failing tail and keep reporting `WorkflowFailed`.
+
 ### Codex review round 3
 
 * **P2 — the history hard-cap preflight counts what will actually be appended.**
