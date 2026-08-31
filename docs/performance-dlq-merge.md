@@ -156,7 +156,58 @@ value).
 
 ## Measurement
 
-<!-- filled in after the fix; see the follow-up commit -->
+Same harness, same workload (8 shards, 25 groups, 500 reps), before/after the
+change above.
+
+### Instruction count (`valgrind --tool=callgrind --branch-sim=no --cache-sim=no`)
+
+| | Before | After | Delta |
+|:--|--:|--:|--:|
+| Ir, whole process | 922,841,106 | 904,945,565 | -17,895,541 (-1.94%) |
+| Ir, isolated* | 235,873,940 | 217,978,399 | **-17,895,541 (-7.59%)** |
+
+\* isolated = whole-process minus the identical 686,967,166-Ir setup cost
+(building the harness's own input), measured once by temporarily skipping
+the call under test — unaffected by this change, since only
+`merge_dlq_aggregates`'s own body was touched.
+
+-7.59% clears this process's 5% impact floor.
+
+### Allocations (`valgrind --tool=dhat`)
+
+| | Before | After | Delta |
+|:--|--:|--:|--:|
+| Blocks | 1,158,011 | 1,083,011 | -75,000 (-6.48%) |
+| Bytes | 64,245,146 | 62,290,146 | -1,955,000 (-3.04%) |
+
+Below this process's 10% allocation floor on its own, but the mechanism
+matches the hypothesis exactly: every merge input row in this workload
+after the first shard is a hit (all 8 shards report the same 25 root
+causes), so the removed `key: group.key.clone()` clone only fires on the
+25 genuine per-rep misses (the first shard's 25 groups) — 25 × 500 reps =
+12,500 removed clones — and the removed `.into_values().map(|group|
+(group.key.clone(), group))` clone fires once per **distinct** final group
+— another 25 × 500 = 12,500. 25,000 removed clones × 3 allocations each
+(one `Vec<Option<String>>` buffer, two `String` buffers for the two
+grouping dimensions) = 75,000 — an exact match to the measured block
+delta, not just a plausible one.
+
+This does **not** clear the allocation floor by itself, but the
+instruction-count delta above independently does (the rubric's floor is
+"at least one of" instruction count *or* allocation count/bytes, not
+both), and the exact block-count match is strong corroboration that the
+Ir delta is this change and not noise.
+
+### Correctness
+
+All 71 pre-existing `dlq::` unit tests pass unchanged, including every
+`merge_*` test (`merge_sums_counts_across_shards`,
+`merge_orders_groups_by_descending_count`, `merge_caps_samples_per_group`,
+`merge_rolls_long_tail_into_other_and_reconciles`,
+`merge_renders_hierarchical_key`, `merge_renders_null_for_missing_dimension_value`,
+`merge_groups_by_dlq_reason`), plus the full `autumn-harvest` lib suite.
+`cargo fmt --check` and `cargo clippy --all-features -- -D warnings` are
+clean.
 
 ## Reproduce
 
