@@ -351,6 +351,18 @@ pub struct PartitionMaintenanceConfig {
     /// Seconds to wait for that lock before deferring a partition to the next
     /// tick. Failing fast is what protects the concurrent-p99 budget.
     pub drop_lock_timeout_secs: u64,
+    /// Seconds the exact ownership scan may run before the sweeper gives up on
+    /// a partition and retries next tick.
+    ///
+    /// Only reached when more old executions survive than
+    /// `owner_probe_cap`; the narrow probe decides the normal case. Raise it
+    /// for very large partitions, or narrow the cohort width.
+    pub exact_scan_timeout_secs: u64,
+    /// How many surviving old executions the narrow ownership probe will
+    /// enumerate before falling back to the exact scan.
+    pub owner_probe_cap: usize,
+    /// Rows per straggler `DELETE` statement.
+    pub straggler_batch: usize,
     /// Opt-in targeted `DELETE` of orphan rows in a cohort pinned by a
     /// long-running execution for longer than this many seconds.
     ///
@@ -366,8 +378,13 @@ impl Default for PartitionMaintenanceConfig {
         Self {
             enabled: true,
             lookahead_cohorts: crate::partition::DEFAULT_LOOKAHEAD_COHORTS,
-            max_drops_per_tick: 32,
+            max_drops_per_tick: crate::partition::SweepOptions::default().max_drops,
             drop_lock_timeout_secs: 2,
+            exact_scan_timeout_secs: crate::partition::SweepOptions::default()
+                .exact_scan_timeout
+                .as_secs(),
+            owner_probe_cap: crate::partition::SweepOptions::default().owner_probe_cap,
+            straggler_batch: crate::partition::SweepOptions::default().straggler_batch,
             straggler_grace_secs: None,
         }
     }
@@ -380,8 +397,10 @@ impl PartitionMaintenanceConfig {
         crate::partition::SweepOptions {
             max_drops: self.max_drops_per_tick,
             lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
+            exact_scan_timeout: Duration::from_secs(self.exact_scan_timeout_secs.max(1)),
+            owner_probe_cap: self.owner_probe_cap,
+            straggler_batch: self.straggler_batch,
             straggler_grace: self.straggler_grace_secs.map(Duration::from_secs),
-            ..crate::partition::SweepOptions::default()
         }
     }
 }
@@ -976,12 +995,41 @@ impl RetentionRuntime {
                 // retention tick, because history retention and reclamation are
                 // independent — the executions are already safely archived and
                 // deleted by this point.
-                if config.partitions.enabled && !config.dry_run {
+                if config.partitions.enabled {
                     let now = Utc::now();
-                    let sweep_opts = config.partitions.sweep_options();
+                    let mut sweep_opts = config.partitions.sweep_options();
+                    // `dry_run` means "do not destroy data". It must NOT stop
+                    // partition CREATION: `ensure_partitions` and
+                    // `drain_default` delete nothing, and a deployment running
+                    // retention in dry-run — a common posture during rollout —
+                    // would otherwise stop extending the lookahead window and,
+                    // after a few days, send every append to the DEFAULT
+                    // partition indefinitely. Only the sweep is suppressed, by
+                    // giving it a zero drop budget.
+                    if config.dry_run {
+                        sweep_opts.max_drops = 0;
+                        sweep_opts.straggler_grace = None;
+                    }
                     for (shard, pool) in pools.iter_shards() {
-                        let Ok(mut conn) = pool.get().await else {
-                            continue;
+                        let mut conn = match pool.get().await {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                // Never silent: a shard that cannot be reached
+                                // gets no lookahead partitions and no
+                                // reclamation, and the operator has to be able
+                                // to tell that apart from "nothing to do".
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %error,
+                                    "harvest event-partition maintenance could not \
+                                     acquire a connection"
+                                );
+                                monitor_task.update_partitions(
+                                    shard,
+                                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                                );
+                                continue;
+                            }
                         };
                         match crate::partition::maintain(
                             &mut conn,
@@ -992,8 +1040,16 @@ impl RetentionRuntime {
                         .await
                         {
                             Ok(outcome) => {
+                                // `blocked` is in the condition deliberately.
+                                // The steady-state failure — nothing created
+                                // (the window is already covered), nothing
+                                // dropped, everything blocked — is exactly the
+                                // state an operator needs to see, and logging
+                                // only on progress would make it the one state
+                                // that produces no output at all.
                                 if !outcome.created.is_empty()
                                     || !outcome.sweep.dropped.is_empty()
+                                    || !outcome.sweep.blocked.is_empty()
                                     || outcome.drained > 0
                                 {
                                     tracing::info!(
@@ -1013,6 +1069,14 @@ impl RetentionRuntime {
                                     shard = %shard,
                                     error = %err,
                                     "harvest event-partition maintenance failed"
+                                );
+                                // Reported, not just logged: without this a
+                                // permanently-failing shard is indistinguishable
+                                // from one that never opted in, because both
+                                // show `partition_maintenance: null`.
+                                monitor_task.update_partitions(
+                                    shard,
+                                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
                                 );
                             }
                         }

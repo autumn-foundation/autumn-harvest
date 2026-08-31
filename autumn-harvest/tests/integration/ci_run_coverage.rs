@@ -315,9 +315,21 @@ struct SuiteRow {
 }
 
 impl SuiteRow {
-    /// `linux`/`linuxpart`/`allos` rows execute in CI; `compileonly` never does.
+    /// Rows that CREDIT a suite as covered.
+    ///
+    /// `linuxpart` deliberately does NOT: it re-runs a suite against the
+    /// opt-in partitioned layout (issue #958), which is *additional* evidence,
+    /// never a substitute for running against the layout every deployment
+    /// actually has. A suite listed only as `linuxpart` would otherwise satisfy
+    /// this guard while never running on the default layout at all — the exact
+    /// silently-never-run gap the guard exists to catch, in a new disguise.
     fn runs(&self) -> bool {
-        self.is_live_db() || self.osclass == "allos"
+        self.osclass == "linux" || self.osclass == "allos"
+    }
+
+    /// Rows that EXECUTE in CI, whichever layout they execute against.
+    fn executes(&self) -> bool {
+        self.runs() || self.osclass == "linuxpart"
     }
 
     /// Runs against a live Docker Postgres, so the `db` default feature is in

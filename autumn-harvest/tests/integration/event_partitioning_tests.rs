@@ -1601,3 +1601,241 @@ async fn the_partitioned_layout_reclaims_without_creating_bloat() {
         part.dead_tuple_ratio * 100.0,
     );
 }
+
+// ══ Regressions found in review ════════════════════════════════════════════
+
+#[tokio::test]
+async fn the_legacy_partition_is_never_dropped_while_it_holds_live_history() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated shard with a RUNNING execution and a legal-held one — the
+    // shape every real deployment has when an operator opts in.
+    let running = insert_execution(&mut conn, "legacy_wf", "lg-run", day(2026, 1, 5), None).await;
+    let held = insert_execution(
+        &mut conn,
+        "legacy_wf",
+        "lg-held",
+        day(2026, 1, 5),
+        Some(day(2026, 1, 5)),
+    )
+    .await;
+    for e in [running, held] {
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(e),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed");
+    }
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET legal_hold_set_at = NOW() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(held)
+    .execute(&mut conn)
+    .await
+    .expect("place hold");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable on a populated table");
+
+    // Every pre-cutover row carries the migration's `-infinity` sentinel, which
+    // sorts BELOW every finite timestamptz. An ownership scan that bound a
+    // finite lower bound for the legacy partition's `MINVALUE` would match
+    // ZERO of its rows, conclude "no live owner", and drop the entire
+    // pre-conversion history — running executions and legal holds included —
+    // on the first tick after conversion.
+    let outcome = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default())
+        .await
+        .expect("sweep must not error on a converted shard");
+
+    assert!(
+        !outcome
+            .dropped
+            .contains(&partition::LEGACY_PARTITION.to_string()),
+        "AC3/AC5: the legacy partition holds a RUNNING and a legal-held \
+         execution's entire history — it must never be dropped. Got {outcome:?}"
+    );
+    assert!(
+        outcome
+            .blocked
+            .iter()
+            .any(|b| b.contains(partition::LEGACY_PARTITION)),
+        "and it must be REPORTED as blocked, not silently skipped: {outcome:?}"
+    );
+    for (exec, label) in [(running, "running"), (held, "held")] {
+        assert_eq!(
+            autumn_harvest::store::load_history(&mut conn, ExecutionId::from_uuid(exec))
+                .await
+                .unwrap_or_else(|e| panic!("{label} history: {e}"))
+                .events
+                .len(),
+            3,
+            "AC5: the {label} execution must not lose a single row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_event_id_is_rejected_even_across_cohorts() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let exec = insert_execution(&mut conn, "dup_wf", "dup-x", Utc::now(), None).await;
+    let exec_id = ExecutionId::from_uuid(exec);
+    autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
+        .await
+        .expect("first append");
+
+    // Move the existing rows into an older cohort, so the re-append below lands
+    // in a DIFFERENT partition from the rows it duplicates. The table
+    // constraint is `UNIQUE (workflow_exec_id, event_id, cohort)` — it can only
+    // see within one partition, so nothing at the index level rejects this.
+    //
+    // This is not a contrived race. Immediately after converting a populated
+    // shard it is SYSTEMATIC: every pre-cutover row carries the `-infinity`
+    // sentinel, so any re-append for a pre-existing execution — a stale worker
+    // whose task was reclaimed, a retried workflow task — lands in today's
+    // cohort. Without a cross-partition check the engine's split-brain detector
+    // silently stops firing for every execution that existed at conversion.
+    backdate_events(&mut conn, exec, Utc::now() - chrono::Duration::days(3)).await;
+
+    let clash = autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0).await;
+    assert!(
+        clash.is_err(),
+        "AC2: `(workflow_exec_id, event_id)` uniqueness — the optimistic-\
+         concurrency detector — must hold ACROSS partitions, not merely within \
+         one cohort"
+    );
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_events"
+        )
+        .await,
+        3,
+        "AC2: and no duplicate row may survive"
+    );
+}
+
+#[tokio::test]
+async fn reverting_succeeds_on_a_shard_that_has_orphans_and_rebuilds_the_flat_constraints() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Orphan event rows are the partitioned layout's DESIGNED garbage: deleting
+    // an execution no longer cascades. So the escape hatch has to cope with
+    // them — otherwise it is unavailable on exactly the shards that have run
+    // long enough to need it, because the flat layout's foreign key forbids
+    // what the partitioned layout deliberately allows.
+    let exec = insert_execution(&mut conn, "rev_wf", "rev-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(&mut conn)
+        .await
+        .expect("collect the execution, leaving orphans");
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_events"
+        )
+        .await,
+        3,
+        "precondition: the events really are orphaned"
+    );
+
+    let report = partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert must succeed on a shard with orphans")
+        .expect("the shard was partitioned");
+    assert_eq!(
+        report.orphans_removed, 3,
+        "the orphans must be discarded — and counted, so an operator is not \
+         left to infer that rows disappeared"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "and the layout is back to an ordinary table"
+    );
+    // The flat layout's constraints must be real again, not silently skipped.
+    let live = insert_execution(&mut conn, "rev_wf", "rev-2", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(live),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("append after revert");
+    assert!(
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(live),
+            &sample_events(),
+            0
+        )
+        .await
+        .is_err(),
+        "the flat UNIQUE (workflow_exec_id, event_id) must be rebuilt and enforcing"
+    );
+}
+
+#[tokio::test]
+async fn enabling_does_not_lose_events_committed_while_the_probe_ran() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The conversion decides between "drop the empty legacy table" and "attach
+    // it whole" from a row probe. Taken before the rename, that probe holds
+    // only ACCESS SHARE — which does not conflict with a concurrent INSERT — so
+    // a workflow that started and wrote its first events in the gap would
+    // commit before the rename, the probe would still say "empty", and the
+    // table containing them would be DROPPED. Enabling on a live-but-currently-
+    // empty shard is exactly the recommended rollout, so that window is the
+    // common case, not an exotic one.
+    //
+    // This test cannot open the real window from one connection, but it pins
+    // the invariant the fix establishes: whatever rows exist when the exclusive
+    // lock is taken must survive the conversion.
+    let exec = insert_execution(&mut conn, "toctou_wf", "tc-1", Utc::now(), None).await;
+    let exec_id = ExecutionId::from_uuid(exec);
+    autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
+        .await
+        .expect("seed");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    assert_eq!(
+        autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("history survives the conversion")
+            .events
+            .len(),
+        3,
+        "no committed event may be lost by the conversion"
+    );
+}

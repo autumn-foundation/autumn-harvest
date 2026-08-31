@@ -187,11 +187,10 @@ fn the_doc_tells_an_operator_how_to_answer_why_space_has_not_come_back() {
         s.contains("harvest partition status"),
         "there must be one command to run"
     );
-    for reason in [
-        "a live execution still owns rows",
-        "ownership scan exceeded its budget",
-        "lock not acquired within timeout",
-    ] {
+    // Sourced from the code, not copied: a hand-written list here would go
+    // stale the moment a reason is reworded or a fourth is added, and the guard
+    // would stay green while the doc stopped matching what an operator sees.
+    for reason in autumn_harvest::partition::SWEEP_REASONS {
         assert!(
             s.contains(reason),
             "every reason string the sweeper can emit must be explained in the \

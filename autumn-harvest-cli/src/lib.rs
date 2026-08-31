@@ -4636,6 +4636,28 @@ async fn dr_connect_read_only(
 
 // ── `harvest partition` (issue #958) ───────────────────────────────────────
 
+/// What `harvest partition disable` did on one shard.
+///
+/// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
+/// successful no-op, not an absent result, and the two must not be spelled the
+/// same way in the JSON an operator's script reads.
+#[derive(Debug)]
+enum DisableOutcome {
+    /// Reverted, discarding the rows the flat layout's constraints forbid.
+    Reverted(autumn_harvest::partition::DisableReport),
+    /// Already unpartitioned; nothing to do.
+    AlreadyUnpartitioned,
+}
+
+impl DisableOutcome {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Reverted(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            Self::AlreadyUnpartitioned => json!({"already_unpartitioned": true}),
+        }
+    }
+}
+
 /// One shard's row in a `harvest partition` report.
 ///
 /// A plain struct with a hand-written JSON projection rather than a
@@ -4653,6 +4675,10 @@ struct PartitionShardReport {
     partitions: Option<Vec<autumn_harvest::partition::PartitionInfo>>,
     maintenance: Option<autumn_harvest::partition::MaintenanceOutcome>,
     enable: Option<autumn_harvest::partition::EnableReport>,
+    /// What a sweep WOULD do right now — read-only, from `status`.
+    would_sweep: Option<autumn_harvest::partition::SweepOutcome>,
+    /// Outcome of `disable`, when that is the verb.
+    disable: Option<DisableOutcome>,
     error: Option<String>,
 }
 
@@ -4667,6 +4693,8 @@ impl PartitionShardReport {
             partitions: None,
             maintenance: None,
             enable: None,
+            would_sweep: None,
+            disable: None,
             error: None,
         }
     }
@@ -4681,6 +4709,8 @@ impl PartitionShardReport {
             partitions: None,
             maintenance: None,
             enable: None,
+            would_sweep: None,
+            disable: None,
             error: None,
         }
     }
@@ -4720,6 +4750,16 @@ impl PartitionShardReport {
             self.enable
                 .as_ref()
                 .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "would_sweep",
+            self.would_sweep
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "disable",
+            self.disable.as_ref().map(DisableOutcome::to_json),
         );
         put("error", self.error.as_ref().map(|v| json!(v)));
         Value::Object(obj)
@@ -4833,6 +4873,21 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                         Ok(parts) => row.partitions = Some(parts),
                         Err(e) => row.error = Some(e.to_string()),
                     }
+                    // The `blocked` reasons are produced by the sweep's gate,
+                    // so a status command that only listed partitions could
+                    // never answer the question this command exists for. This
+                    // is a read-only evaluation of the same gate: no lock, no
+                    // DDL, no straggler delete.
+                    match autumn_harvest::partition::evaluate(
+                        &mut conn,
+                        autumn_harvest::chrono::Utc::now(),
+                        &autumn_harvest::partition::SweepOptions::default(),
+                    )
+                    .await
+                    {
+                        Ok(sweep) => row.would_sweep = Some(sweep),
+                        Err(e) => row.error = Some(e.to_string()),
+                    }
                 }
             }
             Err(e) => row.error = Some(e.to_string()),
@@ -4936,12 +4991,16 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
         match autumn_harvest::partition::disable_partitioning(&mut conn).await {
-            Ok(true) => {
+            Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
-            }
-            Ok(false) => {
-                row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
-                row.error = Some("already unpartitioned; nothing to do".to_string());
+                // `None` = already unpartitioned. That is a successful no-op,
+                // not a failure: `enable` on an already-partitioned shard exits
+                // 0, and a deployment script must be able to run `disable`
+                // twice without the second run failing.
+                row.disable = Some(report.map_or(
+                    DisableOutcome::AlreadyUnpartitioned,
+                    DisableOutcome::Reverted,
+                ));
             }
             Err(e) => row.error = Some(e.to_string()),
         }
@@ -4960,6 +5019,13 @@ fn emit_partition_report(
     format: DrFormat,
     verb: &str,
 ) -> Result<(), CliError> {
+    // `status` is read-only reporting and must not fail the process for an
+    // unreachable shard — that is the established `harvest dr status`
+    // behaviour, and a monitoring script should get the report for the shards
+    // it could reach. Only the MUTATING verbs exit nonzero, where a partial
+    // result means a half-converted cluster a deployment script must not move
+    // on from.
+    let fail_on_error = verb != "status";
     match format {
         DrFormat::Json => {
             let payload: Vec<Value> = rows.iter().map(PartitionShardReport::to_json).collect();
@@ -5018,6 +5084,27 @@ fn emit_partition_report(
                         println!("  blocked: {b}");
                     }
                 }
+                if let Some(sweep) = &r.would_sweep {
+                    println!(
+                        "  droppable now: {}, blocked: {}",
+                        sweep.dropped.len(),
+                        sweep.blocked.len()
+                    );
+                    for b in &sweep.blocked {
+                        println!("  blocked: {b}");
+                    }
+                }
+                match &r.disable {
+                    Some(DisableOutcome::Reverted(d)) => println!(
+                        "  reverted: {} orphan row(s) and {} duplicate row(s) discarded \
+                         to rebuild the flat layout's constraints",
+                        d.orphans_removed, d.duplicates_removed
+                    ),
+                    Some(DisableOutcome::AlreadyUnpartitioned) => {
+                        println!("  already unpartitioned; nothing to do");
+                    }
+                    None => {}
+                }
                 if let Some(e) = &r.error {
                     println!("  ERROR: {e}");
                 }
@@ -5029,7 +5116,7 @@ fn emit_partition_report(
         .filter(|r| !r.reachable || r.error.is_some())
         .map(|r| r.shard_id.to_string())
         .collect();
-    if failed.is_empty() {
+    if failed.is_empty() || !fail_on_error {
         Ok(())
     } else {
         Err(CliError::InvalidInput(format!(

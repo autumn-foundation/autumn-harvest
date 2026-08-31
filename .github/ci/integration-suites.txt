@@ -176,3 +176,4 @@ linuxpart    autumn-harvest         integration                      -          
 linuxpart    autumn-harvest         integration                      -                          lineage_store_tests
 linuxpart    autumn-harvest         integration                      -                          retention_overrides_tests
 linuxpart    autumn-harvest         integration                      -                          retention_summary_tests
+linuxpart    autumn-harvest         integration                      -                          workflow_retry_tests

@@ -1472,19 +1472,35 @@ mod probes {
         }
 
         // ── Incoherent: shard-local referential breaks ──────────────────────
-        let dangling: Vec<(FindingClass, String)> = vec![
-            (
-                FindingClass::DanglingTaskExecution,
-                bounded(
-                    "SELECT t.id FROM harvest_task_queue t \
+        let mut dangling: Vec<(FindingClass, String)> = vec![(
+            FindingClass::DanglingTaskExecution,
+            bounded(
+                "SELECT t.id FROM harvest_task_queue t \
                      WHERE t.workflow_exec_id IS NOT NULL \
                        AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions e \
                                        WHERE e.id = t.workflow_exec_id)",
-                    "sub.id::text",
-                    limit,
-                ),
+                "sub.id::text",
+                limit,
             ),
-            (
+        )];
+        // Issue #958: on the opt-in PARTITIONED layout an orphan event row is
+        // the designed steady state, not a torn restore. That layout drops the
+        // `harvest_events` foreign key — its `ON DELETE CASCADE` is the delete
+        // storm the partitioning exists to remove — so collecting an execution
+        // deliberately leaves its events behind for the partition sweeper to
+        // reclaim at whole-partition granularity.
+        //
+        // Running the probe there would report EVERY healthy partitioned shard
+        // as `Incoherent` ("a broken invariant; do not start workers", exit 1)
+        // — permanently, and including the cross-region failover runbook's
+        // pre-flight. The invariant is real and worth checking; it just is not
+        // an invariant of that layout.
+        if !crate::partition::detect_layout(&mut conn)
+            .await
+            .map(|l| l.is_partitioned())
+            .unwrap_or(false)
+        {
+            dangling.push((
                 FindingClass::DanglingEventExecution,
                 bounded(
                     "SELECT DISTINCT ev.workflow_exec_id AS id FROM harvest_events ev \
@@ -1493,8 +1509,8 @@ mod probes {
                     "sub.id::text",
                     limit,
                 ),
-            ),
-        ];
+            ));
+        }
         for (class, sql) in dangling {
             match probe(&mut conn, class, shard_id, sql, None).await {
                 Ok(Some(f)) => findings.push(f),

@@ -145,11 +145,16 @@ pub const fn full_migrations_sql() -> &'static str {
 ///
 /// **Why this exists.** Issue #958 requires that per-execution event semantics
 /// be "byte-identical between layouts, asserted by running the existing
-/// store/replay integration suites against both layouts". Rather than
-/// hand-porting a handful of suites, every DB-backed suite bootstraps through
-/// this one helper, so CI can re-run the *entire* corpus against the
-/// partitioned layout by setting one environment variable. That turns AC2 from
-/// a claim about a few tests into a claim about all of them.
+/// store/replay integration suites against both layouts". Every DB-backed suite
+/// bootstraps through this one helper, so *any* of them can be re-run against
+/// the partitioned layout by setting one environment variable — no per-suite
+/// port, and no separate set of assertions that could drift from the originals.
+///
+/// CI re-runs the subset listed with osclass `linuxpart` in
+/// `.github/ci/integration-suites.txt`: the store, replay, history, retention,
+/// legal-hold and end-to-end suites. That is a deliberate subset, not the whole
+/// corpus — every suite would double the Docker-backed CI time for suites that
+/// never touch `harvest_events`. Adding one is a single manifest line.
 ///
 /// The enable script is exactly the one
 /// [`partition::enable_partitioning`](crate::partition::enable_partitioning)

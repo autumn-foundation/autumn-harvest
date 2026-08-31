@@ -133,47 +133,99 @@ COMMENT ON COLUMN harvest_events.cohort IS
 CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at
     ON harvest_workflow_executions (created_at);
 
--- ── The referential-integrity trigger ──────────────────────────────────────
+-- ── The insert-time integrity trigger ──────────────────────────────────────
 --
 -- Installed on the partitioned layout only (by `harvest partition enable`);
 -- defined here so it ships with the migration bundle rather than being conjured
 -- at runtime.
 --
+-- It does two jobs, and the second is the subtler one.
+--
+-- **1. An event may not be written for an execution that does not exist.**
 -- The partitioned layout drops `harvest_events_workflow_exec_id_fkey`, because
 -- that FK's `ON DELETE CASCADE` is exactly the row-by-row DELETE storm issue
--- #958 exists to eliminate. This trigger restores the half of the FK that is
--- still wanted — an event may not be written for an execution that does not
--- exist — at comparable cost (both are a primary-key probe per row; this one
--- takes no `FOR KEY SHARE` lock, so it is cheaper in lock traffic).
+-- #958 exists to eliminate. This restores the half of the FK that is still
+-- wanted, at comparable cost (a primary-key probe either way; this one takes no
+-- `FOR KEY SHARE` lock, so it is cheaper in lock traffic). What is NOT restored
+-- is the delete-time cascade -- that is the deliberate trade, and the partition
+-- sweeper is the garbage collector for the orphan rows it leaves.
 --
--- It deliberately does NOT modify `NEW`. A BEFORE ROW trigger on a partitioned
--- table that changes the partition key is rejected by Postgres, because routing
--- has already happened by the time it fires. Validate-only is legal, and is all
--- that is needed.
+-- **2. `(workflow_exec_id, event_id)` stays unique ACROSS partitions.**
+-- Postgres requires the partition key in every unique constraint, so the table
+-- constraint is `UNIQUE (workflow_exec_id, event_id, cohort)`. Because `cohort`
+-- is the row's APPEND INSTANT, that constraint is only unique *within* a
+-- cohort -- two appends of the same `event_id` landing in different cohorts
+-- would both be accepted. That is not a theoretical gap:
 --
--- What is NOT restored is the delete-time cascade. That is the deliberate
--- trade: deleting an execution row leaves its events behind as orphans, and the
--- partition sweeper is their garbage collector. Orphans are invisible to every
--- read path in the engine — all of them filter by a `workflow_exec_id` the
--- caller already resolved to a live execution.
+--   * Immediately after conversion it is systematic. Every pre-cutover row
+--     carries the `-infinity` sentinel, so ANY re-append of an existing
+--     `event_id` for a pre-existing execution lands in today's cohort and would
+--     be accepted -- silently disabling the engine's split-brain detector for
+--     every execution that existed at conversion time.
+--   * Later, a stale worker whose task was reclaimed can wake after a cohort
+--     boundary and re-append an `event_id` the new owner already wrote.
+--
+-- Both cases are a re-append against an ALREADY COMMITTED row, which this
+-- `EXISTS` sees. It uses the partitioned `idx_harvest_events_exec` index, so it
+-- is one two-key index probe per partition per inserted row.
+--
+-- **Residual window, stated honestly.** Two appends of the same `event_id` that
+-- are *simultaneously in flight* -- neither committed when the other's check
+-- runs -- and whose inserts land in different cohorts would still both succeed:
+-- neither transaction can see the other's uncommitted row, and a partitioned
+-- unique index cannot span partitions. Closing it would require serialising the
+-- append hot path per execution (a row or advisory lock), which risks lock-order
+-- deadlocks against the advisory locks the admission and mutex paths already
+-- take. The window is the overlap of two conflicting in-flight appends AND a
+-- cohort boundary falling between their insert instants -- microseconds per
+-- cohort, against a split-brain that is itself rare. `docs/partitioned-events.md`
+-- records this as a known limit of the partitioned layout.
+--
+-- The trigger deliberately does NOT modify `NEW`. A BEFORE ROW trigger on a
+-- partitioned table that changes the partition key is rejected by Postgres,
+-- because routing has already happened by the time it fires.
+--
+-- `SET search_path` is not cosmetic: unlike the FK it replaces (which binds the
+-- referenced relation by OID), a trigger body resolves relation names through
+-- the session `search_path` at runtime. Without pinning it, a session that puts
+-- another schema first could shadow `harvest_workflow_executions` with a table
+-- of its own and bypass the check entirely.
 CREATE OR REPLACE FUNCTION harvest_events_require_execution()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM harvest_workflow_executions WHERE id = NEW.workflow_exec_id
+        SELECT 1 FROM public.harvest_workflow_executions WHERE id = NEW.workflow_exec_id
     ) THEN
         RAISE EXCEPTION
             'harvest_events: no workflow execution % exists', NEW.workflow_exec_id
             USING ERRCODE = 'foreign_key_violation';
     END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM public.harvest_events
+         WHERE workflow_exec_id = NEW.workflow_exec_id
+           AND event_id = NEW.event_id
+    ) THEN
+        -- The message carries the ORIGINAL constraint name so the engine's
+        -- existing conflict mapping (error.rs) classifies this exactly as it
+        -- classified the unpartitioned unique violation. A caller must not be
+        -- able to tell the two layouts apart from the error it gets back.
+        RAISE EXCEPTION
+            'duplicate key value violates unique constraint "harvest_events_workflow_exec_id_event_id_key" (execution %, event_id %)',
+            NEW.workflow_exec_id, NEW.event_id
+            USING ERRCODE = 'unique_violation';
+    END IF;
+
     RETURN NEW;
 END;
 $$;
 
 COMMENT ON FUNCTION harvest_events_require_execution() IS
-    'Issue #958: rejects events for unknown executions, restoring the insert-time '
-    'half of the FK the partitioned layout drops (whose ON DELETE CASCADE is the '
-    'delete storm being eliminated). Never modifies NEW — Postgres rejects a '
-    'BEFORE ROW trigger that changes a partitioned row''s destination.';
+    'Issue #958: rejects events for unknown executions (restoring the insert-time '
+    'half of the FK the partitioned layout drops) and rejects a duplicate '
+    '(workflow_exec_id, event_id) across partitions, which the partition-key-bearing '
+    'UNIQUE constraint can only enforce within one cohort. Never modifies NEW -- '
+    'Postgres rejects a BEFORE ROW trigger that changes a partitioned row''s destination.';

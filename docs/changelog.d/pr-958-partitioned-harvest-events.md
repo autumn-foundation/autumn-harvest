@@ -33,12 +33,18 @@
   with no special-casing: a held or over-retained execution keeps its row, which
   keeps its events owned, which blocks the drop.
 
-  Two honest limits, both documented in `docs/partitioned-events.md`: history
-  reads do not partition-prune (keep the live partition count under ~32 by
-  sizing the cohort width against your retention horizon), and the partitioned
-  layout drops the `harvest_events` foreign key — its `ON DELETE CASCADE` is the
-  delete storm being eliminated — replacing the insert-time half with a
-  validate-only trigger.
+  Honest limits, all documented in `docs/partitioned-events.md`: history reads
+  do not partition-prune (size the cohort width so the live partition count
+  stays around 8–16); the partitioned layout drops the `harvest_events` foreign
+  key — its `ON DELETE CASCADE` is the delete storm being eliminated — replacing
+  the insert-time half with a trigger that also enforces `(workflow_exec_id,
+  event_id)` uniqueness across partitions, with a documented residual window for
+  two appends in flight at once across a cohort boundary; a legal hold now pins
+  every cohort its execution wrote into, retaining other executions' expired
+  rows with it unless `straggler_grace_secs` is set; the partitioned layout
+  needs Postgres 14+; and the whole retention pass is not made faster by this
+  change — the per-execution candidate loop the `HistoryArchiver` contract
+  requires dominates it on both layouts.
 
 ### Fixed
 

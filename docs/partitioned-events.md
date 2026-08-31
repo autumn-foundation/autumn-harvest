@@ -33,14 +33,24 @@ At 20,000 executions × 10 events (200,000 rows) across 20 daily cohorts, 50%
 expired — reproduce with
 `cargo bench -p autumn-harvest --features db --bench retention_reclaim_bench`:
 
-| layout | event reclamation | event-row `DELETE`s | dead-tuple ratio after | append p99 | claim p99 |
-|---|---:|---:|---:|---|---|
-| unpartitioned | (inside the pass) | 99,740 | 15.41% | 2.24 → 2.03 ms | 6.23 → 5.88 ms |
-| partitioned | 0.099 s | **0** | **0.00%** | 2.22 → 2.16 ms | 6.22 → 5.90 ms |
+| layout | event reclamation | event-row `DELETE`s | dead-tuple ratio after | append p99 (quiet → during pass) | load ops/s |
+|---|---:|---:|---:|---|---:|
+| unpartitioned | (inside the pass) | 98,950 | 15.82% | 2.19 → 2.13 ms (−2.4%) | 190 |
+| partitioned | 0.154 s | **0** | **0.00%** | 3.56 → 2.93 ms (−17.7%) | 176 |
 
 Both layouts reclaim exactly the same 100,000 events. The mechanism changes; the
-outcome does not. Concurrent append and claim p99 stay well inside the ±5%
-budget on both.
+outcome does not. Neither layout's concurrent p99 degrades during the pass —
+comfortably inside the ±5% budget.
+
+**Read the p99 column down, not across.** Each arm runs against its own fresh
+container, so the *quiet* numbers are not a controlled comparison between
+layouts; the sound comparison is each arm's own quiet → during-pass change,
+which is what the budget is about. The partitioned layout does cost something on
+append — tuple routing, the cohort `DEFAULT`, and the trigger's cross-partition
+uniqueness probe (one two-key index probe per partition per row), against the
+removed foreign-key check — and the ~7% throughput difference above is the
+closest this benchmark gets to measuring it. Sizing the partition count down
+(below) is what keeps it small.
 
 `HARVEST_BENCH_SCALE=full` runs the issue's headline 10M-row scale against a
 real server.
@@ -97,10 +107,28 @@ The key is a dedicated `cohort` column: the row's **append instant**, floored to
 a fixed width (one UTC day by default) by a plain column `DEFAULT`. Two
 properties follow, and the whole design rests on them.
 
-**1. Uniqueness is preserved, not weakened.** `cohort` comes from a `DEFAULT`,
-never from a statement the engine issues, so `UNIQUE (workflow_exec_id,
-event_id, cohort)` still rejects exactly what the old constraint rejected: a
-second row for the same `(execution, event_id)`.
+**1. Uniqueness is preserved — by the constraint *and* a trigger.** Postgres
+requires the partition key in every unique constraint, so the table constraint
+becomes `UNIQUE (workflow_exec_id, event_id, cohort)` — which, because `cohort`
+is an append instant, is only unique *within* a cohort. That is not enough: the
+engine's optimistic-concurrency detector *is* that constraint, and immediately
+after converting a populated shard the gap would be systematic (every
+pre-cutover row carries the `-infinity` sentinel, so any re-append for a
+pre-existing execution lands in today's cohort). The insert trigger therefore
+also rejects a duplicate `(workflow_exec_id, event_id)` **across** partitions —
+one two-key index probe per partition per inserted row — and raises the original
+constraint name, so callers cannot tell the layouts apart from the error.
+
+> **Known limit.** Two appends of the same `event_id` that are *simultaneously
+> in flight* — neither committed when the other's check runs — and whose inserts
+> land in different cohorts would still both succeed: neither transaction can
+> see the other's uncommitted row, and a partitioned unique index cannot span
+> partitions. Closing it would mean serialising the append hot path per
+> execution, risking lock-order deadlocks against the advisory locks the
+> admission and mutex paths already take. The window is the overlap of two
+> conflicting in-flight appends *and* a cohort boundary falling between their
+> insert instants — microseconds per cohort, against a split-brain that is
+> itself rare.
 
 **2. Past partitions are sealed.** A cohort's range is a window of wall clock
 that has already closed, and the `DEFAULT` can only produce a cohort at or after
@@ -177,12 +205,28 @@ History reads filter on `workflow_exec_id`, not on `cohort`, so each one probes
 every partition's index. **Keep the live partition count small.** The rule:
 
 ```
-partitions ≈ retention horizon ÷ cohort width  +  lookahead (default 7)
+partitions ≈ retention horizon ÷ cohort width  +  lookahead (default 3)  +  2
 ```
 
-With the default one-day cohort and a 7-day horizon that is ~15 partitions. Aim
-to stay under ~32. If your retention horizon is 90 days, use a weekly cohort
-(`--cohort-width-secs 604800`), not a daily one.
+The `+ 2` is the `DEFAULT` partition and — after any non-empty conversion — the
+legacy partition, which survives until every pre-cutover execution is gone. With
+a one-day cohort and a 7-day horizon that is ~13.
+
+**Aim for ~8–16, not more.** Every non-pruning statement takes `AccessShareLock`
+on the parent, each partition, *and* each index it scans — roughly `2N+2`
+relation locks. Postgres reserves 16 fast-path lock slots per backend
+(`FP_LOCK_SLOTS_PER_BACKEND`); past that, every acquisition goes through the
+shared lock-manager hash, and the cost scales with connection count. PostgreSQL
+18 makes those slots scalable; on 14–17 it is a real ceiling. If your retention
+horizon is 90 days, use a weekly cohort (`--cohort-width-secs 604800`), not a
+daily one.
+
+Two per-request paths are more partition-sensitive than `load_history`, because
+they touch `harvest_events` once per *row* rather than once per call:
+`usage.rs`'s `LEFT JOIN LATERAL` for last-event timestamps (behind
+`/admin/usage`), and `quota.rs`'s `history_bytes` sum (on the **workflow-start
+admission path**). Both multiply their existing per-iteration index probe by the
+partition count — another reason to keep it small.
 
 ### A long-running execution pins the cohorts it wrote into
 
@@ -191,11 +235,30 @@ Its siblings' rows in those cohorts are reclaimed late. The opt-in
 a cohort pinned for longer than that. It is **off by default**, so the default
 configuration never issues a row-level delete against `harvest_events`.
 
+**This changes the blast radius of a legal hold, and that is a compliance
+question, not only a disk-space one.** On the unpartitioned layout a hold
+retains one execution's rows. Here, a held execution keeps every cohort it wrote
+into alive — with the default one-day cohort, a 30-day run means ~30 cohorts —
+and every *other* execution's rows in those cohorts are retained with it, across
+workflow types and tenants, however long ago they expired. Retention still
+reports them as deleted, because their execution rows are gone; it is the event
+rows that linger.
+
+If a deployment makes a bounded "history is deleted after N days" commitment,
+set `straggler_grace_secs` so that commitment stays bounded by something the
+operator controls rather than by the longest-lived hold. `harvest partition
+status` reports which cohorts are pinned and why.
+
 ### Postgres version
 
-Requires Postgres 11 or later (declarative partitioning with a default
-partition, and metadata-only `ADD COLUMN ... DEFAULT <constant>`). The engine
-targets 14+ regardless.
+Requires **Postgres 14 or later** for the partitioned layout, which is stricter
+than the engine's own floor. Declarative partitioning with a default partition
+and metadata-only `ADD COLUMN … DEFAULT <constant>` arrive in 11, but
+`ALTER TABLE … DISABLE TRIGGER` on a partitioned parent only recurses to its
+partitions from 14 — and the `DEFAULT`-partition drain depends on that. (The
+drain also disables the cloned trigger on each partition explicitly, so the
+sequence is correct on older versions too; 14+ is the version this is tested
+against.)
 
 ---
 
@@ -305,8 +368,13 @@ The sweeper reports every cohort it considered and left alone, with the reason:
 - `ownership scan exceeded its budget` — the exact gate timed out; it retries
   next tick. Persistent, on a very large partition, means raising
   `exact_scan_timeout` or narrowing the cohort width.
-- `lock not acquired within timeout` — a long transaction is holding
-  `harvest_events`. Expected under load, and self-correcting.
+- `lock not acquired, or an owner appeared before the drop` — either a long
+  transaction is holding `harvest_events`, or the authoritative re-check taken
+  under the exclusive lock found an owner that appeared after the gate ran.
+  Expected under load, and self-correcting.
+- `unbounded upper bound` — a partition with no upper bound, which this engine
+  never creates. It means something else attached one by hand; it can never be
+  swept.
 
 The same information is on every retention tick's per-shard status
 (`partition_maintenance.sweep.blocked`).
@@ -321,7 +389,14 @@ The same information is on every retention tick's per-shard status
 | `lookahead_cohorts` | `7` | Cohorts kept pre-created ahead of now. |
 | `max_drops_per_tick` | `32` | Each drop takes a brief `ACCESS EXCLUSIVE` lock; a bounded budget keeps a backlog from holding the append path off. Successive ticks converge. |
 | `drop_lock_timeout_secs` | `2` | Fail fast and retry rather than making every append queue behind the sweep. |
+| `exact_scan_timeout_secs` | `15` | Budget for the exact ownership scan, reached only when more than `owner_probe_cap` old executions survive. |
+| `owner_probe_cap` | `1000` | How many surviving old executions the cheap narrow probe enumerates before falling back to the exact scan. |
+| `straggler_batch` | `1000` | Rows per straggler `DELETE` statement. |
 | `straggler_grace_secs` | `None` | Opt-in orphan `DELETE` for cohorts pinned by long-running executions. Off means zero row-level deletes. |
+
+`dry_run` suppresses only the *sweep*. Partition creation and the `DEFAULT`
+drain still run — they delete nothing, and a dry-run deployment that stopped
+extending its write window would end up appending into `DEFAULT` indefinitely.
 
 ---
 

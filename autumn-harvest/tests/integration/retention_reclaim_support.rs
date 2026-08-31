@@ -140,6 +140,12 @@ pub struct Measurement {
     pub claim_p99_ms: f64,
     /// Claim p99 (ms) with no pass running.
     pub claim_p99_baseline_ms: f64,
+    /// Load operations completed per second during the pass.
+    ///
+    /// A percentile can hide a uniform per-operation regression: if every
+    /// append got 20% slower, p99 moves 20% and so does p50, but throughput
+    /// halves visibly. Reported so that failure mode is not invisible.
+    pub ops_per_sec: f64,
 }
 
 impl Measurement {
@@ -316,9 +322,7 @@ pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool)
 /// to run, which is the point: the DELETE path's cost is the window in which
 /// that debt exists.
 pub async fn dead_tuple_ratio(conn: &mut AsyncPgConnection) -> f64 {
-    conn.batch_execute("SELECT pg_stat_force_next_flush()")
-        .await
-        .ok();
+    flush_stats(conn).await;
     diesel::sql_query(
         "SELECT CASE WHEN COALESCE(SUM(n_live_tup + n_dead_tup), 0) = 0 THEN 0.0
                      ELSE SUM(n_dead_tup)::float8
@@ -328,16 +332,17 @@ pub async fn dead_tuple_ratio(conn: &mut AsyncPgConnection) -> f64 {
     )
     .get_result::<RatioRow>(conn)
     .await
-    .map(|r| r.v)
-    .unwrap_or(0.0)
+    // NOT `unwrap_or(0.0)`: a failed stats query returning "no bloat" would
+    // make the Success-Metric assertion pass for the wrong reason, which is
+    // worse than no assertion at all.
+    .expect("read dead-tuple ratio")
+    .v
 }
 
 /// Row-level deletes Postgres recorded against `harvest_events` and every
 /// partition of it.
 pub async fn event_rows_deleted(conn: &mut AsyncPgConnection) -> i64 {
-    conn.batch_execute("SELECT pg_stat_force_next_flush()")
-        .await
-        .ok();
+    flush_stats(conn).await;
     scalar(
         conn,
         "SELECT COALESCE(SUM(n_tup_del), 0)::bigint AS n FROM pg_stat_all_tables
@@ -349,6 +354,19 @@ pub async fn event_rows_deleted(conn: &mut AsyncPgConnection) -> i64 {
 /// Count of surviving event rows.
 pub async fn event_count(conn: &mut AsyncPgConnection) -> i64 {
     scalar(conn, "SELECT COUNT(*)::bigint AS n FROM harvest_events").await
+}
+
+/// Flush this backend's pending statistics so a counter read immediately after
+/// is not stale.
+///
+/// A backend buffers statistics locally and flushes them lazily, so without
+/// this a read can miss the work it is supposed to be measuring — and a
+/// `pg_stat_reset()` can be followed by the pre-reset numbers landing on top of
+/// the zeroed values.
+pub async fn flush_stats(conn: &mut AsyncPgConnection) {
+    conn.batch_execute("SELECT pg_stat_force_next_flush()")
+        .await
+        .expect("flush pending statistics");
 }
 
 /// Count of surviving event rows belonging to the SEEDED corpus.
@@ -479,6 +497,10 @@ pub async fn measure_baseline(url: &str, window: Duration) -> (f64, f64) {
 /// `partitioned` describes the layout already applied to `url`; the harness
 /// does not convert it, so the caller decides (and so the same code measures
 /// both arms of the comparison).
+// A single measured scenario: baseline window, seeded-state snapshot, the
+// timed pass, then the timed reclamation. Splitting it would separate the
+// measurement from the state it is measured against.
+#[allow(clippy::too_many_lines)]
 pub async fn measure_pass(
     url: &str,
     partitioned: bool,
@@ -509,14 +531,15 @@ pub async fn measure_pass(
     // Reset AFTER seeding (and after flushing the seed's own pending stats),
     // so the delete counter and dead-tuple ratio below describe THE PASS and
     // not the bulk insert that set it up.
-    conn.batch_execute("SELECT pg_stat_force_next_flush()")
+    flush_stats(&mut conn).await;
+    conn.batch_execute("SELECT pg_stat_reset()")
         .await
-        .ok();
-    conn.batch_execute("SELECT pg_stat_reset()").await.ok();
+        .expect("reset statistics");
 
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
     let load = tokio::spawn(drive_load(url_static, Arc::clone(&stop), Arc::clone(&ops)));
+    let load_started = Instant::now();
 
     let manager =
         diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
@@ -552,19 +575,29 @@ pub async fn measure_pass(
     .expect("retention runtime");
     runtime.run_now();
 
-    let mut collected = 0usize;
+    let mut collected = None;
     for _ in 0..(60 * 60) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let snap = runtime.monitor().snapshot();
         if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
             && r.ran_at.is_some()
         {
-            collected = r.deleted_count;
+            collected = Some(r.deleted_count);
             break;
         }
     }
+    // Falling through silently would produce a Measurement describing a pass
+    // that never finished — a published number with nothing behind it.
+    let collected = collected.expect("the retention pass did not finish within 6 minutes");
     let candidate_loop = started.elapsed();
     runtime.shutdown();
+
+    // Read BEFORE the sweep. `DROP TABLE` removes the partition's row from
+    // `pg_stat_all_tables` entirely, so a post-drop read cannot tell "no row
+    // deletes occurred" from "row deletes occurred in a table that was then
+    // dropped" — and the headline "zero row DELETEs" assertion would be
+    // vacuous in exactly the arm it is supposed to prove.
+    let event_rows_deleted_before_sweep = event_rows_deleted(&mut conn).await;
 
     // Phase 2: the event-storage reclamation on its own. On the partitioned
     // layout this is the partition drop — the O(number-of-partitions) operation
@@ -589,6 +622,19 @@ pub async fn measure_pass(
 
     stop.store(true, Ordering::Relaxed);
     let mut samples = load.await.expect("load task");
+    // Truncate both arms to the SAME window before taking a percentile. The
+    // under-load window is as long as the pass, and the whole point of the
+    // change is that one arm's pass is shorter — so an untruncated comparison
+    // would give the slower arm strictly more chances to catch a checkpoint,
+    // WAL switch or autovacuum wake-up, biasing the numbers in exactly the
+    // direction this benchmark wants to demonstrate.
+    let window_ops = sample_window_ops(&samples, load_started.elapsed(), baseline_window);
+    samples
+        .appends
+        .truncate(window_ops.min(samples.appends.len()));
+    samples
+        .claims
+        .truncate(window_ops.min(samples.claims.len()));
 
     let events_after = seeded_event_count(&mut conn).await;
     let executions_after = execution_count(&mut conn).await;
@@ -604,13 +650,41 @@ pub async fn measure_pass(
         events_reclaimed: events_before - events_after,
         pass,
         events_reclaim,
-        event_rows_deleted: event_rows_deleted(&mut conn).await,
+        event_rows_deleted: event_rows_deleted_before_sweep,
         dead_tuple_ratio: dead_tuple_ratio(&mut conn).await,
         append_p99_ms: p99_ms(&mut samples.appends),
         append_p99_baseline_ms,
         claim_p99_ms: p99_ms(&mut samples.claims),
         claim_p99_baseline_ms,
+        ops_per_sec: {
+            let secs = load_started.elapsed().as_secs_f64();
+            if secs > 0.0 {
+                #[allow(clippy::cast_precision_loss)]
+                let total = AtomicU64::load(&ops, Ordering::Relaxed) as f64;
+                total / secs
+            } else {
+                0.0
+            }
+        },
     }
+}
+
+/// How many operations of a run fall inside the first `window` of it.
+///
+/// The load generator runs one operation at a time, so operations are uniform
+/// enough in the aggregate that a proportional cut is a fair truncation.
+fn sample_window_ops(samples: &LoadSamples, elapsed: Duration, window: Duration) -> usize {
+    if elapsed <= window || elapsed.is_zero() {
+        return samples.appends.len().max(samples.claims.len());
+    }
+    let fraction = window.as_secs_f64() / elapsed.as_secs_f64();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    let n = (samples.appends.len() as f64 * fraction).ceil() as usize;
+    n.max(1)
 }
 
 #[derive(Default)]
@@ -638,8 +712,9 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
     );
     out.push_str(
         "| layout | pass total | event reclamation | events reclaimed | event-row DELETEs \
-         | dead-tuple ratio after | append p99 (quiet -> during) | claim p99 (quiet -> during) |\n\
-         |---|---:|---:|---:|---:|---:|---|---|\n",
+         | dead-tuple ratio after | append p99 (quiet -> during) | claim p99 (quiet -> during) \
+         | load ops/s |\n\
+         |---|---:|---:|---:|---:|---:|---|---|---:|\n",
     );
     for m in arms {
         let reclaim = if m.events_reclaim.is_zero() {
@@ -650,7 +725,7 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
         let _ = writeln!(
             out,
             "| {} | {:.2}s | {reclaim} | {} | {} | {:.2}% | {:.2} -> {:.2} ms ({:+.1}%) \
-             | {:.2} -> {:.2} ms ({:+.1}%) |",
+             | {:.2} -> {:.2} ms ({:+.1}%) | {:.0} |",
             m.layout,
             m.pass.as_secs_f64(),
             m.events_reclaimed,
@@ -662,6 +737,7 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
             m.claim_p99_baseline_ms,
             m.claim_p99_ms,
             m.claim_regression_pct(),
+            m.ops_per_sec,
         );
     }
     out.push_str(
@@ -707,6 +783,7 @@ mod tests {
             append_p99_baseline_ms: 10.0,
             claim_p99_ms: 20.0,
             claim_p99_baseline_ms: 20.0,
+            ops_per_sec: 0.0,
         };
         assert!((m.append_regression_pct() - 5.0).abs() < 1e-9);
         assert!(m.claim_regression_pct().abs() < 1e-9);

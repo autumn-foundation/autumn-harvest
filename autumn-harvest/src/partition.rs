@@ -110,7 +110,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 
 #[cfg(feature = "db")]
-use diesel::sql_types::{Bool, Nullable, Text, Timestamptz};
+use diesel::sql_types::{Array, BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
@@ -129,14 +129,26 @@ pub const DEFAULT_COHORT_WIDTH_SECS: i64 = 86_400;
 
 /// How many cohorts beyond the current one the engine keeps pre-created.
 ///
-/// The retention tick (hourly by default) extends this window, so the engine
-/// would have to be down for a week before an append could reach an uncovered
-/// cohort — and even then the `DEFAULT` partition catches it.
-pub const DEFAULT_LOOKAHEAD_COHORTS: u32 = 7;
+/// Every live partition costs on the read path (history reads filter on
+/// `workflow_exec_id`, not `cohort`, so each one probes every partition), so
+/// the window is sized for resilience rather than generosity: at the default
+/// hourly tick and daily cohorts, maintenance would have to be down for three
+/// days before an append could reach an uncovered cohort — and even then the
+/// `DEFAULT` partition catches it rather than failing the append.
+pub const DEFAULT_LOOKAHEAD_COHORTS: u32 = 3;
 
-/// Smallest accepted cohort width (one minute). Narrower widths multiply the
-/// partition count without improving reclamation granularity.
-pub const MIN_COHORT_WIDTH_SECS: i64 = 60;
+/// Smallest accepted cohort width: one hour, matching the retention janitor's
+/// default tick interval.
+///
+/// Not an arbitrary floor. Coverage created per tick is
+/// `width × (lookahead + 1)`, so a width far below the tick interval leaves the
+/// write window uncovered for most of every hour and sends every append to the
+/// `DEFAULT` partition — whose drain then holds `ACCESS EXCLUSIVE` while it
+/// moves an hour of events, which is precisely the append stall this whole
+/// change exists to avoid. Narrower widths also multiply the partition count
+/// (every non-pruning read probes every partition) without improving
+/// reclamation granularity in any way an operator can use.
+pub const MIN_COHORT_WIDTH_SECS: i64 = 3_600;
 
 /// Largest accepted cohort width (365 days).
 pub const MAX_COHORT_WIDTH_SECS: i64 = 86_400 * 365;
@@ -163,6 +175,39 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// insert-time half. It must never modify `NEW`: Postgres rejects a `BEFORE
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
+
+// ── Sweep "blocked" reasons ────────────────────────────────────────────────
+//
+// Constants, not inline literals, because `docs/partitioned-events.md` explains
+// each one to an operator and `partitioned_events_docs.rs` asserts the doc
+// covers every one of them. Inline strings would let a reason be reworded here
+// and go stale there with nothing failing.
+
+/// Something in the cohort is still retained: a run in flight, a legal hold
+/// (#747), a longer per-type override (#737), or a row not yet past its
+/// horizon.
+pub const OWNED_REASON: &str = "a live execution still owns rows";
+
+/// The exact ownership scan exceeded its `statement_timeout`.
+pub const SCAN_BUDGET_REASON: &str = "ownership scan exceeded its budget";
+
+/// The `ACCESS EXCLUSIVE` lock could not be taken in time, or the re-check
+/// under it found an owner that appeared after the gate ran.
+pub const RECHECK_REASON: &str = "lock not acquired, or an owner appeared before the drop";
+
+/// A partition with no upper bound cannot be closed, so it is never a candidate.
+///
+/// Structurally impossible for the layouts this module creates; reported rather
+/// than silently skipped so a hand-made partition shows up.
+pub const UNBOUNDED_REASON: &str = "unbounded upper bound";
+
+/// Every reason [`sweep`] can report. Used by the documentation guard.
+pub const SWEEP_REASONS: &[&str] = &[
+    OWNED_REASON,
+    SCAN_BUDGET_REASON,
+    RECHECK_REASON,
+    UNBOUNDED_REASON,
+];
 
 // ── Cohort algebra (pure) ──────────────────────────────────────────────────
 
@@ -202,6 +247,7 @@ pub fn partition_name(cohort_start: DateTime<Utc>) -> String {
 /// The physical layout of `harvest_events` on a given shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "layout")]
+#[non_exhaustive]
 pub enum EventLayout {
     /// The stock ordinary table. Every pre-#958 deployment, until an operator
     /// opts in.
@@ -291,6 +337,7 @@ impl EnableOptions {
 /// Which conversion path [`enable_partitioning`] took.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
+#[non_exhaustive]
 pub enum EnableMode {
     /// `harvest_events` was already partitioned; nothing changed.
     AlreadyPartitioned,
@@ -359,6 +406,15 @@ pub struct SweepOptions {
     /// Rows per straggler `DELETE` statement, so a straggler pass cannot open
     /// an unbounded transaction.
     pub straggler_batch: usize,
+    /// How many surviving old executions the narrow ownership probe will
+    /// enumerate before falling back to the exact scan.
+    ///
+    /// The narrow probe asks "do any of THESE executions have a row here?",
+    /// one index probe each, which is what keeps a single legal hold or
+    /// long-running execution from forcing a full ownership scan of every
+    /// closed partition on every tick. Above this many survivors the scan is
+    /// cheaper than the probes.
+    pub owner_probe_cap: usize,
     /// Budget for the exact ownership scan that runs only when the cheap
     /// `created_at` probe cannot decide.
     ///
@@ -375,6 +431,7 @@ impl Default for SweepOptions {
             lock_timeout: Duration::from_secs(2),
             straggler_grace: None,
             straggler_batch: 1_000,
+            owner_probe_cap: 1_000,
             exact_scan_timeout: Duration::from_secs(15),
         }
     }
@@ -401,6 +458,13 @@ pub struct SweepOutcome {
 struct TextRow {
     #[diesel(sql_type = Text)]
     v: String,
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct UuidRow {
+    #[diesel(sql_type = SqlUuid)]
+    id: uuid::Uuid,
 }
 
 #[cfg(feature = "db")]
@@ -579,18 +643,27 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
             }
         })
         .collect();
-    // Oldest first; the DEFAULT partition (no bounds) sorts last so a bounded
-    // sweep never spends its budget on the one partition it must never drop.
-    out.sort_by(|a, b| {
-        a.is_default
-            .cmp(&b.is_default)
-            .then(a.upper.cmp(&b.upper))
-            .then(a.name.cmp(&b.name))
-    });
+    out.sort_by(compare_partitions);
     Ok(out)
 }
 
 // ── Partition creation ─────────────────────────────────────────────────────
+
+/// Sweep order: oldest closed cohort first, with the `DEFAULT` partition last.
+///
+/// `DEFAULT` sorting last is load-bearing, not cosmetic: it is the one
+/// partition that must never be dropped (an append whose cohort has no
+/// partition lands there instead of failing), so a bounded sweep must never
+/// spend its budget reaching it.
+///
+/// Extracted so [`list_partitions`] and its unit test share one comparator —
+/// a test that re-implements the ordering it is meant to guard tests the copy.
+fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Ordering {
+    a.is_default
+        .cmp(&b.is_default)
+        .then(a.upper.cmp(&b.upper))
+        .then(a.name.cmp(&b.name))
+}
 
 /// Format a timestamp as a SQL literal.
 ///
@@ -612,6 +685,7 @@ fn ts_literal(ts: DateTime<Utc>) -> String {
 /// [`HarvestError::Database`] on any failure other than a benign
 /// already-exists/overlap race.
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub async fn ensure_cohort(
     conn: &mut AsyncPgConnection,
     ts: DateTime<Utc>,
@@ -644,7 +718,23 @@ async fn ensure_cohort_with_width(
     );
     match diesel::sql_query(&sql).execute(conn).await {
         Ok(_) => Ok((name, true)),
-        Err(e) if is_benign_partition_race(&e) => Ok((name, false)),
+        // A race is only benign if the partition that now exists is the one we
+        // wanted. `CREATE TABLE IF NOT EXISTS <name> PARTITION OF …` is a
+        // silent no-op when `<name>` exists as an unrelated relation, and the
+        // overlap arm can fire on a genuine bounds mismatch (e.g. after the
+        // cohort width was changed under a live grid) — both would otherwise
+        // report the cohort as covered when it is not, and the next append
+        // would land in the DEFAULT partition with nothing said.
+        Err(e) if is_benign_partition_race(&e) => {
+            if cohort_partition_is_attached(conn, &name, lower, upper).await? {
+                Ok((name, false))
+            } else {
+                Err(HarvestError::Database(format!(
+                    "cohort {lower} is not covered: `{name}` exists but is not attached to \
+                     harvest_events with the expected bounds. underlying error: {e}"
+                )))
+            }
+        }
         // The DEFAULT partition already holds rows for this range, so Postgres
         // refuses to carve it out. Named explicitly because the raw message
         // ("updated partition constraint for default partition ... would be
@@ -660,23 +750,73 @@ async fn ensure_cohort_with_width(
     }
 }
 
-/// A concurrent maintainer created the same partition first, or the `DEFAULT`
-/// partition already holds rows for this range.
+/// Classifying the Postgres errors this module's fail-safe paths depend on.
 ///
-/// The first is benign (idempotent maintenance). The second is reported so the
-/// caller can drain instead of failing the whole tick.
+/// Three behaviours hinge on recognising a specific error — "a concurrent
+/// maintainer won the race", "the exact scan blew its budget, retain", "the
+/// lock was not available, retry next tick" — and getting one wrong turns a
+/// benign path into a hard error that then disappears into a best-effort
+/// warning while reclamation quietly stops.
+///
+/// Diesel's [`DatabaseErrorKind`](diesel::result::DatabaseErrorKind) is used
+/// wherever it distinguishes the case, because it is locale-independent. It
+/// does not cover `duplicate_table`, `lock_not_available` or `query_canceled`,
+/// so those fall back to matching Postgres's message — the same idiom
+/// `error.rs` already uses for constraint names. That fallback IS
+/// locale-sensitive: on a server with a non-English `lc_messages` these
+/// degrade to "treat as a hard error", which is the safe direction (the pass
+/// fails loudly and retries) but noisier than it should be. `lc_messages` is a
+/// superuser-only GUC, so it cannot be pinned per transaction from here.
+///
+/// A concurrent maintainer created the same partition first. Benign either
+/// way: the partition this call wanted now exists, which is the outcome it
+/// wanted — and the caller verifies the bounds before believing it.
 #[cfg(feature = "db")]
 fn is_benign_partition_race(e: &diesel::result::Error) -> bool {
     let msg = e.to_string();
     msg.contains("already exists")
         || msg.contains("would overlap")
         || msg.contains("overlaps with existing")
+        || msg.contains("42P07")
+        || msg.contains("23P01")
 }
 
+/// The `DEFAULT` partition already holds rows for the range being carved out.
+///
+/// Postgres reports the default partition's updated partition constraint as a
+/// check violation, which Diesel does classify.
 #[cfg(feature = "db")]
 fn is_default_partition_conflict(e: &diesel::result::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("default partition")
+    matches!(
+        e,
+        diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, _)
+    ) || e.to_string().contains("default partition")
+}
+
+/// `lock_timeout` fired (SQLSTATE `55P03`).
+#[must_use]
+pub fn is_lock_timeout(msg: &str) -> bool {
+    msg.contains("55P03") || msg.contains("lock timeout")
+}
+
+/// `statement_timeout` fired (SQLSTATE `57014`).
+#[must_use]
+pub fn is_statement_timeout(msg: &str) -> bool {
+    msg.contains("57014") || msg.contains("statement timeout")
+}
+
+/// Is `name` attached to `harvest_events` with exactly these bounds?
+#[cfg(feature = "db")]
+async fn cohort_partition_is_attached(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+    lower: DateTime<Utc>,
+    upper: DateTime<Utc>,
+) -> HarvestResult<bool> {
+    Ok(list_partitions(conn)
+        .await?
+        .into_iter()
+        .any(|p| p.name == name && p.lower == Some(lower) && p.upper == Some(upper)))
 }
 
 /// Ensure every cohort from now through the lookahead window exists.
@@ -822,11 +962,10 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let cohort_fn = cohort_function_sql(width);
+    let suffix_len = LEGACY_RENAME_SUFFIX.len();
     format!(
         r#"-- Issue #958: convert harvest_events to the partitioned layout.
 -- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
-{cohort_fn};
-
 DO $harvest_enable_958$
 DECLARE
     width_secs  bigint := {width};
@@ -852,6 +991,15 @@ BEGIN
     -- not leave every append waiting behind it.
     EXECUTE 'SET LOCAL lock_timeout = ' || quote_literal('{lock_ms}ms');
 
+    -- Deliberately INSIDE the idempotency guard above. Replacing the cohort
+    -- function is what changes the partition grid, so running it before the
+    -- guard would let `enable --cohort-width-secs X` on an ALREADY-partitioned
+    -- shard silently re-cut the grid: `detect_layout` would read back the new
+    -- width while every existing partition still had the old bounds, and the
+    -- next `ensure_partitions` would get `would overlap` on every cohort --
+    -- swallowed as a benign race, so nothing created and nothing reported.
+    EXECUTE $harvest_cohort_def${cohort_fn}$harvest_cohort_def$;
+
     -- Captured BEFORE the rename, so each definition still names
     -- `harvest_events` and replays verbatim onto the new parent, where Postgres
     -- propagates it to every partition. Constraint-backed indexes are excluded:
@@ -863,8 +1011,6 @@ BEGIN
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
        AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
-
-    SELECT EXISTS (SELECT 1 FROM harvest_events) INTO had_rows;
 
     -- The legacy partition covers everything below the current cohort. Every
     -- pre-conversion row carries the migration's `-infinity` sentinel, so all
@@ -882,18 +1028,27 @@ BEGIN
     EXECUTE 'ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE';
     EXECUTE 'ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}';
 
+    -- Probed only AFTER the rename, which is the first statement to take
+    -- ACCESS EXCLUSIVE. A `SELECT EXISTS` before it takes only ACCESS SHARE,
+    -- which does not conflict with a concurrent INSERT: a workflow that started
+    -- and wrote its first events in the gap would commit before the rename,
+    -- `had_rows` would still be false, and the ELSE branch below would DROP the
+    -- table containing them. Enabling on a live-but-currently-empty shard is
+    -- exactly the recommended rollout, so that window is the common case.
+    EXECUTE 'SELECT EXISTS (SELECT 1 FROM {LEGACY_PARTITION})' INTO had_rows;
+
     -- Renaming a table renames neither its indexes nor its constraints, so
     -- without this the new parent could not reclaim their schema-scoped names.
     FOR obj IN SELECT conname AS n FROM pg_constraint
                 WHERE conrelid = '{LEGACY_PARTITION}'::regclass
-                  AND conname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'
+                  AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
         EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',
                        obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
     END LOOP;
     FOR obj IN SELECT indexname AS n FROM pg_indexes
                 WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
-                  AND indexname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'
+                  AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
         EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
     END LOOP;
@@ -912,8 +1067,16 @@ BEGIN
     -- subsequent append: the engine's INSERT statements never mention `cohort`,
     -- so the DEFAULT is always what Postgres uses to pick the partition --
     -- before any row trigger could run.
+    --
+    -- `clock_timestamp()`, NOT `now()`. `now()` is transaction START time, so a
+    -- transaction that began before a cohort boundary and inserts after it
+    -- would stamp the PREVIOUS, already-closed cohort -- contradicting the
+    -- sealed-partition argument this design rests on, and letting a row appear
+    -- in a partition the sweeper has already proved empty.
+    -- `append_events_offloaded` holds a transaction across unbounded payload
+    -- uploads, so that gap is not hypothetical.
     EXECUTE 'ALTER TABLE harvest_events '
-         || 'ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now())';
+         || 'ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())';
 
     -- Both constraints gain `cohort` because Postgres requires the partition
     -- key in every unique constraint. The second still enforces exactly "one
@@ -1072,107 +1235,203 @@ async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<b
 /// [`HarvestError::Database`] if any step fails; the whole revert is one
 /// transaction, so a failure leaves the partitioned layout intact.
 #[cfg(feature = "db")]
-pub async fn disable_partitioning(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
+// One transaction of sequential DDL; splitting it would scatter a single
+// reversal across helpers that only ever run in this order.
+#[allow(clippy::too_many_lines)]
+pub async fn disable_partitioning(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Option<DisableReport>> {
     if !detect_layout(conn).await?.is_partitioned() {
-        return Ok(false);
+        return Ok(None);
     }
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        let index_defs = capture_index_defs(conn).await?;
-        exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE").await?;
-        exec(
-            conn,
-            "ALTER TABLE harvest_events RENAME TO harvest_events_partitioned",
-        )
-        .await?;
-        // Rename the parent's constraints/indexes so the flat table can reclaim
-        // their names, exactly as the enable path does in reverse.
-        for (list_sql, rename_tmpl) in [
-            (
-                "SELECT conname AS v FROM pg_constraint \
+    let report = Box::pin(
+        conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
+            let index_defs = capture_index_defs(conn).await?;
+
+            // The flat layout restores `UNIQUE (workflow_exec_id, event_id)` and
+            // the `ON DELETE CASCADE` foreign key. The partitioned layout
+            // deliberately permits rows that violate BOTH, so rebuilding them over
+            // the live data fails — which would make the operator escape hatch
+            // unavailable on exactly the shards that have been running long enough
+            // to need it:
+            //
+            //   * ORPHANS are the design's own garbage. Deleting an execution
+            //     leaves its events behind for the sweeper, and the sweeper only
+            //     collects at whole-partition granularity, so a converted shard
+            //     essentially always has some. They violate the FK.
+            //   * DUPLICATE (workflow_exec_id, event_id) rows can exist from the
+            //     residual window the insert trigger cannot close (two appends of
+            //     the same event_id in flight at once, landing in different
+            //     cohorts). They violate the unique constraint.
+            //
+            // Both are removed here rather than left to blow up the `ALTER TABLE`,
+            // and both counts are reported: silently discarding rows is not
+            // something an operator should have to infer.
+            let orphans = diesel::sql_query(
+                "DELETE FROM harvest_events e
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id
+              )",
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            // Keep the LOWEST `id` of each duplicate group — the first row written
+            // for that `(execution, event_id)`, which is the one every earlier read
+            // would already have ordered first.
+            let duplicates = diesel::sql_query(
+                "DELETE FROM harvest_events e
+              WHERE EXISTS (
+                  SELECT 1 FROM harvest_events k
+                   WHERE k.workflow_exec_id = e.workflow_exec_id
+                     AND k.event_id = e.event_id
+                     AND k.id < e.id
+              )",
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+            exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE").await?;
+            exec(
+                conn,
+                "ALTER TABLE harvest_events RENAME TO harvest_events_partitioned",
+            )
+            .await?;
+            // Rename the parent's constraints/indexes so the flat table can reclaim
+            // their names, exactly as the enable path does in reverse.
+            for (list_sql, rename_tmpl) in [
+                (
+                    "SELECT conname AS v FROM pg_constraint \
                  WHERE conrelid = 'harvest_events_partitioned'::regclass",
-                "ALTER TABLE harvest_events_partitioned RENAME CONSTRAINT {q} TO {n}__old",
-            ),
-            (
-                "SELECT indexname AS v FROM pg_indexes \
+                    "ALTER TABLE harvest_events_partitioned RENAME CONSTRAINT {q} TO {t}",
+                ),
+                (
+                    "SELECT indexname AS v FROM pg_indexes \
                  WHERE schemaname = current_schema() \
                    AND tablename = 'harvest_events_partitioned'",
-                "ALTER INDEX {q} RENAME TO {n}__old",
-            ),
-        ] {
-            let rows = diesel::sql_query(list_sql)
-                .load::<TextRow>(conn)
-                .await
-                .map_err(database_error)?;
-            for r in rows {
-                exec(
-                    conn,
-                    &rename_tmpl
-                        .replace("{q}", &quote_ident(&r.v))
-                        .replace("{n}", &r.v),
-                )
-                .await?;
+                    "ALTER INDEX {q} RENAME TO {t}",
+                ),
+            ] {
+                let rows = diesel::sql_query(list_sql)
+                    .load::<TextRow>(conn)
+                    .await
+                    .map_err(database_error)?;
+                for r in rows {
+                    exec(
+                        conn,
+                        // Both sides quoted: a mixed-case or special-character
+                        // name (a user-added index on harvest_events) would
+                        // otherwise be case-folded or produce invalid syntax.
+                        &rename_tmpl
+                            .replace("{q}", &quote_ident(&r.v))
+                            .replace("{t}", &quote_ident(&format!("{}__old", r.v))),
+                    )
+                    .await?;
+                }
             }
-        }
-        exec(
-            conn,
-            "CREATE TABLE harvest_events \
+            exec(
+                conn,
+                "CREATE TABLE harvest_events \
              (LIKE harvest_events_partitioned INCLUDING DEFAULTS INCLUDING COMMENTS)",
-        )
-        .await?;
-        exec(
-            conn,
-            "INSERT INTO harvest_events SELECT * FROM harvest_events_partitioned",
-        )
-        .await?;
-        exec(
-            conn,
-            "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
-        )
-        .await?;
-        exec(
-            conn,
-            "ALTER TABLE harvest_events \
+            )
+            .await?;
+            exec(
+                conn,
+                "INSERT INTO harvest_events SELECT * FROM harvest_events_partitioned",
+            )
+            .await?;
+            exec(
+                conn,
+                "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
+            )
+            .await?;
+            exec(
+                conn,
+                "ALTER TABLE harvest_events \
              ADD CONSTRAINT harvest_events_workflow_exec_id_event_id_key \
              UNIQUE (workflow_exec_id, event_id)",
-        )
-        .await?;
-        exec(
-            conn,
-            "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
+            )
+            .await?;
+            exec(
+                conn,
+                "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
              FOREIGN KEY (workflow_exec_id) REFERENCES harvest_workflow_executions(id) \
              ON DELETE CASCADE",
-        )
-        .await?;
-        for def in &index_defs {
-            exec(conn, def).await?;
-        }
-        exec(
-            conn,
-            "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id",
-        )
-        .await?;
-        exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
-        Ok(())
-    }))
+            )
+            .await?;
+            for def in &index_defs {
+                exec(conn, def).await?;
+            }
+            exec(
+                conn,
+                "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id",
+            )
+            .await?;
+            exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
+            Ok(DisableReport {
+                orphans_removed: orphans,
+                duplicates_removed: duplicates,
+            })
+        }),
+    )
     .await?;
-    Ok(true)
+    Ok(Some(report))
+}
+
+/// What [`disable_partitioning`] had to discard to rebuild the flat layout's
+/// constraints.
+///
+/// Both counts are normally the first two numbers an operator wants after a
+/// revert, because both are rows that existed a moment ago and no longer do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DisableReport {
+    /// Event rows whose owning execution no longer existed. The partitioned
+    /// layout's designed garbage; the flat layout's foreign key forbids them.
+    pub orphans_removed: usize,
+    /// Duplicate `(workflow_exec_id, event_id)` rows beyond the first. Zero on
+    /// any shard that never hit the residual append race.
+    pub duplicates_removed: usize,
 }
 
 // ── The sweeper ────────────────────────────────────────────────────────────
 
+/// Report what [`sweep`] would do, without dropping anything.
+///
+/// Read-only: it runs the same gate over the same candidates and returns the
+/// same `blocked` reasons, but never takes an `ACCESS EXCLUSIVE` lock and never
+/// issues DDL. This is what backs `harvest partition status`'s answer to "why
+/// has space not come back?" — the reasons live in the sweep, so a status
+/// command that did not evaluate them could only ever list partitions.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn evaluate(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    opts: &SweepOptions,
+) -> HarvestResult<SweepOutcome> {
+    sweep_inner(conn, now, opts, false).await
+}
+
 /// Drop every fully-reclaimable cohort partition, oldest first.
 ///
-/// A partition is reclaimable when **no execution row remains whose
-/// `created_at` falls in its cohort range**. Because every event of an
-/// execution carries that execution's own cohort, the absence of the execution
-/// row is proof that every event row in the partition is an orphan — its owner
-/// was already archived (#345), summarized (#752) and deleted by the ordinary
-/// retention loop, which this function deliberately does not touch.
+/// A partition is reclaimable when **no row in it belongs to a still-existing
+/// execution** — see [`cohort_occupancy`] for the three tiers that decide that,
+/// cheapest first. Note what this is *not*: cohorts are append instants, so an
+/// execution's events span partitions and the absence of an execution created
+/// in a partition's range proves nothing on its own. (An earlier iteration of
+/// this module did derive the cohort from the owning execution, which would
+/// have made that simpler predicate correct; Postgres forbids it — see the
+/// module documentation.) Optimising toward the simpler predicate would delete
+/// live executions' history.
 ///
-/// That single predicate is what makes legal holds (#747) and per-type
-/// overrides (#737) work here with no special-casing: a held or over-retained
-/// execution's row still exists, so its cohort is not reclaimable, so its rows
-/// are never dropped. There is no second copy of the retention policy to drift.
+/// The gate makes legal holds (#747) and per-type overrides (#737) work with no
+/// special-casing: each keeps its execution row alive, which keeps its rows
+/// owned, which blocks the drop. There is no second copy of the retention
+/// policy here to drift out of sync with the janitor's.
 ///
 /// Each drop runs in its own short transaction under `lock_timeout`. A
 /// partition whose lock cannot be taken in time is reported as blocked and
@@ -1190,12 +1449,24 @@ pub async fn sweep(
     now: DateTime<Utc>,
     opts: &SweepOptions,
 ) -> HarvestResult<SweepOutcome> {
+    sweep_inner(conn, now, opts, true).await
+}
+
+/// The shared body of [`sweep`] and [`evaluate`].
+///
+/// One implementation so a read-only status report and the pass it predicts can
+/// never disagree about which partitions are droppable or why.
+#[cfg(feature = "db")]
+async fn sweep_inner(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    opts: &SweepOptions,
+    apply: bool,
+) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
-    let width = match detect_layout(conn).await? {
-        EventLayout::Unpartitioned => return Ok(outcome),
-        EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
-    };
-    let _ = width;
+    if !detect_layout(conn).await?.is_partitioned() {
+        return Ok(outcome);
+    }
 
     for part in list_partitions(conn).await? {
         if outcome.dropped.len() >= opts.max_drops {
@@ -1213,7 +1484,7 @@ pub async fn sweep(
         let Some(upper) = part.upper else {
             outcome
                 .blocked
-                .push(format!("{} (unbounded upper)", part.name));
+                .push(format!("{} ({UNBOUNDED_REASON})", part.name));
             continue;
         };
         if upper > now {
@@ -1222,7 +1493,13 @@ pub async fn sweep(
 
         if let Some(reason) = cohort_occupancy(conn, part.lower, upper, opts).await? {
             outcome.blocked.push(format!("{} ({reason})", part.name));
-            if let Some(grace) = opts.straggler_grace
+            // Deliberately NOT after a scan timeout. That reason means the
+            // partition was too big to prove anything about; following it with
+            // an unbounded orphan DELETE over that same partition inverts the
+            // "bounded pass, retry next tick" contract this module is built on.
+            if apply
+                && reason != SCAN_BUDGET_REASON
+                && let Some(grace) = opts.straggler_grace
                 && let Ok(grace) = chrono::Duration::from_std(grace)
                 && upper + grace <= now
             {
@@ -1232,12 +1509,18 @@ pub async fn sweep(
             continue;
         }
 
-        if drop_partition(conn, &part.name, opts.lock_timeout).await? {
+        if !apply {
+            // Read-only: report the partition as droppable without taking a
+            // lock or issuing DDL.
+            outcome.dropped.push(part.name);
+            continue;
+        }
+        if drop_partition(conn, &part, upper, opts).await? {
             outcome.dropped.push(part.name);
         } else {
             outcome
                 .blocked
-                .push(format!("{} (lock not acquired within timeout)", part.name));
+                .push(format!("{} ({RECHECK_REASON})", part.name));
         }
     }
     Ok(outcome)
@@ -1249,23 +1532,38 @@ pub async fn sweep(
 /// naming why it was left alone — which is the operator's answer to "why has
 /// space not come back?".
 ///
-/// Two tiers, cheapest first:
+/// Three tiers, cheapest first. Each is a *sufficient* condition for the tier
+/// below to be skipped; all three answer the same question.
 ///
-/// 1. **Fast path.** `NOT EXISTS (… WHERE created_at < upper)`. An execution
-///    cannot have appended a row before it existed, so if nothing predates the
-///    partition's upper bound then nothing that could own a row in it survives.
-///    One index probe on `idx_harvest_we_created_at`, and the steady-state
-///    answer, because retention collects oldest-first.
-/// 2. **Exact path.** Only when the fast probe says "maybe": a semi-join
-///    proving no row in the range has a live owner. Bounded by
-///    `statement_timeout` so one huge partition cannot stall the whole tick —
-///    a timeout reports the partition as blocked and retries next tick, which
-///    is the correct fail-safe direction (retain, never over-delete).
+/// 1. **Nothing predates the partition** — `NOT EXISTS (… WHERE created_at <
+///    upper)`. An execution cannot have appended a row before it existed, so if
+///    nothing predates the partition's upper bound then nothing that could own
+///    a row in it survives. One index probe on `idx_harvest_we_created_at`.
 ///
-/// This is deliberately the *only* place the drop decision is made. Legal holds
-/// (#747) and per-type retention overrides (#737) are honoured because each
-/// keeps its execution row alive; there is no second copy of the retention
-/// policy here to drift out of sync with `run_shard_tick`'s.
+/// 2. **Few survivors** — when tier 1 says "maybe", read back the surviving
+///    old executions, bounded by [`SweepOptions::owner_probe_cap`]. If they fit
+///    under the cap, ask the *narrow* question — do any of THESE executions
+///    have a row in this partition? — which is one index probe per execution on
+///    `idx_harvest_events_exec`, pruned to this partition by the cohort
+///    predicate.
+///
+///    This tier is what makes the sweeper survive the common case. Tier 1's
+///    predicate is a property of the whole executions table, not of this
+///    partition: **one** long-lived execution — a legal hold (#747), a
+///    per-type override (#737), a 60-day run — makes it say "maybe" for
+///    *every* closed partition, forever. Without tier 2 that means a full
+///    ownership scan of every partition on every tick, and on a large one an
+///    unwinnable scan that times out every time and never reclaims anything.
+///
+/// 3. **Exact scan** — only when more old executions survive than the cap: a
+///    semi-join proving no row in the range has a live owner, bounded by a
+///    `statement_timeout`. A timeout retains and retries; an unfinished proof
+///    is not a proof.
+///
+/// Legal holds and per-type overrides need no special-casing in any tier: each
+/// keeps its execution row alive, which keeps its rows owned. There is no
+/// second copy of the retention policy here to drift out of sync with the
+/// janitor's.
 #[cfg(feature = "db")]
 async fn cohort_occupancy(
     conn: &mut AsyncPgConnection,
@@ -1273,6 +1571,7 @@ async fn cohort_occupancy(
     upper: DateTime<Utc>,
     opts: &SweepOptions,
 ) -> HarvestResult<Option<String>> {
+    // ── Tier 1 ────────────────────────────────────────────────────────────
     let predates = diesel::sql_query(
         "SELECT EXISTS (
              SELECT 1 FROM harvest_workflow_executions WHERE created_at < $1
@@ -1287,70 +1586,190 @@ async fn cohort_occupancy(
         return Ok(None);
     }
 
-    let lower = lower.unwrap_or(DateTime::<Utc>::MIN_UTC);
+    // ── Tier 2 ────────────────────────────────────────────────────────────
+    let cap = i64::try_from(opts.owner_probe_cap)
+        .unwrap_or(i64::MAX)
+        .max(1);
+    let survivors = diesel::sql_query(
+        "SELECT id FROM harvest_workflow_executions WHERE created_at < $1 LIMIT $2",
+    )
+    .bind::<Timestamptz, _>(upper)
+    .bind::<BigInt, _>(cap + 1)
+    .load::<UuidRow>(conn)
+    .await
+    .map_err(database_error)?;
+
+    if i64::try_from(survivors.len()).unwrap_or(i64::MAX) <= cap {
+        let ids: Vec<uuid::Uuid> = survivors.into_iter().map(|r| r.id).collect();
+        let owned = cohort_has_rows_for(conn, lower, upper, &ids).await?;
+        return Ok(owned.then(|| OWNED_REASON.to_string()));
+    }
+
+    // ── Tier 3 ────────────────────────────────────────────────────────────
     let ms = u64::try_from(opts.exact_scan_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
     let scan = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
-        Ok(diesel::sql_query(
+        // `lower_predicate` rather than a substituted sentinel: the legacy
+        // partition's lower bound is `MINVALUE`, and its rows carry the
+        // migration's `-infinity` cohort, which sorts BELOW every finite
+        // timestamptz. Binding any finite value for `MINVALUE` here would make
+        // `cohort >= $lower` exclude 100% of the legacy partition's rows — so
+        // the scan would find no live owner, declare the partition reclaimable,
+        // and DROP the entire pre-conversion history of a deployment that had
+        // just opted in, running executions and legal holds included.
+        let sql = format!(
             "SELECT EXISTS (
                  SELECT 1 FROM harvest_events e
-                  WHERE e.cohort >= $1 AND e.cohort < $2
+                  WHERE {} e.cohort < $1
                     AND EXISTS (
                         SELECT 1 FROM harvest_workflow_executions x
                          WHERE x.id = e.workflow_exec_id
                     )
              ) AS v",
-        )
-        .bind::<Timestamptz, _>(lower)
-        .bind::<Timestamptz, _>(upper)
-        .get_result::<BoolRow>(conn)
-        .await
-        .map_err(database_error)?
-        .v)
+            lower.map_or(String::new(), |_| "e.cohort >= $2 AND".to_string())
+        );
+        let query = diesel::sql_query(sql).bind::<Timestamptz, _>(upper);
+        let row = if let Some(lower) = lower {
+            query
+                .bind::<Timestamptz, _>(lower)
+                .get_result::<BoolRow>(conn)
+                .await
+        } else {
+            query.get_result::<BoolRow>(conn).await
+        };
+        Ok(row.map_err(database_error)?.v)
     }))
     .await;
 
     match scan {
         Ok(false) => Ok(None),
-        Ok(true) => Ok(Some("a live execution still owns rows".to_string())),
+        Ok(true) => Ok(Some(OWNED_REASON.to_string())),
         // Fail safe toward RETAINING: an unfinished proof is not a proof.
-        Err(HarvestError::Database(msg)) if msg.contains("statement timeout") => Ok(Some(
-            "ownership scan exceeded its budget; retained and retried next tick".to_string(),
-        )),
+        Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => {
+            Ok(Some(SCAN_BUDGET_REASON.to_string()))
+        }
         Err(e) => Err(e),
     }
 }
 
-/// Drop one partition under a bounded lock wait.
+/// Do any of `ids` have a row in this cohort range?
 ///
-/// Returns `false` (not an error) when the `ACCESS EXCLUSIVE` lock could not be
-/// taken in time: the correct response is to leave the partition for the next
-/// tick, never to make every concurrent append wait.
+/// Tier 2's narrow question, and also the authoritative re-check the drop
+/// transaction runs while holding `ACCESS EXCLUSIVE`. `ids` empty ⇒ `false`
+/// without a query.
+#[cfg(feature = "db")]
+async fn cohort_has_rows_for(
+    conn: &mut AsyncPgConnection,
+    lower: Option<DateTime<Utc>>,
+    upper: DateTime<Utc>,
+    ids: &[uuid::Uuid],
+) -> HarvestResult<bool> {
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    // The `MINVALUE` lower bound is omitted rather than substituted — see the
+    // comment in `cohort_occupancy`'s tier 3.
+    let sql = format!(
+        "SELECT EXISTS (
+             SELECT 1 FROM harvest_events e
+              WHERE e.workflow_exec_id = ANY($1) AND {} e.cohort < $2
+         ) AS v",
+        lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
+    );
+    let query = diesel::sql_query(sql)
+        .bind::<Array<SqlUuid>, _>(ids.to_vec())
+        .bind::<Timestamptz, _>(upper);
+    let row = if let Some(lower) = lower {
+        query
+            .bind::<Timestamptz, _>(lower)
+            .get_result::<BoolRow>(conn)
+            .await
+    } else {
+        query.get_result::<BoolRow>(conn).await
+    };
+    Ok(row.map_err(database_error)?.v)
+}
+
+/// Drop one partition under a bounded lock wait, re-proving it is reclaimable
+/// while holding the lock.
+///
+/// Returns `false` (not an error) when the partition was left in place: either
+/// the `ACCESS EXCLUSIVE` lock could not be taken in time, or the re-check
+/// found an owner. Leaving it for the next tick is the correct response to
+/// both; making every concurrent append wait is not.
+///
+/// **The re-check is not belt-and-braces.** `cohort_occupancy` runs in its own
+/// transaction and commits before this one starts, so between the two a row can
+/// legitimately appear in the partition:
+///
+/// - `drain_default` moves parked rows in with an explicit `cohort`, which is
+///   the one writer that can land a row in an already-closed cohort;
+/// - a transaction that *began* before the cohort boundary and inserts after it
+///   stamps the previous cohort, because the column default is evaluated per
+///   row but a long transaction's clock is not the sweeper's;
+/// - nothing stops a second retention runtime from running maintenance on the
+///   same shard concurrently — candidates are leased per execution, maintenance
+///   is not.
+///
+/// Repeating the check *after* `LOCK TABLE … ACCESS EXCLUSIVE` makes it exact:
+/// that lock conflicts with every writer, so no row can appear between the
+/// re-check and the `DROP` in the same transaction.
 #[cfg(feature = "db")]
 async fn drop_partition(
     conn: &mut AsyncPgConnection,
-    name: &str,
-    lock_timeout: Duration,
+    part: &PartitionInfo,
+    upper: DateTime<Utc>,
+    opts: &SweepOptions,
 ) -> HarvestResult<bool> {
-    let ms = u64::try_from(lock_timeout.as_millis())
+    let ms = u64::try_from(opts.lock_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
-    let name = name.to_string();
-    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let name = part.name.clone();
+    let lower = part.lower;
+    let cap = i64::try_from(opts.owner_probe_cap)
+        .unwrap_or(i64::MAX)
+        .max(1);
+    let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
+        // Taken explicitly, before the re-check, rather than relying on the
+        // DROP to take it afterwards — the whole point is that the check runs
+        // under the lock.
+        exec(conn, "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE").await?;
+
+        let survivors = diesel::sql_query(
+            "SELECT id FROM harvest_workflow_executions WHERE created_at < $1 LIMIT $2",
+        )
+        .bind::<Timestamptz, _>(upper)
+        .bind::<BigInt, _>(cap + 1)
+        .load::<UuidRow>(conn)
+        .await
+        .map_err(database_error)?;
+
+        if i64::try_from(survivors.len()).unwrap_or(i64::MAX) > cap {
+            // More survivors than the narrow re-check can probe. Retaining is
+            // the correct failure mode: the tick that selected this partition
+            // used the exact scan, but that evidence is now stale and we will
+            // not drop on stale evidence.
+            return Ok(false);
+        }
+        let ids: Vec<uuid::Uuid> = survivors.into_iter().map(|r| r.id).collect();
+        if cohort_has_rows_for(conn, lower, upper, &ids).await? {
+            return Ok(false);
+        }
+
         exec(
             conn,
             &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
         )
         .await?;
-        Ok(())
+        Ok(true)
     }))
     .await;
     match result {
-        Ok(()) => Ok(true),
-        Err(HarvestError::Database(msg)) if msg.contains("lock timeout") => Ok(false),
+        Ok(dropped) => Ok(dropped),
+        Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1369,26 +1788,40 @@ async fn delete_orphan_rows(
     batch: usize,
 ) -> HarvestResult<usize> {
     let batch = i64::try_from(batch).unwrap_or(i64::MAX).max(1);
-    let lower = lower.unwrap_or(DateTime::<Utc>::MIN_UTC);
+    // Total work per partition per tick is capped, not just per statement. The
+    // inner SELECT restarts from the top of the range each iteration, so on a
+    // partition where orphans are SPARSE — the common shape for one pinned by a
+    // straggler — each pass re-scans the leading owned rows before finding its
+    // batch, which is quadratic in the partition size. Bounded here; the next
+    // tick continues.
+    let max_batches = 16;
     let mut total = 0usize;
-    loop {
-        let deleted = diesel::sql_query(
+    for _ in 0..max_batches {
+        // The `MINVALUE` lower bound is omitted rather than substituted, for
+        // the same reason as in `cohort_occupancy`: the legacy partition's rows
+        // carry `-infinity`, which sorts below every finite timestamptz, so a
+        // finite lower bind would silently match none of them.
+        let sql = format!(
             "DELETE FROM harvest_events
               WHERE ctid IN (
                   SELECT e.ctid FROM harvest_events e
-                   WHERE e.cohort >= $1 AND e.cohort < $2
+                   WHERE {} e.cohort < $1
                      AND NOT EXISTS (
                          SELECT 1 FROM harvest_workflow_executions x
                           WHERE x.id = e.workflow_exec_id
                      )
-                   LIMIT $3
+                   LIMIT $2
               )",
-        )
-        .bind::<Timestamptz, _>(lower)
-        .bind::<Timestamptz, _>(upper)
-        .bind::<diesel::sql_types::BigInt, _>(batch)
-        .execute(conn)
-        .await
+            lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
+        );
+        let query = diesel::sql_query(sql)
+            .bind::<Timestamptz, _>(upper)
+            .bind::<BigInt, _>(batch);
+        let deleted = if let Some(lower) = lower {
+            query.bind::<Timestamptz, _>(lower).execute(conn).await
+        } else {
+            query.execute(conn).await
+        }
         .map_err(database_error)?;
         total += deleted;
         if deleted == 0 || i64::try_from(deleted).unwrap_or(i64::MAX) < batch {
@@ -1433,13 +1866,6 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
         return Ok(0);
     }
 
-    let cohorts = diesel::sql_query(format!(
-        "SELECT DISTINCT cohort AS v FROM {DEFAULT_PARTITION} ORDER BY 1"
-    ))
-    .load::<TsRow>(conn)
-    .await
-    .map_err(database_error)?;
-
     Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
         exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
         exec(
@@ -1447,29 +1873,83 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
             &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
         )
         .await?;
+
+        // Read the work list AFTER the DETACH, not before. A cohort that
+        // arrived between an outside-the-transaction read and this point would
+        // have no partition created for it, and the INSERT below would fail
+        // with `no partition of relation found` — aborting the whole drain, and
+        // with it the `ensure_partitions` that keeps the write window covered.
+        let cohorts = diesel::sql_query(format!(
+            "SELECT DISTINCT cohort AS v FROM {DEFAULT_PARTITION} ORDER BY 1"
+        ))
+        .load::<TsRow>(conn)
+        .await
+        .map_err(database_error)?;
         for c in &cohorts {
             if let Some(cohort) = c.v {
                 ensure_cohort_with_width(conn, cohort, width).await?;
             }
         }
-        // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT
-        // does not re-fire and every row keeps the cohort it was written with.
-        // The integrity trigger is disabled for the move because a parked row
-        // whose execution has since been collected is exactly the orphan the
-        // sweeper is meant to reclaim later — re-validating it here would turn
-        // a maintenance drain into data loss. The `ACCESS EXCLUSIVE` lock held
-        // by the DETACH above makes disabling it safe for this transaction.
+
+        // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT does
+        // not re-fire and every row keeps the cohort it was written with. The
+        // integrity trigger is disabled for the move because a parked row whose
+        // execution has since been collected is exactly the orphan the sweeper
+        // is meant to reclaim later — re-validating it here would turn a
+        // maintenance drain into data loss.
+        //
+        // Disabled on EACH PARTITION, not just the parent: `ALTER TABLE …
+        // DISABLE TRIGGER` on a partitioned parent only recurses to its
+        // partitions from Postgres 14. On 12/13 the parent-only form is a
+        // silent no-op, the cloned trigger fires for every moved row, and the
+        // first orphan aborts the drain permanently. The ACCESS EXCLUSIVE lock
+        // held by the DETACH above makes this safe for the transaction.
+        let targets = diesel::sql_query(
+            "SELECT c.relname AS v
+               FROM pg_inherits i
+               JOIN pg_class p ON p.oid = i.inhparent
+               JOIN pg_class c ON c.oid = i.inhrelid
+               JOIN pg_namespace n ON n.oid = p.relnamespace
+              WHERE p.relname = 'harvest_events' AND n.nspname = current_schema()",
+        )
+        .load::<TextRow>(conn)
+        .await
+        .map_err(database_error)?;
         exec(
             conn,
             &format!("ALTER TABLE harvest_events DISABLE TRIGGER {EXEC_FK_TRIGGER}"),
         )
         .await?;
+        for t in &targets {
+            exec(
+                conn,
+                &format!(
+                    "ALTER TABLE {} DISABLE TRIGGER {EXEC_FK_TRIGGER}",
+                    quote_ident(&t.v)
+                ),
+            )
+            .await
+            .ok();
+        }
+
         let moved = diesel::sql_query(format!(
             "INSERT INTO harvest_events SELECT * FROM {DEFAULT_PARTITION}"
         ))
         .execute(conn)
         .await
         .map_err(database_error)?;
+
+        for t in &targets {
+            exec(
+                conn,
+                &format!(
+                    "ALTER TABLE {} ENABLE TRIGGER {EXEC_FK_TRIGGER}",
+                    quote_ident(&t.v)
+                ),
+            )
+            .await
+            .ok();
+        }
         exec(
             conn,
             &format!("ALTER TABLE harvest_events ENABLE TRIGGER {EXEC_FK_TRIGGER}"),
@@ -1522,7 +2002,17 @@ pub async fn maintain(
     // Drain first: rows parked in the DEFAULT partition BLOCK creation of the
     // very cohort partitions that would cover them, so an ensure before a drain
     // would fail on exactly the deployment that needs it most.
-    let drained = drain_default(conn).await?;
+    //
+    // Best-effort, deliberately: the drain is the heaviest step (it holds
+    // ACCESS EXCLUSIVE while it moves rows) and the most likely to lose a lock
+    // race. Propagating its failure would take `ensure_partitions` down with
+    // it — and extending the write window is the one thing that must never
+    // stop, because an uncovered cohort is what fills the DEFAULT partition in
+    // the first place. A failed drain is recorded and retried next tick.
+    let (drained, drain_error) = match drain_default(conn).await {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
     let created = ensure_partitions(conn, now, lookahead_cohorts).await?;
     let sweep = sweep(conn, now, sweep_opts).await?;
     Ok(MaintenanceOutcome {
@@ -1530,6 +2020,7 @@ pub async fn maintain(
         created,
         drained,
         sweep,
+        last_error: drain_error,
     })
 }
 
@@ -1551,6 +2042,27 @@ pub struct MaintenanceOutcome {
     pub drained: usize,
     /// The sweep result.
     pub sweep: SweepOutcome,
+    /// Why this pass did not complete, when it did not.
+    ///
+    /// Maintenance is best-effort — it must never fail a retention tick, since
+    /// history retention and reclamation are independent. But "best effort"
+    /// must not mean "invisible": without this a permanently-failing shard
+    /// reports exactly what a shard that never opted in reports, and the
+    /// operator has no way to tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl MaintenanceOutcome {
+    /// A pass that could not run, carrying the reason.
+    #[must_use]
+    pub fn failed(error: String) -> Self {
+        Self {
+            at: Some(Utc::now()),
+            last_error: Some(error),
+            ..Self::default()
+        }
+    }
 }
 
 // ── The large-live-table migration plan ────────────────────────────────────
@@ -1582,6 +2094,7 @@ pub struct MaintenanceOutcome {
 #[must_use]
 pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
     let width = opts.cohort_width_secs.max(1);
+    let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     // Matches `enable_sql`'s `harvest_event_cohort(now())` exactly: the legacy
     // partition ends where the current cohort begins, so the two ranges meet
@@ -1677,7 +2190,7 @@ CREATE TABLE harvest_events
 -- append -- WITHOUT IT every new row would keep the sentinel and land in the
 -- legacy partition forever, which looks fine until nothing is ever droppable.
 ALTER TABLE harvest_events
-    ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now());
+    ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp());
 ALTER TABLE harvest_events
     ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id, cohort);
 ALTER TABLE harvest_events
@@ -1700,6 +2213,18 @@ CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events
 CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT;
 ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION}
     FOR VALUES FROM (MINVALUE) TO ({cutover_lit});
+
+-- Create the write window here, inside the same transaction. These are
+-- metadata-only. Leaving them to the first retention tick would send every
+-- append for up to a tick interval into the DEFAULT partition, and the next
+-- tick would then drain an hour of events under ACCESS EXCLUSIVE -- the append
+-- stall this whole change exists to avoid. Emit one line per cohort from:
+--   SELECT format(
+--     'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events FOR VALUES FROM (%L) TO (%L);',
+--     '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),
+--     lo, lo + interval '{width} seconds')
+--     FROM generate_series(0, {lookahead}) AS step,
+--          LATERAL (SELECT harvest_event_cohort(now() + (step * {width}) * interval '1 second') AS lo) c;
 
 COMMIT;
 
@@ -1934,7 +2459,7 @@ mod tests {
             "harvest_events_require_execution()",
             // Without this the cohort DEFAULT never becomes the live
             // expression and every append lands in the legacy partition.
-            "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now())",
+            "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())",
             // ATTACH propagates the parent PK; the child may not keep its own.
             "harvest_events_pkey__pre958",
             "harvest_events_workflow_exec_id_event_id_key__pre958",
@@ -2040,12 +2565,7 @@ mod tests {
                 is_default: false,
             },
         ];
-        parts.sort_by(|a, b| {
-            a.is_default
-                .cmp(&b.is_default)
-                .then(a.upper.cmp(&b.upper))
-                .then(a.name.cmp(&b.name))
-        });
+        parts.sort_by(compare_partitions);
         assert_eq!(parts[0].name, "harvest_events_p_20260901000000");
         assert!(parts[2].is_default, "DEFAULT sorts last");
     }
