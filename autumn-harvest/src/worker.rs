@@ -34781,6 +34781,41 @@ mod tests {
         }
     }
 
+    /// The audit table compares `kind()` discriminants, which collapse every
+    /// `SidePath` to one label. This pins the other half AC4 asks for: WHICH
+    /// function owns each side path, so moving a command's handling to a
+    /// different persister (or dropping it) fails here rather than silently
+    /// leaving the audit pointing at a function that no longer runs.
+    #[test]
+    fn every_side_path_names_the_function_that_actually_persists_it() {
+        let expected: Vec<(&str, &str)> = vec![
+            ("RecordUpdateResult", "persist_update_result_commands"),
+            (
+                "UpsertSearchAttributes",
+                "persist_search_attrs_from_commands",
+            ),
+            ("SetCurrentDetails", "persist_current_details_from_commands"),
+            ("RecordLog", "persist_workflow_logs_from_commands"),
+            ("PublishProgress", "notify_progress_from_commands"),
+            ("CancelRaceLosers", "apply_race_loser_cancellations"),
+            ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
+        ];
+        let mut seen: Vec<(&str, &str)> = terminal_policy_cases()
+            .iter()
+            .filter_map(|(label, cmd, _)| match terminal_command_policy(cmd) {
+                TerminalCommandPolicy::SidePath(owner) => Some((*label, owner)),
+                _ => None,
+            })
+            .collect();
+        seen.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "the set of side-path commands, and the function each names, must both be pinned"
+        );
+    }
+
     /// The dispatch kinds are exactly the two that would have become work other
     /// subsystems can see (a child execution row, a task-queue row).
     #[test]

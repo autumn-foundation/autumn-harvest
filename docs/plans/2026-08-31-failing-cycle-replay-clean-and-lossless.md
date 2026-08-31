@@ -300,3 +300,14 @@ Two findings were reviewed and **deliberately not changed**, documented instead:
 * **The offload-before-commit window** (`append_events_offloaded` uploads a blob
   before the transaction commits, so a rollback can orphan it) is pre-existing on
   the suspension path and unchanged in kind here.
+
+## 9. Codex review round 1 — findings and resolutions
+
+| # | Severity | Finding | Resolution |
+| --- | --- | --- | --- |
+| 1 | P1 | The `#510` abandoned-dispatch transparency rule keyed off a single `redriven` flag, so it covered pairs written by a failing cycle that came **after** the last redrive. Such a run's most recent child/activity then looked like an unresolved fresh dispatch: the replay parked at the failing frontier instead of resolving the branch from its synthetic terminal and re-deriving the recorded failure path — while still reporting a clean verdict. | `HistoryMatcher::new` tracks the index of the **last** `WorkflowRedriven` and scans only `events[..last_redrive]` for abandoned pairs. Pairs after it stay opaque and positionally matchable. Regression test: `abandoned_records_written_after_the_last_redrive_stay_opaque`. |
+
+The rule this makes precise: *a redrive reopens the cycles it superseded, and
+only those.* Everything the redriven run itself recorded — including a second
+failing cycle's abandoned dispatches — is ordinary history for that run's own
+replay, exactly as it is for a run that was never redriven at all.

@@ -85,6 +85,30 @@ is untouched: no event is rewritten, re-tagged, or reinterpreted — pre-fix
 histories (with dropped commands) replay through exactly the same matcher, and
 now simply reproduce their recorded failure instead of false-flagging drift.
 
+Two knock-on effects of that verdict change, both intended:
+
+* `harvest_replay --fail-on-error` exits `0` where a failed-run fixture used to
+  exit `1`. The flag means "this history revealed a problem with the current
+  build", and a reproduced failure no longer is one. `backup_verify` is
+  unaffected: its sampler selects only `RUNNING`/`PAUSED`/`SUSPENDED` rows, so no
+  sampled history can carry a failing tail.
+* `ReplayReport` gains a public `reproduced_failure` field. The struct is not
+  `#[non_exhaustive]`, so an out-of-tree struct-literal construction of it needs
+  the new field — permitted under the repo's 0.x semver convention, and the
+  in-tree readers all go through the new `failure_message()` accessor instead.
+
+### Codex review round 1
+
+* **P1 — abandoned-dispatch transparency is bounded by the last redrive.** The
+  #510 rule marked *every* abandoned-dispatch pair in a redriven history
+  transparent. A run that was redriven and then failed AGAIN wrote fresh pairs
+  after that redrive: those belong to the terminal-failure tail's own cycle, so
+  making them transparent left the latest failing cycle's child/activity looking
+  like an unresolved fresh dispatch — the replay parked instead of re-deriving
+  the recorded failure path, and still reported a clean verdict. `HistoryMatcher::new`
+  now scans only the prefix before the last `WorkflowRedriven`
+  (`abandoned_records_written_after_the_last_redrive_stay_opaque`).
+
 ### Review round 1
 
 Four review passes (replay semantics, worker persistence, API/docs, test quality)

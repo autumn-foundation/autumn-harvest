@@ -771,10 +771,10 @@ impl HistoryMatcher {
         // made transparent. A bare trailing `WorkflowFailed` with no following
         // redrive stays non-transparent — it is a genuinely failed run and its
         // replay (queries, the replayer harness) must be unaffected.
-        let mut redriven = false;
+        let mut last_redrive: Option<usize> = None;
         for (i, event) in events.iter().enumerate() {
             if Self::is_redrive_lifecycle_event(event) {
-                redriven = true;
+                last_redrive = Some(i);
                 transparent_events.insert(i);
                 // Scan backward to the nearest WorkflowFailed, skipping events
                 // already settled transparent (e.g. an interleaved pause pair)
@@ -807,8 +807,16 @@ impl HistoryMatcher {
         // dispatch the operator redrove it to complete. Mark each abandoned pair
         // transparent so the reopened run emits it live, exactly as it did
         // before #952 recorded anything at all.
-        if redriven {
-            for i in Self::abandoned_dispatch_indices(&events) {
+        //
+        // Bounded by the LAST redrive (Codex P1 round 1): only a cycle a
+        // redrive actually superseded is re-opened work. A run that was
+        // redriven and then failed AGAIN wrote fresh abandoned pairs after that
+        // redrive; those belong to the terminal-failure tail's own cycle and
+        // stay opaque, so a replay resolves them from their synthetic terminal
+        // and re-derives the failure path the recorded run took instead of
+        // parking on a dispatch that never resolves.
+        if let Some(redrive_idx) = last_redrive {
+            for i in Self::abandoned_dispatch_indices(&events[..redrive_idx]) {
                 transparent_events.insert(i);
             }
         }
@@ -896,6 +904,10 @@ impl HistoryMatcher {
     /// [`crate::event::ABANDONED_DISPATCH_REASON`], together with the
     /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
     /// precedes it.
+    ///
+    /// `events` is the **prefix of history the caller wants scanned** (see
+    /// [`Self::new`]: everything before the last `WorkflowRedriven`), so the
+    /// returned indices are always valid indices into the full history too.
     ///
     /// The reason constant is the engine's own reserved marker — the same device
     /// as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
@@ -10469,6 +10481,80 @@ mod tests {
             matcher.match_child_workflow("worker_child", &Value::Null),
             HistoryMatch::NoMatch,
             "the reopened run must re-dispatch the child live"
+        );
+    }
+
+    /// A redrive reopens only the cycles it superseded (Codex P1 round 1,
+    /// issue #952 x #510). A run that was redriven and then failed AGAIN wrote
+    /// fresh abandoned-dispatch records *after* that redrive: those belong to
+    /// the terminal-failure tail's own cycle, so they stay positionally
+    /// matchable and the replay resolves the branch from its synthetic terminal
+    /// instead of parking on a dispatch that will never resolve.
+    #[test]
+    fn abandoned_records_written_after_the_last_redrive_stay_opaque() {
+        let superseded_child = ExecutionId::new();
+        let latest_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: superseded_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: superseded_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: latest_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: latest_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} preceded the redrive, so it must be transparent"
+            );
+        }
+        for idx in [5_usize, 6] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} was written by the cycle that failed AFTER the \
+                 redrive, so it must stay positionally matchable"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { ref error, .. } if error == crate::event::ABANDONED_DISPATCH_REASON
+            ),
+            "the re-dispatched child must resolve from its own synthetic terminal"
         );
     }
 
