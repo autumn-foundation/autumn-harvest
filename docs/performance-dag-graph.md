@@ -18,7 +18,7 @@ machine -- every number below is a deterministic instruction count
 fan-out/fan-in shapes (a root, an 8-way fan-out, a 16-node 2-way-fan-in
 layer, 4 signal-gate nodes, a 16-node layer fed by both gates and earlier
 activities, two more 20-node 2-way-fan-in layers, and an 8-node 4-way-fan-in
-aggregation layer) -- not a degenerate flat chain. The paired 175-event
+aggregation layer) -- not a degenerate flat chain. The paired 164-event
 history mixes succeeded, failed, multi-attempt-retried, condition-skipped
 (`dag_skip:{idx}`, issue #482), and never-reached (unreachable) activities,
 plus all four gates resolved (two by signal, one by a
@@ -29,7 +29,7 @@ function.
 
 ### Harness correction (post-review)
 
-A GitHub Codex review of the PR that introduced this harness caught six
+A GitHub Codex review of the PR that introduced this harness caught seven
 realism gaps in the fixture across several review rounds, all now fixed and
 reflected in every number on this page:
 
@@ -126,13 +126,35 @@ reflected in every number on this page:
    `build_dag` never called `.condition(...)` on any task, so the five
    `dag_skip` markers the fixture recorded for its condition-skipped
    activities were events the real walker could never have produced for
-   those specific (condition-less) tasks either. Fixed by giving every
-   layer4-onward activity task a `.condition(|_ups| true)` predicate in
-   `build_dag` (the closure's return value is never actually evaluated by
-   this fixture -- only its *presence* on the task matters, since
-   `dag_graph.rs`'s classification logic reads recorded history events, not
-   `DagTask::condition`, confirmed by grep before making the change), making
-   every `dag_skip` marker this fixture records structurally legitimate.
+   those specific (condition-less) tasks either. Fixed (at the time) by
+   giving every layer4-onward activity task a `.condition(|_ups| true)`
+   predicate in `build_dag`, on the reasoning that only the predicate's
+   *presence* mattered since `dag_graph.rs`'s classification logic reads
+   recorded history events, not `DagTask::condition`. Fix 7 below found that
+   reasoning incomplete.
+7. **The condition predicate's own return value still didn't agree with which
+   tasks the fixture marked condition-skipped, found in the next review
+   round.** Fix 6 gave every layer4-onward task a `.condition(...)` predicate,
+   but every one of them unconditionally returned `true` -- so
+   `DagTask::dispatch_decision` would run every one of those tasks for real,
+   never `SkipByCondition`, regardless of which tasks `build_events`
+   separately chose (via its own `activity_seq % 6 == 5` rotation) to record
+   a `dag_skip` marker for. The marker events fix 6 called "structurally
+   legitimate" were still unproducible by the real walker: the one thing that
+   actually decides `SkipByCondition` -- the predicate evaluating `false` --
+   never happened for any task. Fixed by making the two sides agree: each
+   layer4-onward task's position among its 64 peers (`this_pos`, assigned in
+   creation order, unconditionally -- not gated by reachability, so
+   `build_dag`'s predicate and `build_events`'s outcome rotation always mean
+   the same task by the same number) sets both its `.condition(...)`
+   predicate (`this_pos % 6 != 5`) and the `match this_pos % 6` arm
+   `build_events` uses to decide its outcome, so a task only ever gets a
+   `dag_skip` marker when its own predicate would actually have evaluated
+   `false`. Switching the outcome rotation from a reachability-gated counter
+   (which only advanced for tasks that turned out reachable, so `build_dag`
+   -- built before any reachability is known -- could never have matched it)
+   to this unconditional per-task position is what makes the two sides
+   possible to keep in agreement at all.
 
 Fixes 1 and 3 interact: the reachability tracking that fix 3 introduces is
 also what fix 1's gate resolutions now rely on (a gate is reachable only
@@ -140,18 +162,16 @@ when its own upstreams are `done`), so they landed as one change to
 `build_events`. Verified directly (temporary debug print, since removed):
 `gate_0: Succeeded`, `gate_1: TimedOut`, `gate_2: Succeeded`,
 `gate_3: Succeeded` -- and a full-graph status-mix dump showing every node's
-status is one a real walker could produce: 51 succeeded, 5 failed, 5
-skipped, 1 gate timed-out (counts as succeeded downstream), 31 legitimately
-pending (upstream failure/skip cascades; nothing left genuinely waiting).
+status is one a real walker could produce.
 
-None of these six gaps invalidated the fix itself (all six bugs are in
+None of these seven gaps invalidated the fix itself (all seven bugs are in
 the harness, not in code paths this change touches), but they did mean the
 workload's realism claims overstated what the fixture actually exercised.
-The numbers below are from the fully corrected harness; event count stayed
-at 175 across fix 6 (it only adds DAG-definition metadata, not new
-events) -- moving from the original 202 (211 after fix 2, 111 after fix 3,
-137 after fix 4, 175 after fix 5), since each round's reachability model
-dispatches a different subset of the 93 tasks than the one before it.
+The numbers below are from the fully corrected harness; event count moved
+from the original 202 (211 after fix 2, 111 after fix 3, 137 after fix 4,
+175 after fix 5, unchanged through fix 6, 164 after fix 7), since each
+round's reachability/outcome model dispatches a different subset of the 93
+tasks than the one before it.
 
 ## Profile
 
@@ -166,17 +186,17 @@ callgrind_annotate --threshold=98 cg.out
 Baseline (unmodified `HEAD`, fully corrected harness):
 
 ```
-859,563,149 (100.0%)  PROGRAM TOTALS
+826,812,687 (100.0%)  PROGRAM TOTALS
 
-183,316,418 (21.33%)  __memcmp_avx2_movbe [libc]
-120,528,000 (14.02%)  alloc::collections::btree::map::BTreeMap<K,V,A>::bulk_build_from_sorted_iter
- 88,587,300 (10.31%)  <alloc::vec::Vec<T> as SpecFromIter<T,I>>::from_iter
- 59,557,500 ( 6.93%)  <core::iter::adapters::map::Map<I,F> as Iterator>::fold
- 59,538,600 ( 6.93%)  core::slice::sort::stable::drift::sort
- 54,343,800 ( 6.32%)  <alloc::collections::btree::map::BTreeMap<K,V,A> as Drop>::drop
- 39,645,628 ( 4.61%)  malloc.c:_int_free
- 37,469,100 ( 4.36%)  autumn_harvest_plugin::dag_retry::node_outcome
- 11,293,500 ( 1.31%)  autumn_harvest_plugin::dag_graph::has_skip_marker
+170,887,673 (20.67%)  __memcmp_avx2_movbe [libc]
+116,901,000 (14.14%)  alloc::collections::btree::map::BTreeMap<K,V,A>::bulk_build_from_sorted_iter
+ 83,469,900 (10.10%)  <alloc::vec::Vec<T> as SpecFromIter<T,I>>::from_iter
+ 56,525,400 ( 6.84%)  core::slice::sort::stable::drift::sort
+ 55,119,300 ( 6.67%)  <core::iter::adapters::map::Map<I,F> as Iterator>::fold
+ 51,826,500 ( 6.27%)  <alloc::collections::btree::map::BTreeMap<K,V,A> as Drop>::drop
+ 39,502,978 ( 4.78%)  malloc.c:_int_free
+ 35,843,400 ( 4.34%)  autumn_harvest_plugin::dag_retry::node_outcome
+ 11,408,100 ( 1.38%)  autumn_harvest_plugin::dag_graph::has_skip_marker
 ```
 
 None of these lines is named `dispatched_activity_names` or
@@ -188,8 +208,8 @@ than under their own names: `__memcmp_avx2_movbe` +
 `BTreeMap::bulk_build_from_sorted_iter` +
 `<Vec<T> as SpecFromIter<T,I>>::from_iter` +
 `<Map<I,F> as Iterator>::fold` + `core::slice::sort::stable::drift::sort` +
-`<BTreeMap<K,V,A> as Drop>::drop` alone sum to **65.83%** of total
-instructions (565,871,618 / 859,563,149) -- comfortably clearing the
+`<BTreeMap<K,V,A> as Drop>::drop` alone sum to **64.67%** of total
+instructions (534,729,773 / 826,812,687) -- comfortably clearing the
 >=5%-of-workload floor -- with `node_outcome`'s and `has_skip_marker`'s own
 (untouched-by-this-fix) self-costs shown separately above for the
 before/after comparison below.
@@ -209,7 +229,7 @@ validation"). Hoisting the computation to run once in `build_run_graph` and
 threading it down as a parameter should remove `latest_scheduled`'s share of
 the BTreeSet-construction cost while leaving `node_outcome`'s own separate,
 out-of-scope call to `dispatched_activity_names` -- and its self-cost,
-37,469,100 Ir above -- untouched.
+35,843,400 Ir above -- untouched.
 
 ## Change
 
@@ -257,12 +277,9 @@ out-of-scope call to `dispatched_activity_names` -- and its self-cost,
   does fire. A new unit test, `gate_only_dag_classifies_without_an_activity_node`,
   pins the gate-only case correctly reaching `Waiting` on a live run. On this
   page's own fixture (which has 89 activity nodes) the guard always takes the
-  `dispatched_activity_names` branch, so it does not change any number
-  measured below -- confirmed by re-running the identical harness before and
-  after adding it (789,692,008 -> 789,695,411 Ir, +0.0004%, noise, on the
-  fixture composition at that point; the harness's event count changed
-  again afterward for unrelated reasons, see the "Harness correction"
-  section above).
+  `dispatched_activity_names` branch, so it does not change the mechanism
+  measured below; the harness's event count and exact Ir figures have since
+  moved for the unrelated reasons in the "Harness correction" section above.
 
 `latest_scheduled` is called from exactly one place (`classify`, confirmed
 by grep before making the change), so no other call site needed updating.
@@ -287,35 +304,35 @@ declaration, differing only by the `dag_graph.rs` diff above, same
 
 | | Instructions (Ir) |
 |---|---|
-| Before | 859,563,149 |
-| After  | 579,419,985 |
-| **Reduction** | **280,143,164 (32.59%)** |
+| Before | 826,812,687 |
+| After  | 558,799,610 |
+| **Reduction** | **268,013,077 (32.42%)** |
 
 Clears the >=5% floor by ~6.5x.
 
 The after-trace's flat profile shows `node_outcome`'s self-cost unchanged at
-**37,469,100** Ir and `has_skip_marker`'s at **11,293,500** Ir -- both
+**35,843,400** Ir and `has_skip_marker`'s at **11,408,100** Ir -- both
 identical to the baseline down to the last instruction, independent
 confirmation that nothing in `dag_retry.rs` (untouched by this change) or in
 the parts of `dag_graph.rs` this change doesn't touch shifted:
 
 ```
-579,419,985 (100.0%)  PROGRAM TOTALS
+558,799,610 (100.0%)  PROGRAM TOTALS
 
-119,125,920 (20.56%)  __memcmp_avx2_movbe [libc]
- 63,504,000 (10.96%)  BTreeMap::bulk_build_from_sorted_iter
- 63,231,600 (10.91%)  <Map<I,F> as Iterator>::fold
- 46,980,900 ( 8.11%)  <Vec<T> as SpecFromIter<T,I>>::from_iter
- 37,469,100 ( 6.47%)  autumn_harvest_plugin::dag_retry::node_outcome   <- unchanged
- 34,254,097 ( 5.91%)  malloc.c:_int_malloc
- 31,369,800 ( 5.41%)  core::slice::sort::stable::drift::sort
- 11,293,500 ( 1.95%)  autumn_harvest_plugin::dag_graph::has_skip_marker   <- unchanged
+111,581,538 (19.97%)  __memcmp_avx2_movbe [libc]
+ 61,593,000 (11.02%)  BTreeMap::bulk_build_from_sorted_iter
+ 58,615,500 (10.49%)  <Map<I,F> as Iterator>::fold
+ 44,265,900 ( 7.92%)  <Vec<T> as SpecFromIter<T,I>>::from_iter
+ 35,843,400 ( 6.41%)  autumn_harvest_plugin::dag_retry::node_outcome   <- unchanged
+ 34,482,621 ( 6.17%)  malloc.c:_int_malloc
+ 29,782,200 ( 5.33%)  core::slice::sort::stable::drift::sort
+ 11,408,100 ( 2.04%)  autumn_harvest_plugin::dag_graph::has_skip_marker   <- unchanged
 ```
 
 The `BTreeSet`-construction family (`memcmp` + `bulk_build_from_sorted_iter`
 + `Vec::from_iter` + `Map::fold` + `sort` + `Drop`, the same lines the
 baseline profile above attributes to the two `dispatched_activity_names`
-call sites) drops from 65.83% of a larger total to a smaller share of a
+call sites) drops from 64.67% of a larger total to a smaller share of a
 smaller total -- exactly the shape of "one of two redundant call sites
 removed, the other (`node_outcome`'s) left at its original, now
 proportionally larger, cost".
@@ -324,11 +341,14 @@ proportionally larger, cost".
 
 | dhat | Before | After | Reduction |
 |---|---|---|---|
-| Total blocks | 816,541 | 526,141 | 290,400 (**35.56%**) |
-| Total bytes  | 198,407,075 | 113,082,275 | 85,324,800 (**43.00%**) |
+| Total blocks | 813,525 | 523,125 | 290,400 (**35.70%**) |
+| Total bytes  | 197,652,103 | 112,327,303 | 85,324,800 (**43.17%**) |
 
 Both independently clear the alternate >=10%-allocation floor as well as the
-primary Ir floor.
+primary Ir floor. The blocks/bytes reduction is identical to every prior
+harness correction: it is purely `(non-gate node count) x (reps - 1)` fewer
+`BTreeSet<&str>` allocations at `latest_scheduled`'s call site, a quantity
+that does not depend on the fixture's event content or ordering.
 
 ### Correctness
 

@@ -441,7 +441,7 @@ fn build_dag() -> DagDefinition {
         .activity(t030)
         .upstream(&layer3[1])
         .upstream(&layer2[9])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer4.push(n_t030);
     let n_t031 = builder
         .activity(t031)
@@ -477,7 +477,7 @@ fn build_dag() -> DagDefinition {
         .activity(t036)
         .upstream(&layer3[3])
         .upstream(&layer2[7])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer4.push(n_t036);
     let n_t037 = builder
         .activity(t037)
@@ -514,7 +514,7 @@ fn build_dag() -> DagDefinition {
         .activity(t042)
         .upstream(&layer4[1])
         .upstream(&layer4[8])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer5.push(n_t042);
     let n_t043 = builder
         .activity(t043)
@@ -550,7 +550,7 @@ fn build_dag() -> DagDefinition {
         .activity(t048)
         .upstream(&layer4[7])
         .upstream(&layer4[14])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer5.push(n_t048);
     let n_t049 = builder
         .activity(t049)
@@ -586,7 +586,7 @@ fn build_dag() -> DagDefinition {
         .activity(t054)
         .upstream(&layer4[13])
         .upstream(&layer4[4])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer5.push(n_t054);
     let n_t055 = builder
         .activity(t055)
@@ -622,7 +622,7 @@ fn build_dag() -> DagDefinition {
         .activity(t060)
         .upstream(&layer4[3])
         .upstream(&layer4[10])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer5.push(n_t060);
     let mut layer6: Vec<DagTaskRef> = Vec::new();
     let n_t061 = builder
@@ -659,7 +659,7 @@ fn build_dag() -> DagDefinition {
         .activity(t066)
         .upstream(&layer5[5])
         .upstream(&layer5[14])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer6.push(n_t066);
     let n_t067 = builder
         .activity(t067)
@@ -695,7 +695,7 @@ fn build_dag() -> DagDefinition {
         .activity(t072)
         .upstream(&layer5[11])
         .upstream(&layer5[0])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer6.push(n_t072);
     let n_t073 = builder
         .activity(t073)
@@ -731,7 +731,7 @@ fn build_dag() -> DagDefinition {
         .activity(t078)
         .upstream(&layer5[17])
         .upstream(&layer5[6])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     layer6.push(n_t078);
     let n_t079 = builder
         .activity(t079)
@@ -776,7 +776,7 @@ fn build_dag() -> DagDefinition {
         .upstream(&layer6[13])
         .upstream(&layer6[14])
         .upstream(&layer6[15])
-        .condition(|_ups| true);
+        .condition(|_ups| false);
     let _ = builder
         .activity(t085)
         .upstream(&layer6[16])
@@ -872,7 +872,13 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
     // uses. See the function doc comment.
     let mut done = vec![false; tasks.len()];
     let mut gate_seen: usize = 0;
-    let mut activity_seq: usize = 0;
+    // Position among layer4-onward activities in creation order -- NOT gated
+    // by reachability. `build_dag` fixes each such task's `.condition(...)`
+    // predicate by this same position (`pos % 6 != 5`), so `pos` has to
+    // advance for every layer4-onward task regardless of whether it turns out
+    // reachable here, or the two would disagree about which task the real
+    // walker would have skipped by condition (issue #690 review, Codex).
+    let mut pos: usize = 0;
 
     for (idx, task) in tasks.iter().enumerate() {
         if let Some(gate) = &task.signal {
@@ -897,13 +903,16 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
             continue;
         }
 
+        let this_pos = pos;
+        pos += 1;
+
         let reachable = task.upstreams.iter().all(|&u| done[u]);
         if !reachable {
             // No real walker would ever have dispatched this node: no events.
             continue;
         }
 
-        match activity_seq % 6 {
+        match this_pos % 6 {
             // Succeeded on the first attempt (half of reachable activities).
             0..=2 => {
                 let id = ActivityExecId::new();
@@ -936,18 +945,20 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
             }
             // Condition-skipped (#482): a `dag_skip` marker, no dispatch. The
             // real walker only records this marker for
-            // `DagDispatchDecision::SkipByCondition`, which requires the task
-            // to actually carry a `.condition(...)` predicate -- `build_dag`
-            // configures one (unconditionally `true`, never actually
-            // evaluated here) on every layer4-onward activity for exactly
-            // this reason (issue #690 review, Codex). Not `done`.
+            // `DagDispatchDecision::SkipByCondition`, which requires the
+            // task's own `.condition(...)` predicate to actually evaluate to
+            // `false` -- `build_dag` sets each layer4-onward task's condition
+            // to `this_pos % 6 != 5` (the same `this_pos` used for the match
+            // above), so this arm is only reachable for a task whose real
+            // predicate agrees (issue #690 review, Codex; a fixed placeholder
+            // `true` here previously made this arm unproducible by the real
+            // walker). Not `done`.
             _ => push(
                 &mut t,
                 &mut events,
                 skip_marker_full(idx, &task.activity_name, &task.upstreams),
             ),
         }
-        activity_seq += 1;
     }
 
     events
