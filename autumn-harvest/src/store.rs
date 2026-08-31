@@ -792,9 +792,20 @@ pub async fn load_history_with_codecs(
 /// default encodes payloads as plain JSON), so this returns byte-identical
 /// events to [`load_history`].
 ///
-/// **Never use this for replay or any engine execution path** — replay must
-/// see decoded plaintext and uses the codec-aware loaders
-/// ([`load_history_inflated`] / [`load_history_with_codecs`]).
+/// **Never use this to feed workflow code** — replay must see decoded
+/// plaintext and uses the codec-aware loaders ([`load_history_inflated`] /
+/// [`load_history_with_codecs`]).
+///
+/// There is a second sanctioned use, distinct from the read surfaces above:
+/// **id arithmetic**. A caller that reads only `next_event_id` (to append at
+/// the right position) or matches on event *variants* and non-payload fields
+/// never looks at a payload, so decoding buys it nothing — and costs it
+/// correctness, because a codec-aware read needs a registry the caller may not
+/// have, and an identity read hard-errors `UnknownCodecKey` on the first keyed
+/// envelope. That would fail an append, a cancel, or a diagnostic scan over a
+/// payload none of them were going to read. `execution.rs`'s
+/// cancel/pause/resume/redrive paths and
+/// [`crate::execution::check_and_report_unfinished_handlers`] are this case.
 ///
 /// # Errors
 ///

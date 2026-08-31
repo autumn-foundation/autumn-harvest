@@ -518,10 +518,13 @@ pub(crate) fn pending_activity_id_for_task(
 pub(crate) async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<store::EventHistory> {
-    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
-        .await?
-        .1)
+    Ok(
+        lock_workflow_execution_row_and_load_history(conn, exec_id, codecs)
+            .await?
+            .1,
+    )
 }
 
 /// Like [`lock_workflow_execution_and_load_history`], but also returns the
@@ -533,6 +536,7 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
 async fn lock_workflow_execution_row_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
     let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -544,7 +548,10 @@ async fn lock_workflow_execution_row_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    let history = store::load_history(conn, exec_id).await?;
+    // Codec-aware, NOT `store::load_history` -- the same reason as `worker.rs`'s
+    // sibling: the engine's writes encode through the configured registry, so an
+    // identity read raises `UnknownCodecKey` on the first keyed envelope.
+    let history = store::load_history_with_codecs(conn, exec_id, codecs).await?;
     Ok((execution, history))
 }
 
@@ -972,6 +979,8 @@ async fn enforce_activity_timeout(
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
@@ -1097,7 +1106,7 @@ async fn enforce_activity_timeout(
         }
 
         let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
         let Some((state, row_schedule_to_close_at)) =
             task_state_and_deadline_for_update(conn, task.id).await?
         else {
@@ -1384,6 +1393,8 @@ pub async fn force_fail_activity(
     workflow_exec_id: uuid::Uuid,
     task_id: uuid::Uuid,
     reason: Option<&str>,
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ForceFailActivityOutcome> {
     use crate::failure::IntoActivityErrorString;
     use crate::schema::harvest_task_queue::dsl;
@@ -1397,7 +1408,7 @@ pub async fn force_fail_activity(
             // `enforce_external_task_timeouts`): execution row FIRST, then the
             // task row.
             let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
 
             let task: Option<TaskQueueItem> = dsl::harvest_task_queue
                 .filter(dsl::id.eq(task_id))
@@ -1558,6 +1569,8 @@ async fn enforce_workflow_timeout(
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
     // `enforce_activity_timeout` — see the note there (issue #619 round-24
@@ -1622,7 +1635,7 @@ async fn enforce_workflow_timeout(
         // execution-row -> task-row order. Locking here also loads the history
         // in the same call, replacing a separate `store::load_history`.
         let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
         // Authoritative deadline re-read, now correctly ordered after the
         // execution lock. See the activity path for why the unlocked check
         // above cannot be trusted on its own.
@@ -2282,9 +2295,16 @@ pub async fn enforce_external_signals_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -2449,7 +2469,7 @@ pub async fn enforce_external_signals_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
                     store::append_events(
                         conn,
                         caller_exec_id,
@@ -2629,9 +2649,16 @@ pub async fn enforce_external_cancels_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -2878,7 +2905,7 @@ pub async fn enforce_external_cancels_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
                     store::append_events(
                         conn,
                         caller_exec_id,
@@ -3037,9 +3064,16 @@ pub async fn enforce_external_awaits_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -3227,7 +3261,7 @@ pub async fn enforce_external_awaits_outbox(
                     // If present, skip the duplicate append (the inline path
                     // owns the awaiter's own wake/resolution).
                     let history =
-                        lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                        lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
                     let already_resolved = history.events.iter().any(|e| match e {
                         WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
                         | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
@@ -3314,6 +3348,7 @@ pub async fn enforce_timeouts_once(
                     &reason,
                     circuit_breakers,
                     metrics,
+                    payload_codecs,
                 )
                 .await
             }
@@ -3324,6 +3359,7 @@ pub async fn enforce_timeouts_once(
                     execution_id_from_uuid(exec_uuid),
                     &reason,
                     metrics,
+                    payload_codecs,
                 )
                 .await
             }
@@ -3355,6 +3391,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += enforce_external_cancels_outbox(
@@ -3363,6 +3400,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += enforce_external_awaits_outbox(
@@ -3370,6 +3408,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += crate::completion_trigger::enforce_completion_triggers_outbox(

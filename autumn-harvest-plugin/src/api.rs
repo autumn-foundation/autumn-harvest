@@ -23136,6 +23136,7 @@ async fn fail_activity_now(
         exec_id.as_uuid(),
         task_id,
         reason.as_deref(),
+        &api_state.payload_codecs(),
     )
     .await;
 

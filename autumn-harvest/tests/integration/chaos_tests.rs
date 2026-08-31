@@ -690,6 +690,7 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
         Duration::from_secs(300),
         &None,
         &[],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("outbox sweep");

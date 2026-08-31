@@ -1417,4 +1417,68 @@ mod tests {
         assert!(!outcome.changed());
         assert_eq!(event, before);
     }
+
+    /// No engine path may read history through the **identity** loader.
+    ///
+    /// `store::load_history` delegates to `load_history_with_codecs` with the
+    /// identity registry, so it hard-errors `UnknownCodecKey` on the first
+    /// keyed envelope. Once the engine's writes encode through the configured
+    /// registry, any engine read still on that loader is a live defect, not a
+    /// latent one: the activity-start path reloads history under the execution
+    /// row lock, so an identity read there means **no activity can start** on a
+    /// deployment with a keyed codec configured.
+    ///
+    /// Every engine read must therefore be one of two things:
+    ///
+    /// - `load_history_with_codecs` / `load_history_inflated`, when it looks at
+    ///   payload fields; or
+    /// - `load_history_undecoded`, when it only does id arithmetic
+    ///   (`next_event_id`) or matches on event variants — decoding buys such a
+    ///   caller nothing and costs it a registry it may not have.
+    ///
+    /// Source-level because the property is "which function was called", which
+    /// no runtime assertion can observe without a keyed deployment of every
+    /// path. The allowlist is deliberately explicit: a file leaves it only by
+    /// being fixed, and a new identity read anywhere else fails here.
+    #[test]
+    fn no_engine_path_reads_history_through_the_identity_loader() {
+        // Both still need a `PayloadCodecs` threaded through a public
+        // signature (`RetentionScanner::spawn`, `run_canary`), which is
+        // issue #1243's remaining scope rather than rotation's. Neither is on
+        // the task-processing path: archival and the replay canary.
+        const KNOWN_IDENTITY_READS: &[(&str, &str)] = &[
+            ("retention.rs", "run_shard_tick: archival export"),
+            ("testing.rs", "run_canary: replay canary"),
+        ];
+
+        let engine_sources: &[(&str, &str)] = &[
+            ("worker.rs", include_str!("worker.rs")),
+            ("timeout.rs", include_str!("timeout.rs")),
+            ("execution.rs", include_str!("execution.rs")),
+            ("sessions.rs", include_str!("sessions.rs")),
+            ("poison_pill.rs", include_str!("poison_pill.rs")),
+            ("context.rs", include_str!("context.rs")),
+            ("retention.rs", include_str!("retention.rs")),
+            ("testing.rs", include_str!("testing.rs")),
+        ];
+
+        for (name, src) in engine_sources {
+            let identity_reads = src.matches("store::load_history(").count();
+            let allowed = KNOWN_IDENTITY_READS
+                .iter()
+                .filter(|(file, _)| file == name)
+                .count();
+            assert_eq!(
+                identity_reads, allowed,
+                "{name}: found {identity_reads} call(s) to the identity \
+                 `store::load_history`, expected {allowed}. Use \
+                 `load_history_with_codecs` when the caller reads payload \
+                 fields, or `load_history_undecoded` when it only needs \
+                 `next_event_id` or event variants. If a new identity read is \
+                 genuinely unavoidable, add it to KNOWN_IDENTITY_READS with the \
+                 reason -- but an identity read raises `UnknownCodecKey` on any \
+                 keyed history, so it is almost certainly a live bug."
+            );
+        }
+    }
 }

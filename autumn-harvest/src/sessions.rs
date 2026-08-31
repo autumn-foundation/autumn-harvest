@@ -793,7 +793,8 @@ async fn break_session_and_fail_members(
                 .expect("database UUIDs must round-trip into ExecutionId");
 
             let history =
-                crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id).await?;
+                crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id, codecs)
+                    .await?;
             let Some(activity_id) = crate::timeout::pending_activity_id_for_task(
                 &history.events,
                 &task,

@@ -2425,7 +2425,7 @@ async fn persist_external_signal_inline(
             // resolved correctly. (issue #757 review, P1)
             let (prior_events, mut next) = if has_await {
                 let locked =
-                    lock_workflow_execution_and_load_history(conn, exec_id).await?;
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
                 debug_assert!(
                     locked.next_event_id >= start_next,
                     "locked next_event_id must not precede the pre-transaction snapshot"
@@ -3770,10 +3770,13 @@ fn has_activity_terminal_event(history: &[WorkflowEvent], activity_id: ActivityE
 async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<store::EventHistory> {
-    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
-        .await?
-        .1)
+    Ok(
+        lock_workflow_execution_row_and_load_history(conn, exec_id, codecs)
+            .await?
+            .1,
+    )
 }
 
 /// Like [`lock_workflow_execution_and_load_history`], but also returns the
@@ -3784,6 +3787,7 @@ async fn lock_workflow_execution_and_load_history(
 async fn lock_workflow_execution_row_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
     let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -3795,7 +3799,11 @@ async fn lock_workflow_execution_row_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    let history = store::load_history(conn, exec_id).await?;
+    // Codec-aware, NOT `store::load_history`. The worker's writes encode
+    // through the configured registry, so an identity read here raises
+    // `UnknownCodecKey` on the first keyed envelope -- which for the activity
+    // start path means no activity can start at all under a keyed codec.
+    let history = store::load_history_with_codecs(conn, exec_id, codecs).await?;
     Ok((execution, history))
 }
 
@@ -3889,7 +3897,7 @@ async fn append_activity_started_if_pending(
     Box::pin(
         conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
             let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
             let Some(activity_id) =
                 pending_activity_id_for_task(&history.events, task, activity_name)?
             else {
@@ -7485,7 +7493,7 @@ async fn persist_signal_wait_park(
         || !waited_cancel_ids.is_empty()
         || !waited_await_ids.is_empty()
     {
-        let history = store::load_history(conn, exec_id).await?;
+        let history = store::load_history_with_codecs(conn, exec_id, codecs).await?;
         let resolved = history.events.iter().any(|ev| match ev {
             WorkflowEvent::ExternalSignalDelivered { signal_id }
             | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
@@ -7767,7 +7775,8 @@ async fn persist_activity_wait_park(
         }
         detached_spawns.persist(conn, commands).await?;
 
-        let history = store::load_history(conn, exec_id).await?;
+        let history =
+            store::load_history_with_codecs(conn, exec_id, registry.payload_codecs()).await?;
         let has_terminal = activity_ids
             .iter()
             .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
@@ -8675,9 +8684,10 @@ async fn persist_all_started_child_workflows(
         create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
             .await?;
 
-        let mut race_next_event_id = store::load_history(conn, parent_exec_id)
-            .await?
-            .next_event_id;
+        let mut race_next_event_id =
+            store::load_history_with_codecs(conn, parent_exec_id, registry.payload_codecs())
+                .await?
+                .next_event_id;
         let race_deferred = apply_race_loser_cancellations(
             conn,
             parent_exec_id,
@@ -9766,7 +9776,13 @@ pub async fn preload_failure_history(
         return PreloadedFailureHistory::NoExecution;
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
-    match store::load_history(conn, exec_id).await {
+    // Undecoded on purpose. This reads `next_event_id` -- id arithmetic over
+    // the row set -- and never looks at a payload field, so it is not a replay
+    // path and needs no codec. Decoding here would be worse than useless: with
+    // no registry in scope it would be the *identity* registry, so a single
+    // keyed envelope anywhere in the history would fail the preload for a path
+    // that was only counting rows.
+    match store::load_history_undecoded(conn, exec_id).await {
         Ok(h) => PreloadedFailureHistory::Loaded {
             exec_id,
             next_event_id: h.next_event_id,
@@ -9848,7 +9864,7 @@ async fn finalize_activity_completion(
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let output = output.clone();
-        let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+        let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
@@ -9925,7 +9941,7 @@ async fn finalize_activity_failure(
     // workflow propagates the error.
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.to_string();
-        let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+        let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
@@ -10697,7 +10713,7 @@ async fn record_schedule_to_close_activity_timeout(
         conn.transaction::<ScheduleToCloseTimeoutOutcome, HarvestError, _>(async |conn| {
             let error = error.clone();
             let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
             let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
             // Authoritative re-check under the execution row lock: bail
             // without mutation when the task was concurrently resolved, the
@@ -10932,7 +10948,7 @@ async fn record_session_acquire_schedule_to_start_timeout(
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.clone();
-        let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+        let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         let Some(state) = task_state_for_update(conn, task.id).await? else {
             return Ok(());
         };
@@ -12025,7 +12041,9 @@ async fn persist_scheduled_external_activity(
             }
             detached_spawns.persist(conn, commands).await?;
 
-            let mut race_next_event_id = store::load_history(conn, exec_id).await?.next_event_id;
+            let mut race_next_event_id = store::load_history_with_codecs(conn, exec_id, codecs)
+                .await?
+                .next_event_id;
             let deferred = apply_race_loser_cancellations(
                 conn,
                 exec_id,
@@ -23119,7 +23137,8 @@ pub async fn quarantine_workflow_task_timeout(
                     .map_err(crate::error::database_error)?;
 
                     let exec_id = execution_id_from_uuid(exec_uuid);
-                    let history = crate::store::load_history(conn, exec_id).await?;
+                    let history =
+                        crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
                     crate::store::append_events_with_codecs(
                         conn,
                         exec_id,

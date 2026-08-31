@@ -293,7 +293,7 @@ mod scanner {
             return Ok((None, Vec::new(), Vec::new()));
         }
 
-        let history = crate::store::load_history(conn, exec_id).await?;
+        let history = crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
         crate::store::append_events_with_codecs(
             conn,
             exec_id,
