@@ -119,8 +119,9 @@ Each of these is inverted into a concrete guard in §6.
 
 ## 4. Six hats
 
-* **White (facts).** 26 `WorkflowCommand` variants; 3 are persisted as
-  pre-terminal events today, 7 through side paths, 16 dropped. Terminal
+* **White (facts).** 26 `WorkflowCommand` variants; 5 are persisted as
+  pre-terminal events today (markers, side effects, detached spawns, and the two
+  timer-lifecycle commands), 7 through side paths, the rest dropped. Terminal
   lifecycle events are already excused from `has_non_lifecycle_unconsumed`.
   `WorkflowRetryScheduled` / `ChildWorkflowCascadeApplied` are appended *after*
   a terminal event. `ChildWorkflowFailed` and `ActivityFailed` already carry a

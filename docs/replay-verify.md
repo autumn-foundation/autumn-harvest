@@ -59,7 +59,8 @@ activity appears as its `ChildWorkflowStarted`/`ActivityScheduled` followed by a
 synthetic terminal explaining that it never started — so the fixture contains
 every command the code issued.
 
-> **`replay-verify` is for *completed* histories, and replays them strictly.**
+> **`replay-verify` is for *terminal* histories — completed, failed, or
+> cancelled — and replays them strictly.**
 > To gate a deploy on the executions that are **in flight right now**, use the
 > replay-drift gate instead — see
 > [`docs/replay-drift-gate.md`](replay-drift-gate.md). It exports a stratified

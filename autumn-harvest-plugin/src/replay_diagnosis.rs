@@ -77,7 +77,8 @@ pub struct FailureDetail {
 /// `POST /api/harvest/workflows/{id}/replay-diagnosis`.
 ///
 /// Serialized `snake_case`. `divergence`, `failure`, and `summary` are omitted
-/// when absent so a clean verdict carries no null clutter.
+/// when absent, so a clean verdict of a run that did not fail carries no null
+/// clutter.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayDiagnosisResponse {
     /// The diagnosed execution id.
@@ -95,7 +96,10 @@ pub struct ReplayDiagnosisResponse {
     /// The classified divergence, present iff `diagnosis == diverged`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergence: Option<DivergenceDetail>,
-    /// The workflow error, present iff `diagnosis == workflow_failed`.
+    /// The workflow error. Present for `workflow_failed`, and (issue #952) for a
+    /// `clean` verdict that REPRODUCED the run's recorded terminal failure —
+    /// reproducing a recorded failure is not a divergence, but the operator still
+    /// needs the error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureDetail>,
     /// A one-line human summary of the mismatch (present for a divergence).

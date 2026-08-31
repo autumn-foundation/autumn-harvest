@@ -1661,6 +1661,23 @@ const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
 #[cfg(test)]
 const WORKFLOW_COMMAND_VARIANTS: usize = 26;
 
+impl TerminalCommandPolicy {
+    /// Discriminant label, so the AC4 audit table can state each variant's
+    /// EXPECTED policy without duplicating the (long, prose) reason strings —
+    /// and therefore without deriving the expectation from the function under
+    /// test, which would make the row tautological.
+    #[cfg(test)]
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::PreTerminalEvent => "pre-terminal-event",
+            Self::SidePath(_) => "side-path",
+            Self::AbandonedDispatch => "abandoned-dispatch",
+            Self::NoRecord(_) => "no-record",
+            Self::Unreachable(_) => "unreachable",
+        }
+    }
+}
+
 /// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
 ///
 /// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
@@ -34003,7 +34020,7 @@ mod tests {
     /// the intended one. Keep it in sync — `every_workflow_command_variant_is_
     /// classified` fails if a variant is missing from the table.
     #[allow(clippy::too_many_lines)]
-    fn terminal_policy_cases() -> Vec<(&'static str, WorkflowCommand, TerminalCommandPolicy)> {
+    fn terminal_policy_cases() -> Vec<(&'static str, WorkflowCommand, &'static str)> {
         vec![
             (
                 "RecordMarker",
@@ -34011,7 +34028,7 @@ mod tests {
                     name: "m".to_string(),
                     details: serde_json::json!(1),
                 },
-                TerminalCommandPolicy::PreTerminalEvent,
+                "pre-terminal-event",
             ),
             (
                 "RecordSideEffect",
@@ -34020,7 +34037,7 @@ mod tests {
                     name: None,
                     value: serde_json::json!("id"),
                 },
-                TerminalCommandPolicy::PreTerminalEvent,
+                "pre-terminal-event",
             ),
             (
                 "SpawnDetachedChildWorkflow",
@@ -34030,7 +34047,7 @@ mod tests {
                     input: Value::Null,
                     parent_close_policy: ParentClosePolicy::Abandon,
                 },
-                TerminalCommandPolicy::PreTerminalEvent,
+                "pre-terminal-event",
             ),
             (
                 "ArmTimer",
@@ -34039,24 +34056,24 @@ mod tests {
                     duration_secs: 5,
                     for_await: false,
                 },
-                TerminalCommandPolicy::PreTerminalEvent,
+                "pre-terminal-event",
             ),
             (
                 "CancelTimer",
                 WorkflowCommand::CancelTimer {
                     timer_id: crate::types::TimerId::new("t"),
                 },
-                TerminalCommandPolicy::PreTerminalEvent,
+                "pre-terminal-event",
             ),
             (
                 "StartChildWorkflow",
                 abandoned_child_cmd(ExecutionId::new(), "worker_child", serde_json::json!({})),
-                TerminalCommandPolicy::AbandonedDispatch,
+                "abandoned-dispatch",
             ),
             (
                 "ScheduleActivity",
                 abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
-                TerminalCommandPolicy::AbandonedDispatch,
+                "abandoned-dispatch",
             ),
             (
                 "RecordUpdateResult",
@@ -34064,14 +34081,14 @@ mod tests {
                     update_id: crate::types::UpdateId::new(),
                     result: Ok(Value::Null),
                 },
-                TerminalCommandPolicy::SidePath("persist_update_result_commands"),
+                "side-path",
             ),
             (
                 "UpsertSearchAttributes",
                 WorkflowCommand::UpsertSearchAttributes {
                     patch: std::collections::HashMap::new(),
                 },
-                TerminalCommandPolicy::SidePath("persist_search_attrs_from_commands"),
+                "side-path",
             ),
             (
                 "SetCurrentDetails",
@@ -34079,7 +34096,7 @@ mod tests {
                     value: "step 2".to_string(),
                     explicit_clear: false,
                 },
-                TerminalCommandPolicy::SidePath("persist_current_details_from_commands"),
+                "side-path",
             ),
             (
                 "RecordLog",
@@ -34088,7 +34105,7 @@ mod tests {
                     level: crate::context::WorkflowLogLevel::Info,
                     message: "hi".to_string(),
                 },
-                TerminalCommandPolicy::SidePath("persist_workflow_logs_from_commands"),
+                "side-path",
             ),
             (
                 "PublishProgress",
@@ -34096,7 +34113,7 @@ mod tests {
                     seq: 1,
                     chunk: Value::Null,
                 },
-                TerminalCommandPolicy::SidePath("notify_progress_from_commands"),
+                "side-path",
             ),
             (
                 "CancelRaceLosers",
@@ -34105,7 +34122,7 @@ mod tests {
                     children: Vec::new(),
                     timers: Vec::new(),
                 },
-                TerminalCommandPolicy::SidePath("apply_race_loser_cancellations"),
+                "side-path",
             ),
             (
                 "ReleaseMutex",
@@ -34113,7 +34130,7 @@ mod tests {
                     key: "k".to_string(),
                     lock_seq: 1,
                 },
-                TerminalCommandPolicy::SidePath("mutex::sweep_terminal_holder_and_wake"),
+                "side-path",
             ),
             (
                 "WaitForActivity",
@@ -34121,10 +34138,7 @@ mod tests {
                     activity_id: crate::types::ActivityExecId::new(),
                     result_tx: oneshot::channel::<Result<Value, String>>().0,
                 },
-                terminal_command_policy(&WorkflowCommand::WaitForActivity {
-                    activity_id: crate::types::ActivityExecId::new(),
-                    result_tx: oneshot::channel::<Result<Value, String>>().0,
-                }),
+                "no-record",
             ),
             (
                 "WaitForSignal",
@@ -34132,10 +34146,7 @@ mod tests {
                     signal_name: "go".to_string(),
                     result_tx: oneshot::channel::<Value>().0,
                 },
-                terminal_command_policy(&WorkflowCommand::WaitForSignal {
-                    signal_name: "go".to_string(),
-                    result_tx: oneshot::channel::<Value>().0,
-                }),
+                "no-record",
             ),
             (
                 "StartTimer",
@@ -34144,11 +34155,7 @@ mod tests {
                     duration_secs: 1,
                     result_tx: oneshot::channel::<()>().0,
                 },
-                terminal_command_policy(&WorkflowCommand::StartTimer {
-                    timer_id: crate::types::TimerId::new("t"),
-                    duration_secs: 1,
-                    result_tx: oneshot::channel::<()>().0,
-                }),
+                "no-record",
             ),
             (
                 "RunLocalActivity",
@@ -34163,17 +34170,7 @@ mod tests {
                     failed_attempts: 0,
                     last_error: None,
                 },
-                terminal_command_policy(&WorkflowCommand::RunLocalActivity {
-                    activity_id: crate::types::ActivityExecId::new(),
-                    name: "compute".to_string(),
-                    input: Value::Null,
-                    start_to_close: None,
-                    retry_policy: None,
-                    result_tx: oneshot::channel::<Result<Value, String>>().0,
-                    already_scheduled: false,
-                    failed_attempts: 0,
-                    last_error: None,
-                }),
+                "no-record",
             ),
             (
                 "ScheduleExternalActivity",
@@ -34186,15 +34183,7 @@ mod tests {
                     schedule_to_close_secs: 60,
                     result_tx: oneshot::channel::<Result<Value, String>>().0,
                 },
-                terminal_command_policy(&WorkflowCommand::ScheduleExternalActivity {
-                    activity_id: crate::types::ActivityExecId::new(),
-                    token: crate::types::ExternalActivityToken::new(),
-                    name: "ext".to_string(),
-                    input: Value::Null,
-                    queue: String::new(),
-                    schedule_to_close_secs: 60,
-                    result_tx: oneshot::channel::<Result<Value, String>>().0,
-                }),
+                "no-record",
             ),
             (
                 "SignalExternalWorkflow",
@@ -34207,12 +34196,7 @@ mod tests {
                     already_requested: false,
                     idempotency_key: None,
                 },
-                terminal_command_policy(&WorkflowCommand::RequestCancelExternalWorkflow {
-                    cancel_id: crate::types::ExternalCancelId::new(),
-                    target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
-                    result_tx: oneshot::channel::<Result<(), String>>().0,
-                    already_requested: false,
-                }),
+                "no-record",
             ),
             (
                 "RequestCancelExternalWorkflow",
@@ -34222,12 +34206,7 @@ mod tests {
                     result_tx: oneshot::channel::<Result<(), String>>().0,
                     already_requested: false,
                 },
-                terminal_command_policy(&WorkflowCommand::RequestCancelExternalWorkflow {
-                    cancel_id: crate::types::ExternalCancelId::new(),
-                    target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
-                    result_tx: oneshot::channel::<Result<(), String>>().0,
-                    already_requested: false,
-                }),
+                "no-record",
             ),
             (
                 "AwaitExternalWorkflow",
@@ -34237,12 +34216,7 @@ mod tests {
                     result_tx: oneshot::channel::<Result<(), String>>().0,
                     already_requested: false,
                 },
-                terminal_command_policy(&WorkflowCommand::RequestCancelExternalWorkflow {
-                    cancel_id: crate::types::ExternalCancelId::new(),
-                    target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
-                    result_tx: oneshot::channel::<Result<(), String>>().0,
-                    already_requested: false,
-                }),
+                "no-record",
             ),
             (
                 "AcquireMutex",
@@ -34250,28 +34224,21 @@ mod tests {
                     key: "k".to_string(),
                     result_tx: oneshot::channel::<i64>().0,
                 },
-                terminal_command_policy(&WorkflowCommand::AcquireMutex {
-                    key: "k".to_string(),
-                    result_tx: oneshot::channel::<i64>().0,
-                }),
+                "no-record",
             ),
             (
                 "Complete",
                 WorkflowCommand::Complete {
                     output: Value::Null,
                 },
-                terminal_command_policy(&WorkflowCommand::Complete {
-                    output: Value::Null,
-                }),
+                "unreachable",
             ),
             (
                 "Fail",
                 WorkflowCommand::Fail {
                     error: "boom".to_string(),
                 },
-                terminal_command_policy(&WorkflowCommand::Fail {
-                    error: "boom".to_string(),
-                }),
+                "unreachable",
             ),
             (
                 "ContinueAsNew",
@@ -34279,10 +34246,7 @@ mod tests {
                     input: Value::Null,
                     new_workflow_type: None,
                 },
-                terminal_command_policy(&WorkflowCommand::ContinueAsNew {
-                    input: Value::Null,
-                    new_workflow_type: None,
-                }),
+                "unreachable",
             ),
         ]
     }
@@ -34337,9 +34301,13 @@ mod tests {
             (0..WORKFLOW_COMMAND_VARIANTS).collect::<Vec<_>>(),
             "the audit table must cover every WorkflowCommand variant exactly once"
         );
-        for (label, cmd, expected) in cases {
+        for (label, cmd, expected_kind) in cases {
             let policy = terminal_command_policy(&cmd);
-            assert_eq!(policy, expected, "{label} classified unexpectedly");
+            assert_eq!(
+                policy.kind(),
+                expected_kind,
+                "{label} classified unexpectedly"
+            );
             assert_eq!(
                 workflow_command_name(&cmd),
                 label,
@@ -34378,7 +34346,7 @@ mod tests {
     fn only_child_and_activity_dispatches_are_abandoned_dispatches() {
         let mut dispatches: Vec<&str> = terminal_policy_cases()
             .iter()
-            .filter(|(_, _, policy)| *policy == TerminalCommandPolicy::AbandonedDispatch)
+            .filter(|(_, _, kind)| *kind == "abandoned-dispatch")
             .map(|(label, _, _)| *label)
             .collect();
         dispatches.sort_unstable();
@@ -34390,8 +34358,8 @@ mod tests {
     #[test]
     fn non_dispatch_commands_produce_no_abandoned_dispatch_events() {
         let plan = AbandonedDispatchPlan::with_started_children([]);
-        for (label, cmd, policy) in terminal_policy_cases() {
-            if policy == TerminalCommandPolicy::AbandonedDispatch {
+        for (label, cmd, kind) in terminal_policy_cases() {
+            if kind == "abandoned-dispatch" {
                 continue;
             }
             assert!(

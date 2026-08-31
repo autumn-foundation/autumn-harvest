@@ -897,10 +897,12 @@ impl HistoryMatcher {
     /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
     /// precedes it.
     ///
-    /// The reason constant is the engine's own reserved marker — the same
-    /// device as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
-    /// `fan_out:{n}` markers (#601) — so this is a deterministic classification
-    /// of events the engine itself wrote, never a guess about author data.
+    /// The reason constant is the engine's own reserved marker — the same device
+    /// as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
+    /// `fan_out:{n}` markers (#601). For a child terminal, whose `error` carries
+    /// the CHILD's own author string, the reason is matched together with the
+    /// exact shape the engine writes (untyped, non-retryable) so an author
+    /// message that happens to collide keeps its genuine terminal.
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
         let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
@@ -913,8 +915,17 @@ impl HistoryMatcher {
                     abandoned_activities.insert(*activity_id);
                     indices.push(i);
                 }
+                // A child's `error` is normally the CHILD's own author-produced
+                // string, so the reason alone is not proof the engine wrote this
+                // event. Pair it with the exact shape the engine writes — untyped
+                // and non-retryable — so a child that coincidentally returns the
+                // same message keeps its genuine terminal.
                 WorkflowEvent::ChildWorkflowFailed {
-                    child_id, error, ..
+                    child_id,
+                    error,
+                    error_type: None,
+                    details: None,
+                    non_retryable: Some(true),
                 } if error == crate::event::ABANDONED_DISPATCH_REASON => {
                     abandoned_children.insert(*child_id);
                     indices.push(i);
