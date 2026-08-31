@@ -119,6 +119,23 @@ documented runbook query truthful and drives a per-row retry backoff. There is
 still no dedicated metric for the relay; that is called out in `docs/sharding.md`
 and tracked as a follow-up.
 
+**Codex round 1 (two P1s, both real).** A failed batch read of the parents'
+states returned an empty map, which the call site read as "every parent is
+terminal" — and `Retire` deletes the outbox row outright with no second look, so
+one transient read error would have permanently lost the terminal wake of every
+awaited cross-shard child in the batch and cascade-cancelled detached children
+whose parents were alive. `parent_terminal` is now `Option<bool>`, and only
+`Some(true)` retires or cascades; start, cancel and terminal delivery still make
+progress during a parent-read outage. Separately, a *drained* shard was rejected
+inside `resolve_child_placement`, which runs in the workflow handler — where the
+ABI erases the error type into a `String` and the executor maps it to a terminal
+`WorkflowOutcome::Failed`, so the worker's typed `ShardUnavailable` recovery
+never saw it and a maintenance window would have permanently failed every
+workflow spawning a placed child. Writability is now enforced by
+`preflight_target_shard` at the **persist** boundary, where the rejection is
+retryable; the resolver still never swaps the requested shard for another, and
+static misconfiguration still fails terminally as it should.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive

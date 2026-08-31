@@ -581,11 +581,34 @@ async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
         });
     }
 
-    let distinct: std::collections::BTreeSet<i32> = shards.iter().copied().collect();
-    assert!(
-        distinct.len() > 1,
-        "three sequential placed spawns all landed on shard {shards:?} — the \
-         placement counter is resetting per decision cycle"
+    // Assert the DETERMINISTIC property, not a distribution one: child N must
+    // hash as the Nth invocation. "they didn't all land on one shard" would be a
+    // flaky assertion — three keys over four shards legitimately collide about 6
+    // times in 100 — and it would also pass by luck under the very bug this test
+    // exists to catch.
+    let router = four_shard_router();
+    let expected: Vec<i32> = (1..=3)
+        .map(|n| {
+            router
+                .pick_for_new_workflow(
+                    "child_wf",
+                    &autumn_harvest::shard::child_placement_key(exec_id, n),
+                )
+                .as_i32()
+        })
+        .collect();
+    assert_eq!(
+        shards, expected,
+        "each sequential spawn must hash as its own invocation ordinal; a \
+         placement counter that resets per decision cycle gives every child the \
+         `#1` key and collapses the loop onto one shard"
+    );
+    // And the ordinals really are distinct keys, so the spread is real rather
+    // than three copies of one pick.
+    assert_eq!(
+        expected.len(),
+        3,
+        "sanity: three ordinals produce three independent picks"
     );
 }
 

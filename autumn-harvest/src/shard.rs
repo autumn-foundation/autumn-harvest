@@ -1590,13 +1590,39 @@ pub fn child_placement_key(parent: ExecutionId, seq: u32) -> String {
 /// even inspected, which is why `router` is an `Option` — the default path must
 /// work in a deployment that never installs one.
 ///
+/// # Where a *drained* shard is rejected — and why not here
+///
+/// This function rejects only **static misconfiguration**: no router installed,
+/// an unknown shard, an undeclared or blank residency key. Retrying any of those
+/// never helps, so surfacing them to the workflow author as a terminal error is
+/// right.
+///
+/// A shard that is merely **drained** (readable but out of `writable_shards`)
+/// is a *transient* operational state, and it is deliberately **not** rejected
+/// here. This function runs inside the workflow handler, and the handler ABI
+/// erases the error type — a workflow's `?` turns any `HarvestError` into a
+/// `String`, which the executor maps to a terminal `WorkflowOutcome::Failed`.
+/// The worker's typed `ShardUnavailable` recovery would never see it, so
+/// rejecting a drain here would *permanently* fail every workflow that spawned a
+/// placed child during a maintenance window — the opposite of the documented
+/// bounded retry.
+///
+/// Writability is therefore enforced one layer down, by
+/// `cross_shard_child::preflight_target_shard`, which runs inside the parent's
+/// **persist** transaction where `ShardUnavailable` is recognised and requeued
+/// with a bounded backoff. Nothing is recorded in the meantime: the resolved id
+/// only reaches history if that persist succeeds, and the persist is exactly
+/// what rejects it.
+///
+/// This is not a fallback. The shard this returns is the shard the caller asked
+/// for (or the rendezvous pick); it is never quietly swapped for the parent's
+/// shard or the default shard, which is the failure mode AC8 exists to remove.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Config`] when a non-default placement is requested
-/// but no router is installed, or when the router rejects the requested pin
-/// (unknown shard, drained shard, undeclared residency key). Placement **never**
-/// falls back to the parent's shard or the default shard: a silent fallback is
-/// the failure mode explicit placement exists to remove (issue #956 AC8).
+/// but no router is installed, or when the router rejects the pin as unknown or
+/// undeclared.
 pub fn resolve_child_placement(
     router: Option<&ShardRouter>,
     placement: &ChildPlacement,
@@ -1619,46 +1645,31 @@ pub fn resolve_child_placement(
         ChildPlacement::ParentShard => unreachable!("short-circuited above"),
         ChildPlacement::Distributed => {
             // `pick_for_new_workflow` falls back to `default_shard` when the
-            // writable set is empty — correct for a top-level start, and exactly
-            // the silent fallback AC8 forbids for an opt-in placement. An
-            // operator draining every shard for a maintenance window is a
-            // supported state, and a `Distributed` child spawned during it must
-            // fail retryably rather than land on the default shard with no
-            // trace: placement is decided once and recorded in the child's id,
-            // so a wrong choice here is not recoverable after the fact.
-            if router.writable_shards().is_empty() {
-                return Err(crate::error::HarvestError::ShardUnavailable {
-                    shard_id: router.default_shard().as_i32(),
-                    reason: "no shard is currently writable, so a distributed child \
-                             cannot be placed"
-                        .to_string(),
-                });
-            }
+            // writable set is empty. That fallback must never *land* a child —
+            // placement is decided once and baked into the child's id, so a
+            // wrong choice here is not recoverable after the maintenance window
+            // ends. It is stopped by `preflight_target_shard`, which rejects a
+            // non-writable target inside the persist transaction (where the
+            // rejection is retryable) rather than here inside the handler (where
+            // the ABI would erase it into a terminal failure). With the writable
+            // set empty, `default_shard` is by definition not writable, so the
+            // preflight rejects it and the parent is requeued with a backoff.
             return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
         }
         ChildPlacement::Shard(shard) => ShardPlacement::Shard(*shard),
         ChildPlacement::ResidencyKey(key) => ShardPlacement::ResidencyKey(key.clone()),
     };
 
-    router
-        .resolve_placement(&requested, workflow_name, placement_key)
-        .map_err(|e| match e {
-            // A drained shard is a *transient* operational state — a rebalance,
-            // a maintenance window — so it is retryable and gets the engine's
-            // bounded-backoff redrive rather than terminally failing the
-            // workflow. Everything else (an unknown shard, an undeclared or
-            // blank residency key) is static misconfiguration that no amount of
-            // retrying fixes, and stays a `Config` error the author sees.
-            ShardPlacementError::ShardNotWritable { requested, .. } => {
-                crate::error::HarvestError::ShardUnavailable {
-                    shard_id: requested.as_i32(),
-                    reason: "shard is readable but not currently accepting new \
-                             workflows; it is being drained"
-                        .to_string(),
-                }
-            }
-            other => crate::error::HarvestError::Config(other.to_string()),
-        })
+    match router.resolve_placement(&requested, workflow_name, placement_key) {
+        Ok(shard) => Ok(shard),
+        // A drained shard is a *transient* operational state — a rebalance, a
+        // maintenance window. Resolve it to the shard the caller named and let
+        // the persist-boundary preflight reject it retryably; see this
+        // function's "Where a drained shard is rejected" note. Everything else
+        // is static misconfiguration and stays a terminal `Config` error.
+        Err(ShardPlacementError::ShardNotWritable { requested, .. }) => Ok(requested),
+        Err(other) => Err(crate::error::HarvestError::Config(other.to_string())),
+    }
 }
 
 /// Lifecycle status of one cross-shard child outbox row (issue #956).
@@ -1709,8 +1720,21 @@ pub struct CrossShardChildObservation<'a> {
     pub cancel_requested: bool,
     /// `None` for an **awaited** child; `Some(policy)` for a **detached** one.
     pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
-    /// Whether the parent has reached a terminal state on this shard.
-    pub parent_terminal: bool,
+    /// Whether the parent has reached a terminal state on this shard, or `None`
+    /// when this sweep could not read it.
+    ///
+    /// The three-state shape is load-bearing. A failed batch read must NOT be
+    /// collapsed into "terminal": `Retire` deletes the row outright, with no
+    /// second look at the parent, so one transient read error would permanently
+    /// lose the wake of every awaited cross-shard child in the batch — and would
+    /// cascade-cancel detached children whose parents are alive and well.
+    /// `None` means "not known to be closed", and no destructive action is
+    /// decided from it.
+    ///
+    /// A `Some(true)` from a *successful* read whose result simply lacks the
+    /// parent's id is correct: the row is genuinely gone (retention collection,
+    /// erase), and there is nobody left to wake.
+    pub parent_terminal: Option<bool>,
     /// The child's `state` column on the target shard, or `None` when the child
     /// row is not visible yet (not created, or the shard was unreadable).
     pub child_state: Option<&'a str>,
@@ -1748,6 +1772,8 @@ pub enum CrossShardChildAction {
 /// 3. A terminal child beats a closed parent: delivery re-checks the parent
 ///    under `FOR UPDATE` and degrades to a plain row-delete when it has sealed,
 ///    whereas retiring first would drop a wake the parent could still consume.
+/// 4. An **unknown** parent (`parent_terminal: None` — this sweep could not read
+///    it) decides nothing destructive. Only `Some(true)` retires or cascades.
 #[must_use]
 pub fn next_cross_shard_child_action(
     obs: &CrossShardChildObservation<'_>,
@@ -1768,10 +1794,14 @@ pub fn next_cross_shard_child_action(
         || {
             if child_terminal {
                 CrossShardChildAction::DeliverTerminal
-            } else if obs.parent_terminal {
+            } else if obs.parent_terminal == Some(true) {
                 // Parity with the same-shard contract: an awaited child can
                 // outlive a cancelled or terminated parent. Nobody is left to
                 // wake, so stop tracking it rather than polling forever.
+                //
+                // `Some(true)` and not a bare truthiness check: an unread parent
+                // must never reach this arm, because retiring here is
+                // irreversible and silently drops the child's terminal wake.
                 CrossShardChildAction::Retire
             } else {
                 CrossShardChildAction::Wait
@@ -1782,13 +1812,15 @@ pub fn next_cross_shard_child_action(
         |policy| {
             if child_terminal {
                 CrossShardChildAction::Retire
-            } else if obs.parent_terminal {
+            } else if obs.parent_terminal == Some(true) {
                 if policy == ParentClosePolicy::Abandon {
                     CrossShardChildAction::Retire
                 } else {
                     CrossShardChildAction::ApplyCloseCascade
                 }
             } else {
+                // Includes `None`: cascading a live parent's children because a
+                // read blipped would cancel or terminate perfectly healthy work.
                 CrossShardChildAction::Wait
             }
         },

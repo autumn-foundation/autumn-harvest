@@ -9085,9 +9085,11 @@ async fn persist_all_started_child_workflows(
         // parks and re-wakes the parent, making it retryable rather than fatal.
         if !remote_new_children.is_empty() {
             let pool = placement_sharded_pool();
+            let router = placement_router();
             for child in &remote_new_children {
                 crate::cross_shard_child::preflight_target_shard(
                     pool.as_ref(),
+                    router.as_ref(),
                     child.child_id.shard(),
                 )?;
             }
@@ -9634,6 +9636,18 @@ fn placement_sharded_pool() -> Option<crate::shard::ShardedDbPool> {
         .and_then(|guard| guard.clone())
 }
 
+/// The installed router, for the preflight's drain check (issue #956).
+///
+/// The drain check is made at this persist boundary rather than in the handler
+/// because only here is a rejection retryable — see
+/// [`crate::cross_shard_child::preflight_target_shard`].
+fn placement_router() -> Option<crate::shard::ShardRouter> {
+    crate::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
 fn resolve_child_workflow_defaults(
     registry: &HandlerRegistry,
     workflow_name: &str,
@@ -9721,6 +9735,7 @@ async fn insert_awaited_child_execution(
     if child_target_shard(child.child_id, shard_id) != shard_id {
         crate::cross_shard_child::preflight_target_shard(
             placement_sharded_pool().as_ref(),
+            placement_router().as_ref(),
             child.child_id.shard(),
         )?;
         let spec = cross_shard_child_spec(
@@ -11583,6 +11598,7 @@ async fn create_detached_child_executions(
         if child_target_shard(*child_id, parent_execution.shard_id) != parent_execution.shard_id {
             crate::cross_shard_child::preflight_target_shard(
                 placement_sharded_pool().as_ref(),
+                placement_router().as_ref(),
                 child_id.shard(),
             )?;
             let spec = cross_shard_child_spec(registry, parent_execution, workflow_name, input)?;

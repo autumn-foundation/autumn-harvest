@@ -213,12 +213,37 @@ impl QuotaCaps {
 /// resolved *away* from the parent's shard, so there is no legitimate no-pool
 /// case to admit.
 ///
+/// # Why the writability check lives here and not in the resolver
+///
+/// A shard that is readable but **drained** out of `writable_shards` must not
+/// accept a new child. That check is deliberately made *here*, at the persist
+/// boundary, rather than in
+/// [`resolve_child_placement`](crate::shard::resolve_child_placement), which
+/// runs inside the workflow handler. The handler ABI erases the error type — a
+/// workflow's `?` turns any `HarvestError` into a `String`, which the executor
+/// maps to a terminal `WorkflowOutcome::Failed` — so a drain rejected there
+/// would *permanently* fail every workflow that spawned a placed child during a
+/// maintenance window. Rejected here, it is a typed `ShardUnavailable` that the
+/// spawn paths requeue with a bounded backoff, which is the documented
+/// behaviour. Nothing has been recorded at this point, so the resolved child id
+/// never reaches history.
+///
+/// This also catches `ChildPlacement::Distributed` resolved while **no** shard is
+/// writable: `pick_for_new_workflow` falls back to `default_shard` in that state,
+/// and with the writable set empty `default_shard` is by definition not writable,
+/// so the fallback is rejected here instead of silently landing a child.
+///
+/// A `None` router skips only the writability half — a deployment with a pool map
+/// and no router cannot have produced a cross-shard target in the first place.
+///
 /// # Errors
 ///
 /// [`HarvestError::ShardUnavailable`] — typed and retryable — when there is no
-/// pool map, or the map has no entry for `target`.
+/// pool map, the map has no entry for `target`, or `target` is not currently
+/// writable.
 pub fn preflight_target_shard(
     sharded_pool: Option<&ShardedDbPool>,
+    router: Option<&crate::shard::ShardRouter>,
     target: ShardId,
 ) -> HarvestResult<()> {
     let unavailable = |reason: &str| HarvestError::ShardUnavailable {
@@ -234,6 +259,13 @@ pub fn preflight_target_shard(
     if pool.exact_pool_for(target).is_none() {
         return Err(unavailable(
             "no database pool is configured for this shard on this node",
+        ));
+    }
+    if let Some(router) = router
+        && !router.is_writable(target)
+    {
+        return Err(unavailable(
+            "shard is not currently accepting new workflows; it is being drained",
         ));
     }
     Ok(())
@@ -471,12 +503,13 @@ pub async fn enforce_cross_shard_children(
             status,
             cancel_requested: row.cancel_requested,
             parent_close_policy: policy,
+            // `None` when this sweep could not read the parents at all. Only a
+            // SUCCESSFUL read that lacks the id means the parent row has
+            // genuinely vanished (retention collection, erase) and there is
+            // nobody left to wake.
             parent_terminal: parent_terminal
-                .get(&row.parent_exec_id)
-                .copied()
-                // A parent row that has vanished (retention collection, erase)
-                // is treated as closed: there is nobody left to wake.
-                .unwrap_or(true),
+                .as_ref()
+                .map(|states| states.get(&row.parent_exec_id).copied().unwrap_or(true)),
             child_state: observed_child.map(|c| c.state.as_str()),
         };
 
@@ -659,17 +692,26 @@ async fn load_child_states(
 
 /// Batched `parent_id -> is_terminal` read on this (the parent's) shard.
 ///
-/// Absorbs its own failure into an empty map rather than propagating: this runs
-/// inside `enforce_timeouts_once`'s `?`-chain, so a propagated error would skip
-/// every scanner duty ordered after the relay (debounce, throttle, event
-/// batches, the idempotency sweep) for the whole tick. An empty map makes every
-/// row observe `parent_terminal: true`; combined with the `DeliverTerminal`
-/// step's own `FOR UPDATE` re-read of the parent, the worst outcome is that a
-/// row is retired one sweep early — never a wrong history append.
+/// Returns `None` when the read itself failed — **not** an empty map. The
+/// distinction is a correctness one, not a stylistic one: the call site treats a
+/// missing id as "the parent row is gone, so it is closed", which is right for a
+/// *successful* read (retention collection, erase) and catastrophically wrong
+/// for a failed one. `Retire` deletes the outbox row outright with no second
+/// look at the parent, so collapsing a transient read error into "terminal"
+/// would permanently lose the terminal wake of every awaited cross-shard child
+/// in the batch, and would cascade-cancel detached children whose parents are
+/// alive. `None` propagates as `parent_terminal: None`, from which the decision
+/// table never decides anything destructive.
+///
+/// The failure is absorbed rather than propagated because this runs inside
+/// `enforce_timeouts_once`'s `?`-chain: a propagated error would skip every
+/// scanner duty ordered after the relay (debounce, throttle, event batches, the
+/// idempotency sweep) for the whole tick. Start and cancel steps do not consult
+/// the parent, so they still make progress during a parent-read outage.
 async fn load_parent_terminal_states(
     conn: &mut AsyncPgConnection,
     rows: &[CrossShardChildRow],
-) -> std::collections::HashMap<uuid::Uuid, bool> {
+) -> Option<std::collections::HashMap<uuid::Uuid, bool>> {
     let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.parent_exec_id).collect();
     let loaded: Result<Vec<(uuid::Uuid, String)>, _> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq_any(&ids))
@@ -680,17 +722,19 @@ async fn load_parent_terminal_states(
         .load(conn)
         .await;
     match loaded {
-        Ok(pairs) => pairs
-            .into_iter()
-            .map(|(id, state)| (id, crate::erase::is_terminal_state(&state)))
-            .collect(),
+        Ok(pairs) => Some(
+            pairs
+                .into_iter()
+                .map(|(id, state)| (id, crate::erase::is_terminal_state(&state)))
+                .collect(),
+        ),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "cross-shard child relay: failed to read parent states; \
-                 treating this sweep's parents as unknown"
+                "cross-shard child relay: failed to read parent states; this \
+                 sweep decides nothing that depends on them"
             );
-            std::collections::HashMap::new()
+            None
         }
     }
 }

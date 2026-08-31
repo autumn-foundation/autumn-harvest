@@ -19,6 +19,8 @@
 //! real parent wakes) lives in `cross_shard_children_tests.rs`, which needs
 //! Docker/Postgres.
 
+#[cfg(feature = "db")]
+use autumn_harvest::cross_shard_child::preflight_target_shard;
 use autumn_harvest::shard::{
     ChildPlacement, CrossShardChildAction, CrossShardChildObservation, CrossShardChildStatus,
     next_cross_shard_child_action, resolve_child_placement,
@@ -273,29 +275,39 @@ fn an_undeclared_residency_key_is_rejected_never_hashed() {
     );
 }
 
+/// A drain is a *transient* operational state, so it must not be rejected inside
+/// the workflow handler — where the ABI erases the error type and the executor
+/// turns it into a terminal failure. The resolver therefore returns the shard
+/// the caller named, and the rejection happens at the persist boundary.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
 #[test]
-fn a_pin_to_a_drained_shard_is_rejected_as_retryable() {
-    // A drain is a transient operational state — a rebalance, a maintenance
-    // window — so it must be retryable rather than terminally failing the
-    // workflow the way a genuine misconfiguration does.
+fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![ShardId::new(0)],
         ShardId::new(0),
     );
-    let err = resolve_child_placement(
+    // The resolver does NOT reject it — rejecting here would be terminal.
+    let resolved = resolve_child_placement(
         Some(&router),
         &ChildPlacement::Shard(ShardId::new(1)),
         ShardId::new(0),
         "child_wf",
         "parent#0",
     )
-    .expect_err("a drained shard must not accept new children");
-    assert!(err.is_shard_unavailable(), "got {err:?}");
-    assert!(
-        err.to_string().contains("drain"),
-        "the message must name the drain: {err}"
+    .expect("a drain must not fail the handler");
+    assert_eq!(
+        resolved,
+        ShardId::new(1),
+        "the resolver must never quietly swap the requested shard"
     );
+
+    // The preflight does, retryably. `None` for the pool map exercises the
+    // fail-closed arm; the drain check is asserted separately below.
+    let err = preflight_target_shard(None, Some(&router), resolved)
+        .expect_err("a drained shard must not accept new children");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
 }
 
 /// A fully-drained fleet must not silently place a `Distributed` child on the
@@ -303,25 +315,49 @@ fn a_pin_to_a_drained_shard_is_rejected_as_retryable() {
 ///
 /// `ShardRouter::pick_for_new_workflow` falls back to `default_shard` when the
 /// writable set is empty — correct for a top-level start, and exactly the silent
-/// fallback AC8 forbids for an opt-in placement. Placement is decided once and
-/// baked into the child's `ExecutionId`, so a wrong choice here is not
-/// recoverable after the maintenance window ends.
+/// fallback AC8 forbids for an opt-in placement. With the writable set empty the
+/// default shard is by definition not writable, so the preflight stops the
+/// fallback before anything is recorded.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
 #[test]
-fn distributed_placement_with_no_writable_shard_fails_instead_of_defaulting() {
+fn distributed_placement_with_no_writable_shard_is_stopped_by_the_preflight() {
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![],
         ShardId::new(0),
     );
-    let err = resolve_child_placement(
+    let resolved = resolve_child_placement(
         Some(&router),
         &ChildPlacement::Distributed,
         ShardId::new(0),
         "child_wf",
         "parent#1",
     )
-    .expect_err("a fully-drained fleet must not silently use the default shard");
+    .expect("resolution itself must not fail the handler");
+    assert!(
+        !router.is_writable(resolved),
+        "with no writable shard the pick is the non-writable default"
+    );
+    let err = preflight_target_shard(None, Some(&router), resolved)
+        .expect_err("a fully-drained fleet must not silently use the default shard");
     assert!(err.is_shard_unavailable(), "got {err:?}");
+}
+
+/// The preflight fails closed with no pool map at all — a reachable
+/// misconfiguration, since the router and the pool map are independent globals.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
+#[test]
+fn the_preflight_fails_closed_with_no_pool_map() {
+    let router = four_shard_router();
+    let err = preflight_target_shard(None, Some(&router), ShardId::new(2))
+        .expect_err("no pool map must not admit a cross-shard placement");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+    assert!(
+        err.to_string().contains('2'),
+        "the message must name the shard: {err}"
+    );
 }
 
 /// A genuine misconfiguration stays a terminal `Config` error: retrying an
@@ -383,7 +419,7 @@ const fn awaited(status: CrossShardChildStatus) -> CrossShardChildObservation<'s
         status,
         cancel_requested: false,
         parent_close_policy: None,
-        parent_terminal: false,
+        parent_terminal: Some(false),
         child_state: None,
     }
 }
@@ -396,7 +432,7 @@ const fn detached(
         status,
         cancel_requested: false,
         parent_close_policy: Some(policy),
-        parent_terminal: false,
+        parent_terminal: Some(false),
         child_state: None,
     }
 }
@@ -480,7 +516,7 @@ fn a_closed_parent_cascades_to_its_running_cross_shard_detached_children() {
         ParentClosePolicy::Terminate,
     ] {
         let mut obs = detached(CrossShardChildStatus::Started, policy);
-        obs.parent_terminal = true;
+        obs.parent_terminal = Some(true);
         obs.child_state = Some("RUNNING");
         assert_eq!(
             next_cross_shard_child_action(&obs),
@@ -493,7 +529,7 @@ fn a_closed_parent_cascades_to_its_running_cross_shard_detached_children() {
 #[test]
 fn abandon_never_cascades() {
     let mut obs = detached(CrossShardChildStatus::Started, ParentClosePolicy::Abandon);
-    obs.parent_terminal = true;
+    obs.parent_terminal = Some(true);
     obs.child_state = Some("RUNNING");
     assert_eq!(
         next_cross_shard_child_action(&obs),
@@ -508,7 +544,7 @@ fn an_awaited_child_outliving_a_closed_parent_retires_the_row() {
     // cancelled or terminated parent. There is nobody left to wake, so the row
     // must be dropped rather than polled forever.
     let mut obs = awaited(CrossShardChildStatus::Started);
-    obs.parent_terminal = true;
+    obs.parent_terminal = Some(true);
     obs.child_state = Some("RUNNING");
     assert_eq!(
         next_cross_shard_child_action(&obs),
@@ -524,7 +560,7 @@ fn a_terminal_child_still_delivers_even_when_the_parent_has_closed() {
     // is the safe ordering: it can degrade to a row-delete, whereas retiring
     // first would drop a wake the parent could still legitimately consume.
     let mut obs = awaited(CrossShardChildStatus::Started);
-    obs.parent_terminal = true;
+    obs.parent_terminal = Some(true);
     obs.child_state = Some("COMPLETED");
     assert_eq!(
         next_cross_shard_child_action(&obs),
@@ -539,6 +575,79 @@ fn a_child_row_not_yet_visible_on_the_target_shard_waits() {
     assert_eq!(
         next_cross_shard_child_action(&obs),
         CrossShardChildAction::Wait
+    );
+}
+
+/// **Regression (Codex round 1, P1).** A sweep that could not read the parents
+/// must decide nothing destructive.
+///
+/// `Retire` deletes the outbox row outright with no second look at the parent,
+/// so collapsing a transient parent-read failure into "the parent is terminal"
+/// permanently loses the terminal wake of every awaited cross-shard child in the
+/// batch — and cascade-cancels detached children whose parents are alive. The
+/// unknown state is `None`, and only `Some(true)` retires or cascades.
+#[test]
+fn an_unreadable_parent_state_never_retires_or_cascades() {
+    // Awaited, child still running, parent unknown -> wait, never retire.
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = None;
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Wait,
+        "an unread parent must not retire an awaited child's row"
+    );
+
+    // Detached, child still running, parent unknown -> wait, never cascade.
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+        ParentClosePolicy::Abandon,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.parent_terminal = None;
+        obs.child_state = Some("RUNNING");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::Wait,
+            "an unread parent must not cascade {policy:?} onto a live child"
+        );
+    }
+}
+
+/// The steps that do not depend on the parent still make progress while the
+/// parent read is failing — a parent-side blip must not stall child creation or
+/// a pending cancel.
+#[test]
+fn an_unreadable_parent_state_still_starts_and_cancels() {
+    let mut pending = awaited(CrossShardChildStatus::PendingStart);
+    pending.parent_terminal = None;
+    assert_eq!(
+        next_cross_shard_child_action(&pending),
+        CrossShardChildAction::StartChild
+    );
+
+    let mut cancelling = awaited(CrossShardChildStatus::Started);
+    cancelling.parent_terminal = None;
+    cancelling.cancel_requested = true;
+    cancelling.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&cancelling),
+        CrossShardChildAction::CancelChild
+    );
+}
+
+/// A terminal child is still delivered while the parent read is failing: the
+/// delivery step re-reads the parent under `FOR UPDATE` and skips the append
+/// itself if it has sealed, so this is safe and avoids stalling every wake.
+#[test]
+fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = None;
+    obs.child_state = Some("COMPLETED");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::DeliverTerminal
     );
 }
 
