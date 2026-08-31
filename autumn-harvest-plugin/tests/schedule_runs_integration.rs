@@ -33,7 +33,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -80,7 +80,7 @@ async fn setup_two_shards() -> ((String, String), ContainerAsync<Postgres>) {
             .expect("shard connect");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("migrate shard");
@@ -769,7 +769,7 @@ async fn lookup_error_on_earlier_shard_still_resolves_on_later_shard() {
             .expect("shard connect");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("migrate shard 1");

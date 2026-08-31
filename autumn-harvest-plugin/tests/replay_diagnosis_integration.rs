@@ -32,7 +32,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to an already-migrated Postgres to
 //! run against it directly (no Docker); otherwise a testcontainer is started with
-//! the schema applied via `autumn_harvest::full_migrations_sql()`. This suite is
+//! the schema applied via `autumn_harvest::test_init_sql()`. This suite is
 //! executed Docker-backed in CI (per the #543/#544/#601 precedent).
 
 #![allow(clippy::similar_names)]
@@ -71,7 +71,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ── Test workflow ────────────────────────────────────────────────────────────

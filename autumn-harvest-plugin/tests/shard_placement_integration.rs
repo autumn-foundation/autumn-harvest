@@ -125,7 +125,7 @@ async fn setup_three_shards() -> ((String, String, String), Option<ContainerAsyn
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
             .await
             .expect("shard connect");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate shard");
     }

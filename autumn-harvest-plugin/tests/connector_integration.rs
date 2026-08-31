@@ -23,7 +23,7 @@
 //!
 //! Execution: honours `HARVEST_TEST_DATABASE_URL` (a migrated Postgres) so the
 //! suite runs where Docker is unavailable; otherwise boots a testcontainers
-//! Postgres from `autumn_harvest::full_migrations_sql()` plus this plugin's
+//! Postgres from `autumn_harvest::test_init_sql()` plus this plugin's
 //! own connector dead-letter migration.
 
 use std::pin::Pin;
@@ -55,7 +55,7 @@ const CONNECTOR_DLQ_SQL: &str =
     include_str!("../migrations/harvest/20260719900000_harvest_connector_dead_letters/up.sql");
 
 fn init_sql() -> Vec<u8> {
-    let mut sql = autumn_harvest::full_migrations_sql().to_string();
+    let mut sql = autumn_harvest::test_init_sql().to_string();
     sql.push('\n');
     sql.push_str(CONNECTOR_DLQ_SQL);
     sql.into_bytes()

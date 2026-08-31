@@ -27,7 +27,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -99,7 +99,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
             .expect("failed to connect to shard database");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("failed to apply harvest migrations to shard database");

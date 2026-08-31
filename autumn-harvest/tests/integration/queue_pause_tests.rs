@@ -67,7 +67,7 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = connect(&url).await;
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrations");
     (url, Some(container))

@@ -6,7 +6,7 @@
 //!
 //!   1. Duplicate migration timestamp prefixes (two `migrations/<ts>_*` dirs
 //!      sharing a `<ts>`), which make Diesel's ordering ambiguous.
-//!   2. An incomplete `full_migrations_sql()` bundle (the paved-path helper new
+//!   2. An incomplete `test_init_sql()` bundle (the paved-path helper new
 //!      testcontainers tests apply), proving it is regenerated from the whole
 //!      `migrations/` tree.
 //!   3. A test fixture that *reintroduces* a hand-rolled migration bundle
@@ -177,7 +177,7 @@ fn version_collision_detection_covers_both_trees() {
 
 #[test]
 fn full_migrations_sql_bundle_is_complete() {
-    let bundle = autumn_harvest::full_migrations_sql();
+    let bundle = autumn_harvest::test_init_sql();
     assert!(!bundle.is_empty(), "migration bundle must not be empty");
 
     // A sentinel from the very first migration (the initial schema) proves the
@@ -205,7 +205,7 @@ fn full_migrations_sql_bundle_is_complete() {
     missing.sort_unstable();
     assert!(
         missing.is_empty(),
-        "full_migrations_sql() is missing {} of {} migration(s) — the bundle drifted from \
+        "test_init_sql() is missing {} of {} migration(s) — the bundle drifted from \
          the migrations/ tree: {missing:?}",
         missing.len(),
         names.len()
@@ -234,7 +234,7 @@ fn full_migrations_sql_bundle_is_complete() {
 
 // ── Paved-path reintroduction guard (PR #1031 / PR #1045 follow-up) ───────────
 //
-// PR #1031 added a completeness guard for `full_migrations_sql()` itself (above),
+// PR #1031 added a completeness guard for `test_init_sql()` itself (above),
 // and PR #1045 swept every DB fixture onto that paved path. Neither prevents a
 // NEW fixture from *reintroducing* a hand-rolled
 // `concat!(include_str!("…migrations/…up.sql"), …)` bundle — which silently
@@ -245,7 +245,7 @@ fn full_migrations_sql_bundle_is_complete() {
 
 /// Test-fixture files (workspace-root-relative paths) that legitimately still
 /// hand-roll a migration bundle instead of calling
-/// `autumn_harvest::full_migrations_sql()`. Each entry documents WHY the fixture
+/// `autumn_harvest::test_init_sql()`. Each entry documents WHY the fixture
 /// needs a bespoke — usually deliberately-partial — schema. Adding a new partial
 /// fixture requires a conscious edit here with a reason; that is the point.
 const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
@@ -260,10 +260,10 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // (`20260514000000_drop_harvest_dag_runs`); needs the pre-drop schema.
     "autumn-harvest-plugin/tests/timeline_integration.rs",
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
-    // the core `migrations/` bundle that `full_migrations_sql()` emits.
+    // the core `migrations/` bundle that `test_init_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
     // The three connector suites (issue #944) each build
-    // `full_migrations_sql()` and then append the plugin-owned
+    // `test_init_sql()` and then append the plugin-owned
     // `harvest_connector_dead_letters` migration, which likewise lives in
     // `autumn-harvest-plugin/migrations/harvest/` rather than the core bundle.
     // The paved path is used for everything it covers; only the one plugin
@@ -307,7 +307,7 @@ fn line_is_handrolled_migration_include(line: &str) -> bool {
 /// rustfmt-wrapped shapes, and is STRICTLY MORE PRECISE than a per-line substring
 /// test — the tokens must belong to one real `include_str!` argument — so
 /// prose/doc comments merely mentioning `migrations/.../up.sql`, or a
-/// `full_migrations_sql()` reference, are never flagged.
+/// `test_init_sql()` reference, are never flagged.
 fn detects_handrolled_migration_include(contents: &str) -> bool {
     // Collapse every run of whitespace (incl. newlines/indent) to a single space
     // so a wrapped `include_str!(\n  "..."\n)` becomes `include_str!( "..." )`, and
@@ -407,7 +407,7 @@ fn line_detector_flags_a_handrolled_include_and_ignores_others() {
     ));
     // The paved path itself is not a hand-rolled include.
     assert!(!line_is_handrolled_migration_include(
-        "    let sql = autumn_harvest::full_migrations_sql();"
+        "    let sql = autumn_harvest::test_init_sql();"
     ));
 }
 
@@ -439,7 +439,7 @@ fn whole_file_detector_flags_a_rustfmt_wrapped_include() {
         "const CI: &str = include_str!(\n    \"../../../.github/workflows/ci.yml\"\n);"
     ));
     assert!(!detects_handrolled_migration_include(
-        "// this fixture used to include_str! a migrations/foo/up.sql bundle; now paved.\nlet sql = autumn_harvest::full_migrations_sql();"
+        "// this fixture used to include_str! a migrations/foo/up.sql bundle; now paved.\nlet sql = autumn_harvest::test_init_sql();"
     ));
 }
 
@@ -447,7 +447,7 @@ fn whole_file_detector_flags_a_rustfmt_wrapped_include() {
 /// `autumn-harvest-plugin/tests/**` may reintroduce a hand-rolled migration
 /// bundle outside `ALLOWED_HANDROLLED_MIGRATION_INCLUDES`, and every allowlisted
 /// entry must still actually contain one (a stale entry — a fixture later
-/// converted to `full_migrations_sql()` — fails and must be removed).
+/// converted to `test_init_sql()` — fails and must be removed).
 #[test]
 fn no_new_handrolled_migration_bundles_outside_allowlist() {
     let root = workspace_root();
@@ -494,7 +494,7 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
     assert!(
         new_offenders.is_empty(),
         "these test fixtures reintroduce a hand-rolled migration bundle \
-         (include_str!(\"…migrations/…up.sql\")). Use autumn_harvest::full_migrations_sql() \
+         (include_str!(\"…migrations/…up.sql\")). Use autumn_harvest::test_init_sql() \
          instead (see PR #1045), or — only if the fixture genuinely needs a partial schema — \
          add it to ALLOWED_HANDROLLED_MIGRATION_INCLUDES with a documented reason:\n  {}",
         new_offenders
@@ -514,7 +514,7 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
     assert!(
         stale.is_empty(),
         "ALLOWED_HANDROLLED_MIGRATION_INCLUDES has stale entries — these no longer contain a \
-         hand-rolled migration include (converted to full_migrations_sql()?). Remove them:\n  {}",
+         hand-rolled migration include (converted to test_init_sql()?). Remove them:\n  {}",
         stale.join("\n  ")
     );
 }

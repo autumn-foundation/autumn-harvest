@@ -158,7 +158,7 @@ async fn fresh_db(tag: &str) -> Option<(String, String)> {
     let url = with_db_name(&admin, &db);
     let mut fresh = connect(&url).await;
     fresh
-        .batch_execute(autumn_harvest::full_migrations_sql())
+        .batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     Some((url, db))

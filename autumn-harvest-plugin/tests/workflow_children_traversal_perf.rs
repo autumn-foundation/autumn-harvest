@@ -75,7 +75,7 @@ use tower::ServiceExt;
 // ── DB bootstrap (adapted from `lineage_tree_integration.rs`) ──────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;

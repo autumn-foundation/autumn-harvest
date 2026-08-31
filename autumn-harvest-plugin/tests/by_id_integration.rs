@@ -59,7 +59,7 @@ type HarvestApiApp = axum::Router;
 // Paved-path migration bundle (issue #604): the whole `migrations/` directory,
 // so the schema can never drift from the hand-rolled list.
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Dual-mode: use a pre-migrated Postgres from `HARVEST_TEST_DATABASE_URL` when

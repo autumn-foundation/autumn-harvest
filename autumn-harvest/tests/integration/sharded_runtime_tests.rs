@@ -115,7 +115,7 @@ async fn setup_shard_databases(
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
         urls.insert(ShardId::new(*shard), shard_url);

@@ -54,7 +54,7 @@ use tokio::sync::Barrier;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 type HarvestApiApp = axum::Router;
 
@@ -129,7 +129,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }

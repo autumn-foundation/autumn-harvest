@@ -42,7 +42,7 @@ static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 const CREATE_USER_RECORDS: &str = "
@@ -66,7 +66,7 @@ async fn setup_db() -> (String, DbHandle) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .unwrap_or(()); // ignore "already exists" errors on repeat runs
         return (url, DbHandle::External);

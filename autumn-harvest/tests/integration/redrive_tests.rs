@@ -76,7 +76,7 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
         .await
         .expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrations");
 

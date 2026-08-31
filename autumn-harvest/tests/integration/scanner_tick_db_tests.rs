@@ -31,7 +31,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Prefer an operator-supplied database (a local Postgres) and fall back to
@@ -55,7 +55,7 @@ async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
                 .await
                 .expect("HARVEST_TEST_DATABASE_URL must be reachable");
             fresh
-                .batch_execute(autumn_harvest::full_migrations_sql())
+                .batch_execute(&autumn_harvest::test_init_sql())
                 .await
                 .expect("migrations should apply");
         }

@@ -51,7 +51,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 // ── Harness ────────────────────────────────────────────────────────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// A live URL to a migrated Postgres, keeping the container (if any) alive.
@@ -1462,4 +1462,61 @@ fn enable_options_reject_a_nonsensical_cohort_width() {
         "a zero lookahead means every append lands in the DEFAULT partition"
     );
     assert!(EnableOptions::default().validate().is_ok());
+}
+
+// ══ The CI layout switch itself ════════════════════════════════════════════
+
+/// Guards the `linuxpart` CI pass against the worst failure mode a
+/// second test run can have: passing while testing nothing new.
+///
+/// `HARVEST_TEST_PARTITIONED` is the only thing that distinguishes that pass
+/// from the plain `linux` one. If the flag ever stopped taking effect — a typo
+/// in the manifest osclass, an env var the runner forgot to export, a
+/// `test_init_sql()` that quietly dropped the enable script — every partitioned
+/// suite would keep passing while re-running the *unpartitioned* layout, and
+/// AC2's "byte-identical between layouts" evidence would silently become a
+/// tautology. This test fails loudly in exactly that case.
+///
+/// It is also meaningful in the default pass, where it pins the other half of
+/// the contract: with the flag unset, the bootstrap must be byte-for-byte the
+/// plain migration bundle, so an existing deployment's test coverage is
+/// unaffected by any of this.
+#[tokio::test]
+async fn the_test_bootstrap_honours_the_partitioned_layout_switch() {
+    let requested = autumn_harvest::test_partitioned_layout_requested();
+
+    if !requested {
+        assert_eq!(
+            autumn_harvest::test_init_sql(),
+            autumn_harvest::full_migrations_sql(),
+            "with HARVEST_TEST_PARTITIONED unset the bootstrap must be exactly \
+             the migration bundle — partitioning is opt-in, and every existing \
+             suite must keep running against the layout operators have today"
+        );
+        return;
+    }
+
+    assert!(
+        autumn_harvest::test_init_sql().contains("PARTITION BY RANGE (cohort)"),
+        "HARVEST_TEST_PARTITIONED is set, so the bootstrap must carry the \
+         enable script"
+    );
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let layout = partition::detect_layout(&mut conn).await.expect("detect");
+    assert!(
+        layout.is_partitioned(),
+        "HARVEST_TEST_PARTITIONED is set but the database came up UNPARTITIONED \
+         ({layout:?}). The partitioned CI pass would then be a second, \
+         identical run of the default pass — green, and proving nothing."
+    );
+    assert!(
+        partition::list_partitions(&mut conn)
+            .await
+            .expect("list")
+            .iter()
+            .any(|p| p.is_default),
+        "and it must be fully set up, DEFAULT partition included"
+    );
 }

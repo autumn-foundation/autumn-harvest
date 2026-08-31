@@ -74,7 +74,7 @@ fn leaked_name(prefix: &str) -> &'static str {
 // ── DB + app setup ──────────────────────────────────────────────────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -153,7 +153,7 @@ async fn setup_one_shard() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = AsyncPgConnection::establish(&url)
         .await
         .expect("shard connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrate shard");
 

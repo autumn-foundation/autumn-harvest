@@ -757,136 +757,38 @@ pub async fn enable_partitioning(
     }
 
     let width = opts.cohort_width_secs;
-    let lock_timeout_ms = u64::try_from(opts.lock_timeout.as_millis()).unwrap_or(u64::MAX);
     let now = Utc::now();
 
-    let mode = Box::pin(conn.transaction::<EnableMode, HarvestError, _>(async |conn| {
-        exec(conn, &format!("SET LOCAL lock_timeout = '{lock_timeout_ms}ms'")).await?;
+    // `enable_sql` is the single implementation of the conversion (the test
+    // harness feeds the very same string to a container's init SQL), so there
+    // is no second copy of these steps here to drift out of sync with it.
+    //
+    // Sent through `batch_execute`, not `sql_query`: the script is two
+    // statements (the cohort function, then the `DO` block), and Postgres's
+    // extended protocol — which `sql_query` uses — rejects multiple commands in
+    // one prepared statement. `batch_execute` uses the simple query protocol,
+    // where a multi-statement string runs as ONE implicit transaction, so the
+    // atomicity the conversion needs is preserved: a failure anywhere rolls the
+    // whole script back and leaves the deployment exactly as it was.
+    diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts))
+        .await
+        .map_err(|e| {
+            HarvestError::Database(format!("partition enable script failed: {e}"))
+        })?;
 
-        // The cohort function is the single source of truth for the width, and
-        // it is what the trigger calls, so it must be redefined BEFORE any row
-        // can be stamped under the new layout.
-        exec(conn, &cohort_function_sql(width)).await?;
-
-        // Capture the index definitions while they still name `harvest_events`
-        // — executing them after the rename recreates them verbatim on the new
-        // parent. Constraint-backed indexes are excluded: their partitioned
-        // equivalents must gain the cohort column and are added explicitly.
-        let index_defs = capture_index_defs(conn).await?;
-
-        let has_rows = scalar_bool(
-            conn,
-            "SELECT EXISTS (SELECT 1 FROM harvest_events) AS v",
-        )
-        .await?;
-
-        // The legacy partition covers everything below the current cohort.
-        // Every pre-conversion row carries the migration's `-infinity`
-        // sentinel, so all of them fall inside it with no row touched; every
-        // row appended from here on takes the new DEFAULT, whose value is at or
-        // after `cohort_start(now)`. The two ranges therefore meet exactly at
-        // the cutover with no gap and no overlap, and — because wall clock only
-        // advances — no later append can ever route back into legacy. The
-        // legacy partition is sealed from the moment it is attached.
-        let cutover = cohort_start(now, width);
-
-        // Detach the sequence before the rename so it survives a `DROP TABLE`
-        // of the empty legacy table and can be re-owned by the new parent. The
-        // BIGSERIAL cursor must be continuous across the conversion: reusing an
-        // id already present in the legacy partition would violate the parent's
-        // primary key.
-        exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE").await?;
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}"),
-        )
-        .await?;
-        rename_legacy_objects(conn).await?;
-
-        // `LIKE … INCLUDING DEFAULTS` copies the columns, their NOT NULLs and
-        // the `nextval(...)` id default — and, crucially, keeps working when a
-        // later migration adds a column, rather than pinning a hand-written
-        // column list that would silently drop it.
-        exec(
-            conn,
-            &format!(
-                "CREATE TABLE harvest_events \
-                 (LIKE {LEGACY_PARTITION} INCLUDING DEFAULTS INCLUDING COMMENTS \
-                  INCLUDING STORAGE) PARTITION BY RANGE (cohort)"
-            ),
-        )
-        .await?;
-
-        // Swap the migration's constant `-infinity` sentinel for the live
-        // cohort expression. Metadata-only (a default change never rewrites a
-        // table), and it is what actually routes every subsequent append: the
-        // engine's INSERT statements never mention `cohort`, so the DEFAULT is
-        // always what Postgres uses to pick the partition — before any row
-        // trigger can run.
-        exec(
-            conn,
-            "ALTER TABLE harvest_events \
-             ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now())",
-        )
-        .await?;
-
-        // Both constraints gain `cohort` because Postgres requires the
-        // partition key in every unique constraint. This is only sound because
-        // `cohort` is functionally dependent on `workflow_exec_id`: the second
-        // constraint below still enforces exactly "one row per
-        // (execution, event_id)".
-        exec(
-            conn,
-            "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey \
-             PRIMARY KEY (id, cohort)",
-        )
-        .await?;
-        exec(
-            conn,
-            "ALTER TABLE harvest_events \
-             ADD CONSTRAINT harvest_events_workflow_exec_id_event_id_key \
-             UNIQUE (workflow_exec_id, event_id, cohort)",
-        )
-        .await?;
-
-        for def in &index_defs {
-            exec(conn, def).await?;
-        }
-
-        exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id").await?;
-
-        // Restores the insert-time half of the FK the partitioned layout
-        // cannot keep. Installed on the parent, Postgres clones it onto every
-        // partition — existing and future. Validate-only: it must never touch
-        // `NEW`, because routing has already happened by the time it fires.
-        exec(
-            conn,
-            &format!(
-                "CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events \
-                 FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()"
-            ),
-        )
-        .await?;
-
-        // The catch-all. Created before any cohort partition so there is never
-        // an instant where an append could find no partition.
-        exec(
-            conn,
-            &format!(
-                "CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT"
-            ),
-        )
-        .await?;
-
-        if has_rows {
-            attach_legacy(conn, cutover).await?;
-            Ok(EnableMode::AttachLegacy { cutover })
-        } else {
-            exec(conn, &format!("DROP TABLE {LEGACY_PARTITION}")).await?;
-            Ok(EnableMode::Fresh)
-        }
-    }))
-    .await?;
+    // Report which path the script took by reading the catalog it produced,
+    // rather than by predicting it: whether the table had rows is the script's
+    // decision, made under the lock it holds.
+    let mode = match list_partitions(conn)
+        .await?
+        .into_iter()
+        .find(|p| p.name == LEGACY_PARTITION)
+    {
+        Some(legacy) => EnableMode::AttachLegacy {
+            cutover: legacy.upper.unwrap_or(now),
+        },
+        None => EnableMode::Fresh,
+    };
 
     let partitions_created = ensure_partitions(conn, now, opts.lookahead_cohorts).await?;
     Ok(EnableReport {
@@ -896,149 +798,201 @@ pub async fn enable_partitioning(
     })
 }
 
-/// Attach the pre-conversion table whole as the `MINVALUE .. cutover`
-/// partition.
+/// The complete, self-contained SQL that converts a fresh or small
+/// `harvest_events` to the partitioned layout.
 ///
-/// The two unique indexes are built here rather than reused: the parent's
-/// primary key and unique constraint now include `cohort`, and Postgres refuses
-/// to attach a partition that has no matching index for them.
+/// This is the **single implementation** of the conversion.
+/// [`enable_partitioning`] executes exactly this script and then reads the
+/// resulting catalog to report which path it took, and the test harness feeds
+/// the same string to a container's `init_sql` so the entire existing DB test
+/// corpus can be re-run against the partitioned layout by setting one
+/// environment variable (issue #958, AC2). There is deliberately no second copy
+/// of these steps in Rust to drift out of sync with this one.
 ///
-/// The `NOT VALID` + `VALIDATE CONSTRAINT` pair is what lets `ATTACH PARTITION`
-/// skip its own full-table verification scan. In-transaction here (test and
-/// small-table scale); [`migration_plan`] splits it out so the validation scan
-/// runs under `SHARE UPDATE EXCLUSIVE` — concurrent-write-safe — on a large
-/// live table.
-#[cfg(feature = "db")]
-async fn attach_legacy(
-    conn: &mut AsyncPgConnection,
-    cutover: DateTime<Utc>,
-) -> HarvestResult<()> {
-    let lit = ts_literal(cutover);
-    // The FK's ON DELETE CASCADE is precisely the row-by-row delete storm being
-    // eliminated; its insert-time half lives on in the validate-only trigger.
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE {LEGACY_PARTITION} \
-             DROP CONSTRAINT IF EXISTS harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX}"
-        ),
-    )
-    .await?;
-    // ATTACH propagates the parent's PRIMARY KEY onto the partition, and a
-    // table may have only one. The old single-column key must go: the parent's
-    // is `(id, cohort)`, and `id` alone can no longer be a key because
-    // uniqueness on a partitioned table has to include the partition column.
-    // Global `id` uniqueness is not lost — one sequence still feeds every
-    // partition, and the composite key rejects the only duplicate that could
-    // otherwise appear.
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE {LEGACY_PARTITION} \
-             DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX}"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS \
-             harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_pk_idx \
-             ON {LEGACY_PARTITION} (id, cohort)"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_exec_event_idx \
-             ON {LEGACY_PARTITION} (workflow_exec_id, event_id, cohort)"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE {LEGACY_PARTITION} ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck \
-             CHECK (cohort < {lit}) NOT VALID"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE {LEGACY_PARTITION} VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck"
-        ),
-    )
-    .await?;
-    exec(
-        conn,
-        &format!(
-            "ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION} \
-             FOR VALUES FROM (MINVALUE) TO ({lit})"
-        ),
-    )
-    .await?;
-    Ok(())
-}
+/// It introspects rather than hard-codes: the index set is read from the
+/// catalog and replayed, so a later migration that adds an index to
+/// `harvest_events` is carried onto the partitioned parent with no change here.
+///
+/// Idempotent — a second run against an already-partitioned table returns
+/// immediately.
+///
+/// For a table large enough that the in-transaction index builds and constraint
+/// validation would hold `ACCESS EXCLUSIVE` too long, use [`migration_plan`]
+/// instead: the same algorithm with the expensive steps moved out of the lock
+/// window.
+#[must_use]
+pub fn enable_sql(opts: &EnableOptions) -> String {
+    let width = opts.cohort_width_secs.max(1);
+    let lookahead = opts.lookahead_cohorts;
+    let lock_ms = opts.lock_timeout.as_millis().max(1);
+    let cohort_fn = cohort_function_sql(width);
+    format!(
+        r#"-- Issue #958: convert harvest_events to the partitioned layout.
+-- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
+{cohort_fn};
 
-/// Rename the legacy table's own indexes and constraints out of the way.
-///
-/// Renaming a table does not rename its indexes, so without this the recreated
-/// parent indexes would collide with the originals on their (schema-scoped)
-/// names.
-#[cfg(feature = "db")]
-async fn rename_legacy_objects(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
-    let constraints = diesel::sql_query(format!(
-        "SELECT conname AS v FROM pg_constraint
-          WHERE conrelid = '{LEGACY_PARTITION}'::regclass
-            AND conname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'"
-    ))
-    .load::<TextRow>(conn)
-    .await
-    .map_err(database_error)?;
-    for c in constraints {
-        exec(
-            conn,
-            &format!(
-                "ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT \
-                 {} TO {}{LEGACY_RENAME_SUFFIX}",
-                quote_ident(&c.v),
-                c.v
-            ),
-        )
-        .await?;
-    }
+DO $harvest_enable_958$
+DECLARE
+    width_secs  bigint := {width};
+    lookahead   int    := {lookahead};
+    idx_defs    text[];
+    idx_def     text;
+    obj         record;
+    cutover     timestamptz;
+    lo          timestamptz;
+    hi          timestamptz;
+    step        int;
+    had_rows    boolean;
+BEGIN
+    -- Idempotent: already partitioned, nothing to do.
+    IF (SELECT c.relkind
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()) = 'p'
+    THEN
+        RETURN;
+    END IF;
 
-    // Constraint renames carry their backing indexes with them; anything left
-    // is a plain index.
-    let indexes = diesel::sql_query(format!(
-        "SELECT indexname AS v FROM pg_indexes
-          WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
-            AND indexname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'"
-    ))
-    .load::<TextRow>(conn)
-    .await
-    .map_err(database_error)?;
-    for i in indexes {
-        exec(
-            conn,
-            &format!(
-                "ALTER INDEX {} RENAME TO {}{LEGACY_RENAME_SUFFIX}",
-                quote_ident(&i.v),
-                i.v
-            ),
-        )
-        .await?;
-    }
-    Ok(())
+    -- Fail fast rather than queue: a conversion that cannot get the lock must
+    -- not leave every append waiting behind it.
+    EXECUTE 'SET LOCAL lock_timeout = ' || quote_literal('{lock_ms}ms');
+
+    -- Captured BEFORE the rename, so each definition still names
+    -- `harvest_events` and replays verbatim onto the new parent, where Postgres
+    -- propagates it to every partition. Constraint-backed indexes are excluded:
+    -- their replacements must include the partition key and are added below.
+    SELECT coalesce(array_agg(pg_get_indexdef(i.indexrelid)), ARRAY[]::text[])
+      INTO idx_defs
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
+
+    SELECT EXISTS (SELECT 1 FROM harvest_events) INTO had_rows;
+
+    -- The legacy partition covers everything below the current cohort. Every
+    -- pre-conversion row carries the migration's `-infinity` sentinel, so all
+    -- of them fall inside it with no row touched; every row appended from here
+    -- takes the new DEFAULT, whose value is at or after this instant. The two
+    -- ranges meet exactly, with no gap and no overlap -- and because wall clock
+    -- only advances, no later append can route back into legacy. The legacy
+    -- partition is sealed from the moment it is attached.
+    cutover := harvest_event_cohort(now());
+
+    -- Detached so the sequence survives a DROP of an empty legacy table and can
+    -- be re-owned by the new parent. The BIGSERIAL cursor must stay continuous
+    -- across the conversion: reusing an id already present in the legacy
+    -- partition would violate the parent's primary key.
+    EXECUTE 'ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE';
+    EXECUTE 'ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}';
+
+    -- Renaming a table renames neither its indexes nor its constraints, so
+    -- without this the new parent could not reclaim their schema-scoped names.
+    FOR obj IN SELECT conname AS n FROM pg_constraint
+                WHERE conrelid = '{LEGACY_PARTITION}'::regclass
+                  AND conname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'
+    LOOP
+        EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',
+                       obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+    END LOOP;
+    FOR obj IN SELECT indexname AS n FROM pg_indexes
+                WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
+                  AND indexname NOT LIKE '%{LEGACY_RENAME_SUFFIX}'
+    LOOP
+        EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+    END LOOP;
+
+    -- `LIKE ... INCLUDING DEFAULTS` copies the columns, their NOT NULLs and the
+    -- `nextval(...)` id default -- and keeps working when a later migration
+    -- adds a column, rather than pinning a hand-written column list that would
+    -- silently drop it. Foreign keys are NOT copied, which is the point: the
+    -- FK's ON DELETE CASCADE is the row-by-row delete storm being eliminated.
+    EXECUTE 'CREATE TABLE harvest_events '
+         || '(LIKE {LEGACY_PARTITION} INCLUDING DEFAULTS INCLUDING COMMENTS INCLUDING STORAGE) '
+         || 'PARTITION BY RANGE (cohort)';
+
+    -- Swap the migration's constant `-infinity` sentinel for the live cohort
+    -- expression. Metadata-only, and it is what actually routes every
+    -- subsequent append: the engine's INSERT statements never mention `cohort`,
+    -- so the DEFAULT is always what Postgres uses to pick the partition --
+    -- before any row trigger could run.
+    EXECUTE 'ALTER TABLE harvest_events '
+         || 'ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now())';
+
+    -- Both constraints gain `cohort` because Postgres requires the partition
+    -- key in every unique constraint. The second still enforces exactly "one
+    -- row per (execution, event_id)": `cohort` comes from a DEFAULT that the
+    -- engine never overrides, so it cannot be used to slip a duplicate past it.
+    EXECUTE 'ALTER TABLE harvest_events '
+         || 'ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id, cohort)';
+    EXECUTE 'ALTER TABLE harvest_events '
+         || 'ADD CONSTRAINT harvest_events_workflow_exec_id_event_id_key '
+         || 'UNIQUE (workflow_exec_id, event_id, cohort)';
+
+    FOREACH idx_def IN ARRAY idx_defs LOOP
+        EXECUTE idx_def;
+    END LOOP;
+
+    EXECUTE 'ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id';
+
+    -- Restores the insert-time half of the FK the partitioned layout cannot
+    -- keep. Validate-only: routing has already happened by the time a row
+    -- trigger fires, so a trigger that touched the partition key would be
+    -- rejected by Postgres outright.
+    EXECUTE 'CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events '
+         || 'FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()';
+
+    -- The catch-all, created before any cohort partition so there is never an
+    -- instant in which an append could find no partition at all.
+    EXECUTE 'CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT';
+
+    IF had_rows THEN
+        -- ATTACH propagates the parent's PRIMARY KEY onto the partition, and a
+        -- table may have only one, so the old single-column key must go. `id`
+        -- alone can no longer be a key anyway: uniqueness on a partitioned
+        -- table has to include the partition column. Global `id` uniqueness is
+        -- not lost -- one sequence still feeds every partition.
+        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
+             || 'harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX}';
+        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
+             || 'harvest_events_pkey{LEGACY_RENAME_SUFFIX}';
+        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
+             || 'harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}';
+        EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_pk_idx '
+             || 'ON {LEGACY_PARTITION} (id, cohort)';
+        EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_exec_event_idx '
+             || 'ON {LEGACY_PARTITION} (workflow_exec_id, event_id, cohort)';
+        -- The NOT VALID + VALIDATE pair is what lets ATTACH skip its own
+        -- full-table verification scan. In one transaction here (fresh/small
+        -- scale); migration_plan() splits it out so the validation scan runs
+        -- under SHARE UPDATE EXCLUSIVE on a large live table.
+        EXECUTE format(
+            'ALTER TABLE {LEGACY_PARTITION} ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck '
+            || 'CHECK (cohort < %L) NOT VALID', cutover);
+        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} '
+             || 'VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck';
+        EXECUTE format(
+            'ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION} '
+            || 'FOR VALUES FROM (MINVALUE) TO (%L)', cutover);
+    ELSE
+        EXECUTE 'DROP TABLE {LEGACY_PARTITION}';
+    END IF;
+
+    -- Pre-create the lookahead window so the engine starts covered. Retention
+    -- maintenance extends it every tick from here; no operator cron is needed.
+    FOR step IN 0..lookahead LOOP
+        lo := harvest_event_cohort(now() + (step * width_secs) * interval '1 second');
+        hi := lo + (width_secs * interval '1 second');
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events '
+            || 'FOR VALUES FROM (%L) TO (%L)',
+            '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),
+            lo, hi);
+    END LOOP;
+END
+$harvest_enable_958$;
+"#
+    )
 }
 
 /// Definitions of every non-constraint index on `harvest_events`, verbatim.
@@ -1071,11 +1025,14 @@ async fn capture_index_defs(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<S
 #[must_use]
 pub fn cohort_function_sql(width_secs: i64) -> String {
     let width = width_secs.max(1);
+    // A NAMED dollar tag, not `$$`: this definition is embedded in a larger
+    // script alongside a `DO` block, and an anonymous tag there would terminate
+    // at the first nested `$$` instead of its own.
     format!(
         "CREATE OR REPLACE FUNCTION harvest_event_cohort(ts TIMESTAMPTZ)\n\
-         RETURNS TIMESTAMPTZ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$\n    \
+         RETURNS TIMESTAMPTZ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $harvest_cohort_fn$\n    \
          SELECT to_timestamp(floor(extract(epoch FROM $1) / {width}) * {width})\n\
-         $$"
+         $harvest_cohort_fn$"
     )
 }
 

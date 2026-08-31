@@ -450,6 +450,16 @@ jobs:
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         shell: bash
         run: bash .github/ci/run-suites.sh run linux
+
+      # Issue #958, AC2: re-run the store/replay/retention suites against the
+      # opt-in PARTITIONED `harvest_events` layout. Same suites, same
+      # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
+      # semantics are byte-identical between layouts" is asserted by the
+      # existing tests rather than by a separate set that could drift from them.
+      - name: Integration suites (partitioned harvest_events layout)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: bash .github/ci/run-suites.sh run linuxpart
       # Issue #684's signal/update-metric run targets SPECIFIC test paths across
       # two modules (a multi-token `--` filter), which the single-`filter`-column
       # manifest schema cannot represent; it stays a literal Docker-backed step.

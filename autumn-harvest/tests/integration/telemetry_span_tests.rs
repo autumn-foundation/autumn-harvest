@@ -43,7 +43,7 @@ use tracing_subscriber::layer::SubscriberExt;
 // -------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // -------------------------------------------------------------------------

@@ -65,7 +65,7 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
         .expect("map postgres port");
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let mut conn = connect(&url).await;
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     (url, Some(container))
@@ -123,7 +123,7 @@ async fn setup_isolated_db_url() -> (String, Option<ContainerAsync<Postgres>>, O
         .expect("create the isolated database");
     let url = with_database(&shared, &name);
     let mut conn = connect(&url).await;
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     (url, None, Some(name))

@@ -12,6 +12,10 @@
 #
 # Usage:
 #   run-suites.sh run linux     # osclass=linux rows, serial (--test-threads=1)
+#   run-suites.sh run linuxpart # osclass=linuxpart rows: the same live-DB shape
+#                               # as `linux`, but with HARVEST_TEST_PARTITIONED=1
+#                               # so the suite re-runs against the opt-in
+#                               # partitioned harvest_events layout (issue #958).
 #   run-suites.sh run allos     # osclass=allos rows, parallel, no live DB
 #   run-suites.sh compile       # plugin rows (osclass linux|compileonly) --no-run
 #
@@ -20,7 +24,7 @@ set -euo pipefail
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-  echo "usage: run-suites.sh <run <linux|allos> | compile>" >&2
+  echo "usage: run-suites.sh <run <linux|linuxpart|allos> | compile>" >&2
   exit 2
 fi
 
@@ -90,14 +94,22 @@ do_run() {
     if [ "$filter" != "-" ]; then
       post+=("$filter")
     fi
-    if [ "$os" = "linux" ]; then
+    if [ "$os" = "linux" ] || [ "$os" = "linuxpart" ]; then
       post+=(--test-threads=1)
     fi
     if [ "${#post[@]}" -gt 0 ]; then
       a+=(-- "${post[@]}")
     fi
 
-    if ! run_cargo "${a[@]}"; then
+    # `linuxpart` is `linux` with the layout switch flipped: identical cargo
+    # invocation, run against the opt-in partitioned `harvest_events` layout.
+    # Exported only for this invocation so a mixed run cannot leak the flag into
+    # the plain `linux` pass.
+    if [ "$want" = "linuxpart" ]; then
+      if ! HARVEST_TEST_PARTITIONED=1 run_cargo "${a[@]}"; then
+        note_failure "$crate/$target ($want)"
+      fi
+    elif ! run_cargo "${a[@]}"; then
       note_failure "$crate/$target ($want)"
     fi
   done < <(records)
@@ -161,16 +173,16 @@ case "$MODE" in
   run)
     WANT="${2:-}"
     case "$WANT" in
-      linux | allos) do_run "$WANT" ;;
+      linux | linuxpart | allos) do_run "$WANT" ;;
       *)
-        echo "usage: run-suites.sh run <linux|allos>" >&2
+        echo "usage: run-suites.sh run <linux|linuxpart|allos>" >&2
         exit 2
         ;;
     esac
     ;;
   compile) do_compile ;;
   *)
-    echo "bad mode: $MODE (expected: run <linux|allos> | compile)" >&2
+    echo "bad mode: $MODE (expected: run <linux|linuxpart|allos> | compile)" >&2
     exit 2
     ;;
 esac

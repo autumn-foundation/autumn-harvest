@@ -17,7 +17,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded, each test scrubs the executions table
 //! first); otherwise a fresh testcontainers Postgres is booted with the full
-//! migration bundle (`autumn_harvest::full_migrations_sql()`).
+//! migration bundle (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +41,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Capturing metrics recorder — records `(workflow, count)` from

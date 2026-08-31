@@ -119,7 +119,7 @@ fn marker_info() -> WorkflowInfo {
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
@@ -143,7 +143,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to per-test database");
-        SimpleAsyncConnection::batch_execute(&mut conn, autumn_harvest::full_migrations_sql())
+        SimpleAsyncConnection::batch_execute(&mut conn, autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         drop(conn);

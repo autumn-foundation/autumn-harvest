@@ -79,13 +79,13 @@ async fn setup_database() -> (String, DbGuard) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect test db");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("run migrations");
         (url, DbGuard::LocalPg)
     } else {
         let container = Postgres::default()
-            .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
+            .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
             .with_tag("16")
             .start()
             .await

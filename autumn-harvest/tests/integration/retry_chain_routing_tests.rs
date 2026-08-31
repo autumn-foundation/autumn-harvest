@@ -47,7 +47,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 // ── Harness ────────────────────────────────────────────────────────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
@@ -68,7 +68,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         drop(admin);
         let url = replace_database(&admin_url, &db_name);
         let mut conn = connect(&url).await;
-        SimpleAsyncConnection::batch_execute(&mut conn, autumn_harvest::full_migrations_sql())
+        SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         drop(conn);

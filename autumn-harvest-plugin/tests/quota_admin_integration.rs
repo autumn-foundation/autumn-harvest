@@ -67,7 +67,7 @@ use tower::ServiceExt;
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -150,7 +150,7 @@ async fn create_and_migrate_shard_pair(admin_url: &str, url_prefix: &str) -> (St
             .expect("connect to shard database");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("apply migrations to shard database");

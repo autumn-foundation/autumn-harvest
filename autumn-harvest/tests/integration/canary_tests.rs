@@ -45,7 +45,7 @@ const CANARY_WF: &str = "__harvest_canary_probe__default";
 const NORMAL_WF: &str = "normal_wf";
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ── Recording metrics ──────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ async fn provision_ephemeral_db(base_url: &str) -> String {
     let mut conn = AsyncPgConnection::establish(&new_url)
         .await
         .expect("connect to ephemeral database");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migration bundle to ephemeral database");
     new_url

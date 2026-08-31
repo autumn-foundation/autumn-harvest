@@ -40,7 +40,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -109,7 +109,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -154,7 +154,7 @@ async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize)
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
             .expect("shard connection");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         urls.push(url);
