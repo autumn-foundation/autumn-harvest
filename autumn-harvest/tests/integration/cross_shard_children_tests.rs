@@ -49,10 +49,16 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// across 4 writable shards").
 const SHARDS: [i32; 4] = [0, 1, 2, 3];
 
-/// How many children each fan-out test spawns. Large enough that landing every
-/// child on one shard by chance is vanishingly unlikely (4^-N), small enough to
-/// stay a CI-friendly test.
-const FAN_OUT_N: usize = 16;
+/// How many children each fan-out test spawns.
+///
+/// 32 is chosen so the suite can assert the strong form of AC8 — *every*
+/// writable shard receives at least one child — without being flaky: the
+/// probability that rendezvous hashing leaves any one of four shards empty is
+/// `4 * (3/4)^32`, about 4 in 10,000. (The ±10% distribution bound itself is
+/// asserted over a real 10,000-child fan-out in
+/// `cross_shard_child_placement_unit.rs`, where no database is involved and the
+/// full success-metric scale is cheap.)
+const FAN_OUT_N: usize = 32;
 
 const PARENT_SHARD: i32 = 0;
 
@@ -441,10 +447,13 @@ async fn a_distributed_fan_out_places_children_on_other_shards() {
     assert_eq!(child_ids.len(), FAN_OUT_N, "every child must be recorded");
 
     let shards_used: BTreeSet<i32> = child_ids.iter().map(|id| id.shard().as_i32()).collect();
-    assert!(
-        shards_used.len() > 1,
-        "placement must spread the fan-out; every child landed on {shards_used:?}"
-    );
+    for shard in SHARDS {
+        assert!(
+            shards_used.contains(&shard),
+            "shard {shard} received none of the {FAN_OUT_N} children (landed on \
+             {shards_used:?}); placement must spread across ALL writable shards"
+        );
+    }
 
     // Each child's row must exist on exactly the shard its id encodes — the
     // O(1), directory-less routing contract (AC2).
