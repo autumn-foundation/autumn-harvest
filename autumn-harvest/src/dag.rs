@@ -1723,9 +1723,13 @@ pub async fn run_unified_dag(
 /// compensator — a divergence, surfacing as a #603 nd-block (a stuck-but-
 /// recoverable run, never a silent partial rollback).
 ///
-/// The same class as the engine-wide `known_limitation_early_config_dependent_
-/// failure_does_not_replay_cleanly` (issue #601); issue #780 enlarges the
-/// surface rather than creating it. A durable fix means persisting the rejection
+/// The same class as any config-dependent decision the engine re-evaluates on
+/// replay because it left no history footprint; issue #780 enlarges the surface
+/// rather than creating it. (Issue #952 closed the sibling case where such a
+/// failure is *uncaught* and seals the run — see
+/// `replayer_tests::early_config_dependent_failure_replays_cleanly` — but a
+/// rejection the unwind catches and routes around records nothing, so it stays
+/// re-decided.) A durable fix means persisting the rejection
 /// in the *engine's* dispatch path — it cannot be done here, because a level
 /// dispatches concurrently through `join_all`, so a marker from inside a task
 /// future has no deterministic position and one after the join is read too late

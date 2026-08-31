@@ -2510,10 +2510,14 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
 /// `ScheduleActivity` lands where history records the compensator's — a
 /// divergence.
 ///
-/// This is the same class as
-/// `replayer_tests::known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
-/// (issue #601), which pins it with a plain non-fan-out `spawn_child_workflow_raw`
-/// call. Issue #780 **enlarges** the surface rather than creating it: before the
+/// This is the same class as any config-dependent decision that leaves no
+/// history footprint. Issue #952 closed the sibling case where such a failure is
+/// *uncaught* and seals the run (a trailing terminal `WorkflowFailed` is now
+/// transparent to in-progress matches —
+/// `replayer_tests::early_config_dependent_failure_replays_cleanly`), but a
+/// rejection the unwind catches and routes around records nothing at all, so it
+/// stays re-decided on every replay.
+/// Issue #780 **enlarges** the surface rather than creating it: before the
 /// unwind existed, a rejection `?`-escaped and sealed the run FAILED with no
 /// compensation events, so there was nothing for a later dispatch to collide
 /// with.

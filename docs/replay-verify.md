@@ -18,6 +18,47 @@ against the current codebase and exits non-zero on any regression, blocking the 
 - Payload codec mismatches if fixtures were exported with encrypted payloads
 - DAG-run replay regressions (a DAG-level verifier is a follow-up feature)
 
+### Histories from runs that FAILED
+
+A history that ends in a terminal `WorkflowFailed` is **verified up to its
+failure point**, and replays cleanly when the code fails again (issue #952).
+
+A failing decision cycle's history is truncated by construction: the commands it
+issued were never turned into events, and a sealed run can never gain another
+one. So the gate checks every recorded event positionally — a reordered activity,
+a renamed gate, a changed child input *before* the failure still fails the gate —
+and then stops. Past the failure point there is nothing to compare against, so a
+new command, an early return, or a park is not reported as drift.
+
+Concretely, for a fixture whose last event is `WorkflowFailed`:
+
+| The candidate build… | Verdict |
+| --- | --- |
+| fails the same way | `ReplaySucceeded`, with the reproduced error in `ReplayReport::failure_message()` |
+| parks at the failure point, having consumed every recorded event | `ReplaySucceeded` |
+| parks *early*, leaving recorded events unconsumed | `NonDeterminismDetected` — the gate still fails |
+| **fixed** the failing check and now completes (consuming every recorded event) | `ReplaySucceeded` |
+| diverges from a recorded event *before* the failure | `NonDeterminismDetected` — the gate still fails |
+| an engine-detected non-determinism, however the workflow wraps the error | `NonDeterminismDetected` — the gate still fails |
+| panics | `WorkflowFailed` — the gate still fails |
+
+One nuance is deliberate: a build whose replay **returns an error** without
+reaching every recorded event is not reported. A fail-fast fan-out is exactly
+that shape — the first branch to fail aborts its siblings, so the siblings'
+recorded events are legitimately never reached — and the recorded run failed for
+the same reason. Positional verification still covers every event the code does
+reach.
+
+Before this, any failed-run fixture reported a divergence at its terminal event,
+which is why teams allowlisted or dropped them from the gate. They can be kept
+now: a failed run's history is exactly where a post-mortem needs replay to work.
+
+The same failing cycle also records the awaited work it dispatched and then
+abandoned by failing before it could suspend — each dispatched child workflow and
+activity appears as its `ChildWorkflowStarted`/`ActivityScheduled` followed by a
+synthetic terminal explaining that it never started — so the fixture contains
+every command the code issued.
+
 > **`replay-verify` is for *completed* histories, and replays them strictly.**
 > To gate a deploy on the executions that are **in flight right now**, use the
 > replay-drift gate instead — see

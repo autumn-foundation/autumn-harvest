@@ -1174,6 +1174,23 @@ async fn run_strict_with_ctx(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
+                    } else if ctx.at_terminal_failure_frontier() {
+                        // Issue #952: the recorded history is sealed by a
+                        // terminal `WorkflowFailed`, so it stops at the failure
+                        // point and carries nothing to compare a post-failure
+                        // command against. A build that FIXED the failing check
+                        // (a raised payload cap, a now-registered handler) runs
+                        // past that point and completes — that is the fix
+                        // working, not drift, and the deploy gate must not
+                        // report it. Drift before the failure point is still
+                        // caught: every recorded event the code REACHED was
+                        // matched positionally above, and this arm runs only
+                        // after `history_has_unconsumed_events()` came back
+                        // false, so nothing recorded was skipped either.
+                        WorkflowOutcome::Completed {
+                            output,
+                            unhandled_signals: std::collections::BTreeMap::new(),
+                        }
                     } else if ctx
                         .drain_commands()
                         .iter()
@@ -1246,6 +1263,44 @@ async fn run_strict_with_ctx(
                     return WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
                         non_deterministic_details: details,
+                        handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
+                    };
+                }
+                // A park that left recorded history unconsumed is a genuine
+                // divergence — the candidate build stopped short of an event the
+                // recorded run produced. Mirrors the canary path's identical
+                // check (`run_workflow_canary` below).
+                //
+                // Issue #952 made this explicit rather than implicit: strict
+                // replay used to lean on `outcome_to_report` mapping EVERY
+                // `Suspended` outcome to `NonDeterminismDetected`, so an early
+                // park and a park at the live frontier were indistinguishable
+                // and both reported. Now that a park on a failing-tail history
+                // reports `ReplaySucceeded` (the failing cycle never suspended,
+                // so parking where it failed is faithful), the early park has to
+                // be separated out HERE, where the matcher is still in scope —
+                // `outcome_to_report` sees only the event list and cannot tell
+                // the two apart. The `InProgress` arms of
+                // `spawn_child_workflow_raw` / `execute_local_activity_raw` /
+                // the child- and signal-race twins deliberately make no inline
+                // ND decision and fall through to this park, so this is the one
+                // place that catches a build which dropped a later command.
+                if ctx.history_has_unconsumed_events() {
+                    let nd = ctx.take_nd_details().or_else(|| {
+                        Some(crate::error::NonDeterministicDetails {
+                            event_index: i32::try_from(ctx.replay_position()).ok(),
+                            expected: Some("<consume all history>".to_string()),
+                            actual: Some("<workflow suspended early>".to_string()),
+                            workflow_type: Some(ctx.workflow_type().to_string()),
+                            build_id: ctx.build_id().map(String::from),
+                        })
+                    });
+                    return WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: workflow suspended before all history \
+                                events were replayed"
+                            .to_string(),
+                        non_deterministic_details: nd,
                         handler_panic: false,
                         unhandled_signals: std::collections::BTreeMap::new(),
                     };
@@ -1412,6 +1467,23 @@ pub(crate) async fn run_workflow_canary(
                                 .to_string(),
                             non_deterministic_details: nd,
                             handler_panic: false,
+                            unhandled_signals: std::collections::BTreeMap::new(),
+                        }
+                    } else if ctx.at_terminal_failure_frontier() {
+                        // Issue #952: the recorded history is sealed by a
+                        // terminal `WorkflowFailed`, so it stops at the failure
+                        // point and carries nothing to compare a post-failure
+                        // command against. A build that FIXED the failing check
+                        // (a raised payload cap, a now-registered handler) runs
+                        // past that point and completes — that is the fix
+                        // working, not drift, and the deploy gate must not
+                        // report it. Drift before the failure point is still
+                        // caught: every recorded event the code REACHED was
+                        // matched positionally above, and this arm runs only
+                        // after `history_has_unconsumed_events()` came back
+                        // false, so nothing recorded was skipped either.
+                        WorkflowOutcome::Completed {
+                            output,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else if ctx

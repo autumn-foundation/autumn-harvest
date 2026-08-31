@@ -1531,6 +1531,22 @@ fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowE
 }
 
 /// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
+/// The failure a replay **reproduced**, in whichever field the report carries it.
+///
+/// Issue #952: a history that ends in a terminal `WorkflowFailed` and replays to
+/// a failure again reports `ReplaySucceeded` — the recorded run failed and the
+/// code failed the same way, which is what a determinism gate asks — and carries
+/// the error string in `ReplayReport::reproduced_failure`. A history with no
+/// terminal-failure tail (e.g. one truncated before its terminal event) still
+/// reports `ReplayStatus::WorkflowFailed`. Both shapes are a reproduced failure;
+/// anything else is a test failure.
+fn reproduced_workflow_failure(report: &autumn_harvest::testing::ReplayReport) -> String {
+    report
+        .failure_message()
+        .unwrap_or_else(|| panic!("expected a reproduced workflow failure:\n{report}"))
+        .to_string()
+}
+
 fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> HistorySnapshot {
     HistorySnapshot {
         workflow_name: name.to_string(),
@@ -2169,9 +2185,7 @@ async fn replay_typed_workflow_failed_round_trips_with_identical_typed_fields() 
         // A self-failing workflow surfaces as `WorkflowFailed` (it did not
         // complete successfully) — the *determinism* is the point: the same
         // typed envelope is reproduced on every cycle.
-        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
-            panic!("expected WorkflowFailed status, got: {report}");
-        };
+        let error = reproduced_workflow_failure(&report);
         reproduced.push(error);
     }
     assert_eq!(
@@ -5356,18 +5370,15 @@ fn single_child_spawn_with_oversized_input<'a>(
 /// `child_fan_out_raw_oversized_child_rejects_before_dispatching_any_sibling`,
 /// `tests/child_fanout_tests.rs`) back through the replayer.
 ///
-/// This does **not** achieve `ReplaySucceeded`, and that is expected, not a
-/// bug: see [`known_limitation_early_config_dependent_failure_does_not_replay_cleanly`]
-/// below for why a bare trailing `WorkflowFailed` diverges on *any* match
-/// attempt reaching it, fan-out or not. What this test locks in is the
-/// narrower claim the fix actually makes: the divergence is a plain
-/// `MarkerRecorded(fan_out:1)` vs `WorkflowFailed` mismatch (the code
-/// correctly attempting to peek/record the marker and finding the terminal
-/// event instead) -- not the pre-fix `ChildWorkflowStarted(fan_out_child)`
-/// vs `WorkflowFailed` mismatch, which would have meant a marker claiming a
-/// child that was never recorded lied about the group's true size.
+/// Issue #952 flipped this from the narrow "diverges at the marker, not at a
+/// phantom child" assertion to a full `ReplaySucceeded`: the trailing
+/// `WorkflowFailed` is now transparent to the in-progress `peek_fan_out_count`
+/// match, so the replayed run re-derives the same payload-cap failure instead
+/// of reporting non-determinism. The property the old assertion protected --
+/// that no `fan_out:{n}` marker claiming a never-recorded child is persisted --
+/// is still covered by the `child_fanout_tests.rs` test named above.
 #[tokio::test]
-async fn replayer_diverges_at_marker_not_at_a_phantom_child_for_payload_cap_failure() {
+async fn replayer_replays_a_payload_cap_fan_out_failure_cleanly() {
     let exec_id = ExecutionId::new();
     let events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -5390,49 +5401,33 @@ async fn replayer_diverges_at_marker_not_at_a_phantom_child_for_payload_cap_fail
             events,
         ))
         .await;
-    match report.status {
-        ReplayStatus::NonDeterminismDetected {
-            ref expected,
-            ref actual,
-            ..
-        } => {
-            assert_eq!(
-                expected, "MarkerRecorded(fan_out:1)",
-                "the fix must move the divergence to the marker check, not \
-                 a phantom child: {report}"
-            );
-            assert_eq!(actual, "WorkflowFailed");
-        }
-        other => panic!(
-            "expected a marker-vs-WorkflowFailed NonDeterminismDetected \
-             (see the known-limitation test for why this doesn't fully \
-             replay), got: {other:?}"
-        ),
-    }
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a fan-out payload-cap failure must replay cleanly (issue #952): {report}"
+    );
+    assert!(
+        reproduced_workflow_failure(&report).contains("payload too large"),
+        "the replayed run must re-derive the SAME payload-cap failure, not merely \
+         reach some other clean outcome: {report}"
+    );
 }
 
-/// Known, **pre-existing** engine limitation (predates issue #601 and is
-/// not specific to fan-out): a workflow whose first live execution fails
-/// due to a config-dependent check -- like the payload-size cap (issue
-/// #252) -- *after* at least one Harvest primitive call has already
-/// touched the matcher does not replay cleanly through `WorkflowReplayer`.
+/// Issue #952 AC1/AC2: the former
+/// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`.
 ///
-/// `HistoryMatcher::new` deliberately leaves a bare trailing `WorkflowFailed`
-/// non-transparent unless it is immediately followed by a `WorkflowRedriven`
-/// event (issue #510) -- see the comment there: "a genuinely failed run...
-/// must be unaffected." So any `match_*` call that reaches that cursor
-/// position sees `WorkflowFailed` instead of the event type it expects and
-/// reports a divergence, rather than gracefully recognizing "the workflow
-/// is about to fail anyway." This is demonstrated here with a **plain
-/// single-child** `spawn_child_workflow_raw` call (no fan-out involved at
-/// all) to prove the limitation is general: issue #601's `peek_fan_out_count`
-/// fix (above) narrows *what* diverges for a fan-out's own payload-cap
-/// failure, but closing this gap for good -- making terminal `WorkflowFailed`
-/// events transparent to in-progress match attempts -- is a deliberate,
-/// documented design tradeoff this codebase currently avoids, and is out of
-/// scope for a context.rs-only change.
+/// A workflow whose first live execution fails due to a config-dependent check
+/// -- the payload-size cap (#252), a missing payload store, a missing handler --
+/// *after* at least one Harvest primitive call has already touched the matcher
+/// now replays cleanly. `HistoryMatcher::new` marks the trailing terminal
+/// `WorkflowFailed` transparent, so the in-progress `match_child_workflow`
+/// observes "this run is failing" (`NoMatch`) instead of diverging, the
+/// payload-cap check re-fires, and the replayed run reproduces the recorded
+/// failure.
+///
+/// Demonstrated with a **plain single-child** `spawn_child_workflow_raw` call
+/// (no fan-out involved) to prove the fix is general.
 #[tokio::test]
-async fn known_limitation_early_config_dependent_failure_does_not_replay_cleanly() {
+async fn early_config_dependent_failure_replays_cleanly() {
     let exec_id = ExecutionId::new();
     let events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -5456,11 +5451,501 @@ async fn known_limitation_early_config_dependent_failure_does_not_replay_cleanly
         ))
         .await;
     assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an early config-dependent failure must replay cleanly (issue #952): {report}"
+    );
+    assert!(
+        reproduced_workflow_failure(&report).contains("payload too large"),
+        "the replayed run must re-derive the SAME payload-cap failure: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #952 -- failure-history fixture corpus.
+//
+// Success metric: >= 5 failing-cycle shapes report `ReplaySucceeded` with zero
+// false positives. Shapes 1-2 are the two flipped known-limitation tests above;
+// shapes 3-6 follow. Negative controls at the end prove the relaxation is
+// scoped to the failing tail and never blesses genuine drift.
+// ---------------------------------------------------------------------------
+
+/// Dispatches `input["children"]` awaited children concurrently and fails in the
+/// same decision cycle from a sibling branch -- the "failed before suspending"
+/// shape from issue #952's second seam. The children are dispatched (their
+/// `StartChildWorkflow` commands are pushed) and the workflow then returns `Err`
+/// without ever suspending.
+fn dispatch_children_then_fail<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["children"].as_u64().unwrap_or(1)).unwrap_or(1);
+        // `join_all`, not `try_join_all`: every slot is polled to completion, so
+        // on replay EVERY recorded dispatch pair is matched positionally. A
+        // fail-fast variant would short-circuit on slot 0 and leave the rest
+        // unverified — the corpus below would then pass with the later pairs
+        // missing, reordered, or carrying the wrong input.
+        let dispatch = async {
+            let outcomes = futures::future::join_all((0..n).map(|slot| {
+                ctx.spawn_child_workflow_raw("worker_child", serde_json::json!({ "slot": slot }))
+            }))
+            .await;
+            // Every dispatch this cycle abandoned surfaces as a child failure on
+            // replay; live, none of them resolved at all.
+            Ok::<Vec<Value>, HarvestError>(outcomes.into_iter().filter_map(Result::ok).collect())
+        };
+        let sibling = async {
+            Err::<Vec<Value>, HarvestError>(HarvestError::Config("budget exceeded".to_string()))
+        };
+        futures::try_join!(dispatch, sibling).map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// The history a post-#952 failing cycle persists for `dispatch_children_then_fail`:
+/// one `ChildWorkflowStarted` + synthetic `ChildWorkflowFailed` pair per
+/// dispatched child, in command-emission order, then the terminal
+/// `WorkflowFailed`.
+fn abandoned_children_history(n: usize) -> Vec<WorkflowEvent> {
+    let mut events = vec![WorkflowEvent::WorkflowStarted {
+        input: serde_json::json!({ "children": n }),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+    for slot in 0..n {
+        let child_id = ExecutionId::new();
+        events.push(WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "worker_child".to_string(),
+            input: serde_json::json!({ "slot": slot }),
+        });
+        events.push(WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: autumn_harvest::event::ABANDONED_DISPATCH_REASON.to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: Some(true),
+        });
+    }
+    events.push(WorkflowEvent::workflow_failed("budget exceeded"));
+    events
+}
+
+async fn replay_children_fixture(n: usize) -> autumn_harvest::testing::ReplayReport {
+    WorkflowReplayer::new()
+        .register_fn("dispatch_children_then_fail", dispatch_children_then_fail)
+        .replay_from_snapshot(make_snapshot(
+            "dispatch_children_then_fail",
+            ExecutionId::new(),
+            abandoned_children_history(n),
+        ))
+        .await
+}
+
+/// Shape 3: failed before suspending with ONE dispatched child.
+#[tokio::test]
+async fn failed_before_suspend_with_one_dispatched_child_replays_cleanly() {
+    let report = replay_children_fixture(1).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "one abandoned child dispatch must replay cleanly: {report}"
+    );
+}
+
+/// Shape 4: failed before suspending with N dispatched children.
+///
+/// Falsifiable in both halves: dropping any recorded pair (or reordering them,
+/// or changing a recorded input) makes `join_all`'s later slots diverge
+/// positionally, and the reproduced-error assertion pins that the replayed run
+/// actually observed the abandoned-dispatch records rather than re-dispatching
+/// live at a transparent frontier.
+#[tokio::test]
+async fn failed_before_suspend_with_three_dispatched_children_replays_cleanly() {
+    let report = replay_children_fixture(3).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "three abandoned child dispatches must replay cleanly: {report}"
+    );
+    assert!(
+        reproduced_workflow_failure(&report).contains("budget exceeded"),
+        "the sibling branch's failure is what the recorded run reproduced: {report}"
+    );
+}
+
+/// The abandoned-dispatch records are REACHED on replay — each child's spawn
+/// returns the recorded synthetic failure rather than re-dispatching live at a
+/// transparent frontier. The handler reports what it observed through its own
+/// error string, which the report carries back as `reproduced_failure`.
+fn observe_abandoned_children<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut observed = Vec::new();
+        for slot in 0..3 {
+            let outcome = ctx
+                .spawn_child_workflow_raw("worker_child", serde_json::json!({ "slot": slot }))
+                .await;
+            observed.push(match outcome {
+                Ok(value) => format!("slot{slot}=ok({value})"),
+                Err(error) => format!("slot{slot}=err({error})"),
+            });
+        }
+        Err(observed.join(" | "))
+    })
+}
+
+#[tokio::test]
+async fn a_replayed_abandoned_child_dispatch_surfaces_the_synthetic_failure() {
+    let report = WorkflowReplayer::new()
+        .register_fn("observe_abandoned_children", observe_abandoned_children)
+        .replay_from_snapshot(make_snapshot(
+            "observe_abandoned_children",
+            ExecutionId::new(),
+            abandoned_children_history(3),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{report}"
+    );
+    let observed = reproduced_workflow_failure(&report);
+    for slot in 0..3 {
+        assert!(
+            observed.contains(&format!("slot{slot}=err(")),
+            "slot {slot} must resolve from the recorded synthetic terminal, got {observed}"
+        );
+    }
+    assert_eq!(
+        observed
+            .matches(autumn_harvest::event::ABANDONED_DISPATCH_REASON)
+            .count(),
+        3,
+        "every recorded dispatch must surface the abandoned-dispatch reason: {observed}"
+    );
+}
+
+/// Shape 5: a workflow that records a `patched()` marker and then fails.
+fn marker_then_fail_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _gated = ctx.patched("gate");
+        // A SECOND gate, recorded nowhere: this one lands past the end of the
+        // recorded history, i.e. inside the transparent terminal-failure tail —
+        // so the shape exercises the matcher relaxation, not just the report
+        // mapping. Without the tail this is an `early completion mismatch`.
+        let _new_gate = ctx.patched("gate_added_after_the_failure");
+        Err("failed after the marker".to_string())
+    })
+}
+
+#[tokio::test]
+async fn failure_after_a_marker_replays_cleanly() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:gate".into(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::workflow_failed("failed after the marker"),
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("marker_then_fail_workflow", marker_then_fail_workflow)
+        .replay_from_snapshot(make_snapshot(
+            "marker_then_fail_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a failure recorded after a marker must replay cleanly: {report}"
+    );
+}
+
+/// Shape 6: a workflow that records a side effect and then fails.
+fn side_effect_then_fail_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _id = ctx.new_uuid();
+        // A second built-in past the end of recorded history — inside the
+        // transparent tail. The infallible built-ins take the DEFERRED
+        // non-determinism path, so this covers the other half of
+        // `strict_replay_no_match_is_divergence`'s failing-frontier exception.
+        let _fresh = ctx.new_uuid();
+        Err("failed after the side effect".to_string())
+    })
+}
+
+#[tokio::test]
+async fn failure_after_a_side_effect_replays_cleanly() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("018f0f5f-0000-7000-8000-000000000000"),
+        },
+        WorkflowEvent::workflow_failed("failed after the side effect"),
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "side_effect_then_fail_workflow",
+            side_effect_then_fail_workflow,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "side_effect_then_fail_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a failure recorded after a side effect must replay cleanly: {report}"
+    );
+}
+
+/// AC5: a history produced by a **pre-fix** deployment — a failing cycle whose
+/// dispatched children were silently dropped, so the whole record is
+/// `[WorkflowStarted, WorkflowFailed]` — is replayed through exactly the same
+/// matcher, with no stored event rewritten, re-tagged, or reinterpreted. The
+/// replayed code re-dispatches at the failing frontier and the sibling branch
+/// fails it again, so the gate no longer false-positives on it either.
+#[tokio::test]
+async fn a_pre_fix_history_with_dropped_dispatches_replays_without_reinterpretation() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "children": 3 }),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::workflow_failed("budget exceeded"),
+    ];
+    let replayer = WorkflowReplayer::new()
+        .register_fn("dispatch_children_then_fail", dispatch_children_then_fail);
+    let mut verdicts = Vec::new();
+    for _ in 0..2 {
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "dispatch_children_then_fail",
+                ExecutionId::new(),
+                events.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a pre-fix failing history must no longer false-flag the gate: {report}"
+        );
+        verdicts.push(report.failure_message().map(ToOwned::to_owned));
+    }
+    assert!(
+        verdicts[0]
+            .as_deref()
+            .is_some_and(|e| e.contains("budget exceeded")),
+        "the recorded failure must be reproduced from the pre-fix history, got {:?}",
+        verdicts[0]
+    );
+    assert_eq!(
+        verdicts[0], verdicts[1],
+        "the same stored JSON must produce the same verdict every cycle"
+    );
+}
+
+/// A `patched()` gate ADDED by the candidate build lands inside the transparent
+/// tail and takes the `NewlyPatched` branch (issue #952 review round 1): the
+/// live-frontier `debug_assert` there must read the cursor-only frontier, not
+/// `is_replaying()`, which now reports `true` for a sealed-failed run. Without
+/// the fix this test panics in a debug build.
+fn newly_patched_then_fail_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        assert!(
+            ctx.is_replaying(),
+            "a run sealed by a terminal WorkflowFailed is finished history, so every \
+             replay-suppressed side effect must stay suppressed"
+        );
+        let _added = ctx.patched("gate_added_by_the_candidate_build");
+        Err("still failing".to_string())
+    })
+}
+
+#[tokio::test]
+async fn a_new_patch_gate_on_a_sealed_failed_history_replays_cleanly() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::workflow_failed("still failing"),
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "newly_patched_then_fail_workflow",
+            newly_patched_then_fail_workflow,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "newly_patched_then_fail_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{report}"
+    );
+}
+
+/// Issue #952 x #510: a redrive REOPENS a sealed run, and its abandoned-dispatch
+/// records must not become history the reopened run replays — otherwise the
+/// redriven cycle reads back "this child failed" and could never re-issue the
+/// dispatch the operator redrove it to complete.
+#[tokio::test]
+async fn a_redriven_history_re_dispatches_the_work_its_failing_cycle_abandoned() {
+    let child_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({ "children": 1 }),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "worker_child".to_string(),
+            input: serde_json::json!({ "slot": 0 }),
+        },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: autumn_harvest::event::ABANDONED_DISPATCH_REASON.to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: Some(true),
+        },
+        WorkflowEvent::workflow_failed("budget exceeded"),
+        WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id: uuid::Uuid::new_v4(),
+            reason: Some("config fixed".to_string()),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("observe_abandoned_children", observe_abandoned_children)
+        .replay_from_snapshot(make_snapshot(
+            "observe_abandoned_children",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    // The reopened run must NOT read the abandoned record back: slot 0 has to
+    // reach the live dispatch path (a strict replay reports that as a divergence,
+    // which is the expected verdict for a redriven history under the STRICT
+    // harness — what matters is that it is not the recorded synthetic failure).
+    let observed = report
+        .failure_message()
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    assert!(
+        !observed.contains(autumn_harvest::event::ABANDONED_DISPATCH_REASON),
+        "a redriven run must never resolve a branch from an abandoned-dispatch \
+         record: {report}"
+    );
+}
+
+/// Negative control: drift *before* the failure point is still reported. The
+/// failing tail excuses only what happens past the last recorded event.
+#[tokio::test]
+async fn drift_before_the_failure_point_still_reports_non_determinism() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "a_different_activity".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::workflow_failed("boom"),
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("canonical_workflow", canonical_workflow)
+        .replay_from_snapshot(make_snapshot(
+            "canonical_workflow",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
         matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
-        "documents a known, pre-existing engine limitation (not a fan-out \
-         regression) -- if this ever starts passing, the limitation this \
-         test documents has been fixed and its doc comment should be \
-         updated/removed: {report}"
+        "a mismatched activity BEFORE the terminal failure is still drift: {report}"
+    );
+}
+
+/// Negative control: the relaxation is failure-only. A COMPLETED history whose
+/// code now issues an extra command is still an early-completion divergence.
+#[tokio::test]
+async fn completed_history_with_extra_command_still_reports_non_determinism() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "single_child_spawn_with_oversized_input",
+            single_child_spawn_with_oversized_input,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "single_child_spawn_with_oversized_input",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a completed history is verified in full: {report}"
     );
 }
 
@@ -7005,9 +7490,7 @@ async fn child_timeout_child_fails_before_deadline_replays_deterministically() {
             .register_fn("child_or_deadline", child_or_deadline_workflow)
             .replay_from_events(events.clone())
             .await;
-        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
-            panic!("a child failure before the deadline surfaces as WorkflowFailed:\n{report}");
-        };
+        let error = reproduced_workflow_failure(&report);
         reproduced.push(error);
     }
     assert_eq!(
@@ -7428,12 +7911,7 @@ async fn child_timeout_oversized_input_propagated_replays_deterministically() {
             )
             .replay_from_events(events.clone())
             .await;
-        let ReplayStatus::WorkflowFailed { error, .. } = report.status else {
-            panic!(
-                "a propagated cap failure must surface as WorkflowFailed, not a \
-                 spurious non-determinism:\n{report}"
-            );
-        };
+        let error = reproduced_workflow_failure(&report);
         assert!(
             error.contains("too large") || error.to_lowercase().contains("payload"),
             "the reproduced error must be the PayloadTooLarge, not a \
@@ -10047,15 +10525,11 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
         !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a fail-fast bounded history must NOT surface false non-determinism: {report}"
     );
-    match report.status {
-        ReplayStatus::WorkflowFailed { ref error, .. } => {
-            assert!(
-                error.contains("task_1_boom"),
-                "reproduced failure must carry the recorded activity error: {report}"
-            );
-        }
-        other => panic!("expected WorkflowFailed (clean reproduction), got {other:?}"),
-    }
+    let error = reproduced_workflow_failure(&report);
+    assert!(
+        error.contains("task_1_boom"),
+        "reproduced failure must carry the recorded activity error: {report}"
+    );
 }
 
 // ---------------------------------------------------------------------------

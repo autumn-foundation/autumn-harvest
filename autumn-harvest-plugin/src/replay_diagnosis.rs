@@ -117,6 +117,13 @@ pub fn report_to_response(
 ) -> ReplayDiagnosisResponse {
     let events_replayed = report.events_replayed;
     let summary = report.mismatched_command_summary.clone();
+    // Issue #952: a history sealed by a terminal `WorkflowFailed` that replays to
+    // the same failure is a CLEAN replay (the recorded run failed and the code
+    // failed again — no divergence), and the harness carries the reproduced error
+    // in `reproduced_failure`. Surface it: this endpoint is the operator's
+    // post-mortem surface, and answering "clean" with no error at all would drop
+    // exactly the thing they came to read.
+    let reproduced = report.reproduced_failure.clone();
     match report.status {
         ReplayStatus::ReplaySucceeded => ReplayDiagnosisResponse {
             execution_id: exec_id.to_string(),
@@ -125,10 +132,19 @@ pub fn report_to_response(
             diagnosis: DiagnosisVerdict::Clean,
             events_replayed,
             divergence: None,
-            failure: None,
+            failure: reproduced.as_ref().map(|error| FailureDetail {
+                error: error.clone(),
+                event_index: events_replayed,
+            }),
             // A clean replay has no mismatch summary; suppress it.
             summary: None,
-            message: "no divergence under current code".to_string(),
+            message: reproduced.map_or_else(
+                || "no divergence under current code".to_string(),
+                |_| {
+                    "no divergence under current code; the recorded failure was reproduced"
+                        .to_string()
+                },
+            ),
         },
         ReplayStatus::NonDeterminismDetected {
             kind,
@@ -170,10 +186,16 @@ pub fn report_to_response(
 /// (execution timeout #243, operator cancel/terminate #504, reset #148), NOT by
 /// the workflow's own return path.
 ///
-/// Deliberately excludes `WorkflowCompleted` / `WorkflowFailed`: those are the
-/// workflow's OWN outcomes, so a replay that lands on one means new code wants to
-/// do MORE work than the old run did — a genuine divergence that must stay
-/// `diverged`, not be masked as clean.
+/// Deliberately excludes `WorkflowCompleted`: that is the workflow's OWN
+/// outcome, so a replay that lands on one means new code wants to do MORE work
+/// than the old run did — a genuine divergence that must stay `diverged`, not be
+/// masked as clean.
+///
+/// `WorkflowFailed` is likewise excluded here, but since issue #952 it can no
+/// longer *reach* this reclassifier as an `actual`: a trailing terminal
+/// `WorkflowFailed` is transparent to the matcher, so a replay that runs past a
+/// failing cycle's own outcome reports clean at the source rather than producing
+/// a divergence for this function to reconsider.
 fn is_external_seal_event(actual: &str) -> bool {
     matches!(
         actual,
@@ -306,6 +328,7 @@ mod tests {
             events_replayed: 7,
             status: ReplayStatus::ReplaySucceeded,
             mismatched_command_summary: None,
+            reproduced_failure: None,
         };
         let resp = report_to_response(id, "wf".to_string(), "COMPLETED".to_string(), report);
         assert_eq!(resp.diagnosis, DiagnosisVerdict::Clean);
@@ -331,6 +354,7 @@ mod tests {
                 event_index: 2,
             },
             mismatched_command_summary: Some("expected send_email, got charge_card".to_string()),
+            reproduced_failure: None,
         };
         let resp = report_to_response(id, "wf".to_string(), "RUNNING".to_string(), report);
         assert_eq!(resp.diagnosis, DiagnosisVerdict::Diverged);
@@ -361,6 +385,7 @@ mod tests {
                 event_index: 4,
             },
             mismatched_command_summary: None,
+            reproduced_failure: None,
         };
         let resp = report_to_response(id, "wf".to_string(), "FAILED".to_string(), report);
         assert_eq!(resp.diagnosis, DiagnosisVerdict::WorkflowFailed);
@@ -403,6 +428,7 @@ mod tests {
                 event_index: 3,
             },
             mismatched_command_summary: Some("s".to_string()),
+            reproduced_failure: None,
         };
         report_to_response(id, "wf".to_string(), "TIMED_OUT".to_string(), report)
     }
@@ -479,6 +505,7 @@ mod tests {
                 events_replayed: 2,
                 status: ReplayStatus::ReplaySucceeded,
                 mismatched_command_summary: None,
+                reproduced_failure: None,
             },
         );
         let out = reclassify_sealed_mid_await(clean, true, true);
@@ -496,6 +523,7 @@ mod tests {
                     event_index: 2,
                 },
                 mismatched_command_summary: None,
+                reproduced_failure: None,
             },
         );
         let out = reclassify_sealed_mid_await(failed, true, true);
@@ -515,6 +543,7 @@ mod tests {
                 event_index: 0,
             },
             mismatched_command_summary: Some("s".to_string()),
+            reproduced_failure: None,
         };
         let resp = report_to_response(id, "wf".to_string(), "RUNNING".to_string(), report);
         let v = serde_json::to_value(&resp).expect("serializes");

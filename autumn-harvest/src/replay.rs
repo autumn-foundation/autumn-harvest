@@ -727,6 +727,24 @@ pub struct HistoryMatcher {
     /// blocked scan as a divergence in NORMAL worker replay too, not only under
     /// strict `WorkflowReplayer` mode (Codex P2 round 12, issue #768).
     timer_scan_stopped_at_command: bool,
+    /// Index of the first event of a **terminal-failure tail** (issue #952), or
+    /// `None` when this history does not end in a failure.
+    ///
+    /// A failing decision cycle's history is truncated by construction: the
+    /// commands the cycle issued were never turned into events, and no further
+    /// event can ever be appended to the sealed run. So a trailing terminal
+    /// `WorkflowFailed` (together with any post-terminal bookkeeping appended
+    /// after it) is made transparent in [`Self::new`] — every `match_*` at that
+    /// cursor answers `NoMatch` ("the run is failing") instead of `Diverged` —
+    /// and, once every pre-terminal event is consumed, the cursor is said to be
+    /// at the **failing frontier** ([`Self::at_terminal_failure_frontier`]),
+    /// where the strict-replay layers above stop reporting divergence.
+    ///
+    /// Deliberately failure-only: a `WorkflowCompleted`/`WorkflowCancelled`
+    /// history is verified in full, and a `WorkflowFailed` that is *reopened* by
+    /// a `WorkflowRedriven` (#510) is not a tail — that case keeps its own,
+    /// redrive-anchored transparency rule.
+    terminal_failure_tail: Option<usize>,
 }
 
 impl HistoryMatcher {
@@ -753,15 +771,24 @@ impl HistoryMatcher {
         // made transparent. A bare trailing `WorkflowFailed` with no following
         // redrive stays non-transparent — it is a genuinely failed run and its
         // replay (queries, the replayer harness) must be unaffected.
+        let mut redriven = false;
         for (i, event) in events.iter().enumerate() {
             if Self::is_redrive_lifecycle_event(event) {
+                redriven = true;
                 transparent_events.insert(i);
                 // Scan backward to the nearest WorkflowFailed, skipping events
-                // already settled transparent (e.g. an interleaved pause pair).
+                // already settled transparent (e.g. an interleaved pause pair)
+                // and post-terminal bookkeeping appended AFTER the terminal
+                // (a workflow-level retry's `WorkflowRetryScheduled` (#523), a
+                // parent-close cascade's `ChildWorkflowCascadeApplied` (#347)) —
+                // without that skip a retried-then-redriven run would leave its
+                // superseded terminal opaque and diverge against it.
                 let mut j = i;
                 while j > 0 {
                     j -= 1;
-                    if transparent_events.contains(&j) {
+                    if transparent_events.contains(&j)
+                        || Self::is_post_terminal_bookkeeping(&events[j])
+                    {
                         continue;
                     }
                     if matches!(events[j], WorkflowEvent::WorkflowFailed { .. }) {
@@ -769,6 +796,30 @@ impl HistoryMatcher {
                     }
                     break;
                 }
+            }
+        }
+        // Issue #952 x #510: a redrive REOPENS a run that a failing cycle sealed,
+        // and that cycle recorded the awaited work it abandoned (see
+        // `crate::event::ABANDONED_DISPATCH_REASON`). Those records exist to keep
+        // the audit trail honest about a run that is over — they must never
+        // become history the reopened run replays, or the redriven cycle would
+        // read back "this activity/child failed" and could never re-issue the
+        // dispatch the operator redrove it to complete. Mark each abandoned pair
+        // transparent so the reopened run emits it live, exactly as it did
+        // before #952 recorded anything at all.
+        if redriven {
+            for i in Self::abandoned_dispatch_indices(&events) {
+                transparent_events.insert(i);
+            }
+        }
+        // Terminal-failure tail (issue #952): a run sealed FAILED can never
+        // grow another event, so everything from its terminal event onward is
+        // transparent to command-dispatch replay — mirroring how the
+        // pause/resume and redrive events above are pre-marked consumed.
+        let terminal_failure_tail = Self::terminal_failure_tail_start(&events);
+        if let Some(start) = terminal_failure_tail {
+            for i in start..events.len() {
+                transparent_events.insert(i);
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
@@ -788,7 +839,127 @@ impl HistoryMatcher {
             deprecated_patches: HashMap::new(),
             patch_ids_recorded_this_cycle: HashSet::new(),
             timer_scan_stopped_at_command: false,
+            terminal_failure_tail,
         }
+    }
+
+    /// Index of the first event of this history's **terminal-failure tail**, or
+    /// `None` if it has none (issue #952).
+    ///
+    /// Walks backwards from the end over events that carry no workflow command
+    /// and are never consumed by the workflow function — operator pause/resume
+    /// (#383) and post-terminal bookkeeping appended *after* a terminal event
+    /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
+    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). If the
+    /// first event it lands on is a `WorkflowFailed`, that index opens the tail.
+    ///
+    /// A `WorkflowRedriven` (#510) is deliberately **not** skipped: a redriven
+    /// run is reopened, not failing, and keeps the narrower redrive-anchored
+    /// transparency instead.
+    ///
+    /// Public so [`crate::testing`] can ask the same question of a snapshot's
+    /// events without building a matcher — one definition, two callers.
+    #[must_use]
+    pub fn terminal_failure_tail_start(events: &[WorkflowEvent]) -> Option<usize> {
+        let mut idx = events.len();
+        while idx > 0 {
+            idx -= 1;
+            let event = &events[idx];
+            if Self::is_pause_lifecycle_event(event) || Self::is_post_terminal_bookkeeping(event) {
+                continue;
+            }
+            // `idx > 0` guard: a history whose FIRST event is the terminal
+            // failure is not a run that failed after doing something — it is a
+            // truncated or corrupt export (a real run always opens with
+            // `WorkflowStarted`). Excusing everything a candidate build does
+            // against such a fixture would let a malformed export pass the gate
+            // unconditionally, so it keeps the pre-#952 strict treatment.
+            return (idx > 0 && matches!(event, WorkflowEvent::WorkflowFailed { .. }))
+                .then_some(idx);
+        }
+        None
+    }
+
+    /// Events appended **after** a run's terminal event as durable bookkeeping.
+    /// They have no workflow-command counterpart and are never consumed by the
+    /// workflow function, so they cannot end a terminal-failure tail.
+    const fn is_post_terminal_bookkeeping(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::WorkflowRetryScheduled { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+        )
+    }
+
+    /// Indices of the **abandoned-dispatch records** a failing cycle wrote
+    /// (issue #952): each `ActivityFailed` / `ChildWorkflowFailed` carrying
+    /// [`crate::event::ABANDONED_DISPATCH_REASON`], together with the
+    /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
+    /// precedes it.
+    ///
+    /// The reason constant is the engine's own reserved marker — the same
+    /// device as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
+    /// `fan_out:{n}` markers (#601) — so this is a deterministic classification
+    /// of events the engine itself wrote, never a guess about author data.
+    fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
+        let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityFailed {
+                    activity_id, error, ..
+                } if error == crate::event::ABANDONED_DISPATCH_REASON => {
+                    abandoned_activities.insert(*activity_id);
+                    indices.push(i);
+                }
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id, error, ..
+                } if error == crate::event::ABANDONED_DISPATCH_REASON => {
+                    abandoned_children.insert(*child_id);
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        if indices.is_empty() {
+            return indices;
+        }
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                    if abandoned_activities.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                    if abandoned_children.contains(child_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
+    }
+
+    /// Whether this history ends in a terminal failure (issue #952).
+    #[must_use]
+    pub const fn has_terminal_failure_tail(&self) -> bool {
+        self.terminal_failure_tail.is_some()
+    }
+
+    /// Whether the cursor has consumed every pre-terminal event of a history
+    /// that ends in a terminal failure — the **failing frontier** (issue #952).
+    ///
+    /// Past this point the recorded history says only "the run failed here", so
+    /// a new command, an early return, or a park is not a divergence: there is
+    /// nothing left to compare against. Callers use it to suppress strict-replay
+    /// divergence reporting; it is never used to skip a *positional* match
+    /// against a real recorded event.
+    #[must_use]
+    pub fn at_terminal_failure_frontier(&self) -> bool {
+        self.has_terminal_failure_tail() && !self.is_replaying()
     }
 
     /// Returns whether the most recent cancellable-timer forward scan STOPPED at
@@ -10044,11 +10215,15 @@ mod tests {
         );
     }
 
+    // ── Terminal-failure tail transparency tests (issue #952) ─────────────
+
+    /// Superseded by issue #952: a bare trailing `WorkflowFailed` used to stay
+    /// opaque, which made every in-progress `match_*` on a failed run diverge
+    /// (see the two known-limitation tests in `tests/integration/replayer_tests.rs`).
+    /// It is now transparent — a failing cycle's history is truncated by
+    /// construction, so there is nothing past the failure point to verify.
     #[test]
-    fn bare_trailing_failed_stays_non_transparent() {
-        // Regression guard: a genuinely failed run (no following WorkflowRedriven)
-        // must keep its terminal WorkflowFailed non-transparent so the replay of
-        // failed workflows (queries, the replayer harness) is unaffected.
+    fn bare_trailing_failed_is_transparent() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -10061,8 +10236,338 @@ mod tests {
         ];
         let matcher = HistoryMatcher::new(events);
         assert!(
+            matcher.is_consumed(1),
+            "a bare trailing WorkflowFailed must be transparent to in-progress matches"
+        );
+        assert!(matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn in_progress_match_past_a_trailing_failed_is_no_match_not_diverged() {
+        // The whole point of the tail: a workflow that issues a match attempt
+        // and only then fails (a payload-cap / missing-handler / missing-store
+        // check) must observe "the run is failing" (NoMatch), not a divergence.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("payload too large"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("some_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a match attempt at the failing frontier must not diverge"
+        );
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "all pre-terminal events consumed → the cursor is at the failing frontier"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_tail_spans_post_terminal_bookkeeping() {
+        // A workflow-level retry (#523) appends WorkflowRetryScheduled AFTER the
+        // sealed run's WorkflowFailed. The tail must still be recognised, and
+        // every event in it transparent, or the retried run's history would keep
+        // false-flagging.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the WorkflowFailed must be transparent"
+        );
+        assert!(
+            matcher.is_consumed(2),
+            "post-terminal bookkeeping in the tail must be transparent too"
+        );
+    }
+
+    #[test]
+    fn a_failed_event_followed_by_real_history_is_not_a_tail() {
+        // Guard against over-reach: only the LAST terminal block is transparent.
+        // A WorkflowFailed with genuine command history after it (the #510
+        // redrive shape, here without the redrive marker) must keep today's
+        // behaviour — the redrive-anchored rule, not the tail rule, decides.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
             !matcher.is_consumed(1),
-            "a bare trailing WorkflowFailed must not be marked transparent"
+            "a WorkflowFailed with real history after it is not a terminal tail"
+        );
+        assert!(!matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn completed_and_cancelled_tails_are_not_terminal_failure_tails() {
+        // The relaxation is failure-only: a COMPLETED history is verified in
+        // full, so its terminal event must stay opaque (an extra command at that
+        // cursor is a genuine early-completion divergence).
+        for terminal in [
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+        ] {
+            let events = vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: chrono::Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+                terminal,
+            ];
+            let matcher = HistoryMatcher::new(events);
+            assert!(
+                !matcher.has_terminal_failure_tail(),
+                "only WorkflowFailed opens a terminal-failure tail"
+            );
+            assert!(!matcher.is_consumed(1));
+        }
+    }
+
+    #[test]
+    fn redrive_tail_is_not_a_terminal_failure_tail() {
+        // A redriven run is REOPENED, not failing: the #510 rule already makes
+        // its superseded terminal transparent, and the failing-frontier
+        // relaxations (which suppress strict-replay divergence reporting) must
+        // NOT apply to it.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.has_terminal_failure_tail(),
+            "a redrive reopens the run; it is not a failing tail"
+        );
+        assert!(
+            matcher.is_consumed(1) && matcher.is_consumed(2),
+            "the #510 redrive-anchored transparency is unchanged"
+        );
+    }
+
+    /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch
+    /// records its failing cycle wrote must become transparent — otherwise the
+    /// reopened cycle reads back "this dispatch failed" and can never re-issue
+    /// the work the operator redrove it to complete.
+    #[test]
+    fn a_redrive_makes_abandoned_dispatch_records_transparent() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=4 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the abandoned pair must be transparent after a redrive"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the reopened run must re-dispatch the child live"
+        );
+    }
+
+    /// Without a redrive the same records are ordinary, positionally-matched
+    /// history: they are what makes a failing cycle's own replay resolvable.
+    #[test]
+    fn abandoned_dispatch_records_stay_opaque_without_a_redrive() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(!matcher.is_consumed(1) && !matcher.is_consumed(2));
+        matcher.advance();
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { .. }
+            ),
+            "the failing cycle's own replay resolves the branch from its record"
+        );
+    }
+
+    /// A retried-then-redriven run: the redrive scan must skip the
+    /// post-terminal `WorkflowRetryScheduled` to reach the terminal it
+    /// supersedes.
+    #[test]
+    fn a_redrive_after_a_workflow_retry_still_supersedes_the_terminal() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the superseded terminal must be transparent even behind a retry record"
+        );
+    }
+
+    #[test]
+    fn failing_frontier_requires_every_pre_terminal_event_consumed() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            !matcher.at_terminal_failure_frontier(),
+            "the recorded activity is still unconsumed — not at the frontier"
+        );
+        assert!(matches!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "with the activity consumed the cursor sits in the transparent tail"
         );
     }
 
