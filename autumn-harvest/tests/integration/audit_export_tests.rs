@@ -1544,10 +1544,8 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
     // sees no hole (which is stronger than mere gap detection).
     assert_eq!(*seen.iter().next().expect("first"), 1);
     assert_eq!(*seen.iter().next_back().expect("last"), RECORDS);
-    let mut expected = 1_i64;
-    for seq in &seen {
+    for (expected, seq) in (1_i64..).zip(seen.iter()) {
         assert_eq!(*seq, expected, "sequence {expected} is missing");
-        expected += 1;
     }
     // The duplicates are the at-least-once contract, not a defect: the
     // pre-crash batch and the outage's re-attempts are re-sent, and the
