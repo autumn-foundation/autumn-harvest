@@ -68,16 +68,12 @@ batch.
   delivered after the race resolved — that signal belongs to a later
   `ctx.wait_for_signal`, which would otherwise park on a signal already
   delivered.
-- `ctx.race()` evaluates **signal branches first**. `pump_signal_handlers` runs
-  after every `match_history` call, and a sibling branch's matcher stashes the
-  race's signal on its way past it, so a push handler registered for the same
-  name would claim it before the race's own branch was checked — and the race
-  could then never re-resolve its recorded winner. The #476 reservation index
-  keys off the `__signal_timeout:{seq}:{name}` timer id, which encodes the
-  signal name; a mixed race's `__race:{seq}:{index}` id encodes none, and an
-  activity-vs-signal race arms no timer at all, so that index cannot cover this
-  shape. Claiming first does, and it is order-independent: the branch INDEX
-  still decides the tie-break.
+- `ctx.race()` **holds the signal pump across its signal phase** so a push
+  handler registered for a branch's name cannot claim the signal that branch is
+  there to resolve on. See the round-7 section below for why the ordering this
+  originally shipped with was not enough. Signal branches are still evaluated
+  first, but purely as ordering hygiene; it is order-independent either way,
+  because the branch INDEX decides the tie-break.
 - Concurrently-armed race deadlines share one virtual-clock anchor, so a
   resolved timer branch advances `ctx.now()` to `anchor + duration` (a monotonic
   max), never by summing durations — matching what `TestRunOutcome::final_now`
@@ -226,6 +222,50 @@ Both remain load-bearing rather than merely green: the performance guards still
 panic if the marker goes missing, and appending a fabricated `#987654` to the
 migration guide still fails the citation guard by name.
 
+**A push handler could still steal a race's signal (Codex round 7, P1;
+issue #1252).** The mitigation above shipped as *evaluation ordering* — check
+signal branches before the rest — on the reasoning that a sibling branch's scan
+is what stashes the race's signal into `pending_signals`, so going first denies
+the pump anything to claim. That reasoning was wrong, and the code comment and
+review reply asserting it have been corrected.
+
+Ordering only closes the window between branches. It cannot close the window
+*before the first branch*, and `race_impl` always has calls there: it reads its
+own `race:{seq}` open marker through `match_history`, and that read's
+`prepare_match` sweep is itself what first stashes the cycle's `SignalReceived`
+events. The pump fires immediately after it, with no branch yet evaluated. So
+two shapes stayed broken:
+
+- a **signal-only** race, `race().signal("abort")`, with a handler registered
+  for `abort` — the open-marker read's pump takes the signal, no branch
+  resolves, and replay reports non-determinism against the recorded
+  `race_winner` marker;
+- a **two-signal-branch** race where branch 0's scan crosses branch 1's signal
+  non-consumingly and the pump following branch 0's own matcher call claims it
+  before branch 1 runs.
+
+The mixed activity-vs-signal shape already covered by
+`race_mixed_signal_is_not_stolen_by_a_push_handler` passed throughout — which is
+why ordering looked sufficient. Both new shapes are pinned as regression tests
+and were confirmed failing first.
+
+No history-derived reservation can fix this. The #476 index works because
+`__signal_timeout:{seq}:{name}` encodes the signal name; a general race records
+only `race:{seq}` and `race_winner:{seq}`, which name no branch, so there is
+nothing to key an index off. The fix is therefore to defer the pump rather than
+to reserve events: `WorkflowContext` gains a `signal_pump_hold` counter that
+`pump_signal_handlers` checks and returns early on, raised by `race_impl` before
+the open-marker read and released after Phase A, at which point one explicit
+`flush_pending_signal_handlers` dispatches whatever no branch claimed. A counter
+rather than a flag so nesting cannot clear an outer hold; an RAII guard so
+`race_impl`'s several early `return Err(..)` paths cannot leak one.
+
+Nothing is dropped — a handler whose signal no race branch wanted still fires,
+one cycle position later than an unheld pump would have run it. Deferring is
+also the only available point: the events only become visible at the very read
+whose pump is suppressed, so there is no earlier moment at which to dispatch
+them.
+
 **Invariants.** **Zero new `WorkflowEvent` variants and no migration** — the
 batch composes existing events (`ActivityScheduled`, `TimerStarted`,
 `SignalReceived`, `ChildWorkflowStarted`, …) at their command-emission positions
@@ -255,8 +295,9 @@ Pre-existing parked tasks need no migration.
   non-determinism, a pin that the #476 timer+signal pair still takes the legacy
   path, and one regression test per review finding: a signal branch crossing
   more than one sibling event, a losing signal branch not stealing a later
-  wait, a push handler not stealing a mixed race's signal, and two timer
-  branches advancing the clock to the max deadline rather than the sum.
+  wait, a push handler not stealing a mixed race's signal — nor a signal-only
+  race's, nor a second signal branch's (issue #1252) — and two timer branches
+  advancing the clock to the max deadline rather than the sum.
 - `tests/integration/mixed_suspension_tests.rs` (DB-backed, real worker loop,
   wired into `.github/ci/integration-suites.txt` so it actually runs): the ≥ 6
   composition matrix end-to-end — activity×timer both directions,

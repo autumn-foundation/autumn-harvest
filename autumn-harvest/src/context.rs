@@ -2757,6 +2757,20 @@ pub struct WorkflowContext {
     /// history. Registration is idempotent -- the first registration wins on
     /// each replay, mirroring `update_registry`.
     signal_registry: Mutex<SignalHandlerRegistry>,
+    /// Depth of the current *signal-pump hold* (issue #950 post-ship
+    /// hardening, issue #1252).
+    ///
+    /// `pump_signal_handlers` normally runs after every `match_history` call.
+    /// A `ctx.race()` with a signal branch has to open a window in that rule:
+    /// it makes several matcher calls between reading its own `race:{seq}`
+    /// open marker and giving each signal branch a chance to claim, and a
+    /// handler registered for a branch's name would otherwise claim the
+    /// signal in one of those gaps -- before the branch it belongs to has
+    /// run. `race_impl` raises this counter across that window and pumps once
+    /// on the way out. A counter rather than a flag so nesting cannot clear
+    /// an outer hold early; a `Drop` guard so `race_impl`'s several early
+    /// `return Err(..)` paths cannot leak one.
+    signal_pump_hold: std::sync::atomic::AtomicUsize,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
     /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
@@ -2954,6 +2968,26 @@ pub struct WorkflowExecutionInfo {
     pub parent_execution_id: Option<ExecutionId>,
 }
 
+/// RAII guard returned by `WorkflowContext::hold_signal_pump` (issue #1252).
+///
+/// Holds `pump_signal_handlers` off for the lifetime of the guard so a
+/// multi-call signal phase -- `ctx.race()`'s branch loop -- cannot lose one of
+/// its own signals to a push handler registered for the same name. The guard
+/// exists so the holder's early-error paths release the hold too; releasing it
+/// is *not* the same as flushing, so the holder still calls
+/// `flush_pending_signal_handlers` on its success path.
+struct SignalPumpHold<'a> {
+    ctx: &'a WorkflowContext,
+}
+
+impl Drop for SignalPumpHold<'_> {
+    fn drop(&mut self) {
+        self.ctx
+            .signal_pump_hold
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
 
@@ -3080,6 +3114,20 @@ impl WorkflowContext {
     /// the handlers registered so far, not ones about to register on the
     /// next line.
     fn pump_signal_handlers(&self) {
+        // A signal-phase hold is in force (issue #1252): some caller is
+        // mid-way through a sequence of matcher calls whose own branches have
+        // first claim on the signals now sitting in `pending_signals`.
+        // Claiming here would resolve a handler with a signal its rightful
+        // waiter never got to see. The holder pumps once on release, so
+        // nothing is dropped -- only deferred to the end of that sequence.
+        if self
+            .signal_pump_hold
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            return;
+        }
+
         let names = self
             .signal_registry
             .lock()
@@ -3131,6 +3179,20 @@ impl WorkflowContext {
     /// are registered (the overwhelmingly common case).
     pub(crate) fn flush_pending_signal_handlers(&self) {
         self.match_history(|_| ());
+    }
+
+    /// Suspends [`pump_signal_handlers`](Self::pump_signal_handlers) until the
+    /// returned guard drops (issue #1252).
+    ///
+    /// Callers that need this are the ones whose *own* matcher calls are the
+    /// thing standing between a recorded signal and its rightful consumer --
+    /// today that is `race_impl`'s signal phase. Drop the guard and call
+    /// [`flush_pending_signal_handlers`](Self::flush_pending_signal_handlers)
+    /// to dispatch whatever the phase left unclaimed.
+    fn hold_signal_pump(&self) -> SignalPumpHold<'_> {
+        self.signal_pump_hold
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SignalPumpHold { ctx: self }
     }
 
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -3250,6 +3312,7 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
+            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -3401,6 +3464,7 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
+            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -3467,6 +3531,7 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
+            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
@@ -10389,6 +10454,16 @@ impl WorkflowContext {
         // (`persist_mixed_suspension_batch`), so the pre-#950
         // `HarvestError::Config` rejection for mixed branch kinds is gone.
 
+        // Hold the signal pump across this race's entire signal phase (issue
+        // #1252). It starts HERE, not at the branch loop: the open-marker read
+        // below is itself a `match_history` call, and its `prepare_match`
+        // sweep is what first stashes this cycle's `SignalReceived` events
+        // into `pending_signals` -- so the pump that would follow it is
+        // already early enough to claim a branch's signal before any branch
+        // has run. The hold is released after Phase A, and the deferred
+        // handlers are dispatched there.
+        let pump_hold = self.hold_signal_pump();
+
         let seq = self.next_race_seq();
         let count = branches.len();
         let open_marker = format!("race:{seq}");
@@ -10436,23 +10511,30 @@ impl WorkflowContext {
 
         // Issue #950: evaluate SIGNAL branches first, then the rest.
         //
-        // `pump_signal_handlers` runs after EVERY `match_history` call, and a
-        // push handler registered for the same name will claim any signal that
-        // has been stashed into `pending_signals` but not yet consumed. A
-        // sibling branch's matcher stashes exactly that on its way past the
-        // signal (`scan_activity_terminal` / `match_child_workflow` both stash
-        // and continue), so evaluating an activity or child branch first hands
-        // the race's own resolution to the handler and the race can never
-        // re-resolve its recorded winner.
+        // This is ordering hygiene, NOT the protection against a push handler
+        // stealing a branch's signal -- the `pump_hold` taken above is. An
+        // earlier revision claimed otherwise; issue #1252 showed why it cannot
+        // be true. Claiming first only narrows the window to the calls a race
+        // makes *before* its first signal branch, and there is always at least
+        // one of those (the open-marker read), so the window never closes.
         //
         // The reservation index that protects the #476 timer+signal race
         // (`race_reserved_signal_events`) keys off the `__signal_timeout:{seq}:{name}`
         // timer id, which encodes the signal name; a mixed race's `__race:{seq}:{index}`
         // id encodes no name, and an activity-vs-signal race arms no timer at
-        // all, so that index cannot cover this shape. Claiming first does, and
-        // it is order-independent: the branch INDEX still decides the tie-break
-        // (`settle_race` takes the minimum resolved index), so evaluation order
-        // has no effect on which branch wins.
+        // all. Nothing a general race records -- `race:{seq}` and
+        // `race_winner:{seq}` -- names its signal branches, so no
+        // history-derived reservation can cover this shape either. Holding the
+        // pump is what covers it.
+        //
+        // The ordering is kept, but do not read correctness into it: with the
+        // hold in place, deleting this sort leaves every race test green
+        // (measured). It is outcome-neutral by construction too -- the branch
+        // INDEX decides the tie-break (`settle_race` takes the minimum
+        // resolved index), so evaluation order cannot change which branch
+        // wins. It stays because a signal branch reaching its own event before
+        // a sibling's scan stashes it is the simpler cursor path, not because
+        // anything depends on it.
         let mut eval_order: Vec<usize> = (0..branches.len()).collect();
         eval_order.sort_by_key(|&i| !matches!(branches[i].kind, RaceBranchKind::Signal { .. }));
 
@@ -10721,6 +10803,16 @@ impl WorkflowContext {
                 }
             }
         }
+
+        // Every signal branch has now had its chance to claim, so the pump can
+        // resume and dispatch anything they left behind -- a handler whose
+        // signal no branch wanted still fires, one cycle position later than
+        // an unheld pump would have run it. Releasing is not flushing: the
+        // pump is a post-hook on `match_history`, so it has to be driven once
+        // explicitly here, or a claimable signal could sit undispatched until
+        // the workflow's next unrelated matcher call.
+        drop(pump_hold);
+        self.flush_pending_signal_handlers();
 
         // Validate payload caps for every branch about to be freshly
         // dispatched *before* pushing any bookkeeping for this cycle (the
@@ -26286,6 +26378,83 @@ mod tests {
             winner.index, 1,
             "the recorded winner is the signal branch; a push handler must not \
              have claimed the signal out from under it"
+        );
+        Ok(())
+    }
+
+    /// A **signal-only** race must not lose its signal to a push handler
+    /// registered for the same name.
+    ///
+    /// `match_history` pumps registered handlers after *every* matcher call,
+    /// and `race_impl` reads its `race:{seq}` open marker through
+    /// `match_history` before it evaluates a single branch. So the pump that
+    /// follows the open-marker read runs while the race is mid-flight, with no
+    /// branch having had a chance to claim anything yet. Nothing in the history
+    /// names a race's signal branches (only `race:{seq}` and
+    /// `race_winner:{seq}` are recorded), so no reservation index can protect
+    /// them the way `__signal_timeout:{seq}:{name}` protects #476 waits --
+    /// the race must instead hold the pump off across its signal phase.
+    #[tokio::test]
+    async fn race_signal_only_is_not_stolen_by_a_push_handler() -> Result<(), HarvestError> {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(1u64),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(0u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        ctx.register_signal_handler_raw("abort", |_payload: Value| {});
+
+        let winner = ctx.race().signal("abort").run().await?;
+        assert_eq!(
+            winner.index, 0,
+            "the sole branch is the recorded winner; the pump that follows the \
+             race's own open-marker read must not have claimed the signal first"
+        );
+        Ok(())
+    }
+
+    /// The same theft one branch later: branch 0 scans past branch 1's signal
+    /// without consuming it, and the pump that follows *branch 0's* matcher
+    /// call claims it before branch 1 is ever evaluated. Suppressing the pump
+    /// for the open-marker read alone would leave this shape broken, so the
+    /// hold has to span the whole branch loop.
+    #[tokio::test]
+    async fn race_second_signal_branch_is_not_stolen_by_a_push_handler() -> Result<(), HarvestError>
+    {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "second".to_string(),
+                payload: serde_json::json!({"n": 2}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(1u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        ctx.register_signal_handler_raw("second", |_payload: Value| {});
+
+        let winner = ctx.race().signal("first").signal("second").run().await?;
+        assert_eq!(
+            winner.index, 1,
+            "branch 1 is the recorded winner; branch 0's scan crossed its \
+             signal without consuming it, and the pump must not claim it in \
+             the gap before branch 1 runs"
         );
         Ok(())
     }
