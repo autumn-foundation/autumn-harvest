@@ -305,8 +305,8 @@ pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 #[cfg(feature = "db")]
 pub use db::{
     CodecRotationCursor, FleetWriteFence, ShardRotationProgress, compare_and_swap_event,
-    count_rows_by_key_id, load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption,
-    sweep_codec_reencryption_once,
+    count_rows_by_key_id, load_shard_rotation_progress, load_shard_rotation_progress_against,
+    retire_codec_key, sweep_codec_reencryption, sweep_codec_reencryption_once,
 };
 
 #[cfg(feature = "db")]
@@ -537,6 +537,39 @@ mod db {
         codecs: &PayloadCodecs,
     ) -> HarvestResult<ShardRotationProgress> {
         let active_key_id = codecs.active_key_id();
+        load_shard_rotation_progress_against(conn, shard_id, codecs, &active_key_id).await
+    }
+
+    /// [`load_shard_rotation_progress`], classifying against a **caller-pinned**
+    /// active key rather than whatever the registry holds right now.
+    ///
+    /// A multi-shard report reads each shard on its own connection, so reading
+    /// the active key per shard lets a concurrent
+    /// [`PayloadCodecs::set_active_key`] straddle the fan-out: shards observed
+    /// before the flip classify their rows against the outgoing key and count
+    /// them as converted, shards observed after classify the same key's rows as
+    /// remaining, and the aggregate advertises whichever key was active when it
+    /// was assembled. The dangerous reading is `rows_remaining_total: 0` beside
+    /// the *new* `active_key_id` while rows under the old key are still out
+    /// there -- precisely what the runbook tells an operator means "safe to
+    /// retire".
+    ///
+    /// Pinning does not make the census transactional across shards -- rows can
+    /// still be written while the fan-out runs -- but it removes the one
+    /// inconsistency that turns a partial observation into a *wrong* one rather
+    /// than merely a stale one. The retirement gate does its own census and
+    /// does not rely on this report.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::error::HarvestError::Database`] from the census or
+    /// the cursor read.
+    pub async fn load_shard_rotation_progress_against(
+        conn: &mut AsyncPgConnection,
+        shard_id: i32,
+        codecs: &PayloadCodecs,
+        active_key_id: &str,
+    ) -> HarvestResult<ShardRotationProgress> {
         // With no keyed codec registered -- every deployment that has not
         // adopted rotation -- the answer is trivially "nothing to rotate", and
         // running a sequential scan of the largest table to say so would let an
@@ -544,7 +577,7 @@ mod db {
         // repeated full-table reads on every shard.
         if !codecs.has_keyed_codecs() {
             return Ok(ShardRotationProgress {
-                active_key_id,
+                active_key_id: active_key_id.to_string(),
                 rows_by_key_id: BTreeMap::new(),
                 cursor: None,
             });
@@ -556,7 +589,7 @@ mod db {
             None
         };
         Ok(ShardRotationProgress {
-            active_key_id,
+            active_key_id: active_key_id.to_string(),
             rows_by_key_id,
             cursor,
         })

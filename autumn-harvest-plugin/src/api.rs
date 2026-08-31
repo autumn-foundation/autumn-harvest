@@ -8347,11 +8347,24 @@ async fn codec_rotation_status(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Value>, AutumnError> {
     let codecs = api_state.payload_codecs();
+    // Pin the active key ONCE, before the fan-out. Each shard is read on its
+    // own connection, so reading the key per shard lets a concurrent
+    // `set_active_key` straddle the report: shards seen before the flip count
+    // their old-key rows as converted, shards seen after count the same key's
+    // rows as remaining, and the body advertises whichever key won the race.
+    // The dangerous reading is `rows_remaining_total: 0` beside the *new*
+    // `active_key_id` -- which the runbook tells the operator means the
+    // outgoing key is safe to retire.
+    let active_key_id = codecs.active_key_id();
     let observations = observe_shards(&api_state, |shard_id, mut conn| {
         let codecs = codecs.clone();
+        let active_key_id = active_key_id.clone();
         async move {
-            ::autumn_harvest::codec_rotation::load_shard_rotation_progress(
-                &mut conn, shard_id, &codecs,
+            ::autumn_harvest::codec_rotation::load_shard_rotation_progress_against(
+                &mut conn,
+                shard_id,
+                &codecs,
+                &active_key_id,
             )
             .await
             .map(|progress| vec![(shard_id, progress)])
@@ -8361,7 +8374,6 @@ async fn codec_rotation_status(
     .await?;
 
     let collected = shard_fanout::collect_fanout_rows(observations);
-    let active_key_id = codecs.active_key_id();
     let mut rows_remaining_total: i64 = 0;
     let mut shards: Vec<Value> = Vec::with_capacity(collected.rows.len());
     for (shard_id, progress) in collected.rows {

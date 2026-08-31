@@ -40,7 +40,8 @@
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::codec_rotation::{
-    FleetWriteFence, load_shard_rotation_progress, retire_codec_key, sweep_codec_reencryption_once,
+    FleetWriteFence, load_shard_rotation_progress, load_shard_rotation_progress_against,
+    retire_codec_key, sweep_codec_reencryption_once,
 };
 use autumn_harvest::erase::erasure_tombstone;
 use autumn_harvest::error::HarvestError;
@@ -1729,5 +1730,64 @@ async fn a_crafted_key_id_in_stored_input_is_not_counted() {
         progress.rows_remaining(),
         0,
         "crafted input must not be able to hold the retirement gate open"
+    );
+}
+
+/// Every shard in one fan-out must classify against the **same** active key.
+///
+/// `GET /admin/codec/rotation` reads each shard on its own connection, so a
+/// `set_active_key` landing mid-fan-out would otherwise have some shards
+/// classify their rows against the outgoing key (counting them as converted)
+/// and later shards against the incoming one (counting them as remaining) --
+/// with the response advertising whichever key was active when the aggregate
+/// was assembled. `rows_remaining_total: 0` under the *new* key, while rows
+/// under the old key are still out there, is exactly the reading the runbook
+/// tells an operator to treat as "safe to retire".
+///
+/// This pins the mechanism the endpoint relies on: classification is against a
+/// caller-supplied key, so the caller can pin one for the whole fan-out.
+#[tokio::test]
+async fn shard_progress_classifies_against_the_pinned_key_not_the_live_one() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "pinned_key").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    // The live registry has moved on to k2, so an unpinned read reports the k1
+    // row as still requiring rotation.
+    codecs.set_active_key("k2").expect("flip");
+    let live = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("live progress");
+    assert_eq!(live.active_key_id, "k2");
+    assert_eq!(
+        live.rows_remaining(),
+        1,
+        "against the live key, the k1 row is outstanding"
+    );
+
+    // Pinned to k1 -- the key that was active when an earlier shard in the same
+    // fan-out was read -- the very same row classifies as already converted.
+    let pinned = load_shard_rotation_progress_against(&mut conn, 0, &codecs, "k1")
+        .await
+        .expect("pinned progress");
+    assert_eq!(
+        pinned.active_key_id, "k1",
+        "the pinned key must be what the shard reports, so the aggregate cannot \
+         mix classifications from either side of a flip"
+    );
+    assert_eq!(
+        pinned.rows_remaining(),
+        0,
+        "against the pinned key, the k1 row is converted"
     );
 }
