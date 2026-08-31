@@ -4954,6 +4954,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(admin_canary).route_layer(require_admin.clone()),
         )
         .route(
+            // Payload-codec key rotation progress (issue #948). Admin-gated,
+            // read-only. The response carries operator-chosen KEY IDS and
+            // per-key row counts — never key material, never payload content.
+            // See docs/api-contract.json.
+            "/admin/codec/rotation",
+            get(codec_rotation_status).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/version-gates/usage",
             get(version_usage).route_layer(require_admin.clone()),
         )
@@ -6156,6 +6164,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
         ("GET", "/admin/canary"),
+        // Payload-codec key rotation progress (issue #948): admin-gated,
+        // read-only. See docs/api-contract.json.
+        ("GET", "/admin/codec/rotation"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -7577,6 +7588,18 @@ pub const fn management_api_response_fields()
             "/admin/quotas",
             Some(&["quotas", "status", "unavailable_shards"]),
         ),
+        (
+            "GET",
+            "/admin/codec/rotation",
+            Some(&[
+                "active_key_id",
+                "registered_key_ids",
+                "shards",
+                "rows_remaining_total",
+                "status",
+                "unavailable_shards",
+            ]),
+        ),
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
@@ -8305,6 +8328,75 @@ async fn admin_canary(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Json<crate::canary::CanaryReport> {
     Json(crate::canary::build_canary_report_from_shards(&api_state).await)
+}
+
+/// `GET /admin/codec/rotation` — report payload-codec key rotation progress
+/// per shard (issue #948, AC7).
+///
+/// Read-only and side-effect-free: it runs the per-key census and reads the
+/// sweep's resume cursor; it never rewrites a row and never advances the sweep.
+///
+/// Fails **closed** on partial availability, exactly like the retirement gate
+/// the operator uses this screen to decide about: a shard that cannot be read
+/// is reported in `unavailable_shards` with `status: "partial"`, never omitted
+/// and never counted as zero rows remaining.
+///
+/// The body carries operator-chosen key *identifiers* and row counts only —
+/// no key material and no payload content.
+async fn codec_rotation_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let codecs = api_state.payload_codecs();
+    // Pin the active key ONCE, before the fan-out. Each shard is read on its
+    // own connection, so reading the key per shard lets a concurrent
+    // `set_active_key` straddle the report: shards seen before the flip count
+    // their old-key rows as converted, shards seen after count the same key's
+    // rows as remaining, and the body advertises whichever key won the race.
+    // The dangerous reading is `rows_remaining_total: 0` beside the *new*
+    // `active_key_id` -- which the runbook tells the operator means the
+    // outgoing key is safe to retire.
+    let active_key_id = codecs.active_key_id();
+    let observations = observe_shards(&api_state, |shard_id, mut conn| {
+        let codecs = codecs.clone();
+        let active_key_id = active_key_id.clone();
+        async move {
+            ::autumn_harvest::codec_rotation::load_shard_rotation_progress_against(
+                &mut conn,
+                shard_id,
+                &codecs,
+                &active_key_id,
+            )
+            .await
+            .map(|progress| vec![(shard_id, progress)])
+            .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+    let mut rows_remaining_total: i64 = 0;
+    let mut shards: Vec<Value> = Vec::with_capacity(collected.rows.len());
+    for (shard_id, progress) in collected.rows {
+        let remaining = progress.rows_remaining();
+        rows_remaining_total = rows_remaining_total.saturating_add(remaining);
+        shards.push(serde_json::json!({
+            "shard_id": shard_id,
+            "rows_by_key_id": progress.rows_by_key_id,
+            "rows_remaining": remaining,
+            "cursor": progress.cursor,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "active_key_id": active_key_id,
+        "registered_key_ids": codecs.registered_key_ids(),
+        "shards": shards,
+        // Only meaningful when `status == "complete"`: an unread shard's rows
+        // are unknown, not zero, so a `partial` total is a floor, not a count.
+        "rows_remaining_total": rows_remaining_total,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
 }
 
 async fn version_usage(
@@ -21317,8 +21409,14 @@ async fn update_with_start_workflow(
             }
 
             // Poll for the update result, then embed it in the response.
-            let poll_response =
-                poll_update_result(&pool, outcome.exec_id, outcome.update_id, timeout_secs).await;
+            let poll_response = poll_update_result(
+                &pool,
+                outcome.exec_id,
+                outcome.update_id,
+                timeout_secs,
+                &api_state.payload_codecs(),
+            )
+            .await;
 
             // Re-build response combining outcome + poll result.
             let mut base = UpdateWithStartResponse::from_outcome(&outcome);
@@ -23044,6 +23142,7 @@ async fn fail_activity_now(
         exec_id.as_uuid(),
         task_id,
         reason.as_deref(),
+        &api_state.payload_codecs(),
     )
     .await;
 
@@ -24247,7 +24346,7 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history(&mut conn, target)
+    let history = store::load_history_with_codecs(&mut conn, target, &api_state.payload_codecs())
         .await
         .map_err(map_error)?;
 
@@ -42945,6 +43044,10 @@ struct UpdateOrphanedResponse {
 /// workflow worker, then either returns immediately (`?wait=admitted`) or polls
 /// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
 /// the default) until the configurable timeout fires.
+// Grew past the 100-line cap when `poll_update_result` gained the codec
+// registry argument, which turned a one-line tail call into a seven-line one.
+// The body is a flat sequence of validation steps, not nested logic.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn admit_update(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_name)): Path<(String, String)>,
@@ -43105,7 +43208,14 @@ pub(crate) async fn admit_update(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    poll_update_result(&pool, target, update_id, timeout_secs).await
+    poll_update_result(
+        &pool,
+        target,
+        update_id,
+        timeout_secs,
+        &api_state.payload_codecs(),
+    )
+    .await
 }
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
@@ -43139,6 +43249,11 @@ pub async fn poll_update_result(
     exec_id: ExecutionId,
     update_id: UpdateId,
     timeout_secs: u64,
+    // The update's `output` is a payload field returned verbatim to the HTTP
+    // caller, so this must be the configured registry: the identity one would
+    // either raise `UnknownCodecKey` or serve a ciphertext envelope as the
+    // update result.
+    codecs: &autumn_harvest::payload_codec::PayloadCodecs,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -43153,7 +43268,7 @@ pub async fn poll_update_result(
                     .get()
                     .await
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let h = store::load_history(&mut c, exec_id).await?;
+                let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
                 if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
@@ -43273,7 +43388,13 @@ async fn get_update_result(
     };
     let mut found = None;
     for candidate in chain.into_iter().rev() {
-        let history = match store::load_history(&mut conn, candidate).await {
+        let history = match store::load_history_with_codecs(
+            &mut conn,
+            candidate,
+            &api_state.payload_codecs(),
+        )
+        .await
+        {
             Ok(h) => h,
             Err(e) => return map_error(e).into_response(),
         };
@@ -48856,7 +48977,7 @@ mod tests {
 
         // And the update must NOT have been durably admitted -- no
         // UpdateAdmitted event should exist for this execution.
-        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("history should load");
         assert!(

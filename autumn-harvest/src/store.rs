@@ -86,6 +86,18 @@ type WorkflowChildProjection = (
     Option<String>,
 );
 
+/// The identity codec registry used by every non-codec-aware call site.
+///
+/// A `PayloadCodecs::default()` now allocates an `Arc<RwLock<_>>` and a
+/// `String` for its rotation state (issue #948), and `append_events` /
+/// `events_to_insert_rows*` are on the worker's hot write path with 20+ call
+/// sites — constructing a throwaway registry per append would be a real, if
+/// small, regression for every deployment. One shared instance costs nothing
+/// and behaves identically: it registers no keyed codec, so its rotation state
+/// is inert.
+static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
+    std::sync::LazyLock::new(crate::payload_codec::PayloadCodecs::default);
+
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
 ///
@@ -95,12 +107,7 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        0,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
+    events_to_insert_rows_from_with_codecs(exec_id, events, 0, &DEFAULT_PAYLOAD_CODECS)
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -118,12 +125,7 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        start_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
+    events_to_insert_rows_from_with_codecs(exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS)
 }
 
 pub fn events_to_insert_rows_from_with_codecs<'a>(
@@ -168,11 +170,33 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
+    append_events_with_codecs(conn, exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// Append events, encoding payload-bearing fields through `codecs` (issue #948).
+///
+/// The codec-aware sibling of [`append_events`], which delegates here with the
+/// identity registry. Payloads are encoded under `codecs`' **active** key, so a
+/// write issued after a rotation lands under the new key even when the caller
+/// captured its registry clone before the flip — the rotation state is shared
+/// across clones for exactly this reason.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the INSERT fails, or a
+/// codec error if encoding a payload fails.
+pub async fn append_events_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     if events.is_empty() {
         return Ok(0);
     }
 
-    let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+    let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
 
     // Cross-region DR write-authority fence (issue #954).
     //
@@ -246,14 +270,47 @@ pub async fn append_events_offloaded(
     start_id: i32,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<usize> {
+    append_events_offloaded_with_codecs(
+        conn,
+        exec_id,
+        events,
+        start_id,
+        offloader,
+        &DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// Append events through both the codec and the offloader (issues #948, #1243).
+///
+/// Composition order is the one ADR-0003 fixes and issue #524 assumes: **encode
+/// first, then offload.** The codec turns a payload into ciphertext; the
+/// offloader then decides whether that ciphertext is large enough to move out
+/// of line, leaving a reference envelope behind. Reversing the two would hand
+/// the codec a reference envelope to encrypt, orphaning the blob and leaving a
+/// row whose payload cannot be resolved without the key — which is why the
+/// rotation sweep skips offload envelopes rather than re-encoding them.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if either INSERT fails, a
+/// codec error if encoding fails, or a payload-store error if offload fails.
+pub async fn append_events_offloaded_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let Some(offloader) = offloader else {
-        return append_events(conn, exec_id, events, start_id).await;
+        return append_events_with_codecs(conn, exec_id, events, start_id, codecs).await;
     };
     if events.is_empty() {
         return Ok(0);
     }
 
-    let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+    let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     for row in &mut rows {
         let refs = offloader.offload_event_value(&mut row.event_data).await?;
@@ -694,7 +751,20 @@ pub async fn admit_update_event(
 /// Returns [`crate::error::HarvestError::NotFound`] when the execution row
 /// does not exist, and [`crate::error::HarvestError::Database`] on any other
 /// query failure.
-pub(crate) async fn lock_and_load_history(
+/// Take the execution row's `FOR UPDATE` lock, then load history **undecoded**.
+///
+/// Its one caller -- `ActivityContext::run_transactional` -- reads only
+/// `next_event_id`, to append the inline `ActivityCompleted` at the right
+/// position. It never looks at a payload field, so decoding buys it nothing
+/// and costs it correctness: decoding here would need the identity registry,
+/// which raises `UnknownCodecKey` on the first keyed envelope and would roll
+/// back **every** transactional activity commit on a deployment with a codec
+/// configured.
+///
+/// The name says `undecoded` so a future caller that does want decoded events
+/// has to notice it is asking the wrong function. See
+/// [`load_history_undecoded`] for the general rule.
+pub(crate) async fn lock_and_load_history_undecoded(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
@@ -713,7 +783,7 @@ pub(crate) async fn lock_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    load_history(conn, exec_id).await
+    load_history_undecoded(conn, exec_id).await
 }
 
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
@@ -731,12 +801,7 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
-    load_history_with_codecs(
-        conn,
-        exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
-    .await
+    load_history_with_codecs(conn, exec_id, &DEFAULT_PAYLOAD_CODECS).await
 }
 
 pub async fn load_history_with_codecs(
@@ -784,9 +849,20 @@ pub async fn load_history_with_codecs(
 /// default encodes payloads as plain JSON), so this returns byte-identical
 /// events to [`load_history`].
 ///
-/// **Never use this for replay or any engine execution path** — replay must
-/// see decoded plaintext and uses the codec-aware loaders
-/// ([`load_history_inflated`] / [`load_history_with_codecs`]).
+/// **Never use this to feed workflow code** — replay must see decoded
+/// plaintext and uses the codec-aware loaders ([`load_history_inflated`] /
+/// [`load_history_with_codecs`]).
+///
+/// There is a second sanctioned use, distinct from the read surfaces above:
+/// **id arithmetic**. A caller that reads only `next_event_id` (to append at
+/// the right position) or matches on event *variants* and non-payload fields
+/// never looks at a payload, so decoding buys it nothing — and costs it
+/// correctness, because a codec-aware read needs a registry the caller may not
+/// have, and an identity read hard-errors `UnknownCodecKey` on the first keyed
+/// envelope. That would fail an append, a cancel, or a diagnostic scan over a
+/// payload none of them were going to read. `execution.rs`'s
+/// cancel/pause/resume/redrive paths and
+/// [`crate::execution::check_and_report_unfinished_handlers`] are this case.
 ///
 /// # Errors
 ///
@@ -1010,7 +1086,7 @@ pub async fn load_history_since(
 
     let events = rows
         .into_iter()
-        .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
+        .map(|row| (*DEFAULT_PAYLOAD_CODECS).decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {

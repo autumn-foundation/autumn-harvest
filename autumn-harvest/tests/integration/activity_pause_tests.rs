@@ -1657,6 +1657,8 @@ async fn a_pause_committed_while_enforcement_waits_on_the_row_lock_suppresses_th
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });

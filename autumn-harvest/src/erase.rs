@@ -2,12 +2,21 @@
 //!
 //! ## Design
 //!
-//! This module implements the **only sanctioned in-place mutation** of
-//! `harvest_events.event_data` rows (alongside heartbeat checkpoints in
-//! `queue::record_heartbeat`). Payload-bearing fields inside each event's
-//! `data` object are replaced with a tombstone marker while the append-only
-//! event log structure — variant `type`, event IDs, timestamps, sequence —
-//! is left completely intact.
+//! This module implements **sanctioned in-place mutation exception #2** of
+//! `harvest_events.event_data` rows. There are exactly two such writers: this
+//! one and codec key re-encryption (`crate::codec_rotation`, issue #948,
+//! exception #3); both are enumerated with their scope guarantees in the
+//! "Engine Invariants" section of `CLAUDE.md`. (The heartbeat checkpoint this
+//! comment used to name alongside them mutates `harvest_task_queue`, not the
+//! event log — see that section.) Payload-bearing fields inside each event's
+//! `data` object are
+//! replaced with a tombstone marker while the append-only event log structure —
+//! variant `type`, event IDs, timestamps, sequence — is left completely intact.
+//!
+//! Erasure always **wins** a race with the re-encryption sweep: that sweep
+//! writes with a compare-and-swap on the row's previous bytes, so a tombstone
+//! committed between its read and its write makes its update match zero rows
+//! rather than resurrecting the ciphertext this module just destroyed.
 //!
 //! Erasure is **terminal-only**: the gate rejects any execution that is not
 //! in a finished state (`COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`,
