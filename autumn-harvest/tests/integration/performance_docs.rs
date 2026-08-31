@@ -36,35 +36,38 @@ fn performance_doc_path() -> PathBuf {
     repo_root().join("docs/performance.md")
 }
 
-/// Marker opening the collated home of the released performance narrative.
+/// Marker opening the released performance narrative.
 ///
-/// Until the 0.6.0 collation sweep this prose lived in
-/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`. Collation folds
-/// every fragment into `CHANGELOG.md` (condensed to one bullet) and
-/// `CLAUDE.md`'s phase list (verbatim) and then deletes it, so the fragment
-/// path stopped existing and every guard below panicked on the read. The
-/// verbatim copy is the one these guards need — a condensed bullet no longer
-/// carries the per-gate figures they cross-check — so they now read the phase
-/// entry out of `CLAUDE.md` instead.
+/// This prose has moved twice. It was authored in
+/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`; the 0.6.0 collation
+/// sweep folded it into `CHANGELOG.md` (condensed to one bullet) and the phase
+/// list (verbatim) and deleted the fragment. That list then moved out of
+/// `CLAUDE.md`, when that file was reduced to repository workflow
+/// instructions, into `docs/shipped-work.md`.
+///
+/// The verbatim copy is the one these guards need — the condensed changelog
+/// bullet does not carry the per-gate figures they cross-check.
 const RELEASED_PERF_ENTRY_MARKER: &str =
     "- **Tooling** — Task-claim / enqueue throughput benchmark";
 
-fn claude_md_path() -> PathBuf {
-    repo_root().join("CLAUDE.md")
+fn released_entry_path() -> PathBuf {
+    repo_root().join("docs/shipped-work.md")
 }
 
-/// The released performance narrative, extracted from `CLAUDE.md`'s phase list.
+/// The released performance narrative, extracted from its published entry.
 ///
 /// Scoped to the single entry rather than handing the guards the whole file:
-/// several of them ban a superseded phrasing, and an unscoped read would let an
-/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
+/// several of them ban a superseded phrasing, and an unscoped read would let
+/// surrounding prose trip — or mask — a check.
 fn released_perf_entry() -> String {
-    let text = read_normalized(&claude_md_path());
+    let path = released_entry_path();
+    let text = read_normalized(&path);
     let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
         panic!(
-            "CLAUDE.md must contain the claim-benchmark phase entry \
+            "{} must contain the claim-benchmark phase entry \
              (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
-             cross-check the published tables against it"
+             cross-check the published tables against it",
+            path.display()
         )
     });
     let rest = &text[start + RELEASED_PERF_ENTRY_MARKER.len()..];
@@ -1235,18 +1238,15 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
     ];
 
     // Pairs of (label, already-extracted text) rather than (label, path): the
-    // released entry is one item inside a 10 000-line `CLAUDE.md`, so handing
-    // this loop that whole file would let an unrelated entry's "28%" trip — or
-    // mask — the scan below.
+    // released entry is scoped to its own marker, so handing this loop the
+    // whole file would let surrounding prose's "28%" trip — or mask — the scan
+    // below.
     for (label, source) in [
         (
             "docs/performance.md",
             read_normalized(&performance_doc_path()),
         ),
-        (
-            "the released performance entry in CLAUDE.md",
-            released_perf_entry(),
-        ),
+        ("the released performance entry", released_perf_entry()),
     ] {
         // A character window, not a line window: `docs/performance.md` is hard
         // wrapped at ~78 columns while the released entry is a single

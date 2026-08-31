@@ -116,3 +116,17 @@ fix, a self-conflicting body failing rather than skipping, a `CREATE INDEX
 CONCURRENTLY` migration applying under `run_in_transaction = false` and a failing
 one staying unrecorded, and an unrecognized ledger row surviving). No new
 `WorkflowEvent` variant, no migration.
+
+**Also restored: the shipped-work record.** `fix: claude.md` (562c781) reduced
+`CLAUDE.md` to repository workflow instructions, which deleted the `### Phase
+Status` list along with it. Two documentation guard families verify against that
+list — `performance_docs` cross-checks `docs/performance.md`'s tables against the
+claim-benchmark entry's verbatim per-gate figures, and
+`migrating_from_temporal_docs` verifies every `#NNN` the migration guide cites is
+a number the repository can actually account for — so `Lint` has been red on
+`trunk-dev` since that commit, with seven failures unrelated to this command. The
+condensed `CHANGELOG.md` bullet cannot stand in for either: it drops the per-gate
+figures, and it accounts for 33 of the 45 issue numbers the guide cites. The list
+is therefore restored verbatim as `docs/shipped-work.md` and both guards point at
+it. Nothing is relaxed or skipped, `CLAUDE.md` keeps its new slim purpose, and
+`docs/changelog.d/README.md` now names the list's new home.
