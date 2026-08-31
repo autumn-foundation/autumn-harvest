@@ -1520,3 +1520,101 @@ async fn the_test_bootstrap_honours_the_partitioned_layout_switch() {
         "and it must be fully set up, DEFAULT partition included"
     );
 }
+
+// ══ Success Metric gate ════════════════════════════════════════════════════
+
+/// CI gate for the falsifiable half of issue #958's Success Metric.
+///
+/// The metric names four quantities. Two are deterministic and are gated here;
+/// two are latency percentiles that depend on the host and belong in the
+/// benchmark (`benches/retention_reclaim_bench.rs`), not in a CI assertion that
+/// would flake on a noisy runner:
+///
+/// - **Gated**: row-level `DELETE`s against `harvest_events` (must be zero) and
+///   the dead-tuple ratio left behind (must be under the metric's 5%).
+/// - **Measured, not gated**: concurrent append and claim p99.
+///
+/// It runs the *unpartitioned* arm too, and asserts it does the opposite. A
+/// one-sided assertion would pass just as happily against a corpus that
+/// happened to be empty, or a retention pass that collected nothing — the
+/// contrast is what makes this evidence rather than a tautology.
+///
+/// Shares its harness with the benchmark, so the number CI gates on and the
+/// number published in `docs/perf-artifacts/` can never come from two different
+/// implementations.
+#[tokio::test]
+async fn the_partitioned_layout_reclaims_without_creating_bloat() {
+    use super::retention_reclaim_support as harness;
+
+    /// Deliberately small: this gate is about the SHAPE of the two costs
+    /// (zero deletes versus tens of thousands, no bloat versus double digits),
+    /// which is already unambiguous at this size. The issue's 10M-row scale
+    /// lives behind `HARVEST_BENCH_SCALE=full` in the benchmark.
+    const SCALE: harness::Scale = harness::Scale {
+        executions: 2_000,
+        events_per_execution: 5,
+        cohorts: 10,
+        expired_fraction: 0.5,
+    };
+
+    let mut results = Vec::new();
+    for partitioned in [false, true] {
+        let (url, _c) = setup_db().await;
+        let mut conn = connect(&url).await;
+        reset_to_unpartitioned(&mut conn).await;
+        if partitioned {
+            partition::enable_partitioning(&mut conn, &EnableOptions::default())
+                .await
+                .expect("enable");
+        }
+        harness::seed(&mut conn, SCALE, partitioned).await;
+        drop(conn);
+        results.push(
+            harness::measure_pass(&url, partitioned, SCALE, Duration::from_millis(500)).await,
+        );
+    }
+
+    let (flat, part) = (&results[0], &results[1]);
+
+    assert!(
+        flat.events_reclaimed > 0 && part.events_reclaimed > 0,
+        "precondition: both layouts must actually reclaim something, else the \
+         contrast below is vacuous. flat={flat:?} part={part:?}"
+    );
+    assert_eq!(
+        flat.events_reclaimed, part.events_reclaimed,
+        "both layouts must reclaim the SAME events — the mechanism changes, the \
+         outcome does not"
+    );
+
+    assert!(
+        flat.event_rows_deleted > 0,
+        "precondition: the unpartitioned baseline must reclaim by row DELETE — \
+         if it did not, this test is not measuring the thing it claims to. \
+         got {}",
+        flat.event_rows_deleted
+    );
+    assert_eq!(
+        part.event_rows_deleted, 0,
+        "AC3 / Success Metric: the partitioned layout must reclaim with ZERO \
+         row-level deletes against harvest_events. The unpartitioned baseline \
+         issued {}.",
+        flat.event_rows_deleted
+    );
+
+    assert!(
+        part.dead_tuple_ratio < 0.05,
+        "Success Metric: post-pass dead-tuple ratio must be under 5%, got \
+         {:.2}% (the unpartitioned baseline left {:.2}%)",
+        part.dead_tuple_ratio * 100.0,
+        flat.dead_tuple_ratio * 100.0,
+    );
+    assert!(
+        flat.dead_tuple_ratio > part.dead_tuple_ratio,
+        "Success Metric: the row-DELETE baseline must leave MORE bloat than the \
+         partition-drop path — otherwise the comparison proves nothing. \
+         flat={:.2}% part={:.2}%",
+        flat.dead_tuple_ratio * 100.0,
+        part.dead_tuple_ratio * 100.0,
+    );
+}

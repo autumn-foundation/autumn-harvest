@@ -274,6 +274,16 @@ name = "claim_bench"
 required-features = ["db"]
 harness = false
 
+# Retention-reclamation benchmark for the opt-in partitioned `harvest_events`
+# layout (issue #958). `harness = false` for the same reason as `claim_bench`:
+# the measured operation is destructive and enormous (it collects half the
+# corpus and drops partitions), so criterion's repeat-until-stable loop would
+# end up timing a pass against an already-empty database.
+[[bench]]
+name = "retention_reclaim_bench"
+required-features = ["db"]
+harness = false
+
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `ReplayVerifier::verify_dir` (issue #251's batch-fixture-verification
 # budget). Exercises real filesystem I/O and `serde_json` deserialize of
