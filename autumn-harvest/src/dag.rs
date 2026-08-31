@@ -1112,9 +1112,16 @@ impl DagBuilder {
             return Err(DagBuildError::CycleDetected);
         }
 
-        // Signal/timer gate isolation (issue #746): the worker requires a
-        // homogeneous suspension batch, so a gate's `WaitForSignal` command must
-        // never share a level with a sibling activity's `ScheduleActivity`.
+        // Signal/timer gate isolation (issue #746). Originally a hard
+        // requirement: the worker could persist only a homogeneous suspension
+        // batch, so a gate's `WaitForSignal` must never share a level with a
+        // sibling activity's `ScheduleActivity`. Issue #950 lifted that
+        // constraint (`persist_mixed_suspension_batch` persists the mixed batch
+        // in one transaction), but the split is RETAINED deliberately: it is the
+        // recorded execution shape of every DAG already in flight, and merging a
+        // gate back into its level would change the command order those
+        // histories replay against. Collapsing it is a separate, versioned
+        // change, not a side effect of #950.
         // Split each Kahn level that contains a gate into
         // `[non-gate tasks] ++ [each gate as its own singleton]`. Same-level
         // tasks are mutually independent, so re-sequencing among them is safe.

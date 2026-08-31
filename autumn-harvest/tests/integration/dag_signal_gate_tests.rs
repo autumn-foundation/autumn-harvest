@@ -17,7 +17,10 @@
 //! * AC6 — a classic (non-unified) DAG with a gate is rejected at build time.
 //! * Level isolation — a gate occupies its own singleton execution level so its
 //!   `WaitForSignal` suspension is never batched with a level's activity
-//!   `ScheduleActivity` dispatches (the worker's homogeneous-batch requirement).
+//!   `ScheduleActivity` dispatches. (Originally the worker's homogeneous-batch
+//!   requirement; since issue #950 the mixed batch is persistable, but the
+//!   singleton-level split is retained so in-flight DAG histories keep replaying
+//!   against the command order they recorded.)
 
 #![allow(clippy::unused_async, clippy::missing_const_for_fn)]
 

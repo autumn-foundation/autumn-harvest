@@ -104,6 +104,8 @@ mod metrics_rs_adapter;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
 #[cfg(feature = "db")]
+mod mixed_suspension_tests;
+#[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
 mod panic_containment_tests;

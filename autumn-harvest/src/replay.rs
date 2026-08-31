@@ -4362,6 +4362,48 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, None)
+    }
+
+    /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
+    ///
+    /// Identical scanning, with one difference: an interleaved event this scan
+    /// does not recognise never diverges — it is crossed as a sibling command
+    /// and the scan continues, and reaching the end of history without the
+    /// signal returns [`HistoryMatch::NoMatch`] rather than a divergence.
+    ///
+    /// `match_signal`'s divergence-on-stray-event behaviour exists for a *solo*
+    /// `wait_for_signal`: if the workflow expected a signal at this cursor and
+    /// history holds something else, that is a real code/history disagreement,
+    /// and parking on a signal that will never arrive would hang the workflow
+    /// forever (issue #768 round 13). Inside a `ctx.race()` neither premise
+    /// holds. Sibling branches legitimately record their own dispatch and
+    /// terminal events around this one — that is the whole point of a mixed
+    /// batch — and a signal branch that simply lost the race has **no recorded
+    /// event at all**, which is the normal outcome, not a divergence. A race
+    /// branch also cannot hang the workflow on a never-arriving signal: some
+    /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
+    /// outcome for every later replay.
+    /// `settle_marker` is this race's own `race_winner:{seq}` marker name; it
+    /// **bounds** the scan. A `SignalReceived` recorded at or after that marker
+    /// was delivered once the race had already resolved, so it cannot be this
+    /// branch's resolution — it belongs to a later waiter. Without the bound a
+    /// *losing* signal branch would scan to end-of-history and silently consume
+    /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
+    /// a signal already delivered.
+    pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, Some(settle_marker))
+    }
+
+    /// `tolerate_interleaved` carries the race's settlement-marker name when the
+    /// caller is a `ctx.race()` branch, and is `None` for a solo
+    /// `wait_for_signal`.
+    #[allow(clippy::too_many_lines)]
+    fn match_signal_inner(
+        &mut self,
+        signal_name: &str,
+        tolerate_interleaved: Option<&str>,
+    ) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
             .iter()
@@ -4378,6 +4420,13 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_command = None;
+        // `first_interleaved_command` is the rewind target: on a win the cursor
+        // returns to the first sibling command crossed, so each one is claimed by
+        // its own matcher in program order. It is NOT a verdict — a crossed
+        // command may belong to a sibling branch of this decision (a #950 mixed
+        // batch, which parks) or be stray (issue #768 round 13, which must
+        // nd-block), and this scan runs too early to tell. See the sibling-command
+        // arm below for why that verdict is deferred to the end of the cycle.
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
@@ -4448,23 +4497,96 @@ impl HistoryMatcher {
                 {
                     scan_cursor += 1;
                 }
-                // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
-                // — e.g. a `[CancelTimer, TimerStarted]` reset, or a
-                // `[CancelTimer, WaitForSignal]` batch from a
-                // `cancel_timer()`/`reset()` in the same cycle as a
-                // `wait_for_signal`, or a push signal handler resetting a timer
-                // — is transparent to the signal scan. A `reset()` records
-                // `[TimerCancelled, TimerStarted]`, so BOTH must be skipped: on a
-                // `wait_for_signal` polled before a same-cycle reset branch, the
-                // history before the signal is `TimerCancelled, TimerStarted`, and
-                // stopping on the re-arm would wrongly report a missing signal
-                // (Codex P2, issue #768). Rewind WITHOUT consuming so each event's
-                // own claimer (`match_timer_cancel` / `match_timer_arm`) can still
-                // claim it exactly once (mirrors `scan_activity_terminal`).
-                WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                // Issue #950: a race branch's scan stops at its OWN settlement
+                // marker. This arm MUST precede the generic sibling-command arm
+                // below, which also matches `MarkerRecorded` and would otherwise
+                // swallow the bound — letting a losing signal branch scan past
+                // the resolved race and consume a signal belonging to a later
+                // `ctx.wait_for_signal`.
+                WorkflowEvent::MarkerRecorded { name, .. }
+                    if tolerate_interleaved == Some(name.as_str()) =>
+                {
+                    return HistoryMatch::NoMatch;
+                }
+                // An interleaved sibling COMMAND. Cross it as an interleaved
+                // command (rewind to it on a win, so its own matcher claims it in
+                // program order) and keep scanning for the awaited signal.
+                //
+                // Two histories put a command here and they are NOT
+                // distinguishable at this point:
+                //
+                //   * a sibling branch of THIS decision (issue #950) —
+                //     `join!(ctx.wait_for_signal(..), ctx.timer(..))` or
+                //     `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`.
+                //     `join!` polls the signal first, so the batch records the
+                //     sibling's `TimerStarted`/`ActivityScheduled` and nothing for
+                //     the signal wait; on the next drive this scan starts ON that
+                //     event, and the sibling's own `match_timer_strict` /
+                //     `scan_activity_terminal` claims it later in the same cycle.
+                //     The correct outcome is a park.
+                //   * a STRAY command left by code that no longer runs (issue #768
+                //     round 13, and the `[TimerCancelled, TimerStarted]` pair a
+                //     same-cycle `reset()` records). Nothing claims it, and
+                //     parking would wait forever on a signal that never arrives.
+                //
+                // What separates them is not the event, it is whether anything in
+                // this decision claims it — which this scan cannot know, because it
+                // runs BEFORE the sibling branches are polled. So it crosses
+                // everything NON-CONSUMINGLY (each event stays claimable exactly
+                // once by `match_timer_cancel` / `match_timer_arm` / etc.) and
+                // leaves the verdict to the end of the cycle, where `executor.rs`
+                // fails the workflow if `history_has_unconsumed_events()`.
+                //
+                // Round 13's protection is preserved in OUTCOME — pinned by
+                // `interleaved_sibling_signal_stray_timer_started_still_diverges`
+                // — while the mixed batch parks, pinned by
+                // `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`.
+                // Deciding here instead is what left an advertised mixed
+                // composition nd-blocked on its first wake (Codex round 3 on PR
+                // #1245); it is also the choice already made for
+                // `wait_for_signal_timeout`'s strict-`Suspended` arm.
+                //
+                // This completes the "full mixed-batch parity for the signal
+                // wait" that issue #1071 scoped out; the sets mirror
+                // `match_timer_strict` / `scan_activity_terminal` — keep them in
+                // sync.
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
                 | WorkflowEvent::TimerCancelled { .. }
                 | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Progress and terminal events of those concurrent siblings —
+                // and a foreign timer's fire (a sibling deadline that fired
+                // before the awaited signal arrived, e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same batch whose
+                // `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`, issue #1071 manifestation #3) — are
+                // transparent to this scan. Cross them NON-CONSUMINGLY, leaving
+                // each for its own matcher to claim, and keep scanning for the
+                // awaited signal. The same treatment `match_timer_strict` and
+                // `scan_activity_terminal` give their sibling terminals; keep the
+                // three sets in sync (issue #1071 / #950).
+                //
+                // Crossing non-consumingly is what keeps round 13's protection
+                // intact without a scan-time guess: a lone stale `TimerFired` (or
+                // any other event here) that no branch of this decision claims is
+                // still unconsumed at suspend and nd-blocks there.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
                 // ExternalSignal event triplets can appear before SignalReceived
@@ -4594,31 +4716,27 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // A foreign timer's fire — a sibling deadline timer that fired
-                // before the awaited signal arrived (e.g. a concurrent
-                // `receive_signal_timeout`/`ctx.timer` in the same suspension
-                // batch, whose `TimerFired` is recorded ahead of the delivered
-                // `SignalReceived`) — is transparent to the signal scan. Cross
-                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
-                // keep scanning for the awaited signal (issue #1071
-                // manifestation #3). This does NOT set `first_interleaved_command`,
-                // so the round-13 stray-`TimerStarted` park-forever guard below
-                // (an interleaved timer with NO resolving signal → diverge) is
-                // untouched: a lone `TimerStarted` still diverges.
-                //
-                // DELIBERATE PARTIAL SCOPE (issue #1071): only the TIMER sibling
-                // is tolerated in `match_signal` — the sole case the issue's
-                // three comments name. An interleaved activity/child/local-activity
-                // sibling in a `join!(wait_for_signal, activity)` mixed batch is
-                // NOT crossed here and still falls through to `other =>` as a
-                // divergence. Full mixed-batch parity for the signal wait is out
-                // of scope; the fuller interleaved sets live in
-                // `match_timer_strict` / `scan_activity_terminal` /
-                // `match_signal_or_timer`.
-                WorkflowEvent::TimerFired { .. } => {
-                    scan_cursor += 1;
-                }
                 other => {
+                    // Issue #950: inside a race, an unrecognised event is a
+                    // sibling branch's own command/terminal, not a divergence —
+                    // cross it as an interleaved command (so a later win rewinds
+                    // the cursor to it for its own claimer) and keep scanning,
+                    // bounded by the race's own settlement marker.
+                    //
+                    // Checked BEFORE the `is_some()` early-return below. That
+                    // guard is what makes the SOLO wait stop after one crossed
+                    // event, and since this arm is what SETS
+                    // `first_interleaved_command`, ordering it second would let a
+                    // race branch cross exactly one event and then bail — while
+                    // the normal shape is two (`ActivityScheduled` +
+                    // `ActivityStarted`) before the signal.
+                    // The settlement-marker bound is applied by its own arm
+                    // above, ahead of the sibling-command arm.
+                    if tolerate_interleaved.is_some() {
+                        first_interleaved_command.get_or_insert(scan_cursor);
+                        scan_cursor += 1;
+                        continue;
+                    }
                     if first_interleaved_command.is_some() {
                         return HistoryMatch::NoMatch;
                     }
@@ -4633,26 +4751,27 @@ impl HistoryMatcher {
         }
 
         // The signal scan reached the end of history without finding the
-        // signal. If it crossed one or more UNCONSUMED interleaved
-        // timer/detached-spawn commands (issue #768) on the way, those events
-        // are a divergence boundary — NOT a swallowed suspend. An already-
-        // consumed reset's timers (claimed by a companion `match_timer_cancel`/
-        // `match_timer_arm` earlier this cycle) are skipped at the top of the
-        // loop and never set `first_interleaved_command`, so a genuine
-        // "signal has not arrived yet" suspend still returns `NoMatch` and
-        // parks correctly. But a STRAY unconsumed `TimerStarted`/`TimerCancelled`
-        // where the workflow expected a signal must diverge (→ NonDeterministic
-        // / #603 nd-block) rather than push a `WaitForSignal` command and park
-        // the workflow forever on a signal that will never arrive
-        // (round 13 regression fix, issue #768).
-        if let Some(first) = first_interleaved_command {
-            return HistoryMatch::Diverged {
-                expected: format!("SignalReceived({signal_name})"),
-                actual: Self::actual_event_name(&self.events[first]),
-                event_index: i32::try_from(first).ok(),
-            };
-        }
-
+        // signal: the awaited signal has not arrived yet, so this wait parks.
+        //
+        // Any interleaved command crossed on the way (a sibling's
+        // `ActivityScheduled`/`ChildWorkflowStarted`, or a `TimerStarted`/
+        // `TimerCancelled`/detached spawn) was crossed NON-CONSUMINGLY, so it is
+        // left for its own claimer. That is what makes returning `NoMatch` here
+        // safe for BOTH readings of a crossed command:
+        //
+        //   * a sibling branch of this decision claims it later in the same
+        //     cycle (the #950 mixed batch) → the frontier is clean when the body
+        //     suspends and the park is correct;
+        //   * nothing claims it (a stray left by code that no longer runs, issue
+        //     #768 round 13) → it is still unconsumed at suspend, and
+        //     `executor.rs`'s `history_has_unconsumed_events()` guard nd-blocks
+        //     the workflow instead of letting it park forever on a signal that
+        //     will never arrive.
+        //
+        // Deciding that here instead would mean guessing, since this scan runs
+        // before the sibling branches of the same decision are polled — which is
+        // exactly how an advertised `join!(wait_for_signal, ctx.timer)` came to
+        // be nd-blocked on its first wake (Codex round 3 on PR #1245).
         HistoryMatch::NoMatch
     }
 
@@ -6699,6 +6818,58 @@ impl HistoryMatcher {
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in
     /// both cases safe to call speculatively.
+    /// Whether any unclaimed `SignalReceived { signal_name }` remains — either
+    /// already stashed in `pending_signals`, or still unconsumed at/after the
+    /// current cursor (issue #950).
+    ///
+    /// A **pure read**: consumes nothing and never moves the cursor. Used by the
+    /// strict/canary replay frontier test for a signal wait, where "cursor at end
+    /// of history" is the wrong question: a mixed suspension batch legitimately
+    /// leaves a SIBLING branch's events unconsumed ahead of the cursor while the
+    /// signal wait itself has nothing to match. What actually distinguishes a
+    /// healthy in-flight park from a real divergence is whether a matching signal
+    /// is still available anywhere.
+    #[must_use]
+    pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
+        if self
+            .pending_signals
+            .iter()
+            .any(|(name, _, _)| name == signal_name)
+        {
+            return true;
+        }
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(
+                        e,
+                        WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                    )
+            })
+    }
+
+    /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
+    /// after the current cursor (issue #950).
+    ///
+    /// A **pure read**: unlike [`Self::peek_u64_marker`] it consumes nothing and
+    /// never moves the cursor, so it is safe to call mid-decision (e.g. between
+    /// a race's branch checks) where a consuming peek would steal the marker
+    /// from the settling step that owns it.
+    #[must_use]
+    pub fn has_unconsumed_marker(&self, marker_name: &str) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name)
+            })
+    }
+
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;
@@ -9572,18 +9743,39 @@ mod tests {
     }
 
     #[test]
-    fn matcher_signal_scan_diverges_on_unconsumed_stray_timer() {
-        // Round 13 regression fix (issue #768): a `wait_for_signal` over a
-        // history carrying a STRAY, unconsumed `TimerStarted` and NO matching
-        // signal must DIVERGE — not silently reach the end of the scan and
-        // return `NoMatch` (which `wait_for_signal` would turn into a
-        // `WaitForSignal` command + `rx.await`, parking a genuinely-diverged
-        // workflow forever instead of nd-blocking, #603).
+    fn matcher_signal_scan_leaves_a_stray_timer_unconsumed_for_the_cycle_guard() {
+        // Round 13 (issue #768) requires that a `wait_for_signal` over a history
+        // carrying a STRAY, unconsumed `TimerStarted` and no matching signal
+        // nd-blocks rather than parking forever on a signal that will never
+        // arrive (#603).
+        //
+        // Issue #950 moved WHERE that is decided. The matcher used to diverge
+        // here, but at scan time a stray timer is indistinguishable from the
+        // timer of an advertised `join!(wait_for_signal, ctx.timer)` mixed batch,
+        // whose sibling branch has not been polled yet — so diverging here
+        // nd-blocked a supported composition on its first wake (Codex round 3 on
+        // PR #1245). The scan now returns `NoMatch` and, crucially, leaves the
+        // event UNCONSUMED; the decision is made at the end of the cycle, where
+        // `executor.rs`'s `history_has_unconsumed_events()` sees that nothing
+        // claimed it and fails the workflow.
+        //
+        // So this asserts the two halves the cycle guard needs, not a verdict:
+        // park, and the stray event still unclaimed. The round-13 OUTCOME is
+        // pinned end-to-end by the integration test
+        // `interleaved_sibling_signal_stray_timer_started_still_diverges`, which
+        // asserts the replay is reported as non-determinism.
         let events = vec![ts("timer-1", 10)];
         let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_signal("my-signal"),
+            HistoryMatch::NoMatch,
+            "the scan must park rather than guess; the stray timer is caught at \
+             the end of the cycle"
+        );
         assert!(
-            matches!(m.match_signal("my-signal"), HistoryMatch::Diverged { .. }),
-            "a stray unconsumed TimerStarted where a signal was expected must diverge, not suspend"
+            !m.is_consumed(0),
+            "the stray timer must be left UNCONSUMED — that is the whole signal \
+             `history_has_unconsumed_events()` keys on to nd-block the run"
         );
     }
 

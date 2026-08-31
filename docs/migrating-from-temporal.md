@@ -130,6 +130,7 @@ original timeout used.
 | `ParentClosePolicy` (`ABANDON` / `REQUEST_CANCEL` / `TERMINATE`) | `ParentClosePolicy` | issue #347 |
 | Hand-rolled `Promise.all` fan-out over children | `ctx.spawn_child_workflow_fan_out` (and `_collect`, `_raw` variants) | issue #601 |
 | Hand-rolled `Promise.race` | `ctx.race()` | issue #600 |
+| `Promise.race` over MIXED awaitables (activity vs timer, child vs signal, …) | `ctx.race()` over any mix of activity / child / timer / signal branches; `futures::join!` for the wait-all form (local activities excepted) | see HVG010 in the determinism guide |
 | Hand-rolled child-vs-timer race | `ctx.execute_child_workflow_timeout` (the child-or-deadline wait) | issue #779 |
 
 ### Schedules
