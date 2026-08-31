@@ -1253,7 +1253,17 @@ pub fn delivery_state(
     consecutive_failures: i32,
     next_attempt_at: DateTime<Utc>,
     now: DateTime<Utc>,
+    retired_at: Option<DateTime<Utc>>,
 ) -> &'static str {
+    // A retired cursor's other columns are a frozen snapshot of whatever the
+    // exporter last did (issue #953, Codex review round 9 P2). Deriving IDLE,
+    // BACKOFF or RETRYING from them would tell an operator that records are
+    // pending delivery when no exporter owes them and retention is free to
+    // purge them. `RETIRED` is checked first because it overrides every other
+    // reading of those columns.
+    if retired_at.is_some() {
+        return "RETIRED";
+    }
     if lease_until.is_some_and(|until| until > now) {
         return "DELIVERING";
     }
@@ -1280,10 +1290,15 @@ pub struct AuditExportShardStatus {
     /// Age in seconds of the oldest record not yet acknowledged; `0.0` when
     /// nothing is pending. This is `harvest.audit.export_lag`.
     pub lag_seconds: f64,
-    /// `IDLE` | `DELIVERING` | `BACKOFF` | `RETRYING`, from
+    /// `IDLE` | `DELIVERING` | `BACKOFF` | `RETRYING` | `RETIRED`, from
     /// [`delivery_state`]. `GET /admin/audit-export` additionally synthesizes
     /// `NOT_STARTED` for a shard with no cursor row at all, which this struct
     /// cannot represent (there is no cursor to describe).
+    ///
+    /// `RETIRED` means an operator ran `decommission_cursor`: the row survives
+    /// only to preserve the sequence high-water mark, no exporter owes this
+    /// shard records, and retention may purge them. The remaining fields are a
+    /// frozen snapshot of the last export activity, not a live one.
     pub delivery_state: String,
     pub consecutive_failures: i32,
     pub last_status: Option<i32>,
@@ -1452,6 +1467,7 @@ pub async fn export_status(
             cursor.consecutive_failures,
             cursor.next_attempt_at,
             now,
+            cursor.retired_at,
         )
         .to_string(),
         consecutive_failures: cursor.consecutive_failures,
@@ -2267,29 +2283,46 @@ mod tests {
         let past = now - chrono::Duration::seconds(30);
 
         assert_eq!(
-            delivery_state(Some(future), 0, past, now),
+            delivery_state(Some(future), 0, past, now, None),
             "DELIVERING",
             "a live lease means a batch is in flight right now"
         );
         assert_eq!(
-            delivery_state(Some(future), 4, future, now),
+            delivery_state(Some(future), 4, future, now, None),
             "DELIVERING",
             "a live lease outranks a pending backoff"
         );
         assert_eq!(
-            delivery_state(Some(past), 3, future, now),
+            delivery_state(Some(past), 3, future, now, None),
             "BACKOFF",
             "an expired lease with failures and a future retry is backing off"
         );
         assert_eq!(
-            delivery_state(None, 3, past, now),
+            delivery_state(None, 3, past, now, None),
             "RETRYING",
             "failures with the retry deadline already passed is a due retry, \
              not a healthy idle"
         );
-        assert_eq!(delivery_state(None, 0, past, now), "IDLE");
+        assert_eq!(delivery_state(None, 0, past, now, None), "IDLE");
+
+        // Retirement overrides every other reading of the row: those columns
+        // are a frozen snapshot, and reporting BACKOFF or RETRYING from them
+        // would say records are pending that nothing owes and retention may
+        // purge.
+        for (lease, failures, attempt) in [
+            (Some(future), 0, past),
+            (Some(past), 3, future),
+            (None, 3, past),
+            (None, 0, past),
+        ] {
+            assert_eq!(
+                delivery_state(lease, failures, attempt, now, Some(past)),
+                "RETIRED",
+                "a retired cursor must never report a live delivery state"
+            );
+        }
         assert_eq!(
-            delivery_state(Some(now), 0, past, now),
+            delivery_state(Some(now), 0, past, now, None),
             "IDLE",
             "a lease expiring exactly now is expired, not live"
         );

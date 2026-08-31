@@ -115,7 +115,7 @@ X-Harvest-Audit-Shard: 0
 X-Harvest-Audit-First-Seq: 4181
 X-Harvest-Audit-Last-Seq: 4680
 
-{"shard":0,"seq":4181,"id":"...","occurred_at":"2026-08-31T04:11:02.117Z","actor":"alice@example.com","operation":"workflow.cancel","target_type":"workflow","target_id":"exec-9f2…","route_or_command":"POST /workflows/{id}/cancel","request_id":null,"idempotency_key":null,"status":"SUCCEEDED","error_summary":null,"source":"api"}
+{"shard":0,"seq":4181,"id":"...","occurred_at":"2026-08-31T04:11:02.117Z","actor":"alice@example.com","operation":"workflow.cancel","target_type":"workflow","target_id":"exec-9f2…","route_or_command":"POST /workflows/{id}/cancel","request_id":null,"idempotency_key":null,"status":"succeeded","error_summary":null,"source":"api"}
 {"shard":0,"seq":4182, …}
 ```
 
@@ -180,7 +180,7 @@ collector:
 |---|---|
 | `occurred_at` | `timeUnixNano` / `timeObservedUnixNano` |
 | `operation` | `body` (or `event.name`) |
-| `status` | `severityText` — `SUCCEEDED` → `INFO`, `FAILED` → `ERROR` |
+| `status` | `severityText` — `"succeeded"` → `INFO`, `"failed"` → `ERROR`. **Lowercase on the wire**: these are the audit table's own values (`audit::STATUS_SUCCEEDED` / `STATUS_FAILED`), passed through verbatim. A receiver matching `"FAILED"` will silently classify every failed privileged action as `INFO`. |
 | `error_summary` | `attributes["exception.message"]` |
 | `shard` | `attributes["harvest.shard.id"]` |
 | `seq` | `attributes["harvest.audit.seq"]` |
@@ -343,12 +343,25 @@ Read-only, admin-gated, cross-shard.
 }
 ```
 
-`delivery_state` is `IDLE`, `DELIVERING`, `BACKOFF`, `RETRYING`, or
-`NOT_STARTED`. `sink_configured` reports whether *this* process has a sink
-installed — `false` next to a growing `pending_records` is the signature of
-"export configured on the web app but not on the worker fleet", which is
-otherwise invisible. An unreachable shard degrades the response to
-`"status": "partial"` rather than failing the read.
+`delivery_state` is `IDLE`, `DELIVERING`, `BACKOFF`, `RETRYING`, `RETIRED`, or
+`NOT_STARTED`. `RETIRED` means an operator ran `decommission_cursor`: no
+exporter owes this shard records and retention may purge them, so the row's
+other fields are a frozen snapshot rather than live state.
+
+`sink_configured` reports whether **the process serving this request** has a
+sink installed, and nothing more. Read it carefully in a split deployment: an
+API process that does not run the exporter reports `false` while export is
+perfectly healthy on the worker fleet, so `false` on its own is not a fault.
+Conversely `true` only tells you *this* process could export, not that the
+process which actually ticks the scanner is configured.
+
+The load-bearing signals for "nothing is exporting this shard" are
+`pending_records` growing across two reads and `lag_seconds` rising, or a
+`delivery_state` of `NOT_STARTED` that persists — all of which are properties
+of the shared database rather than of whichever process answered.
+
+An unreachable shard degrades the response to `"status": "partial"` rather than
+failing the read.
 
 ---
 

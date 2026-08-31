@@ -2893,11 +2893,21 @@ invisible to detection is growing, and the audit table is growing with it.
    | What you see | What it means |
    |---|---|
    | `last_error` populated, `delivery_state: "BACKOFF"` | The sink is rejecting or unreachable. The cursor is parked, retrying with capped backoff. |
-   | `delivery_state: "NOT_STARTED"`, `sink_configured: false` | Export is configured somewhere (the web app) but **not on the worker fleet that runs the scanner**. Invisible in metrics alone. |
+   | `delivery_state: "NOT_STARTED"` that persists across reads | No exporter has ever ticked this shard. Either export is configured nowhere, or it is configured only on a fleet that is not reaching this shard. |
+   | `delivery_state: "RETIRED"` | An operator ran `decommission_cursor` here. No exporter owes this shard records and retention may purge them — this is a deliberate state, not a fault. |
    | No `harvest_audit_export_lag` series at all | No exporter is running for that shard. **Worse than a high value**, and a threshold alert cannot see it. |
 
 3. Check `pending_records` on the same response to size the backlog, and
    whether it is still growing between two reads.
+
+   **Do not diagnose from `sink_configured`.** It reports only whether the
+   process that served your request has a sink installed. In a split
+   web/worker deployment the API process legitimately reports `false` while
+   export is healthy on the worker fleet, and `true` there would not tell you
+   the *worker* is configured. Use the database-backed signals instead —
+   `pending_records` growing across two reads, `lag_seconds` rising, or a
+   persistent `NOT_STARTED` — which describe the shard rather than whichever
+   process answered.
 
 ### Likely causes
 
