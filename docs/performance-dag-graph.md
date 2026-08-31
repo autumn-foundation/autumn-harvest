@@ -353,10 +353,21 @@ proportionally larger, cost".
 | Total bytes  | 197,652,103 | 112,327,303 | 85,324,800 (**43.17%**) |
 
 Both independently clear the alternate >=10%-allocation floor as well as the
-primary Ir floor. The blocks/bytes reduction is identical to every prior
-harness correction: it is purely `(non-gate node count) x (reps - 1)` fewer
-`BTreeSet<&str>` allocations at `latest_scheduled`'s call site, a quantity
-that does not depend on the fixture's event content or ordering.
+primary Ir floor. The *number of eliminated `BTreeSet<&str>` constructions*
+at `latest_scheduled`'s call site is `(non-gate node count - 1) x reps` --
+89 non-gate nodes has stayed constant across every harness-correction round
+in this PR, so that count is `88 x 300 = 26,400` here (previously written as
+`(non-gate node count) x (reps - 1)`, which is off by one call per rep: the
+after-fix harness still makes one `dispatched_activity_names` call per rep,
+not zero). That count is a pure function of topology and reps, but the
+*blocks/bytes* reduction is not: each eliminated `BTreeSet` held however
+many entries that call's event history produced, which depends on the
+fixture's event content (this PR's own history shows the raw reduction
+varying, 316,800 -> 264,000 -> 290,400 blocks, as earlier rounds changed how
+many `ActivityScheduled` events the fixture recorded). The two are close in
+this fixture only because the number of distinct scheduled activity names
+per call has stayed in a similar range across rounds, not because of any
+content-independence (issue #690 review, Codex).
 
 ### Correctness
 
