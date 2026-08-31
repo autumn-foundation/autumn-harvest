@@ -2951,16 +2951,30 @@ invisible to detection is growing, and the audit table is growing with it.
   read the cursor — a failing query, a connection it cannot acquire — the
   recorder keeps serving the last value it was given, commonly `0`. Prometheus
   then sees neither a high value nor an absent series while that shard is going
-  unexported, which defeats both alerts. Alert on **staleness** as well, e.g.
+  unexported.
 
-  ```promql
-  time() - timestamp(harvest_audit_export_lag) > 600
-  ```
+  There is **no metric-only detection for this case today**, and
+  `time() - timestamp(...)` does not provide one: Prometheus stamps each
+  *scraped sample* with the scrape time, and the endpoint keeps exposing the
+  stale value on every scrape, so such an expression stays near the scrape
+  interval forever. Do not rely on it. `changes(...) == 0` fails the same way
+  for the opposite reason — a healthy caught-up shard also holds a constant
+  `0`.
 
-  and treat the `scanner_liveness` health check and `last_error` on
-  `GET /admin/audit-export` as the authoritative "is the exporter working"
-  signals. See autumn-foundation/autumn-harvest#1268 for making the gauge
-  itself carry an explicit unavailable signal.
+  What each alert actually covers:
+
+  | Condition | Detected by |
+  |---|---|
+  | Process down | `up == 0` |
+  | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
+  | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
+  | Exporter alive but **cannot observe the shard** | **nothing in metrics.** `last_error` and `unavailable_shards` on `GET /admin/audit-export` are authoritative; poll the route if you need this covered |
+
+  The last row is a real gap, tracked as
+  autumn-foundation/autumn-harvest#1268 (an explicit availability signal
+  alongside the gauge). Note that the common outage — a sink that is down or
+  rejecting — falls in the *third* row and is covered: the exporter still reads
+  the cursor fine and the gauge climbs as designed.
 
 **Do not reach for the redrive.** `POST /admin/audit-export/redrive` rewinds
 the cursor so already-delivered records are re-exported; it is for **sink-side
