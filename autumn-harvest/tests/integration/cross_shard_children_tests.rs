@@ -698,7 +698,6 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
         autumn_harvest::cross_shard_child::enforce_cross_shard_children(
             &mut conn,
             &Some(sharded.clone()),
-            &SHARDS.iter().map(|s| ShardId::new(*s)).collect::<Vec<_>>(),
         )
         .await
         .expect("relay sweep");
@@ -727,7 +726,190 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
         0,
         "every cross-shard child must settle"
     );
-    let _ = parent2;
+
+    // The actual property under test: the wake was not merely *delivered*, it
+    // was *consumed* — the parent ran to completion off terminals that were
+    // relayed with no worker alive at the moment the children finished. A
+    // settled outbox with a still-parked parent would be a lost wake dressed up
+    // as a clean sweep.
+    let worker3 = build_worker(&sharded, "w-crash-drain");
+    let pool3 = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner3 = Arc::clone(&worker3);
+    let handle3 = tokio::spawn(async move { runner3.run(&pool3).await });
+    assert!(
+        wait_for_state(
+            &sharded,
+            PARENT_SHARD,
+            parent2,
+            "COMPLETED",
+            Duration::from_secs(120)
+        )
+        .await,
+        "the parent never consumed the relayed terminals — a wake was lost"
+    );
+    worker3.shutdown();
+    let _ = handle3.await;
+}
+
+// ── AC4: an awaited cross-shard child is cancelled across the boundary ───────
+
+/// **AC4.** A race loser that lives on another shard is durably cancelled.
+///
+/// `ctx.race()` and the #779 child-deadline race both tear their losers down
+/// through one `CancelRaceLosers` command. For a cross-shard loser that command
+/// cannot cancel inline — the child is in another database — so the parent flags
+/// the outbox row inside its own decision transaction and the relay delivers the
+/// (idempotent) cancel. Without that hop, `cancel_workflow_execution_collect`
+/// would report `NotFound` for a child that is perfectly alive on its own shard,
+/// and that arm is treated as a benign no-op: the loser would run forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_shard_race_loser_is_cancelled_on_its_own_shard() {
+    fn racing_parent<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // The child never finishes on its own, so the 1-second deadline
+            // always wins and the child is always the loser.
+            let out = ctx
+                .spawn_child_workflow_timeout_placed(
+                    "child_forever",
+                    json!(1),
+                    Duration::from_secs(1),
+                    &ChildPlacement::Shard(ShardId::new(2)),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "timed_out": out.is_none() }))
+        })
+    }
+
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("child_forever", child_forever),
+            wf_info("racing_parent", racing_parent),
+        ])
+        .worker(
+            WorkerConfig::default().with_shard_assignments(SHARDS.iter().map(|s| ShardId::new(*s))),
+        )
+        .build();
+    let (registry, _d, _s, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "w-race".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(2);
+    runtime_config.sharded_pool = Some(sharded.clone());
+    let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker builds"));
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    let parent = start_parent(&sharded, "racing_parent", "race-1").await;
+    assert!(
+        wait_for_state(
+            &sharded,
+            PARENT_SHARD,
+            parent,
+            "COMPLETED",
+            Duration::from_secs(120)
+        )
+        .await,
+        "the parent must resolve on its deadline"
+    );
+
+    // The losing child lives on shard 2 and must end CANCELLED there.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut conn = shard_conn(&sharded, 2).await;
+        let states: Vec<String> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::parent_id.eq(Some(parent.as_uuid())))
+            .select(harvest_workflow_executions::state)
+            .load(&mut *conn)
+            .await
+            .expect("loser state query");
+        drop(conn);
+        if states.iter().any(|s| s == "CANCELLED") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cross-shard race loser was never cancelled (states: {states:?}) — \
+             it would run forever"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── Regression: a re-park must not double-record a cross-shard child ─────────
+
+/// **Regression (review finding).** A parent that wakes on a *sibling* while a
+/// cross-shard child is still running must not append a second
+/// `ChildWorkflowStarted` for that child.
+///
+/// The "is this child genuinely new?" test is a lookup in
+/// `harvest_workflow_executions` **on the parent's shard**, where a cross-shard
+/// child's row never appears — so without a shard-aware test every re-park
+/// re-classified the remote child as new. The parent's history would accumulate
+/// one duplicate `ChildWorkflowStarted` per wake, and its next replay would hit
+/// the duplicate positionally and fail the run with a non-determinism
+/// divergence. This is the first realistic shape of the feature: a `Distributed`
+/// fan-out where any sibling settles before a remote child does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repark_never_double_records_a_cross_shard_child() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let worker = build_worker(&sharded, "w-repark");
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    let parent = start_parent(&sharded, "distributed_parent", "repark-1").await;
+    assert!(
+        wait_for_state(
+            &sharded,
+            PARENT_SHARD,
+            parent,
+            "COMPLETED",
+            Duration::from_secs(120)
+        )
+        .await,
+        "a fan-out whose children settle at different times must still complete"
+    );
+
+    // Exactly one `ChildWorkflowStarted` per child, however many times the
+    // parent re-parked on its siblings.
+    let started = started_child_ids(&sharded, PARENT_SHARD, parent).await;
+    let distinct: BTreeSet<uuid::Uuid> = started.iter().map(ExecutionId::as_uuid).collect();
+    assert_eq!(
+        started.len(),
+        distinct.len(),
+        "a cross-shard child was recorded more than once: {} events for {} children",
+        started.len(),
+        distinct.len()
+    );
+    assert_eq!(started.len(), FAN_OUT_N);
+
+    worker.shutdown();
+    let _ = handle.await;
 }
 
 // ── AC4: cancellation and the parent-close cascade cross the boundary ────────

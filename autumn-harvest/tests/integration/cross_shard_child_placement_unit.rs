@@ -274,7 +274,10 @@ fn an_undeclared_residency_key_is_rejected_never_hashed() {
 }
 
 #[test]
-fn a_pin_to_a_drained_shard_is_rejected() {
+fn a_pin_to_a_drained_shard_is_rejected_as_retryable() {
+    // A drain is a transient operational state — a rebalance, a maintenance
+    // window — so it must be retryable rather than terminally failing the
+    // workflow the way a genuine misconfiguration does.
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![ShardId::new(0)],
@@ -288,7 +291,54 @@ fn a_pin_to_a_drained_shard_is_rejected() {
         "parent#0",
     )
     .expect_err("a drained shard must not accept new children");
-    assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+    assert!(
+        err.to_string().contains("drain"),
+        "the message must name the drain: {err}"
+    );
+}
+
+/// A fully-drained fleet must not silently place a `Distributed` child on the
+/// default shard.
+///
+/// `ShardRouter::pick_for_new_workflow` falls back to `default_shard` when the
+/// writable set is empty — correct for a top-level start, and exactly the silent
+/// fallback AC8 forbids for an opt-in placement. Placement is decided once and
+/// baked into the child's `ExecutionId`, so a wrong choice here is not
+/// recoverable after the maintenance window ends.
+#[test]
+fn distributed_placement_with_no_writable_shard_fails_instead_of_defaulting() {
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![],
+        ShardId::new(0),
+    );
+    let err = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Distributed,
+        ShardId::new(0),
+        "child_wf",
+        "parent#1",
+    )
+    .expect_err("a fully-drained fleet must not silently use the default shard");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+}
+
+/// A genuine misconfiguration stays a terminal `Config` error: retrying an
+/// unknown shard or an undeclared residency key never helps.
+#[test]
+fn static_misconfiguration_stays_a_terminal_config_error() {
+    let router = four_shard_router();
+    for placement in [
+        ChildPlacement::Shard(ShardId::new(99)),
+        ChildPlacement::ResidencyKey("mars".to_string()),
+    ] {
+        let err =
+            resolve_child_placement(Some(&router), &placement, ShardId::new(0), "child_wf", "k")
+                .expect_err("must be rejected");
+        assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
+        assert!(!err.is_shard_unavailable(), "got {err:?}");
+    }
 }
 
 #[test]

@@ -27,6 +27,16 @@ Placement is resolved exactly once per child, on the fresh dispatch; replay reus
 the recorded `child_id` verbatim, so widening `writable_shards` cannot move a
 started child.
 
+The `n` counts **invocations**, not fresh dispatches — the same rule
+`fan_out_seq` / `race_seq` / `child_timeout_seq` follow, and deliberately unlike
+`activity_seq`. A fresh `WorkflowContext` is built per decision cycle, so a
+counter that only advanced on a fresh dispatch restarts at zero every cycle and
+hands `#1` to every child of a sequential `for … { spawn(…).await }` loop — each
+of those is the only fresh dispatch in its own cycle — collapsing the whole loop
+onto one shard while a fan-out (all children fresh in one cycle) still looked
+perfectly uniform. Counting invocations makes the Nth spawn's key depend on its
+position in the workflow rather than on which cycle dispatched it.
+
 **One row, four edges.** The parent's decision transaction never spans two
 databases. A cross-shard spawn writes one `harvest_cross_shard_children` row on
 the parent's shard, in the same transaction as `ChildWorkflowStarted` /
@@ -49,11 +59,24 @@ instant leaves the durable row for the next sweep. Delivery is therefore
 exactly-once from the parent's point of view even though the observation is
 at-least-once.
 
-**No silent fallback.** A target shard this node has no pool for raises the new
-typed, retryable `HarvestError::ShardUnavailable`; the parent's decision cycle
-rolls back with nothing recorded and is parked-and-rewoken (the same treatment
-#946's `QuotaExceeded` gets) rather than terminally failed — and the child is
-never quietly re-placed on the parent's shard.
+**No silent fallback, and no hot spin.** A target shard this node has no pool
+for — including "no pool map at all", a reachable misconfiguration since the
+router and the pool map are independent globals — raises the new typed
+`HarvestError::ShardUnavailable`. So does a shard drained out of
+`writable_shards`, and so does a `Distributed` placement with **no** writable
+shard (where `pick_for_new_workflow`'s own fall back to `default_shard` is
+correct for a top-level start and is exactly the silent fallback AC8 forbids
+here — placement is baked into the child's id, so a wrong choice is not
+recoverable afterwards). Static misconfiguration — no router, an unknown shard,
+an undeclared residency key — stays a terminal `Config` error, because retrying
+it never helps.
+
+`ShardUnavailable` is deferred with a **bounded jittered backoff** on every one
+of the four spawn paths, via a generalisation of #946's
+`recover_from_child_quota_exceeded`. The backoff is the load-bearing part: an
+unreachable shard is a static property of this process, so #946's
+park-and-immediately-rewake would re-claim, replay the whole history, fail
+identically and spin at poll cadence forever.
 
 **Zero event-schema impact.** No new `WorkflowEvent` variant and no change to the
 adjacently-tagged JSON contract: `ChildWorkflowStarted` / `ChildWorkflowCompleted`
@@ -71,6 +94,31 @@ every deployment that never opts in. Documented in the new *Cross-shard child
 placement* section of `docs/sharding.md` (including the deliberate residency
 carve-out and the operator queries over the in-flight gauge).
 
+**Review outcomes worth naming.** Four defects were found by review and fixed
+before this landed, each with a regression test: the relay's work-list intersected
+`target_shard` with the caller's shard assignments, which `monitor_shard_scope`
+narrows to one shard — so it selected *only* rows whose target is the parent's own
+shard, i.e. never a cross-shard one, and swept nothing in the deployments it exists
+for. Two concurrent sweeps (every worker assigned a shard runs the relay over the
+same rows) could each append the parent's terminal event; the outbox delete is now
+the exactly-once claim, taken **after** the parent's `FOR UPDATE` so the
+engine-wide execution-row → outbox-row lock order is preserved. The
+"is this child genuinely new?" test looked only at the parent's shard, so every
+re-park re-classified a remote child as new and appended a duplicate
+`ChildWorkflowStarted` — corrupting the parent's history and failing its next
+replay. And `ExecutionId::new()`'s unencoded sentinel compared raw against the
+normalised `shard_id` column, routing a *default-placement* child of an unencoded
+parent into the relay, where no pool for shard 65535 can exist.
+
+Two fairness/robustness fixes came with them: the sweep splits actionable rows
+from a rotating poll of in-flight ones (a single `ORDER BY created_at LIMIT N`
+filled its whole window with rows that were merely waiting, so a 10k fan-out
+would start 200 children and starve the rest behind them), and every non-progress
+path now writes `attempts`/`last_error`/`last_attempt_at`, which both makes the
+documented runbook query truthful and drives a per-row retry backoff. There is
+still no dedicated metric for the relay; that is called out in `docs/sharding.md`
+and tracked as a follow-up.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive
@@ -79,5 +127,9 @@ real handlers through `run_workflow_with_context` and assert on the emitted
 adds multi-shard *runtime* coverage against genuinely separate shard databases:
 children landing on their encoded shard and nowhere else, the parent completing on
 delivered terminals, a crash between the child's terminal and the parent's notify
-losing no wake, the close cascade crossing the boundary, and an unreachable target
-shard never falling back to the parent's shard.
+losing no wake *and the parent then consuming it*, a cross-shard race loser
+cancelled on its own shard, a re-park never double-recording a remote child, the
+close cascade crossing the boundary, and an unreachable target shard never falling
+back to the parent's shard. `fanout_degradation_integration.rs` covers the
+`/children` read path degrading to `200 partial` — flat and depth traversal — and
+staying `complete` on the happy path.

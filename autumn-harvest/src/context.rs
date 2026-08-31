@@ -2617,13 +2617,24 @@ pub struct WorkflowContext {
     /// timer ID across replays, distinct from `signal_timeout_seq`.
     child_timeout_seq: Mutex<u32>,
     /// Monotonically increasing counter for the deterministic child *placement*
-    /// key (issue #956). Incremented once per **fresh** cross-shard child
-    /// dispatch — never on replay, which reuses the recorded `child_id` and so
-    /// never re-derives placement at all. Combined with the parent's
-    /// `ExecutionId` by [`crate::shard::child_placement_key`] into the
-    /// rendezvous key, so a decision cycle retried after a crash re-derives the
-    /// identical shard for each child (the restart-stability contract a
-    /// top-level start gets from its caller-supplied `workflow_id`).
+    /// key (issue #956). Combined with the parent's `ExecutionId` by
+    /// [`crate::shard::child_placement_key`] into the rendezvous key, so the
+    /// Nth placement-aware child spawn in a workflow always hashes the same key
+    /// and therefore lands on the same shard.
+    ///
+    /// Incremented on **every** invocation of a placement-aware spawn — live and
+    /// replay alike — exactly like `fan_out_seq`, `race_seq` and
+    /// `child_timeout_seq`, and deliberately unlike `activity_seq`. That
+    /// distinction is load-bearing: a fresh `WorkflowContext` is built per
+    /// decision cycle, so a counter that only advanced on a *fresh* dispatch
+    /// would restart at zero every cycle and hand the same key to every child of
+    /// a sequential `for … { spawn(…).await }` loop — each of those children is
+    /// the only fresh dispatch in its own cycle — collapsing the whole loop onto
+    /// one shard. Counting invocations instead makes the Nth spawn's key depend
+    /// on its position in the workflow, not on which cycle happened to dispatch
+    /// it, which is also what gives a crash-retried cycle the identical
+    /// placement (the restart-stability contract a top-level start gets from its
+    /// caller-supplied `workflow_id`).
     child_placement_seq: Mutex<u32>,
     /// Shard router used to resolve a non-default [`ChildPlacement`]
     /// (issue #956).
@@ -7208,18 +7219,83 @@ impl WorkflowContext {
         None
     }
 
+    /// The next child-placement sequence number (issue #956).
+    ///
+    /// Called once at the top of **every** placement-aware child spawn, before
+    /// the history matcher runs and regardless of whether this cycle will
+    /// dispatch the child freshly or replay it — see the field's own note for
+    /// why counting invocations rather than fresh dispatches is what makes a
+    /// sequential spawn loop spread across shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `child_placement_seq` mutex is poisoned.
+    fn next_child_placement_seq(&self) -> u32 {
+        let mut seq = self
+            .child_placement_seq
+            .lock()
+            .expect("child_placement_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Prove a `placement` can be resolved at all, before a fan-out records its
+    /// count marker (issue #956).
+    ///
+    /// Every child in a fan-out shares one `&ChildPlacement`, and the only
+    /// placement failures — no router installed, an unknown or drained shard, an
+    /// undeclared residency key, no writable shard — depend solely on the
+    /// placement and the router, never on which child is being placed. So one
+    /// resolution answers the question for the whole group.
+    ///
+    /// Doing it up front is load-bearing, not tidy. `record_fan_out_marker`
+    /// pushes a durable `MarkerRecorded { name: "fan_out:{n}" }` command, and
+    /// `peek_fan_out_count`'s own contract is that no such marker is ever
+    /// persisted without a corresponding dispatch attempt. A placement rejection
+    /// discovered *inside* `try_join_all` lands strictly after the marker: no
+    /// child is pushed, but the marker persists — and on the next replay the
+    /// marker matches, so `fresh_dispatch` is `false` and the child-input
+    /// payload cap is silently skipped on what is in fact the first real
+    /// dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`resolve_child_placement`](crate::shard::resolve_child_placement)
+    /// returns for this placement.
+    fn preflight_placement(
+        &self,
+        placement: &crate::shard::ChildPlacement,
+        workflow_name: &str,
+    ) -> HarvestResult<()> {
+        if placement.is_parent_shard() {
+            return Ok(());
+        }
+        // The key is irrelevant to every failure mode this is checking for; a
+        // stable sentinel keeps the probe from perturbing the real counter.
+        crate::shard::resolve_child_placement(
+            self.placement_router().as_ref(),
+            placement,
+            self.exec_id.shard(),
+            workflow_name,
+            &crate::shard::child_placement_key(self.exec_id, 0),
+        )
+        .map(|_| ())
+    }
+
     /// Mint a **fresh** child `ExecutionId` on the shard `placement` selects.
     ///
     /// The default [`ChildPlacement::ParentShard`](crate::shard::ChildPlacement::ParentShard)
     /// short-circuits to today's `ExecutionId::new_for_shard(parent_shard)` and
-    /// never touches the router or the placement counter, so a deployment that
-    /// never opts in is byte-for-byte unchanged — including the counter, which
-    /// stays at zero and therefore cannot perturb any other caller's key.
+    /// never touches the router, so a deployment that never opts in is
+    /// byte-for-byte unchanged.
     ///
     /// Only ever called on a **fresh dispatch**. A replay reuses the `child_id`
     /// recorded in `ChildWorkflowStarted`, so placement is decided exactly once
     /// in a child's lifetime and the parent's history replays identically
-    /// wherever the child physically lives (issue #956 AC6).
+    /// wherever the child physically lives (issue #956 AC6). `seq` is supplied by
+    /// the caller (from [`next_child_placement_seq`](Self::next_child_placement_seq))
+    /// rather than taken here, precisely because it must advance on the replay
+    /// invocations this function is never reached from.
     ///
     /// # Errors
     ///
@@ -7230,19 +7306,12 @@ impl WorkflowContext {
         &self,
         placement: &crate::shard::ChildPlacement,
         workflow_name: &str,
+        seq: u32,
     ) -> HarvestResult<ExecutionId> {
         let parent_shard = self.exec_id.shard();
         if placement.is_parent_shard() {
             return Ok(ExecutionId::new_for_shard(parent_shard));
         }
-        let seq = {
-            let mut seq = self
-                .child_placement_seq
-                .lock()
-                .expect("child_placement_seq lock poisoned");
-            *seq += 1;
-            *seq
-        };
         let key = crate::shard::child_placement_key(self.exec_id, seq);
         let shard = crate::shard::resolve_child_placement(
             self.placement_router().as_ref(),
@@ -7321,6 +7390,10 @@ impl WorkflowContext {
         input: Value,
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Value> {
+        // Advance the placement counter FIRST, on every invocation (live or
+        // replay) — see `next_child_placement_seq`. Taken before the matcher runs
+        // so an early return from any arm cannot desynchronise it.
+        let placement_seq = self.next_child_placement_seq();
         let history_match = self.match_history(|m| m.match_child_workflow(workflow_name, &input));
 
         match history_match {
@@ -7453,7 +7526,7 @@ impl WorkflowContext {
                 // route to the child's database in O(1), with no directory.
                 // Resolved BEFORE the command is pushed so a rejected placement
                 // fails the spawn with nothing recorded.
-                let child_id = self.mint_child_id(placement, workflow_name)?;
+                let child_id = self.mint_child_id(placement, workflow_name, placement_seq)?;
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
                     child_id,
@@ -7502,12 +7575,14 @@ impl WorkflowContext {
     /// The default policy is `RequestCancel`. Use `Abandon` for "fire-and-forget"
     /// fan-out and long-lived monitor patterns.
     ///
-    /// # Shard restriction
+    /// # Shard placement
     ///
-    /// The child is placed on the **same shard** as the parent. Cross-shard
-    /// detached spawns are not supported in this release; pass an
-    /// `ExecutionId` from a different shard and you will receive
-    /// [`HarvestError::Config`].
+    /// The child is placed on the **same shard** as the parent. To place a
+    /// detached child elsewhere, use
+    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed)
+    /// with an explicit [`ChildPlacement`](crate::shard::ChildPlacement)
+    /// (issue #956); the `ParentClosePolicy` cascade reaches a cross-shard
+    /// child too.
     ///
     /// # Errors
     ///
@@ -7566,6 +7641,9 @@ impl WorkflowContext {
         parent_close_policy: crate::types::ParentClosePolicy,
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<ExecutionId> {
+        // Advance on every invocation, before the matcher — see
+        // `next_child_placement_seq`.
+        let placement_seq = self.next_child_placement_seq();
         let history_match = self.match_history(|m| {
             m.match_detached_child_spawn(workflow_name, &input, parent_close_policy)
         });
@@ -7596,7 +7674,7 @@ impl WorkflowContext {
                     });
                 }
 
-                let child_id = self.mint_child_id(placement, workflow_name)?;
+                let child_id = self.mint_child_id(placement, workflow_name, placement_seq)?;
                 self.push_command(WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
                     workflow_name: workflow_name.to_string(),
@@ -7983,6 +8061,10 @@ impl WorkflowContext {
     ) -> HarvestResult<Option<Value>> {
         use crate::replay::ChildOrTimerMatch;
 
+        // Advance on every invocation, before any matching — see
+        // `next_child_placement_seq`.
+        let placement_seq = self.next_child_placement_seq();
+
         // Deterministic timer ID: the counter increments on every call (live and
         // replay alike), so the Nth race in workflow code always carries the same
         // ID as the Nth recorded race timer. Distinct from the signal-timeout
@@ -8183,7 +8265,7 @@ impl WorkflowContext {
                     Some(id) => id,
                     // Fresh dispatch: resolve placement (issue #956). The
                     // default keeps the pre-#956 `new_for_shard(parent)` mint.
-                    None => self.mint_child_id(placement, workflow_name)?,
+                    None => self.mint_child_id(placement, workflow_name, placement_seq)?,
                 };
                 let (child_tx, child_rx) = oneshot::channel();
                 let (timer_tx, timer_rx) = oneshot::channel();
@@ -10569,6 +10651,10 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Vec<Value>> {
         self.check_cancellation()?;
+        // Before the marker (see `preflight_placement`).
+        if let Some((name, _)) = children.first() {
+            self.preflight_placement(placement, name)?;
+        }
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
@@ -10663,6 +10749,10 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
         self.check_cancellation()?;
+        // Before the marker (see `preflight_placement`).
+        if let Some((name, _)) = children.first() {
+            self.preflight_placement(placement, name)?;
+        }
 
         let seq = self.next_fan_out_seq();
         let count = children.len();

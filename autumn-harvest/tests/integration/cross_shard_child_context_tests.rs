@@ -516,3 +516,151 @@ fn shard_unavailable_renders_its_shard_and_reason() {
     assert!(rendered.contains('2'), "{rendered}");
     assert!(rendered.contains("pool checkout timed out"), "{rendered}");
 }
+
+/// **Regression (review finding).** A *sequential* loop of placed spawns must
+/// spread across shards, not collapse onto one.
+///
+/// A fresh `WorkflowContext` is built per decision cycle, and in a sequential
+/// `spawn(...).await` loop each child is the only **fresh** dispatch in its own
+/// cycle — every earlier child replays from history. A placement counter that
+/// only advanced on a fresh dispatch therefore restarted at 1 every cycle and
+/// handed `"{parent}#1"` to every child in the loop, putting the entire loop on
+/// one shard while the fan-out helper (whose children are all fresh in one
+/// cycle) looked perfectly uniform. Counting *invocations* instead makes the Nth
+/// spawn's key depend on its position in the workflow rather than on which cycle
+/// dispatched it.
+#[tokio::test]
+async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
+    fn three_sequential<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for i in 0..3 {
+                out.push(
+                    ctx.spawn_child_workflow_raw_placed(
+                        "child_wf",
+                        json!(i),
+                        &ChildPlacement::Distributed,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(json!(out))
+        })
+    }
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut history = vec![started()];
+    let mut shards = Vec::new();
+
+    // Drive three decision cycles, completing one child per cycle — the shape a
+    // real sequential loop actually runs in.
+    for i in 0..3 {
+        let ctx = WorkflowContext::for_replay(exec_id, history.clone())
+            .with_shard_router(four_shard_router());
+        let WorkflowOutcome::Suspended { commands } =
+            run_workflow_with_context(ctx, three_sequential, Value::Null).await
+        else {
+            panic!("expected a suspension on child {i}");
+        };
+        let ids = started_child_ids(&commands);
+        assert_eq!(ids.len(), 1, "exactly one child is dispatched per cycle");
+        let child_id = ids[0];
+        shards.push(child_id.shard().as_i32());
+        history.push(WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "child_wf".to_string(),
+            input: json!(i),
+        });
+        history.push(WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: json!(i),
+        });
+    }
+
+    let distinct: std::collections::BTreeSet<i32> = shards.iter().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "three sequential placed spawns all landed on shard {shards:?} — the \
+         placement counter is resetting per decision cycle"
+    );
+}
+
+/// The Nth placed spawn's shard must not depend on which decision cycle
+/// dispatched it — the property that makes the sequential loop above work, and
+/// the restart-stability contract AC2 asks for.
+#[tokio::test]
+async fn a_placed_childs_shard_does_not_depend_on_which_cycle_dispatched_it() {
+    fn two_sequential<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let a = ctx
+                .spawn_child_workflow_raw_placed("child_wf", json!(0), &ChildPlacement::Distributed)
+                .await
+                .map_err(|e| e.to_string())?;
+            let b = ctx
+                .spawn_child_workflow_raw_placed("child_wf", json!(1), &ChildPlacement::Distributed)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!([a, b]))
+        })
+    }
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    // Cycle 1 dispatches child A.
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
+    let WorkflowOutcome::Suspended { commands } =
+        run_workflow_with_context(ctx, two_sequential, Value::Null).await
+    else {
+        panic!("expected a suspension on child A");
+    };
+    let a_id = started_child_ids(&commands)[0];
+
+    // Cycle 2 replays A and dispatches B. B is the SECOND invocation, so its key
+    // must be `#2` even though it is the first fresh dispatch of this cycle.
+    let history = vec![
+        started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: a_id,
+            workflow_name: "child_wf".to_string(),
+            input: json!(0),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: a_id,
+            output: json!(0),
+        },
+    ];
+    let ctx = WorkflowContext::for_replay(exec_id, history).with_shard_router(four_shard_router());
+    let WorkflowOutcome::Suspended { commands } =
+        run_workflow_with_context(ctx, two_sequential, Value::Null).await
+    else {
+        panic!("expected a suspension on child B");
+    };
+    let b_id = started_child_ids(&commands)[0];
+
+    let router = four_shard_router();
+    let parent = exec_id;
+    assert_eq!(
+        a_id.shard(),
+        router.pick_for_new_workflow(
+            "child_wf",
+            &autumn_harvest::shard::child_placement_key(parent, 1)
+        ),
+        "child A must hash as the first invocation"
+    );
+    assert_eq!(
+        b_id.shard(),
+        router.pick_for_new_workflow(
+            "child_wf",
+            &autumn_harvest::shard::child_placement_key(parent, 2)
+        ),
+        "child B must hash as the second invocation, not the first"
+    );
+}

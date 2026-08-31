@@ -57,8 +57,8 @@ module counts at the audited revision, recomputed by CI:
 | `diesel` query layer | 48 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 16 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 11 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 31 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 12 modules | Yes — integer epoch milliseconds. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 32 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 22 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 12 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
@@ -169,7 +169,7 @@ Classification rule:
 | `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
-| `cross_shard_child` | diesel, row-lock | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel plus one `FOR UPDATE` on the parent row before the terminal append, subsumed by the single write lock); the coupling is architectural, not syntactic. |
+| `cross_shard_child` | diesel, interval-sql, raw-sql, row-lock | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel, one `FOR UPDATE` on the parent row before the terminal append — subsumed by the single write lock — and a raw `INTERVAL` retry-backoff predicate that would become integer epoch ms exactly as `build_routing` does); the coupling is architectural, not syntactic. |
 | `debounce` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim; `sqlite_master` probe for the table check. |
 | `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |

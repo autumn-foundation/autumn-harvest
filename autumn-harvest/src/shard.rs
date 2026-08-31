@@ -1618,6 +1618,22 @@ pub fn resolve_child_placement(
     let requested = match placement {
         ChildPlacement::ParentShard => unreachable!("short-circuited above"),
         ChildPlacement::Distributed => {
+            // `pick_for_new_workflow` falls back to `default_shard` when the
+            // writable set is empty — correct for a top-level start, and exactly
+            // the silent fallback AC8 forbids for an opt-in placement. An
+            // operator draining every shard for a maintenance window is a
+            // supported state, and a `Distributed` child spawned during it must
+            // fail retryably rather than land on the default shard with no
+            // trace: placement is decided once and recorded in the child's id,
+            // so a wrong choice here is not recoverable after the fact.
+            if router.writable_shards().is_empty() {
+                return Err(crate::error::HarvestError::ShardUnavailable {
+                    shard_id: router.default_shard().as_i32(),
+                    reason: "no shard is currently writable, so a distributed child \
+                             cannot be placed"
+                        .to_string(),
+                });
+            }
             return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
         }
         ChildPlacement::Shard(shard) => ShardPlacement::Shard(*shard),
@@ -1626,7 +1642,23 @@ pub fn resolve_child_placement(
 
     router
         .resolve_placement(&requested, workflow_name, placement_key)
-        .map_err(|e| crate::error::HarvestError::Config(e.to_string()))
+        .map_err(|e| match e {
+            // A drained shard is a *transient* operational state — a rebalance,
+            // a maintenance window — so it is retryable and gets the engine's
+            // bounded-backoff redrive rather than terminally failing the
+            // workflow. Everything else (an unknown shard, an undeclared or
+            // blank residency key) is static misconfiguration that no amount of
+            // retrying fixes, and stays a `Config` error the author sees.
+            ShardPlacementError::ShardNotWritable { requested, .. } => {
+                crate::error::HarvestError::ShardUnavailable {
+                    shard_id: requested.as_i32(),
+                    reason: "shard is readable but not currently accepting new \
+                             workflows; it is being drained"
+                        .to_string(),
+                }
+            }
+            other => crate::error::HarvestError::Config(other.to_string()),
+        })
 }
 
 /// Lifecycle status of one cross-shard child outbox row (issue #956).
@@ -1765,11 +1797,11 @@ pub fn next_cross_shard_child_action(
 
 /// Is `state` one of the engine's terminal execution states?
 ///
-/// Mirrors `crate::erase::is_terminal_state`, restated here so this module's
-/// pure decision logic carries no `db`-feature dependency.
+/// Delegates to [`crate::erase::is_terminal_state`] rather than restating the
+/// list. A local copy had already drifted — it omitted `CONTINUED_AS_NEW`, so a
+/// child sealing that way would have been polled as non-terminal forever, the
+/// parent parked forever and the outbox row leaked. `erase` carries no
+/// `db`-feature gate, so there is no reason to keep a second list.
 fn is_terminal_execution_state(state: &str) -> bool {
-    matches!(
-        state,
-        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
-    )
+    crate::erase::is_terminal_state(state)
 }

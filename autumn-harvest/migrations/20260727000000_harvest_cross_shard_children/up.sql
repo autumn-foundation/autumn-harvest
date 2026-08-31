@@ -63,12 +63,29 @@ CREATE TABLE IF NOT EXISTS harvest_cross_shard_children (
     last_attempt_at TIMESTAMPTZ NULL
 );
 
--- The relay's work-list query: everything for the shards this worker is
--- assigned, oldest first.
-CREATE INDEX IF NOT EXISTS idx_harvest_cross_shard_children_target
-    ON harvest_cross_shard_children (target_shard, created_at);
+-- The relay runs two work-list queries per sweep, and each gets its own index.
+--
+-- 1. ACTIONABLE rows -- a child not created yet, or a pending cancel. PARTIAL,
+--    because in the steady state of a large fan-out this set is a rounding
+--    error next to the in-flight set: the index stays tiny and the start
+--    backlog drains at full batch width. The predicate is a superset of the
+--    query's (which also carries the retry-backoff due check), so Postgres can
+--    still use it.
+CREATE INDEX IF NOT EXISTS idx_harvest_cross_shard_children_actionable
+    ON harvest_cross_shard_children (target_shard, created_at)
+    WHERE status = 'PENDING_START' OR cancel_requested;
 
--- The parent-side lookups: "which cross-shard children does this parent have?"
--- (used by the cancel paths and the close cascade).
-CREATE INDEX IF NOT EXISTS idx_harvest_cross_shard_children_parent
-    ON harvest_cross_shard_children (parent_exec_id);
+-- 2. IN-FLIGHT rows, polled least-recently-swept first. The `last_attempt_at`
+--    lead column is what makes the poll ROTATE through a large backlog instead
+--    of re-reading the oldest window every tick -- without it, a handful of
+--    long-running children at the head of `created_at` would occupy every slot
+--    and starve every newer row's terminal delivery indefinitely.
+CREATE INDEX IF NOT EXISTS idx_harvest_cross_shard_children_inflight
+    ON harvest_cross_shard_children (target_shard, last_attempt_at, created_at)
+    WHERE status = 'STARTED' AND NOT cancel_requested;
+
+-- Deliberately NO index on `parent_exec_id`: every parent-side lookup (the
+-- cancel request, the "is this child already recorded here?" spawn check) is
+-- keyed by `child_exec_id`, which is the primary key. An unused index here
+-- would be pure write amplification on the hot spawn path -- one insert and one
+-- delete per cross-shard child, which is exactly the 10k-child fan-out.

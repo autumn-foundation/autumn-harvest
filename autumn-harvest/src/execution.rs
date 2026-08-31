@@ -2402,9 +2402,20 @@ async fn inline_cancel(
 /// skipped. There is no `ChildWorkflowCancelled` event variant, so a cancel and
 /// a terminate both surface to the parent as `ChildWorkflowFailed` (the
 /// child-await resolves `Err`) — matching the worker failure path and adding no
-/// new event variant. Awaited children are co-located on the parent's shard
-/// (the worker append-on-child-conn path relies on the same invariant), so this
-/// append on the child's connection targets the correct shard.
+/// new event variant.
+///
+/// # Shard scope (issue #956)
+///
+/// This appends on the **child's** connection, so it only reaches a parent that
+/// lives on the child's own shard. That was universally true before cross-shard
+/// child placement; it is now the common case rather than an invariant. A
+/// cross-shard child's parent row is simply absent from this connection, so the
+/// `parent_state` lookup below returns `None` and this function correctly does
+/// nothing — the wake is owed by the cross-shard relay
+/// (`cross_shard_child::deliver_terminal`), which pulls the child's terminal
+/// state and appends on the *parent's* shard. That handoff is by construction,
+/// not by luck: the relay polls a durable row on the parent's shard and does not
+/// depend on this path having run.
 async fn notify_awaited_parent_of_child_terminal(
     conn: &mut AsyncPgConnection,
     child_exec_id: ExecutionId,

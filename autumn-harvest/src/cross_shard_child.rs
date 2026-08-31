@@ -1,7 +1,7 @@
 //! Cross-shard child workflows (issue #956).
 //!
 //! Children are pinned to the parent's shard by default, and that default is
-//! permanent. When a spawn opts in to [`ChildPlacement::Distributed`] (or an
+//! permanent. When a spawn opts in to [`ChildPlacement::Distributed`](crate::shard::ChildPlacement::Distributed) (or an
 //! explicit pin) and the resolved shard is not the parent's, the child cannot be
 //! created inside the parent's decision transaction — per-execution ACID is
 //! shard-local by design and never spans two databases.
@@ -53,17 +53,36 @@ use crate::models::{CrossShardChildRow, NewCrossShardChildRow, NewWorkflowExecut
 use crate::queue::TaskType;
 use crate::schema::{harvest_cross_shard_children, harvest_workflow_executions};
 use crate::shard::{
-    ChildPlacement, CrossShardChildAction, CrossShardChildObservation, CrossShardChildStatus,
-    ShardedDbPool, next_cross_shard_child_action,
+    CrossShardChildAction, CrossShardChildObservation, CrossShardChildStatus, ShardedDbPool,
+    next_cross_shard_child_action,
 };
 use crate::types::{ExecutionId, ParentClosePolicy, ShardId};
 use crate::{queue, store};
 
-/// How many outbox rows one sweep processes per shard before yielding.
+/// How many **actionable** outbox rows one sweep handles per shard.
 ///
-/// Bounds a single tick's work under a 10k-child fan-out so the relay can never
-/// monopolise a scanner thread; the remainder is picked up on the next tick.
+/// Actionable means the row's own columns say work is owed: a child that has
+/// not been created yet, or a pending cancel. Bounds a single tick so the relay
+/// can never monopolise a scanner thread under a 10k-child fan-out.
 const RELAY_BATCH: i64 = 200;
+
+/// How many **already-started** rows one sweep polls for their child's terminal.
+///
+/// Deliberately larger than [`RELAY_BATCH`]: these rows are usually answered by
+/// one batched `id = ANY(...)` read per target shard that returns only the
+/// children that actually finished, so the cost is a wide read and a narrow
+/// result rather than per-row work.
+const POLL_BATCH: i64 = 1_000;
+
+/// Per-row retry backoff, as a SQL due-predicate.
+///
+/// A row that keeps failing is re-tried after `min(attempts, 6) * 5s`, so a
+/// permanently-broken row (an unreachable shard, a poison spec, an unparseable
+/// stored policy) backs off to one attempt every 30s instead of being re-driven
+/// at full poll cadence — and, more importantly, stops consuming a slot in every
+/// single sweep and starving newer rows behind it.
+const DUE_PREDICATE: &str = "(last_attempt_at IS NULL OR last_attempt_at < NOW() - \
+     (LEAST(attempts, 6) * INTERVAL '5 seconds'))";
 
 /// Everything the relay needs to create the child on the target shard, with
 /// every default **already resolved** at spawn time.
@@ -185,27 +204,37 @@ impl QuotaCaps {
 /// placement contract without trace, which is precisely the failure mode this
 /// check exists to prevent.
 ///
-/// A `None` pool (single-pool deployments and every test harness that never
-/// builds a `ShardedDbPool`) is *not* an error: routing there is degenerate and
-/// a resolved cross-shard target simply cannot occur, because the router that
-/// produced it would have to have more than one writable shard.
+/// Fails **closed** on a `None` pool. The router and the pool map are two
+/// independent globals with two independent installers, so "a multi-shard router
+/// with no `ShardedDbPool`" is a reachable misconfiguration (an API-only runtime,
+/// an embedder, a half-wired test harness) — and in that state the relay would
+/// return `Ok(0)` forever while the row sat there and the parent parked
+/// indefinitely. This function is only ever called for a target that already
+/// resolved *away* from the parent's shard, so there is no legitimate no-pool
+/// case to admit.
 ///
 /// # Errors
 ///
-/// [`HarvestError::ShardUnavailable`] — typed and retryable — when the pool map
-/// has no entry for `target`.
+/// [`HarvestError::ShardUnavailable`] — typed and retryable — when there is no
+/// pool map, or the map has no entry for `target`.
 pub fn preflight_target_shard(
     sharded_pool: Option<&ShardedDbPool>,
     target: ShardId,
 ) -> HarvestResult<()> {
-    let Some(pool) = sharded_pool else {
-        return Ok(());
+    let unavailable = |reason: &str| HarvestError::ShardUnavailable {
+        shard_id: target.as_i32(),
+        reason: reason.to_string(),
     };
+    let pool = sharded_pool.ok_or_else(|| {
+        unavailable(
+            "this process has no sharded database pool, so a child cannot be \
+             placed off the parent's shard",
+        )
+    })?;
     if pool.exact_pool_for(target).is_none() {
-        return Err(HarvestError::ShardUnavailable {
-            shard_id: target.as_i32(),
-            reason: "no database pool is configured for this shard on this node".to_string(),
-        });
+        return Err(unavailable(
+            "no database pool is configured for this shard on this node",
+        ));
     }
     Ok(())
 }
@@ -251,34 +280,16 @@ pub async fn record_cross_shard_child(
     Ok(())
 }
 
-/// Is `child_exec_id` a cross-shard child recorded on this shard?
-///
-/// Used by the parent-side cancel paths to decide between an inline
-/// same-shard cancel and a durable cross-shard cancel request.
-///
-/// # Errors
-///
-/// Propagates database errors.
-pub async fn is_cross_shard_child(
-    conn: &mut AsyncPgConnection,
-    child_exec_id: ExecutionId,
-) -> HarvestResult<bool> {
-    let found: Option<uuid::Uuid> = harvest_cross_shard_children::table
-        .find(child_exec_id.as_uuid())
-        .select(harvest_cross_shard_children::child_exec_id)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-    Ok(found.is_some())
-}
-
 /// Durably request cancellation of a cross-shard child.
 ///
 /// Called inside whatever parent-side transaction decided to cancel (a race
 /// loser, an over-deadline child, an operator cancel), so the request commits
 /// with that decision. The relay delivers it to the target shard on its next
 /// sweep; delivery is idempotent, so an at-least-once redelivery is harmless.
+///
+/// Clears `last_attempt_at` so a row that had backed off after an earlier
+/// failure is picked up on the very next sweep — a cancel is latency-sensitive
+/// in a way a routine poll is not.
 ///
 /// Returns the number of rows flagged — `0` means the child is not (or is no
 /// longer) a tracked cross-shard child, which the caller treats as "nothing to
@@ -292,10 +303,57 @@ pub async fn request_cross_shard_cancel(
     child_exec_id: ExecutionId,
 ) -> HarvestResult<usize> {
     diesel::update(harvest_cross_shard_children::table.find(child_exec_id.as_uuid()))
-        .set(harvest_cross_shard_children::cancel_requested.eq(true))
+        .set((
+            harvest_cross_shard_children::cancel_requested.eq(true),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<DateTime<Utc>>),
+            harvest_cross_shard_children::attempts.eq(0),
+        ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)
+}
+
+/// Which of `child_ids` are already recorded as cross-shard children here?
+///
+/// The spawn path's "is this child genuinely new?" test is a lookup in
+/// `harvest_workflow_executions` **on the parent's shard**, where a cross-shard
+/// child's row never appears — so without this every re-park would classify a
+/// remote child as new and append a *second* `ChildWorkflowStarted` for it,
+/// corrupting the parent's history and failing its next replay with a
+/// non-determinism divergence.
+///
+/// # Errors
+///
+/// Propagates database errors.
+pub async fn recorded_cross_shard_child_ids(
+    conn: &mut AsyncPgConnection,
+    child_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if child_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    harvest_cross_shard_children::table
+        .filter(harvest_cross_shard_children::child_exec_id.eq_any(child_ids))
+        .select(harvest_cross_shard_children::child_exec_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// `(id, state, output, error)` as read from a target shard.
+type ChildStateRow = (
+    uuid::Uuid,
+    String,
+    Option<serde_json::Value>,
+    Option<String>,
+);
+
+/// One in-flight child observed on its target shard.
+#[derive(Debug, Clone)]
+struct TargetChildState {
+    state: String,
+    output: Option<serde_json::Value>,
+    error: Option<String>,
 }
 
 /// One sweep of the cross-shard child relay.
@@ -304,19 +362,29 @@ pub async fn request_cross_shard_cancel(
 /// shard through `sharded_pool`. Returns how many rows made observable progress.
 ///
 /// Failure of one row never aborts the sweep: a target shard that is down is
-/// logged onto the row (`attempts` / `last_error`) and retried next tick, which
-/// mirrors `attempt_signal_delivery`'s "one row's transient failure must not
-/// abort the scan of every other row" contract from issue #492.
+/// logged onto the row (`attempts` / `last_error` / `last_attempt_at`) and
+/// retried after a backoff, which mirrors `attempt_signal_delivery`'s "one row's
+/// transient failure must not abort the scan of every other row" contract from
+/// issue #492.
 ///
 /// # Errors
 ///
-/// Only propagates a failure to *read* this shard's own work-list; per-row
-/// failures are absorbed.
+/// Only propagates a failure to read this shard's own work-list; every per-row
+/// and per-target-shard failure is absorbed onto the row.
 pub async fn enforce_cross_shard_children(
     conn: &mut AsyncPgConnection,
     sharded_pool: &Option<ShardedDbPool>,
-    shard_assignments: &[ShardId],
 ) -> HarvestResult<usize> {
+    // Every cross-shard checkout in this sweep is bounded. Harvest configures no
+    // deadpool `Timeouts`, so a bare `pool.get().await` is an *unbounded* wait,
+    // and the relay holds a connection on the parent's shard for the whole sweep
+    // while reaching across to others — see `acquire_bounded` for the two-pool
+    // wait-for cycle that creates. The relay only ever runs with a
+    // `ShardedDbPool` present, so the multi-shard bound always applies; the
+    // floor (rather than a poll interval) is used because a bounded pool busy
+    // dispatching legitimately takes far longer than one poll to hand a
+    // connection over.
+    let acquire_bound = Some(crate::worker::MIN_SHARD_ACQUIRE_BOUND);
     let active_pool = sharded_pool.clone().or_else(|| {
         crate::shard::GLOBAL_SHARDED_POOL
             .read()
@@ -330,49 +398,61 @@ pub async fn enforce_cross_shard_children(
     };
 
     // Only sweep rows whose target shard this worker actually holds a pool for.
-    // A row for a shard this node cannot see is left for a node that can, which
-    // is the same "leave pending for other workers" contract the #492 outbox
-    // scanners use.
-    let reachable: Vec<i32> = pool
-        .shard_ids()
-        .into_iter()
-        .filter(|shard| shard_assignments.is_empty() || shard_assignments.contains(shard))
-        .map(ShardId::as_i32)
-        .collect();
+    // A row for a shard this node cannot see is left for a node that can — the
+    // same "leave pending for other workers" contract the #492 outbox scanners
+    // use.
+    //
+    // Deliberately NOT filtered by the caller's shard assignments: this row
+    // lives on the PARENT's shard, which is already the connection we are
+    // handed, and `monitor_shard_scope` narrows each per-shard timeout checker's
+    // assignment list to that one shard. Intersecting `target_shard` with it
+    // would keep only rows whose target IS the parent's shard — i.e. exactly the
+    // rows that are never cross-shard — and the relay would sweep nothing at all
+    // in the multi-shard deployments it exists for. The union across the fleet's
+    // per-shard checkers still covers every shard's rows exactly once, because
+    // each checker only ever sees its own database's table.
+    let reachable: Vec<i32> = pool.shard_ids().into_iter().map(ShardId::as_i32).collect();
     if reachable.is_empty() {
         return Ok(0);
     }
 
-    let rows: Vec<CrossShardChildRow> = harvest_cross_shard_children::table
-        .filter(harvest_cross_shard_children::target_shard.eq_any(&reachable))
-        .order(harvest_cross_shard_children::created_at.asc())
-        .limit(RELAY_BATCH)
-        .select(CrossShardChildRow::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
+    let rows = load_sweep_batch(conn, &reachable).await?;
     if rows.is_empty() {
         return Ok(0);
     }
 
+    // Stamp every row this sweep looked at BEFORE acting on it. Two things
+    // depend on this: the `last_attempt_at NULLS FIRST` ordering below rotates
+    // through a large backlog instead of re-reading the same head every tick
+    // (without it a handful of long-running children at the head of
+    // `created_at` starve every newer row indefinitely), and a row whose target
+    // shard is unreadable this sweep still gets a visible breadcrumb.
+    let swept_ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.child_exec_id).collect();
+    mark_swept(conn, &swept_ids).await;
+
     // One batched read per target shard, not one per row: a 10k-child fan-out
-    // must not become a 10k-round-trip sweep (the `O(nodes × shards)` shape the
+    // must not become a 10k-round-trip sweep (the `O(nodes x shards)` shape the
     // children-traversal N+1 fix already called out in this repo).
-    let child_states = load_child_states(&pool, &rows).await;
-    let parent_terminal = load_parent_terminal_states(conn, &rows).await?;
+    let child_states = load_child_states(&pool, &rows, acquire_bound).await;
+    let parent_terminal = load_parent_terminal_states(conn, &rows).await;
 
     let mut progressed = 0;
     for row in rows {
         let Some(status) = CrossShardChildStatus::from_db(&row.status) else {
+            let reason = format!("unrecognised status {:?}", row.status);
             tracing::error!(
                 child_exec_id = %row.child_exec_id,
                 status = %row.status,
-                "cross-shard child relay: unrecognised status; leaving the row untouched"
+                "cross-shard child relay: unrecognised status; the row is stuck"
             );
+            record_attempt_failure(conn, row.child_exec_id, &reason).await;
             continue;
         };
-        let policy = match row.parent_close_policy.as_deref().map(str::parse) {
+        let policy = match row
+            .parent_close_policy
+            .as_deref()
+            .map(str::parse::<ParentClosePolicy>)
+        {
             None => None,
             Some(Ok(policy)) => Some(policy),
             Some(Err(e)) => {
@@ -380,11 +460,13 @@ pub async fn enforce_cross_shard_children(
                     child_exec_id = %row.child_exec_id,
                     error = %e,
                     "cross-shard child relay: unparseable parent_close_policy; \
-                     leaving the row untouched"
+                     the row is stuck"
                 );
+                record_attempt_failure(conn, row.child_exec_id, &e).await;
                 continue;
             }
         };
+        let observed_child = child_states.get(&row.child_exec_id);
         let observation = CrossShardChildObservation {
             status,
             cancel_requested: row.cancel_requested,
@@ -395,11 +477,21 @@ pub async fn enforce_cross_shard_children(
                 // A parent row that has vanished (retention collection, erase)
                 // is treated as closed: there is nobody left to wake.
                 .unwrap_or(true),
-            child_state: child_states.get(&row.child_exec_id).map(String::as_str),
+            child_state: observed_child.map(|c| c.state.as_str()),
         };
 
         let action = next_cross_shard_child_action(&observation);
-        match apply_action(conn, &pool, &row, action, &observation).await {
+        match apply_action(
+            conn,
+            &pool,
+            &row,
+            action,
+            &observation,
+            observed_child,
+            acquire_bound,
+        )
+        .await
+        {
             Ok(true) => progressed += 1,
             Ok(false) => {}
             Err(e) => {
@@ -409,7 +501,7 @@ pub async fn enforce_cross_shard_children(
                     target_shard = row.target_shard,
                     action = ?action,
                     error = %e,
-                    "cross-shard child relay: step failed; retrying on the next sweep"
+                    "cross-shard child relay: step failed; retrying after a backoff"
                 );
                 record_attempt_failure(conn, row.child_exec_id, &e.to_string()).await;
             }
@@ -419,7 +511,85 @@ pub async fn enforce_cross_shard_children(
     Ok(progressed)
 }
 
-/// Batched `child_id → state` read, one query per distinct target shard.
+/// This sweep's work-list: actionable rows first, then a rotating window of
+/// already-started rows.
+///
+/// Splitting the two is what stops head-of-line starvation. A single
+/// `ORDER BY created_at LIMIT N` fills its whole window with rows that are
+/// merely *waiting* — an awaited child that is still running is re-read every
+/// tick and never deleted until it finishes — so under a 10k-child fan-out the
+/// oldest N rows would occupy every slot and rows N+1.. would never be started
+/// at all. Actionable rows are selected by their own columns (`PENDING_START` or
+/// a pending cancel), so the start backlog always drains; waiting rows are then
+/// polled least-recently-swept first, so the poll rotates through the whole
+/// backlog rather than re-reading one end of it.
+async fn load_sweep_batch(
+    conn: &mut AsyncPgConnection,
+    reachable: &[i32],
+) -> HarvestResult<Vec<CrossShardChildRow>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+
+    let mut rows: Vec<CrossShardChildRow> = harvest_cross_shard_children::table
+        .filter(harvest_cross_shard_children::target_shard.eq_any(reachable))
+        .filter(
+            harvest_cross_shard_children::status
+                .eq(CrossShardChildStatus::PendingStart.as_db_str())
+                .or(harvest_cross_shard_children::cancel_requested.eq(true)),
+        )
+        .filter(sql::<Bool>(DUE_PREDICATE))
+        .order(harvest_cross_shard_children::created_at.asc())
+        .limit(RELAY_BATCH)
+        .select(CrossShardChildRow::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let started: Vec<CrossShardChildRow> = harvest_cross_shard_children::table
+        .filter(harvest_cross_shard_children::target_shard.eq_any(reachable))
+        .filter(harvest_cross_shard_children::status.eq(CrossShardChildStatus::Started.as_db_str()))
+        .filter(harvest_cross_shard_children::cancel_requested.eq(false))
+        .filter(sql::<Bool>(DUE_PREDICATE))
+        .order((
+            harvest_cross_shard_children::last_attempt_at
+                .asc()
+                .nulls_first(),
+            harvest_cross_shard_children::created_at.asc(),
+        ))
+        .limit(POLL_BATCH)
+        .select(CrossShardChildRow::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    rows.extend(started);
+    Ok(rows)
+}
+
+/// Stamp `last_attempt_at` on every row this sweep examined.
+///
+/// Best effort: failing to record that we looked is not worth aborting a sweep
+/// whose real work has not started yet.
+async fn mark_swept(conn: &mut AsyncPgConnection, ids: &[uuid::Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    let _ = diesel::update(
+        harvest_cross_shard_children::table
+            .filter(harvest_cross_shard_children::child_exec_id.eq_any(ids)),
+    )
+    .set(harvest_cross_shard_children::last_attempt_at.eq(Some(Utc::now())))
+    .execute(conn)
+    .await;
+}
+
+/// Batched `child_id -> (state, output, error)` read, one query per distinct
+/// target shard.
+///
+/// The terminal payload is fetched here rather than re-read in
+/// `deliver_terminal` so a delivery costs no second round trip to the target
+/// shard, and so the state the action was *decided* from is the state it is
+/// *delivered* from.
 ///
 /// An unreachable shard contributes no entries rather than failing the sweep, so
 /// its rows simply observe `child_state: None` and wait — degrading exactly like
@@ -427,7 +597,8 @@ pub async fn enforce_cross_shard_children(
 async fn load_child_states(
     pool: &ShardedDbPool,
     rows: &[CrossShardChildRow],
-) -> std::collections::HashMap<uuid::Uuid, String> {
+    acquire_bound: Option<std::time::Duration>,
+) -> std::collections::HashMap<uuid::Uuid, TargetChildState> {
     use std::collections::HashMap;
     let mut by_shard: HashMap<i32, Vec<uuid::Uuid>> = HashMap::new();
     for row in rows {
@@ -437,12 +608,12 @@ async fn load_child_states(
             .push(row.child_exec_id);
     }
 
-    let mut states: HashMap<uuid::Uuid, String> = HashMap::new();
+    let mut states: HashMap<uuid::Uuid, TargetChildState> = HashMap::new();
     for (shard, ids) in by_shard {
         let Some(shard_pool) = pool.exact_pool_for(ShardId::new(shard)) else {
             continue;
         };
-        let mut target_conn = match shard_pool.get().await {
+        let mut target_conn = match acquire_bounded(shard_pool, shard, acquire_bound).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
@@ -453,16 +624,29 @@ async fn load_child_states(
                 continue;
             }
         };
-        let loaded: Result<Vec<(uuid::Uuid, String)>, _> = harvest_workflow_executions::table
+        let loaded: Result<Vec<ChildStateRow>, _> = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::id.eq_any(&ids))
             .select((
                 harvest_workflow_executions::id,
                 harvest_workflow_executions::state,
+                harvest_workflow_executions::output,
+                harvest_workflow_executions::error,
             ))
-            .load(&mut target_conn)
+            .load(&mut *target_conn)
             .await;
         match loaded {
-            Ok(pairs) => states.extend(pairs),
+            Ok(pairs) => {
+                for (id, state, output, error) in pairs {
+                    states.insert(
+                        id,
+                        TargetChildState {
+                            state,
+                            output,
+                            error,
+                        },
+                    );
+                }
+            }
             Err(e) => tracing::warn!(
                 target_shard = shard,
                 error = %e,
@@ -473,34 +657,54 @@ async fn load_child_states(
     states
 }
 
-/// Batched `parent_id → is_terminal` read on this (the parent's) shard.
+/// Batched `parent_id -> is_terminal` read on this (the parent's) shard.
+///
+/// Absorbs its own failure into an empty map rather than propagating: this runs
+/// inside `enforce_timeouts_once`'s `?`-chain, so a propagated error would skip
+/// every scanner duty ordered after the relay (debounce, throttle, event
+/// batches, the idempotency sweep) for the whole tick. An empty map makes every
+/// row observe `parent_terminal: true`; combined with the `DeliverTerminal`
+/// step's own `FOR UPDATE` re-read of the parent, the worst outcome is that a
+/// row is retired one sweep early — never a wrong history append.
 async fn load_parent_terminal_states(
     conn: &mut AsyncPgConnection,
     rows: &[CrossShardChildRow],
-) -> HarvestResult<std::collections::HashMap<uuid::Uuid, bool>> {
+) -> std::collections::HashMap<uuid::Uuid, bool> {
     let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.parent_exec_id).collect();
-    let loaded: Vec<(uuid::Uuid, String)> = harvest_workflow_executions::table
+    let loaded: Result<Vec<(uuid::Uuid, String)>, _> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq_any(&ids))
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::state,
         ))
         .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(loaded
-        .into_iter()
-        .map(|(id, state)| (id, crate::erase::is_terminal_state(&state)))
-        .collect())
+        .await;
+    match loaded {
+        Ok(pairs) => pairs
+            .into_iter()
+            .map(|(id, state)| (id, crate::erase::is_terminal_state(&state)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cross-shard child relay: failed to read parent states; \
+                 treating this sweep's parents as unknown"
+            );
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 /// Execute one decided action. Returns whether the row made observable progress.
+#[allow(clippy::too_many_arguments)]
 async fn apply_action(
     conn: &mut AsyncPgConnection,
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     action: CrossShardChildAction,
     observation: &CrossShardChildObservation<'_>,
+    observed_child: Option<&TargetChildState>,
+    acquire_bound: Option<std::time::Duration>,
 ) -> HarvestResult<bool> {
     match action {
         CrossShardChildAction::Wait => Ok(false),
@@ -509,7 +713,7 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::StartChild => {
-            start_child_on_target(pool, row).await?;
+            start_child_on_target(pool, row, acquire_bound).await?;
             // Only after the child is durably committed on the target shard.
             // A crash before this update simply re-runs the insert, which the
             // child's primary key makes a no-op.
@@ -518,6 +722,7 @@ async fn apply_action(
                     harvest_cross_shard_children::status
                         .eq(CrossShardChildStatus::Started.as_db_str()),
                     harvest_cross_shard_children::last_error.eq(None::<String>),
+                    harvest_cross_shard_children::attempts.eq(0),
                 ))
                 .execute(conn)
                 .await
@@ -525,9 +730,13 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::CancelChild => {
-            cancel_child_on_target(pool, row).await?;
+            cancel_child_on_target(pool, row, acquire_bound).await?;
             diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
-                .set(harvest_cross_shard_children::cancel_requested.eq(false))
+                .set((
+                    harvest_cross_shard_children::cancel_requested.eq(false),
+                    harvest_cross_shard_children::last_error.eq(None::<String>),
+                    harvest_cross_shard_children::attempts.eq(0),
+                ))
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -537,54 +746,126 @@ async fn apply_action(
             let policy = observation
                 .parent_close_policy
                 .expect("ApplyCloseCascade is only decided for a detached child");
-            cascade_child_on_target(pool, row, policy).await?;
-            // Record the cascade on the parent exactly as the same-shard path
-            // does — same event variant, same fields — then drop the row. The
-            // append and the delete commit together, so the cascade is recorded
-            // at most once even though its delivery is at-least-once.
-            let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
-            let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
-            let action_str = match policy {
-                ParentClosePolicy::RequestCancel => "request_cancel",
-                ParentClosePolicy::Terminate => "terminate",
-                ParentClosePolicy::Abandon => {
-                    unreachable!("Abandon never reaches ApplyCloseCascade")
-                }
-            };
-            Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-                store::append_single_event(
-                    conn,
-                    parent_exec_id,
-                    WorkflowEvent::ChildWorkflowCascadeApplied {
-                        child_id: child_exec_id,
-                        policy,
-                        action: action_str.to_string(),
-                    },
-                )
-                .await?;
-                delete_row(conn, child_exec_id.as_uuid()).await?;
-                Ok(())
-            }))
-            .await?;
+            cascade_child_on_target(pool, row, policy, acquire_bound).await?;
+            apply_cascade_bookkeeping(conn, row, policy).await?;
             Ok(true)
         }
         CrossShardChildAction::DeliverTerminal => {
-            deliver_terminal(conn, pool, row).await?;
+            let Some(child) = observed_child else {
+                // `DeliverTerminal` is only decided from an observed terminal
+                // state, so this is unreachable; treat it as "wait" rather than
+                // panicking inside a scanner.
+                return Ok(false);
+            };
+            deliver_terminal(conn, row, child).await?;
             Ok(true)
         }
     }
 }
 
+/// Record a completed cross-shard cascade on the parent, then retire the row.
+///
+/// Lock order is **execution row -> outbox row**, matching every other path in
+/// the engine (the parent's own persist appends events — taking the parent row
+/// lock — before it writes or flags an outbox row). Taking the outbox row first
+/// here would let a relay sweep and a concurrent parent decision cycle form a
+/// wait-for cycle; Postgres would abort one with a raw `deadlock_detected`,
+/// which is neither `QuotaExceeded` nor `ShardUnavailable` and would therefore
+/// terminally fail a perfectly healthy parent.
+///
+/// The claim-by-delete inside the transaction is what makes the append
+/// exactly-once: every worker assigned this shard sweeps the same rows, so two
+/// sweeps can decide the same cascade in the same tick. Their effect on the
+/// target shard is idempotent; a history append is not.
+async fn apply_cascade_bookkeeping(
+    conn: &mut AsyncPgConnection,
+    row: &CrossShardChildRow,
+    policy: ParentClosePolicy,
+) -> HarvestResult<()> {
+    let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
+    let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
+    let action_str = match policy {
+        ParentClosePolicy::RequestCancel => "request_cancel",
+        ParentClosePolicy::Terminate => "terminate",
+        ParentClosePolicy::Abandon => unreachable!("Abandon never reaches the cascade"),
+    };
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Execution row first (see the fn doc). A parent whose row is gone
+        // entirely — retention-collected while its detached child's shard was
+        // down — has no history to append to; retire the row rather than
+        // failing forever on a `NotFound` from `append_single_event`.
+        let parent_exists: Option<uuid::Uuid> = harvest_workflow_executions::table
+            .find(parent_exec_id.as_uuid())
+            .select(harvest_workflow_executions::id)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+
+        if !claim_row_by_delete(conn, child_exec_id.as_uuid()).await? {
+            // A peer sweep already recorded this cascade.
+            return Ok(());
+        }
+        if parent_exists.is_some() {
+            store::append_single_event(
+                conn,
+                parent_exec_id,
+                WorkflowEvent::ChildWorkflowCascadeApplied {
+                    child_id: child_exec_id,
+                    policy,
+                    action: action_str.to_string(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }))
+    .await
+}
+
 async fn delete_row(conn: &mut AsyncPgConnection, child_exec_id: uuid::Uuid) -> HarvestResult<()> {
-    diesel::delete(harvest_cross_shard_children::table.find(child_exec_id))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    claim_row_by_delete(conn, child_exec_id).await?;
     Ok(())
 }
 
-/// Best-effort operability breadcrumb. A failure to record a failure is not
-/// itself worth failing the sweep over.
+/// Delete the outbox row and report whether **this** transaction removed it.
+///
+/// This is the exactly-once gate for the two relay steps that append to the
+/// parent's history (`DeliverTerminal` and `ApplyCloseCascade`). Every worker
+/// assigned the parent's shard runs the relay over the same rows — the work-list
+/// read is deliberately lock-free so a sweep never holds a transaction on the
+/// parent's shard while it reaches across to another database — so two workers
+/// can decide the same action in the same tick. Their cross-shard *effects* are
+/// idempotent, but a history append is not: two appends would put two
+/// `ChildWorkflowCompleted` events for one child into the parent's history and
+/// break replay.
+///
+/// Making the delete the gate closes that: it takes a row lock, so the second
+/// transaction blocks until the first commits and then deletes zero rows,
+/// telling it to append nothing. The delete and the append commit together, so
+/// the pair is atomic in both directions.
+///
+/// Callers must take the parent execution row **first** — see
+/// [`apply_cascade_bookkeeping`]'s note on lock order.
+async fn claim_row_by_delete(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: uuid::Uuid,
+) -> HarvestResult<bool> {
+    let deleted = diesel::delete(harvest_cross_shard_children::table.find(child_exec_id))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(deleted > 0)
+}
+
+/// Record a failed relay step on the row, so an operator can see *why* a
+/// cross-shard child is not progressing without reading logs.
+///
+/// Also drives the retry backoff: `attempts` is the exponent in `DUE_PREDICATE`,
+/// so a row that keeps failing both backs off and stops occupying a slot in
+/// every sweep. Best effort — a failure to record a failure is not worth failing
+/// the sweep over.
 async fn record_attempt_failure(
     conn: &mut AsyncPgConnection,
     child_exec_id: uuid::Uuid,
@@ -603,11 +884,11 @@ async fn record_attempt_failure(
 
 /// Create the child execution on its target shard.
 ///
-/// Idempotent by the child's primary key: `ON CONFLICT DO NOTHING` makes a
-/// repeated relay (a crash between this commit and the row's status update) a
-/// no-op rather than a duplicate child. The whole creation — row, its own
-/// `WorkflowStarted` event, its queue task — is one transaction on the target
-/// shard, so a partially-created child is impossible.
+/// Idempotent by the child's primary key: an existence pre-check plus
+/// `ON CONFLICT DO NOTHING` makes a repeated relay (a crash between this commit
+/// and the row's status update) a no-op rather than a duplicate child. The whole
+/// creation — row, its own `WorkflowStarted` event, its queue task — is one
+/// transaction on the target shard, so a partially-created child is impossible.
 // Long by construction: `NewWorkflowExecution` is a wide, fully-explicit row
 // literal (every column named, no `..Default`), exactly as at the two
 // same-shard child-insert sites. Splitting it would hide which columns a
@@ -616,8 +897,9 @@ async fn record_attempt_failure(
 async fn start_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
+    acquire_bound: Option<std::time::Duration>,
 ) -> HarvestResult<()> {
-    let mut conn = target_conn(pool, row).await?;
+    let mut conn = target_conn(pool, row, acquire_bound).await?;
 
     let spec: CrossShardChildSpec =
         serde_json::from_value(row.child_spec.clone()).map_err(HarvestError::Serialization)?;
@@ -743,51 +1025,31 @@ async fn start_child_on_target(
 }
 
 /// Deliver an idempotent cancel to a cross-shard child on its target shard.
-///
-/// `cancel_workflow_execution` is already a no-op against a terminal or missing
-/// execution, so an at-least-once redelivery cannot double-cancel or resurrect.
 async fn cancel_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
+    acquire_bound: Option<std::time::Duration>,
 ) -> HarvestResult<()> {
-    let mut conn = target_conn(pool, row).await?;
+    let mut conn = target_conn(pool, row, acquire_bound).await?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
-    // Already terminal, or never created: the cancel's goal is met either way.
-    absorb_already_settled(
-        crate::execution::cancel_workflow_execution(
-            &mut conn,
-            child_exec_id,
-            "parent requested cancellation",
-            &crate::telemetry::NoOpMetrics,
-        )
-        .await,
+    let result = crate::execution::cancel_workflow_execution(
+        &mut conn,
+        child_exec_id,
+        "parent requested cancellation",
+        &crate::telemetry::NoOpMetrics,
     )
-}
-
-/// Treat "the child is already gone or already terminal" as success.
-///
-/// Both cross-shard mutations (cancel and cascade) are delivered at-least-once,
-/// so a redelivery must be indistinguishable from the first delivery. Exactly
-/// two error shapes mean "the goal is already met": `NotFound` (the child row is
-/// gone) and `Config` (the engine's "already terminal for another reason"
-/// signal). Everything else is a genuine failure and is retried next sweep.
-fn absorb_already_settled<T>(result: HarvestResult<T>) -> HarvestResult<()> {
-    match result {
-        Ok(_) | Err(HarvestError::NotFound(_) | HarvestError::Config(_)) => Ok(()),
-        Err(e) => Err(e),
-    }
+    .await;
+    absorb_already_settled(&mut conn, child_exec_id, result).await
 }
 
 /// Apply a `ParentClosePolicy` to a detached cross-shard child.
-///
-/// Idempotent by state: both branches only act on a `RUNNING`/`PAUSED` child, so
-/// a redelivery after the child already closed does nothing.
 async fn cascade_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     policy: ParentClosePolicy,
+    acquire_bound: Option<std::time::Duration>,
 ) -> HarvestResult<()> {
-    let mut conn = target_conn(pool, row).await?;
+    let mut conn = target_conn(pool, row, acquire_bound).await?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let result = match policy {
         ParentClosePolicy::RequestCancel => {
@@ -810,21 +1072,63 @@ async fn cascade_child_on_target(
         }
         ParentClosePolicy::Abandon => unreachable!("Abandon never reaches the cascade"),
     };
-    // A missing or already-terminal child means the cascade's goal is met, so it
-    // is deliberately as successful as a fresh cascade — an at-least-once
-    // redelivery must not resurrect the child or fail the sweep. Anything else
-    // retries next tick.
-    absorb_already_settled(result)
+    absorb_already_settled(&mut conn, child_exec_id, result).await
+}
+
+/// Treat "the child is already gone or already terminal" as success — but only
+/// after **confirming** it.
+///
+/// Both cross-shard mutations (cancel and cascade) are delivered at-least-once,
+/// so a redelivery must be indistinguishable from the first delivery.
+/// `NotFound` says outright that the child row is gone, which meets the goal.
+/// `Config` does not: the engine uses it both for "already terminal for another
+/// reason" *and* for genuinely unrelated failures — `apply_parent_close_cascade`
+/// returns `Config` when a **grandchild's** stored `parent_close_policy` string
+/// will not parse, and swallowing that would have us record a successful cascade
+/// while the child kept running, untracked. So a `Config` is only absorbed when
+/// a re-read proves the child really is terminal; otherwise it is a real failure
+/// and the row retries after a backoff.
+async fn absorb_already_settled<T>(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+    result: HarvestResult<T>,
+) -> HarvestResult<()> {
+    match result {
+        Ok(_) | Err(HarvestError::NotFound(_)) => Ok(()),
+        Err(HarvestError::Config(reason)) => {
+            let state: Option<String> = harvest_workflow_executions::table
+                .find(child_exec_id.as_uuid())
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            match state {
+                None => Ok(()),
+                Some(state) if crate::erase::is_terminal_state(&state) => Ok(()),
+                Some(state) => Err(HarvestError::Config(format!(
+                    "cross-shard child {child_exec_id} is still {state} after a failed \
+                     cancel/terminate: {reason}"
+                ))),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Deliver a terminal child's outcome to its awaiting parent.
 ///
-/// The child's terminal payload is read from the target shard, then the parent's
+/// The child's terminal payload was already read from the target shard by
+/// `load_child_states`, so this costs no second cross-shard round trip and
+/// delivers exactly the state the action was decided from. The parent's
 /// `ChildWorkflowCompleted`/`ChildWorkflowFailed` append, its wake, and the
 /// outbox row's delete all commit **in one transaction on the parent's shard**.
-/// That single commit is why the delivery is exactly-once from the parent's
-/// point of view even though the relay's observation of the child is
-/// at-least-once.
+///
+/// Lock order is **execution row -> outbox row**, matching every other path in
+/// the engine (see [`apply_cascade_bookkeeping`]). Within that order the
+/// claim-by-delete is the exactly-once gate: two concurrent sweeps can decide
+/// the same delivery, and while their observation of the child is
+/// at-least-once, the parent must see exactly one terminal event.
 ///
 /// A parent that has already sealed is skipped (the append would add
 /// replay-visible history past closure) but its row is still deleted — the same
@@ -832,33 +1136,22 @@ async fn cascade_child_on_target(
 /// enforces on the same-shard path.
 async fn deliver_terminal(
     conn: &mut AsyncPgConnection,
-    pool: &ShardedDbPool,
     row: &CrossShardChildRow,
+    child: &TargetChildState,
 ) -> HarvestResult<()> {
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
-
-    let (state, output, error) = {
-        let mut target_conn = target_conn(pool, row).await?;
-        harvest_workflow_executions::table
-            .find(row.child_exec_id)
-            .select((
-                harvest_workflow_executions::state,
-                harvest_workflow_executions::output,
-                harvest_workflow_executions::error,
-            ))
-            .first::<(String, Option<serde_json::Value>, Option<String>)>(&mut target_conn)
-            .await
-            .map_err(crate::error::database_error)?
-    };
+    let state = child.state.clone();
+    let output = child.output.clone();
+    let error = child.error.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         {
-            // Re-read the parent under `FOR UPDATE` inside the delivery
-            // transaction: the batched pre-read is only a hint, and a parent that
-            // sealed between the two must not receive history past closure. The
-            // lock also serialises this append against a concurrent parent
-            // termination, exactly as the same-shard notify path does.
+            // Parent execution row FIRST — the engine-wide lock order. The
+            // batched pre-read is only a hint: a parent that sealed between the
+            // two must not receive history past closure, and this lock also
+            // serialises the append against a concurrent parent termination,
+            // exactly as the same-shard notify path does.
             let parent_state: Option<String> = harvest_workflow_executions::table
                 .find(parent_exec_id.as_uuid())
                 .select(harvest_workflow_executions::state)
@@ -868,75 +1161,94 @@ async fn deliver_terminal(
                 .optional()
                 .map_err(crate::error::database_error)?;
 
-            let parent_live =
-                matches!(parent_state, Some(ref s) if !crate::erase::is_terminal_state(s));
-
-            if parent_live {
-                // Order any DUE child-deadline timer BEFORE the child terminal so
-                // `match_child_or_timer` resolves an over-deadline child to the
-                // timeout branch on pure recorded order — the same #779 ordering
-                // rule every same-shard wake site applies.
-                crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id)
-                    .await?;
-                let event = if state == "COMPLETED" {
-                    WorkflowEvent::ChildWorkflowCompleted {
-                        child_id: child_exec_id,
-                        output: output.unwrap_or(serde_json::Value::Null),
-                    }
-                } else {
-                    // Cancel, terminate, timeout and failure all surface to the
-                    // parent as `ChildWorkflowFailed` — there is no
-                    // `ChildWorkflowCancelled` variant and issue #956 adds none.
-                    let raw = error.unwrap_or_else(|| format!("child workflow {state}"));
-                    let decoded = crate::failure::decode_workflow_failure(&raw);
-                    WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded)
-                };
-                store::append_single_event(conn, parent_exec_id, event).await?;
-                queue::wake_workflow_task(conn, parent_exec_id).await?;
+            // Then claim the row. Losing the claim means a peer sweep already
+            // delivered this terminal; there is nothing left to do.
+            if !claim_row_by_delete(conn, child_exec_id.as_uuid()).await? {
+                return Ok(());
             }
 
-            delete_row(conn, child_exec_id.as_uuid()).await?;
+            let parent_live =
+                matches!(parent_state, Some(ref s) if !crate::erase::is_terminal_state(s));
+            if !parent_live {
+                return Ok(());
+            }
+
+            // Order any DUE child-deadline timer BEFORE the child terminal so
+            // `match_child_or_timer` resolves an over-deadline child to the
+            // timeout branch on pure recorded order — the same #779 ordering
+            // rule every same-shard wake site applies.
+            crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
+            let event = if state == "COMPLETED" {
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: child_exec_id,
+                    output: output.unwrap_or(serde_json::Value::Null),
+                }
+            } else {
+                // Cancel, terminate, timeout and failure all surface to the
+                // parent as `ChildWorkflowFailed` — there is no
+                // `ChildWorkflowCancelled` variant and issue #956 adds none.
+                // The wording mirrors the same-shard operator-cancel path so a
+                // parent cannot tell where its child lived from the message.
+                let raw =
+                    error.unwrap_or_else(|| format!("child workflow {}", state.to_lowercase()));
+                let decoded = crate::failure::decode_workflow_failure(&raw);
+                WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded)
+            };
+            store::append_single_event(conn, parent_exec_id, event).await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
             Ok(())
         }
     }))
     .await
 }
 
-/// The target shard's pool, or the typed unavailable error.
-///
-/// Returns a *cloned pool handle* rather than a checked-out connection so the
-/// borrow of `pool` ends here; callers take their own connection with their own
-/// lifetime, which keeps each cross-shard step's connection scope explicit.
-fn target_pool(
-    pool: &ShardedDbPool,
-    row: &CrossShardChildRow,
-) -> HarvestResult<crate::worker::DbPool> {
-    pool.exact_pool_for(ShardId::new(row.target_shard))
-        .cloned()
-        .ok_or_else(|| HarvestError::ShardUnavailable {
-            shard_id: row.target_shard,
-            reason: "no database pool is configured for this shard on this node".to_string(),
-        })
-}
-
-/// Check out a connection to the target shard.
+/// Check out a connection to the target shard, under the multi-shard
+/// acquisition bound.
 async fn target_conn(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
+    acquire_bound: Option<std::time::Duration>,
 ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
-    target_pool(pool, row)?
-        .get()
-        .await
-        .map_err(|e| HarvestError::ShardUnavailable {
+    let shard_pool = pool
+        .exact_pool_for(ShardId::new(row.target_shard))
+        .ok_or_else(|| HarvestError::ShardUnavailable {
             shard_id: row.target_shard,
-            reason: format!("pool checkout failed: {e}"),
-        })
+            reason: "no database pool is configured for this shard on this node".to_string(),
+        })?;
+    acquire_bounded(shard_pool, row.target_shard, acquire_bound).await
 }
 
-/// Does `placement` mean "somewhere other than the parent's shard"?
+/// `pool.get()` under an optional deadline.
 ///
-/// A tiny helper so call sites read as intent rather than as an enum match.
-#[must_use]
-pub fn is_cross_shard(placement: &ChildPlacement, parent: ShardId, resolved: ShardId) -> bool {
-    !placement.is_parent_shard() && resolved != parent
+/// Harvest configures no deadpool `Timeouts`, so a bare `pool.get().await` is an
+/// **unbounded** wait. That matters more here than almost anywhere else: the
+/// relay holds a checked-out connection on the *parent's* shard for the whole
+/// sweep while reaching across to other shards, and `Distributed` placement is
+/// symmetric — shard A's parents target B while B's parents target A — so two
+/// per-shard checkers on the same node can form a wait-for cycle across two
+/// pools with no timeout on either side. Bounding the acquisition converts that
+/// from a permanent hang into "skip this shard, retry next sweep", which is
+/// exactly what `shard_acquire_bound` (issue #961) exists for.
+async fn acquire_bounded(
+    shard_pool: &crate::worker::DbPool,
+    shard: i32,
+    bound: Option<std::time::Duration>,
+) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    let unavailable = |reason: String| HarvestError::ShardUnavailable {
+        shard_id: shard,
+        reason,
+    };
+    match bound {
+        None => shard_pool
+            .get()
+            .await
+            .map_err(|e| unavailable(format!("pool checkout failed: {e}"))),
+        Some(bound) => match tokio::time::timeout(bound, shard_pool.get()).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(unavailable(format!("pool checkout failed: {e}"))),
+            Err(_) => Err(unavailable(format!(
+                "pool checkout did not complete within {bound:?}"
+            ))),
+        },
+    }
 }

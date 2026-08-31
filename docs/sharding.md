@@ -335,13 +335,25 @@ FROM harvest_cross_shard_children
 WHERE attempts > 0
 ORDER BY attempts DESC
 LIMIT 20;
+
+-- Oldest still-unsettled child, per target shard: the backlog-age signal.
+SELECT target_shard, min(created_at) AS oldest, count(*) AS in_flight
+FROM harvest_cross_shard_children
+GROUP BY 1
+ORDER BY 2;
 ```
 
-Every settled child deletes its row, so a steadily growing count means the relay is not draining — check `last_error` for an unreachable target shard first.
+Every settled child deletes its row, so a steadily growing count means the relay is not draining — check `last_error` for an unreachable target shard first. `attempts` is written on **every** non-progress path (a failed step, an unreadable target shard, an unrecognised stored value), and it also drives the retry backoff: a row is re-tried after `min(attempts, 6) x 5s`, so one permanently-broken row backs off instead of consuming a slot in every sweep.
+
+There is **no dedicated metric** for the relay yet; the queries above and the `Timeout` scanner's existing `harvest.scanner.tick` liveness are the current signals. A `harvest.cross_shard_child.*` counter family is tracked as a follow-up.
 
 ### Reading a cross-shard tree
 
 `GET /workflows/{id}/children` and `GET /workflows/{id}/tree` already traverse every shard, so a cross-shard child is visible without any new endpoint. Both now degrade rather than `500` when a shard is unreachable: they return the children they could see and name the rest in `unavailable_shards`, with `status` dropping to `partial` — the #756 contract, which cross-shard placement makes routine rather than exotic.
+
+> **Behaviour change for existing `/children` callers.** Before this, an unreachable shard produced a `500`. Now it produces a `200` whose `items` array is *incomplete*. A client that treated `200` as "this is the whole child list" must read `status` (or check `unavailable_shards` is empty) before drawing that conclusion. The fields are additive; the status code is the part that changed.
+
+The parent **detail** view (`GET /workflows/{id}`) resolves no children — it returns the execution row's own `parent_id` and nothing else — so there is nothing there to degrade.
 
 ## Operational Checklist
 

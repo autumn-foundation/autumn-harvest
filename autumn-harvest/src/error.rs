@@ -535,8 +535,9 @@ pub enum HarvestError {
     ///
     /// **Retryable.** Nothing was written — the caller (a parked parent whose
     /// decision cycle rolled back, or the cross-shard relay) should retry once
-    /// the shard is reachable again. Use [`HarvestError::is_shard_unavailable`]
-    /// to classify it without matching on a `#[non_exhaustive]` enum.
+    /// the shard is reachable again. Classify it with
+    /// [`HarvestError::is_shard_unavailable`] rather than by matching the
+    /// variant, so a caller keeps compiling as this enum grows.
     ///
     /// Distinct from [`HarvestError::ShardFenced`], which means the shard *is*
     /// reachable but this process has lost write authority over it and must
@@ -1118,8 +1119,8 @@ impl HarvestError {
     /// Is this a [`HarvestError::ShardUnavailable`]?
     ///
     /// A retryable "I cannot reach that shard right now" classification, kept
-    /// as a predicate so callers never have to match on a `#[non_exhaustive]`
-    /// enum (issue #956).
+    /// as a predicate so callers can classify without matching the variant —
+    /// this enum grows over releases (issue #956).
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
         matches!(self, Self::ShardUnavailable { .. })
