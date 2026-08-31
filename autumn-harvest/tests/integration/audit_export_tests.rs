@@ -1707,6 +1707,58 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
     );
 }
 
+// Retiring the cursor keeps the row (for its sequence high-water mark), so the
+// redrive must check `retired_at` explicitly. Otherwise it answers 200
+// "rewound" for a shard whose records retention is free to purge and where no
+// exporter is running -- a promise the system cannot keep.
+#[tokio::test]
+async fn a_retired_shard_cannot_be_redriven() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    uninstall();
+
+    // While live, a rewind is honoured.
+    assert_eq!(
+        autumn_harvest::audit_export::rewind_cursor_locked(
+            &mut conn,
+            0,
+            RewindRequest::Seq(1),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("rewind"),
+        RewindOutcome::Rewound { from: 3, to: 1 },
+    );
+
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+
+    // Retired: refused, exactly as an unconfigured shard was before the row
+    // began to outlive a decommission.
+    assert_eq!(
+        autumn_harvest::audit_export::rewind_cursor_locked(
+            &mut conn,
+            0,
+            RewindRequest::Seq(0),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("rewind"),
+        RewindOutcome::NotConfigured,
+        "a retired shard must not report a successful rewind: retention may \
+         purge the records it names and no exporter will ship them"
+    );
+
+    // And the refusal did not move the cursor.
+    assert_eq!(cursor_acked(&mut conn, 0).await, 1);
+}
+
 // ── The redrive's audit row commits with the rewind, on one connection ─────
 
 #[tokio::test]

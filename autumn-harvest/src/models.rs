@@ -1028,6 +1028,11 @@ pub struct AuditExportCursor {
     pub last_error: Option<String>,
     pub last_delivered_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Set when an operator retired audit export for this shard. The row is
+    /// kept rather than deleted so `last_assigned_seq` outlives the audit rows
+    /// themselves; a retired cursor is inert — retention ignores it and a
+    /// redrive refuses it.
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────

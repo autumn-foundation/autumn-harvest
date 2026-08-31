@@ -5179,7 +5179,7 @@
         },
         {
           "status": 404,
-          "description": "The named shard has no audit-export cursor -- audit export has never run there."
+          "description": "The named shard has no LIVE audit-export cursor: export has either never run there, or has been retired with decommission_cursor. A retired shard is refused rather than rewound -- retention no longer protects its records and no exporter is running to ship them, so reporting a successful rewind would be a promise the system cannot keep."
         },
         {
           "status": 503,

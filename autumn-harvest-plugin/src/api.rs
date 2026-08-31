@@ -36059,7 +36059,10 @@ async fn audit_export_redrive_handler(
         }
         ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => {
             AutumnError::not_found_msg(format!(
-                "shard {} has no audit-export cursor; audit export has never run there",
+                "shard {} has no live audit-export cursor: audit export has either never \
+                 run there or has been retired. A retired shard cannot be redriven — its \
+                 records are no longer protected from retention and no exporter is \
+                 running to ship them; re-enable export first",
                 request.shard
             ))
             .into_response()

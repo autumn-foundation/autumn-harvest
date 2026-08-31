@@ -1549,7 +1549,15 @@ pub async fn rewind_cursor_locked(
                 .optional()
                 .map_err(crate::error::database_error)?;
 
-            let Some(cursor) = cursor else {
+            // A *retired* cursor is not a rewindable one (issue #953, Codex
+            // review round 8 P2). The row now outlives a decommission so its
+            // sequence high-water mark survives — but retention deliberately
+            // ignores retired cursors and is free to purge the very records a
+            // rewind would target, and no exporter is running to ship them.
+            // Answering 200 "rewound" there is a promise the system cannot
+            // keep, so a retired shard is reported exactly as an unconfigured
+            // one was before the row began to persist.
+            let Some(cursor) = cursor.filter(|c| c.retired_at.is_none()) else {
                 return Ok(RewindOutcome::NotConfigured);
             };
 
