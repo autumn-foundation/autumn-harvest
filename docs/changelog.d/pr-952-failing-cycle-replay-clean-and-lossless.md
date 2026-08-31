@@ -97,6 +97,19 @@ Two knock-on effects of that verdict change, both intended:
   the new field — permitted under the repo's 0.x semver convention, and the
   in-tree readers all go through the new `failure_message()` accessor instead.
 
+### Codex review round 2
+
+* **P2 — the abandoned-*activity* terminal is matched by its full engine shape.**
+  The child arm already required the exact shape the engine writes, because a
+  child's `error` is the child author's own string; an activity's `error` is the
+  activity author's own string in exactly the same way, and that arm was matching
+  on the reason text alone. A genuine `ActivityFailed` quoting
+  `ABANDONED_DISPATCH_REASON` would therefore have been classified synthetic, and
+  a redriven run would have re-dispatched the activity — repeating its side
+  effects — instead of replaying its recorded failure. The arm now destructures
+  `attempt: 1`, `error_type: "Error"`, `non_retryable: true`, `details: None`
+  alongside the reason (`a_genuine_activity_failure_quoting_the_reason_is_not_an_abandoned_record`).
+
 ### Codex review round 1
 
 * **P1 — abandoned-dispatch transparency is bounded by the last redrive.** The

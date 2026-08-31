@@ -921,9 +921,23 @@ impl HistoryMatcher {
         let mut indices: Vec<usize> = Vec::new();
         for (i, event) in events.iter().enumerate() {
             match event {
+                // An activity's `error` is the ACTIVITY author's own message,
+                // exactly as a child's is (Codex P2 round 2), so the reason
+                // string alone is not proof the engine wrote this event. Pair it
+                // with the full shape `abandoned_dispatch_events` writes —
+                // first attempt, untyped `"Error"` class, non-retryable, no
+                // structured details — so a genuine activity failure that
+                // happens to return this message keeps its real terminal
+                // instead of being re-dispatched (and its side effects
+                // repeated) by a redriven run.
                 WorkflowEvent::ActivityFailed {
-                    activity_id, error, ..
-                } if error == crate::event::ABANDONED_DISPATCH_REASON => {
+                    activity_id,
+                    error,
+                    attempt: 1,
+                    error_type,
+                    non_retryable: true,
+                    details: None,
+                } if error == crate::event::ABANDONED_DISPATCH_REASON && error_type == "Error" => {
                     abandoned_activities.insert(*activity_id);
                     indices.push(i);
                 }
@@ -10556,6 +10570,77 @@ mod tests {
             ),
             "the re-dispatched child must resolve from its own synthetic terminal"
         );
+    }
+
+    /// An ACTIVITY's error string is the activity author's own message, so the
+    /// reserved reason alone can be produced by ordinary user code (Codex P2
+    /// round 2). Only the full shape the engine writes counts as synthetic — a
+    /// genuine failure that happens to carry the same message keeps its real
+    /// terminal, so a redriven run replays it instead of re-dispatching the
+    /// activity and repeating its side effects.
+    #[test]
+    fn a_genuine_activity_failure_quoting_the_reason_is_not_an_abandoned_record() {
+        let engine_written = ActivityExecId::new();
+        let author_written = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: author_written,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // Same message, but a real activity terminal: a retried attempt,
+            // retryable, and carrying structured details.
+            WorkflowEvent::ActivityFailed {
+                activity_id: author_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 2,
+                error_type: "Error".into(),
+                details: Some(serde_json::json!({"code": 42})),
+                non_retryable: false,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: engine_written,
+                name: "refund".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: engine_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+        for idx in [3_usize, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} carries the engine's exact abandoned shape, so a redrive \
+                 must make it transparent"
+            );
+        }
     }
 
     /// Without a redrive the same records are ordinary, positionally-matched

@@ -311,3 +311,13 @@ The rule this makes precise: *a redrive reopens the cycles it superseded, and
 only those.* Everything the redriven run itself recorded — including a second
 failing cycle's abandoned dispatches — is ordinary history for that run's own
 replay, exactly as it is for a run that was never redriven at all.
+
+## 10. Codex review round 2 — findings and resolutions
+
+| # | Severity | Finding | Resolution |
+| --- | --- | --- | --- |
+| 1 | P2 | `abandoned_dispatch_indices` matched an abandoned *activity* terminal on the reserved reason string alone, while the child arm required the engine's exact shape. An activity's `error` is the activity author's own message, so a genuine `ActivityFailed` quoting that string would be classified synthetic — and a redriven run would re-dispatch the activity, repeating its side effects, instead of replaying its recorded failure. | The activity arm now destructures the full shape `abandoned_dispatch_events` writes — `attempt: 1`, `error_type: "Error"`, `non_retryable: true`, `details: None` — alongside the reason. Regression test: `a_genuine_activity_failure_quoting_the_reason_is_not_an_abandoned_record`, which puts a look-alike (attempt 2, retryable, with details) and a real engine record in the same redriven history and asserts only the latter goes transparent. |
+
+The symmetry this restores: **neither** dispatch kind's terminal is identified by
+its message. The reserved reason narrows the candidates; the engine's exact
+written shape is what proves the engine wrote it.
