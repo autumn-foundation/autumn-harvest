@@ -1274,7 +1274,7 @@ async fn retention_purges_nothing_when_export_is_configured_but_has_not_run_yet(
 }
 
 #[tokio::test]
-async fn retention_resumes_after_export_is_disabled_leaving_a_stale_cursor() {
+async fn removing_the_sink_alone_does_not_resume_retention() {
     let _guard = TEST_SERIAL.lock().await;
     let _sink = install(Arc::new(RecordingSink::new(200)), 100);
     let (mut conn, _c) = make_conn().await;
@@ -1283,11 +1283,13 @@ async fn retention_resumes_after_export_is_disabled_leaving_a_stale_cursor() {
         .await
         .expect("tick");
 
-    // The operator removes the sink. Nothing ever deletes a cursor row, so a
-    // guard keyed only on the cursor's existence would match every subsequent
-    // `export_seq IS NULL` record and turn audit retention off forever --
-    // unbounded table growth with no signal, since the lag gauge stops being
-    // emitted too.
+    // The operator removes the sink from THIS process and stops there. That is
+    // deliberately not enough: the guard keys on the shard's live cursor row,
+    // not on process-local configuration, precisely so a worker outage cannot
+    // let a web process delete the records that outage stranded. Retiring the
+    // cursor is the second, explicit step -- see
+    // `retention_resumes_only_after_the_cursor_is_decommissioned` and the
+    // escalation section of `docs/runbooks/harvest-alerts.md`.
     uninstall();
     insert_audit_rows(&mut conn, 2).await;
     diesel::update(harvest_audit_log::table)
@@ -1300,9 +1302,58 @@ async fn retention_resumes_after_export_is_disabled_leaving_a_stale_cursor() {
         .await
         .expect("purge runs");
     assert_eq!(
-        deleted, 5,
-        "with no sink configured the guard is skipped entirely and retention \
-         behaves exactly as it did before this feature"
+        deleted, 3,
+        "only the three the sink acknowledged may go. The two later records \
+         are still unexported, and dropping the sink locally is not a \
+         statement that nobody owes them -- an operator who wants the disk \
+         back must retire the cursor explicitly"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 2);
+}
+
+// A retired shard's status must not keep reporting a growing backlog: no
+// exporter owes those records, so an alert on `pending_records` there could
+// never be cleared by any action.
+#[tokio::test]
+async fn a_retired_shard_reports_no_backlog() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    uninstall();
+
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+
+    // Audited operations keep happening after the retirement.
+    insert_audit_rows(&mut conn, 4).await;
+
+    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("a retired cursor is still reported");
+
+    assert_eq!(status.delivery_state, "RETIRED");
+    assert_eq!(
+        status.pending_records, 0,
+        "four unsequenced records exist, but no exporter owes them -- \
+         reporting them as pending delivery would raise a backlog alert that \
+         no action could clear"
+    );
+    assert!((status.lag_seconds - 0.0).abs() < f64::EPSILON);
+    assert_eq!(
+        status.last_assigned_seq, 3,
+        "the high-water mark is still reported: it is why the row is kept"
     );
 }
 

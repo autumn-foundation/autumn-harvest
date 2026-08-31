@@ -1454,7 +1454,18 @@ pub async fn export_status(
         return Ok(None);
     };
 
-    let (pending_records, lag_seconds) = pending_and_lag(conn, cursor.last_acked_seq, now).await?;
+    // A retired cursor owes nothing, so there is no backlog to report (issue
+    // #953, Codex review round 10 P2). Recomputing it from the live audit table
+    // would keep `pending_records` and `lag_seconds` climbing for a shard no
+    // exporter is responsible for -- firing backlog alerts that no action can
+    // clear, and contradicting the contract's promise that a retired entry's
+    // fields are a frozen snapshot. Skipping the query is also the honest
+    // answer to what the fields mean: how much the exporter still owes.
+    let (pending_records, lag_seconds) = if cursor.retired_at.is_some() {
+        (0, 0.0)
+    } else {
+        pending_and_lag(conn, cursor.last_acked_seq, now).await?
+    };
 
     Ok(Some(AuditExportShardStatus {
         shard: shard_id,
