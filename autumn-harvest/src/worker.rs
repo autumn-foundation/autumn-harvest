@@ -9037,18 +9037,23 @@ async fn persist_all_started_child_workflows(
         // A cross-shard child's execution row never appears on THIS shard, so
         // `existing_ids` alone would classify it as new on every re-park and
         // append a SECOND `ChildWorkflowStarted` for it — corrupting the
-        // parent's history and failing its next replay with a positional
-        // divergence. The outbox row is the durable "already started" record for
-        // exactly the window in which a re-park can happen: it is written in the
-        // same transaction as the first `ChildWorkflowStarted`, and it is
-        // deleted in the same transaction that appends the child's terminal —
-        // after which the spawn matches `Matched`, not `ChildInProgress`, and
-        // re-emits nothing (issue #956).
+        // parent's history and parking it forever. The parent's OWN history is
+        // the dedupe record: `ChildWorkflowStarted` is append-only and is
+        // written in the same transaction as the child's creation, so it is a
+        // true "already started" test at every point in the child's lifetime.
+        // The outbox row is NOT (issue #956): it is deleted when the terminal is
+        // delivered, which a decision cycle spanning two transactions can
+        // straddle — history read at T0 (still in progress), terminal delivered
+        // and row deleted at T1, persist at T2 finds neither and re-emits.
         let recorded_remote: HashSet<uuid::Uuid> =
-            crate::cross_shard_child::recorded_cross_shard_child_ids(conn, &requested_ids)
-                .await?
-                .into_iter()
-                .collect();
+            crate::cross_shard_child::already_started_child_ids(
+                conn,
+                parent_exec_id,
+                &requested_ids,
+            )
+            .await?
+            .into_iter()
+            .collect();
 
         let new_children: Vec<&StartedChildWorkflowCommand> = children
             .iter()
@@ -9975,8 +9980,10 @@ async fn persist_child_timeout_race(
 
             // ── child new-vs-existing ──
             // A cross-shard child (issue #956) has no row on THIS shard, so the
-            // outbox row is its "already started" record here; without it every
-            // re-park of this race would append a second `ChildWorkflowStarted`.
+            // parent's own append-only `ChildWorkflowStarted` history is the
+            // "already started" record here; without it every re-park of this
+            // race would append a second one. The outbox row cannot serve: it is
+            // deleted on terminal delivery, inside the window a re-park spans.
             let child_is_new = harvest_workflow_executions::table
                 .find(child.child_id.as_uuid())
                 .select(harvest_workflow_executions::id)
@@ -9985,8 +9992,9 @@ async fn persist_child_timeout_race(
                 .optional()
                 .map_err(crate::error::database_error)?
                 .is_none()
-                && crate::cross_shard_child::recorded_cross_shard_child_ids(
+                && crate::cross_shard_child::already_started_child_ids(
                     conn,
+                    parent_exec_id,
                     &[child.child_id.as_uuid()],
                 )
                 .await?
@@ -10447,13 +10455,16 @@ async fn persist_mixed_suspension_batch(
                 .map_err(crate::error::database_error)?
                 .into_iter()
                 .collect();
-            // A cross-shard child (issue #956) has no row on THIS shard; its
-            // outbox row is the "already started" record here. Without it a
-            // re-park of this mixed batch would append a second
-            // `ChildWorkflowStarted` for the remote child.
+            // A cross-shard child (issue #956) has no row on THIS shard; the
+            // parent's own append-only `ChildWorkflowStarted` history is the
+            // "already started" record here. Without it a re-park of this mixed
+            // batch would append a second `ChildWorkflowStarted` for the remote
+            // child. The outbox row cannot serve: it is deleted on terminal
+            // delivery, inside the window a re-park spans.
             local.extend(
-                crate::cross_shard_child::recorded_cross_shard_child_ids(
+                crate::cross_shard_child::already_started_child_ids(
                     conn,
+                    exec_id,
                     &requested_child_ids,
                 )
                 .await?,

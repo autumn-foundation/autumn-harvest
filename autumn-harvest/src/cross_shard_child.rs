@@ -361,31 +361,82 @@ pub async fn request_cross_shard_cancel(
         .map_err(crate::error::database_error)
 }
 
-/// Which of `child_ids` are already recorded as cross-shard children here?
+/// Which of `child_ids` the parent has ALREADY recorded a `ChildWorkflowStarted`
+/// for, read from the parent's own history (issue #956).
 ///
-/// The spawn path's "is this child genuinely new?" test is a lookup in
-/// `harvest_workflow_executions` **on the parent's shard**, where a cross-shard
-/// child's row never appears — so without this every re-park would classify a
-/// remote child as new and append a *second* `ChildWorkflowStarted` for it,
-/// corrupting the parent's history and failing its next replay with a
-/// non-determinism divergence.
+/// This is the "has this child already been started?" test for a **cross-shard**
+/// child, and it replaces the obvious-looking one that came before it.
+///
+/// A same-shard child is deduped by its execution row, which lives on the
+/// parent's shard and is never removed while the parent runs. A cross-shard
+/// child has no row here, so the first implementation used the
+/// `harvest_cross_shard_children` lifecycle row instead — written in the same
+/// transaction as the first `ChildWorkflowStarted`, so "row exists" did imply
+/// "already started".
+///
+/// The flaw is that the converse does not hold, because the row is **deleted**
+/// when the terminal is delivered while a decision cycle spans TWO
+/// transactions. History is loaded at T0 (the child is still in progress, so the
+/// handler re-issues its `StartChildWorkflow` command); the relay delivers the
+/// terminal and deletes the row at T1; the persist transaction at T2 then finds
+/// the child in neither the executions table (its row is on another shard) nor
+/// the outbox (deleted), calls it new, and appends a SECOND
+/// `ChildWorkflowStarted`. Measured against four real shard databases: a
+/// 32-child distributed fan-out produced 49 start events, every duplicate a
+/// cross-shard child, and the parent then parked forever.
+///
+/// The parent's own history has none of that fragility: `ChildWorkflowStarted`
+/// is append-only, is never deleted or rewritten (the engine's
+/// `harvest_events` invariant), and is written in the same transaction as the
+/// child's creation. So "the event is there" and "the child was started" are the
+/// same fact, for every child, at every point in its lifetime — which is exactly
+/// what a de-duplication test needs and what the outbox row could not provide.
+///
+/// `child_id` is a non-payload field, so it is read straight out of the stored
+/// JSON without a codec pass — no key is needed, and none of the deployments a
+/// codec would affect behave differently here.
 ///
 /// # Errors
 ///
-/// Propagates database errors.
-pub async fn recorded_cross_shard_child_ids(
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the history read fails.
+pub async fn already_started_child_ids(
     conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
     child_ids: &[uuid::Uuid],
 ) -> HarvestResult<Vec<uuid::Uuid>> {
     if child_ids.is_empty() {
         return Ok(Vec::new());
     }
-    harvest_cross_shard_children::table
-        .filter(harvest_cross_shard_children::child_exec_id.eq_any(child_ids))
-        .select(harvest_cross_shard_children::child_exec_id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)
+    // Extract `child_id` in SQL rather than loading whole events: a 10k-child
+    // fan-out's history carries 10k `input` payloads this test has no use for.
+    // Raw SQL because that is how every other JSONB path in the engine is read
+    // (`execution.rs`, `timeout.rs`, `backup_verify.rs`).
+    let recorded: Vec<StartedChildIdRow> = diesel::sql_query(
+        "SELECT e.event_data->'data'->>'child_id' AS child_id \
+         FROM harvest_events e \
+         WHERE e.workflow_exec_id = $1 \
+           AND e.event_type = 'ChildWorkflowStarted'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent_exec_id.as_uuid())
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let wanted: std::collections::HashSet<uuid::Uuid> = child_ids.iter().copied().collect();
+    Ok(recorded
+        .into_iter()
+        .filter_map(|row| row.child_id)
+        .filter_map(|s| uuid::Uuid::parse_str(&s).ok())
+        .filter(|id| wanted.contains(id))
+        .collect())
+}
+
+/// One `child_id` read out of a stored `ChildWorkflowStarted` event.
+#[derive(diesel::QueryableByName)]
+struct StartedChildIdRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    child_id: Option<String>,
 }
 
 /// `(id, state, output, error)` as read from a target shard.
