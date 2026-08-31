@@ -777,8 +777,39 @@ mod db {
         // behind the cursor forever: reset to 0 so they get another attempt.
         // That is what makes a transient failure — a key registered late, a race
         // lost to an erasure — eventually consistent rather than permanent.
+        //
+        // `unresolved_total` only counts rows this pass SAW and could not
+        // convert. It cannot speak for a row the pass never saw, and there is a
+        // way for one to exist: `harvest_events.id` is a `BIGSERIAL`, so an
+        // INSERT allocates its id before it commits. A scan can pass an id that
+        // is not yet visible and leave that row below the cursor once it
+        // commits, where `WHERE id > $1` will never look again. Nothing counted
+        // it, so the pass would look clean and record `completed_at` — and the
+        // census would report the outgoing key forever while `retire_codec_key`
+        // refused forever. A deadlock of the whole procedure, needing a manual
+        // cursor reset to escape.
+        //
+        // So completion is confirmed against the census rather than inferred
+        // from having reached the end. The census is the same count the
+        // retirement gate trusts, which is the point: "complete" now means the
+        // thing the runbook tells an operator it means. It costs one aggregate
+        // per *completing* pass, not per batch, and only on a shard that would
+        // otherwise have declared itself done.
+        let census_clean = if reached_end && unresolved_total == 0 {
+            let by_key = count_rows_by_key_id(conn).await?;
+            by_key
+                .iter()
+                .filter(|(key_id, _)| *key_id != &active_key_id)
+                .all(|(_, count)| *count == 0)
+        } else {
+            false
+        };
+
         let (next_last_event_id, next_unresolved, next_completed_at) = if reached_end {
-            if unresolved_total > 0 {
+            if unresolved_total > 0 || !census_clean {
+                // Either this pass failed rows outright, or something the scan
+                // could not see is still on an outgoing key. Both want the same
+                // remedy: start over rather than declare victory.
                 (0, 0, None)
             } else {
                 (

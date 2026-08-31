@@ -1797,3 +1797,109 @@ async fn shard_progress_classifies_against_the_pinned_key_not_the_live_one() {
         "against the pinned key, the k1 row is converted"
     );
 }
+
+/// Encode `value` under `key_id` using the registry's real encoder, without
+/// disturbing which key is active.
+fn encode_under(codecs: &PayloadCodecs, key_id: &str, value: &Value) -> Value {
+    let restore = codecs.active_key_id();
+    codecs.set_active_key(key_id).expect("activate for fixture");
+    let encoded = codecs.encode_payload(value).expect("encode");
+    codecs.set_active_key(&restore).expect("restore active key");
+    encoded
+}
+
+/// Insert one `WorkflowStarted` row at an explicit `harvest_events.id`.
+///
+/// Explicit ids are what let this file construct the id *gap* a late-committing
+/// `BIGSERIAL` insert leaves behind; the sequence alone never yields one.
+async fn insert_event_at_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    row_id: i64,
+    event_id: i32,
+    encoded_input: &Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_events (id, workflow_exec_id, event_id, event_type, event_data) \
+         VALUES ($1, $2, $3, 'WorkflowStarted', $4)",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(row_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(event_id)
+    .bind::<diesel::sql_types::Jsonb, _>(json!({
+        "type": "WorkflowStarted",
+        "data": {"input": encoded_input, "timestamp": "2026-08-31T00:00:00Z"}
+    }))
+    .execute(conn)
+    .await
+    .expect("insert event at explicit id");
+}
+
+/// A row that commits *below* the cursor must still be converted.
+///
+/// `harvest_events.id` is a `BIGSERIAL`, so an INSERT allocates its id before it
+/// commits. A sweep running concurrently can scan past an id that is not yet
+/// visible, mark the pass complete, and leave that row behind the cursor once it
+/// does commit -- where `WHERE id > resume_from` never looks again.
+///
+/// The existing reset covers rows a pass *saw and failed to convert*
+/// (`unresolved_rows`). It cannot cover a row the pass never saw: nothing
+/// counted it, so the pass looked clean and recorded `completed_at`.
+///
+/// The consequence is a deadlock of the procedure rather than data loss: the
+/// census keeps reporting the outgoing key, `retire_codec_key` keeps refusing,
+/// and rotation can never finish without someone resetting the cursor by hand.
+///
+/// This builds the end state directly -- a committed old-key row below a
+/// completed cursor -- rather than racing an uncommitted INSERT against the
+/// sweep, which would be timing-dependent and flaky in both directions.
+#[tokio::test]
+async fn a_row_committing_below_the_cursor_is_still_converted() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "late_commit").await;
+
+    // Push the cursor high with an explicit id, so an id well below it is
+    // guaranteed free for the late arrival.
+    let encoded = encode_under(&codecs, "k1", &json!({"early": true}));
+    insert_event_at_id(&mut conn, exec_id, 10_000, 0, &encoded).await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+
+    let cursor = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("a cursor exists");
+    assert_eq!(cursor.last_event_id, 10_000);
+    assert!(
+        cursor.completed_at.is_some(),
+        "the first pass must complete, or this test is not exercising the hazard"
+    );
+
+    // The late arrival: below the cursor, still on the outgoing key.
+    let late = encode_under(&codecs, "k1", &json!({"late": true}));
+    insert_event_at_id(&mut conn, exec_id, 5_000, 1, &late).await;
+
+    // One tick to notice the shard is not converted and re-open the pass,
+    // another to walk it.
+    for _ in 0..3 {
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("subsequent pass");
+    }
+
+    let remaining = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .rows_remaining();
+    assert_eq!(
+        remaining, 0,
+        "a row that committed below the cursor must still be swept; leaving it \
+         there deadlocks retirement forever"
+    );
+}
