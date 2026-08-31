@@ -48,13 +48,22 @@ silently never delivers is a compliance gap you would discover at audit time.
 exist for local development; audit records name who acted on which tenant, so
 shipping them in cleartext is itself a finding.
 
+`audit_export_secret(...)` is **required** alongside a webhook, and its absence
+fails the build too. HMAC-SHA256 accepts a zero-length key and produces a
+well-formed signature, so an unconfigured secret does not yield a *missing*
+`X-Harvest-Signature` — it yields one any third party can reproduce, which is
+worse than none for a receiver that verifies it. A custom `AuditSink` may
+authenticate however it likes (IAM, mTLS, a local file), so there the secret is
+optional and its absence only warns.
+
 Other knobs:
 
 | Builder method | Default | Notes |
 |---|---|---|
 | `audit_export_batch_size(n)` | 500 | Records per batch, clamped to `[1, 5000]`. |
 | `audit_export_backoff(b)` | 1s → 2s → 4s … capped at 60s | Capped exponential. **No attempt ceiling** — see below. |
-| `audit_export_secret(k)` | *(none — warns)* | HMAC key for `X-Harvest-Signature`. |
+| `audit_export_lease(d)` | 60s | How long one exporter holds a shard's cursor, **and** the timeout on the sink call. Set it above your sink's own request timeout. |
+| `audit_export_secret(k)` | *(required for a webhook)* | HMAC key for `X-Harvest-Signature`. |
 | `audit_export_sink(s)` | *(none)* | Your own `AuditSink`; takes precedence over the webhook. |
 
 ### Bringing your own sink
@@ -114,6 +123,15 @@ The signature is HMAC-SHA256 over the exact bytes of the body, in the same
 `X-Harvest-Signature: sha256=<hex>` scheme as completion callbacks (#605) — a
 receiver already verifying those can reuse the verification code unchanged.
 Compare with a constant-time comparison.
+
+> **The signature covers the body only.** `X-Harvest-Audit-Shard`,
+> `-First-Seq`, `-Last-Seq`, and `X-Harvest-Timestamp` are unauthenticated
+> routing and triage metadata. Read the authoritative `(shard, seq)` pair from
+> each record **in the body**: deduplicating on the headers would mean
+> deduplicating on attacker-controlled input, and a replay of a captured,
+> validly-signed batch with a shifted range could mark a real range as
+> already-seen — creating exactly the silent gap this feature exists to
+> prevent.
 
 Optional fields serialize as an explicit `null` rather than being omitted, so
 a SIEM's schema inference sees a stable object shape across every batch.
@@ -208,12 +226,25 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
+The guard is keyed on **whether a sink is configured in the process running
+the sweep**, not on whether a cursor row happens to exist. That distinction
+matters in both directions:
+
+- *Sink configured, cursor row not yet created* — a shard the exporter has not
+  reached yet. A cursor-only guard would be vacuous here and purge unexported
+  records outright.
+- *Sink removed, cursor row left behind* — nothing deletes a cursor row, so a
+  cursor-only guard would match every later record forever and silently turn
+  audit retention off permanently.
+
+With no sink configured the guard is skipped entirely and the purge is
+byte-identical to its pre-#953 behaviour.
+
 The trade is that a sink that is down indefinitely lets the audit table grow
 past its retention window. That is deliberate: dropping a privileged-action log
 to reclaim disk is not a decision the engine gets to make for you. Alert on
-`harvest.audit.export_lag` (below) and it will not surprise you. When export is
-not configured, the guard finds no cursor and the purge behaves exactly as it
-did before this feature.
+`harvest.audit.export_lag` (below) and it will not surprise you — see
+`docs/runbooks/harvest-alerts.md#harvest_audit_export_lag_high`.
 
 ---
 
@@ -296,13 +327,26 @@ exactly what it stored.
 
 Three properties worth knowing:
 
-- **A cursor can only ever move backwards.** A request that would advance it is
-  refused with `400`, not applied. Advancing it would mark records delivered
-  that never were — the exact gap this feature exists to make impossible.
+- **A cursor can only ever move backwards.** A request that would advance it —
+  or leave it exactly where it is, which includes replaying the same redrive
+  twice — is refused with `400`, not applied. Advancing it would mark records
+  delivered that never were, the exact gap this feature exists to make
+  impossible.
+- **`before` resolves conservatively.** It rewinds to one below the *lowest*
+  sequence assigned to a record at or after that instant, never to the highest
+  sequence before it. `occurred_at` is transaction start time, so commit order
+  and timestamp order can disagree; anchoring this way means any skew makes the
+  rewind reach *further back* (costing duplicate deliveries your receiver
+  dedupes) rather than skipping records the operator asked for.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
-  as auditable as the operations being exported. The audit write is attempted
-  even when the redrive fails, and a redrive is never reported as succeeded
-  without it.
+  as auditable as the operations being exported. The rewind and its audit
+  record **commit together** — the audit row is written inside the transaction
+  holding the rewind — so an applied-but-unaudited redrive is not
+  representable. The audit row's `target_id` records the shard *and* the
+  requested position (`shard=0;to_seq=42`), since a redrive is the one
+  operation here that can trigger a mass re-export. A refused redrive (`no-op`,
+  unknown shard) is audited as `FAILED`: nothing moved, and the trail must not
+  say otherwise.
 - **It invalidates in-flight deliveries.** The rewind bumps the shard's claim
   epoch, so a batch already in flight cannot acknowledge over it.
 
@@ -317,9 +361,19 @@ past the retention window returns whatever survives.
   `(shard, seq)`, matching #605.
 - **Hash-chained / Merkle tamper-proofing of the at-rest rows.** A worthy but
   separate cryptographic-audit-log effort. What ships here is gap-detectable
-  off-box export, which removes the incentive to tamper at rest: rewriting a
-  row in the database does not rewrite the copy the SIEM already holds, and
-  deleting one leaves a sequence hole.
+  off-box export, which removes most of the incentive to tamper at rest:
+  rewriting a row in the database does not rewrite the copy the SIEM already
+  holds, and deleting an **exported** row leaves a sequence hole the receiver
+  can see.
+
+  Be precise about the limit: a row deleted **before the exporter has sequenced
+  it** — inside the window between the audited action and the next scanner
+  tick, or anywhere in the backlog during a sink outage — never receives a
+  sequence, so the surviving rows are stamped densely and there is no hole to
+  detect. Tamper evidence begins at the moment a record is sequenced, not at
+  the moment it is written. Shorten that window by keeping the export healthy;
+  close it properly only with at-rest hash chaining, which is out of scope
+  here.
 - **Exporting workflow event history.** That is `HistoryArchiver` (#345). This
   is the audit trail only.
 

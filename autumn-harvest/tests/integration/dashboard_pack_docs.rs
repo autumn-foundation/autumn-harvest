@@ -187,11 +187,12 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_shard_dispatched_total",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
-    "harvest_audit_export_lag",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
     "harvest_shard_generation",
+    // Issue #953 — audit export to a SIEM sink (gauge, bare).
+    "harvest_audit_export_lag",
     "harvest_shard_fenced_total",
     // Audit export to a SIEM sink (issue #953).
     "harvest_audit_exported_total",

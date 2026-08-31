@@ -6551,12 +6551,6 @@ pub const fn management_api_request_fields()
             Some(&["refill_rate", "burst"]),
         ),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
-        // ── audit export (issue #953) ────────────────────────────────────
-        (
-            "POST",
-            "/admin/audit-export/redrive",
-            Some(&["shard", "to_seq", "before"]),
-        ),
         (
             "POST",
             "/admin/rate-limits/{activity_name}/override",
@@ -6576,6 +6570,12 @@ pub const fn management_api_request_fields()
             "DELETE",
             "/admin/start-throttle/{workflow_name}/override",
             Some(&[]),
+        ),
+        // ── audit export (issue #953) ────────────────────────────────────
+        (
+            "POST",
+            "/admin/audit-export/redrive",
+            Some(&["shard", "to_seq", "before"]),
         ),
         (
             "POST",
@@ -35764,24 +35764,35 @@ struct AuditExportRedriveRequest {
 ///
 /// Exactly one of `to_seq` or `before` must be supplied. Re-exported records
 /// are **byte-identical** — the export sequence is never re-stamped, so a
-/// record carries the same `(shard, seq)` and the same JSON on every
-/// delivery and the receiver dedupes.
+/// record carries the same `(shard, seq)` and the same JSON on every delivery
+/// and the receiver dedupes.
 ///
 /// A cursor may only ever move **backwards**: a request that would move it
-/// forward is reported as `no-op` rather than applied, because advancing it
-/// would mark records delivered that never were — the exact gap this feature
-/// exists to make impossible.
+/// forward, or leave it where it is, is refused with `400` rather than
+/// applied, because advancing it would mark records delivered that never were
+/// — the exact gap this feature exists to make impossible.
 ///
-/// The redrive itself produces an audit record (`audit_export.redrive`), so
-/// the act of re-exporting is as auditable as the operations being exported.
+/// **The rewind and its own audit record commit together** (issue #953
+/// review). The audit insert runs on the default shard *inside* the still-open
+/// transaction that holds the rewind, so an audit-write failure rolls the
+/// rewind back: an applied-but-unaudited redrive is unrepresentable, not
+/// merely unlikely. A redrive the API refuses (`no-op`, unknown shard) is
+/// audited as `FAILED`, since nothing moved.
+#[allow(clippy::too_many_lines)] // one mutation + its bound audit write
 async fn audit_export_redrive_handler(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     Json(request): Json<AuditExportRedriveRequest>,
 ) -> impl axum::response::IntoResponse {
-    let target = match (request.to_seq, request.before) {
-        (Some(seq), None) => ::autumn_harvest::audit_export::RewindRequest::Seq(seq),
-        (None, Some(before)) => ::autumn_harvest::audit_export::RewindRequest::Before(before),
+    let (target, requested) = match (request.to_seq, request.before) {
+        (Some(seq), None) => (
+            ::autumn_harvest::audit_export::RewindRequest::Seq(seq),
+            format!("to_seq={seq}"),
+        ),
+        (None, Some(before)) => (
+            ::autumn_harvest::audit_export::RewindRequest::Before(before),
+            format!("before={}", before.to_rfc3339()),
+        ),
         (Some(_), Some(_)) => {
             return AutumnError::bad_request_msg(
                 "supply exactly one of to_seq or before, not both",
@@ -35794,76 +35805,135 @@ async fn audit_export_redrive_handler(
         }
     };
 
-    let pool = match api_state.storage_pool().map_err(map_error) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
+    // Mirrors `observe_shards`: a missing storage pool is a 503, not a 400 —
+    // the two audit-export routes must agree about what "storage is not
+    // configured" looks like.
+    let Ok(pool) = api_state.storage_pool() else {
+        return AutumnError::service_unavailable_msg("harvest storage pool is not configured")
+            .into_response();
     };
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/audit-export/redrive";
-    let shard_label = request.shard.to_string();
+
+    // The audit row's target names BOTH the shard and the position asked for.
+    // A redrive is the one operation here that can trigger a mass re-export,
+    // so "alice redrove shard 5" without the position is not an answer an
+    // auditor can use.
+    let target_label = format!("shard={};{requested}", request.shard);
 
     let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
 
-    // Perform the rewind, then ALWAYS attempt the audit write before deciding
-    // the response — including on failure. A failed privileged action must
-    // still leave a trail (issue #945 review, P2).
-    let outcome = match shard_pool {
+    // Records the outcome so the audit row written inside the transaction can
+    // be reported back after it commits.
+    let outcome: Result<::autumn_harvest::audit_export::RewindOutcome, String> = match shard_pool {
         Some(shard_pool) => match acquire_conn(shard_pool).await {
-            Ok(mut conn) => ::autumn_harvest::audit_export::rewind_cursor(
-                &mut conn,
-                request.shard,
-                target,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|e| e.to_string()),
+            Ok(mut conn) => {
+                use diesel_async::AsyncConnection as _;
+                let audit_pool = pool.default_pool().clone();
+                let actor = actor.clone();
+                let source = source.clone();
+                let request_id = request_id.clone();
+                let target_label = target_label.clone();
+                Box::pin(conn.transaction::<
+                    ::autumn_harvest::audit_export::RewindOutcome,
+                    ::autumn_harvest::error::HarvestError,
+                    _,
+                >(async |conn| {
+                    let outcome = ::autumn_harvest::audit_export::rewind_cursor_locked(
+                        conn,
+                        request.shard,
+                        target,
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+
+                    // Only a rewind that actually moved the cursor is a
+                    // SUCCEEDED privileged action; a refused request changed
+                    // nothing and must not read as one in the trail.
+                    let (status, detail) = match &outcome {
+                        ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => (
+                            STATUS_SUCCEEDED,
+                            Some(format!("cursor rewound from {from} to {to}")),
+                        ),
+                        ::autumn_harvest::audit_export::RewindOutcome::NoOp {
+                            cursor,
+                            requested,
+                        } => (
+                            STATUS_FAILED,
+                            Some(format!(
+                                "refused: cursor is at {cursor}, requested {requested}; a \
+                                 cursor may only be rewound"
+                            )),
+                        ),
+                        ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => (
+                            STATUS_FAILED,
+                            Some("refused: shard has no audit-export cursor".to_string()),
+                        ),
+                    };
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_AUDIT_EXPORT_REDRIVE,
+                        target_type: TARGET_AUDIT_EXPORT,
+                        target_id: Some(target_label.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status,
+                        error_summary: detail.as_deref(),
+                        shard_id: Some(request.shard),
+                        source: &source,
+                    };
+                    let mut audit_conn = acquire_conn(&audit_pool).await.map_err(|e| {
+                        ::autumn_harvest::error::HarvestError::Config(format!(
+                            "audit DB connection unavailable: {e}"
+                        ))
+                    })?;
+                    audit::insert_audit(&mut audit_conn, &ar).await?;
+                    Ok(outcome)
+                }))
+                .await
+                .map_err(|e| e.to_string())
+            }
             Err(e) => Err(format!("shard {}: {e}", request.shard)),
         },
         None => Err(format!("shard {} is not configured", request.shard)),
     };
 
-    let (status, error_summary) = match &outcome {
-        Ok(_) => (STATUS_SUCCEEDED, None),
-        Err(e) => (STATUS_FAILED, Some(e.clone())),
-    };
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_AUDIT_EXPORT_REDRIVE,
-        target_type: TARGET_AUDIT_EXPORT,
-        target_id: Some(shard_label.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: error_summary.as_deref(),
-        shard_id: Some(request.shard),
-        source: &source,
-    };
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The transaction rolled back (or never opened), so nothing was
+            // applied. Best-effort record of the attempt itself; if even this
+            // cannot be written the 503 below still reports the failure to the
+            // caller, and no mutation happened to go unrecorded.
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_AUDIT_EXPORT_REDRIVE,
+                target_type: TARGET_AUDIT_EXPORT,
+                target_id: Some(target_label.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(error.as_str()),
+                shard_id: Some(request.shard),
+                source: &source,
+            };
+            if let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                && let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await
+            {
                 tracing::error!(
                     error = %audit_err,
-                    "audit insert failed for audit_export.redrive"
+                    "audit insert failed for a failed audit_export.redrive"
                 );
-                return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
-                ))
-                .into_response();
             }
+            tracing::error!(error = %error, "audit_export.redrive failed");
+            return AutumnError::service_unavailable_msg(error).into_response();
         }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "audit DB connection unavailable for audit_export.redrive"
-            );
-            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
-                .into_response();
-        }
-    }
+    };
 
     match outcome {
-        Ok(::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to }) => (
+        ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => (
             axum::http::StatusCode::OK,
             axum::Json(serde_json::json!({
                 "shard": request.shard,
@@ -35873,23 +35943,22 @@ async fn audit_export_redrive_handler(
             })),
         )
             .into_response(),
-        Ok(::autumn_harvest::audit_export::RewindOutcome::NoOp { cursor, requested }) => {
+        ::autumn_harvest::audit_export::RewindOutcome::NoOp { cursor, requested } => {
             AutumnError::bad_request_msg(format!(
-                "refusing to move shard {}'s audit-export cursor forward (cursor is at \
-                 {cursor}, requested {requested}); a cursor may only be rewound, since \
-                 advancing it would mark records delivered that never were",
+                "refusing to move shard {}'s audit-export cursor to {requested} (it is at \
+                 {cursor}); a cursor may only be rewound, since advancing it would mark \
+                 records delivered that never were",
                 request.shard
             ))
             .into_response()
         }
-        Ok(::autumn_harvest::audit_export::RewindOutcome::NotConfigured) => {
+        ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => {
             AutumnError::not_found_msg(format!(
                 "shard {} has no audit-export cursor; audit export has never run there",
                 request.shard
             ))
             .into_response()
         }
-        Err(e) => AutumnError::service_unavailable_msg(e).into_response(),
     }
 }
 

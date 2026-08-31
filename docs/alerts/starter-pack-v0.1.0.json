@@ -1313,6 +1313,39 @@
         "SELECT rolname FROM pg_roles WHERE pg_has_role(current_user, oid, 'member') AND rolname = 'pg_monitor'"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_unobservable"
+    },
+    {
+      "id": "harvest_audit_export_lag_high",
+      "status": "enforceable",
+      "signal_source": "harvest.audit.export_lag{shard} - age in seconds of the OLDEST audit record the SIEM sink has not acknowledged (issue #953).",
+      "default_threshold": "Ticket when the lag exceeds 300s for 10 minutes on any shard. The issue's own success metric is < 30s p99 under sustained load, so 300s is a deliberately slack starting point: tune it to the window during which your compliance posture can tolerate privileged-action logs not being in the SIEM.",
+      "severity": "ticket",
+      "owner_persona": "security/compliance engineer",
+      "description": "Audit records are not reaching the SIEM. Nothing is lost - the export cursor is held rather than advanced past a failure, and the retention sweep will not purge an unexported record - but the window during which a privileged action would be invisible to detection is growing, and the audit table is growing with it. Read GET /admin/audit-export for the shard's last_error and delivery_state: a populated last_error is a sink problem, a delivery_state of NOT_STARTED with sink_configured false means export is configured on the web app but not on the worker fleet. A MISSING series is worse than a high one: it means no exporter is running for that shard at all, and the gauge cannot tell you so.",
+      "first_action": "curl -s $HARVEST/admin/audit-export | jq '.sink_configured, .shards[]'",
+      "dependencies": [
+        {
+          "ref": "#953",
+          "status": "shipped",
+          "surface": "harvest.audit.export_lag and GET /admin/audit-export"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Pair with the absent-series case: `absent(harvest_audit_export_lag)` fires when no exporter is running at all, which this threshold alert cannot see.",
+        "expressions": [
+          {
+            "name": "harvest_audit_export_lag_high",
+            "expr": "max by (shard) (harvest_audit_export_lag) > 300",
+            "for": "10m"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /admin/audit-export (per-shard cursor, lag, delivery_state, last_error)",
+        "POST /admin/audit-export/redrive (after sink-side data loss only - it re-exports, it does not fix a stalled sink)"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_lag_high"
     }
   ]
 }

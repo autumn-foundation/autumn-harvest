@@ -1,4 +1,4 @@
-### Added — stream audit records to an external SIEM sink (#953)
+## Phase 5.x — stream audit records to an external SIEM sink (issue #953)
 
 Every mutating management-API operation already writes an audit record, but
 those rows lived per-shard inside the same Postgres databases they describe —

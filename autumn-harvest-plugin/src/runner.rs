@@ -217,6 +217,120 @@ struct PreparedHarvestRuntime {
     effective_config: EffectiveConfigView,
 }
 
+/// Install the process-global completion-callback runtime config (issue #605).
+///
+/// Extracted from `PreparedHarvestRuntime::build` so it sits alongside its
+/// audit-export sibling below; the reasoning is unchanged.
+///
+// Install the process-global completion-callback runtime config
+// (issue #605): the deliverer/secret/allowlist/defaults/retry policy
+// the core scanner (`fire_due_completion_deliveries`) and enqueue
+// path (`enqueue_completion_deliveries`) read via
+// `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
+// `HarvestPlugin` web-app path and the standalone runner) funnels
+// through this one construction point, so this is set exactly once
+// regardless of which path started the runtime. Core ships no HTTP
+// client, so an embedder-supplied deliverer is used verbatim and a
+// `reqwest`-based default is substituted otherwise.
+// issue #605 code review: signing with an empty key is not a
+// silent no-op -- HMAC-SHA256 accepts any key length and
+// produces a valid, deterministic (and trivially
+// reproducible by anyone) signature, so a caller who never
+// configures `completion_callback_secret(...)` gets a
+// `X-Harvest-Signature` header that carries no real
+// authenticity guarantee at all. This is reachable for both
+// builder-default AND per-execution targets (the latter
+// bypass builder config entirely), so warn unconditionally
+// rather than only when default targets are configured.
+fn install_completion_callback_config(built: &BuiltHarvest) {
+    let callback_config = built.completion_callback_config();
+    let deliverer = callback_config
+        .deliverer
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new()));
+    let secret = callback_config.secret.clone().unwrap_or_else(|| {
+        // issue #605 code review: signing with an empty key is not a
+        // silent no-op -- HMAC-SHA256 accepts any key length and
+        // produces a valid, deterministic (and trivially
+        // reproducible by anyone) signature, so a caller who never
+        // configures `completion_callback_secret(...)` gets a
+        // `X-Harvest-Signature` header that carries no real
+        // authenticity guarantee at all. This is reachable for both
+        // builder-default AND per-execution targets (the latter
+        // bypass builder config entirely), so warn unconditionally
+        // rather than only when default targets are configured.
+        tracing::warn!(
+            "completion-callback HMAC secret was never configured via \
+                 HarvestBuilder::completion_callback_secret(...) -- every \
+                 delivered callback will be signed with an empty key, which \
+                 defeats the X-Harvest-Signature authenticity guarantee for \
+                 any receiver relying on it"
+        );
+        autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+    });
+    if let Ok(mut lock) = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write() {
+        *lock = Some(Arc::new(
+            autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                deliverer,
+                secret,
+                ssrf_policy: callback_config.ssrf_policy(),
+                default_targets: callback_config.default_targets.clone(),
+                retry_policy: callback_config.retry_policy.clone(),
+            },
+        ));
+    }
+}
+
+/// Install the process-global audit-export runtime config (issue #953).
+///
+/// Called from `PreparedHarvestRuntime::build`, the one construction point
+/// every `BuiltHarvest` consumer funnels through, so the exporter's sink is
+/// installed exactly once regardless of which path started the runtime. Core
+/// ships no HTTP client, so an embedder-supplied `AuditSink` is used verbatim
+/// and a `reqwest` signed-webhook sink is substituted when only a URL was
+/// configured.
+///
+/// Installs `None` when neither was configured — deliberately a write, not a
+/// skip: the config is a process-wide static, so a second runtime built
+/// without a sink must not keep shipping audit records to the first runtime's
+/// destination.
+fn install_audit_export_config(built: &BuiltHarvest) {
+    let audit_config = built.audit_export_config();
+    let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
+        audit_config.sink.clone().or_else(|| {
+            audit_config.webhook_url.as_ref().map(|url| {
+                Arc::new(crate::audit_sink::ReqwestAuditSink::new(url.clone()))
+                    as Arc<dyn autumn_harvest::audit_export::AuditSink>
+            })
+        });
+    let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
+        return;
+    };
+    *lock = sink.map(|sink| {
+        // `HarvestBuilder::try_build` rejects a webhook with no secret, so
+        // reaching the empty-key fallback means an embedder-supplied sink that
+        // authenticates some other way (IAM, mTLS, a local file). Warn rather
+        // than fail: a signature is not always the relevant control there.
+        let secret = audit_config.secret.clone().unwrap_or_else(|| {
+            tracing::warn!(
+                "no audit-export HMAC secret was configured via \
+                 HarvestBuilder::audit_export_secret(...) -- exported batches will carry \
+                 an X-Harvest-Signature computed with an empty key, which any third party \
+                 can reproduce; it conveys no authenticity and a receiver must not treat \
+                 it as tamper evidence"
+            );
+            autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+        });
+        Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+            sink,
+            secret,
+            batch_size: audit_config.effective_batch_size(),
+            backoff: audit_config.backoff.clone(),
+            lease: audit_config.effective_lease(),
+        })
+    });
+}
+
 impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
@@ -225,106 +339,8 @@ impl PreparedHarvestRuntime {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
-        // Install the process-global completion-callback runtime config
-        // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
-        // the core scanner (`fire_due_completion_deliveries`) and enqueue
-        // path (`enqueue_completion_deliveries`) read via
-        // `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
-        // `HarvestPlugin` web-app path and the standalone runner) funnels
-        // through this one construction point, so this is set exactly once
-        // regardless of which path started the runtime. Core ships no HTTP
-        // client, so an embedder-supplied deliverer is used verbatim and a
-        // `reqwest`-based default is substituted otherwise.
-        {
-            let callback_config = built.completion_callback_config();
-            let deliverer = callback_config.deliverer.clone().unwrap_or_else(|| {
-                Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
-            });
-            let secret = callback_config.secret.clone().unwrap_or_else(|| {
-                // issue #605 code review: signing with an empty key is not a
-                // silent no-op -- HMAC-SHA256 accepts any key length and
-                // produces a valid, deterministic (and trivially
-                // reproducible by anyone) signature, so a caller who never
-                // configures `completion_callback_secret(...)` gets a
-                // `X-Harvest-Signature` header that carries no real
-                // authenticity guarantee at all. This is reachable for both
-                // builder-default AND per-execution targets (the latter
-                // bypass builder config entirely), so warn unconditionally
-                // rather than only when default targets are configured.
-                tracing::warn!(
-                    "completion-callback HMAC secret was never configured via \
-                     HarvestBuilder::completion_callback_secret(...) -- every \
-                     delivered callback will be signed with an empty key, which \
-                     defeats the X-Harvest-Signature authenticity guarantee for \
-                     any receiver relying on it"
-                );
-                autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
-            });
-            if let Ok(mut lock) =
-                autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
-            {
-                *lock = Some(Arc::new(
-                    autumn_harvest::completion_callback::CallbackRuntimeConfig {
-                        deliverer,
-                        secret,
-                        ssrf_policy: callback_config.ssrf_policy(),
-                        default_targets: callback_config.default_targets.clone(),
-                        retry_policy: callback_config.retry_policy.clone(),
-                    },
-                ));
-            }
-        }
-
-        // Install the process-global audit-export runtime config (issue #953)
-        // at the same single construction point, for the same reason: every
-        // `BuiltHarvest` consumer funnels through here, so the exporter's sink
-        // is installed exactly once regardless of which path started the
-        // runtime. Core ships no HTTP client, so an embedder-supplied
-        // `AuditSink` is used verbatim and a `reqwest` signed-webhook sink is
-        // substituted when only a URL was configured.
-        //
-        // Nothing is installed when neither was configured: audit export is
-        // opt-in and must be byte-identically inert otherwise (AC8). The
-        // `None` write is deliberate rather than a skip -- the config is a
-        // process-wide static, so a second runtime built without a sink must
-        // not keep shipping audit records to the first runtime's destination.
-        {
-            let audit_config = built.audit_export_config();
-            let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
-                audit_config.sink.clone().or_else(|| {
-                    audit_config.webhook_url.as_ref().map(|url| {
-                        Arc::new(crate::audit_sink::ReqwestAuditSink::new(url.clone()))
-                            as Arc<dyn autumn_harvest::audit_export::AuditSink>
-                    })
-                });
-            if let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-                *lock = sink.map(|sink| {
-                    let secret = audit_config.secret.clone().unwrap_or_else(|| {
-                        // Same hazard as the callback secret above: HMAC-SHA256
-                        // accepts an empty key and produces a valid, trivially
-                        // reproducible signature, so an unconfigured secret
-                        // yields an `X-Harvest-Signature` that carries no
-                        // tamper-evidence at all -- the exact property AC4
-                        // promises.
-                        tracing::warn!(
-                            "audit-export HMAC secret was never configured via \
-                             HarvestBuilder::audit_export_secret(...) -- every exported \
-                             batch will be signed with an empty key, which defeats the \
-                             X-Harvest-Signature tamper-evidence guarantee for any \
-                             receiver relying on it"
-                        );
-                        autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
-                    });
-                    Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
-                        sink,
-                        secret,
-                        batch_size: audit_config.effective_batch_size(),
-                        backoff: audit_config.backoff.clone(),
-                        lease: autumn_harvest::audit_export::DEFAULT_EXPORT_LEASE,
-                    })
-                });
-            }
-        }
+        install_completion_callback_config(&built);
+        install_audit_export_config(&built);
         let classic_dag_names = built
             .dags()
             .iter()

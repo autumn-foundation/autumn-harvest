@@ -5942,7 +5942,7 @@
           }
         }
       ],
-      "description": "Age in seconds of the OLDEST audit record the SIEM sink has not acknowledged, per shard. This is the compliance signal: a rising line means privileged-action logs are not reaching the SIEM, and the cursor is deliberately held rather than advanced past the failure, so nothing is lost \u2014 only late. A flat 0 means every audit record on the shard is acknowledged. A MISSING series means no exporter is running for that shard at all (check GET /admin/audit-export's sink_configured), which is worse than a high value, not better."
+      "description": "Alert: harvest_audit_export_lag_high (docs/runbooks/harvest-alerts.md#harvest_audit_export_lag_high) Age in seconds of the OLDEST audit record the SIEM sink has not acknowledged, per shard. This is the compliance signal: a rising line means privileged-action logs are not reaching the SIEM, and the cursor is deliberately held rather than advanced past the failure, so nothing is lost \u2014 only late. A flat 0 means every audit record on the shard is acknowledged. A MISSING series means no exporter is running for that shard at all (check GET /admin/audit-export's sink_configured), which is worse than a high value, not better."
     },
     {
       "id": 952,

@@ -860,6 +860,22 @@ pub enum HarvestBuilderError {
         rejection: crate::completion_callback::SsrfRejection,
     },
 
+    /// `audit_export_webhook(...)` was configured without
+    /// `audit_export_secret(...)` (issue #953).
+    ///
+    /// Fails the build rather than warning: HMAC-SHA256 accepts a zero-length
+    /// key and produces a well-formed, trivially reproducible signature, so an
+    /// unconfigured secret does not yield a *missing* `X-Harvest-Signature` —
+    /// it yields one any third party can forge, which is worse than none for a
+    /// receiver that verifies it. The signature is the tamper-evidence control
+    /// this feature exists to provide.
+    #[error(
+        "audit_export_webhook(...) requires audit_export_secret(...): batches would \
+         otherwise be signed with an empty HMAC key, which any third party can \
+         reproduce, defeating the X-Harvest-Signature tamper-evidence guarantee"
+    )]
+    AuditSinkSecretMissing,
+
     /// A native `#[activity]` registration shares its name with a WASM activity
     /// binding (issue #965 review). The native registration would win in the
     /// handler registry while the WASM binding lingered, so the worker's WASM
@@ -1870,6 +1886,21 @@ impl HarvestBuilder {
         self
     }
 
+    /// How long one exporter holds a shard's cursor while a batch is in
+    /// flight — and the timeout applied to the sink call itself. Defaults to
+    /// [`crate::audit_export::DEFAULT_EXPORT_LEASE`] (60s); floored at 1s.
+    ///
+    /// **Set this above your sink's own per-request timeout.** A sink that
+    /// can outlive its lease would have every attempt superseded by the next
+    /// tick's claim, so the cursor would never advance while the sink received
+    /// the same batch forever. The bundled `ReqwestAuditSink` defaults to a
+    /// 30s request timeout against this 60s lease.
+    #[must_use]
+    pub const fn audit_export_lease(mut self, lease: std::time::Duration) -> Self {
+        self.audit_export_config.lease = lease;
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -2256,6 +2287,9 @@ impl HarvestBuilder {
         }
         if let Err((url, rejection)) = self.audit_export_config.validate_webhook_url() {
             return Err(HarvestBuilderError::AuditSinkRejected { url, rejection });
+        }
+        if self.audit_export_config.webhook_is_missing_a_secret() {
+            return Err(HarvestBuilderError::AuditSinkSecretMissing);
         }
 
         if let Some(ceiling) = self.max_workflow_history_events {
@@ -6734,6 +6768,98 @@ mod tests {
             ),
             "expected CallbackTargetRejected, got {result:?}"
         );
+    }
+
+    // ── Audit export (issue #953) ────────────────────────────────────────
+
+    #[test]
+    fn builder_rejects_a_non_allowlisted_audit_export_webhook() {
+        // No allowlist configured -> every domain host is rejected. The build
+        // FAILS rather than warning: an audit export that silently never
+        // delivers is a compliance gap discovered at audit time.
+        let result = HarvestBuilder::new()
+            .audit_export_webhook("https://evil.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::AuditSinkRejected { ref url, .. })
+                    if url == "https://evil.com/audit"
+            ),
+            "expected AuditSinkRejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_plain_http_audit_export_webhook_by_default() {
+        let result = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("http://siem.example.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::AuditSinkRejected { .. })),
+            "audit records name who acted on which tenant; cleartext must be \
+             opt-in, got {result:?}"
+        );
+
+        // ...and the documented escape hatch works.
+        let allowed = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_allow_http(true)
+            .audit_export_webhook("http://siem.example.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        assert!(allowed.is_ok(), "got {allowed:?}");
+    }
+
+    #[test]
+    fn builder_rejects_an_audit_export_webhook_with_no_hmac_secret() {
+        let result = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/audit")
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::AuditSinkSecretMissing)),
+            "HMAC-SHA256 accepts an empty key and emits a signature anyone can \
+             recompute, so an unconfigured secret is worse than none -- it must \
+             fail the build, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_an_allowlisted_audit_export_webhook() {
+        let built = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("*.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/harvest/audit")
+            .audit_export_secret(b"k".to_vec())
+            .audit_export_batch_size(250)
+            .try_build()
+            .expect("an allowlisted https webhook with a secret must build");
+        let config = built.audit_export_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.effective_batch_size(), 250);
+    }
+
+    #[test]
+    fn builder_with_no_audit_export_config_is_inert() {
+        // AC8: an embedder who never touches the audit-export API gets a
+        // config that installs nothing at all.
+        let built = HarvestBuilder::new().build();
+        let config = built.audit_export_config();
+        assert!(!config.is_enabled());
+        assert!(config.sink.is_none());
+        assert!(config.webhook_url.is_none());
+        assert!(config.secret.is_none());
     }
 
     #[test]

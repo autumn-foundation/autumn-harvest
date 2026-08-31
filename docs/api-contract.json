@@ -5110,8 +5110,8 @@
       "path": "/admin/audit-export/redrive",
       "category": "admin",
       "read_only": false,
-      "description": "Rewind one shard's audit-export cursor so already-delivered audit records are re-exported to the SIEM sink (issue #953), for recovery after sink-side data loss. Re-exported records are byte-identical -- the per-record export sequence is never re-stamped, so a record carries the same (shard, seq) and the same JSON on every delivery and the receiver dedupes on that pair. A cursor may only ever move BACKWARDS: a request that would move it forward is refused with 400 rather than applied, because advancing it would mark records delivered that never were. The redrive itself writes an audit record (`audit_export.redrive`), so re-exporting is as auditable as the operations being exported.",
-      "idempotency": "Idempotent in effect: rewinding twice to the same position leaves the cursor in the same place (the second call is refused as a no-op only if the first already moved the cursor at or below the requested position). Each call writes its own audit record.",
+      "description": "Rewind one shard's audit-export cursor so already-delivered audit records are re-exported to the SIEM sink (issue #953), for recovery after sink-side data loss. Re-exported records are byte-identical -- the per-record export sequence is never re-stamped, so a record carries the same (shard, seq) and the same JSON on every delivery and the receiver dedupes on that pair. A cursor may only ever move BACKWARDS: a request that would move it forward, or leave it where it is, is refused with 400 rather than applied, because advancing it would mark records delivered that never were. The `before` form resolves to one below the LOWEST sequence assigned to a record at or after that instant, so any clock/commit-order skew makes the rewind reach further back (costing duplicate deliveries the receiver dedupes) rather than skipping records. The redrive itself writes an audit record (`audit_export.redrive`), so re-exporting is as auditable as the operations being exported.",
+      "idempotency": "Idempotent in effect: the cursor ends up at the requested position. A repeat of the same request is refused with 400 rather than applied a second time, because a request that would not move the cursor BACKWARDS (at or above the current position) is never applied. Each accepted call writes its own audit record.",
       "params": [],
       "request_body": {
         "required": true,
@@ -5142,12 +5142,12 @@
           "from",
           "to"
         ],
-        "notes": "`outcome` is `rewound`. `from` is where the cursor was, `to` where it now is; records with seq > to will be re-delivered by the exporter on its next tick. The rewind also bumps the shard's claim epoch and clears its lease, so a delivery already in flight when the rewind lands cannot acknowledge over it and silently undo the redrive."
+        "notes": "`outcome` is `rewound`. `from` is where the cursor was, `to` where it now is; records with seq > to will be re-delivered by the exporter on its next tick. The rewind also bumps the shard's claim epoch and clears its lease, so a delivery already in flight when the rewind lands cannot acknowledge over it and silently undo the redrive. The rewind and the `audit_export.redrive` audit record commit in one unit -- an applied-but-unaudited redrive is not representable -- and the audit row's target_id records the shard AND the requested position (`shard=0;to_seq=42`), since a redrive is the one operation here that can trigger a mass re-export."
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Neither or both of to_seq/before supplied, or the request would move the cursor FORWARD (reported with the current cursor position and the requested one)."
+          "description": "Neither or both of to_seq/before supplied, or the request would not move the cursor backwards -- it is at or above the current position (the message reports both the current cursor and the requested one). Advancing a cursor would mark records delivered that never were."
         },
         {
           "status": 404,
@@ -5155,7 +5155,7 @@
         },
         {
           "status": 503,
-          "description": "Harvest storage pool is not configured, the named shard is unreachable, or the audit record for this redrive could not be written (the redrive is never reported as succeeded without its own audit trail)."
+          "description": "Harvest storage is not configured, the named shard is unreachable, or the audit record for this redrive could not be written. The rewind and its audit record commit together, so a 503 from the audit write means the cursor was NOT moved."
         }
       ]
     },

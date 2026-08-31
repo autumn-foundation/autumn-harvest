@@ -754,8 +754,6 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     // Operator force-open / force-close of a circuit breaker.
-    // Rewinds a shard's audit-export cursor (issue #953): mutating, audited.
-    ("POST /admin/audit-export/redrive", RouteClass::Mutating),
     (
         "POST /admin/circuits/{activity_name}/force-open",
         RouteClass::Mutating,
@@ -764,6 +762,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         RouteClass::Mutating,
     ),
+    // Rewinds a shard's audit-export cursor (issue #953): mutating, audited.
+    ("POST /admin/audit-export/redrive", RouteClass::Mutating),
     // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
     // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
     ("POST /admin/completion-triggers", RouteClass::Mutating),
@@ -814,10 +814,10 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // (issue #945)
     OP_RATE_LIMIT_PACING_OVERRIDE_SET,
     OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
-    // Audit-export cursor redrive (issue #953)
-    OP_AUDIT_EXPORT_REDRIVE,
     OP_START_THROTTLE_PACING_OVERRIDE_SET,
     OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+    // Audit-export cursor redrive (issue #953)
+    OP_AUDIT_EXPORT_REDRIVE,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -1016,12 +1016,6 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
 /// will fail if any expected mutation route is missing or declared as excluded.
 pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Workflow management
-    // Audit export (issue #953): read-only status, and the audited redrive.
-    ("GET /admin/audit-export", None),
-    (
-        "POST /admin/audit-export/redrive",
-        Some(OP_AUDIT_EXPORT_REDRIVE),
-    ),
     ("GET /workflows/count", None),
     ("GET /workflows/summaries", None),
     ("GET /workflows", None),
@@ -1346,6 +1340,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         Some(OP_CIRCUIT_FORCE_CLOSE),
     ),
+    // Audit export (issue #953): read-only status, and the audited redrive.
+    ("GET /admin/audit-export", None),
+    (
+        "POST /admin/audit-export/redrive",
+        Some(OP_AUDIT_EXPORT_REDRIVE),
+    ),
     ("POST /admin/completion-triggers", None),
     ("POST /calendars", None),
     ("PUT /calendars/{name}", None),
@@ -1467,22 +1467,43 @@ pub async fn list_audit(
 /// Called by the retention subsystem on its configured cadence. Returns the
 /// number of rows deleted.
 ///
-/// **Never deletes a record the audit exporter has not yet shipped**
-/// (issue #953). A retention sweep that removed an unexported row would be a
-/// silent compliance gap — the record would be gone from the database *and*
-/// absent from the SIEM, with nothing anywhere to show it was lost, which is
-/// exactly what AC2's "zero silent record loss by construction" rules out.
-/// The guard is expressed as a `NOT EXISTS` against
-/// `harvest_audit_export_cursor`, so when audit export is **not** configured
-/// that table is empty on this shard, the subquery finds nothing, and the
-/// delete is byte-identical to the pre-#953 statement (AC8).
+/// **Never deletes a record the audit exporter has not shipped** (issue
+/// #953). A retention sweep that removed an unexported row would be a silent
+/// compliance gap — the record would be gone from the database *and* absent
+/// from the SIEM, with nothing anywhere to show it was lost, which is exactly
+/// what "zero silent record loss by construction" rules out.
 ///
-/// The cost of the guard is that a sink that is down indefinitely lets the
-/// audit table grow past its retention window. That is the deliberate
-/// trade — dropping a privileged-action log to reclaim disk is not a choice
-/// this function gets to make on an operator's behalf. `harvest.audit.export_lag`
-/// and the `GET /admin/audit-export` `last_error` are how the condition is
-/// surfaced; see `docs/audit-export.md`.
+/// The guard is gated on [`crate::audit_export::is_configured`], **not** on
+/// the presence of a cursor row, because the cursor table alone cannot
+/// distinguish the two states that matter (issue #953 review):
+///
+/// - **Export configured, cursor row absent** — a shard the exporter has not
+///   reached yet (freshly enabled, newly added to the fleet, or one whose
+///   pool has been failing). A cursor-only guard is vacuous here and would
+///   purge unexported records outright.
+/// - **Export disabled, cursor row present** — an operator who enabled export,
+///   ran it, and later removed the sink. Nothing deletes a cursor row, so a
+///   cursor-only guard would find that stale row forever, match every
+///   subsequent `export_seq IS NULL` record, and silently turn audit retention
+///   off permanently — unbounded table growth with no signal, since the lag
+///   gauge is not emitted either once the exporter stops running.
+///
+/// With export not configured, the guard is skipped entirely and the delete
+/// is byte-identical to the pre-#953 statement. With export configured, a row
+/// is deletable only if it carries a sequence at or below every cursor in this
+/// database — so an absent cursor row protects everything, which is the
+/// fail-safe direction.
+///
+/// The cost of the guard is that a sink down indefinitely lets the audit table
+/// grow past its retention window. That is the deliberate trade — dropping a
+/// privileged-action log to reclaim disk is not a choice this function gets to
+/// make on an operator's behalf. `harvest.audit.export_lag` and the
+/// `GET /admin/audit-export` `last_error` are how the condition is surfaced;
+/// see `docs/audit-export.md`.
+///
+/// The subquery is uncorrelated by shard because a shard's database holds at
+/// most one cursor row (the exporter provisions only the shard it is scanning).
+/// Should two ever coexist, `NOT EXISTS` errs toward retaining, never deleting.
 ///
 /// # Errors
 ///
@@ -1497,12 +1518,20 @@ pub async fn purge_old_audit_records(
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
-           AND NOT EXISTS ( \
-                 SELECT 1 FROM harvest_audit_export_cursor c \
-                 WHERE a.export_seq IS NULL OR a.export_seq > c.last_acked_seq \
+           AND ( \
+                 NOT $2::BOOLEAN \
+                 OR ( \
+                      EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
+                      AND NOT EXISTS ( \
+                            SELECT 1 FROM harvest_audit_export_cursor c \
+                            WHERE a.export_seq IS NULL \
+                               OR a.export_seq > c.last_acked_seq \
+                      ) \
+                 ) \
            )",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
     .execute(conn)
     .await
     .map_err(database_error)

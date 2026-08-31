@@ -81,7 +81,9 @@
 //! | `operation` | `body` (or `event.name`) |
 //! | `status` | `severityText` (`SUCCEEDED` -> `INFO`, `FAILED` -> `ERROR`) |
 //! | `error_summary` | `attributes["exception.message"]` |
-//! | `shard`, `seq` | `attributes["harvest.shard.id"]`, `attributes["harvest.audit.seq"]` |
+//! | `shard` | `attributes["harvest.audit.source_shard"]` — the database the record was read from, and half the dedup key |
+//! | `seq` | `attributes["harvest.audit.seq"]` |
+//! | `shard_id` | `attributes["harvest.shard.id"]` — the shard the operation itself named, which can differ from `shard` |
 //! | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
 //! | `id` | `attributes["harvest.audit.id"]` |
 //!
@@ -99,12 +101,19 @@ pub use crate::completion_callback::{CallbackSecret, SIGNATURE_HEADER, TIMESTAMP
 
 /// HTTP header naming the shard a batch came from.
 ///
-/// A receiver that dedupes on `(shard, seq)` can read the pair from headers
-/// without parsing the body, mirroring #605's `X-Harvest-Delivery-Id`.
+/// **Routing and triage metadata only — not covered by the signature.** The
+/// signature (per #605's scheme) is over the request body alone, so a
+/// receiver must read the authoritative `(shard, seq)` pair from each record
+/// *in the body*. Deduplicating on these headers would mean deduplicating on
+/// unauthenticated input: an attacker replaying a captured, validly-signed
+/// batch with a shifted range could mark a real range as already-seen and
+/// create exactly the silent gap this feature exists to prevent.
 pub const SHARD_HEADER: &str = "X-Harvest-Audit-Shard";
-/// HTTP header carrying the first (lowest) `seq` in the batch.
+/// HTTP header carrying the first (lowest) `seq` in the batch. Unsigned — see
+/// [`SHARD_HEADER`].
 pub const FIRST_SEQ_HEADER: &str = "X-Harvest-Audit-First-Seq";
-/// HTTP header carrying the last (highest) `seq` in the batch.
+/// HTTP header carrying the last (highest) `seq` in the batch. Unsigned — see
+/// [`SHARD_HEADER`].
 pub const LAST_SEQ_HEADER: &str = "X-Harvest-Audit-Last-Seq";
 
 /// Default number of audit records claimed and delivered per batch.
@@ -138,6 +147,15 @@ pub struct AuditExportRecord {
     pub seq: i64,
     /// The audit row's own primary key.
     pub id: Uuid,
+    /// The shard the *operation* recorded itself against, straight from
+    /// `harvest_audit_log.shard_id`.
+    ///
+    /// Distinct from [`Self::shard`], which names the database the record was
+    /// read from and is the dedup dimension. The two normally agree, but a
+    /// control-plane mutation writes its audit row on the default shard while
+    /// naming the shard it acted on, so exporting only one of them would make
+    /// a receiver's correlation silently wrong.
+    pub shard_id: Option<i32>,
     pub occurred_at: DateTime<Utc>,
     pub actor: String,
     pub operation: String,
@@ -180,8 +198,9 @@ pub fn serialize_batch(records: &[AuditExportRecord]) -> Result<Vec<u8>, serde_j
 ///
 /// Uses the same `X-Harvest-Signature` HMAC-SHA256 scheme as issue #605
 /// (delegating to [`crate::completion_callback::sign`], so the two can never
-/// drift), plus the shard and sequence range a receiver needs for
-/// `(shard, seq)` dedup and contiguity checking.
+/// drift). **The signature covers the body only** — the shard/sequence/
+/// timestamp headers are unauthenticated routing metadata; see
+/// [`SHARD_HEADER`].
 #[must_use]
 pub fn export_headers(
     secret: &CallbackSecret,
@@ -473,6 +492,10 @@ pub struct AuditExportBuilderConfig {
     pub batch_size: i64,
     /// Capped exponential backoff after a sink failure.
     pub backoff: ExportBackoff,
+    /// How long a claim holds a shard's cursor, and the timeout applied to the
+    /// sink call itself. Must exceed the sink's own per-request timeout — see
+    /// [`DEFAULT_EXPORT_LEASE`].
+    pub lease: std::time::Duration,
 }
 
 impl std::fmt::Debug for AuditExportBuilderConfig {
@@ -486,6 +509,7 @@ impl std::fmt::Debug for AuditExportBuilderConfig {
             .field("sink", &self.sink.as_ref().map(|_| "<AuditSink>"))
             .field("batch_size", &self.batch_size)
             .field("backoff", &self.backoff)
+            .field("lease", &self.lease)
             .finish()
     }
 }
@@ -501,6 +525,7 @@ impl Default for AuditExportBuilderConfig {
             sink: None,
             batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             backoff: ExportBackoff::default(),
+            lease: DEFAULT_EXPORT_LEASE,
         }
     }
 }
@@ -529,6 +554,25 @@ impl AuditExportBuilderConfig {
     /// An embedder-supplied [`AuditSink`] is not validated here — it is not a
     /// URL, and where it ships is the embedder's decision.
     ///
+    /// `true` when a signed webhook is configured but no HMAC key is.
+    ///
+    /// Fails the build rather than warning (issue #953 review): the signature
+    /// *is* the tamper-evidence control this feature promises, and HMAC-SHA256
+    /// accepts a zero-length key happily — so an unconfigured secret does not
+    /// produce a missing header, it produces a well-formed
+    /// `X-Harvest-Signature` that anyone can recompute. A receiver verifying
+    /// it would see a valid signature on a batch any third party could have
+    /// forged, which is worse than no signature at all. A startup
+    /// `tracing::warn!` on a fleet is not a control.
+    ///
+    /// Only the *webhook* path is gated. An embedder-supplied [`AuditSink`]
+    /// may authenticate however it likes (IAM, mTLS, a local file), so an
+    /// absent HMAC key there is a legitimate configuration and only warns.
+    #[must_use]
+    pub const fn webhook_is_missing_a_secret(&self) -> bool {
+        self.sink.is_none() && self.webhook_url.is_some() && self.secret.is_none()
+    }
+
     /// # Errors
     /// Returns the `(url, rejection)` pair when the webhook URL fails
     /// validation.
@@ -542,6 +586,16 @@ impl AuditExportBuilderConfig {
         crate::completion_callback::validate_target_url(url, &policy)
             .map(|_| ())
             .map_err(|rejection| (url.clone(), rejection))
+    }
+
+    /// The claim lease, floored at one second.
+    ///
+    /// A zero lease would make every claim immediately reclaimable and give
+    /// the sink call a zero timeout, so every batch would fail before it was
+    /// sent.
+    #[must_use]
+    pub fn effective_lease(&self) -> std::time::Duration {
+        self.lease.max(std::time::Duration::from_secs(1))
     }
 
     /// Batch size clamped into the supported range.
@@ -567,7 +621,13 @@ impl AuditExportBuilderConfig {
 /// shard resumes promptly. A lease expiring early is safe — it costs a
 /// duplicate delivery, which the receiver dedupes on `(shard, seq)` — while a
 /// lease expiring late costs export lag.
-#[cfg(feature = "db")]
+///
+/// **It also bounds the sink call itself.** The exporter wraps every
+/// `deliver` in a timeout of exactly the configured lease, so a sink can
+/// never outlive its own claim: without that, a sink slower than the lease
+/// would livelock (each attempt superseded by the next claim, the cursor
+/// never advancing) and would additionally wedge the shared background
+/// scanner behind an embedder-supplied `await`.
 pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Everything the exporter needs at runtime, installed once at startup.
@@ -576,7 +636,6 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 /// fully inert: [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
 /// single query, so an embedder who never configures an audit sink sees zero
 /// behavior change and zero scanner work (AC8).
-#[cfg(feature = "db")]
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.
@@ -596,7 +655,6 @@ pub struct AuditExportRuntimeConfig {
 // review): every read clones the value out of the lock, and the struct carries
 // owned fields that would otherwise be deep-copied on every scanner tick for a
 // value that only ever changes at startup.
-#[cfg(feature = "db")]
 pub static GLOBAL_AUDIT_EXPORT_CONFIG: std::sync::RwLock<
     Option<std::sync::Arc<AuditExportRuntimeConfig>>,
 > = std::sync::RwLock::new(None);
@@ -610,7 +668,6 @@ pub static GLOBAL_AUDIT_EXPORT_CONFIG: std::sync::RwLock<
 /// the guard is still valid. Recovering it avoids the failure mode of a bare
 /// `.read().ok()`, where one unrelated panic would silently stop exporting
 /// audit records — a compliance gap — for the rest of the process's life.
-#[cfg(feature = "db")]
 fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntimeConfig>> {
     match GLOBAL_AUDIT_EXPORT_CONFIG.read() {
         Ok(guard) => guard.clone(),
@@ -645,7 +702,6 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 /// same reason as the callback installer: the config is a single process-wide
 /// static, so a second runtime built without a sink must not keep shipping
 /// audit records to the first runtime's destination.
-#[cfg(feature = "db")]
 pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExportBuilderConfig) {
     let Some(sink) = config.sink.clone() else {
         if config.webhook_url.is_some() {
@@ -677,16 +733,24 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
             secret,
             batch_size: config.effective_batch_size(),
             backoff: config.backoff.clone(),
-            lease: DEFAULT_EXPORT_LEASE,
+            lease: config.effective_lease(),
         }));
     }
 }
 
 /// `true` when an audit sink is configured in this process.
 ///
-/// Used by the retention sweep to decide whether the "never purge an
-/// unexported record" guard is live.
-#[cfg(feature = "db")]
+/// Two callers, and both matter:
+/// - [`crate::audit::purge_old_audit_records`] uses it to decide whether the
+///   "never purge an unexported record" guard is live. The guard cannot be
+///   inferred from the cursor table alone: an empty table means *either*
+///   "export was never configured" (purge freely) *or* "export is configured
+///   but has not ticked on this shard yet" (purge nothing), and a stale
+///   cursor row left behind by a since-disabled exporter would otherwise
+///   block retention forever.
+/// - `GET /admin/audit-export` reports it as `sink_configured`, so an
+///   operator can see export configured on the web app but not on the worker
+///   fleet (or vice versa).
 #[must_use]
 pub fn is_configured() -> bool {
     read_global_audit_export_config().is_some()
@@ -736,6 +800,15 @@ pub async fn ensure_cursor_row(
     .await
     .map_err(crate::error::database_error)?;
     Ok(())
+}
+
+/// The `MAX(export_seq)` read back from the sequence-assignment statement —
+/// the high-water mark of sequences actually handed out.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct HighWater {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    high_water: i64,
 }
 
 /// Claim a shard for export: assign sequences to newly-visible audit rows and
@@ -803,26 +876,42 @@ pub async fn claim_shard(
             // simply receives a later sequence on a later tick. That is the
             // whole reason the sequence is stamped by the exporter rather than
             // handed out by a `BIGSERIAL` before commit — see the module docs.
-            let assigned = diesel::sql_query(
+            // The high-water mark is read back from the rows actually
+            // stamped (`MAX(export_seq)`), never inferred from the affected
+            // row count (issue #953 review): the two diverge if any row in
+            // the CTE's snapshot disappears before the UPDATE takes its
+            // lock, and a high-water mark one short of the highest sequence
+            // handed out would let the NEXT tick reissue that sequence to a
+            // different record -- two audit records sharing a `(shard, seq)`,
+            // which a receiver deduping on that key silently drops.
+            //
+            // The outer `AND a.export_seq IS NULL` repeats the CTE's
+            // predicate under the row lock for the same reason: without it
+            // the UPDATE would overwrite a sequence another writer assigned
+            // between the CTE's evaluation and the lock.
+            let assigned: HighWater = diesel::sql_query(
                 "WITH claimed AS ( \
                      SELECT id, row_number() OVER (ORDER BY occurred_at, id) AS rn \
                      FROM harvest_audit_log \
                      WHERE export_seq IS NULL \
                      ORDER BY occurred_at, id \
                      LIMIT $2 \
+                 ), stamped AS ( \
+                     UPDATE harvest_audit_log a \
+                     SET export_seq = $1 + claimed.rn \
+                     FROM claimed \
+                     WHERE a.id = claimed.id AND a.export_seq IS NULL \
+                     RETURNING a.export_seq \
                  ) \
-                 UPDATE harvest_audit_log a \
-                 SET export_seq = $1 + claimed.rn \
-                 FROM claimed \
-                 WHERE a.id = claimed.id",
+                 SELECT COALESCE(MAX(export_seq), $1) AS high_water FROM stamped",
             )
             .bind::<diesel::sql_types::BigInt, _>(cursor.last_assigned_seq)
             .bind::<diesel::sql_types::BigInt, _>(batch_size)
-            .execute(conn)
+            .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
 
-            let last_assigned_seq = cursor.last_assigned_seq + i64::try_from(assigned).unwrap_or(0);
+            let last_assigned_seq = assigned.high_water.max(cursor.last_assigned_seq);
 
             // ── Load the batch to deliver ─────────────────────────────────
             //
@@ -877,6 +966,7 @@ pub async fn claim_shard(
                         shard: shard_id,
                         seq,
                         id: row.id,
+                        shard_id: row.shard_id,
                         occurred_at: row.occurred_at,
                         actor: row.actor,
                         operation: row.operation,
@@ -1064,7 +1154,10 @@ pub struct AuditExportShardStatus {
     /// Age in seconds of the oldest record not yet acknowledged; `0.0` when
     /// nothing is pending. This is `harvest.audit.export_lag`.
     pub lag_seconds: f64,
-    /// `IDLE` | `DELIVERING` | `BACKOFF` | `RETRYING`.
+    /// `IDLE` | `DELIVERING` | `BACKOFF` | `RETRYING`, from
+    /// [`delivery_state`]. `GET /admin/audit-export` additionally synthesizes
+    /// `NOT_STARTED` for a shard with no cursor row at all, which this struct
+    /// cannot represent (there is no cursor to describe).
     pub delivery_state: String,
     pub consecutive_failures: i32,
     pub last_status: Option<i32>,
@@ -1073,14 +1166,85 @@ pub struct AuditExportShardStatus {
     pub next_attempt_at: DateTime<Utc>,
 }
 
+/// Age in seconds of the oldest audit record the sink has not acknowledged,
+/// or `0.0` when nothing is pending. This is `harvest.audit.export_lag`.
+///
+/// Deliberately **two index-servable point lookups** rather than the single
+/// `MIN(occurred_at) WHERE export_seq IS NULL OR export_seq > $1` the admin
+/// view uses (issue #953 review): that disjunction spans both partial indexes
+/// and degenerates into visiting every pending heap tuple. This runs on
+/// **every** scanner tick, and the pending set is largest during exactly the
+/// sink outage when the database is already under stress — so the per-tick
+/// query must not scale with the backlog.
+///
+/// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`,
+///   served as an index-min by `harvest_audit_log_unexported_idx`.
+/// - Sequenced-but-unacknowledged rows: the `occurred_at` of the *next*
+///   record the exporter owes the sink, found by `ORDER BY export_seq LIMIT 1`
+///   on `harvest_audit_log_export_seq_idx`. Sequences are assigned in
+///   `(occurred_at, id)` order within a batch, so this is the oldest such
+///   record in every ordinary case, and it is the operationally meaningful
+///   one — "how old is the next thing we owe the sink?" — in any case.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+#[allow(clippy::cast_precision_loss)] // millisecond lag never approaches 2^53
+pub async fn export_lag_seconds(
+    conn: &mut diesel_async::AsyncPgConnection,
+    last_acked_seq: i64,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<f64> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_log::dsl as log;
+
+    let unsequenced: Option<DateTime<Utc>> = log::harvest_audit_log
+        .filter(log::export_seq.is_null())
+        .select(diesel::dsl::min(log::occurred_at))
+        .first::<Option<DateTime<Utc>>>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_owed: Option<DateTime<Utc>> = log::harvest_audit_log
+        .filter(log::export_seq.gt(last_acked_seq))
+        .select(log::occurred_at)
+        .order(log::export_seq.asc())
+        .first::<DateTime<Utc>>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let oldest = match (unsequenced, next_owed) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+
+    Ok(oldest.map_or(0.0, |oldest| {
+        let secs = (now - oldest).num_milliseconds() as f64 / 1000.0;
+        if secs.is_finite() && secs > 0.0 {
+            secs
+        } else {
+            0.0
+        }
+    }))
+}
+
 /// Pending-record count and lag for one shard.
 ///
 /// "Pending" is `export_seq IS NULL OR export_seq > last_acked_seq` — both a
 /// record the exporter has not sequenced yet and one it sequenced but has not
 /// had acknowledged are equally undelivered.
 ///
+/// The `COUNT(*)` makes this **O(backlog)**, so it is deliberately confined to
+/// the operator-triggered `GET /admin/audit-export` read. The scanner's
+/// per-tick gauge uses [`export_lag_seconds`], which is not.
+///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
+///
 #[cfg(feature = "db")]
 #[allow(clippy::cast_precision_loss)] // millisecond lag never approaches 2^53
 pub async fn pending_and_lag(
@@ -1197,6 +1361,11 @@ pub enum RewindRequest {
 /// Bumps `claim_epoch` and clears the lease, so a delivery already in flight
 /// when the rewind lands cannot acknowledge over it.
 ///
+/// Opens its own transaction. A caller that must commit the rewind together
+/// with something else — the management route pairs it with its own audit
+/// record, so a rewind can never be applied unaudited — should open the
+/// transaction itself and call [`rewind_cursor_locked`].
+///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
 #[cfg(feature = "db")]
@@ -1206,15 +1375,45 @@ pub async fn rewind_cursor(
     request: RewindRequest,
     now: DateTime<Utc>,
 ) -> crate::error::HarvestResult<RewindOutcome> {
-    use diesel::prelude::*;
     use diesel_async::AsyncConnection;
+
+    Box::pin(
+        conn.transaction::<RewindOutcome, crate::error::HarvestError, _>(async |conn| {
+            rewind_cursor_locked(conn, shard_id, request, now).await
+        }),
+    )
+    .await
+}
+
+/// [`rewind_cursor`] without the surrounding transaction.
+///
+/// Takes the cursor row's `FOR UPDATE` lock and applies the rewind but leaves
+/// the commit to the caller, so a caller can bind the rewind to another write
+/// in the same unit. The management route uses this to write its
+/// `audit_export.redrive` record *before* committing, which makes an applied
+/// but unaudited redrive unrepresentable rather than merely unlikely.
+///
+/// **Must be called inside a transaction.** On an autocommit connection each
+/// statement commits independently and the atomicity this exists to provide is
+/// gone.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn rewind_cursor_locked(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    request: RewindRequest,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<RewindOutcome> {
+    use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     use crate::schema::harvest_audit_export_cursor::dsl as cur;
     use crate::schema::harvest_audit_log::dsl as log;
 
-    Box::pin(
-        conn.transaction::<RewindOutcome, crate::error::HarvestError, _>(async |conn| {
+    {
+        {
             let cursor: Option<crate::models::AuditExportCursor> = cur::harvest_audit_export_cursor
                 .find(shard_id)
                 .select(crate::models::AuditExportCursor::as_select())
@@ -1231,19 +1430,38 @@ pub async fn rewind_cursor(
             let requested = match request {
                 RewindRequest::Seq(seq) => seq,
                 RewindRequest::Before(instant) => {
-                    // The highest sequence among records that occurred strictly
-                    // before `instant`; rewinding there re-exports everything from
-                    // `instant` onwards. No such record (the instant predates the
-                    // whole retained window) means rewind to the beginning.
-                    let highest: Option<Option<i64>> = log::harvest_audit_log
-                        .filter(log::occurred_at.lt(instant))
+                    // The LOWEST sequence among records that occurred at or
+                    // after `instant`, minus one -- never `MAX(seq)` over the
+                    // records *before* it (issue #953 review).
+                    //
+                    // The two are not equivalent, and the difference is the
+                    // same hazard this whole design is built around.
+                    // `occurred_at` is transaction START time, so a
+                    // long-running request's audit row can carry an earlier
+                    // `occurred_at` than a row that committed sooner and yet
+                    // be sequenced later. Taking the max over the "before"
+                    // side would then land ABOVE records the operator asked to
+                    // re-export, and they would silently never be re-sent --
+                    // the exact skew the forward path is immune to,
+                    // reintroduced in the recovery path.
+                    //
+                    // Anchoring on the "at or after" side is monotone in the
+                    // safe direction: any skew makes the rewind reach FURTHER
+                    // back, costing duplicate deliveries the receiver dedupes
+                    // on `(shard, seq)`, never a missing record. No sequenced
+                    // record at or after the instant means there is nothing to
+                    // re-export from there, so the cursor stays put.
+                    let lowest: Option<Option<i64>> = log::harvest_audit_log
+                        .filter(log::occurred_at.ge(instant))
                         .filter(log::export_seq.is_not_null())
-                        .select(diesel::dsl::max(log::export_seq))
+                        .select(diesel::dsl::min(log::export_seq))
                         .first(conn)
                         .await
                         .optional()
                         .map_err(crate::error::database_error)?;
-                    highest.flatten().unwrap_or(0)
+                    lowest
+                        .flatten()
+                        .map_or(cursor.last_acked_seq, |seq| seq.saturating_sub(1))
                 }
             };
 
@@ -1267,9 +1485,8 @@ pub async fn rewind_cursor(
                     .map_err(crate::error::database_error)?;
             }
             Ok(outcome)
-        }),
-    )
-    .await
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1306,14 +1523,27 @@ async fn export_once_on_conn(
     let body = match serialize_batch(&claim.records) {
         Ok(body) => body,
         Err(error) => {
-            // Cannot serialize what we claimed — release the claim and back
-            // off rather than silently advancing past records we never sent.
+            // Cannot serialize what we claimed. Hold the cursor AND write a
+            // real backoff (issue #953 review): a bare `release_claim` leaves
+            // `next_attempt_at` in the past, so the next tick re-claims the
+            // same unserializable batch immediately and the shard hot-spins
+            // once per poll interval with the cursor frozen and nothing but a
+            // log line per iteration. A backoff paces the failure and surfaces
+            // it on `GET /admin/audit-export`.
             tracing::error!(
                 shard = shard_id,
                 error = %error,
                 "failed to serialize an audit export batch; holding the cursor"
             );
-            release_claim(conn, shard_id, claim.claim_epoch, Utc::now()).await?;
+            let now = Utc::now();
+            let outcome = classify_export_outcome(
+                &SinkAttempt::transport_error(format!("batch serialization failed: {error}")),
+                last_seq,
+                claim.consecutive_failures,
+                &config.backoff,
+                now,
+            );
+            apply_outcome(conn, shard_id, claim.claim_epoch, &outcome, now).await?;
             return Ok(0);
         }
     };
@@ -1336,7 +1566,28 @@ async fn export_once_on_conn(
         headers: &headers,
     };
 
-    let attempt = config.sink.deliver(&batch).await;
+    // Bound the embedder-supplied call by the claim's own lease (issue #953
+    // review). Two failures this closes:
+    //
+    //   * A sink slower than the lease livelocks: its claim is superseded by
+    //     the next tick's before its 2xx lands, that acknowledgement is
+    //     refused by the epoch guard, and the cursor never advances while the
+    //     sink receives the same batch forever.
+    //   * `fire_due_audit_exports` is awaited inline in
+    //     `enforce_timeouts_once`, so an un-timed `await` on embedder code
+    //     would wedge the shared scanner -- and every resident sequenced after
+    //     it -- for as long as the sink hangs.
+    //
+    // A timeout is classified exactly like any other transport failure: the
+    // cursor is held and the batch is retried. Never a loss.
+    let attempt = tokio::time::timeout(config.lease, config.sink.deliver(&batch))
+        .await
+        .unwrap_or_else(|_| {
+            SinkAttempt::transport_error(format!(
+                "audit sink did not respond within the {}s export lease",
+                config.lease.as_secs()
+            ))
+        });
     let outcome = classify_export_outcome(
         &attempt,
         last_seq,
@@ -1410,7 +1661,7 @@ async fn emit_lag(
     let Ok(Some(acked)) = acked else {
         return;
     };
-    if let Ok((_, lag)) = pending_and_lag(conn, acked, Utc::now()).await {
+    if let Ok(lag) = export_lag_seconds(conn, acked, Utc::now()).await {
         metrics.record_audit_export_lag(u16::try_from(shard_id).unwrap_or(u16::MAX), lag);
     }
 }
@@ -1475,9 +1726,30 @@ pub async fn fire_due_audit_exports(
             }
         }
         _ => {
-            // Unsharded deployment: the default shard is 0, matching how the
-            // rest of the system labels an unsharded install.
-            total += export_once_on_conn(conn, &config, 0, metrics).await?;
+            // Unsharded deployment, or a pool with no assignments. Label the
+            // records with the pool's own default shard rather than a hardcoded
+            // `0` (issue #953 review): a sharded pool whose default is not 0
+            // would otherwise write a cursor row keyed `0` into that shard's
+            // database, alongside the correctly-keyed cursor a worker assigned
+            // to it maintains -- two independent counters stamping `export_seq`
+            // on the same rows from different bases, which breaks per-shard
+            // density and the receiver's contiguity check.
+            let shard = sharded_pool
+                .as_ref()
+                .map_or(0, |sp| sp.default_shard().as_i32());
+            // Logged and swallowed for the same reason as the sharded arm
+            // above: `fire_due_audit_exports` is one resident of
+            // `enforce_timeouts_once`, and a transient audit-export database
+            // error must not abort the timeout/SLA/session residents
+            // sequenced after it.
+            match export_once_on_conn(conn, &config, shard, metrics).await {
+                Ok(n) => total += n,
+                Err(e) => tracing::error!(
+                    shard,
+                    error = %e,
+                    "[audit_export] export failed on the default shard"
+                ),
+            }
         }
     }
 
@@ -1496,6 +1768,7 @@ mod tests {
             shard: 3,
             seq,
             id: Uuid::from_u128(u128::try_from(seq).unwrap_or(0)),
+            shard_id: Some(3),
             occurred_at: DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts"),
             actor: "alice".to_string(),
             operation: "workflow.cancel".to_string(),
@@ -1804,6 +2077,155 @@ mod tests {
             "a negative position is meaningless; clamp to the beginning rather \
              than writing a negative cursor the CHECK constraint would reject"
         );
+    }
+
+    // ── Delivery state (pure; four branches, all reachable) ─────────────────
+
+    #[test]
+    fn delivery_state_reports_every_branch() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts");
+        let future = now + chrono::Duration::seconds(30);
+        let past = now - chrono::Duration::seconds(30);
+
+        assert_eq!(
+            delivery_state(Some(future), 0, past, now),
+            "DELIVERING",
+            "a live lease means a batch is in flight right now"
+        );
+        assert_eq!(
+            delivery_state(Some(future), 4, future, now),
+            "DELIVERING",
+            "a live lease outranks a pending backoff"
+        );
+        assert_eq!(
+            delivery_state(Some(past), 3, future, now),
+            "BACKOFF",
+            "an expired lease with failures and a future retry is backing off"
+        );
+        assert_eq!(
+            delivery_state(None, 3, past, now),
+            "RETRYING",
+            "failures with the retry deadline already passed is a due retry, \
+             not a healthy idle"
+        );
+        assert_eq!(delivery_state(None, 0, past, now), "IDLE");
+        assert_eq!(
+            delivery_state(Some(now), 0, past, now),
+            "IDLE",
+            "a lease expiring exactly now is expired, not live"
+        );
+    }
+
+    // ── Batch-size and lease clamping ───────────────────────────────────────
+
+    #[test]
+    fn batch_size_is_clamped_into_the_supported_range() {
+        let with = |size| {
+            AuditExportBuilderConfig {
+                batch_size: size,
+                ..AuditExportBuilderConfig::default()
+            }
+            .effective_batch_size()
+        };
+
+        assert_eq!(with(0), 1, "a zero batch would never make progress");
+        assert_eq!(with(-7), 1);
+        assert_eq!(with(i64::MIN), 1);
+        assert_eq!(with(1), 1);
+        assert_eq!(with(250), 250);
+        assert_eq!(with(MAX_EXPORT_BATCH_SIZE), MAX_EXPORT_BATCH_SIZE);
+        assert_eq!(
+            with(MAX_EXPORT_BATCH_SIZE + 1),
+            MAX_EXPORT_BATCH_SIZE,
+            "a batch is buffered in memory and POSTed as one body; the ceiling \
+             is what stops a misconfiguration serializing a whole retention \
+             window into one request"
+        );
+        assert_eq!(with(i64::MAX), MAX_EXPORT_BATCH_SIZE);
+        assert_eq!(
+            AuditExportBuilderConfig::default().effective_batch_size(),
+            DEFAULT_EXPORT_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn the_lease_is_floored_at_one_second() {
+        let with = |lease| {
+            AuditExportBuilderConfig {
+                lease,
+                ..AuditExportBuilderConfig::default()
+            }
+            .effective_lease()
+        };
+
+        assert_eq!(
+            with(std::time::Duration::ZERO),
+            std::time::Duration::from_secs(1),
+            "a zero lease also becomes a zero sink timeout, so every batch \
+             would fail before it was sent"
+        );
+        assert_eq!(
+            with(std::time::Duration::from_millis(1)),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            with(std::time::Duration::from_secs(120)),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            AuditExportBuilderConfig::default().effective_lease(),
+            DEFAULT_EXPORT_LEASE
+        );
+    }
+
+    // ── The HMAC secret is a required control for the webhook path ──────────
+
+    #[test]
+    fn a_webhook_without_a_secret_is_reported_as_misconfigured() {
+        let webhook_only = AuditExportBuilderConfig {
+            webhook_url: Some("https://siem.example.com/audit".to_string()),
+            ..AuditExportBuilderConfig::default()
+        };
+        assert!(
+            webhook_only.webhook_is_missing_a_secret(),
+            "HMAC-SHA256 accepts an empty key and emits a well-formed signature \
+             anyone can recompute, so an unconfigured secret is worse than no \
+             signature at all -- it must fail the build, not warn"
+        );
+
+        let with_secret = AuditExportBuilderConfig {
+            secret: Some(CallbackSecret::new(b"k".to_vec())),
+            ..webhook_only.clone()
+        };
+        assert!(!with_secret.webhook_is_missing_a_secret());
+
+        // An embedder-supplied sink may authenticate some other way (IAM,
+        // mTLS, a local file), so a missing HMAC key there is legitimate.
+        let custom_sink = AuditExportBuilderConfig {
+            sink: Some(std::sync::Arc::new(NoopSink)),
+            ..webhook_only
+        };
+        assert!(!custom_sink.webhook_is_missing_a_secret());
+
+        assert!(
+            !AuditExportBuilderConfig::default().webhook_is_missing_a_secret(),
+            "an unconfigured feature is not a misconfiguration"
+        );
+    }
+
+    #[test]
+    fn the_builder_config_debug_never_prints_the_secret() {
+        let config = AuditExportBuilderConfig {
+            secret: Some(CallbackSecret::new(b"SUPERSECRET".to_vec())),
+            webhook_url: Some("https://siem.example.com/audit".to_string()),
+            ..AuditExportBuilderConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("SUPERSECRET"),
+            "the HMAC key must never reach a log line: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
     }
 
     // ── Trait shape ─────────────────────────────────────────────────────────

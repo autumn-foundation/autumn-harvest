@@ -148,6 +148,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_replication_lag_high` | Cross-region DR → *Measured RPO*, with *Shard write-authority generation* for failover skew |
 | `harvest_shard_fenced` | Cross-region DR → *Workers fenced (never self-healing)* |
 | `harvest_replication_unobservable` | Cross-region DR → *Replication observable (0 = the other DR panels are STALE)* |
+| `harvest_audit_export_lag_high` | Audit export to SIEM → *Audit export lag (oldest unshipped audit record)*, with *Audit records exported* to tell a sink outage from a quiet fleet |
 
 ### Readiness-style alerts (no native metric)
 

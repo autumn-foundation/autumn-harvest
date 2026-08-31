@@ -2867,3 +2867,99 @@ and it should be recorded as accepted risk rather than left firing. Escalate
 immediately if a failover is being considered while this is firing — the RPO
 you would be accepting is unmeasured, and that must be said out loud in the
 incident channel rather than recorded as zero.
+
+---
+
+## harvest_audit_export_lag_high
+
+`harvest.audit.export_lag` is the age of the **oldest** audit record the SIEM
+sink has not acknowledged (issue #953; see `docs/audit-export.md`). A rising
+line does **not** mean records are being lost — the export cursor is held
+rather than advanced past a failure, and the retention sweep refuses to purge
+an unexported record — but the window in which a privileged action would be
+invisible to detection is growing, and the audit table is growing with it.
+
+### Triage steps
+
+1. Ask the exporter about itself:
+
+   ```bash
+   curl -s "$HARVEST/admin/audit-export" | jq '{sink_configured, status, shards}'
+   ```
+
+2. Read `delivery_state` and `last_error` on the lagging shard. Three states
+   are worth telling apart:
+
+   | What you see | What it means |
+   |---|---|
+   | `last_error` populated, `delivery_state: "BACKOFF"` | The sink is rejecting or unreachable. The cursor is parked, retrying with capped backoff. |
+   | `delivery_state: "NOT_STARTED"`, `sink_configured: false` | Export is configured somewhere (the web app) but **not on the worker fleet that runs the scanner**. Invisible in metrics alone. |
+   | No `harvest_audit_export_lag` series at all | No exporter is running for that shard. **Worse than a high value**, and a threshold alert cannot see it. |
+
+3. Check `pending_records` on the same response to size the backlog, and
+   whether it is still growing between two reads.
+
+### Likely causes
+
+- The sink endpoint is down, rejecting (non-2xx), or answering with a redirect
+  — redirects are never followed, so a 3xx is a failure by design.
+- The HMAC secret was rotated on the receiver but not in the Harvest build, so
+  every batch is rejected as unauthenticated.
+- Audit export was configured on the web application but not on the worker
+  build; the scanner that exports lives on the workers.
+- A sink slower than the configured claim lease
+  (`HarvestBuilder::audit_export_lease`), so every attempt is superseded before
+  it lands. `last_error` names the lease timeout when this is the cause.
+- A shard whose database has been unreachable to the exporter, so its cursor
+  row was never provisioned.
+
+### False positives
+
+- A brief spike right after a deploy, while a restarted worker re-claims shards
+  whose leases had not yet expired. It clears within one lease period.
+- A backfill or bulk administrative operation that writes a burst of audit rows
+  faster than one batch per scanner tick drains them. Lag rises and then falls;
+  `harvest.audit.exported` stays non-zero throughout, which distinguishes it
+  from a stall.
+- A shard with genuinely no audited traffic reports `0`, not a missing series —
+  do not read `0` as "broken".
+
+### Safe actions
+
+- Fix the sink. Recovery is automatic and needs no operator action: the cursor
+  resumes from where it stopped and nothing was skipped.
+- Configure `audit_export_*` on the worker build if `sink_configured` is
+  `false` there.
+- Raise `audit_export_lease` above the sink's own request timeout if
+  `last_error` reports the lease timeout.
+- Add `absent(harvest_audit_export_lag)` as a companion alert — this threshold
+  rule structurally cannot fire when no exporter is running.
+
+**Do not reach for the redrive.** `POST /admin/audit-export/redrive` rewinds
+the cursor so already-delivered records are re-exported; it is for **sink-side
+data loss** (your SIEM lost a day and you need it back). It does nothing for a
+stalled sink except queue more work behind the stall, and a cursor can only
+ever move backwards, so it cannot be used to skip past a stuck batch. There is
+no supported way to skip an audit record — that is the point of the feature.
+
+### Escalation criteria
+
+- Lag exceeds the window your compliance posture can tolerate privileged-action
+  logs being absent from the SIEM. That number is a policy decision, not a
+  Harvest default; write it down before the incident.
+- `pending_records` grows without bound and the audit table is approaching its
+  volume budget. Retention will not purge unexported records for as long as
+  export is behind — that is the deliberate trade. Disabling the sink restores
+  ordinary purging on the next retention tick, at the cost of permanently
+  losing the un-exported window: treat that as a decision with a paper trail,
+  not a cleanup step.
+- Escalate to the security/compliance owner, not only the platform team: the
+  question "were privileged actions logged during this window?" is theirs to
+  answer.
+
+### Confirming recovery
+
+Lag returns to ~0 and `harvest.audit.exported` resumes. On the receiver, check
+`(shard, seq)` contiguity across the outage window: sequences are dense per
+shard, so a hole is a real gap and a duplicate is the expected at-least-once
+behaviour.

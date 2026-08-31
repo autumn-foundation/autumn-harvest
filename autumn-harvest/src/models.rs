@@ -1006,6 +1006,7 @@ pub struct AuditExportRow {
     pub idempotency_key: Option<String>,
     pub status: String,
     pub error_summary: Option<String>,
+    pub shard_id: Option<i32>,
     pub source: String,
     pub export_seq: Option<i64>,
 }
