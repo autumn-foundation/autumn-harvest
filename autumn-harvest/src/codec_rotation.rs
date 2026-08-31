@@ -860,12 +860,21 @@ mod db {
             // victory over rows it could not convert.
             (0, 0, None)
         } else if !census_needed {
-            // Converged, and the revalidation clock has not come round. Carry
-            // the cursor forward exactly as it stands -- this branch must not
-            // be mistaken for "the census said no", which would reset a
-            // perfectly good completion on every tick.
+            // Converged, and the revalidation clock has not come round. Keep
+            // the completion stamp -- this branch must not be mistaken for
+            // "the census said no", which would reset a perfectly good
+            // completion on every tick.
+            //
+            // But DO advance over what this tick examined. `highest_id` is
+            // correct in both cases by construction: the max id read, falling
+            // back to the resume point when the batch was empty. Carrying the
+            // stored `last_event_id` instead would stand still over an
+            // underfilled batch, so a converged shard receiving traffic would
+            // re-read and re-deserialize the same rows every tick until the
+            // batch filled or the five-minute clock moved it -- read
+            // amplification bounded only by `batch_limit`.
             (
-                resumed.map_or(highest_id, |cursor| cursor.last_event_id),
+                highest_id,
                 0,
                 resumed.and_then(|cursor| cursor.completed_at),
             )

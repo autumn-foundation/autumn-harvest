@@ -1989,3 +1989,80 @@ async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
          finished rotation that never ran"
     );
 }
+
+/// A completed cursor must still advance over rows it has just examined.
+///
+/// A converged shard keeps receiving new events. They arrive already under the
+/// active key, so there is nothing to convert -- but the sweep still reads and
+/// deserializes them. If the cursor does not advance past them, the next tick
+/// re-reads the same rows, and the one after that re-reads them plus whatever
+/// arrived since, until the batch limit or the five-minute revalidation clock
+/// finally moves it. On a continuously active shard at a 500 ms tick that is
+/// read amplification bounded only by `batch_limit`.
+///
+/// `highest_id` is the right value in both cases by construction: it is the max
+/// id examined, and falls back to the resume point when the batch was empty --
+/// so using it costs nothing in the steady state and fixes the active one.
+#[tokio::test]
+async fn a_completed_cursor_advances_over_rows_it_has_examined() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "advance_after_complete").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first_pass = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor");
+    assert!(first_pass.completed_at.is_some());
+    let settled_at = first_pass.last_event_id;
+
+    // New traffic on a converged shard: already under the active key, so
+    // nothing to convert -- but the sweep reads them all the same. Fewer than
+    // `batch_limit`, so the batch is underfilled and `reached_end` is true.
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k2",
+        1,
+        &[completed(json!({"b": 2}))],
+    )
+    .await;
+
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("tick over the new rows");
+
+    let after = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor");
+    assert!(
+        after.last_event_id > settled_at,
+        "the cursor must advance over rows the tick already examined ({} -> {}); \
+         standing still re-reads them on every tick until the batch limit or the \
+         revalidation clock moves it",
+        settled_at,
+        after.last_event_id
+    );
+    assert!(
+        after.completed_at.is_some(),
+        "advancing over already-converted rows must not un-complete the pass"
+    );
+}
