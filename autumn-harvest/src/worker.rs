@@ -2080,13 +2080,13 @@ fn terminal_pre_outcome_events_from_commands(
     })
 }
 
-/// Conservative upper bound on the events [`abandoned_dispatch_events`] appends,
-/// for the history hard-cap preflight.
+/// Upper bound on the events [`abandoned_dispatch_events`] appends, counted
+/// **before** the dedup: every dispatch command scores `+2`.
 ///
-/// Counted **before** the DB-resolved dedup (an already-started child is still
-/// counted `+2`), exactly like `timer_lifecycle_event_count`: over-counting only
-/// ever trips the cap check one event early — dead-lettering instead of
-/// breaching the cap — and can never mask a real overflow.
+/// Used for the `!enabled` warn line (where nothing is deduped because nothing
+/// is recorded at all) and as the pre-dedup half of
+/// [`abandoned_dispatch_event_count_resolved`], which is what the history
+/// hard-cap preflight uses.
 fn abandoned_dispatch_event_count(commands: &[WorkflowCommand]) -> u64 {
     u64::try_from(
         commands
@@ -2096,6 +2096,48 @@ fn abandoned_dispatch_event_count(commands: &[WorkflowCommand]) -> u64 {
             .saturating_mul(2),
     )
     .unwrap_or(u64::MAX)
+}
+
+/// Exactly the events a FAILING cycle's [`abandoned_dispatch_events`] will
+/// append, for the history hard-cap preflight (Codex P2 round 3).
+///
+/// Resolves the same dedup persistence will — a child already backed by an
+/// execution row, or a dispatch this execution's history already records, is
+/// skipped — because over-counting here is NOT the safe direction it is for
+/// `timer_lifecycle_event_count`. Breaching the cap dead-letters the execution
+/// and replaces its real failure with a history-cap error, so a workflow
+/// re-parking many already-started children could be terminally mis-routed on
+/// events that were never going to be appended.
+///
+/// Persistence re-resolves under the execution row lock, so its own dedup set
+/// can only ever be a superset of this one (a concurrent attempt starting a
+/// child in between): the count stays an upper bound, but of what will actually
+/// be written rather than of the whole batch.
+#[cfg(feature = "db")]
+async fn abandoned_dispatch_event_count_resolved(
+    conn: &mut AsyncPgConnection,
+    commands: &[WorkflowCommand],
+    recorded: RecordedDispatchIds,
+) -> HarvestResult<u64> {
+    if abandoned_dispatch_event_count(commands) == 0 {
+        return Ok(0);
+    }
+    let plan = AbandonedDispatchPlan::resolve(conn, commands, recorded).await?;
+    Ok(abandoned_dispatch_event_count_for_plan(commands, &plan))
+}
+
+/// The counting half of [`abandoned_dispatch_event_count_resolved`], split out
+/// so the "the preflight counts exactly what persistence appends" invariant is
+/// testable without a database.
+fn abandoned_dispatch_event_count_for_plan(
+    commands: &[WorkflowCommand],
+    plan: &AbandonedDispatchPlan,
+) -> u64 {
+    let total: usize = commands
+        .iter()
+        .map(|cmd| abandoned_dispatch_events(cmd, plan).len())
+        .sum();
+    u64::try_from(total).unwrap_or(u64::MAX)
 }
 
 /// Collects `MarkerRecorded`, `SideEffectRecorded`, `ChildWorkflowSpawnedDetached`,
@@ -18568,12 +18610,35 @@ async fn process_workflow_task(
         WorkflowOutcome::Completed { .. } => pending_update_result_event_count(&pending_cmds)
             .saturating_add(pre_suspension_event_count(&pending_cmds))
             .saturating_add(terminal_parent_close_cascade_events),
-        WorkflowOutcome::Failed { .. } => pending_update_result_event_count(&pending_cmds)
-            .saturating_add(pre_suspension_event_count(&pending_cmds))
-            .saturating_add(terminal_parent_close_cascade_events)
+        WorkflowOutcome::Failed { .. } => {
             // Issue #952: the abandoned-dispatch records this failing cycle is
-            // about to append.
-            .saturating_add(abandoned_dispatch_event_count(&pending_cmds)),
+            // about to append — resolved against the same dedup persistence
+            // applies, so a re-park of already-started children cannot trip the
+            // cap on events that will never be written (Codex P2 round 3).
+            let abandoned = match abandoned_dispatch_event_count_resolved(
+                conn,
+                &pending_cmds,
+                RecordedDispatchIds::from_history(&history_events),
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    return fail_execution_on_error(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(error),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+            };
+            pending_update_result_event_count(&pending_cmds)
+                .saturating_add(pre_suspension_event_count(&pending_cmds))
+                .saturating_add(terminal_parent_close_cascade_events)
+                .saturating_add(abandoned)
+        }
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
@@ -35026,7 +35091,57 @@ mod tests {
         assert!(
             u64::try_from(dispatch_events).unwrap_or(u64::MAX)
                 <= abandoned_dispatch_event_count(&commands),
-            "the preflight bound must never under-count"
+            "the pre-dedup bound must never under-count"
+        );
+    }
+
+    /// The history hard-cap preflight counts what will actually be APPENDED, not
+    /// the whole batch (Codex P2 round 3). Over-counting is not the safe
+    /// direction here: breaching the cap dead-letters the execution and replaces
+    /// its real failure with a history-cap error, so a re-park of already-started
+    /// children must not be counted.
+    #[test]
+    fn the_cap_preflight_counts_only_the_dispatches_that_will_be_written() {
+        let already_started = ExecutionId::new();
+        let commands = vec![
+            abandoned_child_cmd(already_started, "worker_child", Value::Null),
+            abandoned_child_cmd(ExecutionId::new(), "worker_child", Value::Null),
+            abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+            WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: Value::Null,
+            },
+        ];
+        let plan = AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]);
+        let counted = abandoned_dispatch_event_count_for_plan(&commands, &plan);
+        assert_eq!(
+            counted, 4,
+            "the already-started child contributes nothing to the preflight"
+        );
+        assert!(
+            counted < abandoned_dispatch_event_count(&commands),
+            "the resolved count must be strictly tighter than the pre-dedup bound here"
+        );
+
+        // The invariant that matters: preflight count == events persistence writes.
+        let mut timer_events = vec![None, None, None, None];
+        let written =
+            terminal_pre_outcome_events_from_commands(&commands, &mut timer_events, &plan)
+                .into_iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        WorkflowEvent::ChildWorkflowStarted { .. }
+                            | WorkflowEvent::ChildWorkflowFailed { .. }
+                            | WorkflowEvent::ActivityScheduled { .. }
+                            | WorkflowEvent::ActivityFailed { .. }
+                    )
+                })
+                .count();
+        assert_eq!(
+            u64::try_from(written).unwrap_or(u64::MAX),
+            counted,
+            "the preflight must count exactly the abandoned-dispatch events appended"
         );
     }
 

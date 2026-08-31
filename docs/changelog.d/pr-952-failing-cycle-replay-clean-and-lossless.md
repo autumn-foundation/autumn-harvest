@@ -97,6 +97,22 @@ Two knock-on effects of that verdict change, both intended:
   the new field — permitted under the repo's 0.x semver convention, and the
   in-tree readers all go through the new `failure_message()` accessor instead.
 
+### Codex review round 3
+
+* **P2 — the history hard-cap preflight counts what will actually be appended.**
+  The `Failed` arm added `+2` events for every pending dispatch command, including
+  ones `AbandonedDispatchPlan` then drops (a child already backed by an execution
+  row, a dispatch already in history). Over-counting is *not* the safe direction
+  here as it is for `timer_lifecycle_event_count`: breaching the cap dead-letters
+  the execution and replaces its real failure with a history-cap error, so a
+  workflow re-parking many already-started children could be terminally
+  mis-routed on events that were never going to be written. The preflight now
+  resolves the same dedup persistence applies
+  (`abandoned_dispatch_event_count_resolved`), and
+  `the_cap_preflight_counts_only_the_dispatches_that_will_be_written` pins the
+  count against the events `terminal_pre_outcome_events_from_commands` actually
+  emits.
+
 ### Codex review round 2
 
 * **P2 — the abandoned-*activity* terminal is matched by its full engine shape.**

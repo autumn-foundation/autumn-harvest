@@ -321,3 +321,16 @@ replay, exactly as it is for a run that was never redriven at all.
 The symmetry this restores: **neither** dispatch kind's terminal is identified by
 its message. The reserved reason narrows the candidates; the engine's exact
 written shape is what proves the engine wrote it.
+
+## 11. Codex review round 3 — findings and resolutions
+
+| # | Severity | Finding | Resolution |
+| --- | --- | --- | --- |
+| 1 | P2 | The history hard-cap preflight's `Failed` arm counted every pending dispatch command as `+2` events, before the dedup that `AbandonedDispatchPlan` applies. A failing cycle re-parking many already-started children could therefore cross the cap on events that would never be appended — and crossing it is terminal: the execution is dead-lettered and its real failure replaced by a history-cap error. | The arm now calls `abandoned_dispatch_event_count_resolved`, which resolves the same dedup persistence does and counts the events that will actually be written. Split into `abandoned_dispatch_event_count_for_plan` so the invariant is testable without a database: `the_cap_preflight_counts_only_the_dispatches_that_will_be_written` asserts the count equals the abandoned-dispatch events `terminal_pre_outcome_events_from_commands` emits for the same plan. |
+
+The general lesson, worth keeping: **a conservative bound is only conservative
+relative to a consequence.** Over-counting is safe for a cap whose penalty is
+"append nothing extra"; it is not safe for a cap whose penalty is a terminal
+dead-letter that overwrites the run's real outcome. The pre-dedup counter is
+still correct where it is still used (the `!enabled` warn line, where nothing is
+deduped because nothing is recorded).
