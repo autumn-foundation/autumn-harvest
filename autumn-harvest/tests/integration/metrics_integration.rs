@@ -507,6 +507,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -4158,6 +4159,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 
     // Worker with a build_id
     let config = WorkerRuntimeConfig {
+        dr_fencing: false,
         worker_id: "nd-worker-1".to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,

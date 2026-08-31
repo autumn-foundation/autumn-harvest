@@ -1,14 +1,23 @@
-# Shipped work
+# Shipped work — phase status record
 
-The repository's record of shipped work, one entry per phase. It lived in
-`CLAUDE.md` until that file was reduced to repository workflow instructions;
-the record moved here rather than being retired, because documentation guards
-cross-check published prose and issue citations against it.
+The repository's record of what has shipped: one entry per phase, carrying the
+issue number, what shipped, key design decisions, invariant notes and test
+evidence. Restored here from `CLAUDE.md` (as of 89442c4), which `562c781`
+reduced to workflow instructions.
 
-Do not edit this list in a feature PR — that shared list is what causes
-cross-PR merge conflicts. Add your changelog entry as a new fragment file
-`docs/changelog.d/pr-<number>-<slug>.md` (see `docs/changelog.d/README.md`).
-A periodic maintenance sweep folds fragments back into this list.
+Two guard suites read this file as the shipped-work record and will fail if it
+is removed or condensed:
+
+* `autumn-harvest/tests/integration/performance_docs.rs` cross-checks the tables
+  in `docs/performance.md` against the verbatim `#786` entry. A condensed
+  summary does not carry the per-gate figures it compares.
+* `autumn-harvest/tests/integration/migrating_from_temporal_docs.rs` verifies
+  that every issue number cited by `docs/migrating-from-temporal.md` appears
+  here.
+
+Per `docs/changelog.d/README.md`, feature PRs must NOT append to this list --
+add a fragment under `docs/changelog.d/` instead; the periodic collation sweep
+folds fragments in here.
 
 ### Phase Status
 
@@ -9085,3 +9094,4 @@ A periodic maintenance sweep folds fragments back into this list.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
+

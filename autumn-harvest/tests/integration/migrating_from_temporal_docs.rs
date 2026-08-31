@@ -8,8 +8,7 @@
 //!    required ground — every required section, and at least 25
 //!    concept-mapping table rows (issue #947 AC1's literal minimum);
 //! 2. every `#NNN` issue citation inside the guide actually appears in
-//!    `docs/shipped-work.md` — the repository's own record of what has
-//!    shipped — so a
+//!    `docs/shipped-work.md` — the repository's own record of what has shipped — so a
 //!    claim can never cite a number nobody can verify (issue #947 AC1's
 //!    "verifiable in under a minute" bar, and the "no unshipped capability
 //!    presented as shipped" bar);
@@ -23,7 +22,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const GUIDE_PATH: &str = "docs/migrating-from-temporal.md";
-const SHIPPED_WORK_PATH: &str = "docs/shipped-work.md";
 const EXAMPLE_NAME: &str = "temporal_port_subscription_renewal";
 
 const REQUIRED_SECTIONS: &[&str] = &[
@@ -189,7 +187,7 @@ fn concept_mapping_table_has_at_least_25_rows() {
 #[test]
 fn every_cited_issue_number_appears_in_the_shipped_work_record() {
     let guide = read_doc(GUIDE_PATH);
-    let shipped_work = read_doc(SHIPPED_WORK_PATH);
+    let shipped_work = read_doc("docs/shipped-work.md");
 
     let cited = issue_refs(&guide);
     let known = issue_refs(&shipped_work);
@@ -198,8 +196,8 @@ fn every_cited_issue_number_appears_in_the_shipped_work_record() {
     assert!(
         unverifiable.is_empty(),
         "migration guide cites issue number(s) not found anywhere in \
-         docs/shipped-work.md, so they \
-         cannot be verified against the repository's own shipped-work record: {unverifiable:?}"
+         docs/shipped-work.md, so they cannot be verified against the \
+         repository's own shipped-work record: {unverifiable:?}"
     );
     assert!(
         !cited.is_empty(),

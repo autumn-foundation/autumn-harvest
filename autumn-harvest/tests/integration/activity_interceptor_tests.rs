@@ -482,6 +482,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec![queue.to_string()],
                 notification_database_url: None,
