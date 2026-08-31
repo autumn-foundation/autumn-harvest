@@ -136,6 +136,18 @@ workflow spawning a placed child. Writability is now enforced by
 retryable; the resolver still never swaps the requested shard for another, and
 static misconfiguration still fails terminally as it should.
 
+**Codex round 2 (one P1, the sharpest yet).** The child's own terminal
+transaction rolled back. `wake_parent_for_child_completion`/`_failure` append to
+the parent's history on the **child's** connection — correct while the two are
+co-located, fatal once they are not: on the target shard the parent row does not
+exist, `store::append_single_event` requires it, and the resulting `NotFound`
+rolled back the whole child terminal. The child never settled, so the relay never
+had a terminal to deliver and the parent parked forever — a silent, total failure
+of the feature that only a live two-database run would surface. Those two
+functions and `timeout::wake_parent_for_child_timeout` now skip the inline wake
+when the parent is on another shard and leave it to the relay, which is where it
+belonged all along.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive

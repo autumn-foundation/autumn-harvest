@@ -877,6 +877,19 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // Issue #956: a cross-shard parent is not on this connection, and appending
+    // to it here would `NotFound` and roll back the child's own timeout
+    // transaction — leaving the child non-terminal forever. The cross-shard
+    // relay delivers this wake instead, from the parent's own shard. Mirrors the
+    // identical guard in `worker::wake_parent_for_child_completion`/`_failure`.
+    if crate::worker::parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+        tracing::debug!(
+            parent_execution_id = %parent_exec_id,
+            child_execution_id = %child_exec_id,
+            "cross-shard child timed out; the parent wake is the relay's to deliver"
+        );
+        return Ok(());
+    }
     // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the child
     // terminal (mirrors worker::wake_parent_for_child_completion/_failure) so an
     // over-deadline child that hits its OWN execution timeout resolves the

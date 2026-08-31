@@ -11384,12 +11384,45 @@ pub async fn materialize_due_child_timeout_deadlines(
 }
 
 #[doc(hidden)] // exposed for the #779 integration tests; not a stable API
+/// Does `parent` live on a different shard than `child` (issue #956)?
+///
+/// The child-terminal wake path appends to the parent's history **on the
+/// child's own connection**, which is correct only while the two are
+/// co-located. For a cross-shard child that connection is the target shard's
+/// database, where the parent row does not exist — and
+/// `store::append_single_event` requires it (`.for_update().first().optional()
+/// .ok_or(NotFound)`), so the append would fail and roll back *the child's
+/// entire terminal transaction*. The child would never reach a terminal state
+/// at all, so the relay would never have a terminal to deliver and the parent
+/// would park forever: a silent, total failure of the feature.
+///
+/// An unencoded id on either side means "the parent's shard" by construction
+/// (see [`child_target_shard`]), so it is never cross-shard.
+#[must_use]
+pub fn parent_is_on_another_shard(parent: ExecutionId, child: ExecutionId) -> bool {
+    let (p, c) = (parent.shard(), child.shard());
+    !p.is_unencoded() && !c.is_unencoded() && p != c
+}
+
 pub async fn wake_parent_for_child_completion(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    // Issue #956: a cross-shard parent is not on this connection. Appending to it
+    // here would return `NotFound` and roll back the CHILD's terminal
+    // transaction, so the child would never settle and the relay would never
+    // have a terminal to deliver. The relay owns this wake instead: it pulls the
+    // child's terminal state from here and appends on the parent's own shard.
+    if parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+        tracing::debug!(
+            parent_execution_id = %parent_exec_id,
+            child_execution_id = %child_exec_id,
+            "cross-shard child terminal; the parent wake is the relay's to deliver"
+        );
+        return Ok(());
+    }
     // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
     // terminal so the pure recorded-order `match_child_or_timer` sees the
     // `TimerFired` first and resolves to the timeout branch (None) even when the
@@ -11413,6 +11446,17 @@ pub async fn wake_parent_for_child_failure(
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // Issue #956: same cross-shard guard as `wake_parent_for_child_completion` —
+    // the parent is not on this connection, and appending here would roll back
+    // the child's own terminal transaction. The relay delivers this wake.
+    if parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+        tracing::debug!(
+            parent_execution_id = %parent_exec_id,
+            child_execution_id = %child_exec_id,
+            "cross-shard child terminal; the parent wake is the relay's to deliver"
+        );
+        return Ok(());
+    }
     // #779 (Codex P1): order any DUE child-timeout deadline BEFORE the child
     // terminal (mirrors wake_parent_for_child_completion) so an over-deadline
     // child FAILURE resolves to None, not Err.

@@ -651,6 +651,42 @@ fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
     );
 }
 
+/// **Regression (Codex round 2, P1).** The child-terminal wake must be skipped
+/// when the parent lives on another shard.
+///
+/// `wake_parent_for_child_*` appends to the parent's history on the *child's*
+/// own connection. For a cross-shard child that connection is the target
+/// shard's database, where the parent row does not exist — and
+/// `store::append_single_event` requires it — so the append would `NotFound` and
+/// roll back the **child's entire terminal transaction**. The child would never
+/// settle, the relay would never have a terminal to deliver, and the parent
+/// would park forever: a silent, total failure of the feature.
+#[cfg(feature = "db")]
+#[test]
+fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
+    use autumn_harvest::worker::parent_is_on_another_shard;
+
+    let on_0 = ExecutionId::new_for_shard(ShardId::new(0));
+    let on_2 = ExecutionId::new_for_shard(ShardId::new(2));
+    assert!(
+        parent_is_on_another_shard(on_0, on_2),
+        "a parent on shard 0 and a child on shard 2 must be recognised as split"
+    );
+
+    // Same shard: the inline wake is correct and must NOT be skipped.
+    let also_0 = ExecutionId::new_for_shard(ShardId::new(0));
+    assert!(!parent_is_on_another_shard(on_0, also_0));
+
+    // The unencoded sentinel means "the parent's shard" by construction, on
+    // either side, so it is never cross-shard — the same normalisation the
+    // spawn path applies. Getting this wrong would divert an ordinary
+    // single-shard child's wake into a relay that will never run for it.
+    let unencoded = ExecutionId::new();
+    assert!(!parent_is_on_another_shard(unencoded, on_0));
+    assert!(!parent_is_on_another_shard(on_0, unencoded));
+    assert!(!parent_is_on_another_shard(unencoded, unencoded));
+}
+
 #[test]
 fn status_round_trips_through_its_database_representation() {
     for status in [
