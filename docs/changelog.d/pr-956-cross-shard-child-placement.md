@@ -209,3 +209,13 @@ close cascade crossing the boundary, and an unreachable target shard never falli
 back to the parent's shard. `fanout_degradation_integration.rs` covers the
 `/children` read path degrading to `200 partial` — flat and depth traversal — and
 staying `complete` on the happy path.
+
+**Deferred, with reasoning, to issue #1263.** The payload *offloader* is not
+applied to the relayed child's start event (the codec is — that is the
+confidentiality half; the offloader lives on a registry a scanner does not hold,
+and the child-input cap already stops an over-cap payload becoming a cross-shard
+child). There is no `harvest.cross_shard_child.*` metric family for the relay
+itself, though per-execution terminal metrics no longer depend on placement. And
+a terminal child's *result* is not preserved beyond the target shard's retention
+window — the parent always gets an outcome, but the output is lost in that
+window rather than duplicated across shards for every in-flight child.

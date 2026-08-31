@@ -345,7 +345,7 @@ ORDER BY 2;
 
 Every settled child deletes its row, so a steadily growing count means the relay is not draining — check `last_error` for an unreachable target shard first. `attempts` is written on **every** non-progress path (a failed step, an unreadable target shard, an unrecognised stored value), and it also drives the retry backoff: a row is re-tried after `min(attempts, 6) x 5s`, so one permanently-broken row backs off instead of consuming a slot in every sweep.
 
-There is **no dedicated metric** for the relay yet; the queries above and the `Timeout` scanner's existing `harvest.scanner.tick` liveness are the current signals. A `harvest.cross_shard_child.*` counter family is tracked as a follow-up.
+There is **no dedicated metric** for the relay yet; the queries above and the `Timeout` scanner's existing `harvest.scanner.tick` liveness are the current signals. A `harvest.cross_shard_child.*` counter family is tracked in issue #1263, along with the payload-offloader gap on the relayed child's start event and the retention-window question for undelivered terminals. Per-execution metrics are unaffected: the relay threads the scanner's real recorder into its cancel, terminate and quota-admission calls, so `harvest.workflow.terminal` counts do not depend on where a child was placed.
 
 ### Reading a cross-shard tree
 
