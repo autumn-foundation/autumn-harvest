@@ -121,6 +121,22 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
 /// codec's own message. The sweep runs over the same rows with the same codecs
 /// and has no reason to be laxer. What makes the line actionable is the row id
 /// and the key ids, both of which are bounded and stay.
+/// How often a shard whose pass is already complete re-confirms that against the
+/// census.
+///
+/// The census is a full scan, and a converged shard reaches the end of its scan
+/// on every scanner tick, so confirming completion per tick would
+/// sequential-scan `harvest_events` several times a second per shard. But it
+/// cannot be dropped entirely: a row that commits below the cursor (its
+/// `BIGSERIAL` id allocated before the scan passed it, its transaction
+/// committing after) is found no other way, and leaving it stranded deadlocks
+/// retirement.
+///
+/// Five minutes bounds the scan load to something negligible while keeping the
+/// recovery window far shorter than any rotation an operator is watching.
+#[cfg(feature = "db")]
+const COMPLETED_CURSOR_REVALIDATION: chrono::Duration = chrono::Duration::minutes(5);
+
 #[cfg(feature = "db")]
 const fn sweep_error_kind(error: &HarvestError) -> &'static str {
     match error {
@@ -805,7 +821,29 @@ mod db {
         // thing the runbook tells an operator it means. It costs one aggregate
         // per *completing* pass, not per batch, and only on a shard that would
         // otherwise have declared itself done.
-        let census_clean = if reached_end && unresolved_total == 0 {
+        // On a shard that has already converged, EVERY tick reaches the end
+        // with nothing unresolved -- the batch is empty because there is
+        // nothing past the cursor. Censusing on that condition alone would run
+        // a full scan of `harvest_events` per shard per tick, forever, at the
+        // scanner's interval (500 ms by default). So an already-complete cursor
+        // re-confirms itself on a slow clock instead, using its own
+        // `updated_at` as the timer.
+        //
+        // The clock has to be the stored one, not an in-process one: several
+        // workers sweep the same shard, and a DB-side timestamp makes the
+        // revalidation fleet-wide rather than once per worker.
+        let already_complete = resumed.is_some_and(|cursor| cursor.completed_at.is_some());
+        let revalidation_due = resumed.is_none_or(|cursor| {
+            Utc::now().signed_duration_since(cursor.updated_at)
+                >= super::COMPLETED_CURSOR_REVALIDATION
+        });
+        // Census when a pass is newly completing, when it actually moved, or
+        // when a converged shard's slow clock comes round. Skipping it in the
+        // steady state is the whole point; skipping it forever is not, because
+        // a row that commits below the cursor is only ever found this way.
+        let census_needed =
+            reached_end && unresolved_total == 0 && (!already_complete || revalidation_due);
+        let census_clean = if census_needed {
             let by_key = count_rows_by_key_id(conn).await?;
             by_key
                 .iter()
@@ -815,23 +853,33 @@ mod db {
             false
         };
 
-        let (next_last_event_id, next_unresolved, next_completed_at) = if reached_end {
-            if unresolved_total > 0 || !census_clean {
-                // Either this pass failed rows outright, or something the scan
-                // could not see is still on an outgoing key. Both want the same
-                // remedy: start over rather than declare victory.
-                (0, 0, None)
-            } else {
-                (
-                    highest_id,
-                    0,
-                    resumed
-                        .and_then(|cursor| cursor.completed_at)
-                        .or_else(|| Some(Utc::now())),
-                )
-            }
-        } else {
+        let (next_last_event_id, next_unresolved, next_completed_at) = if !reached_end {
             (highest_id, unresolved_total, None)
+        } else if unresolved_total > 0 {
+            // This pass failed rows outright. Start over rather than declare
+            // victory over rows it could not convert.
+            (0, 0, None)
+        } else if !census_needed {
+            // Converged, and the revalidation clock has not come round. Carry
+            // the cursor forward exactly as it stands -- this branch must not
+            // be mistaken for "the census said no", which would reset a
+            // perfectly good completion on every tick.
+            (
+                resumed.map_or(highest_id, |cursor| cursor.last_event_id),
+                0,
+                resumed.and_then(|cursor| cursor.completed_at),
+            )
+        } else if census_clean {
+            (
+                highest_id,
+                0,
+                resumed
+                    .and_then(|cursor| cursor.completed_at)
+                    .or_else(|| Some(Utc::now())),
+            )
+        } else {
+            // Something the scan could not see is still on an outgoing key.
+            (0, 0, None)
         };
 
         // Steady state on a converted shard: the pass is already complete and
@@ -841,7 +889,15 @@ mod db {
         // codec configured -- and making the cursor read as freshly active
         // while doing no work, which is exactly backwards for an operator
         // watching it.
+        //
+        // A revalidation tick is the exception: it must write even though
+        // nothing changed, because `updated_at` IS the revalidation clock and a
+        // suppressed write would leave it permanently due, censusing every tick
+        // again. One write per shard per interval is the price of bounding the
+        // scan, and it is orders of magnitude below the per-tick churn this
+        // guard exists to prevent.
         let cursor_unchanged = batch_len == 0
+            && !census_needed
             && resumed.is_some_and(|cursor| {
                 cursor.completed_at.is_some()
                     && cursor.last_event_id == next_last_event_id

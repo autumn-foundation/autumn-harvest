@@ -1885,12 +1885,40 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
     let late = encode_under(&codecs, "k1", &json!({"late": true}));
     insert_event_at_id(&mut conn, exec_id, 5_000, 1, &late).await;
 
-    // One tick to notice the shard is not converted and re-open the pass,
-    // another to walk it.
+    // A converged shard must NOT re-census on every tick -- that is a full scan
+    // of `harvest_events` at the scanner's interval, forever. So immediately
+    // after completion the late row is expected to still be there: the
+    // revalidation clock has not come round.
     for _ in 0..3 {
         sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
             .await
-            .expect("subsequent pass");
+            .expect("tick inside the revalidation window");
+    }
+    let throttled = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .rows_remaining();
+    assert_eq!(
+        throttled, 1,
+        "inside the revalidation window the sweep must not re-census; if this \
+         is 0 the throttle is gone and every tick is scanning the table"
+    );
+
+    // Wind the cursor's clock back past the revalidation interval. That is the
+    // only thing standing between the stranded row and recovery.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET updated_at = now() - interval '10 minutes' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the cursor");
+
+    // One tick to revalidate and re-open the pass, another to walk it.
+    for _ in 0..3 {
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("tick after the revalidation window");
     }
 
     let remaining = load_shard_rotation_progress(&mut conn, 0, &codecs)
@@ -1899,8 +1927,9 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
         .rows_remaining();
     assert_eq!(
         remaining, 0,
-        "a row that committed below the cursor must still be swept; leaving it \
-         there deadlocks retirement forever"
+        "once the revalidation clock comes round, a row that committed below \
+         the cursor must still be swept; leaving it there deadlocks retirement \
+         forever"
     );
 }
 
