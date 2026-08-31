@@ -138,7 +138,7 @@ byte-identical.
 
 ### 4.3 The cross-shard child outbox
 
-Migration `20260727000000_harvest_cross_shard_children` adds one table on every
+Migration `20260728000000_harvest_cross_shard_children` adds one table on every
 shard:
 
 | column | meaning |
@@ -149,7 +149,7 @@ shard:
 | `status` | `PENDING_START` → `STARTED` |
 | `cancel_requested` | set by the parent's cancel paths |
 | `workflow_name`, `input`, `queue_name`, `parent_close_policy`, `assigned_build_id`, `context_headers`, `priority` | what the relay needs to create the child |
-| `attempts`, `last_error`, `created_at` | operability |
+| `attempts`, `last_error`, `last_attempt_at`, `created_at` | operability, and the retry backoff / rotation ordering |
 
 ### 4.4 The scanner
 
