@@ -813,9 +813,15 @@ async fn a_stale_read_can_never_overwrite_a_committed_erasure() {
         .expect("erasure commits");
 
     // 3. The sweep's write must lose.
-    let swapped = compare_and_swap_event(&mut conn, row_id, &stale, &candidate)
-        .await
-        .expect("cas");
+    let swapped = compare_and_swap_event(
+        &mut conn,
+        autumn_harvest::types::ShardId::new(0),
+        row_id,
+        &stale,
+        &candidate,
+    )
+    .await
+    .expect("cas");
 
     assert!(!swapped, "a stale compare-and-swap must not take effect");
     let after = raw_event_data(&mut conn, exec_id).await;

@@ -718,7 +718,15 @@ mod db {
             let mut candidate = original.clone();
             match reencrypt_event_payload_fields_under(codecs, &active_key_id, &mut candidate) {
                 Ok(outcome) if outcome.changed() => {
-                    if compare_and_swap_event(conn, row.id, &original, &candidate).await? {
+                    if compare_and_swap_event(
+                        conn,
+                        crate::types::ShardId::new(shard_id),
+                        row.id,
+                        &original,
+                        &candidate,
+                    )
+                    .await?
+                    {
                         rewritten += 1;
                     } else {
                         // The row changed under us — a PII erasure, or another
@@ -831,6 +839,21 @@ mod db {
     /// is the only safe direction, and the caller counts the loss so the pass
     /// re-runs rather than reporting itself complete over that row.
     ///
+    /// It is also fenced against the shard generation (#954). This is the only
+    /// path that UPDATEs `harvest_events` in place, so `store.rs`'s fence on
+    /// every INSERT does not cover it, and the failure an unfenced sweep allows
+    /// is the worst one this feature has: a worker still pinned to the old
+    /// generation, reconnected to the promoted primary, would have its appends
+    /// refused but its **re-encryption accepted** — rewriting rows the new
+    /// region owns under an active key that region may already have retired.
+    /// Silent, permanent, and destroys payloads rather than merely forking
+    /// history. The assertion and the swap share one transaction so the
+    /// assertion's `FOR SHARE` stays a commit-order barrier against a
+    /// concurrent promotion.
+    ///
+    /// The wrapper is skipped entirely when fencing is off, so the pre-#954
+    /// path is unchanged: no fence read, no savepoint, one UPDATE.
+    ///
     /// `#[doc(hidden)] pub` purely so that race semantics can be exercised
     /// directly by an integration test (a stale `original` must not win), which
     /// is not reachable through the batch-oriented public sweep entry point.
@@ -838,9 +861,33 @@ mod db {
     ///
     /// # Errors
     ///
-    /// Propagates database failures.
+    /// Propagates database failures, and
+    /// [`crate::error::HarvestError::ShardFenced`] when this process is pinned
+    /// to a superseded generation.
     #[doc(hidden)]
     pub async fn compare_and_swap_event(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        event_row_id: i64,
+        original: &Value,
+        candidate: &Value,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        if crate::replication::FenceRegistry::is_enabled() {
+            let candidate = candidate.clone();
+            let original = original.clone();
+            return Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+                crate::replication::assert_fence(conn, shard).await?;
+                let updated = swap_statement(conn, event_row_id, &original, &candidate).await?;
+                Ok(updated)
+            }))
+            .await;
+        }
+        swap_statement(conn, event_row_id, original, candidate).await
+    }
+
+    async fn swap_statement(
         conn: &mut AsyncPgConnection,
         event_row_id: i64,
         original: &Value,
