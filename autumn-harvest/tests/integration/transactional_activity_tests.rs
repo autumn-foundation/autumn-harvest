@@ -123,6 +123,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: uuid::Uuid::new_v4().to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,

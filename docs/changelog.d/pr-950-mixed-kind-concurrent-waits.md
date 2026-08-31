@@ -193,34 +193,28 @@ by design — the dispatch arm already refuses to claim a batch containing one
 generic path; the rustdoc now says so, since its absence otherwise reads as the
 same kind of omission this round fixed.
 
-**CI: no test reads `CLAUDE.md` any more.** Two guard suites had been rooted in
-`CLAUDE.md`, which made a CI gate depend on an agent-guidance document nothing
-warns you against editing. `562c781` ("fix: claude.md") trimmed that file from
-10 629 lines to 19 and both began failing — on `trunk-dev` itself and on every
-branch based on it. Because `Lint` fails, the whole `Test` job is skipped, so no
-DB-backed suite in this repository ran in CI at all. Fixed here rather than
-deferred, because it blocks this PR and is not this PR's to wait on:
+**CI: the `CLAUDE.md` guard breakage, and how it was actually resolved.**
+Two guard suites had been rooted in `CLAUDE.md`. `562c781` ("fix: claude.md")
+trimmed that file from 10 629 lines to 19 and both began failing — on
+`trunk-dev` itself and on every branch based on it. Because `Lint` fails, the
+whole `Test` job is skipped, so no DB-backed suite in this repository ran in CI
+at all, including this PR's.
 
-- `performance_docs` (6 failing guards) cross-checks `docs/performance.md`
-  against the verbatim claim-benchmark narrative. That prose lived in
-  `docs/changelog.d/pr-786-claim-throughput-benchmark.md` until the 0.6.0
-  collation sweep folded it into `CLAUDE.md`'s phase list and deleted the
-  fragment. It now lives in `docs/performance-claim-benchmark.md`, a file the
-  guards own — byte-for-byte as collated, so every assertion sees exactly what it
-  saw before. The condensed `CHANGELOG.md` bullet is deliberately not the source:
-  it drops the per-gate figures the guards compare.
-- `migrating_from_temporal_docs::every_cited_issue_number_appears_in_claude_md`
-  checked the guide's `#NNN` citations against `CLAUDE.md` as "the repository's
-  own record of what has shipped". It now scans the engine source, `docs/`, and
-  `CHANGELOG.md`, and is renamed `..._appears_in_the_repository`. That is the
-  stronger record as well as the stabler one: it cannot be trimmed without
-  deleting the code the citation describes. The citations were never wrong —
-  all 45 resolve, and each of the ten that `CHANGELOG.md` alone misses is
-  referenced across one to twenty source files.
+This branch carried an interim fix (`821e1da`) that moved the claim-benchmark
+narrative into `docs/performance-claim-benchmark.md` and repointed the citation
+guard at the engine source, `docs/` and `CHANGELOG.md`. **That fix is gone.**
+`trunk-dev` since landed the same repair, better: #1246 restored the full phase
+list as `docs/shipped-work.md`, whose header states it is guard-referenced and
+must not be collated or condensed, and repointed both guards there. One
+canonical shipped-work record beats two partial ones, and a second verbatim copy
+of the same narrative would only invite drift, so merging `trunk-dev` here takes
+its version of both guard files and deletes
+`docs/performance-claim-benchmark.md`. Nothing of this PR's own work depended on
+the interim shape.
 
-Both remain load-bearing rather than merely green: the performance guards still
-panic if the marker goes missing, and appending a fabricated `#987654` to the
-migration guide still fails the citation guard by name.
+The durable point stands and is now enforced upstream rather than here: a CI
+gate should not read an agent-guidance document that nothing warns you against
+editing.
 
 **A push handler could still steal a race's signal (Codex round 7, P1;
 issue #1252).** The mitigation above shipped as *evaluation ordering* — check
