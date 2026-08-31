@@ -13249,6 +13249,18 @@ pub struct ActivityContext {
     /// was not constructed by the worker's regular activity dispatch path.
     #[cfg(feature = "db")]
     transactional_state: Option<TransactionalState>,
+    /// Payload-codec registry for writes this context issues (issue #1243).
+    ///
+    /// `ActivityCompleted.output` is payload-bearing, so the inline commit in
+    /// `run_transactional` must encode through the same registry the worker
+    /// writes and replays with. Defaults to identity, so a context built
+    /// without one behaves exactly as before.
+    ///
+    /// `db`-gated because its only reader is that commit, which is itself
+    /// `db`-gated: without the feature there is no transactional write path and
+    /// the field would be dead.
+    #[cfg(feature = "db")]
+    payload_codecs: crate::payload_codec::PayloadCodecs,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     /// Read via `header()` / `headers()`. Empty for activities dispatched before
     /// this feature was deployed.
@@ -13402,6 +13414,8 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            #[cfg(feature = "db")]
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
@@ -13454,6 +13468,8 @@ impl ActivityContext {
             previous_failure: None,
             max_attempts: None,
             transactional_state: None,
+            #[cfg(feature = "db")]
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
@@ -13490,6 +13506,8 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            #[cfg(feature = "db")]
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
@@ -13771,6 +13789,23 @@ impl ActivityContext {
     #[must_use]
     pub const fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// Install the payload-codec registry this context's writes encode through
+    /// (issue #1243).
+    ///
+    /// `ActivityCompleted.output` is payload-bearing, so the inline commit in
+    /// [`Self::run_transactional`] has to encode through the same registry the
+    /// worker writes and replays with. `db`-gated alongside that commit and the
+    /// field it sets.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub(crate) fn with_payload_codecs(
+        mut self,
+        codecs: crate::payload_codec::PayloadCodecs,
+    ) -> Self {
+        self.payload_codecs = codecs;
         self
     }
 
@@ -14655,6 +14690,10 @@ impl ActivityContext {
         let exec_id = txn.exec_id;
         let activity_id = txn.activity_id;
         let task_id = txn.task_id;
+        // Issue #1243: bound out here so the transaction closure owns a clone.
+        // The registry's rotation state is shared across clones, so this still
+        // observes a `set_active_key` that lands mid-activity.
+        let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
 
         let mut conn =
@@ -14694,7 +14733,8 @@ impl ActivityContext {
             // codebase: harvest_workflow_executions → harvest_task_queue)
             // and load history so we can compute the next sequential
             // event_id before appending.
-            let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the helper's docs).
+            let history = crate::store::lock_and_load_history_undecoded(conn, exec_id).await?;
 
             // Idempotency guard: verify the task is still RUNNING before
             // we commit.  If it's already COMPLETED (e.g. this is a
@@ -14723,8 +14763,14 @@ impl ActivityContext {
                 activity_id,
                 output: output.clone(),
             };
-            crate::store::append_events(conn, exec_id, &[completion_event], history.next_event_id)
-                .await?;
+            crate::store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[completion_event],
+                history.next_event_id,
+                &codecs,
+            )
+            .await?;
 
             // Mark the task COMPLETED.
             crate::queue::complete_task(conn, task_id, output).await?;
