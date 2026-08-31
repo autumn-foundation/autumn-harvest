@@ -395,6 +395,64 @@ async fn a_migration_body_does_not_see_its_own_version_in_the_ledger() {
     );
 }
 
+#[tokio::test]
+async fn the_ledger_lock_does_not_block_another_migrators_ledger_insert() {
+    // The lock this takes while running a body must not conflict with the
+    // `ROW EXCLUSIVE` an INSERT takes. Diesel's order is body-then-insert with
+    // no ledger lock, so a `diesel migration run` racing us takes the schema
+    // object first and the ledger second — the opposite order to ours. A mode
+    // that blocked its insert (`SHARE ROW EXCLUSIVE`, the obvious first choice)
+    // would close that cycle: we would hold the ledger waiting on its table,
+    // it would wait on the ledger to record the body it just finished, and
+    // Postgres would abort one — reporting a failed migration while the other
+    // migrator applied it correctly.
+    //
+    // Asserted against a real server's conflict table, not against the mode
+    // string, so it stays true if the mode changes.
+    let (_container, url) = empty_postgres().await;
+    migrate::apply(&url, &[]).await.expect("ledger created");
+
+    let mut holder = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    diesel::sql_query(format!(
+        "LOCK TABLE __diesel_schema_migrations IN {} MODE",
+        migrate::LEDGER_LOCK_MODE
+    ))
+    .execute(&mut holder)
+    .await
+    .expect("the migrator's ledger lock");
+
+    // A second session playing Diesel's part: record a completed body. With a
+    // conflicting mode this blocks until `holder` commits, and the timeout
+    // fires instead.
+    let mut other = connect(&url).await;
+    diesel::sql_query("SET statement_timeout = '5s'")
+        .execute(&mut other)
+        .await
+        .expect("timeout");
+    diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ('29990103000000')")
+        .execute(&mut other)
+        .await
+        .expect(
+            "another migrator's ledger insert must not block on our lock: a mode \
+         that conflicts with ROW EXCLUSIVE deadlocks against Diesel's own \
+         body-then-insert lock order",
+        );
+
+    // The other non-conflict the mode is chosen for: `status` reads while a
+    // migration is mid-flight.
+    let versions: Vec<String> = ledger_versions(&url).await;
+    assert!(versions.contains(&"29990103000000".to_string()));
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("rollback");
+}
+
 /// The single count the ledger-visibility migration recorded.
 async fn seen_count(url: &str) -> i64 {
     #[derive(diesel::QueryableByName)]

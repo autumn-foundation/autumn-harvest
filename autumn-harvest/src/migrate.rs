@@ -72,6 +72,14 @@ include!(concat!(env!("OUT_DIR"), "/migration_scripts.rs"));
 /// `diesel_migrations` is greppable.
 const MIGRATION_LEDGER: &str = "__diesel_schema_migrations";
 
+/// The lock mode each migration's transaction takes on `MIGRATION_LEDGER`.
+///
+/// Public so a test can pin the two non-conflicts this mode is chosen for
+/// against a real server rather than against this string. See
+/// `apply_in_transaction` for why a mode that blocked `ROW EXCLUSIVE` would
+/// deadlock against Diesel's own body-then-insert lock order.
+pub const LEDGER_LOCK_MODE: &str = "SHARE UPDATE EXCLUSIVE";
+
 /// `CREATE TABLE IF NOT EXISTS` for the ledger, byte-compatible with the table
 /// `diesel_migrations` creates on a fresh database.
 const CREATE_LEDGER_SQL: &str = "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (\
@@ -544,21 +552,23 @@ pub async fn apply(
 ///
 /// # Concurrency
 ///
-/// Each migration's transaction takes a `SHARE ROW EXCLUSIVE` lock on the
+/// Each migration's transaction takes a `SHARE UPDATE EXCLUSIVE` lock on the
 /// ledger table before running anything. A second migrator racing on the same
 /// database therefore blocks there rather than half-way through the schema
 /// change, and on acquiring the lock re-reads the ledger: finding the version
 /// already committed, it skips the migration as already applied
 /// ([`MigrationReport::applied_concurrently`]) instead of replaying DDL that
 /// has already happened. The lock does not conflict with plain readers, so
-/// `status` is unaffected.
+/// `status` is unaffected, nor with `ROW EXCLUSIVE`, so it never blocks another
+/// migrator's own ledger insert — see `apply_in_transaction` for why that
+/// second property is what keeps this deadlock-free.
 ///
 /// The ledger row itself is **not** the contention point, because it is written
 /// after the body — Diesel's order, which a body that consults the ledger can
-/// depend on. See [`apply_in_transaction`].
+/// depend on. See `apply_in_transaction`.
 ///
 /// A `run_in_transaction = false` migration has no transaction to contend on,
-/// so that protection does not apply to it: see [`apply_without_transaction`]
+/// so that protection does not apply to it: see `apply_without_transaction`
 /// for what a race costs there.
 ///
 /// # Errors
@@ -740,13 +750,38 @@ async fn apply_without_transaction(
 /// from a file `diesel migration run` would have applied correctly. Whatever
 /// serializes concurrent migrators must therefore not be the ledger row itself.
 ///
-/// A `SHARE ROW EXCLUSIVE` lock on the ledger table does the serializing
+/// A `SHARE UPDATE EXCLUSIVE` lock on the ledger table does the serializing
 /// instead. It conflicts with itself, so a second migrator waits here — before
-/// any DDL — rather than half-way through the schema change; it does not
-/// conflict with `ACCESS SHARE`, so `status` and any other plain reader is
-/// unaffected. It is held to the end of the transaction and needs no advisory
-/// key, keeping this path out of the keyspace shared with the claim path,
-/// `mutex`, `admission_gate` and the scheduler.
+/// any DDL — rather than half-way through the schema change. It is held to the
+/// end of the transaction and needs no advisory key, keeping this path out of
+/// the keyspace shared with the claim path, `mutex`, `admission_gate` and the
+/// scheduler.
+///
+/// The mode is chosen for what it does *not* conflict with. `ACCESS SHARE`
+/// means `status` and any other plain reader is unaffected. `ROW EXCLUSIVE` —
+/// what an `INSERT` takes — means this lock never blocks a *different*
+/// migrator's ledger insert, and that is what keeps the arrangement
+/// deadlock-free rather than merely convenient.
+///
+/// Diesel's own order is body-then-insert with no ledger lock, so a
+/// `diesel migration run` (or Autumn's startup path) racing here takes its
+/// locks in the opposite order to this function: the schema object first, the
+/// ledger second. A self-conflicting mode that also blocked `ROW EXCLUSIVE` —
+/// `SHARE ROW EXCLUSIVE`, the obvious first choice — would close that cycle.
+/// This transaction would hold the ledger while waiting on a table the other
+/// migrator has locked for DDL, and that migrator would then wait on the ledger
+/// to record the body it just finished. Postgres would break the deadlock by
+/// aborting one of them, and this command could report a migration as failed
+/// while the competing migrator was in the middle of applying it correctly.
+/// `SHARE UPDATE EXCLUSIVE` lets that insert through, so the other migrator
+/// always finishes and releases its DDL lock, and this transaction proceeds.
+///
+/// What that costs is honest: a migrator that does not take this lock is not
+/// serialized by it, so racing a Diesel migrator can still mean both run the
+/// same body and one fails on its own DDL. Diesel offers no protection against
+/// that either — the guarantee here is over concurrent `harvest migrate` runs,
+/// and it is not worth turning a survivable race against a foreign migrator
+/// into a deadlock to widen it.
 ///
 /// Holding the lock, the ledger is re-checked before the body runs: the
 /// migrator that waited must not replay DDL the winner already committed. That
@@ -762,7 +797,7 @@ async fn apply_in_transaction(
 
     let result: Result<(), ApplyError> = Box::pin(conn.transaction(async |tx| {
         diesel::sql_query(format!(
-            "LOCK TABLE {MIGRATION_LEDGER} IN SHARE ROW EXCLUSIVE MODE"
+            "LOCK TABLE {MIGRATION_LEDGER} IN {LEDGER_LOCK_MODE} MODE"
         ))
         .execute(tx)
         .await?;

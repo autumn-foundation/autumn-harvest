@@ -55,16 +55,29 @@ Two details worth naming:
   transaction's own writes, skips the DDL, and still commits the version —
   an incomplete schema permanently marked applied, from a file
   `diesel migration run` applies correctly. So the ledger row is *not* what
-  serializes concurrent migrators. A `SHARE ROW EXCLUSIVE` lock on the ledger
+  serializes concurrent migrators. A `SHARE UPDATE EXCLUSIVE` lock on the ledger
   table is: it conflicts with itself, so the second migrator waits before any
-  DDL rather than part-way through the schema change, and does not conflict
-  with plain readers, so `status` is unaffected. Holding it, the ledger is
+  DDL rather than part-way through the schema change. Holding it, the ledger is
   re-checked before the body runs, and a version already there is reported as
   `applied_concurrently` instead of replaying DDL. That check is a `SELECT`, so
   "already applied" is decided outright rather than inferred from a unique
   violation the body's own SQL could equally have raised. Still no advisory
   lock, so no new key in a keyspace shared with the claim path, `mutex`,
   `admission_gate` and the scheduler.
+
+  The mode is picked for what it does *not* block. Plain readers, so `status` is
+  unaffected — and `ROW EXCLUSIVE`, so it never blocks another migrator's ledger
+  insert. That second one is the load-bearing part: Diesel takes no ledger lock
+  and inserts *after* the body, so it locks the schema object first and the
+  ledger second — the opposite order to this. `SHARE ROW EXCLUSIVE`, the obvious
+  first choice, blocks `ROW EXCLUSIVE` and would close that cycle, letting
+  Postgres abort one side and report a failed migration while the competing
+  migrator was applying it correctly. What that choice gives up is real but
+  smaller: a migrator that does not take this lock is not serialized by it, so
+  racing Diesel can still mean both run a body and one fails on its own DDL —
+  which is what Diesel-versus-Diesel already does. The guarantee is over
+  concurrent `harvest migrate` runs, and it is not worth turning a survivable
+  race into a deadlock to widen it.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
   ledger. It probes with `to_regclass` and reports a ledger-less database as
   "never migrated", so the gate is safe to point at a database you are only
