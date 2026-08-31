@@ -99,6 +99,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "erase-worker".to_string(),
                 queues: vec!["default".to_string()],

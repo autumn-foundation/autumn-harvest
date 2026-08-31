@@ -317,6 +317,17 @@ required-features = ["db"]
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `dlq::merge_dlq_aggregates` -- the cross-shard merge stage behind
+# `GET /admin/dead-letters/aggregate` (issue #385/#613), distinct from
+# `dlq_aggregate_profile`'s per-shard `group_dead_letter_rows` target above.
+# Same `db` requirement, same reason (dlq.rs uses diesel_async
+# unconditionally). See `benches/dlq_merge_profile.rs`.
+[[bench]]
+name = "dlq_merge_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `stall_diagnosis::classify_execution` -- the pure root-cause classifier
 # behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809). No feature
 # requirement: `stall_diagnosis` is pure and unconditional (no DB access). See

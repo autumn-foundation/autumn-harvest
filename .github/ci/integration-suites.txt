@@ -102,6 +102,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_tests
+linux        autumn-harvest         integration                      testing                    codec_rotation_db_tests
 linux        autumn-harvest         integration                      testing                    cross_region_dr_tests
 linux        autumn-harvest         integration                      testing                    dag_compensation
 linux        autumn-harvest         integration                      testing                    nd_block
@@ -115,6 +116,7 @@ linux        autumn-harvest-plugin  batch_operations_integration     -          
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  canary_integration               -                          -
+linux        autumn-harvest-plugin  codec_rotation_admin_integration  -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  concurrency_admin_integration    -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -

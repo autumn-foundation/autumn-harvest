@@ -47,5 +47,5 @@ Harvest now streams them off-box.
   sequence assigned, no cursor row, and the scanner returns before issuing a
   query. **No new `WorkflowEvent` variant, zero replay-determinism impact.**
 
-New migration: `20260727000000_harvest_audit_export`. See
+New migration: `20260728000000_harvest_audit_export`. See
 `docs/audit-export.md`.

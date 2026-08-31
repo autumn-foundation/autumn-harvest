@@ -556,10 +556,15 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     assert_eq!(worker.as_deref(), Some("c367-crash-worker"), "{diag}");
 
     // The dead worker was never registered → no live heartbeat → orphaned.
-    let summary =
-        autumn_harvest::poison_pill::reclaim_orphaned_tasks(&mut conn, 3, 0, &NoOpMetrics)
-            .await
-            .expect("reclaim");
+    let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        0,
+        &NoOpMetrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
     assert_eq!(
         summary.requeued, 1,
         "the orphan must be re-queued once; {diag}"
@@ -685,6 +690,7 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
         Duration::from_secs(300),
         &None,
         &[],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("outbox sweep");
@@ -1092,9 +1098,13 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
     // Run the broken-session scanner with a generous worker-staleness window
     // (120 s) so the fresh host heartbeat is NOT stale — the only broken reason
     // that can apply is the expired lease.
-    let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(&mut conn, 120)
-        .await
-        .expect("enforce_broken_sessions");
+    let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(
+        &mut conn,
+        120,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("enforce_broken_sessions");
     // `enforce_broken_sessions` returns the count of member *tasks* failed, not
     // the count of sessions reclaimed. This session is intentionally memberless
     // (it seeds no `harvest_task_queue` rows) to isolate the pure lease-expiry
@@ -1352,9 +1362,15 @@ async fn chaos_seeded_convergence_sweep() {
         // remaining claimable tasks until quiescent.
         for _round in 0..(WORKLOAD + 4) {
             let mut conn = connect(&url).await;
-            autumn_harvest::poison_pill::reclaim_orphaned_tasks(&mut conn, 3, 0, &NoOpMetrics)
-                .await
-                .expect("reclaim in sweep");
+            autumn_harvest::poison_pill::reclaim_orphaned_tasks(
+                &mut conn,
+                3,
+                0,
+                &NoOpMetrics,
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            )
+            .await
+            .expect("reclaim in sweep");
             let claimed = autumn_harvest::queue::claim_task(
                 &mut conn,
                 &["default".to_string()],

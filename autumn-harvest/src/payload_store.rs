@@ -315,7 +315,21 @@ pub fn refs_in_event_value(value: &Value) -> Vec<OffloadedRef> {
         .collect()
 }
 
-fn is_offload_envelope(field: &Value) -> bool {
+/// `true` when `field` carries the offload discriminator
+/// [`OFFLOAD_ENVELOPE_KEY`] — i.e. the field holds a claim-check *reference*,
+/// not inline content.
+///
+/// Discriminator-only, and deliberately looser than [`extract_offload_ref`]:
+/// that one is the strict PARSER and returns `None` for a malformed envelope,
+/// which is the wrong question for a caller asking "may I rewrite this field?".
+/// The re-encryption sweep (issue #948) asks exactly that — a field bearing the
+/// offload discriminator must be passed through untouched whether or not its
+/// reference parses, because offload composes *after* codec encode so there is
+/// no ciphertext here to rotate and rewriting it would orphan the blob.
+///
+/// The codec sibling is [`crate::payload_codec::is_codec_envelope`].
+#[must_use]
+pub fn is_offload_envelope(field: &Value) -> bool {
     field
         .as_object()
         .is_some_and(|obj| obj.get(OFFLOAD_ENVELOPE_KEY).and_then(Value::as_i64) == Some(1))

@@ -98,6 +98,8 @@
 //! indistinguishable from `pending` via history alone — which is acceptable per
 //! the issue's AC7 wording, which targets #482 data-dependent branches.
 
+use std::collections::BTreeSet;
+
 use autumn_harvest::dag::{DagDefinition, DagTask, GateTimeoutAction};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::TaskStatus;
@@ -246,8 +248,18 @@ fn is_live_state(exec_state: &str) -> bool {
 /// `status` (from `node_outcome`) and the timing/attempts/error this selects
 /// describing the same attempt — without it a name-reused node would report
 /// `pending` alongside the old compensation's timestamps.
-fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, ActivityExecId)> {
-    let dispatched = crate::dag_retry::dispatched_activity_names(events);
+///
+/// `dispatched` is [`crate::dag_retry::dispatched_activity_names`] over the
+/// same `events` — the caller's job to compute, since it depends only on
+/// `events` and is identical across every node in one `build_run_graph` call
+/// ([`build_run_graph`] computes it once and threads it down here rather than
+/// this function rebuilding it — an O(events) scan plus a fresh `BTreeSet`
+/// allocation — on every single node).
+fn latest_scheduled(
+    events: &[WorkflowEvent],
+    node: &str,
+    dispatched: &BTreeSet<&str>,
+) -> Option<(usize, ActivityExecId)> {
     events.iter().enumerate().rev().find_map(|(idx, event)| {
         if let WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -256,7 +268,7 @@ fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, Acti
             ..
         } = event
         {
-            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &dispatched))
+            (name == node && !crate::dag_retry::is_compensation_dispatch(input, dispatched))
                 .then_some((idx, *activity_id))
         } else {
             None
@@ -438,6 +450,21 @@ pub fn build_run_graph(
         .map(|(_, event)| event.clone())
         .collect();
     let tasks = def.tasks();
+    // `latest_scheduled`'s issue #780 compensator exclusion needs the set of
+    // dispatched activity names — computed once here (it depends only on
+    // `events`, identical for every node below) and threaded down through
+    // `classify`, instead of `latest_scheduled` rebuilding it (an O(events)
+    // scan plus a fresh `BTreeSet` allocation) on every node in the loop.
+    // Only activity (non-gate) nodes ever read `dispatched` (gate nodes take
+    // the early-return branch below and never reach `classify`), so a
+    // gate-only DAG -- which paid nothing for this before the hoist --
+    // skips the O(events) scan entirely rather than paying it unconditionally
+    // for a value nothing will use (issue #690 review, Codex).
+    let dispatched = if tasks.iter().any(|t| t.signal.is_none()) {
+        crate::dag_retry::dispatched_activity_names(&events)
+    } else {
+        BTreeSet::new()
+    };
 
     tasks
         .iter()
@@ -482,6 +509,7 @@ pub fn build_run_graph(
                 &node_name,
                 &task.upstreams,
                 &events,
+                &dispatched,
                 timestamped_events,
                 exec_state,
             );
@@ -773,13 +801,14 @@ fn resolved_upstream_status(
 /// [`DagNodeStatus::Cancelled`], [`DagNodeStatus::Skipped`] vs
 /// [`DagNodeStatus::Pending`]) are the only places history-plus-run-state adds
 /// information beyond the base outcome.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn classify(
     base: NodeOutcome,
     task_index: usize,
     node_name: &str,
     upstreams: &[usize],
     events: &[WorkflowEvent],
+    dispatched: &BTreeSet<&str>,
     timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
     exec_state: &str,
 ) -> (
@@ -820,7 +849,7 @@ fn classify(
     let mut error = None;
     let mut attempts: u32 = 0;
 
-    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name) {
+    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name, dispatched) {
         let (started_count, latest_started_idx) = started_attempts(events, activity_id);
         // A scheduled node has made at least one attempt: the engine appends an
         // `ActivityStarted` per claim, so `started_count` is the true attempt
@@ -1751,6 +1780,33 @@ mod tests {
             gate.status,
             DagNodeStatus::Succeeded,
             "a gate whose signal has arrived reports `succeeded`"
+        );
+    }
+
+    /// A DAG with no activity nodes at all -- just one root signal gate.
+    fn gate_only_dag() -> DagDefinition {
+        let mut builder = DagBuilder::new();
+        let _gate = builder.signal_gate("approval");
+        builder.build().expect("gate-only dag builds")
+    }
+
+    #[test]
+    fn gate_only_dag_classifies_without_an_activity_node() {
+        // issue #690 review, Codex: `build_run_graph` hoists
+        // `dispatched_activity_names` once per call for the (overwhelmingly
+        // common) case of a DAG with at least one activity node, but must
+        // not pay that scan at all for a DAG with none -- the gate-only
+        // shape exercised here.
+        let def = gate_only_dag();
+        let events = vec![(ts(0), started())];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(nodes.len(), 1);
+        let gate = node(&nodes, "approval");
+        assert_eq!(gate.kind, DagNodeKind::Gate);
+        assert_eq!(
+            gate.status,
+            DagNodeStatus::Waiting,
+            "an un-signalled gate with no upstream on a live run reports `waiting`"
         );
     }
 

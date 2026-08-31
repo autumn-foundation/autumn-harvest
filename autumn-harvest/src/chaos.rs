@@ -1043,16 +1043,40 @@ mod controller {
     pub async fn arm(plan: ChaosPlan) -> ChaosGuard {
         install_quiet_hook_once();
         let serial = SERIAL.lock().await;
+        let state = install_armed_state(plan);
+        ChaosGuard {
+            _serial: serial,
+            state,
+        }
+    }
+
+    /// Publish `plan` as the armed state under a fresh generation. Callers
+    /// must already hold [`SERIAL`]; this is the arming half of that lock's
+    /// critical section, factored out so [`ChaosGuard::rearm_in_place`] runs
+    /// the identical sequence rather than a test-local copy of it.
+    fn install_armed_state(plan: ChaosPlan) -> Arc<ChaosState> {
         let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(ChaosState::from_plan(plan, generation));
         *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&state));
         // Publish STATE, then ARMED_GEN — the sole armed/disarmed signal a
         // reader checks (see `entry_snapshot`).
         ARMED_GEN.store(generation, Ordering::SeqCst);
-        ChaosGuard {
-            _serial: serial,
-            state,
-        }
+        state
+    }
+
+    /// Tear down `state` as the armed state. Callers must already hold
+    /// [`SERIAL`]; this is the disarming half of that lock's critical
+    /// section, shared by [`ChaosGuard`]'s `Drop` and
+    /// [`ChaosGuard::rearm_in_place`].
+    fn clear_armed_state(state: &ChaosState) {
+        // Clear armed state before the caller releases `SERIAL`, so another
+        // `arm()` can never observe a half-torn-down state. Disarm the
+        // generation (the sole armed/disarmed signal — see `entry_snapshot`)
+        // so any resolved action still in flight against this state is fenced
+        // by `fire_if_current`.
+        ARMED_GEN.store(0, Ordering::SeqCst);
+        *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
+        state.release_all_holds();
     }
 
     /// The RAII handle returned by [`arm`]. Disarms the harness and releases the
@@ -1117,14 +1141,31 @@ mod controller {
 
     impl Drop for ChaosGuard {
         fn drop(&mut self) {
-            // Clear armed state first, *then* let `_serial` drop (after this
-            // body) so another `arm()` can never observe a half-torn-down
-            // state. Disarm the generation (the sole armed/disarmed signal —
-            // see `entry_snapshot`) so any resolved action still in flight
-            // against this state is fenced by `fire_if_current`.
-            ARMED_GEN.store(0, Ordering::SeqCst);
-            *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
-            self.state.release_all_holds();
+            // Clear armed state here, in the body, so it completes *before*
+            // `_serial` drops (fields drop after the body runs) and no other
+            // `arm()` can observe a half-torn-down state.
+            clear_armed_state(&self.state);
+        }
+    }
+
+    #[cfg(test)]
+    impl ChaosGuard {
+        /// Disarm this guard's plan, run `observe_disarmed`, then arm `plan`
+        /// in its place — all **without** releasing the process-wide
+        /// [`SERIAL`] lock this guard owns.
+        ///
+        /// A test that wants to observe the fully-disarmed window between two
+        /// armed plans cannot get there by dropping its guard: the guard owns
+        /// `SERIAL`, so dropping it hands the lock to whichever sibling test
+        /// is blocked in [`arm`], and that sibling can publish its own
+        /// `ARMED_GEN` before the observation runs. That is a race in the
+        /// test, not in the harness, and it is why this steps through the same
+        /// [`clear_armed_state`] / [`install_armed_state`] sequence the real
+        /// `Drop` and `arm` use while the lock stays put.
+        fn rearm_in_place(&mut self, plan: ChaosPlan, observe_disarmed: impl FnOnce()) {
+            clear_armed_state(&self.state);
+            observe_disarmed();
+            self.state = install_armed_state(plan);
         }
     }
 
@@ -1702,7 +1743,7 @@ mod controller {
 
         #[tokio::test]
         async fn entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled() {
-            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let mut guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let gen1 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, 0, "gen1 must be armed here");
             assert!(
@@ -1715,18 +1756,20 @@ mod controller {
             // generation and state next.
             let observed_armed_under_gen1 = true;
 
-            // The task is preempted here: a *full* disarm (guard1 drop)
-            // happens before it resumes. The real entry point, called fresh
-            // in this fully-disarmed window, correctly observes nothing armed.
-            drop(guard1);
-            assert!(
-                entry_snapshot().is_none(),
-                "a fresh call in the disarmed window observes nothing armed",
-            );
-
-            // ...then a re-arm to a *different* plan completes, still before
-            // the preempted task resumes.
-            let guard2 = arm(ChaosPlan::scripted()).await;
+            // The task is preempted here: a *full* disarm happens before it
+            // resumes, then a re-arm to a *different* plan completes, still
+            // before the preempted task resumes. `rearm_in_place` walks that
+            // disarm/re-arm without ever releasing `SERIAL` — dropping the
+            // guard to disarm would hand the lock to a sibling test, which
+            // could arm into the window the assertion below is about.
+            guard.rearm_in_place(ChaosPlan::scripted(), || {
+                // The real entry point, called fresh in this fully-disarmed
+                // window, correctly observes nothing armed.
+                assert!(
+                    entry_snapshot().is_none(),
+                    "a fresh call in the disarmed window observes nothing armed",
+                );
+            });
             let gen2 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen2, gen1, "gen2 must be a genuinely different generation");
             assert!(
@@ -1746,7 +1789,7 @@ mod controller {
                  gen2's state for a task whose entry belonged to gen1",
             );
 
-            drop(guard2);
+            drop(guard);
         }
 
         // ---- Codex review round 3 (issue #1202): the test above only proves
@@ -1770,7 +1813,7 @@ mod controller {
             // test's own (current-thread) tokio executor, which is fine: the
             // only thing it is waiting on is the separately-spawned
             // `std::thread`, not any other tokio task on this runtime.
-            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let mut guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let gen1 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, 0, "gen1 must be armed here");
 
@@ -1784,8 +1827,11 @@ mod controller {
             // (having already captured entry_gen == gen1), perform a REAL
             // disarm + rearm to a different plan -- genuine concurrency, not
             // a simulated STATE poke like the Fix-3 test above.
-            drop(guard1);
-            let guard2 = arm(ChaosPlan::scripted()).await;
+            // `rearm_in_place`, not drop-then-`arm`: dropping the guard would
+            // release `SERIAL` while this test still has a paused
+            // `entry_snapshot` in flight, letting a sibling test arm on top of
+            // the straddle this test is constructing.
+            guard.rearm_in_place(ChaosPlan::scripted(), || {});
             let gen2 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, gen2, "gen2 must be a genuinely different generation");
 
@@ -1801,7 +1847,7 @@ mod controller {
                  gen2's state for an entry that began while gen1 was armed",
             );
 
-            drop(guard2);
+            drop(guard);
         }
 
         #[test]

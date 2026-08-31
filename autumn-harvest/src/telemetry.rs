@@ -989,6 +989,24 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// `execution.id` is never a label here either.
 pub const METRIC_QUOTA_REJECTED: &str = "harvest.quota.rejected";
 
+/// Counter: incremented by the number of `harvest_events` rows the lazy
+/// payload-codec re-encryption sweep rewrote onto the active key (issue #948).
+///
+/// Label:
+///   - `"shard"` (= [`METRIC_LABEL_SHARD`]) — the shard swept.
+///
+/// The **codec key id is deliberately not a label.** Key ids are
+/// operator-chosen and accumulate over a deployment's life, so labelling by key
+/// would grow a new series on every rotation and never retire the old ones.
+/// Per-key rows-remaining is instead surfaced by `GET /admin/codec/rotation`,
+/// mirroring how `harvest.quota.rejected` (#946) keeps its per-key detail on the
+/// equivalent admin read.
+///
+/// `rate(harvest_codec_reencrypted_total{shard="..."}[5m]) == 0` while
+/// `GET /admin/codec/rotation` still reports rows remaining under a retired key
+/// is the alerting shape for "the rotation has stalled".
+pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
+
 /// Counter: incremented each time a start producer that is **exempt-by-design**
 /// from the admission gate relays a workflow start (issue #618).
 ///
@@ -2122,6 +2140,19 @@ pub trait MetricsRecorder: Send + Sync {
     /// [`METRIC_QUOTA_REJECTED`] for why.
     fn record_quota_rejected(&self, workflow: &str, resource: &str) {
         let _ = (workflow, resource);
+    }
+
+    /// The lazy payload-codec re-encryption sweep (issue #948) rewrote `count`
+    /// `harvest_events` rows on `shard` onto the active key.
+    ///
+    /// `shard` is the shard id rendered as a string — a bounded label, one
+    /// series per shard. The key id is intentionally not passed here; see
+    /// [`METRIC_CODEC_REENCRYPTED`] for why.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_codec_reencrypted(&self, shard: &str, count: u64) {
+        let _ = (shard, count);
     }
 
     /// A workflow task entered the executor on a worker.
