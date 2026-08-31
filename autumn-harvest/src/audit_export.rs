@@ -917,8 +917,21 @@ pub async fn decommission_cursor(
 ) -> crate::error::HarvestResult<bool> {
     use diesel_async::RunQueryDsl;
 
+    // Bumping `claim_epoch` invalidates any delivery still in flight (issue
+    // #953, Codex review round 13 P2). `apply_outcome` is guarded on
+    // `(shard_id, claim_epoch)` alone, so without this an attempt claimed
+    // before the retirement could land after it -- advancing the cursor or
+    // writing backoff state onto a row the status route now reports as a
+    // frozen `RETIRED` snapshot, and racing retention, which is permitted to
+    // purge the shard the moment it is retired. This is exactly what the epoch
+    // is for: it already exists so a slow attempt whose HTTP call outlives its
+    // lease cannot apply a stale outcome over a fresher one. Clearing
+    // `lease_until` in the same statement means the row does not also read as
+    // mid-delivery.
     let retired = diesel::sql_query(
-        "UPDATE harvest_audit_export_cursor SET retired_at = NOW(), updated_at = NOW() \
+        "UPDATE harvest_audit_export_cursor \
+         SET retired_at = NOW(), updated_at = NOW(), \
+             claim_epoch = claim_epoch + 1, lease_until = NULL \
          WHERE shard_id = $1 AND retired_at IS NULL",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)

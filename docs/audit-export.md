@@ -254,8 +254,11 @@ autumn_harvest::audit_export::decommission_cursor(&mut conn, shard_id).await?;
 
 This marks the cursor **retired**; the row itself is never deleted, because its
 `last_assigned_seq` has to outlive the audit rows. A retired cursor is inert:
-retention ignores it, and a redrive against that shard is refused with `404`
-rather than reporting a rewind whose records nothing will ship. Retiring is what tells
+retention ignores it, a redrive against that shard is refused with `404` rather
+than reporting a rewind whose records nothing will ship, the status route
+reports `delivery_state: "RETIRED"` with a zero backlog, and any delivery still
+in flight is invalidated — retiring bumps the cursor's `claim_epoch`, so an
+attempt claimed beforehand can no longer apply its outcome afterwards. Retiring is what tells
 retention that nothing owes this shard records any more, so the next sweep
 purges its aged audit rows normally. Do this
 only once you accept that any records the shard had not yet shipped will never

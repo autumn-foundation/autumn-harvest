@@ -1357,6 +1357,70 @@ async fn a_retired_shard_reports_no_backlog() {
     );
 }
 
+// Retiring a cursor must invalidate a delivery already in flight. `apply_outcome`
+// is guarded on (shard, claim_epoch) alone, so without an epoch bump an attempt
+// claimed before the retirement lands after it -- moving a cursor the status
+// route now reports as a frozen RETIRED snapshot, and racing retention, which
+// is free to purge the shard the moment it is retired.
+#[tokio::test]
+async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+
+    // An exporter claims the shard and is mid-delivery.
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+    assert_eq!(claim.records.len(), 3);
+
+    // The operator retires the cursor while that delivery is outstanding.
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+
+    // The in-flight attempt now reports success against its stale epoch.
+    apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 3,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("apply is not an error, it simply matches nothing");
+
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        0,
+        "a delivery claimed before the retirement must not move the cursor \
+         afterwards: the shard is reported as a frozen RETIRED snapshot and \
+         retention may already have purged those records"
+    );
+
+    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("row");
+    assert_eq!(status.delivery_state, "RETIRED");
+    assert_eq!(
+        status.consecutive_failures, 0,
+        "nor may it write failure or backoff state onto a retired row"
+    );
+}
+
 // ── Redrive edge cases ──────────────────────────────────────────────────────
 
 #[tokio::test]
