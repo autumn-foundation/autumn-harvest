@@ -687,3 +687,148 @@ async fn a_placed_childs_shard_does_not_depend_on_which_cycle_dispatched_it() {
         "child B must hash as the second invocation, not the first"
     );
 }
+
+// ── Replay must never re-resolve placement (issue #956, Codex round 6) ────────
+
+/// A fan-out pinned to shard 2, so a router that no longer contains shard 2
+/// makes the placement genuinely unresolvable rather than merely differently
+/// resolved.
+fn pinned_fan_out<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children: Vec<(String, Value)> =
+            (0..4).map(|i| ("child_wf".to_string(), json!(i))).collect();
+        let out = ctx
+            .spawn_child_workflow_fan_out_raw_placed(
+                children,
+                &ChildPlacement::Shard(ShardId::new(2)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(out))
+    })
+}
+
+/// The same fan-out through the collect-all sibling, which carries an identical
+/// preflight and therefore an identical replay hazard.
+fn pinned_fan_out_collect<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children: Vec<(String, Value)> =
+            (0..4).map(|i| ("child_wf".to_string(), json!(i))).collect();
+        let out = ctx
+            .spawn_child_workflow_fan_out_collect_raw_placed(
+                children,
+                &ChildPlacement::Shard(ShardId::new(2)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(out.len()))
+    })
+}
+
+/// A router that has lost shard 2 — the topology edit an operator makes after a
+/// pinned fan-out has already been dispatched.
+fn router_without_shard_two() -> ShardRouter {
+    let ids = vec![ShardId::new(0), ShardId::new(1), ShardId::new(3)];
+    ShardRouter::new(ids.clone(), ids, ShardId::new(0))
+}
+
+/// A complete recorded history for a 4-child pinned fan-out on shard 2.
+fn recorded_pinned_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let recorded: Vec<ExecutionId> = (0..4)
+        .map(|_| ExecutionId::new_for_shard(ShardId::new(2)))
+        .collect();
+
+    let mut history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(4_u64),
+        },
+    ];
+    for (i, id) in recorded.iter().enumerate() {
+        history.push(WorkflowEvent::ChildWorkflowStarted {
+            child_id: *id,
+            workflow_name: "child_wf".to_string(),
+            input: json!(i),
+        });
+    }
+    for (i, id) in recorded.iter().enumerate() {
+        history.push(WorkflowEvent::ChildWorkflowCompleted {
+            child_id: *id,
+            output: json!(i),
+        });
+    }
+    (exec_id, history)
+}
+
+/// AC6 + AC8: a topology change made *after* dispatch must not fail a parent
+/// that is merely replaying.
+///
+/// Replay needs no placement at all — the child ids are recorded and reused
+/// verbatim, which is exactly what makes AC6's byte-identical replay true. When
+/// the preflight ran unconditionally, removing a pinned shard from the topology
+/// raised `Config`; the handler ABI stringifies that into a terminal `Failed`,
+/// so a routine operator edit permanently failed every parent that had ever
+/// placed a fan-out — including parents whose children had all already
+/// completed, as here.
+#[tokio::test]
+async fn a_topology_change_after_dispatch_never_fails_a_replaying_fan_out_parent() {
+    let (exec_id, history) = recorded_pinned_fan_out_history();
+
+    let ctx =
+        WorkflowContext::for_replay(exec_id, history).with_shard_router(router_without_shard_two());
+    match run_workflow_with_context(ctx, pinned_fan_out, Value::Null).await {
+        WorkflowOutcome::Completed { output, .. } => {
+            let results = output.as_array().expect("array output");
+            assert_eq!(results.len(), 4, "every recorded child must replay");
+        }
+        other => panic!(
+            "replay must not consult the router for an already-recorded fan-out, got {other:?}"
+        ),
+    }
+}
+
+/// The collect-all sibling shares the ordering, so it shares the test.
+#[tokio::test]
+async fn a_topology_change_after_dispatch_never_fails_a_replaying_collect_all_parent() {
+    let (exec_id, history) = recorded_pinned_fan_out_history();
+
+    let ctx =
+        WorkflowContext::for_replay(exec_id, history).with_shard_router(router_without_shard_two());
+    match run_workflow_with_context(ctx, pinned_fan_out_collect, Value::Null).await {
+        WorkflowOutcome::Completed { output, .. } => {
+            assert_eq!(output, json!(4), "every recorded child must replay");
+        }
+        other => panic!(
+            "replay must not consult the router for an already-recorded fan-out, got {other:?}"
+        ),
+    }
+}
+
+/// The other half of the same contract: gating the preflight on `fresh_dispatch`
+/// must not have disabled it. A *fresh* pinned fan-out against a router that
+/// cannot resolve the pin still fails terminally, rather than half-dispatching
+/// or silently falling back to the parent's shard (AC8).
+#[tokio::test]
+async fn a_fresh_pinned_fan_out_is_still_rejected_when_the_pin_cannot_resolve() {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(router_without_shard_two());
+
+    match run_workflow_with_context(ctx, pinned_fan_out, Value::Null).await {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains('2'),
+                "the rejection must name the unresolvable shard, got {error:?}"
+            );
+        }
+        other => panic!("an unresolvable pin must still fail a fresh dispatch, got {other:?}"),
+    }
+}

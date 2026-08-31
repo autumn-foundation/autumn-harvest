@@ -7258,6 +7258,20 @@ impl WorkflowContext {
     /// payload cap is silently skipped on what is in fact the first real
     /// dispatch.
     ///
+    /// It is equally load-bearing that this runs on a **fresh dispatch only**
+    /// (issue #956 Codex round 6). Replay needs no placement at all — the child
+    /// ids are already recorded in `ChildWorkflowStarted` and are reused
+    /// verbatim, which is what makes AC6's byte-identical replay true. Probing
+    /// the router anyway means an operational change made *after* dispatch — a
+    /// worker that has not yet installed a router, a pinned shard removed from
+    /// the topology, a residency mapping edited — raises `Config` on a parent
+    /// that was replaying perfectly well. The handler ABI erases the type (a
+    /// workflow's `?` stringifies it and the executor maps a handler `Err` to a
+    /// terminal `Failed`), so that would turn a routine topology edit into the
+    /// permanent failure of every parent that had ever placed a fan-out. The two
+    /// constraints compose: inside `if fresh_dispatch`, above
+    /// `record_fan_out_marker`.
+    ///
     /// # Errors
     ///
     /// Whatever [`resolve_child_placement`](crate::shard::resolve_child_placement)
@@ -10651,16 +10665,16 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Vec<Value>> {
         self.check_cancellation()?;
-        // Before the marker (see `preflight_placement`).
-        if let Some((name, _)) = children.first() {
-            self.preflight_placement(placement, name)?;
-        }
-
         let seq = self.next_fan_out_seq();
         let count = children.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
+            // Fresh dispatch only, and still before the marker — see
+            // `preflight_placement` for both halves of that ordering.
+            if let Some((name, _)) = children.first() {
+                self.preflight_placement(placement, name)?;
+            }
             self.record_fan_out_marker(seq, count);
         }
 
@@ -10749,16 +10763,16 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
         self.check_cancellation()?;
-        // Before the marker (see `preflight_placement`).
-        if let Some((name, _)) = children.first() {
-            self.preflight_placement(placement, name)?;
-        }
-
         let seq = self.next_fan_out_seq();
         let count = children.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
+            // Fresh dispatch only, and still before the marker — see
+            // `preflight_placement` for both halves of that ordering.
+            if let Some((name, _)) = children.first() {
+                self.preflight_placement(placement, name)?;
+            }
             self.record_fan_out_marker(seq, count);
         }
 

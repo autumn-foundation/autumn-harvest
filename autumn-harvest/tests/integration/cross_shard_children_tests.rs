@@ -25,9 +25,12 @@ use std::time::Duration;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::IntoWorkflowErrorString;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::schema::{harvest_cross_shard_children, harvest_workflow_executions};
+use autumn_harvest::schema::{
+    harvest_cross_shard_children, harvest_events, harvest_workflow_executions,
+};
 use autumn_harvest::shard::{ChildPlacement, ShardRouter, ShardedDbPool};
 use autumn_harvest::telemetry::TelemetryConfig;
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
@@ -219,6 +222,44 @@ fn detached_parent<'a>(
     })
 }
 
+/// A child that fails with a **typed** `WorkflowFailure` (issue #767), so the
+/// crossing can be checked for type preservation rather than just for delivery.
+fn child_typed_failure<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Err(
+            autumn_harvest::failure::WorkflowFailure::new("ValidationRejected", "issuer declined")
+                .with_details(json!({ "code": 51 }))
+                .non_retryable()
+                .into_workflow_error_payload(),
+        )
+    })
+}
+
+/// Awaits one typed-failing child pinned to a shard that is definitely not the
+/// parent's, and swallows the failure so the assertion can be made on the
+/// parent's recorded history rather than on its terminal state.
+fn typed_failure_parent<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match ctx
+            .spawn_child_workflow_raw_placed(
+                "child_typed_failure",
+                json!(1),
+                &ChildPlacement::Shard(ShardId::new(2)),
+            )
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(json!({ "child_failed": e.to_string() })),
+        }
+    })
+}
+
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
@@ -253,6 +294,8 @@ fn all_workflows() -> Vec<WorkflowInfo> {
         wf_info("child_forever", child_forever),
         wf_info("distributed_parent", distributed_parent),
         wf_info("detached_parent", detached_parent),
+        wf_info("child_typed_failure", child_typed_failure),
+        wf_info("typed_failure_parent", typed_failure_parent),
     ]
 }
 
@@ -1127,4 +1170,95 @@ async fn an_unreachable_target_shard_never_falls_back_to_the_parents_shard() {
 
     worker.shutdown();
     let _ = handle.await;
+}
+
+// ── AC3 + #767 parity: a typed failure survives the crossing ─────────────────
+
+/// **AC3, issue #767 parity.** A cross-shard child that fails with a typed
+/// `WorkflowFailure` reaches its parent as a *typed* `ChildWorkflowFailed`.
+///
+/// This is the regression test for a defect that survived a whole review round
+/// because only the field was added and never populated: the relay sees the
+/// child solely through what the child durably wrote, and the execution row's
+/// `error` column holds `decoded.message` alone. Reading it back therefore
+/// yields an untyped failure, silently dropping `error_type` / `details` /
+/// `non_retryable` — the same-shard path forwards the raw envelope through a
+/// function argument and never round-trips it through storage, so nothing on
+/// that path exercises this.
+///
+/// Asserting on the parent's recorded history rather than on a handler-visible
+/// error is deliberate: the event is what replay, the API and the completion
+/// triggers all read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_shard_typed_failure_reaches_the_parent_with_its_type_intact() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let worker = build_worker(&sharded, "w-typed");
+    let pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+
+    let parent = start_parent(&sharded, "typed_failure_parent", "typed-1").await;
+    assert!(
+        wait_for_state(
+            &sharded,
+            PARENT_SHARD,
+            parent,
+            "COMPLETED",
+            Duration::from_secs(120)
+        )
+        .await,
+        "the parent never observed its cross-shard child's failure"
+    );
+    worker.shutdown();
+    let _ = handle.await;
+
+    // The child really did live on another shard, or this proves nothing.
+    let child_ids = started_child_ids(&sharded, PARENT_SHARD, parent).await;
+    assert_eq!(child_ids.len(), 1, "exactly one child");
+    assert_eq!(
+        child_ids[0].shard(),
+        ShardId::new(2),
+        "the child must have been placed off the parent's shard"
+    );
+
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    let events: Vec<Value> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(parent.as_uuid()))
+        .filter(harvest_events::event_type.eq("ChildWorkflowFailed"))
+        .order(harvest_events::event_id.asc())
+        .select(harvest_events::event_data)
+        .load(&mut *conn)
+        .await
+        .expect("parent history query");
+    let failed = events
+        .last()
+        .expect("the parent must have recorded a ChildWorkflowFailed");
+    let data = failed.get("data").expect("adjacently-tagged event data");
+
+    assert_eq!(
+        data.get("error_type").and_then(Value::as_str),
+        Some("ValidationRejected"),
+        "the typed error_type must survive the crossing, got {data}"
+    );
+    assert_eq!(
+        data.get("details").and_then(|d| d.get("code")),
+        Some(&json!(51)),
+        "the structured details must survive the crossing, got {data}"
+    );
+    assert_eq!(
+        data.get("non_retryable").and_then(Value::as_bool),
+        Some(true),
+        "the non_retryable flag must survive the crossing, got {data}"
+    );
+    assert_eq!(
+        data.get("error").and_then(Value::as_str),
+        Some("issuer declined"),
+        "the human message must still be the decoded message, got {data}"
+    );
 }

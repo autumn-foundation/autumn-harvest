@@ -51,7 +51,7 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::models::{CrossShardChildRow, NewCrossShardChildRow, NewWorkflowExecution};
 use crate::queue::TaskType;
-use crate::schema::{harvest_cross_shard_children, harvest_workflow_executions};
+use crate::schema::{harvest_cross_shard_children, harvest_events, harvest_workflow_executions};
 use crate::shard::{
     CrossShardChildAction, CrossShardChildObservation, CrossShardChildStatus, ShardedDbPool,
     next_cross_shard_child_action,
@@ -403,14 +403,19 @@ struct TargetChildState {
     output: Option<serde_json::Value>,
     /// The child's `error` COLUMN, which holds the human message only.
     error: Option<String>,
-    /// The raw typed failure envelope from the child's own `WorkflowFailed`
-    /// event, when one was loaded (issue #767 parity, issue #956 Codex round 4).
+    /// The typed failure recovered from the child's own `WorkflowFailed` event,
+    /// when one was loaded (issue #767 parity, issue #956 Codex rounds 4 and 6).
     ///
-    /// The `error` column stores `decoded.message`, not the envelope, so
+    /// The `error` COLUMN stores `decoded.message`, not the envelope, so
     /// re-decoding it yields an *untyped* failure and the parent would silently
     /// lose `error_type` / `details` / `non_retryable` — a different observable
-    /// surface than the same-shard path, which forwards the raw envelope.
-    typed_failure: Option<String>,
+    /// surface than the same-shard path, which forwards the raw envelope through
+    /// a function argument and never round-trips it through storage.
+    ///
+    /// `WorkflowFailed` already stores the DECODED fields rather than the
+    /// envelope string, so this holds a `DecodedWorkflowFailure` directly and
+    /// needs no second `decode_workflow_failure` pass.
+    typed_failure: Option<crate::failure::DecodedWorkflowFailure>,
 }
 
 /// One sweep of the cross-shard child relay.
@@ -497,7 +502,8 @@ pub async fn enforce_cross_shard_children(
     // One batched read per target shard, not one per row: a 10k-child fan-out
     // must not become a 10k-round-trip sweep (the `O(nodes x shards)` shape the
     // children-traversal N+1 fix already called out in this repo).
-    let (mut child_states, readable_shards) = load_child_states(&pool, &rows, acquire_bound).await;
+    let (mut child_states, readable_shards) =
+        load_child_states(&pool, &rows, acquire_bound, codecs).await;
 
     // A `STARTED` row whose child is absent from a shard we READ SUCCESSFULLY is
     // not "still running" — it is gone. The status is only set after the child's
@@ -706,6 +712,7 @@ async fn load_child_states(
     pool: &ShardedDbPool,
     rows: &[CrossShardChildRow],
     acquire_bound: Option<std::time::Duration>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> (
     std::collections::HashMap<uuid::Uuid, TargetChildState>,
     std::collections::HashSet<i32>,
@@ -752,6 +759,19 @@ async fn load_child_states(
         match loaded {
             Ok(pairs) => {
                 readable.insert(shard);
+                // Recover the typed envelope for the children that actually
+                // failed, in ONE extra query for the whole shard. Only terminal
+                // non-`COMPLETED` children can have a `WorkflowFailed` event, so
+                // a healthy fan-out of completions costs nothing.
+                let failed_ids: Vec<uuid::Uuid> = pairs
+                    .iter()
+                    .filter(|(_, state, _, _)| {
+                        state != "COMPLETED" && crate::erase::is_terminal_state(state)
+                    })
+                    .map(|(id, _, _, _)| *id)
+                    .collect();
+                let mut typed =
+                    load_child_typed_failures(&mut target_conn, &failed_ids, codecs, shard).await;
                 for (id, state, output, error) in pairs {
                     states.insert(
                         id,
@@ -759,7 +779,7 @@ async fn load_child_states(
                             state,
                             output,
                             error,
-                            typed_failure: None,
+                            typed_failure: typed.remove(&id),
                         },
                     );
                 }
@@ -772,6 +792,95 @@ async fn load_child_states(
         }
     }
     (states, readable)
+}
+
+/// Batched `child_id -> DecodedWorkflowFailure` read of the children's own
+/// `WorkflowFailed` events on ONE target shard (issue #767 parity).
+///
+/// The same-shard spawn path forwards the raw failure envelope to the parent
+/// through a function argument, so it never needs to round-trip it through
+/// storage. The relay has no such channel — it sees the child only through what
+/// the child durably wrote — and the execution row's `error` column holds
+/// `decoded.message` alone. Reading it back therefore yields an *untyped*
+/// failure, silently dropping `error_type` / `details` / `non_retryable` for
+/// exactly the children that failed.
+///
+/// `WorkflowFailed` stores the decoded fields themselves, so no second
+/// `decode_workflow_failure` pass is needed: the event *is* the envelope.
+///
+/// **Best-effort by design.** Every failure here (unreadable history, an
+/// undecodable payload under a codec this node lacks) degrades to an empty
+/// entry, and `deliver_terminal` falls back to the `error` column — still a
+/// correct failure, merely untyped. Losing the typing is bad; losing the
+/// terminal delivery entirely, which propagating the error would do, is worse.
+///
+/// The last `WorkflowFailed` wins: a run that failed, was retried and failed
+/// again carries more than one, and the parent is owed the terminal one.
+async fn load_child_typed_failures(
+    target_conn: &mut AsyncPgConnection,
+    child_ids: &[uuid::Uuid],
+    codecs: &crate::payload_codec::PayloadCodecs,
+    shard: i32,
+) -> std::collections::HashMap<uuid::Uuid, crate::failure::DecodedWorkflowFailure> {
+    use std::collections::HashMap;
+
+    let mut out: HashMap<uuid::Uuid, crate::failure::DecodedWorkflowFailure> = HashMap::new();
+    if child_ids.is_empty() {
+        return out;
+    }
+
+    let loaded: Result<Vec<(uuid::Uuid, serde_json::Value)>, _> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(child_ids))
+        .filter(harvest_events::event_type.eq("WorkflowFailed"))
+        .order(harvest_events::event_id.asc())
+        .select((harvest_events::workflow_exec_id, harvest_events::event_data))
+        .load(target_conn)
+        .await;
+
+    let rows = match loaded {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                target_shard = shard,
+                error = %e,
+                "cross-shard child relay: failed to read child WorkflowFailed events; \
+                 terminals will be delivered untyped"
+            );
+            return out;
+        }
+    };
+
+    for (child_id, event_data) in rows {
+        match codecs.decode_event(event_data) {
+            Ok(WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            }) => {
+                out.insert(
+                    child_id,
+                    crate::failure::DecodedWorkflowFailure {
+                        message: error,
+                        error_type,
+                        details,
+                        non_retryable,
+                    },
+                );
+            }
+            // The `event_type` filter makes any other variant impossible; a
+            // decode failure means this node lacks the child's codec key.
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                target_shard = shard,
+                child_exec_id = %child_id,
+                error = %e,
+                "cross-shard child relay: could not decode a child's WorkflowFailed \
+                 event; its terminal will be delivered untyped"
+            ),
+        }
+    }
+    out
 }
 
 /// Batched `parent_id -> is_terminal` read on this (the parent's) shard.
@@ -1368,13 +1477,15 @@ async fn deliver_terminal(
                 // `ChildWorkflowCancelled` variant and issue #956 adds none.
                 // The wording mirrors the same-shard operator-cancel path so a
                 // parent cannot tell where its child lived from the message.
-                // Prefer the typed envelope recovered from the child's own
+                // Prefer the typed failure recovered from the child's own
                 // `WorkflowFailed` event; fall back to the `error` column, which
-                // carries only the human message.
-                let raw = typed_failure
-                    .or(error)
-                    .unwrap_or_else(|| format!("child workflow {}", state.to_lowercase()));
-                let decoded = crate::failure::decode_workflow_failure(&raw);
+                // carries only the human message and therefore decodes untyped.
+                let decoded = typed_failure.clone().unwrap_or_else(|| {
+                    let raw = error
+                        .clone()
+                        .unwrap_or_else(|| format!("child workflow {}", state.to_lowercase()));
+                    crate::failure::decode_workflow_failure(&raw)
+                });
                 WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded)
             };
             store::append_single_event(conn, parent_exec_id, event).await?;

@@ -195,6 +195,34 @@ relay-driven cancellations and terminations counted through a no-op recorder so
 fleet-wide terminal metrics depended on where a child happened to land. All four
 now match the local path exactly.
 
+**Codex round 6 (two P1-class findings, one of them a fix that was never
+written).** The fan-out preflight ran on *every* parent wake, before
+`peek_fan_out_count` had established whether this was a fresh dispatch. Replay
+needs no placement at all — the child ids are recorded and reused verbatim, which
+is what makes the byte-identical replay claim true — so probing the router anyway
+meant an operational change made *after* dispatch (a worker without a router yet,
+a pinned shard removed from the topology, a residency mapping edited) raised
+`Config` on a parent that was replaying perfectly well, and the handler ABI turned
+that into a permanent terminal failure. The preflight now runs inside
+`if fresh_dispatch`, still above `record_fan_out_marker`, so both constraints
+hold at once.
+
+The second is worth recording as a process failure rather than just a bug. The
+round-4 typed-failure finding was reported fixed, the commit message described
+the mechanism, and the field was added to the struct — but the function that was
+supposed to populate it was never written, so `typed_failure` was initialised
+`None` at every site and `deliver_terminal` always fell through to the untyped
+`error` column. The claimed fix did not exist. `load_child_typed_failures` now
+really does read the children's own `WorkflowFailed` events — batched, one extra
+query per target shard, and only for children that are terminal and not
+`COMPLETED`, so a healthy fan-out pays nothing. `WorkflowFailed` stores the
+decoded fields rather than the envelope string, so the event *is* the envelope
+and no second decode pass is needed. It stays best-effort: an unreadable history
+or an undecodable payload degrades to the untyped column rather than dropping the
+terminal. A cross-shard `WorkflowFailure` now reaches its parent with
+`error_type`, `details` and `non_retryable` intact, asserted end-to-end against
+two real shard databases.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive
@@ -208,7 +236,11 @@ cancelled on its own shard, a re-park never double-recording a remote child, the
 close cascade crossing the boundary, and an unreachable target shard never falling
 back to the parent's shard. `fanout_degradation_integration.rs` covers the
 `/children` read path degrading to `200 partial` — flat and depth traversal — and
-staying `complete` on the happy path.
+staying `complete` on the happy path. Round 6 adds three replay guards (a pinned
+fan-out replaying against a topology that has lost its shard, for both the
+fail-fast and collect-all variants, plus the fresh-dispatch rejection that proves
+the gate did not disable the check) and one runtime guard that a typed
+`WorkflowFailure` crosses the shard boundary with its type intact.
 
 **Deferred, with reasoning, to issue #1263.** The payload *offloader* is not
 applied to the relayed child's start event (the codec is — that is the
