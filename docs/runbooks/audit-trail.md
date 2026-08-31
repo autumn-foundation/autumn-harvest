@@ -16,6 +16,19 @@ workflow event history and never stores raw payloads.
 Read-only routes (health checks, list/get/query, worker heartbeats, activity
 heartbeats) intentionally produce no audit rows.
 
+## Shipping the trail off-box
+
+By default these rows live per shard, **inside the same Postgres databases they
+describe** — so the principal who can rewrite the record of what they did is
+the same principal who has database access. If you are answering a SOC 2 /
+ISO 27001 question about where privileged-action logs ship and how you know
+none were lost, turn on audit export (issue #953): Harvest streams every audit
+record to a sink you run with at-least-once delivery, a dense per-shard
+sequence the receiver can check for contiguity, a visible lag metric, and a
+redrive path. See **`docs/audit-export.md`**.
+
+The scenarios below query the local trail directly and work either way.
+
 ---
 
 ## Scenario 1 — "Who cancelled workflow X?"

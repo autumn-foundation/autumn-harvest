@@ -153,6 +153,7 @@ pub struct HarvestBuilder {
     /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
     /// optional custom deliverer.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// A repeated `idempotency_key` within this window deduplicates onto the same
     /// execution; after it elapses the key is reusable. `None` uses
@@ -210,6 +211,7 @@ impl Default for HarvestBuilder {
             usage_max_groups: None,
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
+            audit_export_config: crate::audit_export::AuditExportBuilderConfig::default(),
             start_idempotency_window: None,
             #[cfg(feature = "wasm-activities")]
             wasm_bindings: std::collections::HashMap::new(),
@@ -269,6 +271,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field(
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
+            )
+            .field(
+                "audit_export_enabled",
+                &self.audit_export_config.is_enabled(),
             )
             .finish_non_exhaustive()
     }
@@ -343,6 +349,7 @@ pub struct BuiltHarvest {
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
@@ -406,6 +413,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field(
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
+            )
+            .field(
+                "audit_export_enabled",
+                &self.audit_export_config.is_enabled(),
             )
             .finish_non_exhaustive()
     }
@@ -836,6 +847,19 @@ pub enum HarvestBuilderError {
         rejection: crate::completion_callback::SsrfRejection,
     },
 
+    /// An `audit_export_webhook(...)` sink URL failed SSRF validation against
+    /// the configured audit-export host allowlist (issue #953).
+    ///
+    /// Fails the build rather than warning: an audit export that silently
+    /// never delivers is a compliance gap that surfaces only at audit time.
+    #[error("audit-export sink URL '{url}' rejected: {rejection}")]
+    AuditSinkRejected {
+        /// The rejected sink URL.
+        url: String,
+        /// The machine-readable SSRF rejection reason.
+        rejection: crate::completion_callback::SsrfRejection,
+    },
+
     /// A native `#[activity]` registration shares its name with a WASM activity
     /// binding (issue #965 review). The native registration would win in the
     /// handler registry while the WASM binding lingered, so the worker's WASM
@@ -1043,6 +1067,12 @@ impl BuiltHarvest {
         &self.completion_callback_config
     }
 
+    /// Resolved builder-wide audit-export configuration (issue #953).
+    #[must_use]
+    pub const fn audit_export_config(&self) -> &crate::audit_export::AuditExportBuilderConfig {
+        &self.audit_export_config
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -1069,6 +1099,15 @@ impl BuiltHarvest {
         // inert. See `install_global_callback_config_for_direct_worker`.
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
+        );
+        // Same reasoning for audit export (issue #953): a direct core embedder
+        // never routes through the plugin runner, so without this an
+        // `audit_export_sink(...)` registration would silently never deliver.
+        // Only an embedder-supplied sink can be installed here — core ships no
+        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
+        // deliver with on this path and is reported rather than ignored.
+        crate::audit_export::install_global_audit_export_config_for_direct_worker(
+            &self.audit_export_config,
         );
         // issue #808 review (Codex P2): the start-idempotency expiry sweep
         // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
@@ -1162,6 +1201,15 @@ impl BuiltHarvest {
         // window here is what closes the split web/worker dedup gap.
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
+        );
+        // Same reasoning for audit export (issue #953): a direct core embedder
+        // never routes through the plugin runner, so without this an
+        // `audit_export_sink(...)` registration would silently never deliver.
+        // Only an embedder-supplied sink can be installed here — core ships no
+        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
+        // deliver with on this path and is reported rather than ignored.
+        crate::audit_export::install_global_audit_export_config_for_direct_worker(
+            &self.audit_export_config,
         );
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
@@ -1731,6 +1779,97 @@ impl HarvestBuilder {
         self
     }
 
+    // ── Audit export to an external sink (issue #953) ────────────────────
+
+    /// Ship every management-API audit record to an operator-run
+    /// signed-webhook endpoint (issue #953).
+    ///
+    /// Enables the exporter. Batches are `POSTed` as JSON lines, HMAC-signed
+    /// with the same `X-Harvest-Signature` scheme as completion callbacks;
+    /// see `docs/audit-export.md` for the receiver contract and the
+    /// OTLP-logs mapping.
+    ///
+    /// The URL is SSRF-validated at [`try_build`](Self::try_build) time
+    /// against the audit-export allowlist — call
+    /// [`audit_export_allowlist`](Self::audit_export_allowlist) first, or
+    /// `try_build` returns [`HarvestBuilderError::AuditSinkRejected`].
+    ///
+    /// The `reqwest` transport lives in `autumn-harvest-plugin`; a direct
+    /// core embedder must supply
+    /// [`audit_export_sink`](Self::audit_export_sink) instead.
+    #[must_use]
+    pub fn audit_export_webhook(mut self, url: impl Into<String>) -> Self {
+        self.audit_export_config.webhook_url = Some(url.into());
+        self
+    }
+
+    /// Supply a custom [`crate::audit_export::AuditSink`] — a Kinesis writer,
+    /// an OTLP-logs bridge, a file appender — instead of the plugin's default
+    /// signed webhook. Takes precedence over
+    /// [`audit_export_webhook`](Self::audit_export_webhook).
+    #[must_use]
+    pub fn audit_export_sink(mut self, sink: impl crate::audit_export::AuditSink) -> Self {
+        self.audit_export_config.sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Allowlist of hosts an audit-export webhook URL may point at.
+    #[must_use]
+    pub fn audit_export_allowlist(
+        mut self,
+        allowlist: crate::completion_callback::HostAllowlist,
+    ) -> Self {
+        self.audit_export_config.allowlist = allowlist;
+        self
+    }
+
+    /// Permit `http://` audit-export sink URLs (default: HTTPS only).
+    ///
+    /// Audit records name who acted on which tenant; shipping them in
+    /// cleartext is itself a finding, so this is opt-in.
+    #[must_use]
+    pub const fn audit_export_allow_http(mut self, allow: bool) -> Self {
+        self.audit_export_config.allow_http = allow;
+        self
+    }
+
+    /// Permit IP-literal audit-export sink hosts (default: rejected).
+    #[must_use]
+    pub const fn audit_export_allow_ip_literals(mut self, allow: bool) -> Self {
+        self.audit_export_config.allow_ip_literals = allow;
+        self
+    }
+
+    /// HMAC key for the `X-Harvest-Signature` header on exported batches.
+    #[must_use]
+    pub fn audit_export_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.audit_export_config.secret =
+            Some(crate::completion_callback::CallbackSecret::new(secret));
+        self
+    }
+
+    /// Records per exported batch. Clamped to
+    /// `[1, crate::audit_export::MAX_EXPORT_BATCH_SIZE]`; defaults to
+    /// [`crate::audit_export::DEFAULT_EXPORT_BATCH_SIZE`].
+    #[must_use]
+    pub const fn audit_export_batch_size(mut self, size: i64) -> Self {
+        self.audit_export_config.batch_size = size;
+        self
+    }
+
+    /// Capped exponential backoff applied after a sink failure.
+    ///
+    /// There is deliberately no attempt ceiling: an audit record is a
+    /// compliance artifact and is retried until the sink accepts it.
+    #[must_use]
+    pub const fn audit_export_backoff(
+        mut self,
+        backoff: crate::audit_export::ExportBackoff,
+    ) -> Self {
+        self.audit_export_config.backoff = backoff;
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -2115,6 +2254,9 @@ impl HarvestBuilder {
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
+        if let Err((url, rejection)) = self.audit_export_config.validate_webhook_url() {
+            return Err(HarvestBuilderError::AuditSinkRejected { url, rejection });
+        }
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -2186,6 +2328,7 @@ impl HarvestBuilder {
             usage_window_ceiling,
             usage_max_groups,
             completion_callback_config: self.completion_callback_config,
+            audit_export_config: self.audit_export_config,
             start_idempotency_window: self
                 .start_idempotency_window
                 .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),

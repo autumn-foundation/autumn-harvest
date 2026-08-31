@@ -187,11 +187,14 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_shard_dispatched_total",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
+    "harvest_audit_export_lag",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
     "harvest_shard_generation",
     "harvest_shard_fenced_total",
+    // Audit export to a SIEM sink (issue #953).
+    "harvest_audit_exported_total",
     "harvest_schedule_overdue",
     "harvest_admission_gates_active",
     "harvest_workflow_history_oversized",
@@ -304,6 +307,11 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),
+    // Audit export to a SIEM sink (issue #953). Labelled `{shard}` only:
+    // `actor`/`operation`/`target_id` are unbounded and tenant-identifying,
+    // so they are deliberately never labels (ADR-0001 §7).
+    ("harvest_audit_export_lag", &["shard"]),
+    ("harvest_audit_exported", &["shard"]),
     ("harvest_replication_lag_bytes", &["shard"]),
     ("harvest_replication_standbys", &["shard"]),
     ("harvest_replication_observable", &["shard"]),

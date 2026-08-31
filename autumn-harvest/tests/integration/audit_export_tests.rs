@@ -1,0 +1,992 @@
+#![cfg(feature = "db")]
+// Test-code style lints (consistent with the other integration suites here).
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening
+)]
+//! Audit-record export to an external SIEM sink — issue #953.
+//!
+//! Verifies the claim/deliver/acknowledge pipeline against a real Postgres
+//! container. The invariants under test are the compliance ones:
+//!
+//! - `unconfigured_export_never_touches_anything` — AC8's "byte-identical
+//!   behavior when no sink is registered", asserted on the column, the cursor
+//!   table, and the scanner's return value.
+//! - `every_record_is_exported_with_a_dense_monotonic_sequence` — AC4.
+//! - `a_failing_sink_never_advances_the_cursor` and
+//!   `the_same_batch_is_retried_after_a_failure` — AC2's "never advances past
+//!   the failure".
+//! - `records_committed_after_a_batch_are_never_skipped` — the property that
+//!   rules out a `BIGSERIAL`: a row that becomes visible after an export tick
+//!   gets a LATER sequence and is still delivered.
+//! - `a_crash_between_delivery_and_acknowledgement_redelivers` — AC9's restart
+//!   survival: at-least-once, and the cursor never skipped.
+//! - `a_stale_claim_cannot_acknowledge_over_a_fresher_one` — the claim-epoch
+//!   guard.
+//! - `redrive_re_exports_byte_identical_records`,
+//!   `redrive_refuses_to_move_the_cursor_forward`,
+//!   `redrive_by_timestamp_re_exports_from_that_instant` — AC6.
+//! - `an_in_flight_acknowledgement_cannot_undo_a_redrive`.
+//! - `export_status_reports_cursor_lag_and_state` — AC7.
+//! - `retention_never_purges_an_unexported_record` and its
+//!   unconfigured counterpart — the silent-loss hole a naive retention sweep
+//!   would open.
+//! - `every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range` — AC1/AC4.
+
+use std::sync::{Arc, Mutex};
+
+use autumn_harvest::audit::{
+    self, OP_WORKFLOW_CANCEL, STATUS_SUCCEEDED, TARGET_WORKFLOW, purge_old_audit_records,
+};
+use autumn_harvest::audit_export::{
+    AuditBatch, AuditExportRecord, AuditExportRuntimeConfig, AuditSink, ExportBackoff,
+    ExportOutcome, GLOBAL_AUDIT_EXPORT_CONFIG, RewindOutcome, RewindRequest, SinkAttempt,
+    SinkFuture, apply_outcome, claim_shard, classify_export_outcome, ensure_cursor_row,
+    export_status, fire_due_audit_exports, rewind_cursor, serialize_batch,
+};
+use autumn_harvest::completion_callback::CallbackSecret;
+use autumn_harvest::models::NewAuditRecord;
+use autumn_harvest::schema::harvest_audit_log;
+use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
+use diesel_async::AsyncConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+// `GLOBAL_AUDIT_EXPORT_CONFIG` is a process-wide static (by design — it mirrors
+// `GLOBAL_CALLBACK_CONFIG`'s "set once at startup" contract in production), so
+// every test that installs one must serialize against the others.
+static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+// ── harness ──────────────────────────────────────────────────────────────────
+
+async fn make_conn() -> (
+    diesel_async::AsyncPgConnection,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let mut conn = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect");
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("migration");
+    (conn, container)
+}
+
+/// One captured delivery: what the sink was handed.
+#[derive(Debug, Clone)]
+struct CapturedBatch {
+    shard: i32,
+    first_seq: i64,
+    last_seq: i64,
+    body: Vec<u8>,
+    headers: Vec<(&'static str, String)>,
+    seqs: Vec<i64>,
+    ids: Vec<uuid::Uuid>,
+}
+
+/// Test sink: records every batch and answers with a scripted status.
+struct RecordingSink {
+    batches: Mutex<Vec<CapturedBatch>>,
+    status: Mutex<u16>,
+}
+
+impl RecordingSink {
+    fn new(status: u16) -> Self {
+        Self {
+            batches: Mutex::new(Vec::new()),
+            status: Mutex::new(status),
+        }
+    }
+
+    fn set_status(&self, status: u16) {
+        *self.status.lock().expect("status lock") = status;
+    }
+
+    fn captured(&self) -> Vec<CapturedBatch> {
+        self.batches.lock().expect("batch lock").clone()
+    }
+
+    /// Every sequence the sink has ever been handed, in delivery order.
+    fn all_seqs(&self) -> Vec<i64> {
+        self.captured().into_iter().flat_map(|b| b.seqs).collect()
+    }
+}
+
+impl AuditSink for RecordingSink {
+    fn deliver<'a>(&'a self, batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+        let captured = CapturedBatch {
+            shard: batch.shard,
+            first_seq: batch.first_seq,
+            last_seq: batch.last_seq,
+            body: batch.body.to_vec(),
+            headers: batch.headers.to_vec(),
+            seqs: batch.records.iter().map(|r| r.seq).collect(),
+            ids: batch.records.iter().map(|r| r.id).collect(),
+        };
+        self.batches.lock().expect("batch lock").push(captured);
+        let status = *self.status.lock().expect("status lock");
+        Box::pin(async move { SinkAttempt::success(status) })
+    }
+}
+
+/// Records `harvest.audit.export_lag` / `harvest.audit.exported` samples.
+#[derive(Default)]
+struct RecordingMetrics {
+    lag: Mutex<Vec<(u16, f64)>>,
+    exported: Mutex<Vec<(u16, u64)>>,
+}
+
+impl MetricsRecorder for RecordingMetrics {
+    fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
+        self.lag.lock().expect("lag lock").push((shard, seconds));
+    }
+    fn record_audit_exported(&self, shard: u16, count: u64) {
+        self.exported
+            .lock()
+            .expect("exported lock")
+            .push((shard, count));
+    }
+}
+
+/// Install a runtime config and return the sink for assertions.
+fn install(sink: Arc<RecordingSink>, batch_size: i64) -> Arc<RecordingSink> {
+    install_with_lease(sink, batch_size, std::time::Duration::from_secs(60))
+}
+
+fn install_with_lease(
+    sink: Arc<RecordingSink>,
+    batch_size: i64,
+    lease: std::time::Duration,
+) -> Arc<RecordingSink> {
+    let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *lock = Some(Arc::new(AuditExportRuntimeConfig {
+        sink: sink.clone(),
+        secret: CallbackSecret::new(b"test-secret".to_vec()),
+        batch_size,
+        backoff: ExportBackoff::default(),
+        lease,
+    }));
+    sink
+}
+
+fn uninstall() {
+    let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *lock = None;
+}
+
+async fn insert_audit_rows(conn: &mut diesel_async::AsyncPgConnection, count: usize) {
+    for i in 0..count {
+        let target = format!("exec-{i}");
+        let record = NewAuditRecord {
+            actor: "alice",
+            operation: OP_WORKFLOW_CANCEL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(target.as_str()),
+            route_or_command: "POST /workflows/{id}/cancel",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: Some(0),
+            source: "api",
+        };
+        audit::insert_audit(conn, &record)
+            .await
+            .expect("audit insert");
+    }
+}
+
+async fn export_seqs(conn: &mut diesel_async::AsyncPgConnection) -> Vec<Option<i64>> {
+    harvest_audit_log::table
+        .select(harvest_audit_log::export_seq)
+        .order(harvest_audit_log::occurred_at.asc())
+        .load::<Option<i64>>(conn)
+        .await
+        .expect("load export_seq")
+}
+
+async fn cursor_acked(conn: &mut diesel_async::AsyncPgConnection, shard: i32) -> i64 {
+    use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+    cur::harvest_audit_export_cursor
+        .find(shard)
+        .select(cur::last_acked_seq)
+        .first::<i64>(conn)
+        .await
+        .expect("cursor row")
+}
+
+// ── AC8: opt-in and zero-cost when unconfigured ──────────────────────────────
+
+#[tokio::test]
+async fn unconfigured_export_never_touches_anything() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("scanner runs");
+    assert_eq!(processed, 0, "no sink configured means no work at all");
+
+    assert!(
+        export_seqs(&mut conn).await.iter().all(Option::is_none),
+        "no sequence may be assigned when no sink is configured"
+    );
+    assert_eq!(
+        export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query"),
+        None,
+        "no cursor row is created when no sink is configured"
+    );
+}
+
+// ── AC4: dense, strictly monotonic per-shard sequences ───────────────────────
+
+#[tokio::test]
+async fn every_record_is_exported_with_a_dense_monotonic_sequence() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 7).await;
+
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("scanner runs");
+    uninstall();
+
+    assert_eq!(processed, 7);
+    assert_eq!(
+        sink.all_seqs(),
+        (1..=7).collect::<Vec<i64>>(),
+        "sequences must be dense and start at 1, so a receiver can check \
+         contiguity and not merely detect gaps"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 7);
+
+    let batches = sink.captured();
+    assert_eq!(batches.len(), 1, "one batch under the batch-size cap");
+    assert_eq!(batches[0].shard, 0);
+    assert_eq!((batches[0].first_seq, batches[0].last_seq), (1, 7));
+}
+
+#[tokio::test]
+async fn every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("scanner runs");
+    uninstall();
+
+    let batch = sink.captured().pop().expect("one batch");
+    let header = |name: &str| {
+        batch.headers.iter().find(|(n, _)| *n == name).map_or_else(
+            || panic!("{name} header present"),
+            |(_, value)| value.clone(),
+        )
+    };
+    assert_eq!(
+        header(autumn_harvest::audit_export::SIGNATURE_HEADER),
+        autumn_harvest::completion_callback::sign(
+            &CallbackSecret::new(b"test-secret".to_vec()),
+            &batch.body
+        ),
+        "the signature must cover the exact bytes delivered"
+    );
+    assert_eq!(header(autumn_harvest::audit_export::SHARD_HEADER), "0");
+    assert_eq!(header(autumn_harvest::audit_export::FIRST_SEQ_HEADER), "1");
+    assert_eq!(header(autumn_harvest::audit_export::LAST_SEQ_HEADER), "3");
+
+    // JSON lines: one record per line, newline-terminated.
+    let text = String::from_utf8(batch.body.clone()).expect("utf8 body");
+    assert_eq!(text.lines().count(), 3);
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
+        assert_eq!(value["shard"], serde_json::json!(0));
+        assert!(value["seq"].is_i64());
+    }
+}
+
+// ── AC2: never advance past a failure ────────────────────────────────────────
+
+#[tokio::test]
+async fn a_failing_sink_never_advances_the_cursor() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(500)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("scanner runs");
+    uninstall();
+
+    assert_eq!(processed, 0, "a 500 delivers nothing");
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        0,
+        "the cursor must not move past a failed delivery"
+    );
+    assert_eq!(
+        sink.all_seqs(),
+        vec![1, 2, 3, 4],
+        "the batch was attempted; it simply was not acknowledged"
+    );
+
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("cursor exists");
+    assert_eq!(status.consecutive_failures, 1);
+    assert_eq!(status.last_status, Some(500));
+    assert_eq!(status.pending_records, 4, "nothing was acknowledged");
+}
+
+#[tokio::test]
+async fn the_same_batch_is_retried_after_a_failure() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(503)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("first tick");
+
+    // The failure scheduled a backoff. Clear it (a test stands in for waiting
+    // out the capped exponential delay) and let the now-healthy sink retry.
+    {
+        use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+        diesel::update(cur::harvest_audit_export_cursor.find(0))
+            .set(cur::next_attempt_at.eq(chrono::Utc::now()))
+            .execute(&mut conn)
+            .await
+            .expect("clear backoff");
+    }
+    sink.set_status(200);
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("second tick");
+    uninstall();
+
+    assert_eq!(processed, 3);
+    assert_eq!(cursor_acked(&mut conn, 0).await, 3);
+    let batches = sink.captured();
+    assert_eq!(batches.len(), 2, "the failed batch was retried");
+    assert_eq!(
+        batches[0].seqs, batches[1].seqs,
+        "the retry re-sends exactly the same records"
+    );
+    assert_eq!(
+        batches[0].body, batches[1].body,
+        "and byte-identical bytes, so the receiver's (shard, seq) dedup sees \
+         the same payload it already stored"
+    );
+}
+
+// ── The property that rules out a BIGSERIAL ──────────────────────────────────
+
+#[tokio::test]
+async fn records_committed_after_a_batch_are_never_skipped() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("first tick");
+
+    // A record that becomes visible only AFTER the first export tick. With a
+    // pre-commit BIGSERIAL it could have taken a sequence below the cursor and
+    // been skipped forever; with exporter-assigned sequences it is simply
+    // still NULL and gets a later one.
+    insert_audit_rows(&mut conn, 2).await;
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("second tick");
+    uninstall();
+
+    assert_eq!(processed, 2);
+    assert_eq!(
+        sink.all_seqs(),
+        vec![1, 2, 3, 4, 5],
+        "the late records get LATER sequences and are delivered, never skipped"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+    let seqs = export_seqs(&mut conn).await;
+    assert_eq!(
+        seqs,
+        vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+        "every row carries exactly one sequence"
+    );
+}
+
+// ── AC9: restart survival ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_crash_between_delivery_and_acknowledgement_redelivers() {
+    let _guard = TEST_SERIAL.lock().await;
+    // A zero-length lease stands in for "the process died holding this claim
+    // and the lease has since expired" without needing to kill a real process.
+    let sink = install_with_lease(
+        Arc::new(RecordingSink::new(200)),
+        100,
+        std::time::Duration::from_secs(0),
+    );
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+
+    // Phase 1: claim and deliver by hand, then simply never acknowledge —
+    // exactly what a `kill -9` between the POST and the cursor write leaves
+    // behind.
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor row");
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(0),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("something to claim");
+    let body = serialize_batch(&claim.records).expect("serialize");
+    let headers = autumn_harvest::audit_export::export_headers(
+        &CallbackSecret::new(b"test-secret".to_vec()),
+        &body,
+        0,
+        claim.records[0].seq,
+        claim.records[claim.records.len() - 1].seq,
+        chrono::Utc::now(),
+    );
+    let batch = AuditBatch {
+        shard: 0,
+        first_seq: claim.records[0].seq,
+        last_seq: claim.records[claim.records.len() - 1].seq,
+        records: &claim.records,
+        body: &body,
+        headers: &headers,
+    };
+    let attempt = sink.deliver(&batch).await;
+    assert!(attempt.is_success(), "the sink DID accept this batch");
+    // ...and then the process dies. No `apply_outcome` call.
+
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        0,
+        "the cursor never advanced, so nothing is marked delivered that was \
+         not durably recorded as delivered"
+    );
+
+    // Phase 2: restart. The expired lease lets a fresh claim take the shard.
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("post-restart tick");
+    uninstall();
+
+    assert_eq!(processed, 4);
+    assert_eq!(cursor_acked(&mut conn, 0).await, 4);
+
+    // At-least-once: every record reached the sink at least once, and the
+    // pre-crash batch was simply re-sent with the same sequences.
+    let seqs = sink.all_seqs();
+    for expected in 1..=4_i64 {
+        assert!(
+            seqs.contains(&expected),
+            "seq {expected} must be delivered at least once; got {seqs:?}"
+        );
+    }
+    let batches = sink.captured();
+    assert_eq!(batches.len(), 2, "the pre-crash batch was redelivered");
+    assert_eq!(batches[0].seqs, batches[1].seqs);
+    assert_eq!(batches[0].ids, batches[1].ids);
+    assert_eq!(
+        batches[0].body, batches[1].body,
+        "redelivery is byte-identical, so the receiver dedupes on (shard, seq)"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_claim_cannot_acknowledge_over_a_fresher_one() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 2).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor row");
+
+    let stale = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(0),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("first claim")
+    .expect("something to claim");
+
+    // The lease has already expired, so a second exporter claims the shard.
+    let fresh = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("second claim")
+    .expect("still claimable");
+    assert!(fresh.claim_epoch > stale.claim_epoch);
+
+    // The stale attempt's HTTP call finally returns. Its acknowledgement must
+    // be refused outright — not merged, not partially applied.
+    let applied = apply_outcome(
+        &mut conn,
+        0,
+        stale.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 2,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("apply");
+    assert!(!applied, "a superseded claim may not write the cursor");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 0);
+
+    // The fresh claim's acknowledgement applies normally.
+    let applied = apply_outcome(
+        &mut conn,
+        0,
+        fresh.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 2,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("apply");
+    assert!(applied);
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+}
+
+// ── AC6: redrive ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn redrive_re_exports_byte_identical_records() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("first tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+
+    // The SIEM lost everything after seq 2.
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(2), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 2 });
+
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("re-export tick");
+    uninstall();
+
+    assert_eq!(processed, 3);
+    let batches = sink.captured();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(
+        batches[1].seqs,
+        vec![3, 4, 5],
+        "only the lost tail re-exports"
+    );
+
+    // Byte-identity: the re-exported lines are exactly the lines originally
+    // sent for those sequences.
+    let original = String::from_utf8(batches[0].body.clone()).expect("utf8");
+    let replayed = String::from_utf8(batches[1].body.clone()).expect("utf8");
+    let original_tail: Vec<&str> = original.lines().skip(2).collect();
+    assert_eq!(
+        original_tail,
+        replayed.lines().collect::<Vec<&str>>(),
+        "a re-exported record must be byte-identical to its first delivery"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+}
+
+#[tokio::test]
+async fn redrive_refuses_to_move_the_cursor_forward() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    // Fail the sink so records 5.. would be pending if any existed.
+    sink.set_status(200);
+
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(99), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    uninstall();
+    assert_eq!(
+        outcome,
+        RewindOutcome::NoOp {
+            cursor: 4,
+            requested: 99
+        },
+        "advancing the cursor would mark records delivered that never were"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 4, "cursor unchanged");
+}
+
+#[tokio::test]
+async fn redrive_of_a_shard_that_never_exported_is_reported_not_configured() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    let outcome = rewind_cursor(&mut conn, 7, RewindRequest::Seq(0), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(outcome, RewindOutcome::NotConfigured);
+}
+
+#[tokio::test]
+async fn redrive_by_timestamp_re_exports_from_that_instant() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    // A clock boundary between the first three records and the next three.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let boundary = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 6);
+
+    let outcome = rewind_cursor(
+        &mut conn,
+        0,
+        RewindRequest::Before(boundary),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("rewind");
+    assert_eq!(
+        outcome,
+        RewindOutcome::Rewound { from: 6, to: 3 },
+        "rewinding to an instant re-exports everything at or after it"
+    );
+
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("re-export");
+    uninstall();
+    let batches = sink.captured();
+    assert_eq!(batches[batches.len() - 1].seqs, vec![4, 5, 6]);
+}
+
+#[tokio::test]
+async fn an_in_flight_acknowledgement_cannot_undo_a_redrive() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor row");
+
+    // A delivery is claimed and in flight...
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+    apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 5,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("first ack");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+
+    // ...an operator redrives...
+    let redrive = rewind_cursor(&mut conn, 0, RewindRequest::Seq(1), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(redrive, RewindOutcome::Rewound { from: 5, to: 1 });
+
+    // ...and a straggler from the pre-redrive claim finally acknowledges. It
+    // must not silently re-raise the cursor and undo the operator's redrive.
+    let applied = apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 5,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("stale ack");
+    assert!(
+        !applied,
+        "the redrive bumped the epoch, refusing the stale ack"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 1, "the redrive stands");
+}
+
+// ── AC5/AC7: metrics and status ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn export_status_reports_cursor_lag_and_state() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+
+    let metrics = RecordingMetrics::default();
+    fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("tick");
+
+    // A batch size of 2 leaves a backlog after one tick.
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("cursor");
+    assert_eq!(status.shard, 0);
+    assert_eq!(status.cursor_seq, 2, "one batch acknowledged");
+    assert_eq!(status.pending_records, 3);
+    assert!(status.lag_seconds >= 0.0);
+    assert_eq!(status.delivery_state, "IDLE");
+    assert_eq!(status.consecutive_failures, 0);
+    assert_eq!(status.last_status, Some(200));
+
+    // The lag gauge is emitted on every tick, and the exported counter only
+    // for the acknowledged batch.
+    assert!(
+        !metrics.lag.lock().expect("lag").is_empty(),
+        "harvest.audit.export_lag must be emitted every tick"
+    );
+    assert_eq!(
+        *metrics.exported.lock().expect("exported"),
+        vec![(0_u16, 2)]
+    );
+
+    // Drain the rest and confirm the lag returns to zero.
+    while fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("tick")
+        > 0
+    {}
+    uninstall();
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("cursor");
+    assert_eq!(status.pending_records, 0);
+    assert!(
+        (status.lag_seconds - 0.0).abs() < f64::EPSILON,
+        "lag is 0 when nothing is pending, got {}",
+        status.lag_seconds
+    );
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3, 4, 5]);
+}
+
+// ── Retention must never silently drop an unexported record ──────────────────
+
+#[tokio::test]
+async fn retention_never_purges_an_unexported_record() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+
+    // Export only the first two, then age every row past the retention window.
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 2,
+        "only the acknowledged records may be purged; the three the sink has \
+         never seen must survive, or they would be gone from the database AND \
+         absent from the SIEM with nothing anywhere to show it"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 3);
+
+    // And they still export afterwards.
+    while fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick")
+        > 0
+    {}
+    uninstall();
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn retention_is_unchanged_when_export_is_unconfigured() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 5,
+        "with no export cursor the guard finds nothing and the purge is \
+         byte-identical to its pre-#953 behaviour"
+    );
+}
+
+// ── Backoff decision is applied, not merely computed ─────────────────────────
+
+#[tokio::test]
+async fn a_failure_schedules_a_future_retry_without_moving_the_cursor() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        10,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+
+    let now = chrono::Utc::now();
+    let outcome = classify_export_outcome(
+        &SinkAttempt::transport_error("connection refused".to_string()),
+        1,
+        claim.consecutive_failures,
+        &ExportBackoff::default(),
+        now,
+    );
+    assert!(
+        apply_outcome(&mut conn, 0, claim.claim_epoch, &outcome, now)
+            .await
+            .expect("apply")
+    );
+
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("cursor");
+    assert_eq!(status.cursor_seq, 0);
+    assert_eq!(status.consecutive_failures, 1);
+    assert_eq!(status.last_error.as_deref(), Some("connection refused"));
+    assert!(status.next_attempt_at > now);
+    assert_eq!(status.delivery_state, "BACKOFF");
+
+    // While backing off, a tick claims nothing rather than hammering the sink.
+    let claimed = claim_shard(
+        &mut conn,
+        0,
+        10,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim");
+    assert!(claimed.is_none(), "a shard in backoff is not re-claimed");
+}
+
+/// Compile-time proof that an embedder can supply a sink with no HTTP client
+/// anywhere in sight (AC1: the trait lives in core with no `reqwest`
+/// dependency).
+#[test]
+fn an_embedder_sink_needs_no_http_client() {
+    struct FileSink;
+    impl AuditSink for FileSink {
+        fn deliver<'a>(&'a self, batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+            // A real implementation would append `batch.body` to a file, hand
+            // `batch.records` to an OTLP-logs exporter, or PutRecords to
+            // Kinesis. Nothing here needs HTTP.
+            let count = batch.records.len();
+            Box::pin(async move {
+                if count == 0 {
+                    SinkAttempt::transport_error("empty".to_string())
+                } else {
+                    SinkAttempt::success(200)
+                }
+            })
+        }
+    }
+    let _: Arc<dyn AuditSink> = Arc::new(FileSink);
+    // And the record type is plain data an embedder can map freely.
+    fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+    assert_serde::<AuditExportRecord>();
+}

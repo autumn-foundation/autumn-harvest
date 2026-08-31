@@ -35,10 +35,10 @@ use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
     HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
-    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
-    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
-    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
-    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_ACTIVITY_RETRY_NOW, OP_AUDIT_EXPORT_REDRIVE, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE,
+    OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET,
+    OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
+    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
@@ -49,11 +49,11 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
     OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
-    deny_readonly_mutation,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_AUDIT_EXPORT,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER,
+    TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -5005,6 +5005,19 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             // /admin/debounce and /admin/concurrency.
             get(start_throttle_status).route_layer(require_admin.clone()),
         )
+        // Audit-record export to an external SIEM sink (issue #953).
+        // Read-only status; admin-gated like every other compliance-adjacent
+        // read.
+        .route(
+            "/admin/audit-export",
+            get(audit_export_status_handler).route_layer(require_admin.clone()),
+        )
+        // Rewind a shard's export cursor after sink-side data loss. Mutating
+        // and audited (`audit_export.redrive`).
+        .route(
+            "/admin/audit-export/redrive",
+            post(audit_export_redrive_handler).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/quotas",
             // Admin-gated: the response includes raw quota_key values, which
@@ -6167,6 +6180,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/debounce"),
         ("GET", "/admin/start-throttle"),
         ("GET", "/admin/quotas"),
+        // ── Audit export to a SIEM sink (issue #953) ──────────────────────
+        ("GET", "/admin/audit-export"),
+        ("POST", "/admin/audit-export/redrive"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────
@@ -6535,6 +6551,12 @@ pub const fn management_api_request_fields()
             Some(&["refill_rate", "burst"]),
         ),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        // ── audit export (issue #953) ────────────────────────────────────
+        (
+            "POST",
+            "/admin/audit-export/redrive",
+            Some(&["shard", "to_seq", "before"]),
+        ),
         (
             "POST",
             "/admin/rate-limits/{activity_name}/override",
@@ -7576,6 +7598,17 @@ pub const fn management_api_response_fields()
             "GET",
             "/admin/quotas",
             Some(&["quotas", "status", "unavailable_shards"]),
+        ),
+        // ── audit export (issue #953) ────────────────────────────────────
+        (
+            "GET",
+            "/admin/audit-export",
+            Some(&["sink_configured", "shards", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/admin/audit-export/redrive",
+            Some(&["shard", "outcome", "from", "to"]),
         ),
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
@@ -35642,6 +35675,222 @@ fn merge_quota_rows(
             })
         })
         .collect()
+}
+
+// ── Audit export to an external sink (issue #953) ────────────────────────────
+//
+// Two routes: a read-only status view and an admin-gated, audited redrive.
+// Both are shard-aware because the export cursor is per-shard, living in that
+// shard's own database alongside the audit rows it tracks.
+
+/// `GET /admin/audit-export` — per-shard audit-export cursor position, lag,
+/// delivery state, and last error (issue #953 AC7).
+///
+/// Cross-shard and `shard_fanout`-based like every other admin read: an
+/// unreachable shard degrades the response to `partial` (naming it in
+/// `unavailable_shards`) rather than failing the whole read, so one bad shard
+/// never hides the other shards' compliance posture.
+///
+/// A shard with no cursor row yet reports `delivery_state: "NOT_STARTED"` —
+/// deliberately *with* its live `pending_records`/`lag_seconds`, because "the
+/// exporter has never run here and 40k records are waiting" is precisely the
+/// state an operator needs to see, and omitting the shard would hide it.
+///
+/// Admin-gated and read-only: the response carries `actor`-adjacent
+/// compliance posture but no audit record contents.
+async fn audit_export_status_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        let now = chrono::Utc::now();
+        match ::autumn_harvest::audit_export::export_status(&mut conn, shard_id, now).await {
+            Ok(Some(status)) => Ok(vec![serde_json::json!(status)]),
+            Ok(None) => {
+                // No cursor row: the exporter has never claimed this shard.
+                // Still report the backlog it would face.
+                let (pending, lag) =
+                    ::autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, now)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                Ok(vec![serde_json::json!({
+                    "shard": shard_id,
+                    "cursor_seq": 0,
+                    "last_assigned_seq": 0,
+                    "pending_records": pending,
+                    "lag_seconds": lag,
+                    "delivery_state": "NOT_STARTED",
+                    "consecutive_failures": 0,
+                    "last_status": Value::Null,
+                    "last_error": Value::Null,
+                    "last_delivered_at": Value::Null,
+                    "next_attempt_at": Value::Null,
+                })])
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await?;
+
+    let mut collected = shard_fanout::collect_fanout_rows(observations);
+    collected
+        .rows
+        .sort_by_key(|row| row["shard"].as_i64().unwrap_or(0));
+
+    Ok(Json(serde_json::json!({
+        // Whether THIS process has an audit sink installed. A `false` here
+        // with a growing `pending_records` is the signature of "export was
+        // configured on the web app but not on the worker fleet", which is
+        // otherwise invisible.
+        "sink_configured": ::autumn_harvest::audit_export::is_configured(),
+        "shards": collected.rows,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditExportRedriveRequest {
+    /// Shard whose cursor to rewind.
+    shard: i32,
+    /// Rewind to this exact sequence: records with `seq > to_seq` re-export.
+    to_seq: Option<i64>,
+    /// Rewind so every record at or after this instant re-exports.
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `POST /admin/audit-export/redrive` — rewind one shard's export cursor so
+/// already-delivered audit records are re-exported after sink-side data loss
+/// (issue #953 AC6).
+///
+/// Exactly one of `to_seq` or `before` must be supplied. Re-exported records
+/// are **byte-identical** — the export sequence is never re-stamped, so a
+/// record carries the same `(shard, seq)` and the same JSON on every
+/// delivery and the receiver dedupes.
+///
+/// A cursor may only ever move **backwards**: a request that would move it
+/// forward is reported as `no-op` rather than applied, because advancing it
+/// would mark records delivered that never were — the exact gap this feature
+/// exists to make impossible.
+///
+/// The redrive itself produces an audit record (`audit_export.redrive`), so
+/// the act of re-exporting is as auditable as the operations being exported.
+async fn audit_export_redrive_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<AuditExportRedriveRequest>,
+) -> impl axum::response::IntoResponse {
+    let target = match (request.to_seq, request.before) {
+        (Some(seq), None) => ::autumn_harvest::audit_export::RewindRequest::Seq(seq),
+        (None, Some(before)) => ::autumn_harvest::audit_export::RewindRequest::Before(before),
+        (Some(_), Some(_)) => {
+            return AutumnError::bad_request_msg(
+                "supply exactly one of to_seq or before, not both",
+            )
+            .into_response();
+        }
+        (None, None) => {
+            return AutumnError::bad_request_msg("supply exactly one of to_seq or before")
+                .into_response();
+        }
+    };
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/audit-export/redrive";
+    let shard_label = request.shard.to_string();
+
+    let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
+
+    // Perform the rewind, then ALWAYS attempt the audit write before deciding
+    // the response — including on failure. A failed privileged action must
+    // still leave a trail (issue #945 review, P2).
+    let outcome = match shard_pool {
+        Some(shard_pool) => match acquire_conn(shard_pool).await {
+            Ok(mut conn) => ::autumn_harvest::audit_export::rewind_cursor(
+                &mut conn,
+                request.shard,
+                target,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|e| e.to_string()),
+            Err(e) => Err(format!("shard {}: {e}", request.shard)),
+        },
+        None => Err(format!("shard {} is not configured", request.shard)),
+    };
+
+    let (status, error_summary) = match &outcome {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.clone())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_AUDIT_EXPORT_REDRIVE,
+        target_type: TARGET_AUDIT_EXPORT,
+        target_id: Some(shard_label.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: Some(request.shard),
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for audit_export.redrive"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for audit_export.redrive"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    match outcome {
+        Ok(::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to }) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "rewound",
+                "from": from,
+                "to": to,
+            })),
+        )
+            .into_response(),
+        Ok(::autumn_harvest::audit_export::RewindOutcome::NoOp { cursor, requested }) => {
+            AutumnError::bad_request_msg(format!(
+                "refusing to move shard {}'s audit-export cursor forward (cursor is at \
+                 {cursor}, requested {requested}); a cursor may only be rewound, since \
+                 advancing it would mark records delivered that never were",
+                request.shard
+            ))
+            .into_response()
+        }
+        Ok(::autumn_harvest::audit_export::RewindOutcome::NotConfigured) => {
+            AutumnError::not_found_msg(format!(
+                "shard {} has no audit-export cursor; audit export has never run there",
+                request.shard
+            ))
+            .into_response()
+        }
+        Err(e) => AutumnError::service_unavailable_msg(e).into_response(),
+    }
 }
 
 // ── Per-activity-type pause / resume (issue #807) ────────────────────────────

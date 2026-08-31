@@ -274,6 +274,57 @@ impl PreparedHarvestRuntime {
                 ));
             }
         }
+
+        // Install the process-global audit-export runtime config (issue #953)
+        // at the same single construction point, for the same reason: every
+        // `BuiltHarvest` consumer funnels through here, so the exporter's sink
+        // is installed exactly once regardless of which path started the
+        // runtime. Core ships no HTTP client, so an embedder-supplied
+        // `AuditSink` is used verbatim and a `reqwest` signed-webhook sink is
+        // substituted when only a URL was configured.
+        //
+        // Nothing is installed when neither was configured: audit export is
+        // opt-in and must be byte-identically inert otherwise (AC8). The
+        // `None` write is deliberate rather than a skip -- the config is a
+        // process-wide static, so a second runtime built without a sink must
+        // not keep shipping audit records to the first runtime's destination.
+        {
+            let audit_config = built.audit_export_config();
+            let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
+                audit_config.sink.clone().or_else(|| {
+                    audit_config.webhook_url.as_ref().map(|url| {
+                        Arc::new(crate::audit_sink::ReqwestAuditSink::new(url.clone()))
+                            as Arc<dyn autumn_harvest::audit_export::AuditSink>
+                    })
+                });
+            if let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
+                *lock = sink.map(|sink| {
+                    let secret = audit_config.secret.clone().unwrap_or_else(|| {
+                        // Same hazard as the callback secret above: HMAC-SHA256
+                        // accepts an empty key and produces a valid, trivially
+                        // reproducible signature, so an unconfigured secret
+                        // yields an `X-Harvest-Signature` that carries no
+                        // tamper-evidence at all -- the exact property AC4
+                        // promises.
+                        tracing::warn!(
+                            "audit-export HMAC secret was never configured via \
+                             HarvestBuilder::audit_export_secret(...) -- every exported \
+                             batch will be signed with an empty key, which defeats the \
+                             X-Harvest-Signature tamper-evidence guarantee for any \
+                             receiver relying on it"
+                        );
+                        autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+                    });
+                    Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+                        sink,
+                        secret,
+                        batch_size: audit_config.effective_batch_size(),
+                        backoff: audit_config.backoff.clone(),
+                        lease: autumn_harvest::audit_export::DEFAULT_EXPORT_LEASE,
+                    })
+                });
+            }
+        }
         let classic_dag_names = built
             .dags()
             .iter()

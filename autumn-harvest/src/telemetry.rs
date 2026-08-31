@@ -369,6 +369,37 @@ pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
 /// `docs/cross-region-dr.md` describes. Labelled `{shard}`.
 pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
 
+/// Gauge: audit-export delivery lag for a shard, in seconds (issue #953).
+///
+/// The **age of the oldest audit record the sink has not acknowledged** — the
+/// answer to "how far behind is the SIEM right now?". `0` means every audit
+/// record on the shard has been acknowledged at least once.
+///
+/// Note the deliberate choice of *oldest*, not newest, unacknowledged record:
+/// under sustained mutating load a stuck exporter always has a brand-new
+/// unexported record, so a newest-based gauge would read ~0 during exactly the
+/// outage an operator needs to see. Oldest-based lag is what the issue's own
+/// success metric ("export lag stays < 30s p99") is measurable against.
+///
+/// Emitted on **every** exporter tick, including ticks that deliver nothing —
+/// the signal must not go stale precisely when delivery has stopped.
+///
+/// Labelled `{shard}` only: bounded cardinality per ADR-0001 §7. The audit
+/// `actor`, `operation`, and `target_id` are deliberately never labels — they
+/// are unbounded, user-supplied, and tenant-identifying.
+pub const METRIC_AUDIT_EXPORT_LAG: &str = "harvest.audit.export_lag";
+
+/// Counter: audit records acknowledged by the sink for a shard (issue #953).
+///
+/// Incremented by the batch size only after the cursor has actually advanced,
+/// so `rate(harvest_audit_exported)` is a true delivery rate, not an attempt
+/// rate. At-least-once delivery means a redelivered batch counts again;
+/// receiver-side `(shard, seq)` accounting, not this counter, is the
+/// completeness proof.
+///
+/// Labelled `{shard}` only, for the same cardinality reason as above.
+pub const METRIC_AUDIT_EXPORTED: &str = "harvest.audit.exported";
+
 /// Counter: this worker was fenced off a shard it is pinned to (issue #954).
 ///
 /// Incremented once, immediately before the worker stops. A non-zero value in
@@ -2624,6 +2655,27 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge [`METRIC_SHARD_GENERATION`].
     fn record_shard_generation(&self, shard: u16, generation: i64) {
         let _ = (shard, generation);
+    }
+
+    /// Audit-export delivery lag for a shard, in seconds (issue #953).
+    ///
+    /// Emitted on every exporter tick, delivering or not — see
+    /// [`METRIC_AUDIT_EXPORT_LAG`] for why it is the *oldest* unacknowledged
+    /// record's age rather than the newest.
+    ///
+    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_LAG`].
+    fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
+        let _ = (shard, seconds);
+    }
+
+    /// Audit records the sink acknowledged for a shard (issue #953).
+    ///
+    /// Called once per acknowledged batch with that batch's record count,
+    /// only after the cursor advanced.
+    ///
+    /// Maps to the counter [`METRIC_AUDIT_EXPORTED`].
+    fn record_audit_exported(&self, shard: u16, count: u64) {
+        let _ = (shard, count);
     }
 
     /// This worker was fenced off `shard` and is stopping (issue #954).

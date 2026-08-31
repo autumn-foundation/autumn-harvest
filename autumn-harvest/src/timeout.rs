@@ -3386,6 +3386,13 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    // Off-box audit-record export (issue #953). Folded into this existing
+    // scanner cadence rather than spawning a background task of its own, like
+    // the residents above; a no-op returning `Ok(0)` before any query when no
+    // audit sink is configured.
+    count +=
+        crate::audit_export::fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
