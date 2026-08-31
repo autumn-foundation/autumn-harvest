@@ -10347,3 +10347,1296 @@ async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-kind concurrent waits (issue #950)
+// ---------------------------------------------------------------------------
+//
+// Success-metric half two: each of the ≥ 6 mixed compositions replays
+// deterministically across 1,000 randomized event-arrival orderings with 0
+// divergences. The winner of a mixed race is decided strictly by RECORDED
+// HISTORY ORDER (fixed by the `race_winner:{seq}` marker), never by wall-clock
+// timing on the replaying worker, so any recorded interleaving must reproduce
+// the identical outcome on every cycle.
+
+fn mixed_started() -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+/// `race(activity, timer)` — reports which branch won.
+fn mixed_activity_vs_timer<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .label("work")
+            .timer(std::time::Duration::from_secs(30))
+            .label("deadline")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// `race(activity, signal)`.
+fn mixed_activity_vs_signal<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("long_running", Value::Null, "default")
+            .signal("abort")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// `race(child, timer)`.
+fn mixed_child_vs_timer<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .child_workflow_raw("settle", Value::Null)
+            .timer(std::time::Duration::from_secs(30))
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// `race(child, signal)`.
+fn mixed_child_vs_signal<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .child_workflow_raw("settle", Value::Null)
+            .signal("abort")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// `race(activity, child)`.
+fn mixed_activity_vs_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .child_workflow_raw("settle", Value::Null)
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// Three-way `race(activity, timer, signal)`.
+fn mixed_three_way<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_quote", Value::Null, "default")
+            .timer(std::time::Duration::from_secs(30))
+            .signal("abort")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"index": winner.index, "value": winner.value}))
+    })
+}
+
+/// `join!` of an activity and a durable timer — wait-**all** over mixed kinds.
+fn mixed_join_activity_and_timer<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (activity, timer) = futures::join!(
+            ctx.execute_activity_raw("fetch_quote", Value::Null, "default"),
+            ctx.timer("cool_off", 30),
+        );
+        let activity = activity.map_err(|e| e.to_string())?;
+        timer.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"activity": activity}))
+    })
+}
+
+/// Build the recorded history for a two-branch mixed race whose branch-`0`
+/// dispatch event, branch-`1` dispatch event and the winning terminal appear in
+/// the given order, with the winner marker fixing the outcome.
+struct MixedFixture {
+    /// Events between `WorkflowStarted` and `WorkflowCompleted`.
+    body: Vec<WorkflowEvent>,
+    winner_index: u64,
+    output: Value,
+}
+
+impl MixedFixture {
+    fn into_events(self, branch_count: u64) -> Vec<WorkflowEvent> {
+        let mut events = vec![
+            mixed_started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(branch_count),
+            },
+        ];
+        events.extend(self.body);
+        events.push(WorkflowEvent::MarkerRecorded {
+            name: "race_winner:1".to_string(),
+            details: Value::from(self.winner_index),
+        });
+        events.push(WorkflowEvent::WorkflowCompleted {
+            output: self.output,
+        });
+        events
+    }
+}
+
+fn race_timer(index: usize) -> TimerId {
+    TimerId::new(format!("__race:1:{index}"))
+}
+
+fn activity_vs_timer_activity_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"price": 42}),
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"price": 42}}),
+    }
+    .into_events(2)
+}
+
+fn activity_vs_timer_timer_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            // The losing activity really was picked up by a worker before the
+            // deadline fired: its in-flight progress frontier straddles the
+            // winner's terminal (issue #1126). `permute_mixed_history` moves it
+            // to either side across the sweep.
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-a"),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: race_timer(1),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ],
+        winner_index: 1,
+        output: serde_json::json!({"index": 1, "value": Value::Null}),
+    }
+    .into_events(2)
+}
+
+fn activity_vs_signal_signal_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "long_running".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ],
+        winner_index: 1,
+        output: serde_json::json!({"index": 1, "value": {"reason": "user"}}),
+    }
+    .into_events(2)
+}
+
+fn activity_vs_signal_activity_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "long_running".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"done": true}),
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"done": true}}),
+    }
+    .into_events(2)
+}
+
+fn child_vs_timer_child_wins() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"settled": true}),
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"settled": true}}),
+    }
+    .into_events(2)
+}
+
+fn child_vs_timer_timer_wins() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: race_timer(1),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ],
+        winner_index: 1,
+        output: serde_json::json!({"index": 1, "value": Value::Null}),
+    }
+    .into_events(2)
+}
+
+fn child_vs_signal_signal_wins() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ],
+        winner_index: 1,
+        output: serde_json::json!({"index": 1, "value": {"reason": "user"}}),
+    }
+    .into_events(2)
+}
+
+fn child_vs_signal_child_wins() -> Vec<WorkflowEvent> {
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"settled": true}),
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"settled": true}}),
+    }
+    .into_events(2)
+}
+
+fn activity_vs_child_activity_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"price": 42}),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "lost race to a sibling branch".to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"price": 42}}),
+    }
+    .into_events(2)
+}
+
+fn activity_vs_child_child_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    let child_id = ExecutionId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "settle".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"settled": true}),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ],
+        winner_index: 1,
+        output: serde_json::json!({"index": 1, "value": {"settled": true}}),
+    }
+    .into_events(2)
+}
+
+fn three_way_activity_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"price": 42}),
+            },
+        ],
+        winner_index: 0,
+        output: serde_json::json!({"index": 0, "value": {"price": 42}}),
+    }
+    .into_events(3)
+}
+
+fn three_way_signal_wins() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    MixedFixture {
+        body: vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "fetch_quote".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: race_timer(1),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-a"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".to_string(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ],
+        winner_index: 2,
+        output: serde_json::json!({"index": 2, "value": {"reason": "user"}}),
+    }
+    .into_events(3)
+}
+
+/// `join!(activity, timer)` recorded with the two dispatch events in emission
+/// order and the two terminals in either arrival order — the wait-**all** case.
+fn join_activity_timer_fixture(activity_first: bool) -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    let timer_id = TimerId::new("cool_off");
+    let activity_done = WorkflowEvent::ActivityCompleted {
+        activity_id,
+        output: serde_json::json!({"price": 42}),
+    };
+    let timer_done = WorkflowEvent::TimerFired {
+        timer_id: timer_id.clone(),
+    };
+    let mut events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "fetch_quote".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 30,
+        },
+    ];
+    if activity_first {
+        events.push(activity_done);
+        events.push(timer_done);
+    } else {
+        events.push(timer_done);
+        events.push(activity_done);
+    }
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: serde_json::json!({"activity": {"price": 42}}),
+    });
+    events
+}
+
+/// Every mixed composition in the issue's success metric, as
+/// `(workflow name, handler, fixture builders)`.
+#[allow(clippy::type_complexity)]
+fn mixed_success_metric_matrix() -> Vec<(
+    &'static str,
+    WorkflowHandlerFn,
+    Vec<fn() -> Vec<WorkflowEvent>>,
+)> {
+    vec![
+        (
+            "activity_vs_timer",
+            mixed_activity_vs_timer as WorkflowHandlerFn,
+            vec![
+                activity_vs_timer_activity_wins as fn() -> Vec<WorkflowEvent>,
+                activity_vs_timer_timer_wins,
+            ],
+        ),
+        (
+            "activity_vs_signal",
+            mixed_activity_vs_signal as WorkflowHandlerFn,
+            vec![
+                activity_vs_signal_signal_wins as fn() -> Vec<WorkflowEvent>,
+                activity_vs_signal_activity_wins,
+            ],
+        ),
+        (
+            "child_vs_timer",
+            mixed_child_vs_timer as WorkflowHandlerFn,
+            vec![
+                child_vs_timer_child_wins as fn() -> Vec<WorkflowEvent>,
+                child_vs_timer_timer_wins,
+            ],
+        ),
+        (
+            "child_vs_signal",
+            mixed_child_vs_signal as WorkflowHandlerFn,
+            vec![
+                child_vs_signal_signal_wins as fn() -> Vec<WorkflowEvent>,
+                child_vs_signal_child_wins,
+            ],
+        ),
+        (
+            "activity_vs_child",
+            mixed_activity_vs_child as WorkflowHandlerFn,
+            vec![
+                activity_vs_child_activity_wins as fn() -> Vec<WorkflowEvent>,
+                activity_vs_child_child_wins,
+            ],
+        ),
+        (
+            "three_way",
+            mixed_three_way as WorkflowHandlerFn,
+            vec![
+                three_way_activity_wins as fn() -> Vec<WorkflowEvent>,
+                three_way_signal_wins,
+            ],
+        ),
+    ]
+}
+
+/// Every composition replays cleanly, both directions, once — the fast
+/// smoke-test that localises a failure before the 1,000-iteration sweep below.
+#[tokio::test]
+async fn mixed_compositions_each_replay_succeeded() {
+    for (name, handler, fixtures) in mixed_success_metric_matrix() {
+        for (i, fixture) in fixtures.iter().enumerate() {
+            let report = WorkflowReplayer::new()
+                .register_fn(name, handler)
+                .replay_from_events(fixture())
+                .await;
+            assert!(
+                matches!(report.status, ReplayStatus::ReplaySucceeded),
+                "{name} fixture {i} must replay:\n{report}"
+            );
+        }
+    }
+}
+
+/// Randomly permute the **event-arrival order** of a recorded mixed-race
+/// history, staying inside the space of histories the engine can actually
+/// record.
+///
+/// Two things in a mixed-batch history are NOT arrival order and must be held
+/// fixed, or the permutation manufactures a history no worker could ever write
+/// and the resulting "divergence" is the replay engine correctly rejecting it:
+///
+/// - **The dispatch block.** Every branch's `ActivityScheduled` / `TimerStarted`
+///   / `ChildWorkflowStarted` is written by `build_suspension_events` in command
+///   emission order — one atomic batch, always in branch order. Reordering it is
+///   a *code* change (the workflow declared its branches differently), which
+///   replay is supposed to flag.
+/// - **Which branch terminal is first.** The winner is decided by recorded
+///   history order and pinned by the `race_winner:{seq}` marker, so moving a
+///   different branch's terminal ahead of it describes a different race, not a
+///   different arrival order.
+///
+/// What genuinely varies, and is what this permutes:
+///
+/// - where each losing branch's in-flight **progress** event (`ActivityStarted`)
+///   lands — before the winner's terminal, or after it, straddling the matcher
+///   cursor (the issue #1126 `consume_race_loser_frontier` case), and
+/// - the relative order of the losing branches' teardown terminals, which the
+///   worker appends once the winner is known.
+fn permute_mixed_history(events: &[WorkflowEvent], seed: u64) -> Vec<WorkflowEvent> {
+    const fn is_dispatch(e: &WorkflowEvent) -> bool {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+        )
+    }
+    const fn is_progress(e: &WorkflowEvent) -> bool {
+        matches!(
+            e,
+            WorkflowEvent::ActivityStarted { .. } | WorkflowEvent::ActivityHeartbeat { .. }
+        )
+    }
+    fn is_loser_teardown(e: &WorkflowEvent) -> bool {
+        match e {
+            WorkflowEvent::ActivityFailed { error, .. }
+            | WorkflowEvent::ChildWorkflowFailed { error, .. } => {
+                error.contains("lost race to a sibling branch")
+            }
+            _ => false,
+        }
+    }
+
+    let open_at = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("race:")))
+        .expect("fixture always records the open marker");
+    let winner_at = events
+        .iter()
+        .position(
+            |e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("race_winner:")),
+        )
+        .expect("fixture always records the winner marker");
+
+    let window = &events[open_at + 1..winner_at];
+    let dispatches: Vec<WorkflowEvent> =
+        window.iter().filter(|e| is_dispatch(e)).cloned().collect();
+    let progress: Vec<WorkflowEvent> = window.iter().filter(|e| is_progress(e)).cloned().collect();
+    let winner_terminal: Vec<WorkflowEvent> = window
+        .iter()
+        .filter(|e| !is_dispatch(e) && !is_progress(e) && !is_loser_teardown(e))
+        .cloned()
+        .collect();
+    let mut teardowns: Vec<WorkflowEvent> = window
+        .iter()
+        .filter(|e| is_loser_teardown(e))
+        .cloned()
+        .collect();
+
+    // Deterministic LCG (no RNG dependency), mirroring the sweep's own.
+    let mut state = seed | 1;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) as usize
+    };
+    if teardowns.len() > 1 {
+        for i in (1..teardowns.len()).rev() {
+            teardowns.swap(i, next() % (i + 1));
+        }
+    }
+    let progress_before_win = next() % 2 == 0;
+
+    let mut out = Vec::with_capacity(events.len());
+    out.extend_from_slice(&events[..=open_at]);
+    out.extend(dispatches);
+    if progress_before_win {
+        out.extend(progress.iter().cloned());
+        out.extend(winner_terminal);
+    } else {
+        out.extend(winner_terminal);
+        out.extend(progress.iter().cloned());
+    }
+    out.extend(teardowns);
+    out.extend_from_slice(&events[winner_at..]);
+    out
+}
+
+/// Issue #950 success metric: >= 6 mixed compositions each replay
+/// deterministically across **1,000 randomized event-arrival orderings** with
+/// **0 divergences** (the #476/#779 precedent). Each iteration picks a
+/// composition and a recorded winner, then permutes that history's arrival
+/// order via [`permute_mixed_history`] — where each losing branch's in-flight
+/// progress event lands relative to the winner's terminal, and the order the
+/// losers are torn down in.
+///
+/// Every iteration replays the permuted history **twice** and requires the two
+/// reports to agree: "replays deterministically" is a statement about
+/// reproducibility, which a single replay per ordering cannot establish.
+#[tokio::test]
+async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
+    let matrix = mixed_success_metric_matrix();
+    // Simple deterministic LCG so the test needs no RNG dependency.
+    let mut seed: u64 = 0x5DEE_CE66;
+    let mut divergences: Vec<String> = Vec::new();
+    let mut covered: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut distinct_orderings: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for i in 0..1_000 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let pick = (seed >> 16) as usize % matrix.len();
+        let (name, handler, fixtures) = &matrix[pick];
+        let fixture = fixtures[(seed >> 8) as usize % fixtures.len()];
+        covered.insert(name);
+
+        let events = permute_mixed_history(&fixture(), seed);
+        // Fingerprint the ORDERING (event type names only — the ids are fresh
+        // per fixture call and would make every iteration trivially distinct).
+        distinct_orderings.insert(format!(
+            "{name}|{}",
+            events
+                .iter()
+                .map(WorkflowEvent::type_name)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+
+        let first = WorkflowReplayer::new()
+            .register_fn(*name, *handler)
+            .replay_from_events(events.clone())
+            .await;
+        let second = WorkflowReplayer::new()
+            .register_fn(*name, *handler)
+            .replay_from_events(events)
+            .await;
+        if !matches!(first.status, ReplayStatus::ReplaySucceeded) {
+            divergences.push(format!("iteration {i} ({name}): {first}"));
+        } else if format!("{:?}", first.status) != format!("{:?}", second.status) {
+            divergences.push(format!(
+                "iteration {i} ({name}) is not reproducible: {first} vs {second}"
+            ));
+        }
+    }
+    assert!(
+        divergences.is_empty(),
+        "0 divergences required across 1,000 randomized replays, got {}:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    // Guard the sweep against silently degenerating: it must cover every
+    // composition, AND the permutation must actually produce more orderings than
+    // there are hand-written fixtures (otherwise "randomized orderings" would be
+    // an empty claim).
+    assert_eq!(
+        covered.len(),
+        matrix.len(),
+        "the sweep must exercise every composition, only covered {covered:?}"
+    );
+    let fixture_count: usize = matrix.iter().map(|(_, _, f)| f.len()).sum();
+    assert!(
+        distinct_orderings.len() > fixture_count,
+        "the sweep must explore MORE distinct event orderings ({}) than there are \
+         hand-written fixtures ({fixture_count}) — otherwise it is replaying the \
+         same histories 1,000 times, not sweeping arrival orders",
+        distinct_orderings.len()
+    );
+}
+
+/// The wait-**all** half of AC1: `join!(activity, timer)` replays identically
+/// whichever branch's terminal was recorded first.
+#[tokio::test]
+async fn mixed_join_replays_succeeded_for_both_arrival_orders() {
+    for activity_first in [true, false] {
+        let report = WorkflowReplayer::new()
+            .register_fn("join_activity_timer", mixed_join_activity_and_timer)
+            .replay_from_events(join_activity_timer_fixture(activity_first))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "join! with activity_first={activity_first} must replay:\n{report}"
+        );
+    }
+}
+
+/// `join!` of a **plain** signal wait and an activity — the wait-all form AC1
+/// advertises, and the one shape `match_signal` (not `match_race_signal`)
+/// resolves. `futures::join!` polls in declaration order, so the
+/// `WaitForSignal` command is pushed first and the batch records only the
+/// sibling's `ActivityScheduled`; on the next drive `wait_for_signal` is polled
+/// first and its scan starts ON that interleaved event.
+fn mixed_join_signal_and_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, activity) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.execute_activity_raw("step", Value::Null, "default"),
+        );
+        let signal = signal.map_err(|e| e.to_string())?;
+        let activity = activity.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": signal, "activity": activity}))
+    })
+}
+
+/// `join!` of a plain signal wait and a CHILD workflow — same shape, child
+/// sibling.
+fn mixed_join_signal_and_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, child) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.spawn_child_workflow_raw("settle", Value::Null),
+        );
+        let signal = signal.map_err(|e| e.to_string())?;
+        let child = child.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": signal, "child": child}))
+    })
+}
+
+/// Codex round 1, P1: a plain `join!(wait_for_signal, execute_activity)` must
+/// replay to completion. The sibling's `ActivityScheduled` (and its terminal)
+/// sit between the cursor and the eventual `SignalReceived`, and `match_signal`
+/// previously treated an interleaved activity/child event as a **divergence** —
+/// the composition this PR advertises would have nd-blocked on its first wake
+/// instead of completing.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_last() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "activity": {"done": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a plain join! of a signal wait and an activity must replay:\n{report}"
+    );
+}
+
+/// The same shape with the signal recorded BEFORE the sibling's terminal — the
+/// signal branch resolves first and the activity is still in flight.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_first() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "activity": {"done": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "signal-first arrival order must replay too:\n{report}"
+    );
+}
+
+/// A CHILD sibling, not an activity — the other half of the P1.
+#[tokio::test]
+async fn mixed_join_signal_and_child_replays() {
+    let child_id = ExecutionId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "settle".to_string(),
+            input: Value::Null,
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"settled": true}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"n": 1}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({
+                "signal": {"n": 1},
+                "child": {"settled": true},
+            }),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_child", mixed_join_signal_and_child)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a plain join! of a signal wait and a child workflow must replay:\n{report}"
+    );
+}
+
+/// The in-flight frontier: the sibling activity has run but the signal has NOT
+/// arrived. This is a healthy **suspend** — the workflow re-parks on the signal
+/// — not a divergence.
+///
+/// A TIMER sibling in the same position must park too (Codex round 3; see
+/// `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`).
+/// What round 13 (issue #768) still requires is that a stray command NOTHING in
+/// the decision claims nd-blocks — which is now decided at the end of the cycle
+/// rather than inside the scan.
+#[tokio::test]
+async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("join_signal_activity", mixed_join_signal_and_activity)
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an undelivered signal beside a resolved activity sibling is a healthy \
+         suspend, not a divergence:\n{report}"
+    );
+}
+
+/// `join!` of a signal wait, a durable TIMER and an activity — the three-way
+/// AC1 composition, signal polled first so the persisted batch records
+/// `TimerStarted` + `ActivityScheduled` and nothing for the signal wait.
+fn mixed_join_signal_timer_and_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (signal, timer, activity) = futures::join!(
+            ctx.wait_for_signal("go"),
+            ctx.timer("deadline", 30),
+            ctx.execute_activity_raw("step", Value::Null, "default"),
+        );
+        signal.map_err(|e| e.to_string())?;
+        timer.map_err(|e| e.to_string())?;
+        activity.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Codex round 3, P1: the FIRST wake of a mixed batch that contains a durable
+/// timer beside a signal wait must be a healthy suspend, not a divergence.
+///
+/// `join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` persists `TimerStarted`
+/// and nothing for the signal wait. On the next drive the signal is polled
+/// first, its scan crosses that `TimerStarted`, and before this fix the crossed
+/// timer set `stray_timer_command` — so the end-of-scan round-13 guard (#768)
+/// returned `Diverged` and nd-blocked an advertised AC1 composition on its very
+/// first wake, immediately after #950 made the batch persistable.
+///
+/// The timer here belongs to THIS decision (the sibling branch emits
+/// `StartTimer("t")` in the same cycle and `match_timer_strict` claims the
+/// event), which is what separates it from the orphan timer that
+/// `interleaved_sibling_signal_stray_timer_started_still_diverges` pins.
+#[tokio::test]
+async fn mixed_join_signal_and_timer_parks_before_either_branch_resolves() {
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t"),
+            duration_secs: 5,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "signal_and_user_timer",
+            signal_wait_with_user_timer_workflow,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "signal_and_user_timer",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a mixed batch's own armed timer beside an undelivered signal is a \
+         healthy suspend — the round-13 stray-timer guard must not fire on a \
+         timer this decision itself arms:\n{report}"
+    );
+}
+
+/// The three-way shape Codex named verbatim: signal + timer + activity, sampled
+/// at the frontier where the batch has just been persisted and no branch has
+/// resolved.
+#[tokio::test]
+async fn mixed_join_signal_timer_and_activity_parks_at_the_persistence_frontier() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("deadline"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "join_signal_timer_activity",
+            mixed_join_signal_timer_and_activity,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_timer_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the three-way join!(signal, timer, activity) must park on its first \
+         wake, not nd-block:\n{report}"
+    );
+}
+
+/// The same three-way shape one step further along: the activity has completed
+/// and the timer is still armed, but the signal has not arrived. The signal
+/// scan now crosses `TimerStarted`, `ActivityScheduled` AND `ActivityCompleted`.
+#[tokio::test]
+async fn mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("deadline"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "join_signal_timer_activity",
+            mixed_join_signal_timer_and_activity,
+        )
+        .replay_canary_snapshot(make_snapshot(
+            "join_signal_timer_activity",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a resolved activity sibling beside a still-armed timer and an \
+         undelivered signal is still a healthy suspend:\n{report}"
+    );
+}
+
+/// A **solo** `ctx.wait_for_signal` — no sibling awaitable at all.
+fn solo_wait_for_signal<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let payload = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"signal": payload}))
+    })
+}
+
+/// Codex round 2, P1-B: a deploy that REPLACES a recorded activity with a lone
+/// `wait_for_signal` must still be caught, not silently parked forever.
+///
+/// The history was recorded by code that ran an activity; the new code runs only
+/// a signal wait. `match_signal` now crosses the stale `ActivityScheduled`
+/// instead of diverging on it (issue #950, so a mixed batch's sibling does not
+/// false-diverge), which raised the question of whether this stale-command case
+/// still fails loudly. It does: the stale events are never claimed by anything,
+/// so the executor's suspend-time `history_has_unconsumed_events` guard fires.
+/// The divergence moves from the matcher to the end of the cycle; it does not
+/// disappear.
+#[tokio::test]
+async fn solo_signal_wait_over_a_stale_recorded_activity_still_diverges() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "old_step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("solo_signal", solo_wait_for_signal)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        !matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a solo wait_for_signal over a stale recorded activity must NOT be \
+         reported as a healthy replay — it would park forever on a signal that \
+         will never arrive:\n{report}"
+    );
+}
+
+/// The same stale-command shape under the deploy CANARY, which uses the relaxed
+/// `check_strict_replay_signal_no_match` frontier. The canary must not bless it
+/// either.
+#[tokio::test]
+async fn solo_signal_wait_over_a_stale_recorded_activity_is_not_a_healthy_canary() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "old_step".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!({"done": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("solo_signal", solo_wait_for_signal)
+        .replay_canary_snapshot(make_snapshot("solo_signal", ExecutionId::new(), events))
+        .await;
+    assert!(
+        !matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the canary must not bless a stale recorded activity replaced by a lone \
+         signal wait:\n{report}"
+    );
+}
+
+/// An in-flight mixed race sampled at the recorded-history frontier (both
+/// branches dispatched, neither resolved) is a healthy suspend, not a false
+/// non-determinism — the canary case #779 pinned for its own shape.
+#[tokio::test]
+async fn mixed_in_flight_race_at_the_frontier_replays_succeeded() {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        mixed_started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "fetch_quote".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: race_timer(1),
+            duration_secs: 30,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("activity_vs_timer", mixed_activity_vs_timer)
+        .replay_canary_snapshot(make_snapshot(
+            "activity_vs_timer",
+            ExecutionId::new(),
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an in-flight mixed race at the frontier must be a healthy suspend:\n{report}"
+    );
+}

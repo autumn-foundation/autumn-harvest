@@ -1593,8 +1593,11 @@ where
 /// across a partial suspension must **resume the already-scheduled in-flight
 /// prefix as a homogeneous batch** — never regroup an in-flight slot together
 /// with never-scheduled fresh slots into a mixed
-/// `[WaitForActivity + ScheduleActivity]` suspension batch (which the worker's
-/// `handle_suspended_workflow` cannot persist, terminally FAILING the run).
+/// `[WaitForActivity + ScheduleActivity]` suspension batch. (Before issue #950
+/// the worker's `handle_suspended_workflow` could not persist that batch at all
+/// and terminally FAILED the run; it is persistable now, but the regrouping
+/// would still change the recorded command order across a window change, which
+/// is the determinism property this test pins.)
 ///
 /// Recorded under `W1=1` (only slot 0 scheduled, still in-flight); re-driven
 /// under `W2=3`.
