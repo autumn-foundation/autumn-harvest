@@ -8,7 +8,15 @@ the registered `DagDefinition` and the run's recorded `WorkflowEvent`
 history. Wall-clock timing is not admissible evidence on this (shared-vCPU)
 machine -- every number below is a deterministic instruction count
 (`valgrind --tool=callgrind`) or allocation count/bytes
-(`valgrind --tool=dhat`), both reproducible bit-for-bit on any machine.
+(`valgrind --tool=dhat`), both reproducible bit-for-bit on the *same* binary
+and environment (unlike wall time, they don't vary run to run here). They
+are not a portable cross-machine guarantee: a different libc's dynamically
+selected implementation (`__memcmp_avx2_movbe` below is one such
+CPU-feature-dispatched routine) or a different toolchain can generate
+different instruction counts for the same source, so the specific figures
+on this page are this session's, stable within measurement noise -- the
+percentage reductions and the mechanism they demonstrate are the portable
+claim.
 
 ## Workload
 

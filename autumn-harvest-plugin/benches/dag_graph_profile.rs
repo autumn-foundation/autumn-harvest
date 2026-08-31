@@ -1005,6 +1005,11 @@ fn push_gate_resolution(
         // firing before any signal arrives.
         _ => {
             push(t, events, gate_timer_started(1, &gate.signal_name, 300));
+            // A durable timer cannot fire before its own deadline: advance
+            // the recorded clock by the full 300s the timer was armed for
+            // before recording `TimerFired`, rather than the usual 1s
+            // between events (issue #690 review, Codex).
+            *t += 300;
             push(t, events, gate_timer_fired(1, &gate.signal_name));
             true
         }
