@@ -350,6 +350,19 @@ pub struct BuiltHarvest {
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
     audit_export_config: crate::audit_export::AuditExportBuilderConfig,
+    /// When set, `into_worker_parts*` does **not** install the process-global
+    /// audit-export config (issue #953, Codex review round 5 P1).
+    ///
+    /// The plugin runner publishes it itself, once its whole build has
+    /// succeeded. Without this, the conversion installs the config partway
+    /// through a still-fallible build, and a scanner belonging to a runtime
+    /// already running in this process can tick inside that window and ship
+    /// audit records to a sink that never came into service — or, for a
+    /// webhook-only build, stop exporting entirely, since the direct-worker
+    /// path writes `None` when it finds no embedder sink. Restoring the value
+    /// afterwards repairs the config but cannot un-send those records, so the
+    /// write is suppressed rather than compensated.
+    defer_audit_export_install: bool,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
@@ -1089,6 +1102,28 @@ impl BuiltHarvest {
         &self.audit_export_config
     }
 
+    /// Suppress the process-global audit-export install that
+    /// [`Self::into_worker_parts`] and [`Self::into_worker_parts_with_extra_state`]
+    /// otherwise perform (issue #953, Codex review round 5 P1).
+    ///
+    /// For a caller that publishes the config itself **after** its whole build
+    /// has succeeded — the plugin runner does exactly this. The conversion
+    /// happens partway through a still-fallible build, and a runtime already
+    /// running in this process has a live scanner that can tick inside that
+    /// window: it would ship audit records to a sink that never came into
+    /// service, or (for a webhook-only build, where the direct-worker path
+    /// installs `None`) stop exporting during it. Repairing the global
+    /// afterwards cannot un-send those records, so the write is suppressed
+    /// rather than compensated.
+    ///
+    /// A caller that sets this **must** install the config itself, or audit
+    /// export silently never starts.
+    #[must_use]
+    pub const fn deferring_audit_export_install(mut self) -> Self {
+        self.defer_audit_export_install = true;
+        self
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -1122,9 +1157,11 @@ impl BuiltHarvest {
         // Only an embedder-supplied sink can be installed here — core ships no
         // HTTP client, so `audit_export_webhook(...)` alone has nothing to
         // deliver with on this path and is reported rather than ignored.
-        crate::audit_export::install_global_audit_export_config_for_direct_worker(
-            &self.audit_export_config,
-        );
+        if !self.defer_audit_export_install {
+            crate::audit_export::install_global_audit_export_config_for_direct_worker(
+                &self.audit_export_config,
+            );
+        }
         // issue #808 review (Codex P2): the start-idempotency expiry sweep
         // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
         // its retention window from a process-global static, mirroring the
@@ -1225,9 +1262,11 @@ impl BuiltHarvest {
         // Only an embedder-supplied sink can be installed here — core ships no
         // HTTP client, so `audit_export_webhook(...)` alone has nothing to
         // deliver with on this path and is reported rather than ignored.
-        crate::audit_export::install_global_audit_export_config_for_direct_worker(
-            &self.audit_export_config,
-        );
+        if !self.defer_audit_export_install {
+            crate::audit_export::install_global_audit_export_config_for_direct_worker(
+                &self.audit_export_config,
+            );
+        }
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
         #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
@@ -2379,6 +2418,7 @@ impl HarvestBuilder {
             ))
         });
         Ok(BuiltHarvest {
+            defer_audit_export_install: false,
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
@@ -7023,6 +7063,81 @@ mod tests {
             matches!(err, HarvestBuilderError::AuditSinkSecretMissing),
             "expected AuditSinkSecretMissing, got {err:?}"
         );
+    }
+
+    /// The plugin runner publishes the global itself after its build
+    /// succeeds, so the conversion must not write it at all — not write it and
+    /// have it repaired later (issue #953, Codex review round 5 P1). A live
+    /// runtime's scanner ticking mid-build would otherwise export records to a
+    /// sink that never came into service, and no restore un-sends those.
+    #[cfg(feature = "db")]
+    #[test]
+    fn deferring_the_install_leaves_the_global_untouched_through_conversion() {
+        struct Marker;
+        impl crate::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a crate::audit_export::AuditBatch<'a>,
+            ) -> crate::audit_export::SinkFuture<'a> {
+                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
+            }
+        }
+
+        let _serial = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .map(|mut lock| *lock = None);
+
+        // Stand in for a runtime already exporting in this process.
+        let live = std::sync::Arc::new(crate::audit_export::AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(Marker),
+            secret: crate::completion_callback::CallbackSecret::new(b"live".to_vec()),
+            batch_size: 11,
+            backoff: crate::audit_export::ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(30),
+        });
+        if let Ok(mut lock) = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
+            *lock = Some(live);
+        }
+
+        // A second runtime is built with its OWN sink and converted. With the
+        // install deferred, the conversion must not disturb the live config.
+        let built = HarvestBuilder::new()
+            .audit_export_sink(Marker)
+            .audit_export_secret(b"second".to_vec())
+            .audit_export_batch_size(99)
+            .build()
+            .deferring_audit_export_install();
+        let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
+
+        let observed = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .expect("the live runtime's config must still be installed");
+        assert_eq!(
+            observed.batch_size, 11,
+            "the conversion must not publish the second runtime's sink: a live \
+             scanner ticking here would export to a runtime that may never start"
+        );
+
+        // And without the opt-out the conversion still installs, so a direct
+        // core embedder is unaffected.
+        let built = HarvestBuilder::new()
+            .audit_export_sink(Marker)
+            .audit_export_secret(b"direct".to_vec())
+            .audit_export_batch_size(42)
+            .build();
+        let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
+        let observed = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .expect("the direct-worker path must still install");
+        assert_eq!(observed.batch_size, 42);
+
+        if let Ok(mut lock) = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
+            *lock = None;
+        }
     }
 
     #[test]

@@ -366,6 +366,14 @@ fn commit_audit_export_config(
 /// A guard rather than a restore call at each `?`: it covers every failure
 /// path after the conversion, including ones added later, and cannot be
 /// forgotten. `commit` consumes it on the success path.
+///
+/// Round 5 note: this is now the *second* line of defence. Restoring the
+/// previous value repairs the config but leaves an observable interval — a
+/// live runtime's scanner can tick while the global is clobbered, and no
+/// restore un-sends the audit records it exported to the wrong sink. So the
+/// conversion's own write is suppressed at the source
+/// (`BuiltHarvest::deferring_audit_export_install`) and this guard remains
+/// only to catch anything else that might publish before `commit`.
 struct AuditExportInstallGuard {
     previous: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
     committed: bool,
@@ -421,6 +429,13 @@ impl PreparedHarvestRuntime {
         // P1). `install_completion_callback_config` above still publishes
         // eagerly; that is #605's pre-existing behaviour and out of scope here.
         let audit_export_config = prepare_audit_export_config(&built);
+        // ...and the conversion below must not publish it either (round 5 P1).
+        // Suppressing that write is what keeps the global *untouched* for the
+        // whole build, rather than clobbered and later repaired: a live
+        // runtime's scanner can tick during `compile_dag_catalog`, and a
+        // restore afterwards cannot un-send the records it exported to a sink
+        // that never came into service.
+        let built = built.deferring_audit_export_install();
         let classic_dag_names = built
             .dags()
             .iter()
@@ -487,9 +502,10 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
-        // Armed before the conversion, which installs the global config itself
-        // (see `AuditExportInstallGuard`). Any early return below now restores
-        // the previous config instead of leaving this build's behind.
+        // Belt and braces behind the suppression above: the guard restores the
+        // previous value should anything else in this build publish the global
+        // before `commit`. With the conversion's write suppressed there should
+        // be nothing to restore, and the guard costs one clone.
         let audit_export_guard = AuditExportInstallGuard::arm();
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
