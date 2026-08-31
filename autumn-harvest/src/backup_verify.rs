@@ -1495,11 +1495,28 @@ mod probes {
         // — permanently, and including the cross-region failover runbook's
         // pre-flight. The invariant is real and worth checking; it just is not
         // an invariant of that layout.
-        if !crate::partition::detect_layout(&mut conn)
-            .await
-            .map(|l| l.is_partitioned())
-            .unwrap_or(false)
-        {
+        // A FAILED probe is not "unpartitioned". `detect_layout` errors when the
+        // catalog cannot be read or when `harvest_event_cohort` is missing or
+        // has an unexpected body — and a partitioned shard whose cohort
+        // function is damaged is precisely the kind of thing a restore drill
+        // should surface. Defaulting to `false` there would run the
+        // dangling-event invariant against a partitioned shard, report its
+        // designed orphans as `Incoherent` ("do not start workers", exit 1),
+        // block the restore, and discard the real catalog error that explains
+        // why. Record it as a soft error and skip the layout-dependent probe.
+        let layout = match crate::partition::detect_layout(&mut conn).await {
+            Ok(layout) => Some(layout),
+            Err(e) => {
+                soft_errors.push(format!(
+                    "could not determine the harvest_events layout, so the \
+                     dangling-event invariant was skipped (it does not hold on the \
+                     partitioned layout, where orphan event rows are reclaimed by \
+                     the partition sweeper): {e}"
+                ));
+                None
+            }
+        };
+        if layout.is_some_and(|l| !l.is_partitioned()) {
             dangling.push((
                 FindingClass::DanglingEventExecution,
                 bounded(
