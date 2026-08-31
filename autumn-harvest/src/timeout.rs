@@ -3467,7 +3467,9 @@ pub async fn enforce_timeouts_once(
     // scanner will re-enter its decision cycle on the next claim either way, so
     // ordering costs nothing but keeps the cheap always-empty scan last among
     // the delivery family.
-    count += crate::cross_shard_child::enforce_cross_shard_children(conn, sharded_pool).await?;
+    count +=
+        crate::cross_shard_child::enforce_cross_shard_children(conn, sharded_pool, payload_codecs)
+            .await?;
     count +=
         crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
             .await?;

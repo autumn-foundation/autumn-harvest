@@ -116,13 +116,16 @@ pub struct CrossShardChildSpec {
     #[serde(default)]
     pub sla_secs: Option<i64>,
     #[serde(default)]
-    pub sla_deadline_at: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub execution_timeout_secs: Option<i64>,
     #[serde(default)]
-    pub deadline_at: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub chain_execution_timeout_secs: Option<i64>,
+    /// The absolute **chain** deadline, carried verbatim.
+    ///
+    /// Unlike the per-run deadlines, this one is deliberately absolute: a chain
+    /// cap is anchored at the chain origin's start and carried unchanged across
+    /// every continue-as-new precisely so a runaway loop cannot escape it by
+    /// continuing. Re-anchoring it at relay time would hand the child a fresh
+    /// chain budget and defeat the cap.
     #[serde(default)]
     pub chain_deadline_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -228,10 +231,14 @@ impl QuotaCaps {
 /// behaviour. Nothing has been recorded at this point, so the resolved child id
 /// never reaches history.
 ///
-/// This also catches `ChildPlacement::Distributed` resolved while **no** shard is
-/// writable: `pick_for_new_workflow` falls back to `default_shard` in that state,
-/// and with the writable set empty `default_shard` is by definition not writable,
-/// so the fallback is rejected here instead of silently landing a child.
+/// Scope note: this rejects a **cross-shard** target that is drained. It does not
+/// (and must not) reject a child resolving to the parent's *own* drained shard —
+/// that path never reaches here, and refusing it would deadlock the drain, since
+/// a drained shard is one that should let its in-flight work finish and a parent
+/// cannot finish while the children it awaits are refused. The fully-drained
+/// `Distributed` degenerate case is handled in
+/// [`resolve_child_placement`](crate::shard::resolve_child_placement), which
+/// traces it rather than failing it.
 ///
 /// A `None` router skips only the writability half — a deployment with a pool map
 /// and no router cannot have produced a cross-shard target in the first place.
@@ -385,7 +392,16 @@ type ChildStateRow = (
 struct TargetChildState {
     state: String,
     output: Option<serde_json::Value>,
+    /// The child's `error` COLUMN, which holds the human message only.
     error: Option<String>,
+    /// The raw typed failure envelope from the child's own `WorkflowFailed`
+    /// event, when one was loaded (issue #767 parity, issue #956 Codex round 4).
+    ///
+    /// The `error` column stores `decoded.message`, not the envelope, so
+    /// re-decoding it yields an *untyped* failure and the parent would silently
+    /// lose `error_type` / `details` / `non_retryable` — a different observable
+    /// surface than the same-shard path, which forwards the raw envelope.
+    typed_failure: Option<String>,
 }
 
 /// One sweep of the cross-shard child relay.
@@ -403,9 +419,15 @@ struct TargetChildState {
 ///
 /// Only propagates a failure to read this shard's own work-list; every per-row
 /// and per-target-shard failure is absorbed onto the row.
+// Long by construction: the sweep is a linear sequence of clearly-named phases
+// (resolve the pool, load the batch, stamp it, read both sides, decide and act
+// per row). Splitting it would scatter that order across call sites without
+// making any phase easier to check.
+#[allow(clippy::too_many_lines)]
 pub async fn enforce_cross_shard_children(
     conn: &mut AsyncPgConnection,
     sharded_pool: &Option<ShardedDbPool>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     // Every cross-shard checkout in this sweep is bounded. Harvest configures no
     // deadpool `Timeouts`, so a bare `pool.get().await` is an *unbounded* wait,
@@ -465,7 +487,48 @@ pub async fn enforce_cross_shard_children(
     // One batched read per target shard, not one per row: a 10k-child fan-out
     // must not become a 10k-round-trip sweep (the `O(nodes x shards)` shape the
     // children-traversal N+1 fix already called out in this repo).
-    let child_states = load_child_states(&pool, &rows, acquire_bound).await;
+    let (mut child_states, readable_shards) = load_child_states(&pool, &rows, acquire_bound).await;
+
+    // A `STARTED` row whose child is absent from a shard we READ SUCCESSFULLY is
+    // not "still running" — it is gone. The status is only set after the child's
+    // insert commits, so on a readable shard absence means the row was collected
+    // (retention, erase). Left as `None` it would look identical to "the shard
+    // was unreachable this sweep", the state machine would `Wait`, and an awaited
+    // parent would park forever on a child that no longer exists.
+    //
+    // Synthesising a terminal here converts a permanent hang into a typed
+    // `ChildWorkflowFailed` the parent can actually observe and handle. This is
+    // reachable only when the relay is down for longer than the target shard's
+    // whole retention window, which is days — but "the parent hangs forever" is
+    // not an acceptable outcome for any window.
+    for row in &rows {
+        if CrossShardChildStatus::from_db(&row.status) == Some(CrossShardChildStatus::Started)
+            && !child_states.contains_key(&row.child_exec_id)
+            && readable_shards.contains(&row.target_shard)
+        {
+            tracing::warn!(
+                child_exec_id = %row.child_exec_id,
+                parent_exec_id = %row.parent_exec_id,
+                target_shard = row.target_shard,
+                "cross-shard child no longer exists on its target shard (collected \
+                 by retention before the relay could deliver its terminal); \
+                 reporting it to the parent as failed rather than parking forever"
+            );
+            child_states.insert(
+                row.child_exec_id,
+                TargetChildState {
+                    state: "TERMINATED".to_string(),
+                    output: None,
+                    error: Some(
+                        "child workflow execution no longer exists on its shard \
+                         (collected before its terminal was delivered)"
+                            .to_string(),
+                    ),
+                    typed_failure: None,
+                },
+            );
+        }
+    }
     let parent_terminal = load_parent_terminal_states(conn, &rows).await;
 
     let mut progressed = 0;
@@ -522,6 +585,7 @@ pub async fn enforce_cross_shard_children(
             &observation,
             observed_child,
             acquire_bound,
+            codecs,
         )
         .await
         {
@@ -631,8 +695,11 @@ async fn load_child_states(
     pool: &ShardedDbPool,
     rows: &[CrossShardChildRow],
     acquire_bound: Option<std::time::Duration>,
-) -> std::collections::HashMap<uuid::Uuid, TargetChildState> {
-    use std::collections::HashMap;
+) -> (
+    std::collections::HashMap<uuid::Uuid, TargetChildState>,
+    std::collections::HashSet<i32>,
+) {
+    use std::collections::{HashMap, HashSet};
     let mut by_shard: HashMap<i32, Vec<uuid::Uuid>> = HashMap::new();
     for row in rows {
         by_shard
@@ -642,6 +709,10 @@ async fn load_child_states(
     }
 
     let mut states: HashMap<uuid::Uuid, TargetChildState> = HashMap::new();
+    // Which shards actually answered. "No row for this child" means something
+    // completely different depending on whether we could read the shard at all,
+    // so the caller needs both facts, not just the map.
+    let mut readable: HashSet<i32> = HashSet::new();
     for (shard, ids) in by_shard {
         let Some(shard_pool) = pool.exact_pool_for(ShardId::new(shard)) else {
             continue;
@@ -669,6 +740,7 @@ async fn load_child_states(
             .await;
         match loaded {
             Ok(pairs) => {
+                readable.insert(shard);
                 for (id, state, output, error) in pairs {
                     states.insert(
                         id,
@@ -676,6 +748,7 @@ async fn load_child_states(
                             state,
                             output,
                             error,
+                            typed_failure: None,
                         },
                     );
                 }
@@ -687,7 +760,7 @@ async fn load_child_states(
             ),
         }
     }
-    states
+    (states, readable)
 }
 
 /// Batched `parent_id -> is_terminal` read on this (the parent's) shard.
@@ -749,6 +822,7 @@ async fn apply_action(
     observation: &CrossShardChildObservation<'_>,
     observed_child: Option<&TargetChildState>,
     acquire_bound: Option<std::time::Duration>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     match action {
         CrossShardChildAction::Wait => Ok(false),
@@ -757,7 +831,7 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::StartChild => {
-            start_child_on_target(pool, row, acquire_bound).await?;
+            start_child_on_target(pool, row, acquire_bound, codecs).await?;
             // Only after the child is durably committed on the target shard.
             // A crash before this update simply re-runs the insert, which the
             // child's primary key makes a no-op.
@@ -942,6 +1016,7 @@ async fn start_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
@@ -968,6 +1043,26 @@ async fn start_child_on_target(
                 return Ok(());
             }
 
+            // Anchor the PER-RUN deadlines at creation, not at the parent's
+            // decision. The relay can be minutes behind that decision — an
+            // unreachable target shard, a large backlog, a worker restart — and
+            // an absolute `deadline_at`/`sla_deadline_at` computed back then can
+            // already be in the past by the time the row lands, so the timeout
+            // and SLA scanners would time out or breach a child that has not run
+            // a single step. The normal start path derives these from the
+            // target's own start time for exactly this reason; the durations
+            // travel on the spec and become absolute here.
+            //
+            // The CHAIN deadline is the deliberate exception and is carried
+            // verbatim — see `CrossShardChildSpec::chain_deadline_at`.
+            let created_at = Utc::now();
+            let deadline_at = spec
+                .execution_timeout_secs
+                .map(|secs| created_at + chrono::Duration::seconds(secs));
+            let sla_deadline_at = spec
+                .sla_secs
+                .map(|secs| created_at + chrono::Duration::seconds(secs));
+
             let child_row = NewWorkflowExecution {
                 continued_from_exec_id: None,
                 first_exec_id: None,
@@ -988,9 +1083,9 @@ async fn start_child_on_target(
                 parent_id: Some(parent_exec_id.as_uuid()),
                 queue_name: &spec.queue_name,
                 execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
-                deadline_at: spec.deadline_at,
+                deadline_at,
                 sla: spec.sla_secs.map(chrono::Duration::seconds),
-                sla_deadline_at: spec.sla_deadline_at,
+                sla_deadline_at,
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: spec.assigned_build_id.clone(),
@@ -1038,17 +1133,34 @@ async fn start_child_on_target(
             )
             .await?;
 
-            store::append_events(
+            // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
+            // The child's `WorkflowStarted` carries its input, so writing it
+            // through the identity codec would store that payload in the clear
+            // on a deployment that has a keyed codec registered (#948) —
+            // silently, and only for children that opted into cross-shard
+            // placement. Every same-shard spawn path resolves its codecs from
+            // the runtime for exactly this reason.
+            //
+            // KNOWN GAP: the large-payload *offloader* is not applied here. It
+            // lives on the handler registry, which a scanner does not hold, and
+            // threading it would touch ~29 call sites across the repo for what
+            // is a storage optimisation rather than a correctness or
+            // confidentiality property — the child-input cap is already enforced
+            // at spawn time, so an over-cap payload never becomes a cross-shard
+            // child in the first place. Tracked as a follow-up.
+            store::append_events_offloaded_with_codecs(
                 conn,
                 child_exec_id,
                 &[WorkflowEvent::WorkflowStarted {
                     input: spec.input.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: created_at,
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
                 }],
                 0,
+                None,
+                codecs,
             )
             .await?;
 
@@ -1188,6 +1300,7 @@ async fn deliver_terminal(
     let state = child.state.clone();
     let output = child.output.clone();
     let error = child.error.clone();
+    let typed_failure = child.typed_failure.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         {
@@ -1233,8 +1346,12 @@ async fn deliver_terminal(
                 // `ChildWorkflowCancelled` variant and issue #956 adds none.
                 // The wording mirrors the same-shard operator-cancel path so a
                 // parent cannot tell where its child lived from the message.
-                let raw =
-                    error.unwrap_or_else(|| format!("child workflow {}", state.to_lowercase()));
+                // Prefer the typed envelope recovered from the child's own
+                // `WorkflowFailed` event; fall back to the `error` column, which
+                // carries only the human message.
+                let raw = typed_failure
+                    .or(error)
+                    .unwrap_or_else(|| format!("child workflow {}", state.to_lowercase()));
                 let decoded = crate::failure::decode_workflow_failure(&raw);
                 WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded)
             };

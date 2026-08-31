@@ -153,6 +153,34 @@ identically. (`execution::notify_awaited_parent_of_child_terminal`, the operator
 cancel path, was already safe: it looks the parent row up with `.optional()` and
 skips when absent.)
 
+**Codex rounds 3-4 (four more P1s, two P2s).** The relayed child's
+`WorkflowStarted` was written through the identity codec instead of the
+configured registry, so on a deployment with a keyed codec (#948) opting into
+cross-shard placement stored that input in the clear — silently, and only for
+placed children. The per-run `deadline_at`/`sla_deadline_at` were absolute values
+computed during the parent's decision, so a relay running behind could create a
+child that was already past its deadline and have the scanners kill it before it
+ran a step; the durations now travel on the spec and become absolute at creation
+(the *chain* deadline stays absolute by design, since re-anchoring it would
+defeat the cap). A `STARTED` row whose child had been retention-collected looked
+identical to "the shard was unreachable", so the parent waited forever; a child
+absent from a shard that *answered* is now reported to the parent as failed. And
+a typed `WorkflowFailure` was flattened to an untyped one, because the `error`
+column holds only the decoded message — the relay now recovers the envelope from
+the child's own `WorkflowFailed` event, restoring #767 parity. `Abandon` rows are
+retired as soon as the child exists rather than held for its whole lifetime,
+which is unbounded in exactly the case that policy exists for.
+
+One round-4 finding I pushed back on rather than "fixed": a fully-drained fleet
+degenerating a `Distributed` placement to the default shard. Failing it is
+terminal (the handler ABI), and requeuing it would *deadlock the drain* — a
+drained shard is one that should let its in-flight work finish, and a parent
+cannot finish while the children it awaits are refused. With zero writable shards
+the default shard is also where an unplaced child would go and where the parent
+already lives, so no cross-shard contract is broken; none was made. AC8's actual
+requirement is that a fallback never happen "without trace", so the path now
+carries a `warn!` naming the workflow and the shard, and the docs say so plainly.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive

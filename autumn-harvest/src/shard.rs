@@ -1644,16 +1644,34 @@ pub fn resolve_child_placement(
     let requested = match placement {
         ChildPlacement::ParentShard => unreachable!("short-circuited above"),
         ChildPlacement::Distributed => {
-            // `pick_for_new_workflow` falls back to `default_shard` when the
-            // writable set is empty. That fallback must never *land* a child —
-            // placement is decided once and baked into the child's id, so a
-            // wrong choice here is not recoverable after the maintenance window
-            // ends. It is stopped by `preflight_target_shard`, which rejects a
-            // non-writable target inside the persist transaction (where the
-            // rejection is retryable) rather than here inside the handler (where
-            // the ABI would erase it into a terminal failure). With the writable
-            // set empty, `default_shard` is by definition not writable, so the
-            // preflight rejects it and the parent is requeued with a backoff.
+            // `pick_for_new_workflow` falls back to `default_shard` when NOTHING
+            // is writable. That degenerate case is deliberately allowed to land
+            // the child, and it is deliberately traced.
+            //
+            // Allowed, because the alternatives are worse. Failing the spawn
+            // would be terminal (the handler ABI erases the error type — see the
+            // note above). Requeuing it would *deadlock the drain itself*: a
+            // drained shard is one that should let its in-flight work finish,
+            // and a parent cannot finish while the children it is awaiting are
+            // refused. And "the parent's shard" is not an arbitrary consolation
+            // prize here — with zero writable shards it is where an *unplaced*
+            // child would go, and where the parent already lives, so no
+            // cross-shard placement contract is broken: none was made.
+            //
+            // Traced, because AC8's requirement is that a fallback never happens
+            // "without trace". A `warn!` naming the workflow and the shard is
+            // that trace; the operator draining the fleet can see exactly which
+            // placed spawns degenerated while the window was open.
+            if router.writable_shards().is_empty() {
+                let shard = router.default_shard();
+                tracing::warn!(
+                    workflow_name,
+                    shard = shard.as_i32(),
+                    "no shard is currently writable; a Distributed child placement \
+                     degenerates to the default shard for the duration of the drain"
+                );
+                return Ok(shard);
+            }
             return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
         }
         ChildPlacement::Shard(shard) => ShardPlacement::Shard(*shard),
@@ -1810,14 +1828,16 @@ pub fn next_cross_shard_child_action(
         // Detached: the parent never consumes a terminal; the only thing left
         // owed is the parent-close cascade.
         |policy| {
-            if child_terminal {
+            // `Abandon` is owed nothing at all once the child exists: no terminal
+            // to deliver, and by definition no cascade. Retiring immediately
+            // matters at scale — an abandoned child may be long-lived or never
+            // terminate, and keeping its row would grow the table and the poll
+            // set without bound across repeated detached fan-outs. The row's job
+            // (getting the child created on the target shard) is done.
+            if policy == ParentClosePolicy::Abandon || child_terminal {
                 CrossShardChildAction::Retire
             } else if obs.parent_terminal == Some(true) {
-                if policy == ParentClosePolicy::Abandon {
-                    CrossShardChildAction::Retire
-                } else {
-                    CrossShardChildAction::ApplyCloseCascade
-                }
+                CrossShardChildAction::ApplyCloseCascade
             } else {
                 // Includes `None`: cascading a live parent's children because a
                 // read blipped would cancel or terminate perfectly healthy work.

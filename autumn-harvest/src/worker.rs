@@ -9610,10 +9610,12 @@ fn cross_shard_child_spec(
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
         severity: defaults.severity.map(str::to_string),
+        // Durations only for the per-run budgets: the relay turns them into
+        // absolute deadlines when it actually creates the child, so a relay that
+        // runs late cannot hand the child an already-expired deadline (issue
+        // #956, Codex round 4). The chain deadline stays absolute by design.
         sla_secs: defaults.sla.map(|d| d.num_seconds()),
-        sla_deadline_at: defaults.sla_deadline_at,
         execution_timeout_secs: defaults.execution_timeout.map(|d| d.num_seconds()),
-        deadline_at: defaults.deadline_at,
         chain_execution_timeout_secs: defaults.chain_execution_timeout.map(|d| d.num_seconds()),
         chain_deadline_at: defaults.chain_deadline_at,
         retry_policy: defaults.retry_policy.clone(),

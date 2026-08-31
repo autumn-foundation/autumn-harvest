@@ -310,18 +310,19 @@ fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
     assert!(err.is_shard_unavailable(), "got {err:?}");
 }
 
-/// A fully-drained fleet must not silently place a `Distributed` child on the
-/// default shard.
+/// A fully-drained fleet degenerates a `Distributed` placement to the default
+/// shard — deliberately, and with a trace.
 ///
-/// `ShardRouter::pick_for_new_workflow` falls back to `default_shard` when the
-/// writable set is empty — correct for a top-level start, and exactly the silent
-/// fallback AC8 forbids for an opt-in placement. With the writable set empty the
-/// default shard is by definition not writable, so the preflight stops the
-/// fallback before anything is recorded.
-// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
-#[cfg(feature = "db")]
+/// Every alternative is worse. Failing the spawn would be terminal (the handler
+/// ABI erases the error type). Requeuing it would *deadlock the drain*: a drained
+/// shard is one that should let its in-flight work finish, and a parent cannot
+/// finish while the children it awaits are refused. And with zero writable
+/// shards the default shard is where an *unplaced* child would go and where the
+/// parent already lives, so no cross-shard contract is broken — none was made.
+/// AC8 requires that a fallback never happen "without trace", which the `warn!`
+/// on this path provides.
 #[test]
-fn distributed_placement_with_no_writable_shard_is_stopped_by_the_preflight() {
+fn distributed_placement_with_no_writable_shard_degenerates_to_the_default_shard() {
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![],
@@ -334,13 +335,28 @@ fn distributed_placement_with_no_writable_shard_is_stopped_by_the_preflight() {
         "child_wf",
         "parent#1",
     )
-    .expect("resolution itself must not fail the handler");
-    assert!(
-        !router.is_writable(resolved),
-        "with no writable shard the pick is the non-writable default"
+    .expect("a drained fleet must not fail the handler");
+    assert_eq!(
+        resolved,
+        router.default_shard(),
+        "the degenerate pick is the default shard, not an arbitrary one"
     );
-    let err = preflight_target_shard(None, Some(&router), resolved)
-        .expect_err("a fully-drained fleet must not silently use the default shard");
+}
+
+/// A *cross-shard* drained target is still rejected at the persist boundary —
+/// that is the case the preflight exists for, and it does not deadlock any
+/// drain because the parent is not on that shard.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
+#[test]
+fn a_drained_cross_shard_target_is_rejected_by_the_preflight() {
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    let err = preflight_target_shard(None, Some(&router), ShardId::new(1))
+        .expect_err("a drained cross-shard target must not accept new children");
     assert!(err.is_shard_unavailable(), "got {err:?}");
 }
 
@@ -538,6 +554,60 @@ fn abandon_never_cascades() {
     );
 }
 
+/// **Regression (Codex round 4, P2).** An `Abandon` row must be retired as soon
+/// as the child exists — not held until the child or the parent terminates.
+///
+/// `Abandon` is owed nothing after the start: no terminal to deliver, and by
+/// definition no cascade. Holding the row until the child ends is unbounded in
+/// exactly the case the policy exists for — a long-lived or never-terminating
+/// detached child — so repeated detached fan-out would grow the table and the
+/// per-sweep poll set without limit.
+#[test]
+fn an_abandon_row_retires_once_the_child_has_started() {
+    // Still starting: the row's one job is not done yet.
+    let pending = detached(
+        CrossShardChildStatus::PendingStart,
+        ParentClosePolicy::Abandon,
+    );
+    assert_eq!(
+        next_cross_shard_child_action(&pending),
+        CrossShardChildAction::StartChild
+    );
+
+    // Started, child running, parent alive: nothing further is owed.
+    let mut started = detached(CrossShardChildStatus::Started, ParentClosePolicy::Abandon);
+    started.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&started),
+        CrossShardChildAction::Retire,
+        "an Abandon row must not be held for the child's whole lifetime"
+    );
+
+    // Even with the parent state unreadable — the decision does not depend on it.
+    started.parent_terminal = None;
+    assert_eq!(
+        next_cross_shard_child_action(&started),
+        CrossShardChildAction::Retire
+    );
+}
+
+/// The non-`Abandon` policies still hold their row until the cascade is owed.
+#[test]
+fn a_cascading_policy_holds_its_row_until_the_parent_closes() {
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.child_state = Some("RUNNING");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::Wait,
+            "{policy:?} still owes a cascade if the parent closes"
+        );
+    }
+}
+
 #[test]
 fn an_awaited_child_outliving_a_closed_parent_retires_the_row() {
     // Parity with the same-shard contract: an awaited child can outlive a
@@ -598,11 +668,14 @@ fn an_unreadable_parent_state_never_retires_or_cascades() {
         "an unread parent must not retire an awaited child's row"
     );
 
-    // Detached, child still running, parent unknown -> wait, never cascade.
+    // Detached with a CASCADING policy, child still running, parent unknown ->
+    // wait, never cascade. `Abandon` is excluded deliberately: it retires
+    // regardless of the parent (it is owed no cascade at all), and retiring an
+    // Abandon row destroys nothing — the child is meant to outlive its parent
+    // and the row tracks no pending obligation.
     for policy in [
         ParentClosePolicy::RequestCancel,
         ParentClosePolicy::Terminate,
-        ParentClosePolicy::Abandon,
     ] {
         let mut obs = detached(CrossShardChildStatus::Started, policy);
         obs.parent_terminal = None;
