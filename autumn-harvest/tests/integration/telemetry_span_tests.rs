@@ -366,6 +366,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
             let worker = Arc::new(
                 Worker::new(
                     WorkerRuntimeConfig {
+                        dr_fencing: false,
                         worker_id: "telem-test-worker".to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,

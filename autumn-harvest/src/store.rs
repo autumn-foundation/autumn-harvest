@@ -174,11 +174,41 @@ pub async fn append_events(
 
     let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
-    let inserted = diesel::insert_into(harvest_events::table)
-        .values(&rows)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // Cross-region DR write-authority fence (issue #954).
+    //
+    // Below the empty-append early return — an empty append writes nothing, so
+    // there is nothing to fence — and, when fencing is on, in the **same
+    // transaction** as the INSERT. That pairing is the whole guarantee: the
+    // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
+    // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
+    // released at statement end. Checked-then-inserted across two autocommit
+    // statements, a concurrent `harvest dr fence` could commit in between and
+    // the stale worker would still append history the operator had been told
+    // was fenced off.
+    //
+    // Most callers already hold a transaction, in which case `transaction()`
+    // opens a savepoint and the outer lock already covers this. The wrapper is
+    // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
+    // no fence read, no savepoint, one INSERT.
+    let inserted = if crate::replication::FenceRegistry::is_enabled() {
+        Box::pin(
+            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
+                crate::replication::assert_fence(conn, exec_id.shard()).await?;
+                diesel::insert_into(harvest_events::table)
+                    .values(&rows)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)
+            }),
+        )
+        .await?
+    } else {
+        diesel::insert_into(harvest_events::table)
+            .values(&rows)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    };
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -236,6 +266,15 @@ pub async fn append_events_offloaded(
     // permanently invisible to the GC sweep).
     let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
         async |conn| {
+            // Cross-region DR write-authority fence (issue #954), inside the
+            // transaction and *after* the offload upload above. Checking before
+            // the upload was doubly wrong: the check's `ACCESS SHARE` was
+            // released before the INSERT ever began (so it was not a barrier at
+            // all on an autocommit caller), and on a transactional caller it
+            // held the lock across an unbounded network upload — so an operator
+            // fencing during an incident queued behind the slowest payload PUT.
+            crate::replication::assert_fence(conn, exec_id.shard()).await?;
+
             let inserted = diesel::insert_into(harvest_events::table)
                 .values(&rows)
                 .execute(conn)
@@ -420,6 +459,11 @@ pub async fn append_single_event(
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
+
+    // Cross-region DR fence (see `replication::assert_fence`), before the
+    // execution row lock so a fenced worker releases immediately rather than
+    // holding a lock the region that now owns this data needs.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Lock the parent execution row so that concurrent callers serialise their
     // MAX(event_id) + INSERT pairs — preventing a duplicate-event-id collision

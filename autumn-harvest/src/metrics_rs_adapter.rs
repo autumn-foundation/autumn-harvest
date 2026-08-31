@@ -373,6 +373,57 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(count as f64);
     }
 
+    fn record_replication_lag_seconds(&self, shard: u16, seconds: f64) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_LAG_SECONDS,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(seconds);
+    }
+
+    fn record_replication_observable(&self, shard: u16, observable: bool) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_OBSERVABLE,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(if observable { 1.0 } else { 0.0 });
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_replication_lag_bytes(&self, shard: u16, bytes: i64) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_LAG_BYTES,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(bytes as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_replication_standbys(&self, shard: u16, count: u64) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_STANDBYS,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(count as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_shard_generation(&self, shard: u16, generation: i64) {
+        gauge!(
+            crate::telemetry::METRIC_SHARD_GENERATION,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(generation as f64);
+    }
+
+    fn record_shard_fenced(&self, shard: u16) {
+        counter!(
+            crate::telemetry::METRIC_SHARD_FENCED,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
     fn record_shard_dispatched(&self, shard: u16) {
         counter!(
             crate::telemetry::METRIC_SHARD_DISPATCHED,
