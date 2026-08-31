@@ -1336,9 +1336,43 @@ pub async fn disable_partitioning(
              (LIKE harvest_events_partitioned INCLUDING DEFAULTS INCLUDING COMMENTS)",
             )
             .await?;
+            // `INCLUDING DEFAULTS` copies the PARTITIONED parent's cohort
+            // default — `harvest_event_cohort(clock_timestamp())` — onto the
+            // flat table, where it has no business being. Left alone, every
+            // append after a revert stamps a live cohort into a column the
+            // unpartitioned layout treats as inert, and a later `enable` then
+            // fails: its legacy `CHECK (cohort < cutover)` is violated by every
+            // row written in the current cohort. That would make reverting a
+            // one-way door, on the one path the documentation offers an
+            // operator for exactly that.
+            exec(
+                conn,
+                "ALTER TABLE harvest_events \
+                 ALTER COLUMN cohort SET DEFAULT '-infinity'::timestamptz",
+            )
+            .await?;
             exec(
                 conn,
                 "INSERT INTO harvest_events SELECT * FROM harvest_events_partitioned",
+            )
+            .await?;
+            // Reset the partition key to the inert sentinel the unpartitioned
+            // layout is defined to carry.
+            //
+            // Without this, reverting is a ONE-WAY DOOR. The copied rows keep
+            // the real cohorts they were written with, and a later `enable`
+            // computes `cutover = harvest_event_cohort(now())` and attaches the
+            // legacy table with `CHECK (cohort < cutover)` — which every row
+            // written in the current cohort violates, so the conversion fails
+            // outright. An operator who rolled back could never roll forward
+            // again, on the one path the documentation offers them for exactly
+            // that.
+            //
+            // Free here: `disable` already rewrites the whole table.
+            exec(
+                conn,
+                "UPDATE harvest_events SET cohort = '-infinity'::timestamptz \
+                 WHERE cohort <> '-infinity'::timestamptz",
             )
             .await?;
             exec(

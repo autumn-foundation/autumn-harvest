@@ -1839,3 +1839,68 @@ async fn enabling_does_not_lose_events_committed_while_the_probe_ran() {
         "no committed event may be lost by the conversion"
     );
 }
+
+#[tokio::test]
+async fn reverting_and_re_enabling_round_trips() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Rolling back must not be a one-way door. `disable` is the escape hatch
+    // the documentation offers, and an operator who takes it during an incident
+    // has to be able to roll forward again afterwards.
+    //
+    // The trap is subtle: `disable` builds the flat table with `LIKE …
+    // INCLUDING DEFAULTS`, which copies the PARTITIONED parent's cohort default
+    // onto it. Every append after the revert then stamps a live cohort into a
+    // column the flat layout treats as inert — and the next `enable` attaches
+    // the legacy table with `CHECK (cohort < cutover)`, which every row written
+    // in the current cohort violates. The conversion fails outright, with an
+    // error naming a constraint the operator has never heard of.
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("first enable");
+    let exec = insert_execution(&mut conn, "rt_wf", "rt-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("append while partitioned");
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert")
+        .expect("was partitioned");
+    assert_eq!(events_relkind(&mut conn).await, "r");
+
+    // Append again on the flat layout — this is what poisons the column if the
+    // partitioned default was carried over.
+    let flat = insert_execution(&mut conn, "rt_wf", "rt-2", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(flat),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("append while flat");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("re-enable after a revert must succeed");
+    assert_eq!(events_relkind(&mut conn).await, "p");
+    for (e, label) in [(exec, "pre-revert"), (flat, "post-revert")] {
+        assert_eq!(
+            autumn_harvest::store::load_history(&mut conn, ExecutionId::from_uuid(e))
+                .await
+                .unwrap_or_else(|err| panic!("{label} history: {err}"))
+                .events
+                .len(),
+            3,
+            "the {label} execution's history must survive the round trip"
+        );
+    }
+}
