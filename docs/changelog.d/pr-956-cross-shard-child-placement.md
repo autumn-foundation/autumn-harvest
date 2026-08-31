@@ -146,7 +146,12 @@ had a terminal to deliver and the parent parked forever — a silent, total fail
 of the feature that only a live two-database run would surface. Those two
 functions and `timeout::wake_parent_for_child_timeout` now skip the inline wake
 when the parent is on another shard and leave it to the relay, which is where it
-belonged all along.
+belonged all along. Auditing for the same *shape* rather than the reported
+instance turned up a fourth site the review had not reached — the poison-pill
+seal in `poison_pill.rs` appends to the parent the same way — now guarded
+identically. (`execution::notify_awaited_parent_of_child_terminal`, the operator
+cancel path, was already safe: it looks the parent row up with `.optional()` and
+skips when absent.)
 
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
