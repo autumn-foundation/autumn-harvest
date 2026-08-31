@@ -100,7 +100,11 @@ impl Scale {
 
     /// Executions the pass is expected to collect.
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     pub fn expired(&self) -> usize {
         (self.executions as f64 * self.expired_fraction) as usize
     }
@@ -165,13 +169,17 @@ fn pct_change(baseline: f64, measured: f64) -> f64 {
 /// collects, an interpolated percentile would imply a precision the
 /// measurement does not have.
 #[must_use]
-pub fn p99_ms(samples: &mut Vec<Duration>) -> f64 {
+pub fn p99_ms(samples: &mut [Duration]) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
     samples.sort_unstable();
-    let idx = ((samples.len() as f64) * 0.99).ceil() as usize;
-    let idx = idx.saturating_sub(1).min(samples.len() - 1);
+    // Integer arithmetic rather than a float multiply: sample counts here are
+    // in the thousands, and `ceil(len * 0.99)` on a float is one rounding
+    // surprise away from picking the wrong rank. `(len * 99).div_ceil(100)` is
+    // the same nearest-rank definition with no float in it at all.
+    let rank = (samples.len().saturating_mul(99)).div_ceil(100);
+    let idx = rank.saturating_sub(1).min(samples.len() - 1);
     samples[idx].as_secs_f64() * 1000.0
 }
 
@@ -220,7 +228,9 @@ async fn scalar(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
 pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool) {
     let cohorts = i64::try_from(scale.cohorts).unwrap_or(1).max(1);
     let executions = i64::try_from(scale.executions).unwrap_or(0);
-    let per_exec = i64::try_from(scale.events_per_execution).unwrap_or(1).max(1);
+    let per_exec = i64::try_from(scale.events_per_execution)
+        .unwrap_or(1)
+        .max(1);
     let expired = i64::try_from(scale.expired()).unwrap_or(0);
 
     if partitioned {
@@ -232,11 +242,9 @@ pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool)
                 .await
                 .expect("materialize cohort");
         }
-        conn.batch_execute(
-            "ALTER TABLE harvest_events DISABLE TRIGGER harvest_events_exec_fk_trg",
-        )
-        .await
-        .expect("disable integrity trigger for bulk seed");
+        conn.batch_execute("ALTER TABLE harvest_events DISABLE TRIGGER harvest_events_exec_fk_trg")
+            .await
+            .expect("disable integrity trigger for bulk seed");
     }
 
     // `created_at` places an execution in a cohort; `completed_at` decides
@@ -290,11 +298,9 @@ pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool)
     .expect("seed events");
 
     if partitioned {
-        conn.batch_execute(
-            "ALTER TABLE harvest_events ENABLE TRIGGER harvest_events_exec_fk_trg",
-        )
-        .await
-        .expect("re-enable integrity trigger");
+        conn.batch_execute("ALTER TABLE harvest_events ENABLE TRIGGER harvest_events_exec_fk_trg")
+            .await
+            .expect("re-enable integrity trigger");
     }
 
     conn.batch_execute("ANALYZE harvest_workflow_executions; ANALYZE harvest_events")
@@ -390,11 +396,7 @@ pub struct LoadSamples {
 /// rather than hand-written SQL, so what is measured is the hot path operators
 /// actually run — including, on the partitioned layout, tuple routing, the
 /// `DEFAULT` cohort expression and the integrity trigger.
-pub async fn drive_load(
-    url: &str,
-    stop: Arc<AtomicBool>,
-    ops: Arc<AtomicU64>,
-) -> LoadSamples {
+pub async fn drive_load(url: &str, stop: Arc<AtomicBool>, ops: Arc<AtomicU64>) -> LoadSamples {
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .expect("load connection");
@@ -516,9 +518,10 @@ pub async fn measure_pass(
     let ops = Arc::new(AtomicU64::new(0));
     let load = tokio::spawn(drive_load(url_static, Arc::clone(&stop), Arc::clone(&ops)));
 
-    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-        AsyncPgConnection,
-    >::new(url_static);
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url_static,
+        );
     let pool = deadpool::managed::Pool::builder(manager)
         .max_size(8)
         .build()
@@ -568,8 +571,7 @@ pub async fn measure_pass(
     // that replaces the delete storm. Run through the engine's own maintenance
     // entry point, not a hand-written DROP, so what is timed is what a
     // retention tick actually does.
-    let mut events_reclaim = Duration::ZERO;
-    if partitioned {
+    let events_reclaim = if partitioned {
         let t = Instant::now();
         autumn_harvest::partition::maintain(
             &mut conn,
@@ -579,8 +581,10 @@ pub async fn measure_pass(
         )
         .await
         .expect("partition maintenance");
-        events_reclaim = t.elapsed();
-    }
+        t.elapsed()
+    } else {
+        Duration::ZERO
+    };
     let pass = candidate_loop + events_reclaim;
 
     stop.store(true, Ordering::Relaxed);
@@ -619,16 +623,19 @@ impl autumn_harvest::telemetry::MetricsRecorder for NoopMetrics {}
 /// `docs/perf-artifacts/`.
 #[must_use]
 pub fn report(scale: Scale, arms: &[Measurement]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
-    out.push_str(&format!(
+    let _ = writeln!(
+        out,
         "Scale: {} executions x {} events = {} event rows, across {} daily cohorts; \
-         {:.0}% expired.\n\n",
+         {:.0}% expired.\n",
         scale.executions,
         scale.events_per_execution,
         scale.events(),
         scale.cohorts,
         scale.expired_fraction * 100.0
-    ));
+    );
     out.push_str(
         "| layout | pass total | event reclamation | events reclaimed | event-row DELETEs \
          | dead-tuple ratio after | append p99 (quiet -> during) | claim p99 (quiet -> during) |\n\
@@ -640,9 +647,10 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
         } else {
             format!("{:.3}s", m.events_reclaim.as_secs_f64())
         };
-        out.push_str(&format!(
+        let _ = writeln!(
+            out,
             "| {} | {:.2}s | {reclaim} | {} | {} | {:.2}% | {:.2} -> {:.2} ms ({:+.1}%) \
-             | {:.2} -> {:.2} ms ({:+.1}%) |\n",
+             | {:.2} -> {:.2} ms ({:+.1}%) |",
             m.layout,
             m.pass.as_secs_f64(),
             m.events_reclaimed,
@@ -654,7 +662,7 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
             m.claim_p99_baseline_ms,
             m.claim_p99_ms,
             m.claim_regression_pct(),
-        ));
+        );
     }
     out.push_str(
         "\n`pass total` is the whole retention pass. `event reclamation` splits out the part \
@@ -670,7 +678,7 @@ pub fn report(scale: Scale, arms: &[Measurement]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Duration, Measurement, Scale, p99_ms, pct_change};
 
     #[test]
     fn p99_is_nearest_rank_and_handles_the_empty_sample() {

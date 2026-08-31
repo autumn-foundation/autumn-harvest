@@ -4657,7 +4657,7 @@ struct PartitionShardReport {
 }
 
 impl PartitionShardReport {
-    fn unreachable(shard_id: i32, dsn: String, reason: String) -> Self {
+    const fn unreachable(shard_id: i32, dsn: String, reason: String) -> Self {
         Self {
             shard_id,
             dsn,
@@ -4671,7 +4671,7 @@ impl PartitionShardReport {
         }
     }
 
-    fn reachable(shard_id: i32, dsn: String) -> Self {
+    const fn reachable(shard_id: i32, dsn: String) -> Self {
         Self {
             shard_id,
             dsn,
@@ -4747,13 +4747,14 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                 .map_err(|e| CliError::InvalidInput(e.to_string()))?;
             println!(
                 "{}",
-                autumn_harvest::partition::migration_plan(&opts, autumn_harvest::chrono::Utc::now())
+                autumn_harvest::partition::migration_plan(
+                    &opts,
+                    autumn_harvest::chrono::Utc::now()
+                )
             );
             Ok(())
         }
-        PartitionCommand::Status { shards, format } => {
-            run_partition_status(shards, *format).await
-        }
+        PartitionCommand::Status { shards, format } => run_partition_status(shards, *format).await,
         PartitionCommand::Enable {
             shards,
             cohort_width_secs,
@@ -4995,8 +4996,10 @@ fn emit_partition_report(
                         println!(
                             "    {:<40} {} .. {}",
                             p.name,
-                            p.lower.map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
-                            p.upper.map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
+                            p.lower
+                                .map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
+                            p.upper
+                                .map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
                         );
                     }
                 }
@@ -5035,7 +5038,6 @@ fn emit_partition_report(
         )))
     }
 }
-
 
 /// Run a `harvest dr` subcommand.
 ///

@@ -29,9 +29,7 @@ use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
 use autumn_harvest::history_export::HistoryExportDocument;
-use autumn_harvest::partition::{
-    self, EnableMode, EnableOptions, EventLayout, SweepOptions,
-};
+use autumn_harvest::partition::{self, EnableMode, EnableOptions, EventLayout, SweepOptions};
 use autumn_harvest::retention::{
     ArchiverFuture, HistoryArchiver, RetentionConfig, RetentionRuntime,
 };
@@ -142,13 +140,11 @@ async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> bool {
 
 /// `relkind` of `harvest_events`: `r` = ordinary table, `p` = partitioned.
 async fn events_relkind(conn: &mut AsyncPgConnection) -> String {
-    diesel::sql_query(
-        "SELECT relkind::text AS v FROM pg_class WHERE relname = 'harvest_events'",
-    )
-    .get_result::<TextRow>(conn)
-    .await
-    .expect("relkind")
-    .v
+    diesel::sql_query("SELECT relkind::text AS v FROM pg_class WHERE relname = 'harvest_events'")
+        .get_result::<TextRow>(conn)
+        .await
+        .expect("relkind")
+        .v
 }
 
 /// Insert an execution row with an explicit `created_at` (the cohort anchor)
@@ -193,11 +189,7 @@ async fn insert_execution(
 ///
 /// Layout-agnostic: `ensure_cohort` is a no-op on the unpartitioned layout and
 /// the column exists there too, so the same helper serves both.
-async fn backdate_events(
-    conn: &mut AsyncPgConnection,
-    exec: uuid::Uuid,
-    at: DateTime<Utc>,
-) {
+async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: DateTime<Utc>) {
     partition::ensure_cohort(conn, at)
         .await
         .expect("materialize the destination cohort");
@@ -269,7 +261,7 @@ struct RecordingArchiver {
 }
 
 impl RecordingArchiver {
-    fn failing() -> Self {
+    const fn failing() -> Self {
         Self {
             docs: Mutex::new(Vec::new()),
             fail: true,
@@ -480,41 +472,40 @@ async fn history_load_and_delta_load_are_identical_between_layouts() {
     let ref_delta = autumn_harvest::store::load_history_since(&mut conn, exec_id, 1)
         .await
         .expect("ref delta");
-    let ref_json: Vec<String> = diesel::sql_query(
-        "SELECT event_data::text AS v FROM harvest_events ORDER BY event_id",
-    )
-    .load::<TextRow>(&mut conn)
-    .await
-    .expect("ref json")
-    .into_iter()
-    .map(|r| r.v)
-    .collect();
+    let ref_json: Vec<String> =
+        diesel::sql_query("SELECT event_data::text AS v FROM harvest_events ORDER BY event_id")
+            .load::<TextRow>(&mut conn)
+            .await
+            .expect("ref json")
+            .into_iter()
+            .map(|r| r.v)
+            .collect();
 
     // Partitioned run with the same inputs.
     reset_to_unpartitioned(&mut conn).await;
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("enable");
-    let exec2 = insert_execution(&mut conn, "cmp_wf", "cmp-1", day(2026, 3, 2), None).await;
-    let exec2_id = ExecutionId::from_uuid(exec2);
-    autumn_harvest::store::append_events(&mut conn, exec2_id, &sample_events(), 0)
+    let partitioned_exec =
+        insert_execution(&mut conn, "cmp_wf", "cmp-1", day(2026, 3, 2), None).await;
+    let partitioned_id = ExecutionId::from_uuid(partitioned_exec);
+    autumn_harvest::store::append_events(&mut conn, partitioned_id, &sample_events(), 0)
         .await
         .expect("append partitioned");
-    let part_full = autumn_harvest::store::load_history(&mut conn, exec2_id)
+    let part_full = autumn_harvest::store::load_history(&mut conn, partitioned_id)
         .await
         .expect("part full");
-    let part_delta = autumn_harvest::store::load_history_since(&mut conn, exec2_id, 1)
+    let part_delta = autumn_harvest::store::load_history_since(&mut conn, partitioned_id, 1)
         .await
         .expect("part delta");
-    let part_json: Vec<String> = diesel::sql_query(
-        "SELECT event_data::text AS v FROM harvest_events ORDER BY event_id",
-    )
-    .load::<TextRow>(&mut conn)
-    .await
-    .expect("part json")
-    .into_iter()
-    .map(|r| r.v)
-    .collect();
+    let part_json: Vec<String> =
+        diesel::sql_query("SELECT event_data::text AS v FROM harvest_events ORDER BY event_id")
+            .load::<TextRow>(&mut conn)
+            .await
+            .expect("part json")
+            .into_iter()
+            .map(|r| r.v)
+            .collect();
 
     assert_eq!(
         as_json(&ref_full.events),
@@ -550,15 +541,14 @@ async fn sequential_per_execution_event_ids_survive_partitioning() {
         .await
         .expect("second append");
 
-    let ids: Vec<i64> = diesel::sql_query(
-        "SELECT event_id::bigint AS n FROM harvest_events ORDER BY event_id",
-    )
-    .load::<CountRow>(&mut conn)
-    .await
-    .expect("ids")
-    .into_iter()
-    .map(|r| r.n)
-    .collect();
+    let ids: Vec<i64> =
+        diesel::sql_query("SELECT event_id::bigint AS n FROM harvest_events ORDER BY event_id")
+            .load::<CountRow>(&mut conn)
+            .await
+            .expect("ids")
+            .into_iter()
+            .map(|r| r.n)
+            .collect();
     assert_eq!(
         ids,
         (0..6).collect::<Vec<i64>>(),
@@ -695,15 +685,14 @@ async fn an_execution_whose_events_span_cohorts_loads_its_full_history_in_order(
         6,
         "AC2: load_history must return every event across the split"
     );
-    let ids: Vec<i64> = diesel::sql_query(
-        "SELECT event_id::bigint AS n FROM harvest_events ORDER BY event_id",
-    )
-    .load::<CountRow>(&mut conn)
-    .await
-    .expect("ids")
-    .into_iter()
-    .map(|r| r.n)
-    .collect();
+    let ids: Vec<i64> =
+        diesel::sql_query("SELECT event_id::bigint AS n FROM harvest_events ORDER BY event_id")
+            .load::<CountRow>(&mut conn)
+            .await
+            .expect("ids")
+            .into_iter()
+            .map(|r| r.n)
+            .collect();
     assert_eq!(
         ids,
         (0..6).collect::<Vec<i64>>(),
@@ -782,7 +771,11 @@ async fn a_retention_pass_reclaims_an_expired_cohort_by_dropping_its_partition()
          metadata operation — not emptied row by row"
     );
     assert_eq!(
-        scalar_i64(&mut conn, "SELECT COUNT(*)::bigint AS n FROM harvest_events").await,
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_events"
+        )
+        .await,
         0,
         "AC3: the events are gone"
     );
@@ -894,12 +887,9 @@ async fn a_cohort_with_a_surviving_execution_is_never_dropped() {
         "AC3: a partition holding a long-running execution's rows must NOT be \
          dropped — correctness first"
     );
-    let survivors = autumn_harvest::store::load_history(
-        &mut conn,
-        ExecutionId::from_uuid(running),
-    )
-    .await
-    .expect("running history still loadable");
+    let survivors = autumn_harvest::store::load_history(&mut conn, ExecutionId::from_uuid(running))
+        .await
+        .expect("running history still loadable");
     assert_eq!(
         survivors.events.len(),
         3,
@@ -940,7 +930,11 @@ async fn the_archiver_receives_full_history_before_the_partition_is_dropped() {
          correctness is independent of drop- vs delete-based reclamation"
     );
     assert_eq!(
-        scalar_i64(&mut conn, "SELECT COUNT(*)::bigint AS n FROM harvest_events").await,
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_events"
+        )
+        .await,
         0,
         "AC4: and the rows are reclaimed afterwards"
     );
@@ -1117,13 +1111,7 @@ async fn a_longer_per_type_override_blocks_the_partition_drop() {
 
 #[tokio::test]
 async fn pii_erasure_tombstones_partitioned_rows_identically() {
-    let (url, _c) = setup_db().await;
-    let mut conn = connect(&url).await;
-
-    async fn erase_and_read(
-        conn: &mut AsyncPgConnection,
-        exec: uuid::Uuid,
-    ) -> Vec<String> {
+    async fn erase_and_read(conn: &mut AsyncPgConnection, exec: uuid::Uuid) -> Vec<String> {
         autumn_harvest::erase::erase_workflow_payloads(
             conn,
             ExecutionId::from_uuid(exec),
@@ -1140,17 +1128,15 @@ async fn pii_erasure_tombstones_partitioned_rows_identically() {
             .collect()
     }
 
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+
     reset_to_unpartitioned(&mut conn).await;
     let past = Utc::now() - chrono::Duration::days(3);
     let a = insert_execution(&mut conn, "pii_wf", "p-1", past, Some(past)).await;
-    autumn_harvest::store::append_events(
-        &mut conn,
-        ExecutionId::from_uuid(a),
-        &sample_events(),
-        0,
-    )
-    .await
-    .expect("seed");
+    autumn_harvest::store::append_events(&mut conn, ExecutionId::from_uuid(a), &sample_events(), 0)
+        .await
+        .expect("seed");
     let unpartitioned = erase_and_read(&mut conn, a).await;
 
     reset_to_unpartitioned(&mut conn).await;
@@ -1158,14 +1144,9 @@ async fn pii_erasure_tombstones_partitioned_rows_identically() {
         .await
         .expect("enable");
     let b = insert_execution(&mut conn, "pii_wf", "p-1", past, Some(past)).await;
-    autumn_harvest::store::append_events(
-        &mut conn,
-        ExecutionId::from_uuid(b),
-        &sample_events(),
-        0,
-    )
-    .await
-    .expect("seed");
+    autumn_harvest::store::append_events(&mut conn, ExecutionId::from_uuid(b), &sample_events(), 0)
+        .await
+        .expect("seed");
     let partitioned = erase_and_read(&mut conn, b).await;
 
     assert_eq!(
@@ -1203,13 +1184,9 @@ async fn heartbeat_checkpoints_are_unaffected_by_partitioning() {
     .expect("insert task")
     .id;
 
-    autumn_harvest::queue::record_heartbeat(
-        &mut conn,
-        task,
-        serde_json::json!({"progress": 0.5}),
-    )
-    .await
-    .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
+    autumn_harvest::queue::record_heartbeat(&mut conn, task, serde_json::json!({"progress": 0.5}))
+        .await
+        .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
 
     assert_eq!(
         scalar_i64(
@@ -1240,7 +1217,10 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
     .await
     .expect("enable");
 
-    let before = partition::list_partitions(&mut conn).await.expect("list").len();
+    let before = partition::list_partitions(&mut conn)
+        .await
+        .expect("list")
+        .len();
 
     let pool = build_pool(&url);
     run_one_tick(
@@ -1258,7 +1238,8 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
          before={before} after={}",
         after.len()
     );
-    let horizon = Utc::now() + chrono::Duration::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
+    let horizon =
+        Utc::now() + chrono::Duration::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
     assert!(
         after
             .iter()
@@ -1389,10 +1370,12 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
         outcome
             .blocked
             .iter()
-            .any(|b| b.contains(&partition::partition_name(partition::cohort_start(
-                live_ts,
-                partition::DEFAULT_COHORT_WIDTH_SECS
-            )))),
+            .any(
+                |b| b.contains(&partition::partition_name(partition::cohort_start(
+                    live_ts,
+                    partition::DEFAULT_COHORT_WIDTH_SECS
+                )))
+            ),
         "AC8: a cohort blocked by a live execution must be reported, not \
          silently skipped; got {outcome:?}"
     );

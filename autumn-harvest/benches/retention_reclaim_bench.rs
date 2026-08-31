@@ -130,7 +130,11 @@ mod runner {
             .expect("seed connection");
         eprintln!(
             "seeding {} arm: {} executions x {} events…",
-            if partitioned { "partitioned" } else { "unpartitioned" },
+            if partitioned {
+                "partitioned"
+            } else {
+                "unpartitioned"
+            },
             scale.executions,
             scale.events_per_execution
         );

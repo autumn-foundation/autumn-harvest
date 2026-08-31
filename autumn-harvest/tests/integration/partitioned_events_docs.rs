@@ -85,7 +85,6 @@ fn the_doc_records_that_postgres_forbids_the_stamping_trigger() {
 
 #[test]
 fn the_doc_states_that_the_whole_pass_is_not_made_fast_by_this_change() {
-    let d = flat(&doc());
     let raw = doc();
     let s = flat(section(&raw, "Measured").expect("a `## Measured` section"));
     assert!(
@@ -156,7 +155,6 @@ fn the_doc_warns_that_a_long_running_execution_pins_its_cohorts() {
 
 #[test]
 fn the_migration_runbook_separates_the_online_steps_from_the_lock_window() {
-    let d = flat(&doc());
     let raw = doc();
     let s = flat(section(&raw, "Enabling it").expect("an `## Enabling it` section"));
     for needle in [
@@ -183,7 +181,6 @@ fn the_migration_runbook_separates_the_online_steps_from_the_lock_window() {
 
 #[test]
 fn the_doc_tells_an_operator_how_to_answer_why_space_has_not_come_back() {
-    let d = flat(&doc());
     let raw = doc();
     let s = flat(section(&raw, "Operating it").expect("an `## Operating it` section"));
     assert!(

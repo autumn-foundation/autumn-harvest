@@ -141,9 +141,11 @@ pub const MIN_COHORT_WIDTH_SECS: i64 = 60;
 /// Largest accepted cohort width (365 days).
 pub const MAX_COHORT_WIDTH_SECS: i64 = 86_400 * 365;
 
-/// The catch-all partition. Always present, normally empty: an append whose
-/// cohort has no partition lands here instead of failing with `no partition of
-/// relation found`, which would stall a workflow on a maintenance gap.
+/// The catch-all partition. Always present, normally empty.
+///
+/// An append whose cohort has no partition lands here instead of failing with
+/// `no partition of relation found`, which would stall a live workflow on a
+/// maintenance gap.
 pub const DEFAULT_PARTITION: &str = "harvest_events_p_default";
 
 /// The pre-cutover partition holding every row that existed before
@@ -192,10 +194,7 @@ pub fn cohort_start(ts: DateTime<Utc>, width_secs: i64) -> DateTime<Utc> {
 /// any width down to one second.
 #[must_use]
 pub fn partition_name(cohort_start: DateTime<Utc>) -> String {
-    format!(
-        "{PARTITION_PREFIX}{}",
-        cohort_start.format("%Y%m%d%H%M%S")
-    )
+    format!("{PARTITION_PREFIX}{}", cohort_start.format("%Y%m%d%H%M%S"))
 }
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -494,9 +493,7 @@ pub fn parse_cohort_width(function_def: &str) -> Option<i64> {
 /// `FOR VALUES FROM (MINVALUE) TO ('2026-08-31 00:00:00+00')`. Pure, so the
 /// parsing is unit-tested rather than only exercised through a live catalog.
 #[must_use]
-pub fn parse_partition_bound(
-    expr: &str,
-) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool) {
+pub fn parse_partition_bound(expr: &str) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool) {
     let expr = expr.trim();
     if expr.eq_ignore_ascii_case("DEFAULT") {
         return (None, None, true);
@@ -548,9 +545,7 @@ fn parse_bound_literal(raw: &str) -> Option<DateTime<Utc>> {
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
-pub async fn list_partitions(
-    conn: &mut AsyncPgConnection,
-) -> HarvestResult<Vec<PartitionInfo>> {
+pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<PartitionInfo>> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = Text)]
@@ -772,9 +767,7 @@ pub async fn enable_partitioning(
     // whole script back and leaves the deployment exactly as it was.
     diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts))
         .await
-        .map_err(|e| {
-            HarvestError::Database(format!("partition enable script failed: {e}"))
-        })?;
+        .map_err(|e| HarvestError::Database(format!("partition enable script failed: {e}")))?;
 
     // Report which path the script took by reading the catalog it produced,
     // rather than by predicting it: whether the table had rows is the script's
@@ -820,6 +813,9 @@ pub async fn enable_partitioning(
 /// validation would hold `ACCESS EXCLUSIVE` too long, use [`migration_plan`]
 /// instead: the same algorithm with the expensive steps moved out of the lock
 /// window.
+// One `format!` of a SQL script. Splitting it to satisfy a line budget would
+// scatter a single readable runbook across helpers that only ever concatenate.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn enable_sql(opts: &EnableOptions) -> String {
     let width = opts.cohort_width_secs.max(1);
@@ -1083,7 +1079,11 @@ pub async fn disable_partitioning(conn: &mut AsyncPgConnection) -> HarvestResult
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let index_defs = capture_index_defs(conn).await?;
         exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE").await?;
-        exec(conn, "ALTER TABLE harvest_events RENAME TO harvest_events_partitioned").await?;
+        exec(
+            conn,
+            "ALTER TABLE harvest_events RENAME TO harvest_events_partitioned",
+        )
+        .await?;
         // Rename the parent's constraints/indexes so the flat table can reclaim
         // their names, exactly as the enable path does in reverse.
         for (list_sql, rename_tmpl) in [
@@ -1146,7 +1146,11 @@ pub async fn disable_partitioning(conn: &mut AsyncPgConnection) -> HarvestResult
         for def in &index_defs {
             exec(conn, def).await?;
         }
-        exec(conn, "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id").await?;
+        exec(
+            conn,
+            "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id",
+        )
+        .await?;
         exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
         Ok(())
     }))
@@ -1228,11 +1232,12 @@ pub async fn sweep(
             continue;
         }
 
-        match drop_partition(conn, &part.name, opts.lock_timeout).await? {
-            true => outcome.dropped.push(part.name),
-            false => outcome
+        if drop_partition(conn, &part.name, opts.lock_timeout).await? {
+            outcome.dropped.push(part.name);
+        } else {
+            outcome
                 .blocked
-                .push(format!("{} (lock not acquired within timeout)", part.name)),
+                .push(format!("{} (lock not acquired within timeout)", part.name));
         }
     }
     Ok(outcome)
@@ -1329,11 +1334,17 @@ async fn drop_partition(
     name: &str,
     lock_timeout: Duration,
 ) -> HarvestResult<bool> {
-    let ms = u64::try_from(lock_timeout.as_millis()).unwrap_or(u64::MAX).max(1);
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
     let name = name.to_string();
     let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
-        exec(conn, &format!("DROP TABLE IF EXISTS {}", quote_ident(&name))).await?;
+        exec(
+            conn,
+            &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
+        )
+        .await?;
         Ok(())
     }))
     .await;
@@ -1467,9 +1478,7 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
         exec(conn, &format!("TRUNCATE {DEFAULT_PARTITION}")).await?;
         exec(
             conn,
-            &format!(
-                "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
-            ),
+            &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
         )
         .await?;
         Ok(moved)
@@ -1567,6 +1576,9 @@ pub struct MaintenanceOutcome {
 /// `CREATE TABLE`, and the `ATTACH`. Seconds, not minutes — and bounded by an
 /// explicit `lock_timeout` so a conversion that cannot get the lock fails
 /// instead of stalling the deployment behind it.
+// As with `enable_sql`: one `format!` of an operator runbook, deliberately kept
+// in one place so it reads top to bottom.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
     let width = opts.cohort_width_secs.max(1);
@@ -1577,7 +1589,7 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
     let cutover_lit = ts_literal(cohort_start(now, width));
     let cohort_fn = cohort_function_sql(width);
     format!(
-        r#"-- ────────────────────────────────────────────────────────────────
+        r"-- ────────────────────────────────────────────────────────────────
 -- harvest_events -> partitioned layout (issue #958), LARGE LIVE TABLE
 --
 -- `harvest partition enable` runs the same algorithm in ONE transaction,
@@ -1696,7 +1708,7 @@ COMMIT;
 -- retention tick. Nothing further is required of the operator, and no cron
 -- job needs to exist.
 --   harvest partition status --shard <dsn>
-"#
+"
     )
 }
 
@@ -1790,7 +1802,10 @@ mod tests {
             "FOR VALUES FROM ('2026-08-31 00:00:00+00') TO ('2026-09-01 00:00:00+00')",
         );
         assert!(!default);
-        assert_eq!(lo, Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap()));
+        assert_eq!(
+            lo,
+            Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap())
+        );
         assert_eq!(hi, Some(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()));
     }
 
@@ -1800,7 +1815,10 @@ mod tests {
             parse_partition_bound("FOR VALUES FROM (MINVALUE) TO ('2026-08-31 00:00:00+00')");
         assert!(!default);
         assert_eq!(lo, None, "MINVALUE is an open lower bound");
-        assert_eq!(hi, Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap()));
+        assert_eq!(
+            hi,
+            Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]
@@ -1813,8 +1831,9 @@ mod tests {
 
     #[test]
     fn fractional_second_bounds_parse() {
-        let (_, hi, _) =
-            parse_partition_bound("FOR VALUES FROM (MINVALUE) TO ('2026-08-31 00:00:00.123456+00')");
+        let (_, hi, _) = parse_partition_bound(
+            "FOR VALUES FROM (MINVALUE) TO ('2026-08-31 00:00:00.123456+00')",
+        );
         assert!(hi.is_some(), "a sub-second bound must still parse");
     }
 
@@ -1982,7 +2001,11 @@ mod tests {
     #[test]
     fn timestamp_literals_cannot_contain_a_quote() {
         let lit = ts_literal(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
-        assert_eq!(lit.matches('\'').count(), 2, "exactly the delimiters: {lit}");
+        assert_eq!(
+            lit.matches('\'').count(),
+            2,
+            "exactly the delimiters: {lit}"
+        );
     }
 
     #[test]
@@ -1997,7 +2020,7 @@ mod tests {
 
     #[test]
     fn the_default_partition_sorts_last_so_a_bounded_sweep_never_reaches_it() {
-        let mut parts = vec![
+        let mut parts = [
             PartitionInfo {
                 name: DEFAULT_PARTITION.to_string(),
                 lower: None,

@@ -312,10 +312,10 @@ mod loom_sync;
 pub mod metrics_rs_adapter;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
 pub mod poison_pill;
-pub mod partition;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
