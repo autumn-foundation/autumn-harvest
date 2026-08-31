@@ -187,6 +187,8 @@ mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod throttle_tests;
 #[cfg(feature = "db")]
+mod timeout_scanner_perf_repro;
+#[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
 mod transactional_start_tests;

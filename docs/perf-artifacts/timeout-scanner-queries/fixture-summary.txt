@@ -1,0 +1,4 @@
+harvest_task_queue: 300000 COMPLETED, 2000 RUNNING (1-in-30 heartbeat_timeout, 1-in-20 start_to_close expired), 5000 PENDING (1-in-10 schedule_to_start expired, 1-in-200 schedule_to_close_at expired+owned by a PAUSED execution)
+harvest_queue_pauses: 1 row (queue_0)
+harvest_activity_pauses: 1 row (act_5)
+harvest_workflow_executions: 100025 RUNNING+PAUSED (25 PAUSED referenced by the frozen-row carve-out above; of the 100000 RUNNING rows, 1-in-500 deadline_at, 1-in-700 chain_deadline_at, 1-in-300 sla_deadline_at expired)

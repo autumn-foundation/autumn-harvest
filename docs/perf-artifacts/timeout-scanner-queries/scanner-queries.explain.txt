@@ -1,0 +1,107 @@
+-- heartbeat_timeout_query --
+Index Scan using idx_harvest_tq_running on public.harvest_task_queue  (cost=0.28..2964.00 rows=1 width=648) (actual rows=100 loops=1)
+  Output: id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, completed_at, last_heartbeat_at, heartbeat_timeout, start_to_close, schedule_to_start, retry_policy, output, error, sticky_worker_id, sticky_until, sticky_timeout, trace_context, concurrency_key, concurrency_cap, heartbeat_details, required_build_id, activity_id, rate_limit_key, crash_strikes, schedule_to_close_at, required_capabilities, context_headers, created_at, wake_requested, session_id, capability_misses, capability_miss_workers, capability_miss_handler
+  Filter: ((harvest_task_queue.heartbeat_timeout IS NOT NULL) AND ((COALESCE(harvest_task_queue.last_heartbeat_at, harvest_task_queue.started_at) + harvest_task_queue.heartbeat_timeout) < now()))
+  Rows Removed by Filter: 1900
+  Buffers: shared hit=48
+Query Identifier: -7763062428880529445
+Planning:
+  Buffers: shared hit=251 read=8
+Planning Time: 0.553 ms
+Execution Time: 0.327 ms
+
+-- start_to_close_timeout_query --
+Index Scan using idx_harvest_tq_running on public.harvest_task_queue  (cost=0.28..2964.00 rows=1 width=648) (actual rows=66 loops=1)
+  Output: id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, completed_at, last_heartbeat_at, heartbeat_timeout, start_to_close, schedule_to_start, retry_policy, output, error, sticky_worker_id, sticky_until, sticky_timeout, trace_context, concurrency_key, concurrency_cap, heartbeat_details, required_build_id, activity_id, rate_limit_key, crash_strikes, schedule_to_close_at, required_capabilities, context_headers, created_at, wake_requested, session_id, capability_misses, capability_miss_workers, capability_miss_handler
+  Filter: ((harvest_task_queue.start_to_close IS NOT NULL) AND ((harvest_task_queue.started_at + harvest_task_queue.start_to_close) < now()))
+  Rows Removed by Filter: 1934
+  Buffers: shared hit=48
+Query Identifier: -4588086312003911486
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.144 ms
+Execution Time: 0.347 ms
+
+-- schedule_to_start_timeout_query --
+Nested Loop Anti Join  (cost=50.07..50143.19 rows=2 width=648) (actual rows=250 loops=1)
+  Output: t.id, t.queue_name, t.task_type, t.workflow_exec_id, t.activity_name, t.input, t.state, t.priority, t.worker_id, t.attempt, t.max_attempts, t.scheduled_at, t.started_at, t.completed_at, t.last_heartbeat_at, t.heartbeat_timeout, t.start_to_close, t.schedule_to_start, t.retry_policy, t.output, t.error, t.sticky_worker_id, t.sticky_until, t.sticky_timeout, t.trace_context, t.concurrency_key, t.concurrency_cap, t.heartbeat_details, t.required_build_id, t.activity_id, t.rate_limit_key, t.crash_strikes, t.schedule_to_close_at, t.required_capabilities, t.context_headers, t.created_at, t.wake_requested, t.session_id, t.capability_misses, t.capability_miss_workers, t.capability_miss_handler
+  Join Filter: ((t.task_type = 'activity'::text) AND (ap.activity_name = t.activity_name))
+  Rows Removed by Join Filter: 250
+  Buffers: shared hit=211
+  ->  Nested Loop Anti Join  (cost=50.07..50142.15 rows=2 width=648) (actual rows=250 loops=1)
+        Output: t.id, t.queue_name, t.task_type, t.workflow_exec_id, t.activity_name, t.input, t.state, t.priority, t.worker_id, t.attempt, t.max_attempts, t.scheduled_at, t.started_at, t.completed_at, t.last_heartbeat_at, t.heartbeat_timeout, t.start_to_close, t.schedule_to_start, t.retry_policy, t.output, t.error, t.sticky_worker_id, t.sticky_until, t.sticky_timeout, t.trace_context, t.concurrency_key, t.concurrency_cap, t.heartbeat_details, t.required_build_id, t.activity_id, t.rate_limit_key, t.crash_strikes, t.schedule_to_close_at, t.required_capabilities, t.context_headers, t.created_at, t.wake_requested, t.session_id, t.capability_misses, t.capability_miss_workers, t.capability_miss_handler
+        Join Filter: (qp.queue_name = t.queue_name)
+        Rows Removed by Join Filter: 250
+        Buffers: shared hit=210
+        ->  Bitmap Heap Scan on public.harvest_task_queue t  (cost=50.07..50141.10 rows=2 width=648) (actual rows=475 loops=1)
+              Output: t.id, t.queue_name, t.task_type, t.workflow_exec_id, t.activity_name, t.input, t.state, t.priority, t.worker_id, t.attempt, t.max_attempts, t.scheduled_at, t.started_at, t.completed_at, t.last_heartbeat_at, t.heartbeat_timeout, t.start_to_close, t.schedule_to_start, t.retry_policy, t.output, t.error, t.sticky_worker_id, t.sticky_until, t.sticky_timeout, t.trace_context, t.concurrency_key, t.concurrency_cap, t.heartbeat_details, t.required_build_id, t.activity_id, t.rate_limit_key, t.crash_strikes, t.schedule_to_close_at, t.required_capabilities, t.context_headers, t.created_at, t.wake_requested, t.session_id, t.capability_misses, t.capability_miss_workers, t.capability_miss_handler
+              Recheck Cond: (t.state = 'PENDING'::text)
+              Filter: ((t.schedule_to_start IS NOT NULL) AND ((t.scheduled_at + t.schedule_to_start) < now()) AND ((t.schedule_to_close_at IS NULL) OR (t.schedule_to_close_at > now()) OR (NOT (SubPlan 1))))
+              Rows Removed by Filter: 4525
+              Heap Blocks: exact=104
+              Buffers: shared hit=209
+              ->  Bitmap Index Scan on idx_harvest_tq_poll  (cost=0.00..50.07 rows=5158 width=0) (actual rows=5000 loops=1)
+                    Buffers: shared hit=5
+              SubPlan 1
+                ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions e  (cost=0.42..8.44 rows=1 width=0) (actual rows=1 loops=25)
+                      Index Cond: (e.id = t.workflow_exec_id)
+                      Filter: (e.state = 'PAUSED'::text)
+                      Buffers: shared hit=100
+        ->  Materialize  (cost=0.00..1.01 rows=1 width=8) (actual rows=1 loops=475)
+              Output: qp.queue_name
+              Buffers: shared hit=1
+              ->  Seq Scan on public.harvest_queue_pauses qp  (cost=0.00..1.01 rows=1 width=8) (actual rows=1 loops=1)
+                    Output: qp.queue_name
+                    Buffers: shared hit=1
+  ->  Materialize  (cost=0.00..1.01 rows=1 width=6) (actual rows=1 loops=250)
+        Output: ap.activity_name
+        Buffers: shared hit=1
+        ->  Seq Scan on public.harvest_activity_pauses ap  (cost=0.00..1.01 rows=1 width=6) (actual rows=1 loops=1)
+              Output: ap.activity_name
+              Buffers: shared hit=1
+Query Identifier: -676585615793315292
+Planning:
+  Buffers: shared hit=220
+Planning Time: 0.961 ms
+Execution Time: 1.122 ms
+
+-- schedule_to_close_timeout_query --
+Nested Loop Anti Join  (cost=0.56..24.62 rows=1 width=648) (actual rows=0 loops=1)
+  Output: t.id, t.queue_name, t.task_type, t.workflow_exec_id, t.activity_name, t.input, t.state, t.priority, t.worker_id, t.attempt, t.max_attempts, t.scheduled_at, t.started_at, t.completed_at, t.last_heartbeat_at, t.heartbeat_timeout, t.start_to_close, t.schedule_to_start, t.retry_policy, t.output, t.error, t.sticky_worker_id, t.sticky_until, t.sticky_timeout, t.trace_context, t.concurrency_key, t.concurrency_cap, t.heartbeat_details, t.required_build_id, t.activity_id, t.rate_limit_key, t.crash_strikes, t.schedule_to_close_at, t.required_capabilities, t.context_headers, t.created_at, t.wake_requested, t.session_id, t.capability_misses, t.capability_miss_workers, t.capability_miss_handler
+  Buffers: shared hit=126
+  ->  Index Scan using harvest_task_queue_schedule_to_close_idx on public.harvest_task_queue t  (cost=0.14..8.16 rows=1 width=648) (actual rows=25 loops=1)
+        Output: t.id, t.queue_name, t.task_type, t.workflow_exec_id, t.activity_name, t.input, t.state, t.priority, t.worker_id, t.attempt, t.max_attempts, t.scheduled_at, t.started_at, t.completed_at, t.last_heartbeat_at, t.heartbeat_timeout, t.start_to_close, t.schedule_to_start, t.retry_policy, t.output, t.error, t.sticky_worker_id, t.sticky_until, t.sticky_timeout, t.trace_context, t.concurrency_key, t.concurrency_cap, t.heartbeat_details, t.required_build_id, t.activity_id, t.rate_limit_key, t.crash_strikes, t.schedule_to_close_at, t.required_capabilities, t.context_headers, t.created_at, t.wake_requested, t.session_id, t.capability_misses, t.capability_miss_workers, t.capability_miss_handler
+        Index Cond: (t.schedule_to_close_at < now())
+        Buffers: shared hit=26
+  ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions e  (cost=0.42..8.44 rows=1 width=16) (actual rows=1 loops=25)
+        Output: e.id
+        Index Cond: (e.id = t.workflow_exec_id)
+        Filter: (e.state = 'PAUSED'::text)
+        Buffers: shared hit=100
+Query Identifier: 4491242059752269105
+Planning:
+  Buffers: shared hit=72
+Planning Time: 0.445 ms
+Execution Time: 0.085 ms
+
+-- workflow_execution_timeout_query --
+Bitmap Heap Scan on public.harvest_workflow_executions  (cost=8.31..12.34 rows=1 width=1196) (actual rows=314 loops=1)
+  Output: id, workflow_name, workflow_id, run_id, shard_id, state, input, output, error, parent_id, sticky_worker_id, queue_name, started_at, completed_at, execution_timeout, memo, search_attrs, created_at, assigned_build_id, deadline_at, parent_close_policy, owner, runbook_url, severity, paused_at, pause_reason, pause_actor, current_details, sla, sla_deadline_at, sla_breached, sla_breached_at, context_headers, schedule_id, scheduled_for, workflow_attempt, workflow_retry_policy, retry_of_exec_id, origin, nd_blocked_at, nd_block_reason, nd_block_count, completion_callbacks, legal_hold_set_at, legal_hold_until, legal_hold_reason, legal_hold_actor, continued_from_exec_id, first_exec_id, start_source, start_source_ref, started_by, chain_execution_timeout, chain_deadline_at, history_bloat_warned_at, triage_note, quota_key
+  Recheck Cond: (((harvest_workflow_executions.deadline_at IS NOT NULL) AND (harvest_workflow_executions.deadline_at < now()) AND (harvest_workflow_executions.state = 'RUNNING'::text)) OR ((harvest_workflow_executions.chain_deadline_at IS NOT NULL) AND (harvest_workflow_executions.chain_deadline_at < now()) AND (harvest_workflow_executions.state = 'RUNNING'::text)))
+  Filter: (((harvest_workflow_executions.deadline_at IS NOT NULL) AND (harvest_workflow_executions.deadline_at < now())) OR ((harvest_workflow_executions.chain_deadline_at IS NOT NULL) AND (harvest_workflow_executions.chain_deadline_at < now())))
+  Heap Blocks: exact=314
+  Buffers: shared hit=316
+  ->  BitmapOr  (cost=8.31..8.31 rows=1 width=0) (actual rows=0 loops=1)
+        Buffers: shared hit=2
+        ->  Bitmap Index Scan on idx_harvest_executions_deadline  (cost=0.00..4.16 rows=1 width=0) (actual rows=200 loops=1)
+              Index Cond: ((harvest_workflow_executions.deadline_at IS NOT NULL) AND (harvest_workflow_executions.deadline_at < now()))
+              Buffers: shared hit=1
+        ->  Bitmap Index Scan on idx_harvest_executions_chain_deadline  (cost=0.00..4.16 rows=1 width=0) (actual rows=142 loops=1)
+              Index Cond: ((harvest_workflow_executions.chain_deadline_at IS NOT NULL) AND (harvest_workflow_executions.chain_deadline_at < now()))
+              Buffers: shared hit=1
+Query Identifier: -6379659818413335117
+Planning:
+  Buffers: shared hit=173
+Planning Time: 0.365 ms
+Execution Time: 0.671 ms
+

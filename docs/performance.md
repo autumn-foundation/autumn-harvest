@@ -1167,7 +1167,12 @@ from the benchmark are directly comparable.
   claim filter is `queue_name = ANY($1)`, so a worker bound to all four still
   scans all four — but that is an expectation, not a measurement.
 * **The scheduler tick and the timeout scanner are not benchmarked here.** They
-  are separate hot paths and separate work.
+  are separate hot paths and separate work. The timeout scanner's own scanner
+  queries (`timeout::enforce_timeouts_once`) have since been profiled — see
+  `docs/performance-timeout-scanner.md` — with a negative result: every
+  scanner query is already served by an existing partial index or an
+  already-cheap plan shape at realistic table-cardinality skew. The
+  scheduler tick itself remains unmeasured.
 
 ## See also
 
@@ -1194,3 +1199,9 @@ from the benchmark are directly comparable.
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* `docs/performance-timeout-scanner.md` — the timeout scanner's own queries
+  (`timeout::enforce_timeouts_once`), measured with a negative result.
+* `docs/perf-artifacts/timeout-scanner-queries/` — committed
+  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
+* `autumn-harvest/scripts/timeout_scanner_perf_repro.sh` — regenerates that
+  evidence from a clean checkout.
