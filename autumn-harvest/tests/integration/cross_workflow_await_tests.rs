@@ -908,6 +908,7 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
         Duration::from_secs(30),
         &None,
         &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .unwrap();
@@ -922,6 +923,7 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
         Duration::from_secs(30),
         &None,
         &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .unwrap();

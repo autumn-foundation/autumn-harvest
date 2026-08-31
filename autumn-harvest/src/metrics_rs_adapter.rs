@@ -887,6 +887,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_codec_reencrypted(&self, shard: &str, count: u64) {
+        counter!(
+            crate::telemetry::METRIC_CODEC_REENCRYPTED,
+            METRIC_LABEL_SHARD => shard.to_owned(),
+        )
+        .increment(count);
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_workflow_history_oversized(&self, workflow_name: &str, count: u64) {
         gauge!(

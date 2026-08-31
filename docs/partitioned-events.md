@@ -266,7 +266,7 @@ against.)
 
 ## Enabling it
 
-The migration (`20260727000000_harvest_event_partitioning`) is **inert**. It
+The migration (`20260728000000_harvest_event_partitioning`) is **inert**. It
 ships the cohort function, the `cohort` column, the drop gate's index and the
 integrity trigger, but does not convert anything. Existing deployments keep the
 ordinary table and byte-for-byte identical behaviour until an operator opts in.

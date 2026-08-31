@@ -100,6 +100,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
             dr_fencing: false,
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
@@ -1035,6 +1036,8 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });

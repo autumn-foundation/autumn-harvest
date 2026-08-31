@@ -10,7 +10,7 @@
   and task-claim p99 inside the ±5% budget.
 
   **Existing deployments are untouched.** The migration
-  (`20260727000000_harvest_event_partitioning`) is inert: it ships the machinery
+  (`20260728000000_harvest_event_partitioning`) is inert: it ships the machinery
   but converts nothing. Opt in per shard with `harvest partition enable`, or
   `harvest partition plan` for a large live table (the plan keeps the index
   builds and constraint validation outside the `ACCESS EXCLUSIVE` window, so the

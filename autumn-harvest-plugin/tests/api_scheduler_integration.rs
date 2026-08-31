@@ -3578,6 +3578,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });

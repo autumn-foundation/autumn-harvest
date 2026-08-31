@@ -1544,6 +1544,8 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -1634,6 +1636,8 @@ async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -2241,6 +2245,8 @@ async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() 
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -2340,6 +2346,8 @@ async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce");
@@ -2672,6 +2680,8 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -3005,6 +3015,8 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -3130,6 +3142,8 @@ async fn schedule_to_start_sweep_does_not_hold_a_task_row_while_awaiting_the_exe
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
