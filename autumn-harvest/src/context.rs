@@ -14227,7 +14227,8 @@ impl ActivityContext {
             // codebase: harvest_workflow_executions → harvest_task_queue)
             // and load history so we can compute the next sequential
             // event_id before appending.
-            let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the helper's docs).
+            let history = crate::store::lock_and_load_history_undecoded(conn, exec_id).await?;
 
             // Idempotency guard: verify the task is still RUNNING before
             // we commit.  If it's already COMPLETED (e.g. this is a

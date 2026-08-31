@@ -707,7 +707,20 @@ pub async fn admit_update_event(
 /// Returns [`crate::error::HarvestError::NotFound`] when the execution row
 /// does not exist, and [`crate::error::HarvestError::Database`] on any other
 /// query failure.
-pub(crate) async fn lock_and_load_history(
+/// Take the execution row's `FOR UPDATE` lock, then load history **undecoded**.
+///
+/// Its one caller -- `ActivityContext::run_transactional` -- reads only
+/// `next_event_id`, to append the inline `ActivityCompleted` at the right
+/// position. It never looks at a payload field, so decoding buys it nothing
+/// and costs it correctness: decoding here would need the identity registry,
+/// which raises `UnknownCodecKey` on the first keyed envelope and would roll
+/// back **every** transactional activity commit on a deployment with a codec
+/// configured.
+///
+/// The name says `undecoded` so a future caller that does want decoded events
+/// has to notice it is asking the wrong function. See
+/// [`load_history_undecoded`] for the general rule.
+pub(crate) async fn lock_and_load_history_undecoded(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
@@ -726,7 +739,7 @@ pub(crate) async fn lock_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    load_history(conn, exec_id).await
+    load_history_undecoded(conn, exec_id).await
 }
 
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].

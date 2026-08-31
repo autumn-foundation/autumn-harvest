@@ -21409,8 +21409,14 @@ async fn update_with_start_workflow(
             }
 
             // Poll for the update result, then embed it in the response.
-            let poll_response =
-                poll_update_result(&pool, outcome.exec_id, outcome.update_id, timeout_secs).await;
+            let poll_response = poll_update_result(
+                &pool,
+                outcome.exec_id,
+                outcome.update_id,
+                timeout_secs,
+                &api_state.payload_codecs(),
+            )
+            .await;
 
             // Re-build response combining outcome + poll result.
             let mut base = UpdateWithStartResponse::from_outcome(&outcome);
@@ -24340,7 +24346,7 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history(&mut conn, target)
+    let history = store::load_history_with_codecs(&mut conn, target, &api_state.payload_codecs())
         .await
         .map_err(map_error)?;
 
@@ -43038,6 +43044,10 @@ struct UpdateOrphanedResponse {
 /// workflow worker, then either returns immediately (`?wait=admitted`) or polls
 /// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
 /// the default) until the configurable timeout fires.
+// Grew past the 100-line cap when `poll_update_result` gained the codec
+// registry argument, which turned a one-line tail call into a seven-line one.
+// The body is a flat sequence of validation steps, not nested logic.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn admit_update(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_name)): Path<(String, String)>,
@@ -43198,7 +43208,14 @@ pub(crate) async fn admit_update(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    poll_update_result(&pool, target, update_id, timeout_secs).await
+    poll_update_result(
+        &pool,
+        target,
+        update_id,
+        timeout_secs,
+        &api_state.payload_codecs(),
+    )
+    .await
 }
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
@@ -43232,6 +43249,11 @@ pub async fn poll_update_result(
     exec_id: ExecutionId,
     update_id: UpdateId,
     timeout_secs: u64,
+    // The update's `output` is a payload field returned verbatim to the HTTP
+    // caller, so this must be the configured registry: the identity one would
+    // either raise `UnknownCodecKey` or serve a ciphertext envelope as the
+    // update result.
+    codecs: &autumn_harvest::payload_codec::PayloadCodecs,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -43246,7 +43268,7 @@ pub async fn poll_update_result(
                     .get()
                     .await
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let h = store::load_history(&mut c, exec_id).await?;
+                let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
                 if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
@@ -43366,7 +43388,13 @@ async fn get_update_result(
     };
     let mut found = None;
     for candidate in chain.into_iter().rev() {
-        let history = match store::load_history(&mut conn, candidate).await {
+        let history = match store::load_history_with_codecs(
+            &mut conn,
+            candidate,
+            &api_state.payload_codecs(),
+        )
+        .await
+        {
             Ok(h) => h,
             Err(e) => return map_error(e).into_response(),
         };
@@ -48949,7 +48977,7 @@ mod tests {
 
         // And the update must NOT have been durably admitted -- no
         // UpdateAdmitted event should exist for this execution.
-        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("history should load");
         assert!(

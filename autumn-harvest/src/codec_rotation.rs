@@ -1440,17 +1440,54 @@ mod tests {
     /// no runtime assertion can observe without a keyed deployment of every
     /// path. The allowlist is deliberately explicit: a file leaves it only by
     /// being fixed, and a new identity read anywhere else fails here.
+    ///
+    /// # Why the counting is written this way
+    ///
+    /// An earlier version of this guard matched the literal `store::load_history(`
+    /// and missed three real defects: a bare `load_history(` in a module that
+    /// imports it, and the `lock_and_load_history` **wrapper**, whose one caller
+    /// (`ActivityContext::run_transactional`) would have rolled back every
+    /// transactional activity commit under a keyed codec. Matching a call
+    /// spelling is a guess about how callers write; neutralising every *safe*
+    /// spelling and counting the remainder is not.
     #[test]
     fn no_engine_path_reads_history_through_the_identity_loader() {
+        /// Every loader that is safe by construction. `lock_and_load_history_undecoded`
+        /// is here because its name states the contract; a wrapper that hides an
+        /// identity read behind a neutral name is exactly what this guard missed once.
+        const SAFE_LOADERS: &[&str] = &[
+            "load_history_with_codecs(",
+            "load_history_undecoded(",
+            "load_history_inflated(",
+            "load_history_since_inflated(",
+            "load_history_since(",
+            "load_history_page(",
+            "load_history_with_timestamps(",
+            "lock_and_load_history_undecoded(",
+            "lock_workflow_execution_row_and_load_history(",
+            "lock_workflow_execution_and_load_history(",
+            "fn load_history(",
+        ];
+
+        // Neutralise every safe spelling, then count what is left. This catches
+        // `store::load_history(`, a bare `load_history(` in a module that
+        // imports it, and any future wrapper spelled some third way.
+        fn identity_reads(src: &str) -> usize {
+            let mut text = src.to_string();
+            for safe in SAFE_LOADERS {
+                text = text.replace(safe, "SAFE_LOADER_CALL");
+            }
+            text.matches("load_history(").count()
+        }
+
         // Both still need a `PayloadCodecs` threaded through a public
         // signature (`RetentionScanner::spawn`, `run_canary`), which is
         // issue #1243's remaining scope rather than rotation's. Neither is on
         // the task-processing path: archival and the replay canary.
-        const KNOWN_IDENTITY_READS: &[(&str, &str)] = &[
-            ("retention.rs", "run_shard_tick: archival export"),
-            ("testing.rs", "run_canary: replay canary"),
-        ];
+        const KNOWN_IDENTITY_READS: &[(&str, usize)] = &[("retention.rs", 1), ("testing.rs", 2)];
 
+        // `store.rs` is excluded: it *defines* the loaders, and its own
+        // delegation between them is the thing every other file must not do.
         let engine_sources: &[(&str, &str)] = &[
             ("worker.rs", include_str!("worker.rs")),
             ("timeout.rs", include_str!("timeout.rs")),
@@ -1460,24 +1497,35 @@ mod tests {
             ("context.rs", include_str!("context.rs")),
             ("retention.rs", include_str!("retention.rs")),
             ("testing.rs", include_str!("testing.rs")),
+            ("reset.rs", include_str!("reset.rs")),
+            ("handle.rs", include_str!("handle.rs")),
+            ("event_batch.rs", include_str!("event_batch.rs")),
+            ("debounce.rs", include_str!("debounce.rs")),
+            ("throttle.rs", include_str!("throttle.rs")),
+            ("batch.rs", include_str!("batch.rs")),
+            ("external_task.rs", include_str!("external_task.rs")),
+            (
+                "completion_trigger.rs",
+                include_str!("completion_trigger.rs"),
+            ),
         ];
 
         for (name, src) in engine_sources {
-            let identity_reads = src.matches("store::load_history(").count();
+            let found = identity_reads(src);
             let allowed = KNOWN_IDENTITY_READS
                 .iter()
-                .filter(|(file, _)| file == name)
-                .count();
+                .find(|(file, _)| file == name)
+                .map_or(0, |(_, n)| *n);
             assert_eq!(
-                identity_reads, allowed,
-                "{name}: found {identity_reads} call(s) to the identity \
-                 `store::load_history`, expected {allowed}. Use \
-                 `load_history_with_codecs` when the caller reads payload \
-                 fields, or `load_history_undecoded` when it only needs \
-                 `next_event_id` or event variants. If a new identity read is \
-                 genuinely unavoidable, add it to KNOWN_IDENTITY_READS with the \
-                 reason -- but an identity read raises `UnknownCodecKey` on any \
-                 keyed history, so it is almost certainly a live bug."
+                found, allowed,
+                "{name}: found {found} call(s) to the identity `load_history`, \
+                 expected {allowed}. Use `load_history_with_codecs` when the \
+                 caller reads payload fields, or `load_history_undecoded` when \
+                 it only needs `next_event_id` or event variants. If a new \
+                 identity read is genuinely unavoidable, add it to \
+                 KNOWN_IDENTITY_READS with the reason -- but an identity read \
+                 raises `UnknownCodecKey` on any keyed history, so it is almost \
+                 certainly a live bug."
             );
         }
     }
