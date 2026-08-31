@@ -135,7 +135,7 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
 /// Five minutes bounds the scan load to something negligible while keeping the
 /// recovery window far shorter than any rotation an operator is watching.
 #[cfg(feature = "db")]
-const COMPLETED_CURSOR_REVALIDATION: chrono::Duration = chrono::Duration::minutes(5);
+const COMPLETED_CURSOR_REVALIDATION_SECS: f64 = 300.0;
 
 #[cfg(feature = "db")]
 const fn sweep_error_kind(error: &HarvestError) -> &'static str {
@@ -833,16 +833,19 @@ mod db {
         // workers sweep the same shard, and a DB-side timestamp makes the
         // revalidation fleet-wide rather than once per worker.
         let already_complete = resumed.is_some_and(|cursor| cursor.completed_at.is_some());
-        let revalidation_due = resumed.is_none_or(|cursor| {
-            Utc::now().signed_duration_since(cursor.updated_at)
-                >= super::COMPLETED_CURSOR_REVALIDATION
-        });
-        // Census when a pass is newly completing, when it actually moved, or
-        // when a converged shard's slow clock comes round. Skipping it in the
-        // steady state is the whole point; skipping it forever is not, because
-        // a row that commits below the cursor is only ever found this way.
-        let census_needed =
-            reached_end && unresolved_total == 0 && (!already_complete || revalidation_due);
+        // Census when a pass is newly completing, and on a converged shard only
+        // when this worker wins the interval's claim. Skipping it in the steady
+        // state is the whole point; skipping it forever is not, because a row
+        // that commits below the cursor is only ever found this way.
+        let census_needed = if reached_end && unresolved_total == 0 {
+            if already_complete {
+                claim_completed_cursor_revalidation(conn, shard_id).await?
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         let census_clean = if census_needed {
             let by_key = count_rows_by_key_id(conn).await?;
             by_key
@@ -899,14 +902,11 @@ mod db {
         // while doing no work, which is exactly backwards for an operator
         // watching it.
         //
-        // A revalidation tick is the exception: it must write even though
-        // nothing changed, because `updated_at` IS the revalidation clock and a
-        // suppressed write would leave it permanently due, censusing every tick
-        // again. One write per shard per interval is the price of bounding the
-        // scan, and it is orders of magnitude below the per-tick churn this
-        // guard exists to prevent.
+        // A revalidation tick needs no exception here: the claim statement has
+        // already bumped `updated_at`, so a clean re-census writes nothing and
+        // a dirty one falls through this guard anyway, its reset changing the
+        // fields below.
         let cursor_unchanged = batch_len == 0
-            && !census_needed
             && resumed.is_some_and(|cursor| {
                 cursor.completed_at.is_some()
                     && cursor.last_event_id == next_last_event_id
@@ -1018,6 +1018,54 @@ mod db {
     /// this, and a second one racing it simply overwrites with its own
     /// consistent view rather than compounding two partial increments onto a
     /// row whose meaning it never read.
+    /// Atomically claim the right to re-census a completed shard.
+    ///
+    /// Returns `true` for the ONE caller that wins the interval.
+    ///
+    /// Two properties, both of which a read-then-decide check gets wrong:
+    ///
+    /// - **The comparison happens on the database clock.** `updated_at` is
+    ///   written with `NOW()`, so testing it against the worker's `Utc::now()`
+    ///   measures host clock skew as much as elapsed time: a worker running
+    ///   five minutes fast finds the cursor due immediately after every
+    ///   refresh and censuses on every tick, which is precisely the per-tick
+    ///   full scan the throttle exists to stop. A worker running slow silently
+    ///   stretches the recovery window instead. `NOW()` on both sides of the
+    ///   predicate removes the host clock from the question entirely.
+    ///
+    /// - **The claim and the bump are one statement.** Several replicas run a
+    ///   timeout checker over the same shard. Reading the timestamp, deciding,
+    ///   then censusing, then writing, lets every replica pass the check before
+    ///   any of them writes -- so a large shard takes one simultaneous
+    ///   sequential scan *per replica* every interval, which is worse than the
+    ///   unthrottled single-worker case this was meant to fix. `UPDATE ...
+    ///   WHERE updated_at < deadline RETURNING` makes exactly one replica win,
+    ///   because the row lock serialises them and the loser's predicate no
+    ///   longer holds.
+    ///
+    /// Bumping `updated_at` before the census rather than after is deliberate:
+    /// the interval is a rate limit on an expensive scan, not a lease on
+    /// completing it. A crash mid-census costs one skipped revalidation, which
+    /// the next interval picks up.
+    async fn claim_completed_cursor_revalidation(
+        conn: &mut AsyncPgConnection,
+        shard_id: i32,
+    ) -> HarvestResult<bool> {
+        let claimed = diesel::sql_query(
+            "UPDATE harvest_codec_rotation_cursor \
+                SET updated_at = NOW() \
+              WHERE shard_id = $1 \
+                AND completed_at IS NOT NULL \
+                AND updated_at < NOW() - make_interval(secs => $2)",
+        )
+        .bind::<Integer, _>(shard_id)
+        .bind::<diesel::sql_types::Double, _>(super::COMPLETED_CURSOR_REVALIDATION_SECS)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(claimed > 0)
+    }
+
     async fn write_cursor(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
