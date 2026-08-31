@@ -708,6 +708,7 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
             &mut conn,
             &Some(sharded.clone()),
             &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            &autumn_harvest::telemetry::NoOpMetrics,
         )
         .await
         .expect("relay sweep");

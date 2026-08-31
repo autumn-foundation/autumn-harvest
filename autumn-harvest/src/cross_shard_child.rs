@@ -148,6 +148,15 @@ pub struct CrossShardChildSpec {
     pub concurrency_key: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<u32>,
+    /// The `harvest.child_workflow.start` producer context captured at spawn.
+    ///
+    /// Carried on the row because the relay creates the child later, on another
+    /// connection, long after the span that produced it has gone. Without it a
+    /// remotely placed child begins a disconnected trace — breaking
+    /// parent-to-child correlation for precisely the distributed fan-outs this
+    /// feature exists to enable.
+    #[serde(default)]
+    pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
 }
 
 /// The cap half of a [`crate::quota::QuotaPolicy`], in a form that survives a
@@ -428,6 +437,7 @@ pub async fn enforce_cross_shard_children(
     conn: &mut AsyncPgConnection,
     sharded_pool: &Option<ShardedDbPool>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
     // Every cross-shard checkout in this sweep is bounded. Harvest configures no
     // deadpool `Timeouts`, so a bare `pool.get().await` is an *unbounded* wait,
@@ -586,6 +596,7 @@ pub async fn enforce_cross_shard_children(
             observed_child,
             acquire_bound,
             codecs,
+            metrics,
         )
         .await
         {
@@ -823,6 +834,7 @@ async fn apply_action(
     observed_child: Option<&TargetChildState>,
     acquire_bound: Option<std::time::Duration>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<bool> {
     match action {
         CrossShardChildAction::Wait => Ok(false),
@@ -831,7 +843,7 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::StartChild => {
-            start_child_on_target(pool, row, acquire_bound, codecs).await?;
+            start_child_on_target(pool, row, acquire_bound, codecs, metrics).await?;
             // Only after the child is durably committed on the target shard.
             // A crash before this update simply re-runs the insert, which the
             // child's primary key makes a no-op.
@@ -848,7 +860,7 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::CancelChild => {
-            cancel_child_on_target(pool, row, acquire_bound).await?;
+            cancel_child_on_target(pool, row, acquire_bound, metrics).await?;
             diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
                 .set((
                     harvest_cross_shard_children::cancel_requested.eq(false),
@@ -864,7 +876,7 @@ async fn apply_action(
             let policy = observation
                 .parent_close_policy
                 .expect("ApplyCloseCascade is only decided for a detached child");
-            cascade_child_on_target(pool, row, policy, acquire_bound).await?;
+            cascade_child_on_target(pool, row, policy, acquire_bound, metrics).await?;
             apply_cascade_bookkeeping(conn, row, policy).await?;
             Ok(true)
         }
@@ -1017,6 +1029,7 @@ async fn start_child_on_target(
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
@@ -1129,7 +1142,7 @@ async fn start_child_on_target(
                 spec.quota.map(QuotaCaps::to_policy),
                 spec.quota_key.as_deref(),
                 &workflow_name,
-                None,
+                Some(metrics),
             )
             .await?;
 
@@ -1173,6 +1186,7 @@ async fn start_child_on_target(
             params.required_build_id = spec.assigned_build_id.clone();
             params.concurrency_key = spec.concurrency_key.clone();
             params.max_concurrent = spec.max_concurrent;
+            params.trace_context = spec.trace_context.clone();
             queue::enqueue(conn, &params).await?;
             Ok(())
         }
@@ -1181,10 +1195,17 @@ async fn start_child_on_target(
 }
 
 /// Deliver an idempotent cancel to a cross-shard child on its target shard.
+///
+/// Takes the scanner's REAL metrics recorder, not a no-op. `cancel_workflow_execution`
+/// emits `harvest.workflow.terminal{outcome="cancelled"}` itself, so swallowing
+/// the recorder here would make fleet-wide terminal counts depend on whether a
+/// child happened to be placed locally or remotely — silently under-counting
+/// exactly the cancellations a distributed fan-out produces.
 async fn cancel_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
@@ -1192,7 +1213,7 @@ async fn cancel_child_on_target(
         &mut conn,
         child_exec_id,
         "parent requested cancellation",
-        &crate::telemetry::NoOpMetrics,
+        metrics,
     )
     .await;
     absorb_already_settled(&mut conn, child_exec_id, result).await
@@ -1204,6 +1225,7 @@ async fn cascade_child_on_target(
     row: &CrossShardChildRow,
     policy: ParentClosePolicy,
     acquire_bound: Option<std::time::Duration>,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
@@ -1213,7 +1235,7 @@ async fn cascade_child_on_target(
                 &mut conn,
                 child_exec_id,
                 "parent closed",
-                &crate::telemetry::NoOpMetrics,
+                metrics,
             )
             .await
         }
@@ -1222,7 +1244,7 @@ async fn cascade_child_on_target(
                 &mut conn,
                 child_exec_id,
                 "ParentClosed",
-                &crate::telemetry::NoOpMetrics,
+                metrics,
             )
             .await
         }

@@ -9241,6 +9241,11 @@ async fn persist_all_started_child_workflows(
                 parent_execution,
                 &child.workflow_name,
                 &child.input,
+                None, // awaited child
+                child_trace_ctxs
+                    .get(&child.child_id.as_uuid())
+                    .cloned()
+                    .flatten(),
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
@@ -9537,6 +9542,19 @@ struct ChildWorkflowDefaults {
     quota: Option<crate::quota::QuotaPolicy>,
 }
 
+/// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
+/// policy (issue #956, mirroring the local detached path).
+fn clamp_detached_retry_policy(
+    registry: &HandlerRegistry,
+    policy: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let ceiling = registry.max_workflow_attempts_ceiling?;
+    let policy = policy?;
+    let mut parsed: crate::policy::RetryPolicy = serde_json::from_value(policy.clone()).ok()?;
+    parsed.max_attempts = parsed.max_attempts.min(ceiling);
+    serde_json::to_value(&parsed).ok().or(Some(policy))
+}
+
 /// The shard a child's recorded `ExecutionId` actually targets, relative to its
 /// parent (issue #956).
 ///
@@ -9584,7 +9602,13 @@ fn cross_shard_child_spec(
     parent_execution: &WorkflowExecution,
     workflow_name: &str,
     input: &serde_json::Value,
+    // `Some(_)` for a detached child. Detached children are shaped differently
+    // from awaited ones on the local path and must be shaped identically here:
+    // placement changes WHERE a child runs, never what it is.
+    parent_close_policy: Option<crate::types::ParentClosePolicy>,
+    trace_context: Option<TraceContextCarrier>,
 ) -> HarvestResult<crate::cross_shard_child::CrossShardChildSpec> {
+    let detached = parent_close_policy.is_some();
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
     let quota_key: Option<String> = defaults
         .quota
@@ -9615,10 +9639,34 @@ fn cross_shard_child_spec(
         // runs late cannot hand the child an already-expired deadline (issue
         // #956, Codex round 4). The chain deadline stays absolute by design.
         sla_secs: defaults.sla.map(|d| d.num_seconds()),
-        execution_timeout_secs: defaults.execution_timeout.map(|d| d.num_seconds()),
-        chain_execution_timeout_secs: defaults.chain_execution_timeout.map(|d| d.num_seconds()),
-        chain_deadline_at: defaults.chain_deadline_at,
-        retry_policy: defaults.retry_policy.clone(),
+        // A detached child resolves NO execution timeout at spawn on the local
+        // path — and therefore no chain cap either — so a remotely placed one
+        // must not acquire one. Copying the awaited-child defaults here would
+        // mean that merely changing a spawn's placement could start timing out a
+        // formerly unbounded detached child, which the placed API's
+        // location-only contract forbids.
+        execution_timeout_secs: (!detached)
+            .then(|| defaults.execution_timeout.map(|d| d.num_seconds()))
+            .flatten(),
+        chain_execution_timeout_secs: (!detached)
+            .then(|| defaults.chain_execution_timeout.map(|d| d.num_seconds()))
+            .flatten(),
+        chain_deadline_at: if detached {
+            None
+        } else {
+            defaults.chain_deadline_at
+        },
+        // Clamp a detached child's declared retry policy by the server-side
+        // ceiling, exactly as the local detached path does. Detached children
+        // bypass `StartWorkflowParams`, where the ceiling is normally applied, so
+        // without this a workflow whose declared policy exceeds the ceiling would
+        // get all its declared attempts purely because it was placed remotely.
+        retry_policy: if detached {
+            clamp_detached_retry_policy(registry, defaults.retry_policy.clone())
+        } else {
+            defaults.retry_policy.clone()
+        },
+        trace_context,
         quota_key,
         quota: defaults
             .quota
@@ -9745,6 +9793,8 @@ async fn insert_awaited_child_execution(
             parent_execution,
             &child.workflow_name,
             &child.input,
+            None, // awaited child
+            trace_context,
         )?;
         return crate::cross_shard_child::record_cross_shard_child(
             conn,
@@ -11398,12 +11448,34 @@ pub async fn materialize_due_child_timeout_deadlines(
 /// at all, so the relay would never have a terminal to deliver and the parent
 /// would park forever: a silent, total failure of the feature.
 ///
-/// An unencoded id on either side means "the parent's shard" by construction
-/// (see [`child_target_shard`]), so it is never cross-shard.
+/// Only the **child** side normalises the unencoded sentinel, and that asymmetry
+/// is the whole point. An unencoded *child* id means "the parent's shard" by
+/// construction — that is what the default placement mints from an unencoded
+/// parent — so it is never cross-shard. An unencoded *parent* says nothing at
+/// all about the child: an unencoded parent that opts into a placement mints a
+/// child encoded to a real remote shard, and exempting it here would send that
+/// child's terminal straight back into the inline append this guard exists to
+/// prevent. An unencoded parent's own row lives on the router's default shard
+/// (`StartWorkflowParams::shard_id` normalises it that way), so that is what the
+/// child's encoded shard is compared against.
+///
+/// With no router installed there is no second database to be on, so nothing is
+/// cross-shard.
 #[must_use]
 pub fn parent_is_on_another_shard(parent: ExecutionId, child: ExecutionId) -> bool {
-    let (p, c) = (parent.shard(), child.shard());
-    !p.is_unencoded() && !c.is_unencoded() && p != c
+    let child_shard = child.shard();
+    if child_shard.is_unencoded() {
+        return false;
+    }
+    let parent_shard = if parent.shard().is_unencoded() {
+        let Some(router) = placement_router() else {
+            return false;
+        };
+        router.default_shard()
+    } else {
+        parent.shard()
+    };
+    child_shard != parent_shard
 }
 
 pub async fn wake_parent_for_child_completion(
@@ -11647,7 +11719,24 @@ async fn create_detached_child_executions(
                 placement_router().as_ref(),
                 child_id.shard(),
             )?;
-            let spec = cross_shard_child_spec(registry, parent_execution, workflow_name, input)?;
+            let spec = cross_shard_child_spec(
+                registry,
+                parent_execution,
+                workflow_name,
+                input,
+                Some(*parent_close_policy),
+                // Capture the producer context so a remotely placed detached
+                // child joins its parent's trace, exactly as the local path does.
+                tracing::info_span!(
+                    parent: execute_span,
+                    "harvest.child_workflow.start",
+                    "otel.kind" = "producer",
+                    { ATTR_WORKFLOW_ID } = %workflow_name,
+                    { ATTR_EXECUTION_ID } = %child_id,
+                    { ATTR_SHARD_ID } = child_id.shard().as_i32(),
+                )
+                .in_scope(|| registry.telemetry().capture_trace_context()),
+            )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
                 execution_id_from_uuid(parent_execution.id),

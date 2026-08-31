@@ -181,6 +181,20 @@ already lives, so no cross-shard contract is broken; none was made. AC8's actual
 requirement is that a fallback never happen "without trace", so the path now
 carries a `warn!` naming the workflow and the shard, and the docs say so plainly.
 
+**Codex round 5 (one P1, four P2s).** `parent_is_on_another_shard` exempted an
+unencoded *parent*, but an unencoded parent that opts into a placement mints a
+child encoded to a real remote shard — so its terminal went straight back into
+the inline append the guard exists to prevent. Only the *child* side normalises
+the sentinel now; an unencoded parent's row lives on the router's default shard,
+which is what the child's encoded shard is compared against. The four P2s were
+all "placement changed something other than location": a remotely placed detached
+child inherited the awaited-child execution and chain timeouts (the local
+detached path deliberately persists none), skipped the
+`max_workflow_attempts_ceiling` clamp, began a disconnected trace, and had its
+relay-driven cancellations and terminations counted through a no-op recorder so
+fleet-wide terminal metrics depended on where a child happened to land. All four
+now match the local path exactly.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive
