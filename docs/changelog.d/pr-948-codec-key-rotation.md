@@ -27,7 +27,7 @@ forget. A row the pass could not convert (an unregistered key, corrupt
 ciphertext, a compare-and-swap lost to a concurrent erasure) is counted as
 unresolved, and a pass that ends with a non-zero count re-runs instead of being
 marked complete — so `completed_at` means "this pass converted everything it
-saw", and a key re-registered too late is still picked up. One migration (`20260726000000_harvest_codec_rotation_cursor`). The
+saw", and a key re-registered too late is still picked up. One migration (`20260727000000_harvest_codec_rotation_cursor`). The
 sweep returns without issuing a statement unless a keyed codec is registered, so
 every deployment that has not adopted rotation pays nothing.
 

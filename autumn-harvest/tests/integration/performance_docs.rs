@@ -36,39 +36,38 @@ fn performance_doc_path() -> PathBuf {
     repo_root().join("docs/performance.md")
 }
 
-/// Marker opening the released performance narrative.
+/// Marker opening the released performance narrative in the shipped-work record.
 ///
-/// This prose has moved twice. It was written in
-/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`; the 0.6.0
-/// collation sweep folded it into `CHANGELOG.md` (condensed to one bullet) and
-/// `CLAUDE.md`'s phase list (verbatim) and deleted the fragment; then commit
-/// 562c781 trimmed `CLAUDE.md` back to repository instructions — which is what
-/// that file is for — and the verbatim copy went with it, panicking every
-/// guard below on the read.
+/// This prose has been chased across three homes by routine maintenance, and
+/// each move broke these guards: it began in
+/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`, which the 0.6.0
+/// collation sweep folded away and deleted; it then lived in `CLAUDE.md`'s
+/// phase list, which `562c781` removed when it cut that file down to workflow
+/// instructions. It now lives in `docs/shipped-work.md`, whose header says it
+/// is guard-referenced and must not be collated or condensed.
 ///
-/// It now lives in `docs/performance-released-entry.md`, next to the page it
-/// is cross-checked against. The verbatim copy is the one these guards need: a
-/// condensed `CHANGELOG.md` bullet no longer carries the per-gate figures.
+/// The *verbatim* entry is the one these guards need — a condensed bullet no
+/// longer carries the per-gate figures they cross-check, which is why
+/// `CHANGELOG.md` cannot serve as the source.
 const RELEASED_PERF_ENTRY_MARKER: &str =
     "- **Tooling** — Task-claim / enqueue throughput benchmark";
 
-fn released_perf_entry_path() -> PathBuf {
-    repo_root().join("docs/performance-released-entry.md")
+fn shipped_work_path() -> PathBuf {
+    repo_root().join("docs/shipped-work.md")
 }
 
-/// The released performance narrative.
+/// The released performance narrative, extracted from the shipped-work record.
 ///
-/// Still scoped from the marker to the next entry rather than handed the whole
-/// file: several guards ban a superseded phrasing, and an unscoped read would
-/// let surrounding prose trip — or mask — a check. Its own file now means that
-/// scope spans this narrative and nothing else.
+/// Scoped to the single entry rather than handing the guards the whole file:
+/// several of them ban a superseded phrasing, and an unscoped read would let an
+/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
 fn released_perf_entry() -> String {
-    let text = read_normalized(&released_perf_entry_path());
+    let text = read_normalized(&shipped_work_path());
     let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
         panic!(
-            "docs/performance-released-entry.md must contain the claim-benchmark \
-             entry (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance \
-             guards cross-check the published tables against it"
+            "docs/shipped-work.md must contain the claim-benchmark phase entry \
+             (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
+             cross-check the published tables against it"
         )
     });
     let rest = &text[start + RELEASED_PERF_ENTRY_MARKER.len()..];
@@ -387,8 +386,12 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
     let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
-    let body = top_level_fn_body(&queue_src, "claim_task")
-        .expect("queue.rs must define `pub async fn claim_task(`");
+    // `claim_task_on_shard`, not `claim_task`: issue #954 made the latter a thin
+    // wrapper that delegates, so the claim transaction — and every statement
+    // this guard exists to keep the docs honest about — lives in the former.
+    // The guard follows the transaction, which is what it was always about.
+    let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
+        .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
 
     let mut called: Vec<&str> = Vec::new();
     for (idx, _) in body.match_indices("crate::queue_pause::") {
@@ -1239,15 +1242,18 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
     ];
 
     // Pairs of (label, already-extracted text) rather than (label, path): the
-    // released entry is scoped from its marker to the next entry, so handing
-    // this loop a whole file would let unrelated prose's "28%" trip — or mask
-    // — the scan below.
+    // released entry is one item inside a long shipped-work record, so handing
+    // this loop that whole file would let an unrelated entry's "28%" trip — or
+    // mask — the scan below.
     for (label, source) in [
         (
             "docs/performance.md",
             read_normalized(&performance_doc_path()),
         ),
-        ("docs/performance-released-entry.md", released_perf_entry()),
+        (
+            "the released performance entry in docs/shipped-work.md",
+            released_perf_entry(),
+        ),
     ] {
         // A character window, not a line window: `docs/performance.md` is hard
         // wrapped at ~78 columns while the released entry is a single

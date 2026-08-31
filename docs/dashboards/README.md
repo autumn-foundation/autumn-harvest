@@ -144,6 +144,10 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_no_capable_worker` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_no_capable_worker) |
 | `harvest_capability_miss_never_offered` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_capability_miss_never_offered) |
 | `harvest_capability_miss_release_sustained` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_capability_miss_release_sustained) |
+| `harvest_replication_down` | Cross-region DR → *Connected standbys (0 = replication is DOWN)*, with *WAL backlog* for severity |
+| `harvest_replication_lag_high` | Cross-region DR → *Measured RPO*, with *Shard write-authority generation* for failover skew |
+| `harvest_shard_fenced` | Cross-region DR → *Workers fenced (never self-healing)* |
+| `harvest_replication_unobservable` | Cross-region DR → *Replication observable (0 = the other DR panels are STALE)* |
 
 ### Readiness-style alerts (no native metric)
 
@@ -164,7 +168,7 @@ the API result through your own probe with bounded labels) —
 | `$datasource` | datasource | your Prometheus datasources | every panel |
 | `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label, including `harvest_retention_deleted` (issue #737); series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
 | `$queue` | query, multi + All | `label_values(harvest_queue_depth, queue)` | series carrying a `queue` label |
-| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, and the canary series) |
+| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, the cross-region DR series (`harvest_replication_lag_seconds`, `harvest_replication_lag_bytes`, `harvest_replication_standbys`, `harvest_replication_observable`, `harvest_shard_generation`, `harvest_shard_fenced_total`), and the canary series) |
 
 Variables are applied per-panel only where the series actually carries the
 label — applying `shard=~"$shard"` to an unlabelled series would silently

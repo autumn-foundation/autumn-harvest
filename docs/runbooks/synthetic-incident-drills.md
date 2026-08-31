@@ -137,3 +137,38 @@ In a multi-shard environment, restore **every** shard, pass every shard to a
 one run exits `0`.
 
 Runbook: [`backup-restore.md`](backup-restore.md).
+
+## replication-stalled
+
+In a staging environment with a cross-region standby (issue #954), stall the
+standby's apply worker rather than disconnecting it — a disconnection is the
+easy case, and a stall is the one that defeats
+`pg_stat_replication.replay_lag`. On the standby, in a session you hold open:
+
+```
+BEGIN; LOCK TABLE harvest_replication_heartbeat IN ACCESS EXCLUSIVE MODE;
+```
+
+Leave it held while the primary keeps working, and watch
+`harvest.replication.lag_seconds` climb in real time while
+`pg_stat_replication.replay_lag` stays `NULL`.
+
+Expected alert: `harvest_replication_lag_high`.
+
+Runbook step: `harvest_replication_lag_high` -> `### Triage steps`, especially
+step 3 (find the session on the standby holding the lock) and the `NULL`
+`replay_lag` beside a large measured RPO, which is the stuck-apply signature.
+
+Then `ROLLBACK` the blocking session and confirm the RPO recovers rather than
+staying latched.
+
+For the disconnection variant, `ALTER SUBSCRIPTION <name> DISABLE` instead.
+Expected alert: `harvest_replication_down` — and confirm that
+`harvest.replication.lag_seconds` goes **absent** rather than reporting `0`,
+which is the property the whole alert design rests on.
+
+Resolution target: the alert fires within its `for` window, `harvest dr status`
+names the affected shard, and the RPO returns to under one sampler interval
+once the stall clears. This is the alerting rehearsal only; the full
+fence/promote/verify/start procedure is drilled separately in
+`docs/runbooks/cross-region-failover.md` § *Failover drill*.

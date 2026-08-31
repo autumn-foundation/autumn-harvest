@@ -15,7 +15,7 @@
 //! implementation in `queue.rs`.
 //!
 //! Compile-checked only in this sandbox (no Docker/testcontainers available),
-//! matching the #543/#544/#601 precedent documented in CLAUDE.md.
+//! matching the #543/#544/#601 precedent documented in docs/shipped-work.md.
 #![cfg(feature = "db")]
 
 use autumn_harvest::queue::{EnqueueParams, TaskType};
@@ -828,6 +828,7 @@ mod db_tests {
                 Worker::new(
                     autumn_harvest::worker::WorkerRuntimeConfig {
                         codec_rotation_batch_size: 0,
+                        dr_fencing: false,
                         worker_id: worker_id.to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,

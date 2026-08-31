@@ -152,6 +152,7 @@ fn build_registry(
 fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
+        dr_fencing: false,
         worker_id: worker_id.to_string(),
         // Two queues so `info().queue_name` is falsifiable: with a single
         // "default" queue, the workflow queue, the activity queue and the

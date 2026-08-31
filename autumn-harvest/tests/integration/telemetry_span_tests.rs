@@ -367,6 +367,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                 Worker::new(
                     WorkerRuntimeConfig {
                         codec_rotation_batch_size: 0,
+                        dr_fencing: false,
                         worker_id: "telem-test-worker".to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,

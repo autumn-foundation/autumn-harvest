@@ -186,6 +186,13 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_worker_slot_target",
     "harvest_shard_stranded_pending",
     "harvest_shard_dispatched_total",
+    // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
+    "harvest_replication_lag_seconds",
+    "harvest_replication_lag_bytes",
+    "harvest_replication_standbys",
+    "harvest_replication_observable",
+    "harvest_shard_generation",
+    "harvest_shard_fenced_total",
     "harvest_schedule_overdue",
     "harvest_admission_gates_active",
     "harvest_workflow_history_oversized",
@@ -295,6 +302,14 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_queue_dispatched", &["queue"]),
     ("harvest_shard_stranded_pending", &["shard"]),
     ("harvest_shard_dispatched", &["shard"]),
+    // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
+    // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
+    ("harvest_replication_lag_seconds", &["shard"]),
+    ("harvest_replication_lag_bytes", &["shard"]),
+    ("harvest_replication_standbys", &["shard"]),
+    ("harvest_replication_observable", &["shard"]),
+    ("harvest_shard_generation", &["shard"]),
+    ("harvest_shard_fenced", &["shard"]),
     ("harvest_worker_slots_in_use", &["slot_type"]),
     ("harvest_worker_slots_available", &["slot_type"]),
     ("harvest_worker_slot_target", &["slot_type"]),

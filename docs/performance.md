@@ -1011,7 +1011,12 @@ a single round trip either. It issues, in order:
    itself rather than inherited, so step 4 always gets a fresh snapshot.
 2. **The claim CTE.** The rate-limit debit and the per-key concurrency
    advisory-lock re-check are branches *within* this statement, not extra ones —
-   this is the statement the `EXPLAIN` below plans.
+   this is the statement the `EXPLAIN` below plans. With cross-region DR fencing
+   enabled (issue #954, off by default) it carries one additional
+   `MATERIALIZED` CTE probing `harvest_shard_generation` — still the same single
+   statement and the same round-trip count, and the published figures below were
+   measured with fencing off, which is the default and the configuration the
+   plan applies to.
 3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back

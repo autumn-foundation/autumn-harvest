@@ -568,6 +568,34 @@ pub enum HarvestError {
         current: u64,
     },
 
+    /// This process is pinned to a shard generation the database has moved
+    /// past: another region holds write authority now (issue #954).
+    ///
+    /// Raised by [`crate::replication::assert_fence`] on the persist path and
+    /// by the worker's periodic self-fence check. It is **terminal for the
+    /// worker, not for the workflow**: the work is untouched and will be
+    /// claimed by a worker in the region that actually holds authority. A
+    /// worker that sees this must stop, never retry and never re-pin — re-
+    /// pinning to the newer generation is exactly the split-brain the epoch
+    /// exists to prevent.
+    ///
+    /// `current` is `None` when the shard's `harvest_shard_generation` row is
+    /// absent entirely. That also fences: a pinned worker with nothing to
+    /// check against fails closed rather than assuming it still has authority.
+    #[error(
+        "shard {shard_id} is fenced: this worker is pinned to generation {pinned} but the \
+         database is at {current:?} — another region holds write authority"
+    )]
+    ShardFenced {
+        /// The shard whose write authority moved.
+        shard_id: i32,
+        /// The generation this process pinned at startup.
+        pinned: i64,
+        /// The generation the database currently reports, or `None` when the
+        /// fencing row is absent.
+        current: Option<i64>,
+    },
+
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
     /// call failed permanently.
     ///

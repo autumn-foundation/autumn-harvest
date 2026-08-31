@@ -300,6 +300,84 @@ pub const METRIC_WORKER_SLOT_TARGET: &str = "harvest.worker.slot_target";
 /// the live target rather than what the controller requested.
 pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions";
 
+/// Gauge: measured RPO for a shard — how many seconds of acknowledged work a
+/// failover to the standby region would lose right now (issue #954).
+///
+/// Sourced from replication positions: the age of the newest
+/// `harvest_replication_heartbeat` watermark whose WAL position the slowest
+/// standby of this shard's database has already confirmed.
+///
+/// **The series is absent, not zero, when the RPO is unknown** — no standby
+/// connected, no slot, or the standby further behind than the retained
+/// watermark trail. That is deliberate and load-bearing: a dead standby
+/// reported as `0` reads as a perfect RPO, which is the most dangerous number
+/// this metric could publish. Alert on a
+/// [`METRIC_REPLICATION_STANDBYS`] value of `0` for "replication is down";
+/// alert on this gauge only for "replication is slow".
+///
+/// Labelled `{shard}` only. A standby's `application_name` is operator-chosen
+/// and unbounded, so it is not a label (ADR-0001 §7); per-standby detail is
+/// available from `pg_stat_replication` directly.
+pub const METRIC_REPLICATION_LAG_SECONDS: &str = "harvest.replication.lag_seconds";
+
+/// Gauge: `1` while a shard's replication views are readable, `0` when they
+/// are not (issue #954).
+///
+/// Exists because **a Prometheus gauge keeps exporting its last value until it
+/// is changed** — so simply declining to emit the RPO and standby gauges when
+/// the views become unreadable does not make those series stale, it freezes
+/// them at their last healthy reading and an unobservable shard goes on looking
+/// fine indefinitely.
+///
+/// The two options that do not work: emitting `0` standbys on an unreadable
+/// view pages on-call for what is almost always a missing `GRANT pg_monitor`,
+/// and emitting nothing leaves the stale value in place. So availability is
+/// published as its own signal, and the other DR gauges are withheld while it
+/// is `0`.
+///
+/// Alerting: require `harvest_replication_observable == 1` on the
+/// replication-down rule so it cannot fire on a stale reading, and alert on
+/// `== 0` separately — that is a configuration problem, not an outage.
+/// Labelled `{shard}`.
+pub const METRIC_REPLICATION_OBSERVABLE: &str = "harvest.replication.observable";
+
+/// Gauge: worst-case WAL backlog in bytes for a shard (issue #954).
+///
+/// The byte companion to [`METRIC_REPLICATION_LAG_SECONDS`], and the signal
+/// that survives a disconnected standby: a slot with no walsender still pins
+/// WAL, so the backlog stays knowable when the time lag is not. Also the
+/// disk-pressure signal — an abandoned slot grows this without bound until the
+/// primary runs out of WAL space. Labelled `{shard}`.
+pub const METRIC_REPLICATION_LAG_BYTES: &str = "harvest.replication.lag_bytes";
+
+/// Gauge: number of standbys with a live walsender for a shard (issue #954).
+///
+/// `0` means replication is **down** for that shard — the RPO is unbounded and
+/// growing, and a failover now would lose everything since the standby stopped
+/// consuming. This, not a lag threshold, is the "replication broken" alert:
+/// a standby that is not connected produces no lag reading to threshold.
+/// Labelled `{shard}`.
+pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
+
+/// Gauge: the write-authority epoch a shard's database currently reports
+/// (issue #954).
+///
+/// Monotonic per shard. Its value is uninteresting; its *skew* is the point —
+/// shards fail over independently, so
+/// `max(harvest_shard_generation) by () != min(...)` is the machine-readable
+/// form of "some shards were failed over and some were not", the hazard
+/// `docs/cross-region-dr.md` describes. Labelled `{shard}`.
+pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
+
+/// Counter: this worker was fenced off a shard it is pinned to (issue #954).
+///
+/// Incremented once, immediately before the worker stops. A non-zero value in
+/// the *promoted* region means a fleet was left pinned to a pre-failover epoch
+/// and must be restarted; a non-zero value with no failover in progress means
+/// someone bumped a generation on a healthy shard. Both are page-worthy and
+/// neither is self-healing. Labelled `{shard}`.
+pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -2532,6 +2610,60 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, count);
     }
 
+    /// Measured RPO for a shard in seconds (issue #954).
+    ///
+    /// Emitted per shard by the replication sampler, and **only when the RPO is
+    /// actually known**: the sampler skips this call entirely when it is not,
+    /// so the series goes stale rather than reporting a false `0`. Pair with
+    /// [`Self::record_replication_standbys`] to tell "slow" from "down".
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_LAG_SECONDS`].
+    fn record_replication_lag_seconds(&self, shard: u16, seconds: f64) {
+        let _ = (shard, seconds);
+    }
+
+    /// Whether a shard's replication views are readable (issue #954).
+    ///
+    /// Emitted on **every** sampler tick, `0` included — it is the one DR
+    /// signal that must never go stale, because it is what tells a dashboard
+    /// that the others have.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_OBSERVABLE`].
+    fn record_replication_observable(&self, shard: u16, observable: bool) {
+        let _ = (shard, observable);
+    }
+
+    /// Worst-case WAL backlog in bytes for a shard (issue #954).
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_LAG_BYTES`].
+    fn record_replication_lag_bytes(&self, shard: u16, bytes: i64) {
+        let _ = (shard, bytes);
+    }
+
+    /// Number of standbys with a live walsender for a shard (issue #954).
+    ///
+    /// Always emitted, `0` included — `0` is the signal.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_STANDBYS`].
+    fn record_replication_standbys(&self, shard: u16, count: u64) {
+        let _ = (shard, count);
+    }
+
+    /// The write-authority epoch a shard's database currently reports
+    /// (issue #954).
+    ///
+    /// Maps to the gauge [`METRIC_SHARD_GENERATION`].
+    fn record_shard_generation(&self, shard: u16, generation: i64) {
+        let _ = (shard, generation);
+    }
+
+    /// This worker was fenced off `shard` and is stopping (issue #954).
+    ///
+    /// Maps to the counter [`METRIC_SHARD_FENCED`].
+    fn record_shard_fenced(&self, shard: u16) {
+        let _ = shard;
+    }
+
     /// A task was dispatched from the given shard (issue #961).
     ///
     /// Recorded once per dispatched task by the worker's poll loop, which is
@@ -4095,6 +4227,31 @@ mod tests {
             METRIC_SHARD_STRANDED_PENDING,
             "harvest.shard.stranded_pending"
         );
+    }
+
+    #[test]
+    fn replication_gauges_have_default_noop_impls_and_stable_names() {
+        // Issue #954 AC4. Labelled `{shard}` only: the standby's
+        // `application_name` is operator-chosen and therefore unbounded, so it
+        // is deliberately NOT a label (ADR-0001 §7).
+        let rec = NoOpMetrics;
+        rec.record_replication_lag_seconds(0, 12.5);
+        rec.record_replication_observable(0, false);
+        rec.record_replication_lag_bytes(0, 4_096);
+        rec.record_replication_standbys(0, 1);
+        rec.record_shard_generation(0, 7);
+        rec.record_shard_fenced(0);
+        assert_eq!(
+            METRIC_REPLICATION_LAG_SECONDS,
+            "harvest.replication.lag_seconds"
+        );
+        assert_eq!(
+            METRIC_REPLICATION_LAG_BYTES,
+            "harvest.replication.lag_bytes"
+        );
+        assert_eq!(METRIC_REPLICATION_STANDBYS, "harvest.replication.standbys");
+        assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
+        assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
     }
 
     #[test]

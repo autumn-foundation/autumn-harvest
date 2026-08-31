@@ -149,6 +149,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,

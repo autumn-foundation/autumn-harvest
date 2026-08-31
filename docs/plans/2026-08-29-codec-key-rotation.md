@@ -152,7 +152,7 @@ Returns 0 without touching the connection when no keyed registry is configured. 
 **compare-and-swap** on the previous `event_data`, advances the durable cursor, records
 `harvest.codec.reencrypted{shard}`. Folded into `enforce_timeouts_once`.
 
-Migration `20260726000000_harvest_codec_rotation_cursor`:
+Migration `20260727000000_harvest_codec_rotation_cursor`:
 `(shard_id, active_key_id)` primary key, `last_event_id`, `rows_reencrypted`,
 `completed_at`, `updated_at`.
 
