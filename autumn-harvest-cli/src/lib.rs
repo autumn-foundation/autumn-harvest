@@ -4965,7 +4965,18 @@ async fn run_partition_maintain(
         )
         .await
         {
-            Ok(outcome) => row.maintenance = Some(outcome),
+            Ok(outcome) => {
+                // A pass that ran but did not COMPLETE — a `drain_default` that
+                // lost its bounded lock attempt, say — comes back as `Ok` with
+                // `last_error` set, because maintenance is best-effort and must
+                // never fail a retention tick. The CLI is not a retention tick.
+                // Without this, `harvest partition maintain` would print an
+                // ordinary zero-drain report and exit 0 while the DEFAULT
+                // partition stayed undrained, and scheduled operator automation
+                // would never notice.
+                row.error.clone_from(&outcome.last_error);
+                row.maintenance = Some(outcome);
+            }
             Err(e) => row.error = Some(e.to_string()),
         }
         out.push(row);
@@ -5077,6 +5088,9 @@ fn emit_partition_report(
                         m.sweep.dropped.len(),
                         m.sweep.straggler_rows_deleted,
                     );
+                    if let Some(e) = &m.last_error {
+                        println!("  INCOMPLETE: {e}");
+                    }
                     // The answer to "why has space not come back?". Printed
                     // even when empty is noise, so only when there is
                     // something to explain.

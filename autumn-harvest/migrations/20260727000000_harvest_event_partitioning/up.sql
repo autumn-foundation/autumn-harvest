@@ -190,41 +190,50 @@ CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at
 -- the session `search_path` at runtime. Without pinning it, a session that puts
 -- another schema first could shadow `harvest_workflow_executions` with a table
 -- of its own and bypass the check entirely.
+-- Created through `format(%I, current_schema())` so `search_path` names the
+-- schema Harvest is actually installed in, and the body can then use
+-- UNQUALIFIED relation names.
+--
+-- Hard-coding `public` would be wrong twice over on a deployment installed
+-- under any other schema — which the rest of this module supports, discovering
+-- everything through `current_schema()`. Every append would either fail because
+-- `public.harvest_workflow_executions` does not exist, or, worse, validate
+-- against an unrelated table that happens to sit in `public`. Pinning the
+-- search_path (rather than leaving it unset) is still what stops a session from
+-- shadowing these relations with its own.
+DO $harvest_trigger_958$
+BEGIN
+    EXECUTE format($harvest_trigger_fn$
 CREATE OR REPLACE FUNCTION harvest_events_require_execution()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = pg_catalog, public
-AS $$
+SET search_path = %I, pg_catalog
+AS $harvest_trigger_body$
 DECLARE
     owner_exists boolean;
 BEGIN
     -- `FOR KEY SHARE`, not a bare EXISTS. Without the lock the probe is not a
     -- guarantee, only an observation: the trigger can see the execution, a
     -- concurrent retention delete can then commit, and this INSERT can commit
-    -- afterwards -- producing exactly the orphan the check exists to prevent,
-    -- while the comment above claims the FK's protection was restored.
+    -- afterwards -- producing exactly the orphan the check exists to prevent.
     --
     -- `FOR KEY SHARE` is precisely the lock mode the foreign key took, so this
     -- introduces no lock-ordering hazard the pre-#958 layout did not already
     -- have: it conflicts with the `FOR UPDATE` / `DELETE` that collects an
-    -- execution, and with nothing else. Either the delete waits for this insert
-    -- and then proceeds, or this insert waits for the delete and then finds no
-    -- row and rejects. (Orphans left behind by a delete that ran BEFORE the
-    -- insert began are a different thing entirely -- those are the partitioned
-    -- layout's designed garbage, reclaimed by the sweeper.)
+    -- execution, and with nothing else.
     SELECT true INTO owner_exists
-      FROM public.harvest_workflow_executions
+      FROM harvest_workflow_executions
      WHERE id = NEW.workflow_exec_id
        FOR KEY SHARE;
 
     IF owner_exists IS NULL THEN
         RAISE EXCEPTION
-            'harvest_events: no workflow execution % exists', NEW.workflow_exec_id
+            'harvest_events: no workflow execution %% exists', NEW.workflow_exec_id
             USING ERRCODE = 'foreign_key_violation';
     END IF;
 
     IF EXISTS (
-        SELECT 1 FROM public.harvest_events
+        SELECT 1 FROM harvest_events
          WHERE workflow_exec_id = NEW.workflow_exec_id
            AND event_id = NEW.event_id
     ) THEN
@@ -233,14 +242,17 @@ BEGIN
         -- classified the unpartitioned unique violation. A caller must not be
         -- able to tell the two layouts apart from the error it gets back.
         RAISE EXCEPTION
-            'duplicate key value violates unique constraint "harvest_events_workflow_exec_id_event_id_key" (execution %, event_id %)',
+            'duplicate key value violates unique constraint "harvest_events_workflow_exec_id_event_id_key" (execution %%, event_id %%)',
             NEW.workflow_exec_id, NEW.event_id
             USING ERRCODE = 'unique_violation';
     END IF;
 
     RETURN NEW;
 END;
-$$;
+$harvest_trigger_body$
+$harvest_trigger_fn$, current_schema());
+END
+$harvest_trigger_958$;
 
 COMMENT ON FUNCTION harvest_events_require_execution() IS
     'Issue #958: rejects events for unknown executions (restoring the insert-time '

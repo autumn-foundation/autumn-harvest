@@ -2152,3 +2152,81 @@ async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
         "and the survivors are untouched"
     );
 }
+
+#[tokio::test]
+async fn the_layout_works_when_harvest_is_installed_outside_public() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    // The rest of this module discovers everything through `current_schema()`,
+    // so a deployment installed under a non-`public` schema is supported. The
+    // integrity trigger has to agree: hard-coding `public` in its body means
+    // every append either fails because `public.harvest_workflow_executions`
+    // does not exist, or — worse — validates against an unrelated table that
+    // happens to sit in `public`. The trigger is created through
+    // `format(%I, current_schema())` so its pinned `search_path` names the
+    // schema it was actually installed in.
+    diesel::sql_query("DROP SCHEMA IF EXISTS harvest_alt CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("reset");
+    diesel::sql_query("CREATE SCHEMA harvest_alt")
+        .execute(&mut conn)
+        .await
+        .expect("create schema");
+
+    let mut alt = connect(&url).await;
+    diesel::sql_query("SET search_path = harvest_alt")
+        .execute(&mut alt)
+        .await
+        .expect("pin the session to the alternate schema");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut alt,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("migrate into the alternate schema");
+
+    partition::enable_partitioning(&mut alt, &EnableOptions::default())
+        .await
+        .expect("enable in a non-public schema");
+
+    let exec = insert_execution(&mut alt, "alt_wf", "alt-1", Utc::now(), None).await;
+    let exec_id = ExecutionId::from_uuid(exec);
+    autumn_harvest::store::append_events(&mut alt, exec_id, &sample_events(), 0)
+        .await
+        .expect("append must work — the trigger resolves its relations in this schema");
+    assert_eq!(
+        autumn_harvest::store::load_history(&mut alt, exec_id)
+            .await
+            .expect("history")
+            .events
+            .len(),
+        3,
+    );
+
+    // And both halves of the trigger must still be enforcing, not merely
+    // resolving against something.
+    assert!(
+        autumn_harvest::store::append_events(&mut alt, exec_id, &sample_events(), 0)
+            .await
+            .is_err(),
+        "the cross-partition uniqueness check must be live here too"
+    );
+    assert!(
+        autumn_harvest::store::append_events(
+            &mut alt,
+            ExecutionId::from_uuid(uuid::Uuid::new_v4()),
+            &sample_events(),
+            0,
+        )
+        .await
+        .is_err(),
+        "and so must the execution-existence check"
+    );
+
+    diesel::sql_query("DROP SCHEMA harvest_alt CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("cleanup");
+}
