@@ -76,6 +76,7 @@ mod debugger_tests;
 mod delayed_start_tests;
 mod det_check_tests;
 mod event_batch_tests;
+mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;

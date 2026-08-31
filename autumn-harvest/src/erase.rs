@@ -494,11 +494,25 @@ mod db {
         for (row_id, mut event_data) in raw_events {
             let count = tombstone_payload_fields(&mut event_data);
             if count > 0 {
-                diesel::update(harvest_events::table.find(row_id))
-                    .set(harvest_events::event_data.eq(event_data))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
+                // Keyed on `workflow_exec_id` as well as the row id. On the
+                // opt-in partitioned layout (issue #958) the partition key is
+                // `cohort`, which is derived from the owning execution — so
+                // adding the execution to the predicate lets the planner prune
+                // to the one partition holding this execution's history instead
+                // of probing every partition's index for a bare `id`. The
+                // predicate is strictly narrower than `find(row_id)` (the rows
+                // were just selected FOR this execution, and `id` is globally
+                // unique from a single sequence), so the unpartitioned layout
+                // behaves identically.
+                diesel::update(
+                    harvest_events::table
+                        .filter(harvest_events::id.eq(row_id))
+                        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
+                )
+                .set(harvest_events::event_data.eq(event_data))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
                 events_scrubbed += 1;
                 fields_tombstoned += count;
             }
