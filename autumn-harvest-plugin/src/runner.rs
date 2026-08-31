@@ -350,6 +350,63 @@ fn commit_audit_export_config(
     *lock = config;
 }
 
+/// Restores the process-global audit-export config unless the build succeeds
+/// (issue #953, Codex review round 3 P1).
+///
+/// Deferring the runner's own publish was not sufficient. `BuiltHarvest::
+/// into_worker_parts_with_extra_state` *also* installs the global config —
+/// `install_global_audit_export_config_for_direct_worker`, which exists so a
+/// core embedder who never touches the plugin runner still gets their sink —
+/// and the runner calls that conversion **before** `compile_dag_catalog`, which
+/// is fallible. So a catalog failure could still leave a live runtime's sink
+/// replaced, or cleared outright for a webhook-only build (the direct-worker
+/// path writes `None` when it finds no embedder sink, since it has no HTTP
+/// client to build one with).
+///
+/// A guard rather than a restore call at each `?`: it covers every failure
+/// path after the conversion, including ones added later, and cannot be
+/// forgotten. `commit` consumes it on the success path.
+struct AuditExportInstallGuard {
+    previous: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    committed: bool,
+}
+
+impl AuditExportInstallGuard {
+    /// Snapshot the global config. Take this immediately *before* the
+    /// conversion that may clobber it.
+    fn arm() -> Self {
+        let previous = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .read()
+            .ok()
+            .and_then(|lock| lock.clone());
+        Self {
+            previous,
+            committed: false,
+        }
+    }
+
+    /// Publish this runtime's config; the snapshot is discarded.
+    fn commit(
+        mut self,
+        config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    ) {
+        self.committed = true;
+        commit_audit_export_config(config);
+    }
+}
+
+impl Drop for AuditExportInstallGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // The build failed after the conversion already wrote the global.
+        // Put back whatever was there, so a runtime that never started cannot
+        // redirect or silence a running runtime's audit export.
+        commit_audit_export_config(self.previous.take());
+    }
+}
+
 impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
@@ -430,6 +487,10 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
+        // Armed before the conversion, which installs the global config itself
+        // (see `AuditExportInstallGuard`). Any early return below now restores
+        // the previous config instead of leaving this build's behind.
+        let audit_export_guard = AuditExportInstallGuard::arm();
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -465,7 +526,7 @@ impl PreparedHarvestRuntime {
 
         // Every fallible step has succeeded; only now may this runtime's sink
         // replace whatever a previously-built runtime installed.
-        commit_audit_export_config(audit_export_config);
+        audit_export_guard.commit(audit_export_config);
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -925,7 +986,8 @@ pub(crate) fn injected_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_runtime_storage_pool, select_runtime_shard0_pool, uncovered_writable_shards,
+        AuditExportInstallGuard, resolve_runtime_storage_pool, select_runtime_shard0_pool,
+        uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;
@@ -933,6 +995,62 @@ mod tests {
     use autumn_harvest::worker::DbPool;
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+    /// A build that fails after the worker-parts conversion must leave the
+    /// process-global audit-export config exactly as it found it (issue #953,
+    /// Codex review round 3 P1). The conversion installs the config itself, so
+    /// deferring only the runner's own publish was not enough.
+    #[test]
+    fn a_failed_build_restores_the_previous_audit_export_config() {
+        struct Marker;
+        impl autumn_harvest::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+
+        // A live runtime's config.
+        let live = std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(Marker),
+            secret: autumn_harvest::completion_callback::CallbackSecret::new(b"live".to_vec()),
+            batch_size: 7,
+            backoff: autumn_harvest::audit_export::ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(30),
+        });
+        super::commit_audit_export_config(Some(live));
+
+        {
+            let guard = AuditExportInstallGuard::arm();
+            // Stand in for the conversion clobbering the global, then a later
+            // fallible step failing: the guard drops without `commit`.
+            super::commit_audit_export_config(None);
+            drop(guard);
+        }
+
+        let restored = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .expect("the live runtime's config must be restored, not cleared");
+        assert_eq!(
+            restored.batch_size, 7,
+            "a runtime that never started must not silence a running one's export"
+        );
+
+        // And the success path still publishes.
+        let guard = AuditExportInstallGuard::arm();
+        guard.commit(None);
+        assert!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .is_none(),
+            "commit must publish, including a deliberate None"
+        );
+    }
 
     /// Build a pool tagged by its `max_size` (readable without connecting) so
     /// two pools are distinguishable in a DB-free test.

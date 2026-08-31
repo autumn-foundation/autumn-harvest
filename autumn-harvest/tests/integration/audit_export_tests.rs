@@ -1444,12 +1444,12 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
     );
 }
 
-// The other half of the same knob: once the exporter is genuinely gone, the
-// heartbeat goes stale and retention must resume. Nothing ever deletes a
-// cursor row, so a guard keyed on its mere existence would turn audit
-// retention off permanently.
+// The other half of the same knob. Retiring export is an EXPLICIT operator
+// action, never an inferred one: an earlier revision expired the guard 24h
+// after the last heartbeat, which meant a worker outage longer than a day
+// deleted the very records the outage had stranded.
 #[tokio::test]
-async fn retention_resumes_once_the_exporter_heartbeat_goes_stale() {
+async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     let _guard = TEST_SERIAL.lock().await;
     let _sink = install(Arc::new(RecordingSink::new(200)), 2);
     let (mut conn, _c) = make_conn().await;
@@ -1465,27 +1465,39 @@ async fn retention_resumes_once_the_exporter_heartbeat_goes_stale() {
         .await
         .expect("age rows");
 
-    // Age the heartbeat past its TTL: the exporter has been removed, not
-    // merely restarted.
+    // A very old heartbeat is NOT consent to delete: the exporter may simply
+    // have been down. The three unexported records must survive.
     {
         use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
-        let stale = chrono::Utc::now()
-            - autumn_harvest::audit_export::EXPORT_HEARTBEAT_TTL
-            - chrono::Duration::hours(1);
         diesel::update(cur::harvest_audit_export_cursor.find(0))
-            .set(cur::updated_at.eq(stale))
+            .set(cur::updated_at.eq(chrono::Utc::now() - chrono::Duration::days(400)))
             .execute(&mut conn)
             .await
             .expect("age heartbeat");
     }
-
     let deleted = purge_old_audit_records(&mut conn, 90)
         .await
         .expect("purge runs");
     assert_eq!(
-        deleted, 5,
-        "a stale heartbeat with no local sink means the exporter is gone; \
-         retention must resume rather than be disabled forever"
+        deleted, 2,
+        "a long exporter outage must never license deleting the records it \
+         stranded; only the two acknowledged rows may go"
+    );
+
+    // Only an explicit decommission lifts the guard.
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+            .await
+            .expect("decommission"),
+        "the cursor row existed, so it must report as removed"
+    );
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 3,
+        "once an operator retires the cursor, retention resumes over the \
+         remaining aged rows"
     );
 }
 
@@ -1522,8 +1534,9 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
     assert!(
         refreshed > stale,
         "a tick that claims nothing must still refresh the heartbeat: an idle \
-         exporter is alive, and retention reads this to decide whether it owes \
-         records"
+         exporter is alive, and `GET /admin/audit-export` reports this as \
+         liveness. Retention no longer reads it -- see \
+         `retention_resumes_only_after_the_cursor_is_decommissioned`"
     );
 }
 

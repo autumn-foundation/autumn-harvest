@@ -227,24 +227,42 @@ row would be a silent compliance gap — gone from the database *and* absent fro
 the SIEM, with nothing anywhere to show it was lost.
 
 The guard applies when **either** signal says an exporter still owes this
-shard records. Neither is sufficient alone:
+shard records:
 
-- **A live exporter heartbeat** — the exporter refreshes
-  `harvest_audit_export_cursor.updated_at` on every tick, including ticks that
-  export nothing, and the guard trusts it for 24 hours. This is durable, shared
-  state, so it works when retention and export run in **different processes**:
-  a split web/worker deployment where only the worker configures the sink would
-  otherwise have the web app's retention sweep delete rows the worker still
-  owes.
-- **A sink configured in the sweeping process** — covers the window before the
-  exporter's first tick on a shard has written any heartbeat at all (freshly
+- **A cursor row exists for the shard.** Durable, shared state, so it works when
+  retention and export run in **different processes** — a split web/worker
+  deployment where only the worker configures the sink would otherwise have the
+  web app's retention sweep delete rows the worker still owes.
+- **A sink is configured in the sweeping process.** Covers the window before the
+  exporter's first tick on a shard has created the cursor row at all (freshly
   enabled, newly added to the fleet, or a shard whose pool has been failing).
 
-A *stale* heartbeat with no local sink means the exporter was removed, and the
-guard lifts. That case matters: nothing ever deletes a cursor row, so a guard
-keyed on the row's mere existence would match every later record forever and
-silently turn audit retention off permanently — unbounded table growth, with
-the lag gauge no longer emitted to show why.
+The guard is deliberately **not** time-based. An earlier revision expired it 24
+hours after the exporter's last heartbeat, so a long worker outage lifted it. A
+timeout cannot distinguish "export was intentionally removed" from "the worker
+has been down since Friday", and it resolves that ambiguity by deleting audit
+records during exactly the outage where they matter most.
+
+### Retiring audit export on a shard
+
+Because the guard never expires on its own, turning export off is an explicit
+operator action:
+
+```rust
+autumn_harvest::audit_export::decommission_cursor(&mut conn, shard_id).await?;
+```
+
+Removing the cursor row is what tells retention that nothing owes this shard
+records any more; the next sweep purges its aged audit rows normally. Do this
+only once you accept that any records the shard had not yet shipped will never
+reach the SIEM.
+
+Until then, a sink left down indefinitely lets the audit table grow past its
+retention window. That is the deliberate trade — unbounded growth is loud
+(`harvest.audit.export_lag`, the `last_error` on `GET /admin/audit-export`),
+bounded by the genuine unexported backlog rather than the whole table
+(fully-acknowledged records are purged on the normal schedule), and reversible.
+Deleted audit records are not.
 
 With export inactive by both signals the guard is skipped entirely and the
 purge is byte-identical to its pre-#953 behaviour.

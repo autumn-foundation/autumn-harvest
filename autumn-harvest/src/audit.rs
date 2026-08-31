@@ -1488,36 +1488,39 @@ pub async fn list_audit(
 /// ## Deciding whether export is live
 ///
 /// The guard applies when **either** signal says an exporter owes this shard
-/// records. Neither is sufficient alone, and the reasons are different
-/// failures:
+/// records:
 ///
-/// - **A live exporter heartbeat** — a `harvest_audit_export_cursor` row whose
-///   `updated_at` is within [`crate::audit_export::EXPORT_HEARTBEAT_TTL`]. This
-///   is durable, shared state, so it works when retention and export run in
-///   **different processes** (issue #953, Codex review P1): a split web/worker
-///   deployment where only the worker configures the sink would otherwise have
-///   the web app's retention sweep delete rows the worker still owes.
-/// - **A sink configured in this process**
+/// - **A cursor row exists** for the shard. Durable, shared state, so it works
+///   when retention and export run in **different processes** (issue #953,
+///   Codex review P1): a split web/worker deployment where only the worker
+///   configures the sink would otherwise have the web app's retention sweep
+///   delete rows the worker still owes.
+/// - **A sink is configured in this process**
 ///   ([`crate::audit_export::is_configured`]) — covers the window before the
-///   exporter's first tick on a shard has written any heartbeat at all
-///   (freshly enabled, newly added to the fleet, or a shard whose pool has been
-///   failing), where the durable signal does not exist yet.
+///   exporter's first tick on a shard has created the cursor row at all
+///   (freshly enabled, newly added to the fleet, or a shard whose pool has
+///   been failing).
 ///
-/// A stale heartbeat with no local sink means the exporter has been *removed*,
-/// and the guard lifts. That case matters: nothing ever deletes a cursor row,
-/// so a guard keyed on the row's mere existence would match every later record
-/// forever and silently turn audit retention off permanently — unbounded table
-/// growth, with the lag gauge no longer emitted to show why.
+/// Deliberately **not** time-based. An earlier revision expired the guard 24h
+/// after the exporter's last heartbeat, so a long worker outage lifted it; a
+/// timeout cannot distinguish "export was intentionally removed" from "the
+/// worker has been down since Friday", and it resolves that ambiguity by
+/// deleting audit records during exactly the outage where they matter most
+/// (issue #953, Codex review round 3 P1).
+///
+/// Retiring export is therefore an explicit operator action —
+/// [`crate::audit_export::decommission_cursor`] — not an inferred one. The
+/// cost is that a sink left down indefinitely lets the audit table grow past
+/// its retention window. That is the deliberate trade, and the growth is
+/// bounded by the genuine unexported backlog rather than the whole table:
+/// fully-acknowledged records are purged on the normal schedule. Dropping a
+/// privileged-action log to reclaim disk is not a choice this function gets to
+/// make on an operator's behalf; `harvest.audit.export_lag` and the
+/// `last_error` on `GET /admin/audit-export` are how the condition is
+/// surfaced. See `docs/audit-export.md`.
 ///
 /// With export inactive by both signals the guard is skipped entirely and the
 /// delete is byte-identical to the pre-#953 statement.
-///
-/// The cost of the guard is that a sink down indefinitely lets the audit table
-/// grow past its retention window. That is the deliberate trade — dropping a
-/// privileged-action log to reclaim disk is not a choice this function gets to
-/// make on an operator's behalf. `harvest.audit.export_lag` and the
-/// `GET /admin/audit-export` `last_error` are how the condition is surfaced;
-/// see `docs/audit-export.md`.
 ///
 /// The pending-check subquery is uncorrelated by shard because a shard's
 /// database holds at most one cursor row (the exporter provisions only the
@@ -1533,9 +1536,7 @@ pub async fn purge_old_audit_records(
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
-    let now = chrono::Utc::now();
-    let cutoff = now - chrono::Duration::days(retention_days);
-    let heartbeat_floor = now - crate::audit_export::EXPORT_HEARTBEAT_TTL;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
     diesel::sql_query(
@@ -1544,10 +1545,7 @@ pub async fn purge_old_audit_records(
            AND NOT ( \
                  ( \
                    $2::BOOLEAN \
-                   OR EXISTS ( \
-                        SELECT 1 FROM harvest_audit_export_cursor c \
-                        WHERE c.updated_at > $3 \
-                   ) \
+                   OR EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
                  ) \
                  AND ( \
                    a.export_seq IS NULL \
@@ -1560,7 +1558,6 @@ pub async fn purge_old_audit_records(
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
-    .bind::<diesel::sql_types::Timestamptz, _>(heartbeat_floor)
     .execute(conn)
     .await
     .map_err(database_error)

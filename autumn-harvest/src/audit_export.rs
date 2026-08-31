@@ -841,20 +841,43 @@ pub async fn ensure_cursor_row(
     Ok(())
 }
 
-/// How long an exporter heartbeat (`harvest_audit_export_cursor.updated_at`)
-/// stays trusted as evidence that export is live on a shard.
+/// Remove a shard's export cursor, re-enabling audit retention there.
 ///
-/// Read by [`crate::audit::purge_old_audit_records`] to decide whether the
-/// "never purge an unexported record" guard applies, in a process that may not
-/// have a sink configured itself.
+/// The **explicit decommission step** for audit export (issue #953, Codex
+/// review round 3 P1). While a cursor row exists,
+/// [`crate::audit::purge_old_audit_records`] will not delete a record that
+/// shard still owes the sink — the row's presence, not a timeout, is what says
+/// "an exporter is responsible for this shard".
 ///
-/// Deliberately far longer than any scanner cadence (the exporter refreshes it
-/// every tick, seconds apart) and far shorter than the default 90-day audit
-/// retention window. The asymmetry is the point: a briefly-restarting exporter
-/// never drops the guard, while an exporter that has been *removed* eventually
-/// stops blocking retention forever — the failure mode a purely-durable signal
-/// has, since nothing deletes a cursor row.
-pub const EXPORT_HEARTBEAT_TTL: chrono::Duration = chrono::Duration::hours(24);
+/// This deliberately replaced a 24-hour heartbeat TTL. A TTL cannot tell
+/// "export was intentionally removed" from "the worker has been down since
+/// Friday", and it resolves that ambiguity by *deleting audit records* — the
+/// one outcome this feature exists to prevent, arriving precisely during an
+/// outage. Unbounded table growth is the strictly better failure: it is loud
+/// (`harvest.audit.export_lag`, the `last_error` on
+/// `GET /admin/audit-export`), it is bounded by the genuine unexported
+/// backlog rather than by the whole table (fully-acknowledged records are
+/// purged normally), and it is *reversible* — deleted audit records are not.
+///
+/// So retiring an export configuration is an operator action, not an inferred
+/// one. See `docs/audit-export.md`.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn decommission_cursor(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+) -> crate::error::HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    let removed = diesel::sql_query("DELETE FROM harvest_audit_export_cursor WHERE shard_id = $1")
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(removed > 0)
+}
 
 /// The `MAX(export_seq)` read back from the sequence-assignment statement —
 /// the high-water mark of sequences actually handed out.
