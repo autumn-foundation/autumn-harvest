@@ -1996,3 +1996,77 @@ async fn the_large_table_migration_plan_actually_runs() {
         "the uniqueness trigger must be installed by the script too"
     );
 }
+
+#[tokio::test]
+async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let exec = insert_execution(&mut conn, "race_wf", "race-1", Utc::now(), None).await;
+
+    // The integrity trigger's probe takes `FOR KEY SHARE` — the same lock mode
+    // the foreign key it replaces took. Without it the probe is an observation,
+    // not a guarantee: the trigger sees the execution, a concurrent delete
+    // commits, and the insert commits afterwards, creating exactly the orphan
+    // the check exists to prevent.
+    //
+    // Here the deleter holds its transaction open while the append runs, so the
+    // append must BLOCK on the row lock rather than sail past. Once the delete
+    // commits, the append's probe finds no row and rejects.
+    let mut deleter = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut deleter)
+        .await
+        .expect("begin");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(&mut deleter)
+        .await
+        .expect("delete inside an open transaction");
+
+    let appender_url = url.clone();
+    let append = tokio::spawn(async move {
+        let mut c = connect(&appender_url).await;
+        autumn_harvest::store::append_events(
+            &mut c,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+    });
+
+    // The append must still be blocked on the uncommitted delete's row lock.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !append.is_finished(),
+        "the append must BLOCK on the execution row lock while the delete is \
+         uncommitted — if it finished, the probe took no lock and the orphan \
+         race is open"
+    );
+
+    diesel::sql_query("COMMIT")
+        .execute(&mut deleter)
+        .await
+        .expect("commit the delete");
+
+    let result = append.await.expect("append task");
+    assert!(
+        result.is_err(),
+        "once the delete commits, the append must be rejected — its execution \
+         no longer exists"
+    );
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_events"
+        )
+        .await,
+        0,
+        "and no orphan row may have been committed"
+    );
+}

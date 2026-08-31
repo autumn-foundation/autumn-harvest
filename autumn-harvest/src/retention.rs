@@ -670,6 +670,22 @@ impl RetentionConfig {
             // A bounded summary policy spawns the janitor so its GC pass runs
             // even if the history horizon was later removed (issue #752).
             || self.summary_gc_active()
+            // Partition maintenance is work in its own right, not a rider on
+            // history retention (issue #958). Without this, a deployment that
+            // turned every retention horizon off — `audit_retention_days = 0`,
+            // `schedule_decision_retention_days = 0`, no history or summary
+            // age — would leave `partitions.enabled` reading `true` while the
+            // runtime never spawned to honour it. On an opted-in partitioned
+            // shard the lookahead window then expires, every subsequent append
+            // lands in the DEFAULT partition, and no cohort is ever reclaimed.
+            //
+            // Note what this does NOT do: partition *creation* is not
+            // reclamation, so it must keep running even for an operator who
+            // deliberately retains everything forever. The only deployments
+            // this newly spawns for are those that had switched every horizon
+            // off — which is exactly the broken case; the stock config
+            // (`audit_retention_days: 90`) already spawned.
+            || self.partitions.enabled
     }
 }
 
@@ -3023,10 +3039,30 @@ mod tests {
         let config = RetentionConfig {
             audit_retention_days: 0,
             schedule_decision_retention_days: 0,
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
             ..Default::default()
         };
-        // default with no purging is not enabled
+        // no purging AND no partition maintenance is not enabled
         assert!(!config.enabled());
+
+        // …but partition maintenance ALONE is (issue #958). An opted-in
+        // partitioned shard whose horizons are all off still needs its
+        // lookahead window extended, or every append ends up in the DEFAULT
+        // partition and nothing is ever reclaimed.
+        let partitions_only = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
+        assert!(partitions_only.partitions.enabled);
+        assert!(
+            partitions_only.enabled(),
+            "partition maintenance must itself spawn the runtime — otherwise \
+             `partitions.enabled` reads true while nothing honours it"
+        );
 
         let config = RetentionConfig {
             max_age_secs: Some(3600),
@@ -3116,9 +3152,17 @@ mod tests {
         assert!(config.summary_enabled());
         assert!(!config.summary_gc_active());
         assert_eq!(config.summary_age(), None);
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..config
+        };
         assert!(
             !config.enabled(),
-            "an unbounded-summary-only config with no history/audit horizon is not enabled"
+            "an unbounded-summary-only config with no history/audit horizon and no \
+             partition maintenance is not enabled"
         );
 
         // But a history horizon + unbounded summary IS enabled (via history).

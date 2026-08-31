@@ -145,9 +145,9 @@ CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at
 -- The partitioned layout drops `harvest_events_workflow_exec_id_fkey`, because
 -- that FK's `ON DELETE CASCADE` is exactly the row-by-row DELETE storm issue
 -- #958 exists to eliminate. This restores the half of the FK that is still
--- wanted, at comparable cost (a primary-key probe either way; this one takes no
--- `FOR KEY SHARE` lock, so it is cheaper in lock traffic). What is NOT restored
--- is the delete-time cascade -- that is the deliberate trade, and the partition
+-- wanted, at the same cost and with the same lock: a primary-key probe taking
+-- `FOR KEY SHARE`, exactly as the FK did. What is NOT restored is the
+-- delete-time cascade -- that is the deliberate trade, and the partition
 -- sweeper is the garbage collector for the orphan rows it leaves.
 --
 -- **2. `(workflow_exec_id, event_id)` stays unique ACROSS partitions.**
@@ -195,10 +195,29 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
 AS $$
+DECLARE
+    owner_exists boolean;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM public.harvest_workflow_executions WHERE id = NEW.workflow_exec_id
-    ) THEN
+    -- `FOR KEY SHARE`, not a bare EXISTS. Without the lock the probe is not a
+    -- guarantee, only an observation: the trigger can see the execution, a
+    -- concurrent retention delete can then commit, and this INSERT can commit
+    -- afterwards -- producing exactly the orphan the check exists to prevent,
+    -- while the comment above claims the FK's protection was restored.
+    --
+    -- `FOR KEY SHARE` is precisely the lock mode the foreign key took, so this
+    -- introduces no lock-ordering hazard the pre-#958 layout did not already
+    -- have: it conflicts with the `FOR UPDATE` / `DELETE` that collects an
+    -- execution, and with nothing else. Either the delete waits for this insert
+    -- and then proceeds, or this insert waits for the delete and then finds no
+    -- row and rejects. (Orphans left behind by a delete that ran BEFORE the
+    -- insert began are a different thing entirely -- those are the partitioned
+    -- layout's designed garbage, reclaimed by the sweeper.)
+    SELECT true INTO owner_exists
+      FROM public.harvest_workflow_executions
+     WHERE id = NEW.workflow_exec_id
+       FOR KEY SHARE;
+
+    IF owner_exists IS NULL THEN
         RAISE EXCEPTION
             'harvest_events: no workflow execution % exists', NEW.workflow_exec_id
             USING ERRCODE = 'foreign_key_violation';

@@ -190,9 +190,11 @@ that FK's `ON DELETE CASCADE` **is** the delete storm being eliminated.
 
 Its insert-time half is restored by a validate-only trigger
 (`harvest_events_require_execution`): an event may still not be written for an
-execution that does not exist. Cost is comparable — a primary-key probe either
-way, and the trigger takes no `FOR KEY SHARE` lock, so it is cheaper in lock
-traffic than the FK trigger it replaces.
+execution that does not exist. Same cost and same lock as the FK — a
+primary-key probe taking `FOR KEY SHARE`. The lock is not optional: without it
+the probe is an observation rather than a guarantee, and an append racing a
+retention delete could observe the execution, let the delete commit, and then
+commit an orphan itself.
 
 What is deliberately *not* restored is the delete-time cascade. Deleting an
 execution leaves orphan event rows, and the sweeper is their garbage collector.
@@ -339,9 +341,13 @@ the partitions that would cover them), then create (so a tick that drops a
 backlog still leaves the write window covered), then sweep (so a cohort freed
 earlier in the same tick is reclaimed now rather than next time).
 
-The one gap: maintenance lives in the retention runtime, so a deployment with
-retention entirely disabled has nothing running it. Use
-`harvest partition maintain` on a schedule there, or leave audit retention on.
+Partition maintenance counts as retention work in its own right, so the runtime
+spawns for it even when every retention *horizon* is off (`max_age`, audit and
+schedule purging all disabled). Partition creation is not reclamation: an
+operator who deliberately retains everything forever still needs the write
+window extended, or every append ends up in the `DEFAULT` partition. Set
+`partitions.enabled = false` to opt out — but then nothing maintains the layout,
+and `harvest partition maintain` has to run on a schedule instead.
 
 ### The `DEFAULT` partition
 
