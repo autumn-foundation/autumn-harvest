@@ -2070,3 +2070,85 @@ async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
         "and no orphan row may have been committed"
     );
 }
+
+#[tokio::test]
+async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Force the gate onto its EXACT scan (tier 3) by making more executions
+    // survive than the narrow probe will enumerate, then check the partition is
+    // still dropped.
+    //
+    // The bug this pins: the authoritative re-check under the drop lock used to
+    // bail out whenever the survivor count exceeded `owner_probe_cap` — which
+    // is exactly the condition that sends the gate to tier 3 in the first
+    // place. So every partition that needed the exact scan to prove itself
+    // droppable was rejected at the last step, forever. Reclamation stopped
+    // dead on precisely the high-volume and legal-hold-heavy shards this
+    // feature exists for, while the sweep kept cheerfully reporting them as
+    // "blocked".
+    let old = Utc::now() - chrono::Duration::days(30);
+    for i in 0..4 {
+        seed_expired(&mut conn, "exact_wf", &format!("x-{i}"), old).await;
+    }
+    let cohort_partition = partition::partition_name(partition::cohort_start(
+        old,
+        partition::DEFAULT_COHORT_WIDTH_SECS,
+    ));
+
+    // Live executions created BEFORE the cohort's upper bound — strictly
+    // older, or the cheap tier-1 probe answers "nothing predates this" and the
+    // exact scan is never reached — and more of them than the cap, so tier 2 is
+    // skipped too. None of them owns a row in the old cohort (they have no
+    // events at all), so the exact scan must prove the partition droppable.
+    for i in 0..6 {
+        insert_execution(
+            &mut conn,
+            "survivor_wf",
+            &format!("s-{i}"),
+            Utc::now() - chrono::Duration::days(40),
+            None,
+        )
+        .await;
+    }
+
+    // A cap BELOW the survivor count is what forces tier 3. With the stock cap
+    // of 1000 the narrow probe would answer, and this test would pass without
+    // ever reaching the code path it exists for.
+    let mut config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    config.partitions.owner_probe_cap = 2;
+    assert!(
+        config.partitions.owner_probe_cap < 6,
+        "precondition: the survivor count must exceed the probe cap, or the \
+         exact scan is never reached"
+    );
+
+    let pool = build_pool(&url);
+    run_one_tick(pool, config, None).await;
+
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            &format!("SELECT to_regclass('{cohort_partition}') IS NOT NULL AS v"),
+        )
+        .await,
+        "AC3: a cohort proved droppable by the exact scan must actually be \
+         dropped — the re-check under the lock has to re-run the SAME proof, \
+         not a narrower one that can never succeed"
+    );
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_workflow_executions \
+              WHERE workflow_name = 'survivor_wf'"
+        )
+        .await,
+        6,
+        "and the survivors are untouched"
+    );
+}

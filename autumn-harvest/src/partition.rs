@@ -860,14 +860,49 @@ pub async fn ensure_partitions(
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
     };
     let mut created = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
     for step in 0..=i64::from(lookahead_cohorts) {
         let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
             break;
         };
-        let (name, was_created) = ensure_cohort_with_width(conn, at, width).await?;
-        if was_created {
-            created.push(name);
+        match ensure_cohort_with_width(conn, at, width).await {
+            Ok((name, true)) => created.push(name),
+            Ok((_, false)) => {}
+            // One cohort that cannot be carved out must not stop the REST of
+            // the window from being created.
+            //
+            // The case that matters: a `drain_default` that lost its bounded
+            // lock attempt leaves current-cohort rows in the DEFAULT partition,
+            // and Postgres then rejects creating THAT cohort because the
+            // updated default constraint would be violated. Aborting the loop
+            // there would stop coverage extension during exactly the
+            // maintenance-gap recovery it is meant to protect — every later
+            // cohort would keep piling into DEFAULT until a drain finally
+            // succeeded, making the gap self-perpetuating.
+            //
+            // Later cohorts are almost never represented in DEFAULT, so they
+            // are created normally and the write window is restored; the
+            // blocked one is retried next tick, after the drain.
+            Err(e) => {
+                tracing::warn!(
+                    cohort = %cohort_start(at, width),
+                    error = %e,
+                    "harvest could not create a cohort partition; continuing with the rest \
+                     of the lookahead window"
+                );
+                blocked.push(cohort_start(at, width).to_rfc3339());
+            }
         }
+    }
+    if created.is_empty() && !blocked.is_empty() {
+        // Nothing at all could be covered — that is not a partial success, and
+        // the caller must record it rather than report an empty, healthy-looking
+        // maintenance pass.
+        return Err(HarvestError::Database(format!(
+            "no cohort partition could be created; appends will land in \
+             {DEFAULT_PARTITION}. blocked cohorts: {}",
+            blocked.join(", ")
+        )));
     }
     Ok(created)
 }
@@ -1784,9 +1819,7 @@ async fn drop_partition(
         .max(1);
     let name = part.name.clone();
     let lower = part.lower;
-    let cap = i64::try_from(opts.owner_probe_cap)
-        .unwrap_or(i64::MAX)
-        .max(1);
+    let opts = *opts;
     let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
         // Taken explicitly, before the re-check, rather than relying on the
@@ -1794,24 +1827,14 @@ async fn drop_partition(
         // under the lock.
         exec(conn, "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE").await?;
 
-        let survivors = diesel::sql_query(
-            "SELECT id FROM harvest_workflow_executions WHERE created_at < $1 LIMIT $2",
-        )
-        .bind::<Timestamptz, _>(upper)
-        .bind::<BigInt, _>(cap + 1)
-        .load::<UuidRow>(conn)
-        .await
-        .map_err(database_error)?;
-
-        if i64::try_from(survivors.len()).unwrap_or(i64::MAX) > cap {
-            // More survivors than the narrow re-check can probe. Retaining is
-            // the correct failure mode: the tick that selected this partition
-            // used the exact scan, but that evidence is now stale and we will
-            // not drop on stale evidence.
-            return Ok(false);
-        }
-        let ids: Vec<uuid::Uuid> = survivors.into_iter().map(|r| r.id).collect();
-        if cohort_has_rows_for(conn, lower, upper, &ids).await? {
+        // The SAME three-tier proof, re-run under the lock — not a narrower
+        // one. An earlier revision bailed out whenever more executions survived
+        // than `owner_probe_cap`, which is precisely the condition under which
+        // the gate had used the exact scan: every partition that needed tier 3
+        // to prove itself droppable was then rejected here, forever, so
+        // reclamation stopped entirely on high-volume or legal-hold-heavy
+        // shards — the deployments this feature exists for.
+        if cohort_occupancy(conn, lower, upper, &opts).await?.is_some() {
             return Ok(false);
         }
 
@@ -1853,14 +1876,29 @@ async fn delete_orphan_rows(
     let max_batches = 16;
     let mut total = 0usize;
     for _ in 0..max_batches {
+        // Keyed on `(id, cohort)` — the partitioned table's PRIMARY KEY — and
+        // NOT on `ctid`.
+        //
+        // A `ctid` is unique only WITHIN one physical child table. Matching it
+        // against the partitioned PARENT, whose scan spans every partition,
+        // deletes any row in any other partition that happens to share the same
+        // physical location — including events belonging to live executions.
+        // That is silent, unbounded data loss, and it is invisible in testing
+        // because a small corpus rarely reuses a `ctid` across partitions.
+        //
+        // `(id, cohort)` is globally unique (one sequence feeds every
+        // partition, and the key carries the partition column), so the outer
+        // DELETE targets exactly the rows the inner SELECT chose — and prunes
+        // to their partition instead of scanning all of them.
+        //
         // The `MINVALUE` lower bound is omitted rather than substituted, for
         // the same reason as in `cohort_occupancy`: the legacy partition's rows
         // carry `-infinity`, which sorts below every finite timestamptz, so a
         // finite lower bind would silently match none of them.
         let sql = format!(
             "DELETE FROM harvest_events
-              WHERE ctid IN (
-                  SELECT e.ctid FROM harvest_events e
+              WHERE (id, cohort) IN (
+                  SELECT e.id, e.cohort FROM harvest_events e
                    WHERE {} e.cohort < $1
                      AND NOT EXISTS (
                          SELECT 1 FROM harvest_workflow_executions x
