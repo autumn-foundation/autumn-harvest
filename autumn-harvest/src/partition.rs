@@ -710,6 +710,15 @@ async fn ensure_cohort_with_width(
         )));
     };
     let name = partition_name(lower);
+    // Probed first, so `was_created` means what it says. `CREATE TABLE IF NOT
+    // EXISTS … PARTITION OF` is a successful NO-OP when a relation of that name
+    // already exists, so a bare `Ok` arm would report every already-covered
+    // cohort as newly created on every single maintenance tick — and would
+    // report a colliding unrelated table as coverage while appends kept piling
+    // into the DEFAULT partition.
+    if cohort_partition_is_attached(conn, &name, lower, upper).await? {
+        return Ok((name, false));
+    }
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {name} PARTITION OF harvest_events \
          FOR VALUES FROM ({}) TO ({})",
@@ -717,7 +726,20 @@ async fn ensure_cohort_with_width(
         ts_literal(upper)
     );
     match diesel::sql_query(&sql).execute(conn).await {
-        Ok(_) => Ok((name, true)),
+        // Verified rather than assumed, for the same reason: the statement can
+        // succeed without having created the partition we asked for.
+        Ok(_) => {
+            if cohort_partition_is_attached(conn, &name, lower, upper).await? {
+                Ok((name, true))
+            } else {
+                Err(HarvestError::Database(format!(
+                    "cohort {lower} is not covered: creating `{name}` reported success but it \
+                     is not attached to harvest_events with the expected bounds (a relation of \
+                     that name already exists). Appends for this cohort will land in \
+                     {DEFAULT_PARTITION}."
+                )))
+            }
+        }
         // A race is only benign if the partition that now exists is the one we
         // wanted. `CREATE TABLE IF NOT EXISTS <name> PARTITION OF …` is a
         // silent no-op when `<name>` exists as an unrelated relation, and the
@@ -2101,41 +2123,268 @@ impl MaintenanceOutcome {
 
 // ── The large-live-table migration plan ────────────────────────────────────
 
-/// Emit the operator-run SQL script that converts a **large live**
-/// `harvest_events` with a minimal lock window.
+/// One statement of the large-live-table conversion plan.
+///
+/// The plan exists in exactly one form — this list — and
+/// [`migration_plan`] renders it. That is what makes it *executable*: an
+/// earlier revision printed the catalog-driven parts as prose ("emit one line
+/// per object from: SELECT format(…)"), so an operator who ran the generated
+/// file verbatim never renamed the legacy constraints, and step 4 aborted on
+/// `ADD CONSTRAINT harvest_events_pkey` because the old schema-scoped index
+/// still held the name. Everything catalog-driven is a `DO` block now, and an
+/// integration test runs these steps against a real populated database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    /// Numbered phase this statement belongs to (1-5), for the rendered script.
+    pub phase: u8,
+    /// The SQL, without a trailing semicolon.
+    pub sql: String,
+    /// `true` when the statement cannot run inside a transaction block —
+    /// `CREATE INDEX CONCURRENTLY`. Each must be sent on its own.
+    pub concurrent: bool,
+}
+
+/// The conversion plan for a **large live** `harvest_events`, as executable
+/// statements.
 ///
 /// [`enable_partitioning`] runs the same algorithm in one transaction, which is
-/// right for a greenfield or small table and wrong for a ten-million-row one:
-/// the index builds and the constraint validation would hold `ACCESS EXCLUSIVE`
-/// for their whole duration, blocking every append. This plan splits those two
-/// steps out of the lock window:
-///
-/// - `CREATE UNIQUE INDEX CONCURRENTLY` builds the two partition-key indexes
-///   without blocking reads or writes.
-/// - `ADD CONSTRAINT … NOT VALID` takes a brief lock; the separate
-///   `VALIDATE CONSTRAINT` does the full scan under `SHARE UPDATE EXCLUSIVE`,
-///   which concurrent readers and writers do not conflict with. Because the
-///   constraint is then valid, `ATTACH PARTITION` skips its own verification
-///   scan entirely.
+/// right for a fresh or small table and wrong for a ten-million-row one: the
+/// index builds and the constraint validation would hold `ACCESS EXCLUSIVE` for
+/// their whole duration, blocking every append. These steps move both out of
+/// the lock window — `CREATE INDEX CONCURRENTLY` builds without blocking
+/// reads or writes, and `ADD CONSTRAINT … NOT VALID` + `VALIDATE CONSTRAINT`
+/// does the full scan under `SHARE UPDATE EXCLUSIVE`, which concurrent readers
+/// and writers do not conflict with. Because the constraint is then valid,
+/// `ATTACH PARTITION` skips its own verification scan entirely.
 ///
 /// What remains inside the exclusive window is metadata-only: a rename, a
-/// `CREATE TABLE`, and the `ATTACH`. Seconds, not minutes — and bounded by an
-/// explicit `lock_timeout` so a conversion that cannot get the lock fails
-/// instead of stalling the deployment behind it.
-// As with `enable_sql`: one `format!` of an operator runbook, deliberately kept
-// in one place so it reads top to bottom.
+/// `CREATE TABLE`, and the `ATTACH`.
+// One ordered list of statements. Splitting it would scatter a runbook that has
+// to be read (and executed) top to bottom across helpers that only concatenate.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
+pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<PlanStep> {
     let width = opts.cohort_width_secs.max(1);
     let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
-    // Matches `enable_sql`'s `harvest_event_cohort(now())` exactly: the legacy
-    // partition ends where the current cohort begins, so the two ranges meet
-    // with no gap and no overlap.
+    let suffix_len = LEGACY_RENAME_SUFFIX.len();
     let cutover_lit = ts_literal(cohort_start(now, width));
-    let cohort_fn = cohort_function_sql(width);
-    format!(
+
+    let step = |phase: u8, sql: String| PlanStep {
+        phase,
+        sql,
+        concurrent: false,
+    };
+    let concurrent = |phase: u8, sql: String| PlanStep {
+        phase,
+        sql,
+        concurrent: true,
+    };
+
+    vec![
+        // ── 1: bake the chosen width into the cohort function ─────────────
+        step(1, cohort_function_sql(width)),
+        // ── 2: the partition-key indexes, built without blocking ──────────
+        concurrent(
+            2,
+            format!(
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {LEGACY_PARTITION}_pk_idx\n    \
+                 ON harvest_events (id, cohort)"
+            ),
+        ),
+        concurrent(
+            2,
+            format!(
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS \
+                 {LEGACY_PARTITION}_exec_event_idx\n    \
+                 ON harvest_events (workflow_exec_id, event_id, cohort)"
+            ),
+        ),
+        // ── 3: pre-validate so ATTACH skips its own scan ──────────────────
+        step(
+            3,
+            format!(
+                "ALTER TABLE harvest_events\n    \
+                 ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck\n    \
+                 CHECK (cohort < {cutover_lit}) NOT VALID"
+            ),
+        ),
+        step(
+            3,
+            format!("ALTER TABLE harvest_events VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck"),
+        ),
+        // ── 4: THE WINDOW — one transaction, metadata only ────────────────
+        step(4, "BEGIN".to_string()),
+        step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
+        // Captured BEFORE the rename, so each definition still names
+        // `harvest_events` and replays verbatim onto the new parent. The two
+        // indexes built in step 2 are excluded: replaying them would duplicate
+        // the constraint indexes added below.
+        step(
+            4,
+            format!(
+                "CREATE TEMP TABLE harvest_events_idx_defs ON COMMIT DROP AS\n  \
+                 SELECT pg_get_indexdef(i.indexrelid) AS def\n    \
+                 FROM pg_index i\n    \
+                 JOIN pg_class c ON c.oid = i.indrelid\n    \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n   \
+                 WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n     \
+                 AND NOT EXISTS (SELECT 1 FROM pg_constraint con\n                      \
+                 WHERE con.conindid = i.indexrelid)\n     \
+                 AND c.oid <> 0\n     \
+                 AND i.indexrelid::regclass::text NOT IN\n         \
+                 ('{LEGACY_PARTITION}_pk_idx', '{LEGACY_PARTITION}_exec_event_idx')"
+            ),
+        ),
+        step(
+            4,
+            "ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE".to_string(),
+        ),
+        step(
+            4,
+            format!("ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}"),
+        ),
+        // Renaming a table renames neither its indexes nor its constraints, so
+        // without this the new parent cannot reclaim their schema-scoped names
+        // — and `ADD CONSTRAINT harvest_events_pkey` below aborts.
+        step(
+            4,
+            format!(
+                "DO $harvest_rename_958$\nDECLARE obj record;\nBEGIN\n    \
+                 FOR obj IN SELECT conname AS n FROM pg_constraint\n                \
+                 WHERE conrelid = '{LEGACY_PARTITION}'::regclass\n                  \
+                 AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
+                 LOOP\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',\n                       \
+                 obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
+                 END LOOP;\n    \
+                 FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
+                 WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'\n                  \
+                 AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
+                 LOOP\n        \
+                 EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,\n                       \
+                 obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
+                 END LOOP;\nEND\n$harvest_rename_958$"
+            ),
+        ),
+        // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
+        // insert-time half lives on in the trigger below. The old PK and unique
+        // constraint must go too: ATTACH propagates the parent's, and a table
+        // may have only one primary key.
+        step(
+            4,
+            format!(
+                "ALTER TABLE {LEGACY_PARTITION}\n    \
+                 DROP CONSTRAINT IF EXISTS \
+                 harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX},\n    \
+                 DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX},\n    \
+                 DROP CONSTRAINT IF EXISTS \
+                 harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}"
+            ),
+        ),
+        step(
+            4,
+            format!(
+                "CREATE TABLE harvest_events\n    \
+                 (LIKE {LEGACY_PARTITION} INCLUDING DEFAULTS INCLUDING COMMENTS \
+                 INCLUDING STORAGE)\n    PARTITION BY RANGE (cohort)"
+            ),
+        ),
+        // WITHOUT THIS every new row keeps the `-infinity` sentinel and lands
+        // in the legacy partition forever, which looks fine until nothing is
+        // ever droppable. `clock_timestamp()`, not `now()`: `now()` is
+        // transaction START time, so a long transaction begun before a cohort
+        // boundary would stamp the previous, already-closed cohort.
+        step(
+            4,
+            "ALTER TABLE harvest_events\n    \
+             ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())"
+                .to_string(),
+        ),
+        step(
+            4,
+            "ALTER TABLE harvest_events\n    \
+             ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id, cohort)"
+                .to_string(),
+        ),
+        step(
+            4,
+            "ALTER TABLE harvest_events\n    \
+             ADD CONSTRAINT harvest_events_workflow_exec_id_event_id_key\n    \
+             UNIQUE (workflow_exec_id, event_id, cohort)"
+                .to_string(),
+        ),
+        step(
+            4,
+            "DO $harvest_idx_958$\nDECLARE d text;\nBEGIN\n    \
+             FOR d IN SELECT def FROM harvest_events_idx_defs LOOP\n        \
+             EXECUTE d;\n    END LOOP;\nEND\n$harvest_idx_958$"
+                .to_string(),
+        ),
+        step(
+            4,
+            "ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id".to_string(),
+        ),
+        // Validate-only: a BEFORE ROW trigger on a partitioned table must not
+        // touch the partition key, because routing has already happened when it
+        // fires. It also enforces `(workflow_exec_id, event_id)` uniqueness
+        // ACROSS partitions, which the constraint above can only do within one.
+        step(
+            4,
+            format!(
+                "CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events\n    \
+                 FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()"
+            ),
+        ),
+        step(
+            4,
+            format!("CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT"),
+        ),
+        step(
+            4,
+            format!(
+                "ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION}\n    \
+                 FOR VALUES FROM (MINVALUE) TO ({cutover_lit})"
+            ),
+        ),
+        // The write window, created here rather than left to the first
+        // retention tick: metadata-only, and deferring it would send every
+        // append for up to a tick interval into the DEFAULT partition, whose
+        // drain then holds ACCESS EXCLUSIVE while it moves them back — the
+        // append stall this whole change exists to avoid.
+        step(
+            4,
+            format!(
+                "DO $harvest_window_958$\nDECLARE lo timestamptz; hi timestamptz; step int;\n\
+                 BEGIN\n    FOR step IN 0..{lookahead} LOOP\n        \
+                 lo := harvest_event_cohort(now() + (step * {width}) * interval '1 second');\n        \
+                 hi := lo + ({width} * interval '1 second');\n        \
+                 EXECUTE format(\n            \
+                 'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events \
+                 FOR VALUES FROM (%L) TO (%L)',\n            \
+                 '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),\n            \
+                 lo, hi);\n    END LOOP;\nEND\n$harvest_window_958$"
+            ),
+        ),
+        step(4, "COMMIT".to_string()),
+    ]
+}
+
+/// Render the operator-run conversion script for a **large live**
+/// `harvest_events`.
+///
+/// Every statement comes from [`migration_plan_steps`], so the script an
+/// operator runs and the statements CI executes are the same list — the plan
+/// cannot drift into prose that looks like SQL but does nothing.
+///
+/// Steps 1–3 are online and may take a long time on a large table. Only step 4
+/// takes `ACCESS EXCLUSIVE`, and everything it does is metadata-only, so it is
+/// a seconds-long window rather than a scan.
+#[must_use]
+pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
+    let width = opts.cohort_width_secs.max(1);
+    let cutover_lit = ts_literal(cohort_start(now, width));
+    let mut out = format!(
         r"-- ────────────────────────────────────────────────────────────────
 -- harvest_events -> partitioned layout (issue #958), LARGE LIVE TABLE
 --
@@ -2143,132 +2392,58 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 -- which is right for a fresh or small table and wrong for a
 -- ten-million-row one: the index builds and the constraint validation
 -- would hold ACCESS EXCLUSIVE for their whole duration, blocking every
--- append. This plan moves both out of the lock window.
+-- append. This script moves both out of the lock window.
 --
--- Run one numbered step at a time. Steps 1-3 are online: they hold no
--- lock that blocks appends, and may take a long time on a large table.
--- Only step 4 takes ACCESS EXCLUSIVE, and everything it does is
--- metadata-only, so it is a seconds-long window rather than a scan.
+-- Steps 1-3 are ONLINE: they hold no lock that blocks appends, and may
+-- take a long time on a large table. Only step 4 takes ACCESS EXCLUSIVE,
+-- and everything it does is metadata-only.
 --
--- Recheck the cutover before running step 4. The literal below was
--- computed when this plan was printed. A STALE (older) cutover is safe --
--- every pre-conversion row carries the migration's `-infinity` sentinel,
--- so all of them still fall inside the legacy range -- but it leaves the
--- cohorts between the stale cutover and now with no partition, so their
--- rows land in the DEFAULT partition until maintenance drains them. To
--- avoid that entirely, regenerate the plan (or substitute the value of
--- `SELECT harvest_event_cohort(now());`) immediately before step 3.
--- A cutover in the FUTURE is not safe: rows appended after the swap would
--- fall inside the legacy range and be attached to a partition that is
--- meant to be sealed.
+-- Run the CREATE INDEX CONCURRENTLY statements in step 2 ONE AT A TIME:
+-- CONCURRENTLY cannot run inside a transaction block, so a client that
+-- wraps a whole file in one transaction will reject them.
+--
+-- Recheck the cutover ({cutover_lit}) before running step 3. It was
+-- computed when this script was generated. A STALE (older) cutover is
+-- safe -- every pre-conversion row carries the `-infinity` sentinel, so
+-- all of them still fall inside the legacy range -- but it leaves the
+-- cohorts between then and now with no partition, so their rows land in
+-- the DEFAULT partition until maintenance drains them. To avoid that,
+-- regenerate this script (or substitute `SELECT harvest_event_cohort(now());`)
+-- immediately before step 3. A cutover in the FUTURE is NOT safe: rows
+-- appended after the swap would fall inside a partition meant to be sealed.
 --
 -- Rollback: until step 4 commits, nothing is committed but two extra
 -- indexes and one CHECK constraint, all droppable with no downtime.
 -- ────────────────────────────────────────────────────────────────
-
--- Step 1 (online). Bake the chosen cohort width into the cohort function.
-{cohort_fn};
-
--- Step 2 (online, may take a while). Build the two indexes the parent's
--- partition-key-bearing PRIMARY KEY and UNIQUE constraints require.
--- CONCURRENTLY cannot run inside a transaction block: run each on its own.
-CREATE UNIQUE INDEX CONCURRENTLY {LEGACY_PARTITION}_pk_idx
-    ON harvest_events (id, cohort);
-CREATE UNIQUE INDEX CONCURRENTLY {LEGACY_PARTITION}_exec_event_idx
-    ON harvest_events (workflow_exec_id, event_id, cohort);
-
--- Step 3 (online). Pre-validate the range constraint so ATTACH PARTITION in
--- step 4 can skip its own full-table verification scan. ADD ... NOT VALID
--- takes a brief lock; VALIDATE does the scan under SHARE UPDATE EXCLUSIVE,
--- which concurrent readers and writers do not conflict with.
-ALTER TABLE harvest_events
-    ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck
-    CHECK (cohort < {cutover_lit}) NOT VALID;
-ALTER TABLE harvest_events
-    VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck;
-
--- Step 4 (THE WINDOW: ACCESS EXCLUSIVE, metadata-only). One transaction:
--- if anything fails, nothing changed.
-BEGIN;
-SET LOCAL lock_timeout = '{lock_ms}ms';
-
-ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE;
-ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION};
--- Rename the old table's constraints and indexes out of the way so the new
--- parent can reclaim their names (renaming a table does not rename these).
--- Emit one line per object from:
---   SELECT format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I{LEGACY_RENAME_SUFFIX};', conname, conname)
---     FROM pg_constraint WHERE conrelid = '{LEGACY_PARTITION}'::regclass;
---   SELECT format('ALTER INDEX %I RENAME TO %I{LEGACY_RENAME_SUFFIX};', indexname, indexname)
---     FROM pg_indexes WHERE tablename = '{LEGACY_PARTITION}';
-
--- The FK's ON DELETE CASCADE is the row-by-row delete storm being
--- eliminated. Its insert-time half lives on in the trigger below.
-ALTER TABLE {LEGACY_PARTITION}
-    DROP CONSTRAINT IF EXISTS harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX};
--- ATTACH propagates the parent's PRIMARY KEY onto the partition and a table
--- may have only one, so the old single-column key must go. `id` alone can no
--- longer be a key anyway: uniqueness on a partitioned table has to include
--- the partition column. The indexes built CONCURRENTLY in step 2 are what
--- the parent's constraints bind to.
-ALTER TABLE {LEGACY_PARTITION}
-    DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX};
-ALTER TABLE {LEGACY_PARTITION}
-    DROP CONSTRAINT IF EXISTS harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX};
-
-CREATE TABLE harvest_events
-    (LIKE {LEGACY_PARTITION} INCLUDING DEFAULTS INCLUDING COMMENTS INCLUDING STORAGE)
-    PARTITION BY RANGE (cohort);
--- Swap the migration's constant `-infinity` sentinel for the live cohort
--- expression. Metadata-only, and it is what actually routes every subsequent
--- append -- WITHOUT IT every new row would keep the sentinel and land in the
--- legacy partition forever, which looks fine until nothing is ever droppable.
-ALTER TABLE harvest_events
-    ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp());
-ALTER TABLE harvest_events
-    ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id, cohort);
-ALTER TABLE harvest_events
-    ADD CONSTRAINT harvest_events_workflow_exec_id_event_id_key
-    UNIQUE (workflow_exec_id, event_id, cohort);
--- Recreate every non-constraint index on the new parent; Postgres
--- propagates each to all partitions. Emit them from:
---   SELECT pg_get_indexdef(i.indexrelid)
---     FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
---    WHERE c.relname = '{LEGACY_PARTITION}'
---      AND NOT EXISTS (SELECT 1 FROM pg_constraint con
---                       WHERE con.conindid = i.indexrelid);
-ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id;
-
--- Validate-only: a BEFORE ROW trigger on a partitioned table must not touch
--- the partition key, because routing has already happened when it fires.
-CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events
-    FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution();
-
-CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT;
-ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION}
-    FOR VALUES FROM (MINVALUE) TO ({cutover_lit});
-
--- Create the write window here, inside the same transaction. These are
--- metadata-only. Leaving them to the first retention tick would send every
--- append for up to a tick interval into the DEFAULT partition, and the next
--- tick would then drain an hour of events under ACCESS EXCLUSIVE -- the append
--- stall this whole change exists to avoid. Emit one line per cohort from:
---   SELECT format(
---     'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events FOR VALUES FROM (%L) TO (%L);',
---     '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),
---     lo, lo + interval '{width} seconds')
---     FROM generate_series(0, {lookahead}) AS step,
---          LATERAL (SELECT harvest_event_cohort(now() + (step * {width}) * interval '1 second') AS lo) c;
-
-COMMIT;
-
--- Step 5 (online). Let the engine take over: it pre-creates the lookahead
--- window, drains the DEFAULT partition and sweeps droppable cohorts on every
--- retention tick. Nothing further is required of the operator, and no cron
--- job needs to exist.
---   harvest partition status --shard <dsn>
 "
-    )
+    );
+    let mut last_phase = 0u8;
+    for st in migration_plan_steps(opts, now) {
+        if st.phase != last_phase {
+            out.push_str(match st.phase {
+                1 => "\n-- Step 1 (online). Bake the chosen cohort width into the cohort function.\n",
+                2 => "\n-- Step 2 (online, may take a while). Build the two indexes the parent's\n\
+                      -- partition-key-bearing PRIMARY KEY and UNIQUE constraints require.\n\
+                      -- Run each on its own: CONCURRENTLY cannot run in a transaction block.\n",
+                3 => "\n-- Step 3 (online). Pre-validate the range constraint so ATTACH PARTITION in\n\
+                      -- step 4 skips its own full-table verification scan. ADD ... NOT VALID\n\
+                      -- takes a brief lock; VALIDATE does the scan under SHARE UPDATE EXCLUSIVE,\n\
+                      -- which concurrent readers and writers do not conflict with.\n",
+                _ => "\n-- Step 4 (THE WINDOW: ACCESS EXCLUSIVE, metadata-only). One transaction:\n\
+                      -- if anything fails, nothing changed.\n",
+            });
+            last_phase = st.phase;
+        }
+        out.push_str(&st.sql);
+        out.push_str(";\n");
+    }
+    out.push_str(
+        "\n-- Step 5 (online). Let the engine take over: it pre-creates the lookahead\n\
+         -- window, drains the DEFAULT partition and sweeps droppable cohorts on every\n\
+         -- retention tick. Nothing further is required of the operator, and no cron\n\
+         -- job needs to exist.\n--   harvest partition status --shard <dsn>\n",
+    );
+    out
 }
 
 // ── Unit tests (no database) ───────────────────────────────────────────────

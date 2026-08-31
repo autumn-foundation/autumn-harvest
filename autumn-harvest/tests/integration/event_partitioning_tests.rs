@@ -1904,3 +1904,95 @@ async fn reverting_and_re_enabling_round_trips() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_large_table_migration_plan_actually_runs() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The plan is the path the documentation sends an operator down for any
+    // table too big for `enable`'s single transaction. An earlier revision
+    // printed its catalog-driven parts as PROSE — "emit one line per object
+    // from: SELECT format(…)" — so running the generated file verbatim silently
+    // skipped the legacy constraint renames, and step 4 then aborted on
+    // `ADD CONSTRAINT harvest_events_pkey` because the old schema-scoped index
+    // still held the name. The operator discovers that after spending an hour
+    // on the CONCURRENTLY index builds.
+    //
+    // So this test does not inspect the script's text: it EXECUTES it, against
+    // a populated table, and checks the result is the same layout `enable`
+    // produces. Executing it is the only assertion that can catch prose
+    // masquerading as SQL.
+    let exec = insert_execution(&mut conn, "plan_wf", "plan-1", day(2026, 2, 3), None).await;
+    let exec_id = ExecutionId::from_uuid(exec);
+    autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
+        .await
+        .expect("seed a populated table");
+
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        // `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so
+        // each is sent on its own — exactly as the script instructs.
+        diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "plan step (phase {}) failed — an operator running the generated \
+                     script would hit this:\n{}\nerror: {e}",
+                    step.phase, step.sql
+                )
+            });
+    }
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "running the plan must leave the table partitioned"
+    );
+    let parts = partition::list_partitions(&mut conn).await.expect("list");
+    assert!(
+        parts.iter().any(|p| p.name == partition::LEGACY_PARTITION),
+        "the pre-conversion rows must be attached as the legacy partition: {parts:?}"
+    );
+    assert!(
+        parts.iter().any(|p| p.is_default),
+        "and the DEFAULT catch-all must exist: {parts:?}"
+    );
+    assert!(
+        parts.iter().filter(|p| !p.is_default).count()
+            >= partition::DEFAULT_LOOKAHEAD_COHORTS as usize,
+        "and the write window must be covered before the first retention tick: {parts:?}"
+    );
+    assert_eq!(
+        autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("history survives the scripted conversion")
+            .events
+            .len(),
+        3,
+    );
+
+    // The layout must be functionally the real thing, not merely partitioned:
+    // the trigger and the cohort default are what the sweeper depends on.
+    let fresh = insert_execution(&mut conn, "plan_wf", "plan-2", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(fresh),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("append after the scripted conversion");
+    assert!(
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(fresh),
+            &sample_events(),
+            0
+        )
+        .await
+        .is_err(),
+        "the uniqueness trigger must be installed by the script too"
+    );
+}
