@@ -36,6 +36,47 @@ fn performance_doc_path() -> PathBuf {
     repo_root().join("docs/performance.md")
 }
 
+/// Marker opening the released performance narrative in the shipped-work record.
+///
+/// This prose has been chased across three homes by routine maintenance, and
+/// each move broke these guards: it began in
+/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`, which the 0.6.0
+/// collation sweep folded away and deleted; it then lived in `CLAUDE.md`'s
+/// phase list, which `562c781` removed when it cut that file down to workflow
+/// instructions. It now lives in `docs/shipped-work.md`, whose header says it
+/// is guard-referenced and must not be collated or condensed.
+///
+/// The *verbatim* entry is the one these guards need — a condensed bullet no
+/// longer carries the per-gate figures they cross-check, which is why
+/// `CHANGELOG.md` cannot serve as the source.
+const RELEASED_PERF_ENTRY_MARKER: &str =
+    "- **Tooling** — Task-claim / enqueue throughput benchmark";
+
+fn shipped_work_path() -> PathBuf {
+    repo_root().join("docs/shipped-work.md")
+}
+
+/// The released performance narrative, extracted from the shipped-work record.
+///
+/// Scoped to the single entry rather than handing the guards the whole file:
+/// several of them ban a superseded phrasing, and an unscoped read would let an
+/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
+fn released_perf_entry() -> String {
+    let text = read_normalized(&shipped_work_path());
+    let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
+        panic!(
+            "docs/shipped-work.md must contain the claim-benchmark phase entry \
+             (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
+             cross-check the published tables against it"
+        )
+    });
+    let rest = &text[start + RELEASED_PERF_ENTRY_MARKER.len()..];
+    let end = rest.find("\n- **").map_or(text.len(), |off| {
+        start + RELEASED_PERF_ENTRY_MARKER.len() + off
+    });
+    text[start..end].to_string()
+}
+
 /// Read a file with line endings normalised to `\n`.
 ///
 /// Every structural helper below locates boundaries with `\n`-anchored needles
@@ -345,8 +386,12 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
     let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
-    let body = top_level_fn_body(&queue_src, "claim_task")
-        .expect("queue.rs must define `pub async fn claim_task(`");
+    // `claim_task_on_shard`, not `claim_task`: issue #954 made the latter a thin
+    // wrapper that delegates, so the claim transaction — and every statement
+    // this guard exists to keep the docs honest about — lives in the former.
+    // The guard follows the transaction, which is what it was always about.
+    let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
+        .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
 
     let mut called: Vec<&str> = Vec::new();
     for (idx, _) in body.match_indices("crate::queue_pause::") {
@@ -610,6 +655,80 @@ fn performance_guards_run_on_docs_only_changes() {
          run unconditionally: a condition is how these guards stopped running on \
          docs-only PRs in the first place. Stanza:\n{stanza}"
     );
+}
+
+/// The changelog fragment must not publish superseded figures.
+///
+/// The fragment is collated into the public `CHANGELOG.md`, so its opening
+/// entry *is* the release note. Rounds of review appended corrections to the
+/// end of it as a development diary — which left the headline still quoting an
+/// earlier run's numbers and the attribution that was later retracted, roughly
+/// ninety thousand characters before the retraction. A reader of the collated
+/// changelog meets the superseded claim first and may never reach the fix.
+///
+/// So this pins the fragment against the same tables `docs/performance.md`
+/// publishes: the figures it quotes must be the current ones, and the rejected
+/// isolated-cost reading must not appear as an assertion anywhere in it.
+///
+/// This guard lives here rather than beside the changelog because
+/// `docs/changelog.d/**` is also classified `code=false` — a changelog-only
+/// edit is exactly the kind of change that skips the gated test matrix, and the
+/// ungated lint step runs *this* module.
+#[test]
+fn changelog_fragment_quotes_the_published_figures() {
+    let doc = read_performance_doc();
+    let rows = parse_gate_table(&doc);
+    let by_name: std::collections::BTreeMap<&str, &GateRow> =
+        rows.iter().map(|r| (r.gate.as_str(), r)).collect();
+    let control = by_name
+        .get("double_backlog")
+        .expect("the control row must exist");
+
+    let fragment = released_perf_entry();
+
+    // The control's multiplier is the one the retracted attribution was built
+    // on, so it is the one most likely to be left stale. Read the current value
+    // off the table rather than hardcoding it.
+    //
+    // Scoped to the sentence that introduces the control, NOT to the whole
+    // fragment: the figure also appears in the appended round-by-round diary,
+    // so a bare `fragment.contains(..)` is satisfied by a *correct* mention in
+    // the diary while the *leading* entry — the part that becomes the release
+    // note — still quotes a superseded run. That is exactly the drift this
+    // guards, so an unscoped check would pass through it. (Verified: it did.)
+    let published = format!("+{}%", control.delta_pct);
+    let intro = fragment
+        .find("ClaimGate::DoubleBacklog")
+        .expect("the changelog fragment must introduce the `ClaimGate::DoubleBacklog` control");
+    let window_end = (intro + 400).min(fragment.len());
+    let window = &fragment[intro..window_end];
+    assert!(
+        window.contains(&published),
+        "the changelog fragment introduces the `double_backlog` control without \
+         quoting its published cost ({published}). The fragment is collated into \
+         the public CHANGELOG, so a superseded figure here IS the release note \
+         while the correction sits thousands of characters below it. Window:\n{window}"
+    );
+
+    // Assertions of the reading the control cannot support. Quoted occurrences
+    // are exempt — see [`asserted_in_own_voice`] for why that exemption is
+    // load-bearing rather than a convenience.
+    for banned in [
+        "deleting the predicate would buy nothing",
+        "Deleting the predicate would buy nothing",
+        "the anti-join costs **−2%**",
+        "the anti-join costs **+1%**",
+    ] {
+        assert!(
+            !asserted_in_own_voice(&fragment, banned),
+            "the changelog fragment states \"{banned}\" in its own voice, which \
+             attributes the `paused_rows` delta to the anti-join predicate in \
+             isolation. The `double_backlog` control sorts a different number of \
+             rows, so it cannot support that; publish the depth-controlled \
+             finding instead. (Quoting the phrase while retracting it is fine — \
+             put it in quotation marks.)"
+        );
+    }
 }
 
 /// The harness docs must name the statistic the gate actually asserts.
@@ -971,6 +1090,118 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
     }
 }
 
+/// The released entry's *current-behavior* description must not promise a
+/// pid-liveness guarantee the sweep no longer offers.
+///
+/// Round 5 removed the pid veto from `sweep_step` outright, making the
+/// server-visible lease the sole liveness authority — precisely because a
+/// containerised run records pid 1, pid 1 is alive everywhere, and the veto
+/// therefore skipped every stale database a previous container run had left
+/// behind. The opening description still told operators the sweep skips a
+/// database "whose owning pid is still alive", which is both untrue and
+/// reassuring in the wrong direction: an operator reading it would expect a
+/// live-but-leaseless run to be protected from reclamation.
+///
+/// Scoped to the text *before* the first `Post-review hardening` section, and
+/// that scoping is the substance of the test. The released entry embeds a
+/// round-by-round narrative in which "the local pid check is kept" is a true
+/// statement about round 2, later superseded; banning the phrase everywhere
+/// would forbid the entry from recording its own history. The prefix is the
+/// part that speaks in the present tense about shipped behaviour.
+///
+/// The sibling guard below catches a *retracted conclusion*; this one catches a
+/// *retracted mechanism*. Neither the figure checks nor the own-voice check can
+/// see either, because in both cases the prose is internally consistent and
+/// only disagrees with the code.
+#[test]
+fn the_released_entry_does_not_promise_pid_liveness_protection() {
+    let fragment = released_perf_entry();
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    // Everything up to the first round narrative is the shipped-behaviour
+    // description; the narratives after it are history and may say otherwise.
+    let current_behavior = leading
+        .split_once("Post-review hardening")
+        .map_or(leading, |(before, _)| before);
+
+    for banned in [
+        "owning pid is still alive",
+        "liveness check is Linux-only",
+        "whose owning pid",
+    ] {
+        assert!(
+            !current_behavior.contains(banned),
+            "the released changelog entry's opening description states \
+             \"{banned}\", promising that a live local pid protects a database \
+             from the stale sweep. Round 5 removed that veto: the server-visible \
+             lease is the sole liveness authority, so a database with no backend \
+             attached is reclaimed regardless of pid — deliberately, because a \
+             containerised run records pid 1 and pid 1 is always alive. The \
+             round narratives below may record the superseded rule; the opening \
+             description may not."
+        );
+    }
+
+    assert!(
+        current_behavior.contains("pg_stat_activity"),
+        "the released changelog entry's opening description must name the \
+         mechanism that actually decides reclamation (`pg_stat_activity`). \
+         Deleting the pid claim without replacing it leaves the sweep's safety \
+         property unstated, which is how the stale claim survived six rounds of \
+         review in the first place."
+    );
+}
+
+/// The changelog fragment's *leading* entry must not publish the retracted
+/// `all_gates` bound.
+///
+/// Scoped to the leading entry, not the whole fragment, and the distinction is
+/// the whole point. The fragment is collated into the public `CHANGELOG.md`, so
+/// its first top-level bullet *is* the released claim; the round-by-round diary
+/// appended below it legitimately records what was believed at each stage and
+/// then corrected, and a guard that forbade the superseded wording anywhere
+/// would forbid the diary from recording the correction at all.
+///
+/// This is the second time this exact drift has occurred (round 26 was the
+/// first) and the existing `changelog_fragment_quotes_the_published_figures`
+/// did not catch it, because that guard checks the *figures* the entry quotes
+/// against the published tables. Here the figure was right and the *conclusion*
+/// drawn from it was withdrawn — a class the figure check cannot see.
+#[test]
+fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
+    let fragment = released_perf_entry();
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    for banned in [
+        "The bound that does survive on predicate cost",
+        "bound that does survive",
+    ] {
+        assert!(
+            !asserted_in_own_voice(leading, banned),
+            "the changelog fragment's leading entry states \"{banned}\", \
+             presenting the `all_gates` +28% as a surviving bound on combined \
+             predicate cost. Round 28 retracted that: `all_gates` seeds the \
+             PAUSED ballast, so it sorts 10 000 rows where its equal-depth \
+             comparand sorts 20 000, and the comparison bounds nothing. The \
+             diary below may record the superseded claim; the released entry \
+             may not."
+        );
+    }
+
+    assert!(
+        collapse_ws(leading).contains("bounds nothing in either direction"),
+        "the changelog fragment's leading entry must carry the narrowed \
+         conclusion. Deleting the claim without it leaves +28% in the release \
+         note for a reader to draw the retracted conclusion from."
+    );
+}
+
 /// `+28%` must not be published as a bound in *either* direction.
 ///
 /// Round 28 retracted "the surviving bound on combined predicate cost" and
@@ -1010,10 +1241,24 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
         "conservative",
     ];
 
-    for (label, source) in [(
-        "docs/performance.md",
-        read_normalized(&performance_doc_path()),
-    )] {
+    // Pairs of (label, already-extracted text) rather than (label, path): the
+    // released entry is one item inside a long shipped-work record, so handing
+    // this loop that whole file would let an unrelated entry's "28%" trip — or
+    // mask — the scan below.
+    for (label, source) in [
+        (
+            "docs/performance.md",
+            read_normalized(&performance_doc_path()),
+        ),
+        (
+            "the released performance entry in docs/shipped-work.md",
+            released_perf_entry(),
+        ),
+    ] {
+        // A character window, not a line window: `docs/performance.md` is hard
+        // wrapped at ~78 columns while the released entry is a single
+        // 40 000-character line, so any line-based span is either too small for
+        // one document or the whole of the other.
         let text = collapse_ws(&source);
         for (idx, _) in text.match_indices("28%") {
             let lo = idx.saturating_sub(WINDOW);
@@ -1047,6 +1292,172 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
                 );
             }
         }
+    }
+}
+
+/// Every per-gate figure the changelog's *leading* entry quotes must be the one
+/// the published table currently carries.
+///
+/// The existing `changelog_fragment_quotes_the_published_figures` pins exactly
+/// one number — the control's multiplier — because that was the figure the
+/// round-26 drift turned on. It therefore did not notice that the leading
+/// entry's "per-gate attribution (AC2)" list had gone stale in *all five* of its
+/// figures when round 22 regenerated the tables from a fresh run: the diary
+/// recorded the regeneration, the page carried the new numbers, and the entry
+/// that becomes the release note kept the old ones. Two of them had even swapped
+/// rank with each other, so the release note published an ordering the page
+/// explicitly says does not reproduce.
+///
+/// Rather than pin a sixth specific number, this reads every gate name the
+/// leading entry mentions alongside a percentage and checks that percentage
+/// against the table. A future regeneration cannot leave any of them behind.
+#[test]
+fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
+    let doc = read_performance_doc();
+    let rows = parse_gate_table(&doc);
+    let fragment = released_perf_entry();
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    // The AC2 list is the part of the entry that summarises the gate table.
+    // Scoped to it because the entry legitimately quotes other runs elsewhere
+    // (the reproducibility spread), which the page publishes on purpose.
+    let start = leading
+        .find("per-gate attribution (AC2)")
+        .expect("the leading entry must summarise the per-gate attribution");
+    let end = leading[start..]
+        .find("; (4)")
+        .map_or(leading.len(), |o| start + o);
+    let ac2 = &leading[start..end];
+
+    // Prose names gates in words ("build-id routing"), not by table key, so map
+    // the two explicitly rather than guessing from the identifier.
+    for (gate, prose) in [
+        ("rate_limited", "rate-limit gate"),
+        ("circuit_breaker_set", "circuit-breaker tracked set"),
+        ("build_policy", "build-id routing"),
+        ("concurrency_key", "per-key concurrency"),
+        ("all_gates", "all gates together"),
+    ] {
+        let Some(row) = rows.iter().find(|r| r.gate == gate) else {
+            continue;
+        };
+        if !ac2.contains(prose) {
+            continue;
+        }
+        let published = format!("+{}%", row.delta_pct);
+        assert!(
+            ac2.contains(&published),
+            "the changelog's leading entry quotes a figure for `{gate}` \
+             (\"{prose}\") that is not the published {published}. The AC2 list \
+             is a summary of the gate table, so regenerating the table must \
+             carry it along; the release note otherwise contradicts the page it \
+             points at. Leading-entry AC2 text: {ac2}"
+        );
+    }
+}
+
+/// Every millisecond figure the changelog's headline findings quote must still
+/// appear somewhere on the published page.
+///
+/// The per-gate guard above covers the AC2 list. Auditing that fix turned up
+/// that the *same* round-22 regeneration had also left findings (1) and (4)
+/// behind — the release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms) and
+/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s, while the page's
+/// own sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
+/// ~4 600 enqueues/s. So the drift was never specific to the gate list; it was
+/// the whole headline.
+///
+/// A containment check rather than a table parse, deliberately: the headline is
+/// prose that quotes figures from several tables (the sweep, the enqueue sweep,
+/// the plan's buffer counts), and a parser per table would have to be extended
+/// every time the prose cites a new one — the same instance-by-instance trap
+/// that let this survive. Requiring each quoted figure to appear *somewhere* on
+/// the page needs no such extension: regenerating any table drops its old
+/// values off the page, and the stale quote fails here.
+///
+/// Scoped to the two regions that summarise *current* measurements — the
+/// headline findings and the gate's budget rationale — rather than the whole
+/// entry. The entry also narrates superseded runs on purpose ("an earlier
+/// revision ... read ~2 900 ms instead of ~300 ms"), and the page publishes that
+/// history deliberately, so a whole-entry sweep would fail on text that is
+/// correct. The excluded region is narrative about the past; these two are
+/// claims about the present.
+#[test]
+fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
+    let doc = read_performance_doc();
+    let fragment = released_perf_entry();
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    let start = leading
+        .find("Headline measured findings")
+        .expect("the leading entry must summarise the headline findings");
+    let end = leading[start..]
+        .find("An equal-depth control")
+        .map_or(leading.len(), |o| start + o);
+
+    // The budget sentence quotes the reference p50 the gate is derived from, so
+    // it goes stale on exactly the same regeneration. It sat outside the
+    // headline block and drifted independently: round 5 widened the reference
+    // to a 200-234 ms range and the entry kept quoting a flat "234 ms", which
+    // by then also contradicted the entry's own corrected headline.
+    let budget_start = leading
+        .find("fails the build when")
+        .expect("the leading entry must state the gate's budget");
+    let budget_end = leading[budget_start..]
+        .find("It asserts p50")
+        .map_or(leading.len(), |o| budget_start + o);
+
+    let headline = &format!(
+        "{} {}",
+        &leading[start..end],
+        &leading[budget_start..budget_end]
+    );
+
+    // `9.92 ms`, `234.22 ms`, `3 531.95 ms` — digits with optional ASCII-space
+    // thousands separators, two decimals, followed by the unit.
+    let mut quoted = Vec::new();
+    let bytes: Vec<char> = headline.chars().collect();
+    for (i, c) in bytes.iter().enumerate() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_digit() || bytes[i - 1] == '.') {
+            continue;
+        }
+        let rest: String = bytes[i..].iter().collect();
+        let num_len = rest.find(" ms").filter(|&n| n > 0 && n <= 12).filter(|&n| {
+            // Integer figures count too. Requiring a decimal point is what let
+            // the budget sentence's flat `234 ms` reference drift undetected
+            // while every decimal figure beside it was being checked.
+            let s = &rest[..n];
+            s.chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ' ')
+        });
+        if let Some(n) = num_len {
+            quoted.push(rest[..n].to_string());
+        }
+    }
+
+    assert!(
+        !quoted.is_empty(),
+        "the headline findings must quote at least one millisecond figure; if \
+         they no longer do, this guard is watching the wrong text and should be \
+         re-scoped rather than deleted"
+    );
+
+    for figure in quoted {
+        assert!(
+            doc.contains(&figure),
+            "the changelog's headline findings quote `{figure} ms`, which no \
+             longer appears anywhere in docs/performance.md. The page was \
+             regenerated and the release note kept the previous run's number."
+        );
     }
 }
 

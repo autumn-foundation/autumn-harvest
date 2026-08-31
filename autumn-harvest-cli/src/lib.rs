@@ -95,6 +95,142 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Cross-region disaster-recovery operator commands (issue #954).
+///
+/// All three talk to shard databases directly, never to the management API:
+/// during a regional failover the management API may be exactly what is down,
+/// and the whole point of the fence is to be reachable when the region is not.
+#[derive(Subcommand, Debug)]
+pub enum DrCommand {
+    /// Report each shard's write-authority epoch and measured RPO.
+    ///
+    /// Read-only, safe at any time, and the first thing to run when deciding
+    /// whether to fail over: it shows the RPO you would be accepting.
+    Status {
+        /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
+        /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
+        /// POSITIONAL index as its shard id.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Slot-name prefix identifying this shard's DR replication.
+        ///
+        /// Must match the workers' `replication_slot_prefix`. Without a prefix
+        /// every walsender for the database would count as a DR standby —
+        /// including an unrelated logical-decoding consumer such as a CDC
+        /// pipeline — so a shard whose real cross-region subscriber had
+        /// disconnected would report itself protected.
+        #[arg(long, value_name = "PREFIX", default_value = "harvest_dr")]
+        slot_prefix: String,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// **Revoke the old region's write authority**: bump each shard's epoch.
+    ///
+    /// This is the fence. Every worker pinned to the previous epoch — in
+    /// EITHER region — stops. Run it on the promoted primary, on every shard,
+    /// before starting any workers.
+    Fence {
+        /// A shard database DSN. Repeat once per shard.
+        ///
+        /// Supply EVERY shard. Fencing a subset leaves a half-failed-over
+        /// cluster taking live cross-shard traffic, which converts bounded,
+        /// known skew into unbounded skew (see docs/cross-region-dr.md).
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Why this fence is being applied. Recorded in
+        /// `harvest_shard_generation.fenced_reason`.
+        ///
+        /// Required, not optional: an unattributable epoch bump found three
+        /// months later is indistinguishable from a mistake.
+        #[arg(long, value_name = "TEXT", required = true)]
+        reason: String,
+
+        /// Who is applying it. Recorded in `fenced_by`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            env = "HARVEST_ACTOR",
+            default_value = "unknown"
+        )]
+        actor: String,
+
+        /// Acknowledge that this stops every worker pinned to the old epoch.
+        ///
+        /// Deliberately long and unpleasant to type. A fence during a healthy
+        /// week is a fleet-wide outage recovered only by restarting the fleet.
+        #[arg(long = "i-understand-this-stops-the-fleet", required = true)]
+        confirm: bool,
+
+        /// Fence a shard that has no fencing row yet, creating one.
+        ///
+        /// Off by default, and that default is a safety guard rather than
+        /// tidiness. A shard with no row has never been pinned by a worker, so
+        /// there is nothing to fence — and the overwhelmingly likely cause of
+        /// an absent row is a **wrong shard id**: `--shard <dsn>` with no
+        /// `<id>=` prefix takes its *positional index* as the shard id, so one
+        /// mis-ordered DSN silently creates a phantom row, bumps it, prints
+        /// success, and fences nobody while the operator believes the region is
+        /// fenced. Refusing is the loud outcome.
+        #[arg(long)]
+        provision: bool,
+
+        /// Fence a database that still looks like a live primary.
+        ///
+        /// By default this refuses a target that is not in recovery **and**
+        /// still has connected standbys — i.e. a healthy primary rather than
+        /// the standby you just promoted. That combination is the signature of
+        /// a mis-typed DSN, and the cost of getting it wrong is a self-inflicted
+        /// fleet-wide outage on a region that was fine.
+        #[arg(long)]
+        force: bool,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// Finish promoting a standby: advance every sequence to match the data.
+    ///
+    /// **Required after promoting a LOGICAL standby.** Logical replication
+    /// copies rows but not sequence values, so a promoted logical standby holds
+    /// every replicated `harvest_events` row while `harvest_events_id_seq`
+    /// still sits where it started — and the new primary's first append dies on
+    /// a duplicate key.
+    ///
+    /// A separate verb from `fence` on purpose: folding it in would let an
+    /// operator fence a shard and never advance its sequences, and discover it
+    /// only when the first workflow tried to make progress. Harmless and
+    /// idempotent on a physical replica, which replicates sequences already.
+    Promote {
+        /// A promoted shard database DSN. Repeat once per shard.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+}
+
+/// Output format for `harvest dr`.
+///
+/// This is a **local** flag (`--format` / `-o`); it is deliberately distinct
+/// from the global `--output`, which formats management-API responses that
+/// these commands never make.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum DrFormat {
+    /// Human-readable table.
+    #[default]
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
 /// `harvest backup` subcommands (issue #943).
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
@@ -970,6 +1106,17 @@ enum Commands {
         #[command(subcommand)]
         command: BuildRoutingCommand,
     },
+    /// Cross-region disaster-recovery operations: inspect the RPO, apply the
+    /// failover fence, finish a promotion (issue #954).
+    ///
+    /// Talks to shard databases directly, never to the management API — during
+    /// a regional failover the management API may be exactly what is down.
+    /// See `docs/runbooks/cross-region-failover.md`.
+    Dr {
+        #[command(subcommand)]
+        command: DrCommand,
+    },
+
     /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
     ///
     /// Read-only against every supplied scratch database: each connection is
@@ -2938,6 +3085,9 @@ impl Cli {
             Commands::Backup { .. } => {
                 unreachable!("Backup handles its own execution locally")
             }
+            Commands::Dr { .. } => {
+                unreachable!("Dr handles its own execution locally")
+            }
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
@@ -3046,6 +3196,13 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *probe_limit,
         )
         .await;
+    }
+
+    // `dr` talks to shard databases directly, not to the management API: a
+    // regional failover is precisely when the management API may be
+    // unreachable (mirrors `backup verify`).
+    if let Commands::Dr { command } = &cli.command {
+        return run_dr(command).await;
     }
 
     // det-check is read-only local source analysis: no HTTP, handled entirely
@@ -4218,6 +4375,587 @@ pub async fn run_backup_verify(
     }
 
     backup_verify_gate(&report).map_or(Ok(()), Err)
+}
+
+// ── harvest dr: cross-region disaster recovery (issue #954) ─────────────────
+
+/// One shard's DR state, as `harvest dr status` reports it.
+///
+/// Serialized by hand rather than by `serde::Serialize`: this crate depends on
+/// `serde_json` but not on `serde` itself, and one small projection is a better
+/// trade than a new dependency.
+#[derive(Debug)]
+struct DrShardStatus {
+    shard_id: i32,
+    /// Redacted — a DSN can embed a password.
+    dsn: String,
+    reachable: bool,
+    unreachable_reason: Option<String>,
+    /// `None` when this shard has never been provisioned, which means fencing
+    /// is not yet in force there. Distinct from `generation_error`: "there is
+    /// no fence here" and "we could not tell" are different answers, and the
+    /// runbook's verification step ("every shard's generation must have
+    /// increased") reads the second as the first if they are collapsed.
+    generation: Option<String>,
+    /// Why the generation could not be read, when it could not be.
+    generation_error: Option<String>,
+    /// The measured RPO. **`None` means UNKNOWN, not zero** — see
+    /// `docs/cross-region-dr.md`. Serialized as an explicit JSON `null` so a
+    /// consumer cannot mistake absence for a value of `0`.
+    rpo_seconds: Option<f64>,
+    /// Whether `rpo_seconds` is an exact reading or only a **lower bound**.
+    ///
+    /// `true` when the standby has fallen behind the whole retained watermark
+    /// trail: the RPO is at least the reported value and unbounded above.
+    /// "42 seconds" and "at least an hour, we cannot see how much more" are
+    /// different failover decisions, so the table renders the second as `≥`.
+    rpo_is_lower_bound: bool,
+    lag_bytes: Option<i64>,
+    /// `None` when the replication views could not be read at all.
+    ///
+    /// Distinct from `Some(0)`, and the distinction is the point: `0` is the
+    /// definitive "this shard has no standby, its RPO is unbounded", while
+    /// `None` is "the role cannot read `pg_stat_replication` — most likely a
+    /// missing `GRANT pg_monitor`". Collapsing the second into the first
+    /// printed a categorical no-standby warning for a permissions gap, to an
+    /// operator deciding whether to fail over.
+    connected_standbys: Option<usize>,
+    inactive_slots: Option<usize>,
+    /// Why the replication views were unreadable, when they were.
+    replication_error: Option<String>,
+}
+
+impl DrShardStatus {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "shard_id": self.shard_id,
+            "dsn": self.dsn,
+            "reachable": self.reachable,
+            "unreachable_reason": self.unreachable_reason,
+            "generation": self.generation,
+            "generation_error": self.generation_error,
+            // Explicit null, never 0: see the field docs.
+            "rpo_seconds": self.rpo_seconds,
+            "rpo_is_lower_bound": self.rpo_is_lower_bound,
+            "lag_bytes": self.lag_bytes,
+            "connected_standbys": self.connected_standbys,
+            "inactive_slots": self.inactive_slots,
+            "replication_error": self.replication_error,
+        })
+    }
+}
+
+async fn dr_connect(
+    dsn: &str,
+) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
+    use autumn_harvest::diesel_async::AsyncConnection as _;
+    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
+        .await
+        .map_err(|e| {
+            CliError::InvalidInput(format!(
+                "cannot connect to {}: {e}",
+                autumn_harvest::backup_verify::redact_dsn(dsn)
+            ))
+        })
+}
+
+/// Connect for a read-only DR command, with the session pinned read-only.
+///
+/// `harvest dr status` is documented as "read-only, safe at any time" and is
+/// pointed at a **production primary** during an incident. `backup verify`
+/// backs the same promise with `SET SESSION CHARACTERISTICS AS TRANSACTION
+/// READ ONLY` rather than with care; this does too, so Postgres itself enforces
+/// it. `fence` and `promote` deliberately do not use this.
+async fn dr_connect_read_only(
+    dsn: &str,
+) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
+    use autumn_harvest::diesel_async::SimpleAsyncConnection as _;
+
+    let mut conn = dr_connect(dsn).await?;
+    conn.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .await
+        .map_err(|e| {
+            CliError::InvalidInput(format!(
+                "could not pin {} read-only: {e}",
+                autumn_harvest::backup_verify::redact_dsn(dsn)
+            ))
+        })?;
+    Ok(conn)
+}
+
+/// Run a `harvest dr` subcommand.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidInput`] for an unparseable or unreachable shard
+/// target, and propagates database errors from the fence and promote paths.
+/// `status` never fails on an unreachable shard: it reports the shard as
+/// unreachable and carries on, because during an incident a partial answer
+/// about the shards you *can* reach is the answer you need.
+pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
+    match command {
+        DrCommand::Status {
+            shards,
+            slot_prefix,
+            format,
+        } => run_dr_status(shards, slot_prefix, *format).await,
+        DrCommand::Fence {
+            shards,
+            reason,
+            actor,
+            confirm,
+            provision,
+            force,
+            format,
+        } => run_dr_fence(shards, reason, actor, *confirm, *provision, *force, *format).await,
+        DrCommand::Promote { shards, format } => run_dr_promote(shards, *format).await,
+    }
+}
+
+async fn run_dr_status(
+    shards: &[String],
+    slot_prefix: &str,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    use autumn_harvest::replication::{current_generation, query_replication_status};
+    use autumn_harvest::types::ShardId;
+
+    let targets = parse_shard_targets(shards)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let shard = ShardId::new(target.shard_id);
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        let mut conn = match dr_connect_read_only(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(DrShardStatus {
+                    shard_id: target.shard_id,
+                    dsn: redacted,
+                    reachable: false,
+                    unreachable_reason: Some(error.to_string()),
+                    generation: None,
+                    generation_error: None,
+                    rpo_seconds: None,
+                    rpo_is_lower_bound: false,
+                    lag_bytes: None,
+                    connected_standbys: None,
+                    inactive_slots: None,
+                    replication_error: None,
+                });
+                continue;
+            }
+        };
+        let (generation, generation_error) = match current_generation(&mut conn, shard).await {
+            Ok(Some(g)) => (Some(g.as_i64().to_string()), None),
+            Ok(None) => (None, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let status = query_replication_status(&mut conn, shard, slot_prefix)
+            .await
+            .ok();
+        out.push(DrShardStatus {
+            shard_id: target.shard_id,
+            dsn: redacted,
+            reachable: true,
+            unreachable_reason: None,
+            generation,
+            generation_error,
+            rpo_seconds: status
+                .as_ref()
+                .and_then(autumn_harvest::replication::ReplicationStatus::rpo_seconds),
+            rpo_is_lower_bound: status
+                .as_ref()
+                .is_some_and(autumn_harvest::replication::ReplicationStatus::rpo_is_lower_bound),
+            lag_bytes: status
+                .as_ref()
+                .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
+            // `Unavailable` is carried through as `None` rather than counted as
+            // zero standbys: "we cannot see" and "there is nothing there" are
+            // opposite answers to a failover decision.
+            connected_standbys: status.as_ref().and_then(|st| {
+                matches!(
+                    st,
+                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
+                )
+                .then(|| st.connected_standbys())
+            }),
+            inactive_slots: status.as_ref().and_then(|st| {
+                matches!(
+                    st,
+                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
+                )
+                .then(|| st.inactive_slots())
+            }),
+            // `ReplicationStatus` is `#[non_exhaustive]`, so this matches the
+            // two variants it cares about and treats anything else as
+            // observable — a future variant must opt in to being reported as an
+            // outage rather than inherit it.
+            replication_error: match status.as_ref() {
+                Some(autumn_harvest::replication::ReplicationStatus::Unavailable { reason }) => {
+                    Some(reason.clone())
+                }
+                None => Some("replication views could not be queried".to_string()),
+                Some(_) => None,
+            },
+        });
+    }
+
+    match format {
+        DrFormat::Json => {
+            let payload: Vec<serde_json::Value> = out.iter().map(DrShardStatus::to_json).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
+            );
+        }
+        DrFormat::Text => print!("{}", format_dr_status_text(&out)),
+    }
+    Ok(())
+}
+
+/// Render `harvest dr status` as a table.
+///
+/// Pure, so the "unknown is not zero" rendering is testable without a database.
+/// An unknown RPO prints `unknown`, never `0.0s`: a dead standby that reads as
+/// a perfect RPO is the most dangerous line this table could print.
+fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{:<6} {:<11} {:>10} {:>12} {:>10} {:>10}  DSN",
+        "SHARD", "GENERATION", "RPO", "LAG BYTES", "STANDBYS", "IDLE SLOTS",
+    );
+    for r in rows {
+        if !r.reachable {
+            let _ = writeln!(
+                s,
+                "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
+                r.shard_id, "UNREACHABLE", "-", "-", "-", "-", r.dsn
+            );
+            continue;
+        }
+        let generation = r.generation.clone().unwrap_or_else(|| {
+            if r.generation_error.is_some() {
+                // NOT "unfenced": an unreadable row is not an absent one, and
+                // the difference decides whether an operator re-fences.
+                "unknown".to_string()
+            } else {
+                "unfenced".to_string()
+            }
+        });
+        let rpo = r.rpo_seconds.map_or_else(
+            || "unknown".to_string(),
+            |v| {
+                if r.rpo_is_lower_bound {
+                    // The standby is behind the whole retained trail, so this
+                    // is a floor. Printing it bare would read as a measurement.
+                    format!(">={v:.0}s")
+                } else {
+                    format!("{v:.1}s")
+                }
+            },
+        );
+        let bytes = r
+            .lag_bytes
+            .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+        // `unreadable`, never `0`: `0` is the definitive "there is no standby
+        // here", and printing it for a role that simply cannot read
+        // `pg_stat_replication` tells an operator mid-failover that DR is down
+        // when the truth is that it is unobservable.
+        let standbys = r
+            .connected_standbys
+            .map_or_else(|| "unreadable".to_string(), |n| n.to_string());
+        let slots = r
+            .inactive_slots
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        let _ = writeln!(
+            s,
+            "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
+            r.shard_id, generation, rpo, bytes, standbys, slots, r.dsn
+        );
+    }
+    if rows
+        .iter()
+        .any(|r| r.reachable && r.connected_standbys == Some(0))
+    {
+        let _ = writeln!(
+            s,
+            "\nWARNING: a shard has no connected standby. Its RPO is unbounded and growing; \
+             `unknown` above means UNMEASURABLE, not zero."
+        );
+    }
+    // Deliberately a separate, differently-worded line from the warning above.
+    if rows
+        .iter()
+        .any(|r| r.reachable && r.replication_error.is_some())
+    {
+        let _ = writeln!(
+            s,
+            "\nNOTE: a shard's replication views could not be read (usually a missing \
+             `GRANT pg_monitor`), so its standby count and RPO are UNKNOWN — not zero, and not \
+             evidence that replication is down."
+        );
+    }
+    s
+}
+
+/// Phase 1 of `harvest dr fence`: validate every shard, mutate nothing.
+///
+/// A fence that dies partway leaves a HALF-FENCED cluster — the state the
+/// runbook names as the worst possible one, because live cross-shard traffic
+/// then turns bounded skew into unbounded skew — and during a regional failover
+/// an unreachable shard is the *expected* condition, not the exceptional one.
+/// So every failure that can be found without writing is found here, before
+/// anything is written.
+async fn dr_fence_preflight(
+    targets: &[autumn_harvest::backup_verify::ShardTarget],
+    provision: bool,
+    force: bool,
+) -> Result<
+    Vec<(
+        i32,
+        autumn_harvest::types::ShardId,
+        autumn_harvest::diesel_async::AsyncPgConnection,
+    )>,
+    CliError,
+> {
+    use autumn_harvest::replication::{current_generation, ensure_generation_row};
+    use autumn_harvest::types::ShardId;
+
+    // without writing is found before anything is written.
+    let mut conns = Vec::with_capacity(targets.len());
+    for target in targets {
+        let shard = ShardId::new(target.shard_id);
+        let mut conn = dr_connect(&target.dsn).await?;
+        let posture = dr_write_posture(&mut conn).await?;
+        if posture.looks_like_a_live_primary() && !force {
+            return Err(CliError::InvalidInput(format!(
+                "refusing to fence shard {}: {} is not in recovery and still has {} connected \
+                 standby(s), so it looks like a healthy PRIMARY rather than the standby you just \
+                 promoted. Fencing it stops every worker on it, recoverable only by restarting \
+                 the fleet. Pass --force if this really is the promoted primary.",
+                target.shard_id,
+                autumn_harvest::backup_verify::redact_dsn(&target.dsn),
+                posture.connected_standbys,
+            )));
+        }
+        if provision {
+            ensure_generation_row(&mut conn, shard)
+                .await
+                .map_err(|e| dr_error(target.shard_id, &e))?;
+        } else if current_generation(&mut conn, shard)
+            .await
+            .map_err(|e| dr_error(target.shard_id, &e))?
+            .is_none()
+        {
+            // Preflight the row's existence here rather than letting
+            // `bump_generation` return NotFound in phase 2. A missing row is a
+            // fully discoverable input error — almost always a wrong shard id,
+            // since an unprefixed `--shard <dsn>` takes its POSITIONAL index —
+            // and discovering it after earlier shards were already bumped
+            // produces precisely the half-fenced cluster this two-phase
+            // structure exists to prevent.
+            return Err(CliError::InvalidInput(format!(
+                "shard {} has no harvest_shard_generation row at {}, so there is nothing to \
+                 fence: no worker has ever pinned it. This is usually a wrong shard id — an \
+                 unprefixed `--shard <dsn>` takes its positional index as the shard id, so \
+                 prefix explicitly as `<id>=<dsn>`. Pass --provision to create the row and fence \
+                 it anyway. No shard has been fenced.",
+                target.shard_id,
+                autumn_harvest::backup_verify::redact_dsn(&target.dsn),
+            )));
+        }
+        conns.push((target.shard_id, shard, conn));
+    }
+
+    Ok(conns)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dr_fence(
+    shards: &[String],
+    reason: &str,
+    actor: &str,
+    confirm: bool,
+    provision: bool,
+    force: bool,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    use autumn_harvest::replication::bump_generation;
+
+    // clap marks the flag `required`, so this is belt-and-braces for a
+    // programmatic caller — but the cost of getting it wrong is a fleet.
+    if !confirm {
+        return Err(CliError::InvalidInput(
+            "refusing to fence without --i-understand-this-stops-the-fleet".to_string(),
+        ));
+    }
+
+    let targets = parse_shard_targets(shards)?;
+
+    let mut conns = dr_fence_preflight(&targets, provision, force).await?;
+
+    // ── Phase 2: bump. `bump_generation` returns NotFound for a shard with no
+    // row, which is deliberately NOT papered over with a provisioning call —
+    // see `--provision`.
+    let mut results = Vec::with_capacity(conns.len());
+    let mut failure: Option<CliError> = None;
+    for (shard_id, shard, conn) in &mut conns {
+        match bump_generation(conn, *shard, reason, actor).await {
+            Ok(generation) => results.push(serde_json::json!({
+                "shard_id": *shard_id,
+                "generation": generation.as_i64(),
+                "reason": reason,
+                "actor": actor,
+            })),
+            Err(error) => {
+                failure = Some(dr_error(*shard_id, &error));
+                break;
+            }
+        }
+    }
+
+    // Report what DID happen before returning any error. An operator who is
+    // told only "shard 3 failed" cannot know that shards 0-2 are already
+    // fenced, and that is exactly the fact they need in order to decide what to
+    // do next. On the JSON path this goes to stderr so stdout stays parseable.
+    let rendered = match format {
+        DrFormat::Json => serde_json::to_string_pretty(&results)
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?,
+        DrFormat::Text => {
+            let mut out = String::new();
+            for r in &results {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "shard {} fenced at generation {}\n",
+                        r["shard_id"], r["generation"]
+                    ),
+                );
+            }
+            out
+        }
+    };
+    if let Some(error) = failure {
+        eprintln!(
+            "PARTIAL FENCE — {} of {} shard(s) were fenced before the failure below. The cluster \
+             is now HALF-FENCED: do not start workers until every shard is fenced.\n{rendered}",
+            results.len(),
+            targets.len()
+        );
+        return Err(error);
+    }
+
+    match format {
+        DrFormat::Json => println!("{rendered}"),
+        DrFormat::Text => {
+            print!("{rendered}");
+            println!(
+                "\nEvery worker pinned to the previous generation is now unable to claim or \
+                 persist and will stop. Restart the fleet against this region; never re-pin a \
+                 fenced worker in place."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What a target database looks like from a write-authority standpoint.
+struct DrWritePosture {
+    in_recovery: bool,
+    connected_standbys: i64,
+}
+
+impl DrWritePosture {
+    /// A database that is writable *and* still serving standbys is a primary
+    /// doing its job — not the standby an operator just promoted.
+    const fn looks_like_a_live_primary(&self) -> bool {
+        !self.in_recovery && self.connected_standbys > 0
+    }
+}
+
+async fn dr_write_posture(
+    conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
+) -> Result<DrWritePosture, CliError> {
+    // `QueryableByName`'s generated code refers to `diesel` by that bare path,
+    // so the re-export has to be in scope under that name.
+    use autumn_harvest::diesel;
+    use autumn_harvest::diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        in_recovery: bool,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        standbys: i64,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT pg_is_in_recovery() AS in_recovery, \
+                (SELECT COUNT(*) FROM pg_stat_replication)::bigint AS standbys",
+    )
+    .load(conn)
+    .await
+    .map_err(|e| CliError::InvalidInput(format!("could not read write posture: {e}")))?;
+
+    // An unreadable `pg_stat_replication` (no `pg_monitor`) must not block a
+    // failover: degrade to "cannot tell", which lets the fence proceed. The
+    // guard is a typo catcher, not a security boundary.
+    Ok(rows.into_iter().next().map_or(
+        DrWritePosture {
+            in_recovery: false,
+            connected_standbys: 0,
+        },
+        |r| DrWritePosture {
+            in_recovery: r.in_recovery,
+            connected_standbys: r.standbys,
+        },
+    ))
+}
+
+/// Wrap a database error with the shard it came from.
+///
+/// During a multi-shard failover "which shard" is the single missing detail in
+/// an error an operator reads under time pressure.
+fn dr_error(shard_id: i32, error: &autumn_harvest::error::HarvestError) -> CliError {
+    CliError::InvalidInput(format!("shard {shard_id}: {error}"))
+}
+
+async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+    use autumn_harvest::replication::advance_sequences_after_promotion;
+
+    let targets = parse_shard_targets(shards)?;
+    let mut results = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let mut conn = dr_connect(&target.dsn).await?;
+        let advanced = advance_sequences_after_promotion(&mut conn)
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+        results.push(serde_json::json!({
+            "shard_id": target.shard_id,
+            "sequences_advanced": advanced
+                .iter()
+                .map(|(name, value)| serde_json::json!({ "sequence": name, "set_to": value }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    match format {
+        DrFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&results)
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?
+        ),
+        DrFormat::Text => {
+            for r in &results {
+                let seqs = r["sequences_advanced"].as_array().map_or(0, Vec::len);
+                println!("shard {}: {seqs} sequence(s) advanced", r["shard_id"]);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── harvest schema: payload-schema contract gate (issue #794) ───────────────

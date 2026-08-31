@@ -1165,6 +1165,7 @@ pub(crate) fn runtime_config(
     workflow_task_timeout: Duration,
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        dr_fencing: false,
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,
@@ -2105,6 +2106,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-deadline-echo".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2337,6 +2339,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-deadline-echo-shifted".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2503,6 +2506,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-complete".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2641,6 +2645,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-fail".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2813,6 +2818,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-activity-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3050,6 +3056,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-activity-orphaned".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3310,6 +3317,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-activity-timeout".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3483,6 +3491,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-e2e-timer-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -7855,6 +7864,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-sched-baseline".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -7988,6 +7998,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-sched-maxruns".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -8110,6 +8121,7 @@ async fn workflow_schedule_pause_and_resume() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                dr_fencing: false,
                 worker_id: "worker-sched-pause".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,

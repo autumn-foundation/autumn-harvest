@@ -287,6 +287,8 @@ pub mod replay;
 /// CLI bundle writer, and [`testing::ReplayVerifier::replay_bundle`], so the
 /// bundle wire shape cannot drift between producer and consumer.
 pub mod replay_sample;
+/// Cross-region DR fencing and replication-lag measurement (issue #954).
+pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;

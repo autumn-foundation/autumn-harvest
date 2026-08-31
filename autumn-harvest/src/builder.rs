@@ -3105,6 +3105,50 @@ pub struct WorkerConfig {
     /// A value of `0` is normalized to `None` (no aging). `None` is the
     /// default — existing deployments are unaffected.
     pub priority_aging_secs: Option<u32>,
+    /// Enable cross-region DR write-authority fencing for this worker
+    /// (issue #954).
+    ///
+    /// **Off by default, and off costs nothing**: with it off the claim query
+    /// is the byte-for-byte pre-#954 statement, the persist path issues no
+    /// extra statement, and no replication sampler is spawned.
+    ///
+    /// When on, at startup the worker provisions and *pins* each assigned
+    /// shard's `harvest_shard_generation` epoch. From then on it can only claim
+    /// tasks and append events while the database still reports that epoch. If
+    /// an operator bumps it — the failover fence — this worker stops with
+    /// [`crate::error::HarvestError::ShardFenced`] rather than writing into a
+    /// database another region now owns.
+    ///
+    /// The pin is never refreshed. A fenced worker is recovered by restarting
+    /// it, never by adopting the new epoch: adopting is precisely the
+    /// split-brain the epoch exists to prevent. See
+    /// `docs/runbooks/cross-region-failover.md`.
+    pub dr_fencing: bool,
+    /// How often the DR sampler writes a replication watermark, reads the
+    /// replication views, and re-checks this worker's fence (issue #954).
+    ///
+    /// Also the **resolution floor of the reported RPO** — a healthy
+    /// deployment reports somewhere between zero and one interval — and the
+    /// bound on how long a fenced worker keeps running before it notices. Only
+    /// used when [`Self::dr_fencing`] is set. Default: 15 seconds.
+    pub replication_sample_interval: Duration,
+    /// How much trailing watermark history the DR sampler keeps
+    /// (issue #954).
+    ///
+    /// The ceiling on the lag that can be *measured*: a standby further behind
+    /// than the oldest retained watermark reports an unknown RPO rather than a
+    /// floor value that would understate the loss. Only used when
+    /// [`Self::dr_fencing`] is set. Default: 1 hour.
+    pub replication_watermark_retain: Duration,
+    /// Slot-name prefix identifying this shard's DR replication (issue #954).
+    ///
+    /// Defaults to `harvest_dr`, matching the setup SQL in
+    /// `docs/cross-region-dr.md`. Without a prefix filter every walsender for
+    /// the shard's database counts as a DR standby — including an unrelated
+    /// logical-decoding consumer such as a CDC pipeline — and a shard whose
+    /// real cross-region subscriber had disconnected would report itself
+    /// protected. Only used when [`Self::dr_fencing`] is set.
+    pub replication_slot_prefix: String,
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -3455,6 +3499,10 @@ impl Default for WorkerConfig {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
+            dr_fencing: false,
+            replication_sample_interval: Duration::from_secs(15),
+            replication_watermark_retain: Duration::from_secs(3600),
+            replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -3606,6 +3654,93 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = timeout;
+        self
+    }
+    /// Enable cross-region DR write-authority fencing (issue #954).
+    ///
+    /// See [`WorkerConfig::dr_fencing`]. Turning this on is what makes a
+    /// failover fence bite; leaving it off is byte-for-byte the pre-#954
+    /// runtime.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_dr_fencing(true);
+    /// assert!(config.dr_fencing);
+    /// ```
+    #[must_use]
+    pub const fn with_dr_fencing(mut self, enabled: bool) -> Self {
+        self.dr_fencing = enabled;
+        self
+    }
+
+    /// Set how much trailing watermark history the DR sampler keeps
+    /// (issue #954).
+    ///
+    /// See [`WorkerConfig::replication_watermark_retain`] — this is the ceiling
+    /// on the replication lag that can be *measured*, so a deployment expecting
+    /// to ride out long standby stalls should raise it.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default()
+    ///     .with_replication_watermark_retain(Duration::from_secs(6 * 3600));
+    /// assert_eq!(
+    ///     config.replication_watermark_retain,
+    ///     Duration::from_secs(6 * 3600)
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn with_replication_watermark_retain(mut self, retain: Duration) -> Self {
+        self.replication_watermark_retain = retain;
+        self
+    }
+
+    /// Set the slot-name prefix identifying this shard's DR replication
+    /// (issue #954).
+    ///
+    /// See [`WorkerConfig::replication_slot_prefix`]. Set this when your slots
+    /// are not named `harvest_dr*`; leaving it wrong makes an unrelated
+    /// walsender read as a healthy DR standby.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_replication_slot_prefix("dr_eu");
+    /// assert_eq!(config.replication_slot_prefix, "dr_eu");
+    /// ```
+    #[must_use]
+    pub fn with_replication_slot_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.replication_slot_prefix = prefix.into();
+        self
+    }
+
+    /// Set the DR sampler cadence (issue #954).
+    ///
+    /// See [`WorkerConfig::replication_sample_interval`] — this is both the
+    /// RPO's resolution floor and the bound on fence-detection latency.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config =
+    ///     WorkerConfig::default().with_replication_sample_interval(Duration::from_secs(5));
+    /// assert_eq!(config.replication_sample_interval, Duration::from_secs(5));
+    /// ```
+    #[must_use]
+    pub const fn with_replication_sample_interval(mut self, interval: Duration) -> Self {
+        self.replication_sample_interval = interval;
         self
     }
 
