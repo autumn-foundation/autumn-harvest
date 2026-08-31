@@ -1571,28 +1571,37 @@ pub struct MaintenanceOutcome {
 pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
     let width = opts.cohort_width_secs.max(1);
     let lock_ms = opts.lock_timeout.as_millis().max(1);
-    let cutover = cohort_start(now, width)
-        .checked_add_signed(chrono::Duration::seconds(width))
-        .unwrap_or(now);
-    let cutover_lit = ts_literal(cutover);
+    // Matches `enable_sql`'s `harvest_event_cohort(now())` exactly: the legacy
+    // partition ends where the current cohort begins, so the two ranges meet
+    // with no gap and no overlap.
+    let cutover_lit = ts_literal(cohort_start(now, width));
     let cohort_fn = cohort_function_sql(width);
     format!(
-        r"-- ────────────────────────────────────────────────────────────────
+        r#"-- ────────────────────────────────────────────────────────────────
 -- harvest_events -> partitioned layout (issue #958), LARGE LIVE TABLE
+--
+-- `harvest partition enable` runs the same algorithm in ONE transaction,
+-- which is right for a fresh or small table and wrong for a
+-- ten-million-row one: the index builds and the constraint validation
+-- would hold ACCESS EXCLUSIVE for their whole duration, blocking every
+-- append. This plan moves both out of the lock window.
 --
 -- Run one numbered step at a time. Steps 1-3 are online: they hold no
 -- lock that blocks appends, and may take a long time on a large table.
 -- Only step 4 takes ACCESS EXCLUSIVE, and everything it does is
 -- metadata-only, so it is a seconds-long window rather than a scan.
 --
--- Recheck the cutover before running step 4. It must be strictly greater
--- than the cohort of EVERY execution that exists at that moment, so an
--- execution created before the swap keeps appending into the legacy
--- partition instead of tearing its history across two partitions:
---
---     SELECT harvest_event_cohort(max(created_at))
---            + interval '{width} seconds'
---       FROM harvest_workflow_executions;
+-- Recheck the cutover before running step 4. The literal below was
+-- computed when this plan was printed. A STALE (older) cutover is safe --
+-- every pre-conversion row carries the migration's `-infinity` sentinel,
+-- so all of them still fall inside the legacy range -- but it leaves the
+-- cohorts between the stale cutover and now with no partition, so their
+-- rows land in the DEFAULT partition until maintenance drains them. To
+-- avoid that entirely, regenerate the plan (or substitute the value of
+-- `SELECT harvest_event_cohort(now());`) immediately before step 3.
+-- A cutover in the FUTURE is not safe: rows appended after the swap would
+-- fall inside the legacy range and be attached to a partition that is
+-- meant to be sealed.
 --
 -- Rollback: until step 4 commits, nothing is committed but two extra
 -- indexes and one CHECK constraint, all droppable with no downtime.
@@ -1635,13 +1644,28 @@ ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION};
 --     FROM pg_indexes WHERE tablename = '{LEGACY_PARTITION}';
 
 -- The FK's ON DELETE CASCADE is the row-by-row delete storm being
--- eliminated. Its insert-time protection lives on in the cohort trigger.
+-- eliminated. Its insert-time half lives on in the trigger below.
 ALTER TABLE {LEGACY_PARTITION}
     DROP CONSTRAINT IF EXISTS harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX};
+-- ATTACH propagates the parent's PRIMARY KEY onto the partition and a table
+-- may have only one, so the old single-column key must go. `id` alone can no
+-- longer be a key anyway: uniqueness on a partitioned table has to include
+-- the partition column. The indexes built CONCURRENTLY in step 2 are what
+-- the parent's constraints bind to.
+ALTER TABLE {LEGACY_PARTITION}
+    DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX};
+ALTER TABLE {LEGACY_PARTITION}
+    DROP CONSTRAINT IF EXISTS harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX};
 
 CREATE TABLE harvest_events
     (LIKE {LEGACY_PARTITION} INCLUDING DEFAULTS INCLUDING COMMENTS INCLUDING STORAGE)
     PARTITION BY RANGE (cohort);
+-- Swap the migration's constant `-infinity` sentinel for the live cohort
+-- expression. Metadata-only, and it is what actually routes every subsequent
+-- append -- WITHOUT IT every new row would keep the sentinel and land in the
+-- legacy partition forever, which looks fine until nothing is ever droppable.
+ALTER TABLE harvest_events
+    ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now());
 ALTER TABLE harvest_events
     ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id, cohort);
 ALTER TABLE harvest_events
@@ -1656,8 +1680,10 @@ ALTER TABLE harvest_events
 --                       WHERE con.conindid = i.indexrelid);
 ALTER SEQUENCE harvest_events_id_seq OWNED BY harvest_events.id;
 
+-- Validate-only: a BEFORE ROW trigger on a partitioned table must not touch
+-- the partition key, because routing has already happened when it fires.
 CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events
-    FOR EACH ROW EXECUTE FUNCTION harvest_events_stamp_cohort();
+    FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution();
 
 CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT;
 ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION}
@@ -1666,10 +1692,11 @@ ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION}
 COMMIT;
 
 -- Step 5 (online). Let the engine take over: it pre-creates the lookahead
--- window and sweeps droppable cohorts every retention tick. Nothing further
--- is required of the operator, and no cron job needs to exist.
+-- window, drains the DEFAULT partition and sweeps droppable cohorts on every
+-- retention tick. Nothing further is required of the operator, and no cron
+-- job needs to exist.
 --   harvest partition status --shard <dsn>
-"
+"#
     )
 }
 
@@ -1856,6 +1883,93 @@ mod tests {
             "a cutover computed when the plan was generated can be stale by the \
              time step 4 runs; a pre-conversion execution created after that \
              point would tear its history across two partitions"
+        );
+    }
+
+    /// The operator-run plan and the executed script must perform the same
+    /// conversion.
+    ///
+    /// They are necessarily two texts — one is a transaction the engine runs,
+    /// the other is a numbered runbook a human follows — so they cannot share
+    /// an implementation. This pins the load-bearing statements to both. It is
+    /// not a hypothetical: the plan really did drift once, and every one of
+    /// these assertions is a bug it shipped with.
+    ///
+    /// - A stale trigger function name (`harvest_events_stamp_cohort`, which no
+    ///   longer exists): the plan would have failed outright at step 4.
+    /// - A missing `ALTER COLUMN cohort SET DEFAULT`: silent, and far worse —
+    ///   every new row would keep the `-infinity` sentinel and land in the
+    ///   legacy partition forever, so nothing would ever become droppable and
+    ///   the operator would conclude partitioning does not work.
+    /// - Missing legacy PK/unique drops: `ATTACH PARTITION` fails with
+    ///   "multiple primary keys ... are not allowed" *after* the operator has
+    ///   already spent an hour on the CONCURRENTLY index builds.
+    #[test]
+    fn the_operator_plan_performs_the_same_conversion_as_the_executed_script() {
+        let opts = EnableOptions::default();
+        let plan = migration_plan(&opts, Utc::now());
+        let script = enable_sql(&opts);
+
+        for needle in [
+            // The trigger must name the function that actually exists.
+            "harvest_events_require_execution()",
+            // Without this the cohort DEFAULT never becomes the live
+            // expression and every append lands in the legacy partition.
+            "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(now())",
+            // ATTACH propagates the parent PK; the child may not keep its own.
+            "harvest_events_pkey__pre958",
+            "harvest_events_workflow_exec_id_event_id_key__pre958",
+            // The FK whose cascade is the delete storm being eliminated.
+            "harvest_events_workflow_exec_id_fkey__pre958",
+            // The partitioned shape itself.
+            "PARTITION BY RANGE (cohort)",
+            "PRIMARY KEY (id, cohort)",
+            "UNIQUE (workflow_exec_id, event_id, cohort)",
+            // The catch-all that keeps an append from ever failing.
+            DEFAULT_PARTITION,
+        ] {
+            assert!(
+                script.contains(needle),
+                "the executed script must contain `{needle}`"
+            );
+            assert!(
+                plan.contains(needle),
+                "the operator plan has drifted from the executed script: it is \
+                 missing `{needle}`. An operator following it would get a \
+                 different (or broken) layout from the one `harvest partition \
+                 enable` produces."
+            );
+        }
+
+        assert!(
+            !plan.contains("harvest_events_stamp_cohort"),
+            "the plan must not reference the cohort-STAMPING trigger: Postgres \
+             rejects a BEFORE ROW trigger that changes a partitioned row's \
+             destination, and that function no longer exists"
+        );
+        assert!(
+            !script.contains("harvest_events_stamp_cohort"),
+            "nor may the executed script"
+        );
+    }
+
+    /// The plan's cutover and the script's must be the same instant.
+    ///
+    /// The script computes `harvest_event_cohort(now())` inside the database;
+    /// the plan bakes a literal in when it is printed. If the two used
+    /// different rules, an operator following the plan would attach the legacy
+    /// partition at a boundary the engine does not agree with — leaving either
+    /// a gap (rows with no partition) or an overlap (`ATTACH` fails).
+    #[test]
+    fn the_plans_cutover_is_the_current_cohort_boundary() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 31, 17, 42, 9).unwrap();
+        let plan = migration_plan(&EnableOptions::default(), now);
+        let expected = cohort_start(now, DEFAULT_COHORT_WIDTH_SECS);
+        assert!(
+            plan.contains(&expected.to_rfc3339()),
+            "the plan must attach legacy at the CURRENT cohort boundary \
+             ({expected}), the same value `harvest_event_cohort(now())` \
+             produces inside the script"
         );
     }
 

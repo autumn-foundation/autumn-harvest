@@ -110,6 +110,7 @@ mod mixed_suspension_tests;
 mod mutex_tests;
 mod nd_block_tests;
 mod panic_containment_tests;
+mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
@@ -142,8 +143,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
-mod retention_reclaim_support;
 mod retention_overrides_tests;
+mod retention_reclaim_support;
 mod retention_summary_tests;
 mod retry_after_tests;
 mod retry_chain_routing_tests;
