@@ -1421,6 +1421,75 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
     );
 }
 
+// The other half of the epoch bump: a retirement that commits between
+// `ensure_cursor_row` and the claim's locked read must stop the scanner taking
+// a NEW claim, not merely invalidate the old one. Retention may purge the
+// shard's records the moment it is retired.
+#[tokio::test]
+async fn a_retired_cursor_cannot_be_claimed() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+
+    // Claimable while live.
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("a live cursor is claimable");
+    apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 3,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("ack");
+
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+    insert_audit_rows(&mut conn, 2).await;
+
+    // Two new records exist and the lease is clear, so only the retired check
+    // stands between the scanner and another delivery.
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim query succeeds");
+    assert!(
+        claim.is_none(),
+        "a retired cursor must not be claimable: delivering after retirement \
+         moves a row reported as a frozen RETIRED snapshot, for records \
+         retention is already free to purge"
+    );
+
+    // And nothing was stamped by the refused claim.
+    let unsequenced: i64 = harvest_audit_log::table
+        .filter(harvest_audit_log::export_seq.is_null())
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(unsequenced, 2, "a refused claim must assign no sequences");
+}
+
 // ── Redrive edge cases ──────────────────────────────────────────────────────
 
 #[tokio::test]

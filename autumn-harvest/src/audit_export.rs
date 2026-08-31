@@ -997,6 +997,20 @@ pub async fn claim_shard(
                 return Ok(None);
             };
 
+            // A retired cursor is inert (issue #953, Codex review round 14 P2).
+            // `export_once_on_conn` calls `ensure_cursor_row` first, which
+            // un-retires, so in the ordinary flow a running exporter never sees
+            // this. The window is a `decommission_cursor` that commits between
+            // that call and this locked read: without the check the scanner
+            // takes a NEW claim and delivers a batch after the retirement.
+            // Bumping the epoch on retirement only invalidates claims taken
+            // *before* it, so this is the other half of that fix -- and it
+            // matters because retention is permitted to purge the shard's
+            // records the moment it is retired.
+            if cursor.retired_at.is_some() {
+                return Ok(None);
+            }
+
             // Backing off after a sink failure, or another exporter (or this
             // one, on a previous tick whose HTTP call has not returned) holds
             // a live lease. Either way this shard is not ours right now.
