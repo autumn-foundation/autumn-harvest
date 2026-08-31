@@ -3371,6 +3371,24 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    // Cross-shard child workflows (issue #956). Runs on this shard's own
+    // `harvest_cross_shard_children` rows: creates opt-in cross-shard children on
+    // their target shard, delivers their terminals back to the parent parked
+    // here, relays parent-side cancels, and applies the `ParentClosePolicy`
+    // cascade across the shard boundary. A no-op — one indexed, empty-relation
+    // scan — in every deployment that never opts in.
+    //
+    // Placed after the #492 outbox scanners deliberately: those deliver signals
+    // and cancels that a workflow is parked on, and a parent woken by this
+    // scanner will re-enter its decision cycle on the next claim either way, so
+    // ordering costs nothing but keeps the cheap always-empty scan last among
+    // the delivery family.
+    count += crate::cross_shard_child::enforce_cross_shard_children(
+        conn,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
     count +=
         crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
             .await?;

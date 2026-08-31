@@ -3627,6 +3627,23 @@ struct WorkflowChildrenCursor {
 struct WorkflowChildrenResponse {
     items: Vec<WorkflowChildResponse>,
     next_cursor: Option<String>,
+    /// Cross-shard completeness of this page (issue #756 contract, extended to
+    /// this endpoint by issue #956).
+    ///
+    /// `GET /workflows/{id}/children` has always fanned out across every shard —
+    /// a child could live anywhere even before cross-shard *placement* existed,
+    /// because the traversal follows `parent_id` across the whole fleet — but it
+    /// propagated a pool error with `?`, so one unreachable shard turned the
+    /// whole call into a `500`. Cross-shard children make that failure mode
+    /// routine rather than exotic, so the endpoint now degrades: it returns the
+    /// children it could see and names the shards it could not, exactly like
+    /// `GET /workflows/{id}/tree` and the other #756 endpoints.
+    ///
+    /// Additive: always present, `complete` on the happy path.
+    status: FanoutStatus,
+    /// Shards that could not be queried, named with a reason. Empty when
+    /// `status` is `complete`.
+    unavailable_shards: Vec<UnavailableShard>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6766,7 +6783,12 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}/children",
-            Some(&["items", "next_cursor"]),
+            // `status` + `unavailable_shards` added additively (issue #756's
+            // contract, extended here by #956): the traversal already spans
+            // every shard, and cross-shard child placement makes an unreachable
+            // shard routine — so it degrades to `200 partial` naming the shard
+            // rather than a `500`.
+            Some(&["items", "next_cursor", "status", "unavailable_shards"]),
         ),
         (
             "GET",
@@ -10964,7 +10986,8 @@ async fn list_workflow_children(
             .map_err(map_error)?;
     }
 
-    let mut rows = load_workflow_children_page_from_shards(&api_state, exec_id, &filters).await?;
+    let fanout = load_workflow_children_page_from_shards(&api_state, exec_id, &filters).await?;
+    let mut rows = fanout.rows;
     sort_workflow_child_rows(&mut rows);
 
     let next_cursor = if rows.len() > filters.limit {
@@ -10978,42 +11001,135 @@ async fn list_workflow_children(
     Ok(Json(WorkflowChildrenResponse {
         items: rows.into_iter().map(WorkflowChildResponse::from).collect(),
         next_cursor,
+        status: fanout.status,
+        unavailable_shards: fanout.unavailable_shards,
     }))
+}
+
+/// Query one shard for `parent_id`'s direct children, folding any failure into
+/// the observation rather than propagating it (issue #956).
+///
+/// An unreachable shard contributes zero rows and a named reason, which
+/// `collect_fanout_rows` turns into a `partial` status — never a `500`.
+async fn workflow_children_on_shard(
+    shard_id: i32,
+    shard_pool: Option<autumn_harvest::worker::DbPool>,
+    parent_id: ExecutionId,
+    query_filters: store::WorkflowChildFilters,
+) -> crate::shard_fanout::ShardObservation<store::WorkflowChildRow> {
+    let Some(shard_pool) = shard_pool else {
+        return crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some("no connection pool configured for this shard".to_string()),
+        };
+    };
+    let mut conn = match shard_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return crate::shard_fanout::ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    match store::load_workflow_children(&mut conn, parent_id, &query_filters, 0).await {
+        Ok(rows) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+/// Query one shard for the children of a whole traversal frontier.
+async fn workflow_children_multi_on_shard(
+    shard_id: i32,
+    shard_pool: Option<autumn_harvest::worker::DbPool>,
+    parent_uuids: Vec<uuid::Uuid>,
+    query_filters: store::WorkflowChildFilters,
+    depth: u8,
+) -> crate::shard_fanout::ShardObservation<store::WorkflowChildRow> {
+    let Some(shard_pool) = shard_pool else {
+        return crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some("no connection pool configured for this shard".to_string()),
+        };
+    };
+    let mut conn = match shard_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return crate::shard_fanout::ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    match store::load_workflow_children_multi(&mut conn, &parent_uuids, &query_filters, depth).await
+    {
+        Ok(rows) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 async fn load_workflow_children_page_from_shards(
     api_state: &HarvestApiState,
     parent_id: ExecutionId,
     filters: &WorkflowChildrenFilters,
-) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
+) -> Result<crate::shard_fanout::FanoutRows<store::WorkflowChildRow>, AutumnError> {
     if filters.max_depth > 0 {
         return load_workflow_children_tree_from_shards(api_state, parent_id, filters).await;
     }
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut rows = Vec::new();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let query_filters = workflow_children_store_filters(filters);
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut shard_rows = store::load_workflow_children(&mut conn, parent_id, &query_filters, 0)
-            .await
-            .map_err(map_error)?;
-        rows.append(&mut shard_rows);
-    }
+    let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+        workflow_children_on_shard(
+            *shard_id,
+            pools.get(shard_id).cloned(),
+            parent_id,
+            query_filters.clone(),
+        )
+    }))
+    .await;
 
-    Ok(rows)
+    Ok(crate::shard_fanout::collect_fanout_rows(observations))
 }
 
 async fn load_workflow_children_tree_from_shards(
     api_state: &HarvestApiState,
     parent_id: ExecutionId,
     filters: &WorkflowChildrenFilters,
-) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
+) -> Result<crate::shard_fanout::FanoutRows<store::WorkflowChildRow>, AutumnError> {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let mut rows = Vec::new();
     let mut frontier = vec![parent_id];
     let mut seen = HashSet::new();
+    // A shard is degraded for the WHOLE traversal the moment any depth level
+    // fails against it: a missed level's children are missed descendants, so
+    // reporting `complete` afterwards would understate the gap.
+    let mut shard_errors: std::collections::BTreeMap<i32, String> =
+        std::collections::BTreeMap::new();
+    let mut observed: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
     // Result filters cannot constrain traversal: a nonmatching child can have
     // matching descendants, and either row may live on any shard.
     let traversal_filters = store::WorkflowChildFilters::default();
@@ -11034,17 +11150,24 @@ async fn load_workflow_children_tree_from_shards(
         // `seen`, and result filters only ever inspect the row itself.
         let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
-        for (_shard, shard_pool) in pool.iter_shards() {
-            let mut conn = acquire_conn(shard_pool).await?;
-            let shard_rows = store::load_workflow_children_multi(
-                &mut conn,
-                &parent_uuids,
-                &traversal_filters,
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            workflow_children_multi_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                parent_uuids.clone(),
+                traversal_filters.clone(),
                 depth,
             )
-            .await
-            .map_err(map_error)?;
-            for row in shard_rows {
+        }))
+        .await;
+
+        for observation in observations {
+            if let Some(reason) = observation.error {
+                shard_errors.insert(observation.shard_id, reason);
+                continue;
+            }
+            observed.insert(observation.shard_id);
+            for row in observation.rows {
                 if !seen.insert(row.exec_id.as_uuid()) {
                     continue;
                 }
@@ -11061,7 +11184,26 @@ async fn load_workflow_children_tree_from_shards(
         frontier = next_frontier;
     }
 
-    Ok(rows)
+    let mut unavailable_shards: Vec<crate::shard_fanout::UnavailableShard> = shard_errors
+        .into_iter()
+        .map(|(shard_id, reason)| crate::shard_fanout::UnavailableShard { shard_id, reason })
+        .collect();
+    unavailable_shards.sort_by_key(|s| s.shard_id);
+    // A shard that answered at one depth and failed at another counts as
+    // degraded, so subtract the failures from the observed set before deciding
+    // completeness.
+    let inspected = observed
+        .iter()
+        .filter(|shard| !unavailable_shards.iter().any(|u| u.shard_id == **shard))
+        .count();
+    let status =
+        crate::shard_fanout::FanoutStatus::from_counts(inspected, unavailable_shards.len());
+
+    Ok(crate::shard_fanout::FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    })
 }
 
 // ── Recursive cross-shard lineage tree (issue #621) ───────────────────────────

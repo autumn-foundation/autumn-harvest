@@ -54,9 +54,9 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 47 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 48 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
-| `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
+| `row-lock` blocking row lock (Diesel `.for_update()`) | 16 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 11 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 31 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 22 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
@@ -65,12 +65,12 @@ module counts at the audited revision, recomputed by CI:
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **90 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **91 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**47 of the 102 core modules** exhibit at least one mechanism — a shade under
+**48 of the 103 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -169,6 +169,7 @@ Classification rule:
 | `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
+| `cross_shard_child` | diesel, row-lock | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel plus one `FOR UPDATE` on the parent row before the terminal append, subsumed by the single write lock); the coupling is architectural, not syntactic. |
 | `debounce` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim; `sqlite_master` probe for the table check. |
 | `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
@@ -206,7 +207,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 7 · (b) 20 · (c) 20.**
+**Totals: (a) 7 · (b) 20 · (c) 21.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:

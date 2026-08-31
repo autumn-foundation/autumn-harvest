@@ -172,13 +172,16 @@ fn distributed_placement_on_a_single_shard_router_stays_on_the_parent_shard() {
 
 // ── Success metric: ±10% of the rendezvous-uniform distribution ──────────────
 
+const FAN_OUT_N: usize = 10_000;
+
 #[test]
+#[allow(clippy::cast_precision_loss)] // counts are bounded by FAN_OUT_N
 fn a_ten_thousand_child_fan_out_spreads_within_ten_percent_of_uniform() {
     let router = four_shard_router();
     let parent = ExecutionId::new_for_shard(ShardId::new(0));
     let mut counts = [0usize; 4];
-    const N: usize = 10_000;
-    for seq in 0..N {
+    let n = FAN_OUT_N;
+    for seq in 0..n {
         let key = autumn_harvest::shard::child_placement_key(parent, u32::try_from(seq).unwrap());
         let shard = resolve_child_placement(
             Some(&router),
@@ -191,12 +194,12 @@ fn a_ten_thousand_child_fan_out_spreads_within_ten_percent_of_uniform() {
         counts[usize::try_from(shard.as_i32()).unwrap()] += 1;
     }
 
-    let expected = N as f64 / 4.0;
-    for (shard, &n) in counts.iter().enumerate() {
-        let deviation = (n as f64 - expected).abs() / expected;
+    let expected = n as f64 / 4.0;
+    for (shard, &count) in counts.iter().enumerate() {
+        let deviation = (count as f64 - expected).abs() / expected;
         assert!(
             deviation <= 0.10,
-            "shard {shard} got {n} of {N} children ({:.2}% off uniform); \
+            "shard {shard} got {count} of {n} children ({:.2}% off uniform); \
              the success metric allows ±10%",
             deviation * 100.0
         );
@@ -297,8 +300,9 @@ fn opting_in_without_an_installed_router_is_a_typed_error_not_a_silent_fallback(
         ChildPlacement::Shard(ShardId::new(1)),
         ChildPlacement::ResidencyKey("eu".to_string()),
     ] {
-        let err = resolve_child_placement(None, &placement, ShardId::new(0), "child_wf", "parent#0")
-            .expect_err("no router installed must fail, not fall back");
+        let err =
+            resolve_child_placement(None, &placement, ShardId::new(0), "child_wf", "parent#0")
+                .expect_err("no router installed must fail, not fall back");
         assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
     }
 }
@@ -324,7 +328,7 @@ fn shard_unavailable_is_a_distinct_retryable_error() {
 
 // ── The relay state machine ──────────────────────────────────────────────────
 
-fn awaited(status: CrossShardChildStatus) -> CrossShardChildObservation<'static> {
+const fn awaited(status: CrossShardChildStatus) -> CrossShardChildObservation<'static> {
     CrossShardChildObservation {
         status,
         cancel_requested: false,
@@ -334,7 +338,7 @@ fn awaited(status: CrossShardChildStatus) -> CrossShardChildObservation<'static>
     }
 }
 
-fn detached(
+const fn detached(
     status: CrossShardChildStatus,
     policy: ParentClosePolicy,
 ) -> CrossShardChildObservation<'static> {
@@ -385,7 +389,13 @@ fn a_requested_cancel_is_delivered_before_anything_else() {
 
 #[test]
 fn every_terminal_child_state_delivers_the_terminal_to_an_awaited_parent() {
-    for state in ["COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED", "TERMINATED"] {
+    for state in [
+        "COMPLETED",
+        "FAILED",
+        "TIMED_OUT",
+        "CANCELLED",
+        "TERMINATED",
+    ] {
         let mut obs = awaited(CrossShardChildStatus::Started);
         obs.child_state = Some(state);
         assert_eq!(
@@ -415,7 +425,10 @@ fn a_detached_child_never_delivers_a_terminal_to_its_parent() {
 
 #[test]
 fn a_closed_parent_cascades_to_its_running_cross_shard_detached_children() {
-    for policy in [ParentClosePolicy::RequestCancel, ParentClosePolicy::Terminate] {
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
         let mut obs = detached(CrossShardChildStatus::Started, policy);
         obs.parent_terminal = true;
         obs.child_state = Some("RUNNING");

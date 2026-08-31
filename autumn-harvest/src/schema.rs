@@ -677,6 +677,40 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// One in-flight **cross-shard child workflow**, recorded on the PARENT's
+    /// shard in the same transaction as the parent's `ChildWorkflowStarted` /
+    /// `ChildWorkflowSpawnedDetached` event (issue #956).
+    ///
+    /// Not a message queue: this is the child's lifecycle record on the
+    /// parent's side. Start, cancel, terminal delivery and close-cascade are
+    /// transitions of this one row.
+    harvest_cross_shard_children (child_exec_id) {
+        /// The child's `ExecutionId` — also the PK on the target shard, which
+        /// is what makes a repeated relay a no-op.
+        child_exec_id -> Uuid,
+        /// The parent, always on this shard.
+        parent_exec_id -> Uuid,
+        /// Denormalised from `child_exec_id`'s encoded shard.
+        target_shard -> Integer,
+        /// `PENDING_START` | `STARTED`.
+        status -> Text,
+        /// A parent-side cancel not yet delivered to the target shard.
+        cancel_requested -> Bool,
+        /// NULL = awaited child; otherwise the detached child's `ParentClosePolicy`.
+        parent_close_policy -> Nullable<Text>,
+        workflow_name -> Text,
+        /// Fully-resolved child creation spec (see `CrossShardChildSpec`).
+        child_spec -> Jsonb,
+        created_at -> Timestamptz,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        last_attempt_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Admission gates that halt new workflow starts for a scoped subset of work (issue #377).
     harvest_admission_gates (id) {
         id -> Uuid,
@@ -1008,6 +1042,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
+    harvest_cross_shard_children,
     harvest_debounce,
     harvest_start_throttle,
     harvest_start_idempotency,

@@ -8915,6 +8915,41 @@ async fn persist_all_started_child_workflows(
             .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
             .collect();
 
+        // Issue #956: a child whose `ExecutionId` encodes a shard other than the
+        // parent's was placed there deliberately (an opt-in `ChildPlacement`).
+        // Its rows cannot be created here — the parent's decision transaction is
+        // shard-local by design — so it is recorded as a cross-shard child and
+        // created on its target shard by the relay. `existing_ids` above only
+        // covers this shard, so a re-park's already-recorded remote child is
+        // deduped by `record_cross_shard_child`'s own `ON CONFLICT DO NOTHING`
+        // on the child id instead.
+        //
+        // The split is by ENCODED SHARD, not by the placement enum: an explicit
+        // `ChildPlacement::Shard` that happens to name the parent's own shard is
+        // genuinely same-shard and must take the untouched local path.
+        let (remote_new_children, local_new_children): (
+            Vec<&StartedChildWorkflowCommand>,
+            Vec<&StartedChildWorkflowCommand>,
+        ) = new_children
+            .iter()
+            .copied()
+            .partition(|c| c.child_id.shard().as_i32() != shard_id);
+
+        // AC8: refuse a placement this node cannot honour rather than silently
+        // landing the child on the parent's shard. Checked BEFORE anything is
+        // inserted, and inside the transaction so the failure rolls the whole
+        // decision cycle back with nothing recorded — the outer match below then
+        // parks and re-wakes the parent, making it retryable rather than fatal.
+        if !remote_new_children.is_empty() {
+            let pool = placement_sharded_pool();
+            for child in &remote_new_children {
+                crate::cross_shard_child::preflight_target_shard(
+                    pool.as_ref(),
+                    child.child_id.shard(),
+                )?;
+            }
+        }
+
         // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans only
         // for genuinely new children (after the existing_ids filter).
         // `parent: &execute_span` makes each span a child of this executor
@@ -9028,7 +9063,11 @@ async fn persist_all_started_child_workflows(
         // lock is taken here that the loop would not otherwise have taken.
         let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
-        for child in &new_children {
+        // Local children only (issue #956): a cross-shard child's quota is
+        // enforced on ITS shard by the relay, under that shard's own advisory
+        // lock, so taking the lock here would serialise unrelated parents on a
+        // key this transaction never admits against.
+        for child in &local_new_children {
             let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
             if let Some(policy) = defaults.quota
                 && policy.has_any_cap()
@@ -9045,7 +9084,30 @@ async fn persist_all_started_child_workflows(
         // Provenance ref for every child in this fan-out is the parent
         // execution id (issue #740); compute it once outside the loop.
         let parent_exec_id_str = parent_exec_id.to_string();
-        for child in &new_children {
+
+        // Cross-shard children (issue #956): one durable row each, written in
+        // THIS transaction so the row and the parent's `ChildWorkflowStarted`
+        // commit together. No committed row means no child was ever promised, so
+        // an orphan on the target shard is impossible.
+        for child in &remote_new_children {
+            let spec = cross_shard_child_spec(
+                registry,
+                parent_execution,
+                &child.workflow_name,
+                &child.input,
+            )?;
+            crate::cross_shard_child::record_cross_shard_child(
+                conn,
+                parent_exec_id,
+                child.child_id,
+                &child.workflow_name,
+                None, // awaited child
+                &spec,
+            )
+            .await?;
+        }
+
+        for child in &local_new_children {
             let child_workflow_id = child.child_id.to_string();
             let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
@@ -9271,6 +9333,27 @@ async fn persist_all_started_child_workflows(
             queue::wake_workflow_task(conn, parent_exec_id).await?;
             return Ok(());
         }
+        // A cross-shard child's target shard is unreachable from this node
+        // (issue #956 AC8). Like the quota arm above this is an ADMISSION
+        // condition, not a workflow failure: the transaction rolled back with
+        // nothing committed (no child rows, no outbox rows, no parent event
+        // appends), so park and immediately re-wake the parent to re-drive the
+        // identical decision cycle once the shard is reachable — never fall back
+        // to the parent's shard, which would break the placement contract
+        // silently, and never terminally fail the parent over a transient
+        // topology gap.
+        Err(e @ HarvestError::ShardUnavailable { .. }) => {
+            tracing::warn!(
+                parent_execution_id = %parent_exec_id,
+                error = %e,
+                "cross-shard child placement target is unreachable; parking the \
+                 parent task to retry rather than placing the child on the \
+                 parent's shard",
+            );
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
+            return Ok(());
+        }
         Err(e) => return Err(e),
     };
 
@@ -9308,6 +9391,77 @@ struct ChildWorkflowDefaults {
     /// visible to the target type's own quota accounting exactly like any
     /// other registry-aware start path.
     quota: Option<crate::quota::QuotaPolicy>,
+}
+
+/// Build the fully-resolved creation spec for a **cross-shard** child
+/// (issue #956).
+///
+/// Every default is resolved here, on the spawning worker, through the same
+/// [`resolve_child_workflow_defaults`] call the same-shard path makes and at the
+/// same moment — so a cross-shard child cannot silently pick up different
+/// defaults than the same-shard twin it would otherwise have been. The relay
+/// never re-derives anything; it only replays this spec onto the target shard.
+///
+/// # Errors
+///
+/// [`HarvestError::PayloadTooLarge`] when the child's resolved quota key
+/// exceeds the key cap — the identical bound-check the same-shard child paths
+/// apply before inserting the row.
+fn cross_shard_child_spec(
+    registry: &HandlerRegistry,
+    parent_execution: &WorkflowExecution,
+    workflow_name: &str,
+    input: &serde_json::Value,
+) -> HarvestResult<crate::cross_shard_child::CrossShardChildSpec> {
+    let defaults = resolve_child_workflow_defaults(registry, workflow_name);
+    let quota_key: Option<String> = defaults
+        .quota
+        .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
+    if let Some(key) = quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        return Err(HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: workflow_name.to_string(),
+            activity_name: None,
+        });
+    }
+    let (concurrency_key, max_concurrent) =
+        resolve_workflow_concurrency(registry, workflow_name, input);
+    Ok(crate::cross_shard_child::CrossShardChildSpec {
+        input: input.clone(),
+        queue_name: parent_execution.queue_name.clone(),
+        assigned_build_id: parent_execution.assigned_build_id.clone(),
+        context_headers: parent_execution.context_headers.clone(),
+        owner: defaults.owner.map(str::to_string),
+        runbook_url: defaults.runbook_url.map(str::to_string),
+        severity: defaults.severity.map(str::to_string),
+        sla_secs: defaults.sla.map(|d| d.num_seconds()),
+        sla_deadline_at: defaults.sla_deadline_at,
+        execution_timeout_secs: defaults.execution_timeout.map(|d| d.num_seconds()),
+        deadline_at: defaults.deadline_at,
+        chain_execution_timeout_secs: defaults.chain_execution_timeout.map(|d| d.num_seconds()),
+        chain_deadline_at: defaults.chain_deadline_at,
+        retry_policy: defaults.retry_policy.clone(),
+        quota_key,
+        quota: defaults
+            .quota
+            .as_ref()
+            .map(crate::cross_shard_child::QuotaCaps::from_policy),
+        concurrency_key,
+        max_concurrent,
+    })
+}
+
+/// The sharded pool this process can reach, for cross-shard placement
+/// preflight (issue #956).
+fn placement_sharded_pool() -> Option<crate::shard::ShardedDbPool> {
+    crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
 }
 
 fn resolve_child_workflow_defaults(
@@ -9372,6 +9526,10 @@ fn resolve_child_workflow_defaults(
 /// The parent's own `ChildWorkflowStarted` event is appended by the caller (in
 /// command-emission order with the sibling `TimerStarted`); this helper only
 /// touches the child row, the child's history, and the child's task.
+// Long by construction (and longer since #956 added the cross-shard early
+// return): the body is dominated by a wide, fully-explicit `NewWorkflowExecution`
+// literal, matching its `persist_all_started_child_workflows` twin.
+#[allow(clippy::too_many_lines)]
 async fn insert_awaited_child_execution(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -9382,6 +9540,35 @@ async fn insert_awaited_child_execution(
 ) -> HarvestResult<()> {
     let shard_id = parent_execution.shard_id;
     let queue_name = parent_execution.queue_name.clone();
+
+    // Issue #956: a child placed on another shard cannot be inserted on this
+    // connection — the parent's decision transaction is shard-local. Record it
+    // instead, in this same transaction, and let the cross-shard relay create it
+    // over there. This single early return covers BOTH callers
+    // (`persist_child_timeout_race` and `persist_mixed_suspension_batch`), so
+    // placement can never be honoured by one child-spawn shape and silently
+    // dropped by another.
+    if child.child_id.shard().as_i32() != shard_id {
+        crate::cross_shard_child::preflight_target_shard(
+            placement_sharded_pool().as_ref(),
+            child.child_id.shard(),
+        )?;
+        let spec = cross_shard_child_spec(
+            registry,
+            parent_execution,
+            &child.workflow_name,
+            &child.input,
+        )?;
+        return crate::cross_shard_child::record_cross_shard_child(
+            conn,
+            parent_exec_id,
+            child.child_id,
+            &child.workflow_name,
+            None, // awaited child
+            &spec,
+        )
+        .await;
+    }
 
     let child_workflow_id = child.child_id.to_string();
     // Provenance ref for the child is the parent execution id (issue #740).
@@ -10113,6 +10300,13 @@ async fn persist_mixed_suspension_batch(
             std::collections::BTreeSet::new();
         for child in &batch.children {
             if existing_child_ids.contains(&child.child_id.as_uuid()) {
+                continue;
+            }
+            // A cross-shard child (issue #956) is admitted against its OWN
+            // shard's advisory lock by the relay, so locking its key here would
+            // serialise unrelated parents on a key this transaction never
+            // admits against.
+            if child.child_id.shard().as_i32() != shard_id {
                 continue;
             }
             let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
@@ -11132,6 +11326,28 @@ async fn create_detached_child_executions(
         else {
             continue;
         };
+
+        // Issue #956: a detached child placed on another shard is recorded here,
+        // in the parent's own transaction, and created over there by the relay.
+        // The row also carries the `ParentClosePolicy`, which is what lets the
+        // relay cascade the parent's close across the shard boundary.
+        if child_id.shard().as_i32() != parent_execution.shard_id {
+            crate::cross_shard_child::preflight_target_shard(
+                placement_sharded_pool().as_ref(),
+                child_id.shard(),
+            )?;
+            let spec = cross_shard_child_spec(registry, parent_execution, workflow_name, input)?;
+            crate::cross_shard_child::record_cross_shard_child(
+                conn,
+                execution_id_from_uuid(parent_execution.id),
+                *child_id,
+                workflow_name,
+                Some(*parent_close_policy),
+                &spec,
+            )
+            .await?;
+            continue;
+        }
 
         // Idempotent: skip if already created (crash-restart replay).
         let already_exists: bool = harvest_workflow_executions::table
@@ -13006,6 +13222,17 @@ pub async fn apply_race_loser_cancellations(
         }
 
         for child_id in children {
+            // A cross-shard losing child (issue #956) lives on another database,
+            // so it cannot be cancelled inside this transaction. Flag its outbox
+            // row instead: the flag commits with this very decision cycle, and
+            // the relay delivers the (idempotent) cancel on its next sweep. This
+            // is checked FIRST because `cancel_workflow_execution_collect` would
+            // otherwise report `NotFound` for a child that is perfectly alive on
+            // its own shard, and that arm is treated as a benign no-op — the
+            // losing child would run forever.
+            if crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0 {
+                continue;
+            }
             match crate::execution::cancel_workflow_execution_collect(
                 conn,
                 *child_id,

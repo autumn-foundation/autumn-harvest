@@ -1731,9 +1731,9 @@ pub fn next_cross_shard_child_action(
 
     let child_terminal = obs.child_state.is_some_and(is_terminal_execution_state);
 
-    match obs.parent_close_policy {
+    obs.parent_close_policy.map_or_else(
         // Awaited: the parent is parked on this child's terminal.
-        None => {
+        || {
             if child_terminal {
                 CrossShardChildAction::DeliverTerminal
             } else if obs.parent_terminal {
@@ -1744,10 +1744,10 @@ pub fn next_cross_shard_child_action(
             } else {
                 CrossShardChildAction::Wait
             }
-        }
+        },
         // Detached: the parent never consumes a terminal; the only thing left
         // owed is the parent-close cascade.
-        Some(policy) => {
+        |policy| {
             if child_terminal {
                 CrossShardChildAction::Retire
             } else if obs.parent_terminal {
@@ -1759,8 +1759,8 @@ pub fn next_cross_shard_child_action(
             } else {
                 CrossShardChildAction::Wait
             }
-        }
-    }
+        },
+    )
 }
 
 /// Is `state` one of the engine's terminal execution states?

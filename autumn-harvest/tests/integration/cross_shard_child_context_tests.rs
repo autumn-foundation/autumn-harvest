@@ -15,13 +15,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow_with_context};
 use autumn_harvest::shard::ChildPlacement;
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
-use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::{ShardRouter, WorkflowInfo};
 use serde_json::{Value, json};
 
@@ -206,8 +206,8 @@ fn distributed_without_router<'a>(
 async fn the_default_fan_out_keeps_every_child_on_the_parent_shard() {
     let parent_shard = ShardId::new(1);
     let exec_id = ExecutionId::new_for_shard(parent_shard);
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
 
     let WorkflowOutcome::Suspended { commands } =
         run_workflow_with_context(ctx, default_fan_out, Value::Null).await
@@ -230,8 +230,8 @@ async fn the_default_fan_out_keeps_every_child_on_the_parent_shard() {
 #[tokio::test]
 async fn distributed_fan_out_spreads_children_across_every_writable_shard() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
 
     let WorkflowOutcome::Suspended { commands } =
         run_workflow_with_context(ctx, distributed_fan_out, Value::Null).await
@@ -351,8 +351,8 @@ fn child_workflow_started_json_gains_no_placement_field() {
 #[tokio::test]
 async fn a_detached_child_can_be_pinned_to_another_shard() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
 
     let WorkflowOutcome::Suspended { commands } =
         run_workflow_with_context(ctx, pinned_detached_child, Value::Null).await
@@ -369,8 +369,8 @@ async fn a_detached_child_can_be_pinned_to_another_shard() {
 #[tokio::test]
 async fn the_child_deadline_race_honours_distributed_placement() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
 
     let WorkflowOutcome::Suspended { commands } =
         run_workflow_with_context(ctx, distributed_child_timeout, Value::Null).await
@@ -462,8 +462,8 @@ async fn the_typed_fan_out_helper_accepts_a_placement() {
     }
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
     let WorkflowOutcome::Suspended { commands } =
         run_workflow_with_context(ctx, handler, Value::Null).await
     else {
@@ -492,11 +492,14 @@ async fn a_rejected_pin_fails_the_spawn() {
     }
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let ctx =
-        WorkflowContext::for_replay(exec_id, vec![started()]).with_shard_router(four_shard_router());
+    let ctx = WorkflowContext::for_replay(exec_id, vec![started()])
+        .with_shard_router(four_shard_router());
     match run_workflow_with_context(ctx, handler, Value::Null).await {
         WorkflowOutcome::Failed { error, .. } => {
-            assert!(error.contains("99"), "must name the rejected shard: {error}");
+            assert!(
+                error.contains("99"),
+                "must name the rejected shard: {error}"
+            );
         }
         other => panic!("expected a typed failure, got {other:?}"),
     }

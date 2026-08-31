@@ -188,6 +188,13 @@ pub mod completion_trigger;
 pub mod concurrency;
 pub mod context;
 pub mod critical_path;
+/// Cross-shard child workflow placement (issue #956).
+///
+/// The relay that creates opt-in cross-shard children on their target shard,
+/// delivers their terminals back to the awaiting parent, and applies the
+/// parent-close cascade — all with shard-local ACID preserved.
+#[cfg(feature = "db")]
+pub mod cross_shard_child;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;

@@ -7199,10 +7199,10 @@ impl WorkflowContext {
         // only source — which is exactly what the pure executor tests use.
         #[cfg(feature = "db")]
         {
-            return crate::shard::GLOBAL_SHARD_ROUTER
+            crate::shard::GLOBAL_SHARD_ROUTER
                 .read()
                 .ok()
-                .and_then(|guard| guard.as_ref().cloned());
+                .and_then(|guard| guard.as_ref().cloned())
         }
         #[cfg(not(feature = "db"))]
         None
