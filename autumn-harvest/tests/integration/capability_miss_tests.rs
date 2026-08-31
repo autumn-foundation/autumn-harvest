@@ -270,6 +270,7 @@ fn build_worker_tuned(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: queues.iter().map(|q| (*q).to_string()).collect(),
@@ -2911,6 +2912,7 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         1, // next_event_id: irrelevant on ClaimLost, and re-derived under the guard
         "dispatcher-a",
         error,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -3028,6 +3030,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 1,
                 "dispatcher-a",
                 "workflow suspended without emitted commands; resumption is not implemented yet",
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
             .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
@@ -3180,6 +3183,7 @@ async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transacti
                 1,
                 "dispatcher-a",
                 error,
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await?;
 
@@ -3290,6 +3294,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
                 1,
                 "dispatcher-a",
                 "workflow suspended without emitted commands; resumption is not implemented yet",
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
             .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
@@ -5015,6 +5020,7 @@ async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5104,6 +5110,7 @@ async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             },
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
         )
         .await
         .expect("the guarded write must not error")
@@ -5197,6 +5204,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escala
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5255,6 +5263,7 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5343,6 +5352,7 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
         // its own test below.
         None,
         |_| {},
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the terminal write must not collide with the consumed event id");
@@ -5447,6 +5457,7 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5523,6 +5534,7 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5613,6 +5625,7 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");

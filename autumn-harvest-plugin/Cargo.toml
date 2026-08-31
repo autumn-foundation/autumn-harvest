@@ -104,6 +104,17 @@ tracing-subscriber = "0.3"
 # bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
 tempfile = "3"
 
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `dag_graph::build_run_graph` -- the pure projection behind
+# `GET /dag-run-graph` (issue #690) that reconstructs a unified DAG run's
+# node topology from the registered DagDefinition and recorded event
+# history. No feature requirement: `dag_graph`/`dag_retry` are unconditional
+# modules. See `benches/dag_graph_profile.rs` and
+# `docs/performance-dag-graph.md`.
+[[bench]]
+name = "dag_graph_profile"
+harness = false
+
 [lints]
 workspace = true
 

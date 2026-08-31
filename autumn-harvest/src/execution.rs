@@ -2325,7 +2325,8 @@ async fn inline_cancel(
     deferred_checks: &mut Vec<(ExecutionId, String)>,
 ) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = "terminated to start new execution";
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     store::append_events(
         conn,
         exec_id,
@@ -2548,7 +2549,8 @@ pub async fn cancel_workflow_execution_collect(
             .await
             .map_err(database_error)?;
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3249,7 +3251,8 @@ pub async fn pause_workflow_execution(
                 }
             }
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3569,7 +3572,8 @@ pub async fn resume_workflow_execution(
                 new_sla_deadline_at,
             } = resume_deadline_shifts(&execution, resumed_at);
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3900,7 +3904,8 @@ pub async fn reactivate_failed_execution(
     let new_deadline_at = execution.execution_timeout.map(|d| now + d);
     let new_sla_deadline_at = execution.sla.map(|d| now + d);
 
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     store::append_events(
         conn,
         exec_id,
@@ -4298,7 +4303,8 @@ pub async fn terminate_workflow_execution_collect(
                 ));
             }
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -7657,7 +7663,8 @@ pub async fn check_and_report_unfinished_handlers(
     workflow_name: &str,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     let matcher = crate::replay::HistoryMatcher::new(history.events);
     let count = matcher.unfinished_update_handler_count_at_end();
     if count > 0 {

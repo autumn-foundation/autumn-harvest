@@ -1431,6 +1431,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         &mut conn,
         exec_id,
         stale_next_event_id,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect_err("stale-id ingest must conflict on the committed event_id");
@@ -1448,6 +1449,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         Duration::from_secs(5),
         exec_id,
         stale_next_event_id,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("a transient conflict is NOT a genuine error");
@@ -1528,6 +1530,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         Duration::from_secs(5),
         exec_id,
         fresh.next_event_id,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("clean re-drive")

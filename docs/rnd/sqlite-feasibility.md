@@ -54,23 +54,23 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 48 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 49 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 16 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 12 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 32 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 22 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 13 modules | Yes — integer epoch milliseconds. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 33 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 23 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 12 modules | Subsumed by the single write lock. |
-| `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
+| `to_regclass` table-existence probes | 7 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **91 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **92 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**48 of the 103 core modules** exhibit at least one mechanism — a shade under
+**49 of the 104 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -165,6 +165,7 @@ Classification rule:
 | `batch` | diesel, raw-pg-sql, raw-sql | (b) | JSONB `\|\|` concatenation and `search_attrs @> $jsonb` containment. SQLite JSON1 has neither — rewrite with `json_patch`/`json_extract`. |
 | `build_routing` | diesel, interval-sql, raw-sql | (b) | Integer epoch ms for the interval arithmetic. |
 | `calendar` | diesel | (a) | Plain CRUD. |
+| `codec_rotation` | diesel, interval-sql, raw-pg-sql, raw-sql, to_regclass | (b) | Lazy re-encryption sweep (issue #948). Every Postgres-ism is a rewrite, not a capability: `::jsonb`/`::TEXT` casts, a `JOIN LATERAL` over the payload-field allowlist, a `~` regex validating the stored key id, and a `to_regclass` probe for the cursor table. The `~` check is the only awkward one — validate the key id in Rust, as the decoder already does. No claim, no lock: the sweep is a batched scan whose writes are compare-and-swaps. |
 | `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
 | `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
@@ -207,7 +208,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 7 · (b) 20 · (c) 21.**
+**Totals: (a) 7 · (b) 21 · (c) 21.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
