@@ -94,6 +94,24 @@ async fn make_conn() -> (
     (conn, container)
 }
 
+/// A pool for the same database that can hand out exactly **one** connection.
+///
+/// The shape that matters for the scoped scanner: with the scanner already
+/// holding the only connection, any second checkout is unsatisfiable.
+async fn single_connection_pool(
+    container: &testcontainers::ContainerAsync<Postgres>,
+) -> autumn_harvest::worker::DbPool {
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("single-connection pool")
+}
+
 /// One captured delivery: what the sink was handed.
 #[derive(Debug, Clone)]
 struct CapturedBatch {
@@ -1400,6 +1418,43 @@ async fn an_idle_tick_never_calls_the_sink_but_still_emits_lag() {
         vec![(0_u16, 0.0)],
         "the gauge is emitted with 0 rather than going stale"
     );
+}
+
+// The scoped per-shard scanner exports through the connection it was handed.
+// A one-connection shard pool is the case that matters: the scanner is already
+// holding that pool's only connection, so any second checkout fails and the
+// shard would never export at all.
+#[tokio::test]
+async fn a_scoped_shard_exports_through_the_held_connection() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = Arc::new(RecordingSink::new(200));
+    let _installed = install(sink.clone(), 100);
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+
+    // A pool that can hand out exactly one connection -- and `conn` above is
+    // standing in for that one being already checked out by the scanner.
+    let single = single_connection_pool(&container).await;
+    let sharded = autumn_harvest::shard::ShardedDbPool::single(single);
+
+    let exported = fire_due_audit_exports(
+        &mut conn,
+        &Some(sharded),
+        &[autumn_harvest::types::ShardId::new(0)],
+        &NoOpMetrics,
+    )
+    .await
+    .expect("tick");
+    uninstall();
+
+    assert_eq!(
+        exported, 4,
+        "the scoped shard must export through the connection already held; a \
+         second checkout on a one-connection pool can never succeed, so \
+         acquiring one would mean this shard is never exported"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 4);
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3, 4]);
 }
 
 // ── Retention must not depend on the local process's sink registration ─────

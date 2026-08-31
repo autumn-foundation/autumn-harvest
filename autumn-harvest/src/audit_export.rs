@@ -569,8 +569,20 @@ impl AuditExportBuilderConfig {
     /// may authenticate however it likes (IAM, mTLS, a local file), so an
     /// absent HMAC key there is a legitimate configuration and only warns.
     #[must_use]
-    pub const fn webhook_is_missing_a_secret(&self) -> bool {
-        self.sink.is_none() && self.webhook_url.is_some() && self.secret.is_none()
+    pub fn webhook_is_missing_a_secret(&self) -> bool {
+        if self.sink.is_some() || self.webhook_url.is_none() {
+            return false;
+        }
+        // An *explicitly empty* secret is missing, not configured (issue #953,
+        // Codex review round 3 P1). `audit_export_secret(env::var("...")
+        // .unwrap_or_default())` with the variable unset yields
+        // `Some(CallbackSecret(b""))`, which an `is_none()` check waves through
+        // — and produces exactly the publicly-reproducible signature this
+        // check exists to reject. Failing closed has to mean the bytes, not
+        // the `Option`.
+        self.secret
+            .as_ref()
+            .is_none_or(|secret| secret.as_bytes().is_empty())
     }
 
     /// Validate the webhook URL against the SSRF policy.
@@ -1756,6 +1768,22 @@ async fn emit_lag(
 /// A no-op (returns `Ok(0)` **before any query**) when no audit sink has been
 /// configured (AC8).
 ///
+/// # Caller contract
+///
+/// When `shard_assignments` names **exactly one** shard, `conn` must be a
+/// connection to *that* shard's database. Every scanner caller satisfies this:
+/// `spawn_timeout_checker_for_shard` checks `conn` out of the shard's own pool
+/// and passes `monitor_shard_scope(shard, ..) == [shard]`. This function then
+/// exports that shard **through `conn` itself** rather than checking out a
+/// second connection (issue #953, Codex review round 3 P1).
+///
+/// That is not an optimisation, it is what makes export work at all on a
+/// one-connection pool: the scanner is already holding that pool's only
+/// connection, so asking for a second one can never succeed. An earlier
+/// revision bounded the wait to avoid deadlocking the scanner, which fixed the
+/// wedge but left the shard silently never exported — a bounded wait that
+/// times out on every tick is still "never".
+///
 /// # Errors
 /// Returns `HarvestError` if a database query fails. A sink's transport
 /// failure is never an `Err` here — it is captured as a [`SinkAttempt`] and
@@ -1774,7 +1802,23 @@ pub async fn fire_due_audit_exports(
     let mut total = 0usize;
 
     match sharded_pool {
+        // The scoped per-shard scanner: `conn` already belongs to this shard
+        // (see the caller contract above), so use it directly. No second
+        // checkout means no self-deadlock and no bounded-wait skip.
+        Some(_) if shard_assignments.len() == 1 => {
+            let shard = shard_assignments[0];
+            match export_once_on_conn(conn, &config, shard.as_i32(), metrics).await {
+                Ok(n) => total += n,
+                Err(e) => tracing::error!(
+                    shard = shard.as_i32(),
+                    error = %e,
+                    "[audit_export] shard export failed"
+                ),
+            }
+        }
         Some(sp) if !shard_assignments.is_empty() => {
+            // The process-wide loop across several shards. Here `conn`'s shard
+            // is not knowable, so each shard is exported through its own pool.
             for shard in shard_assignments {
                 let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
                     continue;
@@ -2326,6 +2370,32 @@ mod tests {
         fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
             Box::pin(async { SinkAttempt::success(200) })
         }
+    }
+
+    #[test]
+    fn an_explicitly_empty_webhook_secret_is_missing() {
+        // The realistic path: `audit_export_secret(std::env::var("SIEM_HMAC")
+        // .unwrap_or_default())` with the variable unset. An `is_none()` check
+        // waves this through and the build ships a signature anyone can
+        // recompute -- the exact outcome the check exists to prevent.
+        let mut config = AuditExportBuilderConfig {
+            webhook_url: Some("https://siem.example.com/ingest".to_string()),
+            secret: Some(CallbackSecret::new(Vec::new())),
+            ..AuditExportBuilderConfig::default()
+        };
+        assert!(
+            config.webhook_is_missing_a_secret(),
+            "an empty secret must fail closed exactly like an absent one"
+        );
+
+        config.secret = Some(CallbackSecret::new(b"real".to_vec()));
+        assert!(!config.webhook_is_missing_a_secret());
+
+        // Still scoped to the webhook path: an embedder sink may authenticate
+        // however it likes, so an empty secret there is only a warning.
+        config.secret = Some(CallbackSecret::new(Vec::new()));
+        config.sink = Some(std::sync::Arc::new(NoopSink));
+        assert!(!config.webhook_is_missing_a_secret());
     }
 
     #[test]
