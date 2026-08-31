@@ -1402,6 +1402,182 @@ async fn an_idle_tick_never_calls_the_sink_but_still_emits_lag() {
     );
 }
 
+// ── The issue's success metric, at CI-affordable scale ─────────────────────
+//
+// The issue asks for receiver-side `(shard, seq)` accounting over >= 100k
+// records with a forced restart mid-stream and a 10-minute sink outage,
+// proving 0 lost records and 0 gaps. That volume and those wall-clock
+// durations are not a CI test; this encodes the same *shape* at 5,000 records,
+// with the restart and the outage injected deterministically rather than
+// waited out. What it proves is exactly what the metric asks: every sequence
+// arrives at least once, the set is contiguous with no hole, and the cursor
+// never moved past a record the sink had not acknowledged.
+//
+// Run the full-scale version against a real sink before claiming the metric;
+// this is the regression guard that keeps the mechanism honest between runs.
+#[tokio::test]
+async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
+    const RECORDS: i64 = 5_000;
+    const BATCH: i64 = 500;
+
+    let _guard = TEST_SERIAL.lock().await;
+    // A short lease so the injected "crash" is reclaimable on the next tick
+    // without waiting out a real 60s lease.
+    let sink = install_with_lease(
+        Arc::new(RecordingSink::new(200)),
+        BATCH,
+        std::time::Duration::from_secs(0),
+    );
+    let (mut conn, _c) = make_conn().await;
+
+    // Bulk-insert; every column but the defaults is uniform, so the shape of
+    // the record is irrelevant to what this test measures.
+    diesel::sql_query(
+        "INSERT INTO harvest_audit_log \
+             (actor, operation, target_type, target_id, route_or_command, status, source) \
+         SELECT 'alice', 'workflow.cancel', 'workflow', 'exec-' || g, \
+                'POST /workflows/{id}/cancel', 'SUCCEEDED', 'api' \
+         FROM generate_series(1, $1) AS g",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(RECORDS)
+    .execute(&mut conn)
+    .await
+    .expect("bulk insert");
+
+    // ── Phase 1: export a few batches normally ──────────────────────────────
+    for _ in 0..3 {
+        fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+            .await
+            .expect("tick");
+    }
+    let after_normal = cursor_acked(&mut conn, 0).await;
+    assert!(after_normal > 0, "some progress before the failures");
+
+    // ── Phase 2: a process death between the POST and the cursor write ──────
+    // Claim and deliver by hand, then never acknowledge.
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        BATCH,
+        std::time::Duration::from_secs(0),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+    let body = serialize_batch(&claim.records).expect("serialize");
+    let headers = autumn_harvest::audit_export::export_headers(
+        &CallbackSecret::new(b"test-secret".to_vec()),
+        &body,
+        0,
+        claim.records[0].seq,
+        claim.records[claim.records.len() - 1].seq,
+        chrono::Utc::now(),
+    );
+    let crashed_batch = AuditBatch {
+        shard: 0,
+        first_seq: claim.records[0].seq,
+        last_seq: claim.records[claim.records.len() - 1].seq,
+        records: &claim.records,
+        body: &body,
+        headers: &headers,
+    };
+    assert!(
+        sink.deliver(&crashed_batch).await.is_success(),
+        "the sink DID accept the pre-crash batch"
+    );
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        after_normal,
+        "the cursor must not have moved for a batch that was never acknowledged"
+    );
+
+    // ── Phase 3: a sink outage ──────────────────────────────────────────────
+    // Ten minutes of 503s, compressed: three failing ticks with the backoff
+    // deadline cleared between them, which is what a long outage looks like to
+    // the cursor.
+    sink.set_status(503);
+    for _ in 0..3 {
+        fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+            .await
+            .expect("tick during outage");
+        clear_backoff(&mut conn).await;
+    }
+    let after_outage = cursor_acked(&mut conn, 0).await;
+    assert_eq!(
+        after_outage, after_normal,
+        "an outage must not advance the cursor by a single sequence"
+    );
+
+    // ── Phase 4: the sink returns; drain to completion ──────────────────────
+    sink.set_status(200);
+    let mut ticks = 0;
+    loop {
+        clear_backoff(&mut conn).await;
+        let n = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+            .await
+            .expect("recovery tick");
+        ticks += 1;
+        if cursor_acked(&mut conn, 0).await >= RECORDS {
+            break;
+        }
+        assert!(
+            ticks < 200,
+            "the exporter must drain the backlog; stalled after {ticks} ticks \
+             with {n} delivered on the last one"
+        );
+    }
+    uninstall();
+
+    // ── Receiver-side accounting ────────────────────────────────────────────
+    let delivered = sink.all_seqs();
+    let seen: std::collections::BTreeSet<i64> = delivered.iter().copied().collect();
+
+    // 0 lost records: every sequence arrived at least once.
+    assert_eq!(
+        i64::try_from(seen.len()).expect("count fits"),
+        RECORDS,
+        "every record must reach the sink at least once"
+    );
+    // 0 gaps: the set is contiguous from 1, so a receiver checking contiguity
+    // sees no hole (which is stronger than mere gap detection).
+    assert_eq!(*seen.iter().next().expect("first"), 1);
+    assert_eq!(*seen.iter().next_back().expect("last"), RECORDS);
+    let mut expected = 1_i64;
+    for seq in &seen {
+        assert_eq!(*seq, expected, "sequence {expected} is missing");
+        expected += 1;
+    }
+    // The duplicates are the at-least-once contract, not a defect: the
+    // pre-crash batch and the outage's re-attempts are re-sent, and the
+    // receiver dedupes on `(shard, seq)`.
+    assert!(
+        delivered.len() > seen.len(),
+        "this scenario must actually exercise redelivery, or it is not testing \
+         at-least-once at all"
+    );
+    // The cursor never skipped: every sequence at or below it was delivered.
+    assert_eq!(cursor_acked(&mut conn, 0).await, RECORDS);
+    // And nothing is left pending.
+    let (pending, _) =
+        autumn_harvest::audit_export::pending_and_lag(&mut conn, RECORDS, chrono::Utc::now())
+            .await
+            .expect("pending");
+    assert_eq!(pending, 0);
+}
+
+/// Clear a shard's backoff deadline. Stands in for waiting out the capped
+/// exponential delay, which is wall-clock time a test must not spend.
+async fn clear_backoff(conn: &mut diesel_async::AsyncPgConnection) {
+    use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+    diesel::update(cur::harvest_audit_export_cursor.find(0))
+        .set(cur::next_attempt_at.eq(chrono::Utc::now()))
+        .execute(conn)
+        .await
+        .expect("clear backoff");
+}
+
 /// Compile-time proof that an embedder can supply a sink with no HTTP client
 /// anywhere in sight (AC1: the trait lives in core with no `reqwest`
 /// dependency).
