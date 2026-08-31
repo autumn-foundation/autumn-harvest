@@ -1607,4 +1607,85 @@ mod tests {
             );
         }
     }
+
+    /// The write-side twin of
+    /// [`no_engine_path_reads_history_through_the_identity_loader`].
+    ///
+    /// `store::append_events` encodes with the identity registry, so a
+    /// payload-bearing event written through it lands in `harvest_events` as
+    /// **cleartext** — and stays that way. Unlike an identity *read*, which
+    /// fails loudly with `UnknownCodecKey`, an identity write succeeds
+    /// silently, and the sweep never repairs it: converting plaintext to
+    /// ciphertext is not something the sweep does, by design (it re-encodes
+    /// rows that already carry a non-active key id, and plaintext carries
+    /// none). So the leak is permanent and invisible.
+    ///
+    /// That asymmetry is exactly why this guard exists separately: the read
+    /// guard catches its class the first time a keyed deployment runs, and this
+    /// one has to catch its class before that, because nothing downstream will.
+    ///
+    /// The allowlist is not aspirational — every entry is a real remaining gap
+    /// tracked in issue #1243, with the count pinned so the number can only go
+    /// down. `store.rs` is excluded: it *defines* both helpers, and its own
+    /// delegation between them is the thing every other file must not do.
+    #[test]
+    fn no_engine_path_appends_history_through_the_identity_encoder() {
+        const SAFE_APPENDS: &[&str] = &[
+            "append_events_with_codecs(",
+            "append_events_offloaded_with_codecs(",
+            "fn append_events(",
+            "fn append_events_offloaded(",
+        ];
+
+        fn identity_appends(src: &str) -> usize {
+            let mut text = src.to_string();
+            for safe in SAFE_APPENDS {
+                text = text.replace(safe, "SAFE_APPEND_CALL");
+            }
+            text.matches("append_events(").count()
+                + text.matches("append_events_offloaded(").count()
+        }
+
+        // Issue #1243's remaining write-path scope. `execution.rs` holds the
+        // start paths (`WorkflowStarted.input`); `reset.rs` the fork marker and
+        // the source-execution terminal.
+        const KNOWN_IDENTITY_APPENDS: &[(&str, usize)] = &[("execution.rs", 8), ("reset.rs", 2)];
+
+        let engine_sources: &[(&str, &str)] = &[
+            ("worker.rs", include_str!("worker.rs")),
+            ("timeout.rs", include_str!("timeout.rs")),
+            ("execution.rs", include_str!("execution.rs")),
+            ("sessions.rs", include_str!("sessions.rs")),
+            ("poison_pill.rs", include_str!("poison_pill.rs")),
+            ("context.rs", include_str!("context.rs")),
+            ("reset.rs", include_str!("reset.rs")),
+            ("retention.rs", include_str!("retention.rs")),
+            ("testing.rs", include_str!("testing.rs")),
+            ("external_task.rs", include_str!("external_task.rs")),
+            (
+                "completion_trigger.rs",
+                include_str!("completion_trigger.rs"),
+            ),
+            ("batch.rs", include_str!("batch.rs")),
+        ];
+
+        for (name, src) in engine_sources {
+            let found = identity_appends(src);
+            let allowed = KNOWN_IDENTITY_APPENDS
+                .iter()
+                .find(|(file, _)| file == name)
+                .map_or(0, |(_, n)| *n);
+            assert_eq!(
+                found, allowed,
+                "{name}: found {found} call(s) to the identity `append_events`, \
+                 expected {allowed}. Use `append_events_with_codecs` and pass the \
+                 configured registry. Pass it even when the event carries no \
+                 payload-bearing field: the codec only touches \
+                 PAYLOAD_FIELD_KEYS, so it is a no-op for the rest, and a \
+                 uniform rule removes a per-site judgement that is easy to get \
+                 wrong. An identity append writes cleartext that the sweep will \
+                 never encrypt."
+            );
+        }
+    }
 }

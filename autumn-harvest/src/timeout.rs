@@ -1196,7 +1196,14 @@ async fn enforce_activity_timeout(
             activity_id,
             timeout_type: reason.timeout_type(),
         };
-        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[timeout_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await?;
         Ok(true)
@@ -1547,7 +1554,14 @@ pub async fn force_fail_activity(
                 non_retryable: parsed.non_retryable,
                 details: parsed.details,
             };
-            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[failed_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
             queue::fail_task(conn, task.id, &envelope).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
 
@@ -1647,7 +1661,14 @@ async fn enforce_workflow_timeout(
         let error = timeout_error(&execution.workflow_name, reason);
         let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
-        store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[workflow_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         update_workflow_execution_timed_out(conn, exec_id, &error).await?;
         queue::fail_task(conn, task.id, &error).await?;
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
@@ -2470,11 +2491,12 @@ pub async fn enforce_external_signals_outbox(
                     };
 
                     let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
-                    store::append_events(
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -2906,11 +2928,12 @@ pub async fn enforce_external_cancels_outbox(
                     };
 
                     let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
-                    store::append_events(
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -3270,11 +3293,12 @@ pub async fn enforce_external_awaits_outbox(
                     if already_resolved {
                         return Ok(Some((false, Some(row.id))));
                     }
-                    store::append_events(
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
