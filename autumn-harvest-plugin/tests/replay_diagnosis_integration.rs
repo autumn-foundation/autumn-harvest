@@ -13,7 +13,9 @@
 //!   (2)  A history that diverges from the registered handler (a recorded
 //!        activity name the handler no longer schedules) → 200 `diverged` with
 //!        `{kind, event_index, expected, actual}`.
-//!   (3)  A `FAILED` run diagnosed retroactively (AC4) → 200.
+//!   (3)  A `FAILED` run diagnosed retroactively (AC4) → 200 `clean` carrying the
+//!        reproduced failure (issue #952: reproducing a recorded terminal failure
+//!        is not a divergence).
 //!   (4)  Unknown execution id → 404.
 //!   (5)  Malformed execution id → 400.
 //!   (6)  A workflow type not registered on this node → 200 `not_registered`.
@@ -667,8 +669,15 @@ async fn failed_run_is_diagnosable_retroactively() {
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["diagnosis"], json!("workflow_failed"));
-    assert!(body["failure"]["error"].as_str().is_some());
+    // Issue #952: a history sealed by a terminal `WorkflowFailed` that replays to
+    // the same failure has NOT diverged — the verdict is `clean`, and the
+    // reproduced error is surfaced in `failure` so this endpoint stays the
+    // post-mortem surface it was built to be (#614 AC4).
+    assert_eq!(body["diagnosis"], json!("clean"));
+    assert!(
+        body["failure"]["error"].as_str().is_some(),
+        "a clean verdict that reproduced the recorded failure must still carry it: {body}"
+    );
 }
 
 #[tokio::test]

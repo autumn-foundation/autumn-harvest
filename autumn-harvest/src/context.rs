@@ -1966,11 +1966,8 @@ impl WorkflowLogger<'_> {
         // never triggers the `pump_signal_handlers` post-hook (mirroring
         // `publish_progress` and `info()`; `is_replaying()` locks the same way,
         // so this is behaviourally identical to the pre-#790 guard).
-        {
-            let matcher = self.ctx.matcher.lock().expect("matcher lock poisoned");
-            if matcher.is_replaying() {
-                return;
-            }
+        if self.ctx.replay_suppresses_side_effects() {
+            return;
         }
 
         // Sink 1: tracing (unchanged from issue #379).
@@ -3039,7 +3036,32 @@ impl WorkflowContext {
     /// strict replay the matcher is never locked, so no `pump_signal_handlers`
     /// side effect is introduced on the non-strict path.
     fn strict_replay_no_match_is_divergence(&self) -> bool {
-        self.strict_replay && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
+        self.strict_replay
+            && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
+            // Issue #952 — the FAILING-FRONTIER exception. A history sealed by a
+            // terminal `WorkflowFailed` is truncated by construction: the
+            // commands the failing cycle issued were never turned into events,
+            // and no further event can ever be appended to the sealed run. So
+            // once every pre-terminal event is consumed there is nothing left to
+            // compare a new command against, and the `NoMatch` the transparent
+            // tail produces is "the run is failing", not drift. Divergence
+            // BEFORE that point is still fully reported — every recorded event
+            // is matched positionally exactly as before.
+            && !self.at_terminal_failure_frontier()
+    }
+
+    /// Whether the matcher sits at the **failing frontier** of a history sealed
+    /// by a terminal `WorkflowFailed` (issue #952) — see
+    /// [`crate::replay::HistoryMatcher::at_terminal_failure_frontier`].
+    ///
+    /// Locks the matcher directly rather than going through `match_history`, so
+    /// this read triggers no `pump_signal_handlers` post-hook — it is a
+    /// question ABOUT the cursor, never a step of it.
+    pub(crate) fn at_terminal_failure_frontier(&self) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .at_terminal_failure_frontier()
     }
 
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
@@ -4066,12 +4088,12 @@ impl WorkflowContext {
         // [`history_event_count`](Self::history_event_count) accessor stays the
         // total, because [`should_continue_as_new`](Self::should_continue_as_new)
         // needs the whole-history size for its checkpoint decision.)
-        let (history_event_count, is_replaying) = {
+        // Issue #952: `is_replaying` here must agree with `ctx.is_replaying()`
+        // at the same position, so it carries the sealed-run clause too.
+        let is_replaying = self.replay_suppresses_side_effects();
+        let history_event_count = {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
-            (
-                u64::try_from(matcher.position()).unwrap_or(u64::MAX),
-                matcher.is_replaying(),
-            )
+            u64::try_from(matcher.position()).unwrap_or(u64::MAX)
         };
         WorkflowExecutionInfo {
             execution_id: self.execution_id(),
@@ -4486,7 +4508,39 @@ impl WorkflowContext {
     /// Panics if the internal matcher mutex is poisoned.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
-        self.matcher
+        self.replay_suppresses_side_effects()
+    }
+
+    /// The single "this cycle must not re-fire side effects" predicate — the
+    /// cursor-based replay check, PLUS (issue #952) a run already sealed by a
+    /// terminal `WorkflowFailed`.
+    ///
+    /// A sealed run is finished history, so re-executing it (a post-mortem query
+    /// replay (#612), the `WorkflowReplayer`) is always a replay — even though
+    /// the transparent terminal-failure tail leaves the cursor-based check
+    /// reporting "past history". Without this every replay-suppressed side
+    /// effect (the #379 logger, #532 business metrics, `set_current_details`,
+    /// search-attribute patches, #791 progress chunks) would re-fire on a sealed
+    /// run, and a `version()` gate would try to grow a history that can never
+    /// accept another event.
+    ///
+    /// Every suppression guard in this file routes through here — including the
+    /// ones that lock the matcher directly rather than calling
+    /// [`Self::is_replaying`] — so the two spellings can never drift.
+    pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Cursor-only "is there recorded history left to consume?" — the
+    /// live-frontier question, which (unlike [`Self::is_replaying`]) answers
+    /// `false` inside a transparent terminal-failure tail (issue #952).
+    ///
+    /// Used only where the question really is "did the matcher run off the end
+    /// of recorded history?", never as a replay-suppression guard.
+    fn at_history_frontier(&self) -> bool {
+        !self
+            .matcher
             .lock()
             .expect("matcher lock poisoned")
             .is_replaying()
@@ -5197,7 +5251,13 @@ impl WorkflowContext {
 
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
-        if !self.is_replaying() && version == max {
+        //
+        // Cursor-only frontier check (issue #952): `match_version` decided it was
+        // past history from the same cursor state and latched
+        // `patch_ids_recorded_this_cycle` expecting this push, so the two must
+        // ask the same question. `is_replaying()` additionally reports `true`
+        // for a sealed-failed run, which would latch without pushing.
+        if self.at_history_frontier() && version == max {
             self.push_command(WorkflowCommand::RecordMarker {
                 name: crate::replay::version_marker_name(change_id),
                 details: Value::from(u64::from(max)),
@@ -5332,8 +5392,12 @@ impl WorkflowContext {
                 // recorded history (live frontier) by construction — the
                 // marker is recorded exactly once per call site, never during
                 // a replay pass.
+                // Cursor-only frontier check: a `patched()` call reached
+                // inside a transparent terminal-failure tail (issue #952) is
+                // still "past recorded history" for the matcher, even though
+                // `is_replaying()` reports `true` for the sealed run.
                 debug_assert!(
-                    !self.is_replaying(),
+                    self.at_history_frontier(),
                     "NewlyPatched must only be returned on the live frontier"
                 );
                 self.push_command(WorkflowCommand::RecordMarker {
@@ -9307,11 +9371,15 @@ impl WorkflowContext {
     /// case, its recorded children) — a **silent misattribution**, strictly
     /// worse than the plain "expected `fan_out:N`, got `fan_out:M`" divergence
     /// burning the number produces. A caught-and-continued fan-out failure
-    /// simply not replaying cleanly is an accepted instance of the broader,
-    /// pre-existing, engine-wide limitation documented on
-    /// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
-    /// (`tests/replayer_tests.rs`) — not something a numbering trick should
-    /// try to paper over.
+    /// simply not replaying cleanly is an accepted instance of a narrower
+    /// remaining limitation — not something a numbering trick should try to
+    /// paper over. (Issue #952 fixed the *uncaught* half: a cycle that fails
+    /// on a config-dependent check now replays cleanly, because its trailing
+    /// terminal `WorkflowFailed` is transparent to in-progress matches — see
+    /// `replayer_tests::early_config_dependent_failure_replays_cleanly`. A
+    /// failure the workflow **catches** and continues past leaves no terminal
+    /// event and no history footprint at all, so replay still re-decides it
+    /// against live configuration; #952 defers that case explicitly.)
     fn next_fan_out_seq(&self) -> u32 {
         let mut seq = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
         *seq += 1;
@@ -12628,10 +12696,14 @@ impl WorkflowContext {
         //   history (epoch) to have grown; a same-position re-drive (spurious
         //   wake / rolled-back retry) re-emits the SAME seq deterministically.
         let epoch = {
-            let matcher = self.matcher.lock().expect("matcher lock poisoned");
-            if matcher.is_replaying() {
+            // Issue #952: the sealed-run clause matters here too — see
+            // `replay_suppresses_side_effects`. Locked separately from that
+            // predicate (rather than via `match_history`) so this read still
+            // triggers no `pump_signal_handlers` post-hook.
+            if self.replay_suppresses_side_effects() {
                 return Ok(());
             }
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
         // Serialize the caller's chunk (the only fallible step).

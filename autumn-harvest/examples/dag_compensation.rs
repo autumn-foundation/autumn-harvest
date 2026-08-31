@@ -448,12 +448,12 @@ mod tests {
 
     /// (c) **Self-check.** A compensated history replays deterministically.
     ///
-    /// A failing DAG's handler returns `Err("one or more DAG tasks failed")`,
-    /// and `ReplayStatus::ReplaySucceeded` is reserved for a handler returning
-    /// `Ok` — so a failing-DAG history (compensating or not) replays to
-    /// `ReplayStatus::WorkflowFailed`, which is precisely "reproduced the same
-    /// terminal error with ZERO divergence". Pinning the exact error rules out
-    /// `NonDeterminismDetected`.
+    /// A failing DAG's handler returns `Err("one or more DAG tasks failed")`, and
+    /// its history ends in a terminal `WorkflowFailed`. Since issue #952 a replay
+    /// that reproduces that failure is a clean replay — `ReplaySucceeded` with the
+    /// reproduced error in `ReplayReport::failure_message()`, which is precisely
+    /// "reproduced the same terminal error with ZERO divergence". Pinning the
+    /// exact error rules out a failure for some other reason.
     #[tokio::test]
     async fn compensated_history_replays_deterministically() {
         let ledger: Ledger = Arc::new(Mutex::new(BTreeMap::new()));
@@ -468,14 +468,19 @@ mod tests {
         );
 
         let report = outcome.replay_check(handler).await;
+        // Issue #952: the history ends in a terminal `WorkflowFailed`, so a replay
+        // that reproduces the same failure is a CLEAN replay and the error is read
+        // through `failure_message()`. The assertion is unchanged in substance:
+        // the ORIGINAL DAG error, deterministically, never a divergence.
+        assert_eq!(
+            report.failure_message(),
+            Some("one or more DAG tasks failed"),
+            "a compensating history must replay deterministically to the original \
+             DAG error:\n{report}"
+        );
         assert!(
-            matches!(
-                report.status,
-                ReplayStatus::WorkflowFailed { ref error, .. }
-                    if error == "one or more DAG tasks failed"
-            ),
-            "a compensating history must replay deterministically (WorkflowFailed \
-             with the original DAG error, never NonDeterminismDetected):\n{report}"
+            !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "a compensating history must never replay as non-determinism:\n{report}"
         );
     }
 }
