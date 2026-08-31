@@ -1595,6 +1595,60 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
     );
 }
 
+// Decommissioning must be reversible without corrupting the sequence. If a
+// recreated cursor restarted at 0, the next records would take `(shard, seq)`
+// pairs that already name DIFFERENT records -- and a receiver deduping on that
+// pair, exactly as this feature instructs, would discard the new ones.
+#[tokio::test]
+async fn a_recreated_cursor_continues_the_sequence_it_left_off_at() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = Arc::new(RecordingSink::new(200));
+    let _installed = install(sink.clone(), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3, 4]);
+    uninstall();
+
+    // The operator retires export; the four stamped rows stay in the table.
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+
+    // Later, export is re-enabled and new audited operations arrive.
+    let sink2 = Arc::new(RecordingSink::new(200));
+    let _reinstalled = install(sink2.clone(), 100);
+    insert_audit_rows(&mut conn, 2).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick after re-enable");
+    uninstall();
+
+    let seqs = sink2.all_seqs();
+    let fresh: Vec<i64> = seqs.iter().copied().filter(|s| *s > 4).collect();
+    assert_eq!(
+        fresh,
+        vec![5, 6],
+        "the two new records must continue from 5, not restart at 1 and \
+         collide with the sequences already assigned to different records; \
+         got {seqs:?}"
+    );
+
+    // Every stamped row still has a distinct sequence -- the invariant a
+    // restarted counter would break.
+    let stamped: Vec<Option<i64>> = harvest_audit_log::table
+        .filter(harvest_audit_log::export_seq.is_not_null())
+        .select(harvest_audit_log::export_seq)
+        .order(harvest_audit_log::export_seq.asc())
+        .load(&mut conn)
+        .await
+        .expect("load sequences");
+    let stamped: Vec<i64> = stamped.into_iter().flatten().collect();
+    assert_eq!(stamped, vec![1, 2, 3, 4, 5, 6]);
+}
+
 // ── The redrive's audit row commits with the rewind, on one connection ─────
 
 #[tokio::test]

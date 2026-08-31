@@ -257,6 +257,16 @@ records any more; the next sweep purges its aged audit rows normally. Do this
 only once you accept that any records the shard had not yet shipped will never
 reach the SIEM.
 
+Stopping the exporter alone does **not** restore purging — the guard keys on
+the cursor row, not on the sweeping process's sink configuration, which is what
+makes it safe across a split web/worker deployment. Both steps are required.
+
+Re-enabling export afterwards is safe: a recreated cursor seeds its
+`last_assigned_seq` from `MAX(export_seq)`, so new records continue the
+sequence instead of re-issuing numbers that already name different records
+(which a receiver deduping on `(shard, seq)` would silently discard). Any
+records still in the table are re-delivered, and the receiver dedupes them.
+
 Until then, a sink left down indefinitely lets the audit table grow past its
 retention window. That is the deliberate trade — unbounded growth is loud
 (`harvest.audit.export_lag`, the `last_error` on `GET /admin/audit-export`),

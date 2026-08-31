@@ -2949,10 +2949,22 @@ no supported way to skip an audit record — that is the point of the feature.
   Harvest default; write it down before the incident.
 - `pending_records` grows without bound and the audit table is approaching its
   volume budget. Retention will not purge unexported records for as long as
-  export is behind — that is the deliberate trade. Disabling the sink restores
-  ordinary purging on the next retention tick, at the cost of permanently
-  losing the un-exported window: treat that as a decision with a paper trail,
-  not a cleanup step.
+  export is behind — that is the deliberate trade.
+
+  **Disabling the sink is not enough to restore purging.** The guard keys on
+  the shard's cursor row, not on whether a sink happens to be configured in the
+  process running retention — deliberately, so that a worker outage cannot let
+  a web process delete the records that outage stranded. Relieving the disk
+  pressure takes two steps: stop the exporter, then explicitly retire the
+  cursor with `audit_export::decommission_cursor(&mut conn, shard_id)`. The
+  next retention tick then purges that shard's aged rows normally.
+
+  This permanently gives up the un-exported window: those records will never
+  reach the SIEM. Treat it as a decision with a paper trail and a
+  security/compliance sign-off, not a cleanup step. It is reversible in the
+  sense that re-enabling export later continues the sequence correctly (a
+  recreated cursor seeds its high-water mark from the rows already stamped) —
+  but the records purged in between are gone.
 - Escalate to the security/compliance owner, not only the platform team: the
   question "were privileged actions logged during this window?" is theirs to
   answer.

@@ -842,8 +842,24 @@ pub async fn ensure_cursor_row(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
+    // `last_assigned_seq` is seeded from the rows already stamped, never from
+    // 0 (issue #953, Codex review round 4 P1). A cursor row can go missing
+    // while sequenced audit rows remain -- `decommission_cursor`, a manual
+    // DELETE, a partial restore -- and restarting the counter at 0 would
+    // re-issue `(shard, seq)` pairs that name *different* records. A receiver
+    // deduping on that pair, exactly as this feature tells it to, would then
+    // discard genuine new records; and acknowledging a retained batch would
+    // set `last_acked_seq > last_assigned_seq`, violating the cursor's own
+    // CHECK. Seeding from `MAX(export_seq)` makes the high-water mark a
+    // property of the stamped data rather than of the cursor row's survival.
+    //
+    // `last_acked_seq` deliberately stays 0: a recreated cursor re-delivers
+    // the retained backlog rather than assuming it was shipped. That is
+    // at-least-once, the receiver dedupes it on a now-stable `(shard, seq)`,
+    // and it errs toward re-export rather than silent loss.
     diesel::sql_query(
-        "INSERT INTO harvest_audit_export_cursor (shard_id) VALUES ($1) \
+        "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
+         SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
          ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW()",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
@@ -873,6 +889,11 @@ pub async fn ensure_cursor_row(
 ///
 /// So retiring an export configuration is an operator action, not an inferred
 /// one. See `docs/audit-export.md`.
+///
+/// Safe to reverse: [`ensure_cursor_row`] seeds a recreated cursor's
+/// `last_assigned_seq` from `MAX(export_seq)`, so re-enabling export later
+/// continues the sequence rather than re-issuing numbers that already name
+/// different records.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
