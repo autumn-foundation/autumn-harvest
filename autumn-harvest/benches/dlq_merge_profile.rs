@@ -87,6 +87,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// do comparison work across shards rather than folding identical values.
 fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> DlqAggregatePartial {
     let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let count_per_group = 100 + i64::try_from(shard_id).unwrap_or(0);
     let rows: Vec<DlqRawGroup> = (0..groups)
         .map(|g| {
             let failed_at =
@@ -96,7 +97,7 @@ fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> Dl
                     Some(format!("workflow_{g}")),
                     Some(format!("failure_signature_{g}")),
                 ],
-                count: 100 + i64::try_from(shard_id).unwrap_or(0),
+                count: count_per_group,
                 first_seen: Some(failed_at),
                 last_seen: Some(failed_at + chrono::Duration::seconds(30)),
                 sample_ids: (0..samples_per_group)
@@ -105,9 +106,15 @@ fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> Dl
             }
         })
         .collect();
+    // Reconcile with the per-group counts above, matching the invariant a real
+    // per-shard aggregate_dead_letters() result satisfies: total/filtered_total
+    // is the sum of every group's count on that shard.
+    let shard_total = i64::try_from(groups)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(count_per_group);
     DlqAggregatePartial {
-        total: i64::try_from(groups * 800).unwrap_or(i64::MAX),
-        filtered_total: i64::try_from(groups * 800).unwrap_or(i64::MAX),
+        total: shard_total,
+        filtered_total: shard_total,
         groups: rows,
     }
 }
@@ -151,13 +158,25 @@ fn main() {
         total_truncated += usize::from(response.truncated);
     }
 
-    let expected_groups_per_rep = groups.min(params.limit_groups as usize);
+    let limit = params.limit_groups as usize;
+    let regular_groups_per_rep = groups.min(limit);
+    // rollup_top_n adds one extra "_other" row per rep when the input exceeds
+    // `limit` -- every group here has a positive count, so truncation always
+    // implies a non-empty rollup.
+    let rep_is_truncated = groups > limit;
+    let expected_groups_per_rep = regular_groups_per_rep + usize::from(rep_is_truncated);
     let expected_total = expected_groups_per_rep * reps;
+    let expected_total_truncated = if rep_is_truncated { reps } else { 0 };
     assert_eq!(
         total_groups_returned, expected_total,
         "sanity check: every shard reports the same {groups} root causes, so the \
          merge should collapse to exactly {expected_groups_per_rep} groups per rep \
          (got {total_groups_returned} across {reps} reps)"
+    );
+    assert_eq!(
+        total_truncated, expected_total_truncated,
+        "sanity check: truncation should be {rep_is_truncated} on every rep \
+         (got {total_truncated} truncated reps out of {reps})"
     );
 
     println!(
