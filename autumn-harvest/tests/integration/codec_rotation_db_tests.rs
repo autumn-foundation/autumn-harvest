@@ -1903,3 +1903,60 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
          there deadlocks retirement forever"
     );
 }
+
+/// A cursor belonging to a *different* key must not be reported as the active
+/// key's.
+///
+/// `ShardRotationProgress::cursor` is documented as the resume cursor for the
+/// active key's pass, and the sweep already honours that: it filters a stored
+/// cursor by `active_key_id` before resuming, precisely so a rollback cannot
+/// resume a pass the rolled-back-to key finished long ago.
+///
+/// The reporting path did not apply the same filter. Between a key flip and
+/// that shard's next sweep tick, `GET /admin/codec/rotation` would hand back
+/// the *previous* key's completed cursor beside the new `active_key_id` --
+/// which reads as "the new rotation is already done" to anyone consuming the
+/// endpoint, including the operator the runbook sends there.
+#[tokio::test]
+async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "cursor_key_scope").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    // Complete a pass under k2, leaving a k2 cursor with `completed_at` set.
+    codecs.set_active_key("k2").expect("flip to k2");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("k2 pass");
+    let k2_view = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress under k2");
+    let k2_cursor = k2_view.cursor.expect("k2 pass wrote a cursor");
+    assert_eq!(k2_cursor.active_key_id, "k2");
+    assert!(k2_cursor.completed_at.is_some());
+
+    // Roll forward to k1 -- a different key. The k2 cursor is still the only
+    // row in the table, and this read happens before k1's first tick.
+    codecs.set_active_key("k1").expect("flip to k1");
+    let k1_view = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress under k1");
+
+    assert_eq!(k1_view.active_key_id, "k1");
+    assert!(
+        k1_view.cursor.is_none(),
+        "a cursor recorded for a different key must not be reported as this \
+         key's; a completed k2 cursor beside active_key_id=k1 reads as a \
+         finished rotation that never ran"
+    );
+}

@@ -583,8 +583,18 @@ mod db {
             });
         }
         let rows_by_key_id = count_rows_by_key_id(conn).await?;
+        // Scope the cursor to the key being reported, exactly as the sweep
+        // scopes the cursor it resumes from. `ShardRotationProgress::cursor` is
+        // documented as the resume cursor for the *active key's* pass, and
+        // between a flip and that shard's next tick the stored row still
+        // belongs to the previous key. Reporting it here would put a completed
+        // cursor beside the new `active_key_id`, which reads as a finished
+        // rotation that has not started -- to a dashboard, and to the operator
+        // the runbook sends to this endpoint.
         let cursor = if cursor_table_present(conn).await? {
-            load_cursor(conn, shard_id).await?
+            load_cursor(conn, shard_id)
+                .await?
+                .filter(|cursor| cursor.active_key_id == active_key_id)
         } else {
             None
         };
