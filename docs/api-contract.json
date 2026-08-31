@@ -5170,7 +5170,7 @@
           "from",
           "to"
         ],
-        "notes": "`outcome` is `rewound`. `from` is where the cursor was, `to` where it now is; records with seq > to will be re-delivered by the exporter on its next tick. The rewind also bumps the shard's claim epoch and clears its lease, so a delivery already in flight when the rewind lands cannot acknowledge over it and silently undo the redrive. The rewind and the `audit_export.redrive` audit record commit in one unit -- an applied-but-unaudited redrive is not representable -- and the audit row's target_id records the shard AND the requested position (`shard=0;to_seq=42`), since a redrive is the one operation here that can trigger a mass re-export."
+        "notes": "`outcome` is `rewound`. `from` is where the cursor was, `to` where it now is; records with seq > to will be re-delivered by the exporter on its next tick. The rewind also bumps the shard's claim epoch and clears its lease, so a delivery already in flight when the rewind lands cannot acknowledge over it and silently undo the redrive. The rewind and the `audit_export.redrive` audit record are one transaction on one connection, so an applied-but-unaudited redrive is not representable; that audit row lands in the TARGET shard's audit log (not the default shard's, unlike other audited routes) because it describes a shard-scoped mutation and a second connection could neither be atomic with the rewind nor safely acquired while holding it. and the audit row's target_id records the shard AND the requested position (`shard=0;to_seq=42`), since a redrive is the one operation here that can trigger a mass re-export."
       },
       "error_responses": [
         {

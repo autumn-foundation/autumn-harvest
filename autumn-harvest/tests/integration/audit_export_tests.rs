@@ -1402,6 +1402,264 @@ async fn an_idle_tick_never_calls_the_sink_but_still_emits_lag() {
     );
 }
 
+// ── Retention must not depend on the local process's sink registration ─────
+//
+// Split web/worker deployment: only the worker configures the sink, and the
+// web app runs the retention sweep. The sweeping process therefore answers
+// "is export configured?" with `false`, so the guard has to come from durable,
+// shared state — the exporter's heartbeat on the cursor row.
+#[tokio::test]
+async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+
+    // The "worker process" exports two records and heartbeats the cursor.
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Now the "retention process": no sink registered here at all.
+    uninstall();
+    assert!(
+        !autumn_harvest::audit_export::is_configured(),
+        "this stands in for the process that runs retention"
+    );
+
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 2,
+        "the live heartbeat must protect the three unexported records even \
+         though THIS process has no sink configured; only the acknowledged \
+         two may be purged"
+    );
+}
+
+// The other half of the same knob: once the exporter is genuinely gone, the
+// heartbeat goes stale and retention must resume. Nothing ever deletes a
+// cursor row, so a guard keyed on its mere existence would turn audit
+// retention off permanently.
+#[tokio::test]
+async fn retention_resumes_once_the_exporter_heartbeat_goes_stale() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    uninstall();
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Age the heartbeat past its TTL: the exporter has been removed, not
+    // merely restarted.
+    {
+        use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+        let stale = chrono::Utc::now()
+            - autumn_harvest::audit_export::EXPORT_HEARTBEAT_TTL
+            - chrono::Duration::hours(1);
+        diesel::update(cur::harvest_audit_export_cursor.find(0))
+            .set(cur::updated_at.eq(stale))
+            .execute(&mut conn)
+            .await
+            .expect("age heartbeat");
+    }
+
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 5,
+        "a stale heartbeat with no local sink means the exporter is gone; \
+         retention must resume rather than be disabled forever"
+    );
+}
+
+#[tokio::test]
+async fn every_tick_refreshes_the_exporter_heartbeat() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    // No audit rows at all: an idle tick must still heartbeat, or an idle but
+    // perfectly healthy exporter would look dead to the retention sweep.
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("idle tick");
+
+    use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+    let stale = chrono::Utc::now() - chrono::Duration::days(3);
+    diesel::update(cur::harvest_audit_export_cursor.find(0))
+        .set(cur::updated_at.eq(stale))
+        .execute(&mut conn)
+        .await
+        .expect("age heartbeat");
+
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("second idle tick");
+    uninstall();
+
+    let refreshed: chrono::DateTime<chrono::Utc> = cur::harvest_audit_export_cursor
+        .find(0)
+        .select(cur::updated_at)
+        .first(&mut conn)
+        .await
+        .expect("cursor row");
+    assert!(
+        refreshed > stale,
+        "a tick that claims nothing must still refresh the heartbeat: an idle \
+         exporter is alive, and retention reads this to decide whether it owes \
+         records"
+    );
+}
+
+// ── The redrive's audit row commits with the rewind, on one connection ─────
+
+#[tokio::test]
+async fn a_redrive_and_its_audit_record_land_together_on_the_target_shard() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 4).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    uninstall();
+
+    // The management handler runs the rewind and the audit insert in ONE
+    // transaction on the target shard's connection. Reproduce that shape here
+    // (the handler itself is exercised by the auth-boundary and contract
+    // suites) and assert the pairing.
+    use diesel_async::AsyncConnection as _;
+    let outcome = Box::pin(
+        conn.transaction::<RewindOutcome, autumn_harvest::error::HarvestError, _>(async |conn| {
+            let outcome = autumn_harvest::audit_export::rewind_cursor_locked(
+                conn,
+                0,
+                RewindRequest::Seq(1),
+                chrono::Utc::now(),
+            )
+            .await?;
+            let record = NewAuditRecord {
+                actor: "alice",
+                operation: autumn_harvest::audit::OP_AUDIT_EXPORT_REDRIVE,
+                target_type: autumn_harvest::audit::TARGET_AUDIT_EXPORT,
+                target_id: Some("shard=0;to_seq=1"),
+                route_or_command: "POST /admin/audit-export/redrive",
+                request_id: None,
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: Some("cursor rewound from 4 to 1"),
+                shard_id: Some(0),
+                source: "api",
+            };
+            audit::insert_audit(conn, &record).await?;
+            Ok(outcome)
+        }),
+    )
+    .await
+    .expect("transaction commits");
+
+    assert_eq!(outcome, RewindOutcome::Rewound { from: 4, to: 1 });
+    assert_eq!(cursor_acked(&mut conn, 0).await, 1);
+
+    // The audit row landed on the SAME shard as the cursor it describes, so it
+    // is picked up by that shard's own exporter like any other audit record.
+    let redrive_rows: i64 = harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_AUDIT_EXPORT_REDRIVE))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(redrive_rows, 1);
+}
+
+// A rewind whose audit insert fails must leave the cursor untouched: an
+// applied-but-unaudited privileged mutation is the thing the single
+// transaction exists to make unrepresentable.
+#[tokio::test]
+async fn a_failed_audit_write_rolls_the_rewind_back() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+    apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 3,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("ack");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 3);
+
+    // Rewind, then fail the audit insert inside the same transaction. A NULL
+    // `operation` violates the table's NOT NULL, standing in for any reason
+    // the audit write could fail.
+    use diesel_async::AsyncConnection as _;
+    let result = Box::pin(
+        conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            autumn_harvest::audit_export::rewind_cursor_locked(
+                conn,
+                0,
+                RewindRequest::Seq(0),
+                chrono::Utc::now(),
+            )
+            .await?;
+            diesel::sql_query(
+                "INSERT INTO harvest_audit_log (actor, operation, target_type, \
+                 route_or_command, status, source) \
+                 VALUES ('alice', NULL, 'audit_export', 'POST /x', 'SUCCEEDED', 'api')",
+            )
+            .execute(conn)
+            .await
+            .map_err(autumn_harvest::error::database_error)?;
+            Ok(())
+        }),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the audit insert must fail this transaction"
+    );
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        3,
+        "the rewind must roll back with its audit write: a cursor moved with \
+         no trail is exactly what the single transaction prevents"
+    );
+}
+
 // ── The issue's success metric, at CI-affordable scale ─────────────────────
 //
 // The issue asks for receiver-side `(shard, seq)` accounting over >= 100k

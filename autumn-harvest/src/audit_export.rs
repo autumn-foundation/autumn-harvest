@@ -615,6 +615,24 @@ impl AuditExportBuilderConfig {
 // M4: process-global runtime config (opt-in; `None` == fully inert)
 // ---------------------------------------------------------------------
 
+/// Bound on acquiring a shard's connection inside the scanner (issue #953,
+/// Codex review P1).
+///
+/// `pool.get()` is an **unbounded** wait — Harvest configures no deadpool
+/// `Timeouts`. The scanner is already holding a connection when it runs (the
+/// timeout checker checks one out before calling `enforce_timeouts_once`), and
+/// for a per-shard checker that connection comes from the very pool this
+/// function then asks for a second one. On a one-connection pool that is a
+/// self-deadlock: the wait never returns, audit export never runs, and every
+/// scanner resident sequenced after it is wedged with it.
+///
+/// Bounding converts the indefinite park into "skip this shard for one tick",
+/// which is visible in the log and self-heals, mirroring
+/// `worker::shard_acquire_bound` (added for the same class of bug in #961).
+/// Deliberately generous: the bound exists to stop an *indefinite* block, not
+/// to police normal contention on a busy pool.
+pub const SHARD_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Default lease held on a shard's cursor while a batch is in flight.
 ///
 /// Long enough to cover a slow sink, short enough that a crashed exporter's
@@ -776,11 +794,19 @@ pub struct ClaimedBatch {
     pub records: Vec<AuditExportRecord>,
 }
 
-/// Create this shard's cursor row if it does not exist yet.
+/// Create this shard's cursor row if it does not exist, and stamp it as alive.
 ///
 /// Deliberately not seeded by the migration: a shard's database cannot know
 /// its own shard id (see the migration's comment, and
 /// `replication::ensure_generation_row` for the same pattern in #954).
+///
+/// **`updated_at` doubles as an exporter heartbeat** (issue #953, Codex review
+/// P1). Called on every scanner tick, including ticks that claim nothing, so a
+/// fresh `updated_at` means "an exporter is running against this shard right
+/// now" — durable, shared state that a *different process* can read. That is
+/// what lets [`crate::audit::purge_old_audit_records`] protect unexported rows
+/// in a split web/worker deployment, where the process running retention may
+/// have no sink configured and so cannot answer the question locally.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -793,7 +819,7 @@ pub async fn ensure_cursor_row(
 
     diesel::sql_query(
         "INSERT INTO harvest_audit_export_cursor (shard_id) VALUES ($1) \
-         ON CONFLICT (shard_id) DO NOTHING",
+         ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW()",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
     .execute(conn)
@@ -801,6 +827,21 @@ pub async fn ensure_cursor_row(
     .map_err(crate::error::database_error)?;
     Ok(())
 }
+
+/// How long an exporter heartbeat (`harvest_audit_export_cursor.updated_at`)
+/// stays trusted as evidence that export is live on a shard.
+///
+/// Read by [`crate::audit::purge_old_audit_records`] to decide whether the
+/// "never purge an unexported record" guard applies, in a process that may not
+/// have a sink configured itself.
+///
+/// Deliberately far longer than any scanner cadence (the exporter refreshes it
+/// every tick, seconds apart) and far shorter than the default 90-day audit
+/// retention window. The asymmetry is the point: a briefly-restarting exporter
+/// never drops the guard, while an exporter that has been *removed* eventually
+/// stops blocking retention forever — the failure mode a purely-durable signal
+/// has, since nothing deletes a cursor row.
+pub const EXPORT_HEARTBEAT_TTL: chrono::Duration = chrono::Duration::hours(24);
 
 /// The `MAX(export_seq)` read back from the sequence-assignment statement —
 /// the high-water mark of sequences actually handed out.
@@ -1702,15 +1743,28 @@ pub async fn fire_due_audit_exports(
                 let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
                     continue;
                 };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[audit_export] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
-                };
+                // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
+                let mut shard_conn =
+                    match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                "[audit_export] failed to get connection to shard {shard:?}: {e:?}"
+                            );
+                            continue;
+                        }
+                        Err(_elapsed) => {
+                            tracing::error!(
+                                shard = shard.as_i32(),
+                                bound = ?SHARD_ACQUIRE_BOUND,
+                                "[audit_export] timed out acquiring a connection for this shard; \
+                                 skipping it for one tick. If this repeats, the shard's pool is \
+                                 saturated or too small: the scanner already holds one connection \
+                                 from it, so a max_size of 1 can never yield a second"
+                            );
+                            continue;
+                        }
+                    };
                 // One shard's failure must never stop the others: an
                 // unreachable shard is an availability problem, but silently
                 // skipping every *later* shard's export would be a compliance

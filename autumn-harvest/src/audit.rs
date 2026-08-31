@@ -1479,32 +1479,38 @@ pub async fn list_audit(
 /// Called by the retention subsystem on its configured cadence. Returns the
 /// number of rows deleted.
 ///
-/// **Never deletes a record the audit exporter has not shipped** (issue
-/// #953). A retention sweep that removed an unexported row would be a silent
+/// **Never deletes a record the audit exporter has not shipped** (issue #953).
+/// A retention sweep that removed an unexported row would be a silent
 /// compliance gap — the record would be gone from the database *and* absent
 /// from the SIEM, with nothing anywhere to show it was lost, which is exactly
 /// what "zero silent record loss by construction" rules out.
 ///
-/// The guard is gated on [`crate::audit_export::is_configured`], **not** on
-/// the presence of a cursor row, because the cursor table alone cannot
-/// distinguish the two states that matter (issue #953 review):
+/// ## Deciding whether export is live
 ///
-/// - **Export configured, cursor row absent** — a shard the exporter has not
-///   reached yet (freshly enabled, newly added to the fleet, or one whose
-///   pool has been failing). A cursor-only guard is vacuous here and would
-///   purge unexported records outright.
-/// - **Export disabled, cursor row present** — an operator who enabled export,
-///   ran it, and later removed the sink. Nothing deletes a cursor row, so a
-///   cursor-only guard would find that stale row forever, match every
-///   subsequent `export_seq IS NULL` record, and silently turn audit retention
-///   off permanently — unbounded table growth with no signal, since the lag
-///   gauge is not emitted either once the exporter stops running.
+/// The guard applies when **either** signal says an exporter owes this shard
+/// records. Neither is sufficient alone, and the reasons are different
+/// failures:
 ///
-/// With export not configured, the guard is skipped entirely and the delete
-/// is byte-identical to the pre-#953 statement. With export configured, a row
-/// is deletable only if it carries a sequence at or below every cursor in this
-/// database — so an absent cursor row protects everything, which is the
-/// fail-safe direction.
+/// - **A live exporter heartbeat** — a `harvest_audit_export_cursor` row whose
+///   `updated_at` is within [`crate::audit_export::EXPORT_HEARTBEAT_TTL`]. This
+///   is durable, shared state, so it works when retention and export run in
+///   **different processes** (issue #953, Codex review P1): a split web/worker
+///   deployment where only the worker configures the sink would otherwise have
+///   the web app's retention sweep delete rows the worker still owes.
+/// - **A sink configured in this process**
+///   ([`crate::audit_export::is_configured`]) — covers the window before the
+///   exporter's first tick on a shard has written any heartbeat at all
+///   (freshly enabled, newly added to the fleet, or a shard whose pool has been
+///   failing), where the durable signal does not exist yet.
+///
+/// A stale heartbeat with no local sink means the exporter has been *removed*,
+/// and the guard lifts. That case matters: nothing ever deletes a cursor row,
+/// so a guard keyed on the row's mere existence would match every later record
+/// forever and silently turn audit retention off permanently — unbounded table
+/// growth, with the lag gauge no longer emitted to show why.
+///
+/// With export inactive by both signals the guard is skipped entirely and the
+/// delete is byte-identical to the pre-#953 statement.
 ///
 /// The cost of the guard is that a sink down indefinitely lets the audit table
 /// grow past its retention window. That is the deliberate trade — dropping a
@@ -1513,9 +1519,10 @@ pub async fn list_audit(
 /// `GET /admin/audit-export` `last_error` are how the condition is surfaced;
 /// see `docs/audit-export.md`.
 ///
-/// The subquery is uncorrelated by shard because a shard's database holds at
-/// most one cursor row (the exporter provisions only the shard it is scanning).
-/// Should two ever coexist, `NOT EXISTS` errs toward retaining, never deleting.
+/// The pending-check subquery is uncorrelated by shard because a shard's
+/// database holds at most one cursor row (the exporter provisions only the
+/// shard it is scanning). Should two ever coexist, `EXISTS` errs toward
+/// retaining, never deleting.
 ///
 /// # Errors
 ///
@@ -1526,24 +1533,34 @@ pub async fn purge_old_audit_records(
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(retention_days);
+    let heartbeat_floor = now - crate::audit_export::EXPORT_HEARTBEAT_TTL;
+
+    // Delete an aged row UNLESS export is live AND that row is still pending.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
-           AND ( \
-                 NOT $2::BOOLEAN \
-                 OR ( \
-                      EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
-                      AND NOT EXISTS ( \
-                            SELECT 1 FROM harvest_audit_export_cursor c \
-                            WHERE a.export_seq IS NULL \
-                               OR a.export_seq > c.last_acked_seq \
-                      ) \
+           AND NOT ( \
+                 ( \
+                   $2::BOOLEAN \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor c \
+                        WHERE c.updated_at > $3 \
+                   ) \
+                 ) \
+                 AND ( \
+                   a.export_seq IS NULL \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor c \
+                        WHERE a.export_seq > c.last_acked_seq \
+                   ) \
                  ) \
            )",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
+    .bind::<diesel::sql_types::Timestamptz, _>(heartbeat_floor)
     .execute(conn)
     .await
     .map_err(database_error)

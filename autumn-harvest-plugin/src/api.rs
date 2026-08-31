@@ -35871,12 +35871,25 @@ struct AuditExportRedriveRequest {
 /// applied, because advancing it would mark records delivered that never were
 /// — the exact gap this feature exists to make impossible.
 ///
-/// **The rewind and its own audit record commit together** (issue #953
-/// review). The audit insert runs on the default shard *inside* the still-open
-/// transaction that holds the rewind, so an audit-write failure rolls the
-/// rewind back: an applied-but-unaudited redrive is unrepresentable, not
-/// merely unlikely. A redrive the API refuses (`no-op`, unknown shard) is
-/// audited as `FAILED`, since nothing moved.
+/// **The rewind and its audit record are one transaction on one connection**
+/// (issue #953, Codex review P1/P2). The audit row is written through the very
+/// connection holding the cursor lock, into the *target shard's*
+/// `harvest_audit_log` — deliberately not the default shard's, which is the
+/// house pattern for every other audited route here. Two reasons:
+///
+/// 1. **Atomicity is real, not approximate.** A second connection's insert
+///    commits independently, so the two could disagree in either direction: a
+///    committed `SUCCEEDED` row claiming a rewind that then failed to commit,
+///    or a rewind with no trail. Same connection, same transaction, one
+///    outcome.
+/// 2. **It cannot self-deadlock.** `acquire_conn` is an unbounded `pool.get()`.
+///    Asking the default pool for a second connection while already holding one
+///    from it — which is what a redrive of the *default* shard does — parks
+///    forever on a small pool, while holding the cursor lock.
+///
+/// The audit row is shard-local anyway: it describes a shard-scoped mutation,
+/// carries that shard's id, and is picked up by that shard's own exporter, so
+/// it reaches the SIEM like every other audit record.
 #[allow(clippy::too_many_lines)] // one mutation + its bound audit write
 async fn audit_export_redrive_handler(
     headers: axum::http::HeaderMap,
@@ -35922,13 +35935,10 @@ async fn audit_export_redrive_handler(
 
     let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
 
-    // Records the outcome so the audit row written inside the transaction can
-    // be reported back after it commits.
     let outcome: Result<::autumn_harvest::audit_export::RewindOutcome, String> = match shard_pool {
         Some(shard_pool) => match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
                 use diesel_async::AsyncConnection as _;
-                let audit_pool = pool.default_pool().clone();
                 let actor = actor.clone();
                 let source = source.clone();
                 let request_id = request_id.clone();
@@ -35982,16 +35992,12 @@ async fn audit_export_redrive_handler(
                         shard_id: Some(request.shard),
                         source: &source,
                     };
-                    let mut audit_conn = acquire_conn(&audit_pool).await.map_err(|e| {
-                        ::autumn_harvest::error::HarvestError::Config(format!(
-                            "audit DB connection unavailable: {e}"
-                        ))
-                    })?;
-                    audit::insert_audit(&mut audit_conn, &ar).await?;
+                    // Same `conn`, same transaction as the rewind above.
+                    audit::insert_audit(conn, &ar).await?;
                     Ok(outcome)
                 }))
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e: ::autumn_harvest::error::HarvestError| e.to_string())
             }
             Err(e) => Err(format!("shard {}: {e}", request.shard)),
         },
@@ -36002,9 +36008,9 @@ async fn audit_export_redrive_handler(
         Ok(outcome) => outcome,
         Err(error) => {
             // The transaction rolled back (or never opened), so nothing was
-            // applied. Best-effort record of the attempt itself; if even this
-            // cannot be written the 503 below still reports the failure to the
-            // caller, and no mutation happened to go unrecorded.
+            // applied and there is no mutation to leave unrecorded. Record the
+            // *attempt* on the default shard, best effort — this is the one
+            // path where the target shard may be exactly what is unreachable.
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_AUDIT_EXPORT_REDRIVE,

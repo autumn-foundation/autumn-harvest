@@ -226,19 +226,28 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
-The guard is keyed on **whether a sink is configured in the process running
-the sweep**, not on whether a cursor row happens to exist. That distinction
-matters in both directions:
+The guard applies when **either** signal says an exporter still owes this
+shard records. Neither is sufficient alone:
 
-- *Sink configured, cursor row not yet created* — a shard the exporter has not
-  reached yet. A cursor-only guard would be vacuous here and purge unexported
-  records outright.
-- *Sink removed, cursor row left behind* — nothing deletes a cursor row, so a
-  cursor-only guard would match every later record forever and silently turn
-  audit retention off permanently.
+- **A live exporter heartbeat** — the exporter refreshes
+  `harvest_audit_export_cursor.updated_at` on every tick, including ticks that
+  export nothing, and the guard trusts it for 24 hours. This is durable, shared
+  state, so it works when retention and export run in **different processes**:
+  a split web/worker deployment where only the worker configures the sink would
+  otherwise have the web app's retention sweep delete rows the worker still
+  owes.
+- **A sink configured in the sweeping process** — covers the window before the
+  exporter's first tick on a shard has written any heartbeat at all (freshly
+  enabled, newly added to the fleet, or a shard whose pool has been failing).
 
-With no sink configured the guard is skipped entirely and the purge is
-byte-identical to its pre-#953 behaviour.
+A *stale* heartbeat with no local sink means the exporter was removed, and the
+guard lifts. That case matters: nothing ever deletes a cursor row, so a guard
+keyed on the row's mere existence would match every later record forever and
+silently turn audit retention off permanently — unbounded table growth, with
+the lag gauge no longer emitted to show why.
+
+With export inactive by both signals the guard is skipped entirely and the
+purge is byte-identical to its pre-#953 behaviour.
 
 The trade is that a sink that is down indefinitely lets the audit table grow
 past its retention window. That is deliberate: dropping a privileged-action log
@@ -340,13 +349,18 @@ Three properties worth knowing:
   dedupes) rather than skipping records the operator asked for.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
   as auditable as the operations being exported. The rewind and its audit
-  record **commit together** — the audit row is written inside the transaction
-  holding the rewind — so an applied-but-unaudited redrive is not
-  representable. The audit row's `target_id` records the shard *and* the
-  requested position (`shard=0;to_seq=42`), since a redrive is the one
-  operation here that can trigger a mass re-export. A refused redrive (`no-op`,
-  unknown shard) is audited as `FAILED`: nothing moved, and the trail must not
-  say otherwise.
+  record are **one transaction on one connection** — the audit row is written
+  through the very connection holding the cursor lock — so an
+  applied-but-unaudited redrive is not representable. That row lands in the
+  *target shard's* audit log rather than the default shard's, unlike every
+  other audited route: it describes a shard-scoped mutation, and a second
+  connection's insert would commit independently (breaking the atomicity) and
+  could self-deadlock when the target *is* the default shard. It is exported by
+  that shard's own exporter like any other audit record. The `target_id`
+  records the shard *and* the requested position (`shard=0;to_seq=42`), since a
+  redrive is the one operation here that can trigger a mass re-export. A
+  refused redrive (`no-op`, unknown shard) is audited as `FAILED`: nothing
+  moved, and the trail must not say otherwise.
 - **It invalidates in-flight deliveries.** The rewind bumps the shard's claim
   epoch, so a batch already in flight cannot acknowledge over it.
 
