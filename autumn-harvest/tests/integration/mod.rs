@@ -53,6 +53,8 @@ mod context_headers_tests;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]
 mod cross_region_dr_tests;
+mod cross_shard_child_context_tests;
+mod cross_shard_child_placement_unit;
 #[cfg(feature = "db")]
 mod cross_type_continue_as_new_tests;
 mod cross_workflow_await_tests;

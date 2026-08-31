@@ -1484,3 +1484,292 @@ mod tests {
         let _ = router_with(&[0, 1]).with_residency_map([(String::new(), ShardId::new(1))]);
     }
 }
+
+// ── Cross-shard child placement (issue #956) ─────────────────────────────────
+
+/// Where a **child** workflow should be placed (issue #956).
+///
+/// Children are pinned to the parent's shard by default and that default is
+/// permanent: [`ChildPlacement::ParentShard`] is byte-for-byte today's
+/// behaviour, resolves without consulting the router at all, and is what every
+/// existing `spawn_child_workflow*` call gets. The other variants are an
+/// **opt-in, per-spawn** policy for the child-heavy orchestrator workloads that
+/// otherwise concentrate a whole fan-out's storage and dispatch load on one
+/// database.
+///
+/// # Choosing a variant
+///
+/// | Variant | Use when |
+/// |---|---|
+/// | [`ParentShard`](ChildPlacement::ParentShard) | Anything without a fan-out scale problem. The default. |
+/// | [`Distributed`](ChildPlacement::Distributed) | A large fan-out whose write load should spread across `writable_shards`. |
+/// | [`Shard`](ChildPlacement::Shard) | Ops tooling that already knows the shard number. |
+/// | [`ResidencyKey`](ChildPlacement::ResidencyKey) | The child has a jurisdiction of its own, distinct from the parent's. |
+///
+/// # Residency interaction (issue #697)
+///
+/// Residency is transitive across the workflow tree *under the default*: a
+/// child of a pinned parent stays on the parent's shard. Opting a child into
+/// `Distributed` deliberately breaks that transitivity for that child, which is
+/// exactly what a residency-bound tree must not do. Use
+/// [`ChildPlacement::ResidencyKey`] when the child has its own declared
+/// jurisdiction, and leave residency-bound trees on the default.
+///
+/// ```rust
+/// use autumn_harvest::shard::ChildPlacement;
+///
+/// assert_eq!(ChildPlacement::default(), ChildPlacement::ParentShard);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ChildPlacement {
+    /// Pin the child to the parent's shard. **The default, permanently.**
+    ///
+    /// Resolves without touching [`ShardRouter`], so a deployment that never
+    /// installs a router (every single-shard deployment, every existing test)
+    /// is unaffected.
+    #[default]
+    ParentShard,
+    /// Spread children across `writable_shards` by rendezvous hash.
+    ///
+    /// Uses the same [`ShardRouter::pick_for_new_workflow`] a top-level start
+    /// uses, keyed on a deterministic per-parent placement key (see
+    /// [`child_placement_key`]) so a decision cycle retried after a crash
+    /// re-derives the identical shard.
+    Distributed,
+    /// Pin the child to a concrete shard.
+    ///
+    /// Rejected — never silently re-hashed — unless the shard is both readable
+    /// and writable, exactly like [`ShardPlacement::Shard`].
+    Shard(ShardId),
+    /// Pin the child via an operator-declared residency key.
+    ///
+    /// Resolved through [`ShardRouter::with_residency_map`]; an undeclared key
+    /// is an error, never a hash fallback.
+    ResidencyKey(String),
+}
+
+impl ChildPlacement {
+    /// Is this the default (parent-pinned) placement?
+    ///
+    /// Callers use this to take the untouched same-shard code path without
+    /// pattern-matching on a `#[non_exhaustive]` enum.
+    #[must_use]
+    pub const fn is_parent_shard(&self) -> bool {
+        matches!(self, Self::ParentShard)
+    }
+}
+
+/// The deterministic rendezvous key for the `seq`-th child of `parent`.
+///
+/// Restart stability is the whole point: a top-level start hashes a caller-
+/// supplied `workflow_id`, which is stable by construction, but a child's
+/// `ExecutionId` is minted fresh on every dispatch. Hashing the *minted id*
+/// would re-roll the shard whenever a decision cycle is retried after a crash.
+/// Hashing `(parent, seq)` instead re-derives the identical shard, giving
+/// children the same restart-stability contract top-level starts have.
+///
+/// ```rust
+/// use autumn_harvest::shard::child_placement_key;
+/// use autumn_harvest::types::{ExecutionId, ShardId};
+///
+/// let parent = ExecutionId::new_for_shard(ShardId::new(0));
+/// assert_eq!(child_placement_key(parent, 3), child_placement_key(parent, 3));
+/// assert_ne!(child_placement_key(parent, 3), child_placement_key(parent, 4));
+/// ```
+#[must_use]
+pub fn child_placement_key(parent: ExecutionId, seq: u32) -> String {
+    format!("{parent}#{seq}")
+}
+
+/// Resolve a [`ChildPlacement`] to the shard the child must be created on.
+///
+/// Pure: the router is passed in rather than read from
+/// [`GLOBAL_SHARD_ROUTER`], so every branch is unit-testable without a process
+/// global. [`ChildPlacement::ParentShard`] short-circuits before `router` is
+/// even inspected, which is why `router` is an `Option` — the default path must
+/// work in a deployment that never installs one.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when a non-default placement is requested
+/// but no router is installed, or when the router rejects the requested pin
+/// (unknown shard, drained shard, undeclared residency key). Placement **never**
+/// falls back to the parent's shard or the default shard: a silent fallback is
+/// the failure mode explicit placement exists to remove (issue #956 AC8).
+pub fn resolve_child_placement(
+    router: Option<&ShardRouter>,
+    placement: &ChildPlacement,
+    parent_shard: ShardId,
+    workflow_name: &str,
+    placement_key: &str,
+) -> crate::error::HarvestResult<ShardId> {
+    if placement.is_parent_shard() {
+        return Ok(parent_shard);
+    }
+
+    let Some(router) = router else {
+        return Err(crate::error::HarvestError::Config(format!(
+            "child placement {placement:?} requires an installed ShardRouter; \
+             refusing to fall back to the parent's shard"
+        )));
+    };
+
+    let requested = match placement {
+        ChildPlacement::ParentShard => unreachable!("short-circuited above"),
+        ChildPlacement::Distributed => {
+            return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
+        }
+        ChildPlacement::Shard(shard) => ShardPlacement::Shard(*shard),
+        ChildPlacement::ResidencyKey(key) => ShardPlacement::ResidencyKey(key.clone()),
+    };
+
+    router
+        .resolve_placement(&requested, workflow_name, placement_key)
+        .map_err(|e| crate::error::HarvestError::Config(e.to_string()))
+}
+
+/// Lifecycle status of one cross-shard child outbox row (issue #956).
+///
+/// Persisted as the row's `status` TEXT column. Deliberately a two-state
+/// machine: everything after `Started` is decided by *observed* facts (the
+/// child's state on the target shard, the parent's state here), never by a
+/// status the relay has to remember to advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrossShardChildStatus {
+    /// The parent committed the spawn; the child does not exist on the target
+    /// shard yet.
+    PendingStart,
+    /// The child row exists on the target shard.
+    Started,
+}
+
+impl CrossShardChildStatus {
+    /// The database representation of this status.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::PendingStart => "PENDING_START",
+            Self::Started => "STARTED",
+        }
+    }
+
+    /// Parse a database `status` value, or `None` when it is not recognised.
+    #[must_use]
+    pub fn from_db(raw: &str) -> Option<Self> {
+        match raw {
+            "PENDING_START" => Some(Self::PendingStart),
+            "STARTED" => Some(Self::Started),
+            _ => None,
+        }
+    }
+}
+
+/// Everything the relay knows about one cross-shard child this tick.
+///
+/// Assembled from the outbox row on the parent's shard plus one batched read of
+/// the child's state on the target shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossShardChildObservation<'a> {
+    /// Where the row is in its lifecycle.
+    pub status: CrossShardChildStatus,
+    /// A parent-side cancel that has not been delivered to the target shard yet.
+    pub cancel_requested: bool,
+    /// `None` for an **awaited** child; `Some(policy)` for a **detached** one.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
+    /// Whether the parent has reached a terminal state on this shard.
+    pub parent_terminal: bool,
+    /// The child's `state` column on the target shard, or `None` when the child
+    /// row is not visible yet (not created, or the shard was unreadable).
+    pub child_state: Option<&'a str>,
+}
+
+/// What the relay should do with one cross-shard child outbox row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossShardChildAction {
+    /// Create the child execution on the target shard, then mark the row
+    /// [`CrossShardChildStatus::Started`].
+    StartChild,
+    /// Deliver an idempotent cancel to the child on the target shard.
+    CancelChild,
+    /// Append the child's terminal event to the parent's history, wake the
+    /// parent, and drop the row — all in one transaction on the parent's shard.
+    DeliverTerminal,
+    /// Apply the parent-close policy to a detached child on the target shard.
+    ApplyCloseCascade,
+    /// Nothing to do this tick.
+    Wait,
+    /// The row is owed nothing more; drop it.
+    Retire,
+}
+
+/// Decide what one cross-shard child outbox row needs, from observed facts only.
+///
+/// Factored out of the scanner so every branch is exhaustively unit-testable
+/// with no database. The ordering is load-bearing:
+///
+/// 1. A row that has not started yet always starts first — a cancel or a closed
+///    parent still needs a child row to act on, and the parent's history already
+///    records `ChildWorkflowStarted`.
+/// 2. A pending cancel beats everything else, so a race-loser or over-deadline
+///    child stops burning work at the first opportunity.
+/// 3. A terminal child beats a closed parent: delivery re-checks the parent
+///    under `FOR UPDATE` and degrades to a plain row-delete when it has sealed,
+///    whereas retiring first would drop a wake the parent could still consume.
+#[must_use]
+pub fn next_cross_shard_child_action(
+    obs: &CrossShardChildObservation<'_>,
+) -> CrossShardChildAction {
+    use crate::types::ParentClosePolicy;
+
+    if obs.status == CrossShardChildStatus::PendingStart {
+        return CrossShardChildAction::StartChild;
+    }
+    if obs.cancel_requested {
+        return CrossShardChildAction::CancelChild;
+    }
+
+    let child_terminal = obs.child_state.is_some_and(is_terminal_execution_state);
+
+    match obs.parent_close_policy {
+        // Awaited: the parent is parked on this child's terminal.
+        None => {
+            if child_terminal {
+                CrossShardChildAction::DeliverTerminal
+            } else if obs.parent_terminal {
+                // Parity with the same-shard contract: an awaited child can
+                // outlive a cancelled or terminated parent. Nobody is left to
+                // wake, so stop tracking it rather than polling forever.
+                CrossShardChildAction::Retire
+            } else {
+                CrossShardChildAction::Wait
+            }
+        }
+        // Detached: the parent never consumes a terminal; the only thing left
+        // owed is the parent-close cascade.
+        Some(policy) => {
+            if child_terminal {
+                CrossShardChildAction::Retire
+            } else if obs.parent_terminal {
+                if policy == ParentClosePolicy::Abandon {
+                    CrossShardChildAction::Retire
+                } else {
+                    CrossShardChildAction::ApplyCloseCascade
+                }
+            } else {
+                CrossShardChildAction::Wait
+            }
+        }
+    }
+}
+
+/// Is `state` one of the engine's terminal execution states?
+///
+/// Mirrors `crate::erase::is_terminal_state`, restated here so this module's
+/// pure decision logic carries no `db`-feature dependency.
+fn is_terminal_execution_state(state: &str) -> bool {
+    matches!(
+        state,
+        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
+    )
+}

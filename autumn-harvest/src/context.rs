@@ -2616,6 +2616,24 @@ pub struct WorkflowContext {
     /// this once so each race has a stable, unique `__child_timeout:{seq}:{name}`
     /// timer ID across replays, distinct from `signal_timeout_seq`.
     child_timeout_seq: Mutex<u32>,
+    /// Monotonically increasing counter for the deterministic child *placement*
+    /// key (issue #956). Incremented once per **fresh** cross-shard child
+    /// dispatch — never on replay, which reuses the recorded `child_id` and so
+    /// never re-derives placement at all. Combined with the parent's
+    /// `ExecutionId` by [`crate::shard::child_placement_key`] into the
+    /// rendezvous key, so a decision cycle retried after a crash re-derives the
+    /// identical shard for each child (the restart-stability contract a
+    /// top-level start gets from its caller-supplied `workflow_id`).
+    child_placement_seq: Mutex<u32>,
+    /// Shard router used to resolve a non-default [`ChildPlacement`]
+    /// (issue #956).
+    ///
+    /// `None` — the default, and what every executor entry point constructs —
+    /// falls back to the process-global [`crate::shard::GLOBAL_SHARD_ROUTER`]
+    /// the runtime installs at boot. An explicit router is threaded in by tests
+    /// and by embedders that run several topologies in one process, so
+    /// placement never depends on mutating a process global.
+    shard_router: Option<crate::shard::ShardRouter>,
     /// Monotonically increasing counter for naming `ctx.race()` markers
     /// (issue #600). Each `race()` call increments this once so each race has
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
@@ -3294,6 +3312,8 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
+            child_placement_seq: Mutex::new(0),
+            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -3446,6 +3466,8 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
+            child_placement_seq: Mutex::new(0),
+            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -3513,6 +3535,8 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
+            child_placement_seq: Mutex::new(0),
+            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -7148,6 +7172,88 @@ impl WorkflowContext {
         }
     }
 
+    /// Thread an explicit [`ShardRouter`](crate::shard::ShardRouter) for
+    /// resolving non-default [`ChildPlacement`](crate::shard::ChildPlacement)
+    /// (issue #956).
+    ///
+    /// Without this the context falls back to the process-global router the
+    /// runtime installs at boot, which is the production path. Supplying one
+    /// explicitly is for tests and for embedders running more than one topology
+    /// in a single process — neither should have to mutate a process global to
+    /// exercise placement.
+    #[must_use]
+    pub fn with_shard_router(mut self, router: crate::shard::ShardRouter) -> Self {
+        self.shard_router = Some(router);
+        self
+    }
+
+    /// The router placement resolution should consult: the explicitly threaded
+    /// one, else the process-global one, else none.
+    fn placement_router(&self) -> Option<crate::shard::ShardRouter> {
+        if let Some(router) = self.shard_router.clone() {
+            return Some(router);
+        }
+        // The process-global router is itself `db`-gated (it is installed by the
+        // runtime/plugin at boot). In a `--no-default-features` build there is
+        // no global to fall back to, so an explicitly threaded router is the
+        // only source — which is exactly what the pure executor tests use.
+        #[cfg(feature = "db")]
+        {
+            return crate::shard::GLOBAL_SHARD_ROUTER
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned());
+        }
+        #[cfg(not(feature = "db"))]
+        None
+    }
+
+    /// Mint a **fresh** child `ExecutionId` on the shard `placement` selects.
+    ///
+    /// The default [`ChildPlacement::ParentShard`](crate::shard::ChildPlacement::ParentShard)
+    /// short-circuits to today's `ExecutionId::new_for_shard(parent_shard)` and
+    /// never touches the router or the placement counter, so a deployment that
+    /// never opts in is byte-for-byte unchanged — including the counter, which
+    /// stays at zero and therefore cannot perturb any other caller's key.
+    ///
+    /// Only ever called on a **fresh dispatch**. A replay reuses the `child_id`
+    /// recorded in `ChildWorkflowStarted`, so placement is decided exactly once
+    /// in a child's lifetime and the parent's history replays identically
+    /// wherever the child physically lives (issue #956 AC6).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`HarvestError::Config`] when a non-default placement is
+    /// requested with no router installed, or when the router rejects the pin.
+    /// Never falls back to the parent's shard (issue #956 AC8).
+    fn mint_child_id(
+        &self,
+        placement: &crate::shard::ChildPlacement,
+        workflow_name: &str,
+    ) -> HarvestResult<ExecutionId> {
+        let parent_shard = self.exec_id.shard();
+        if placement.is_parent_shard() {
+            return Ok(ExecutionId::new_for_shard(parent_shard));
+        }
+        let seq = {
+            let mut seq = self
+                .child_placement_seq
+                .lock()
+                .expect("child_placement_seq lock poisoned");
+            *seq += 1;
+            *seq
+        };
+        let key = crate::shard::child_placement_key(self.exec_id, seq);
+        let shard = crate::shard::resolve_child_placement(
+            self.placement_router().as_ref(),
+            placement,
+            parent_shard,
+            workflow_name,
+            &key,
+        )?;
+        Ok(ExecutionId::new_for_shard(shard))
+    }
+
     /// Spawn a child workflow and await its terminal result.
     ///
     /// During replay, returns the recorded child output or failure.
@@ -7164,11 +7270,56 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
         input: Value,
+    ) -> HarvestResult<Value> {
+        self.spawn_child_workflow_raw_placed(
+            workflow_name,
+            input,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Spawn a child workflow on the shard `placement` selects and await its
+    /// terminal result (issue #956).
+    ///
+    /// Identical to [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)
+    /// in every respect except where the child's rows live. With the default
+    /// [`ChildPlacement::ParentShard`](crate::shard::ChildPlacement::ParentShard)
+    /// the two are the same call.
+    ///
+    /// # Cross-shard semantics
+    ///
+    /// When `placement` resolves to a shard other than the parent's, the child
+    /// is **not** created inside the parent's decision transaction — that
+    /// transaction stays shard-local by design. Instead the spawn durably
+    /// records a cross-shard outbox row alongside `ChildWorkflowStarted`, and
+    /// the runtime's cross-shard relay creates the child on the target shard and
+    /// later delivers its terminal back. The effects are **at-least-once with
+    /// dedupe**; the observable contract for the workflow author is unchanged,
+    /// but the child's start and its terminal wake are each one scanner tick
+    /// away rather than one transaction away.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)
+    /// returns, plus [`HarvestError::Config`] when a non-default placement is
+    /// requested and no [`ShardRouter`](crate::shard::ShardRouter) is installed
+    /// or the router rejects the requested pin. Placement never silently falls
+    /// back to the parent's shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    pub async fn spawn_child_workflow_raw_placed(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Value> {
         let history_match = self.match_history(|m| m.match_child_workflow(workflow_name, &input));
 
@@ -7295,14 +7446,17 @@ impl WorkflowContext {
                     });
                 }
 
+                // Inherit the parent's shard so data residency is transitive
+                // across the workflow tree (issue #697 AC4) — unless the caller
+                // opted this spawn out via `placement` (issue #956). Either way
+                // the encoded shard is what makes every later id-based lookup
+                // route to the child's database in O(1), with no directory.
+                // Resolved BEFORE the command is pushed so a rejected placement
+                // fails the spawn with nothing recorded.
+                let child_id = self.mint_child_id(placement, workflow_name)?;
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
-                    // Inherit the parent's shard so data residency is transitive
-                    // across the workflow tree (issue #697 AC4). The worker
-                    // already writes the child's row on the parent's shard; the
-                    // encoded shard is what makes every later id-based lookup
-                    // route there too, instead of the default shard.
-                    child_id: ExecutionId::new_for_shard(self.exec_id.shard()),
+                    child_id,
                     workflow_name: workflow_name.to_string(),
                     input,
                     result_tx: tx,
@@ -7371,6 +7525,47 @@ impl WorkflowContext {
         input: Value,
         parent_close_policy: crate::types::ParentClosePolicy,
     ) -> HarvestResult<ExecutionId> {
+        self.spawn_child_workflow_detached_raw_placed(
+            workflow_name,
+            input,
+            parent_close_policy,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+    }
+
+    /// Spawn a **detached** child workflow on the shard `placement` selects
+    /// (issue #956).
+    ///
+    /// Identical to
+    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
+    /// except for where the child's rows live; the default placement makes the
+    /// two the same call.
+    ///
+    /// The `ParentClosePolicy` cascade reaches a cross-shard detached child too:
+    /// the parent's close is observed by the cross-shard relay, which applies
+    /// `RequestCancel`/`Terminate` on the target shard with the same
+    /// at-least-once + idempotent-delivery semantics as the external
+    /// signal/cancel outboxes. Because that hop is not inside the parent's
+    /// terminal transaction, the cascade lands one scanner tick after the parent
+    /// seals rather than atomically with it.
+    ///
+    /// # Errors
+    ///
+    /// Everything
+    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
+    /// returns, plus [`HarvestError::Config`] when a non-default placement
+    /// cannot be resolved. Never falls back to the parent's shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub fn spawn_child_workflow_detached_raw_placed(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        parent_close_policy: crate::types::ParentClosePolicy,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<ExecutionId> {
         let history_match = self.match_history(|m| {
             m.match_detached_child_spawn(workflow_name, &input, parent_close_policy)
         });
@@ -7401,7 +7596,7 @@ impl WorkflowContext {
                     });
                 }
 
-                let child_id = ExecutionId::new_for_shard(self.exec_id.shard());
+                let child_id = self.mint_child_id(placement, workflow_name)?;
                 self.push_command(WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
                     workflow_name: workflow_name.to_string(),
@@ -7449,8 +7644,40 @@ impl WorkflowContext {
     where
         I: serde::Serialize,
     {
+        self.spawn_child_workflow_detached_placed(
+            info,
+            input,
+            parent_close_policy,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+    }
+
+    /// Typed wrapper around
+    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed)
+    /// (issue #956).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
+    /// Propagates all errors from
+    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed).
+    pub fn spawn_child_workflow_detached_placed<I>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+        parent_close_policy: crate::types::ParentClosePolicy,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<ExecutionId>
+    where
+        I: serde::Serialize,
+    {
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
-        self.spawn_child_workflow_detached_raw(info.name, json_input, parent_close_policy)
+        self.spawn_child_workflow_detached_raw_placed(
+            info.name,
+            json_input,
+            parent_close_policy,
+            placement,
+        )
     }
 
     // ── Typed dispatch helpers ────────────────────────────────────────────────
@@ -7617,8 +7844,33 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        self.spawn_child_workflow_placed(info, input, &crate::shard::ChildPlacement::ParentShard)
+            .await
+    }
+
+    /// Typed wrapper around
+    /// [`spawn_child_workflow_raw_placed`](Self::spawn_child_workflow_raw_placed)
+    /// (issue #956).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized
+    /// or the child output cannot be deserialized. Propagates all errors from
+    /// [`spawn_child_workflow_raw_placed`](Self::spawn_child_workflow_raw_placed).
+    pub async fn spawn_child_workflow_placed<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<O>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
         let json_input = serde_json::to_value(input)?;
-        let raw = self.spawn_child_workflow_raw(info.name, json_input).await?;
+        let raw = self
+            .spawn_child_workflow_raw_placed(info.name, json_input, placement)
+            .await?;
         Ok(serde_json::from_value(raw)?)
     }
 
@@ -7686,13 +7938,48 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal `child_timeout_seq` mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::single_match_else)]
     pub async fn spawn_child_workflow_timeout(
         &self,
         workflow_name: &str,
         input: Value,
         timeout: std::time::Duration,
+    ) -> HarvestResult<Option<Value>> {
+        self.spawn_child_workflow_timeout_placed(
+            workflow_name,
+            input,
+            timeout,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Spawn a child on the shard `placement` selects and await its result with
+    /// a deadline (issue #956, extending #779).
+    ///
+    /// Identical to
+    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout)
+    /// except for where the child's rows live. The deadline timer is a
+    /// **parent-side** durable timer, so it is unaffected by placement and still
+    /// arms in the same suspension batch as the child.
+    ///
+    /// # Errors
+    ///
+    /// Everything
+    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout)
+    /// returns, plus [`HarvestError::Config`] when a non-default placement
+    /// cannot be resolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `child_timeout_seq` mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::single_match_else)]
+    pub async fn spawn_child_workflow_timeout_placed(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        timeout: std::time::Duration,
+        placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Option<Value>> {
         use crate::replay::ChildOrTimerMatch;
 
@@ -7892,8 +8179,12 @@ impl WorkflowContext {
                 // recorded id is reused verbatim (`recorded_child_id`), so
                 // pre-fix in-flight children keep their unencoded ids and replay
                 // unchanged.
-                let child_id = recorded_child_id
-                    .unwrap_or_else(|| ExecutionId::new_for_shard(self.exec_id.shard()));
+                let child_id = match recorded_child_id {
+                    Some(id) => id,
+                    // Fresh dispatch: resolve placement (issue #956). The
+                    // default keeps the pre-#956 `new_for_shard(parent)` mint.
+                    None => self.mint_child_id(placement, workflow_name)?,
+                };
                 let (child_tx, child_rx) = oneshot::channel();
                 let (timer_tx, timer_rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -7942,9 +8233,37 @@ impl WorkflowContext {
     where
         O: serde::de::DeserializeOwned,
     {
+        self.execute_child_workflow_timeout_placed(
+            info,
+            input,
+            timeout,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Typed wrapper around
+    /// [`spawn_child_workflow_timeout_placed`](Self::spawn_child_workflow_timeout_placed)
+    /// (issue #956).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the input cannot be serialized
+    /// or the child output cannot be deserialized. Propagates all errors from
+    /// [`spawn_child_workflow_timeout_placed`](Self::spawn_child_workflow_timeout_placed).
+    pub async fn execute_child_workflow_timeout_placed<O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: impl serde::Serialize,
+        timeout: std::time::Duration,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<Option<O>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
         let json_input = serde_json::to_value(input)?;
         match self
-            .spawn_child_workflow_timeout(info.name, json_input, timeout)
+            .spawn_child_workflow_timeout_placed(info.name, json_input, timeout, placement)
             .await?
         {
             Some(raw) => Ok(Some(serde_json::from_value(raw)?)),
@@ -10212,6 +10531,43 @@ impl WorkflowContext {
         &self,
         children: Vec<(String, Value)>,
     ) -> HarvestResult<Vec<Value>> {
+        self.spawn_child_workflow_fan_out_raw_placed(
+            children,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Spawn N child workflows in parallel, placing each one per `placement`
+    /// (issue #956) — fail-fast variant.
+    ///
+    /// This is the call the issue exists for: with
+    /// [`ChildPlacement::Distributed`](crate::shard::ChildPlacement::Distributed)
+    /// a large fan-out's children rendezvous-spread across `writable_shards`
+    /// instead of concentrating every child's event log, task-queue row, timer
+    /// and signal on the parent's database.
+    ///
+    /// Each child gets its own deterministic placement key, so the spread is
+    /// uniform *and* a decision cycle retried after a crash re-derives the
+    /// identical placement for every slot.
+    ///
+    /// # Errors
+    ///
+    /// Everything
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw)
+    /// returns, plus [`HarvestError::Config`] when a non-default placement
+    /// cannot be resolved — raised before any child in the group is dispatched
+    /// where the failure is placement-configuration (no router, rejected pin),
+    /// so a misconfigured fan-out never half-dispatches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_raw_placed(
+        &self,
+        children: Vec<(String, Value)>,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<Vec<Value>> {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
@@ -10229,7 +10585,8 @@ impl WorkflowContext {
         let futures: Vec<_> = children
             .into_iter()
             .map(|(workflow_name, input)| async move {
-                self.spawn_child_workflow_raw(&workflow_name, input).await
+                self.spawn_child_workflow_raw_placed(&workflow_name, input, placement)
+                    .await
             })
             .collect();
 
@@ -10273,6 +10630,38 @@ impl WorkflowContext {
         &self,
         children: Vec<(String, Value)>,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.spawn_child_workflow_fan_out_collect_raw_placed(
+            children,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Spawn N child workflows in parallel, placing each one per `placement`
+    /// (issue #956) — collect-all variant.
+    ///
+    /// Same placement semantics as
+    /// [`spawn_child_workflow_fan_out_raw_placed`](Self::spawn_child_workflow_fan_out_raw_placed);
+    /// same per-slot failure capture as
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw).
+    ///
+    /// # Errors
+    ///
+    /// Everything
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw)
+    /// returns, plus [`HarvestError::Config`] when a non-default placement
+    /// cannot be resolved. A placement-configuration failure is an engine-level
+    /// error (the outer `Result`), never a per-slot `Err(String)`: it means the
+    /// deployment is misconfigured, not that one child failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_collect_raw_placed(
+        &self,
+        children: Vec<(String, Value)>,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
@@ -10290,7 +10679,10 @@ impl WorkflowContext {
         let futures: Vec<_> = children
             .into_iter()
             .map(|(workflow_name, input)| async move {
-                match self.spawn_child_workflow_raw(&workflow_name, input).await {
+                match self
+                    .spawn_child_workflow_raw_placed(&workflow_name, input, placement)
+                    .await
+                {
                     Ok(v) => Ok(Ok(v)),
                     // A failed child surfaces as a typed `WorkflowFailed` (issue #767);
                     // it is the collect-all per-slot failure to capture rather than
@@ -10335,6 +10727,40 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        self.spawn_child_workflow_fan_out_placed(
+            info,
+            inputs,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Typed fail-fast fan-out with an explicit
+    /// [`ChildPlacement`](crate::shard::ChildPlacement) (issue #956).
+    ///
+    /// The ergonomic form of the primitive this issue exists for:
+    ///
+    /// ```rust,ignore
+    /// let results: Vec<Receipt> = ctx
+    ///     .spawn_child_workflow_fan_out_placed(&process_one_info(), items, &ChildPlacement::Distributed)
+    ///     .await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates all errors from
+    /// [`spawn_child_workflow_fan_out_raw_placed`](Self::spawn_child_workflow_fan_out_raw_placed).
+    pub async fn spawn_child_workflow_fan_out_placed<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<Vec<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
         let children = inputs
             .into_iter()
             .map(|i| {
@@ -10343,7 +10769,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let raw_results = self.spawn_child_workflow_fan_out_raw(children).await?;
+        let raw_results = self
+            .spawn_child_workflow_fan_out_raw_placed(children, placement)
+            .await?;
         raw_results
             .into_iter()
             .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
@@ -10372,6 +10800,32 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        self.spawn_child_workflow_fan_out_collect_placed(
+            info,
+            inputs,
+            &crate::shard::ChildPlacement::ParentShard,
+        )
+        .await
+    }
+
+    /// Typed collect-all fan-out with an explicit
+    /// [`ChildPlacement`](crate::shard::ChildPlacement) (issue #956).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates engine-level errors from
+    /// [`spawn_child_workflow_fan_out_collect_raw_placed`](Self::spawn_child_workflow_fan_out_collect_raw_placed).
+    pub async fn spawn_child_workflow_fan_out_collect_placed<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+        placement: &crate::shard::ChildPlacement,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
         let children = inputs
             .into_iter()
             .map(|i| {
@@ -10381,7 +10835,7 @@ impl WorkflowContext {
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
         let raw_results = self
-            .spawn_child_workflow_fan_out_collect_raw(children)
+            .spawn_child_workflow_fan_out_collect_raw_placed(children, placement)
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
