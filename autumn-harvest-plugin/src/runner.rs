@@ -281,20 +281,29 @@ fn install_completion_callback_config(built: &BuiltHarvest) {
     }
 }
 
-/// Install the process-global audit-export runtime config (issue #953).
+/// Resolve the audit-export runtime config from a `BuiltHarvest` (issue #953).
 ///
-/// Called from `PreparedHarvestRuntime::build`, the one construction point
-/// every `BuiltHarvest` consumer funnels through, so the exporter's sink is
-/// installed exactly once regardless of which path started the runtime. Core
-/// ships no HTTP client, so an embedder-supplied `AuditSink` is used verbatim
-/// and a `reqwest` signed-webhook sink is substituted when only a URL was
-/// configured.
+/// **Pure**: it reads `built` and allocates, but touches no process-global
+/// state. Installing is a separate step ([`commit_audit_export_config`]) so
+/// that a runtime whose construction later *fails* cannot leave the global
+/// config replaced (issue #953, Codex review P1) — `PreparedHarvestRuntime::build`
+/// has several fallible steps after this point, and the config is a
+/// process-wide static shared with any runtime already running in this process.
+/// Clobbering it from a failed build would silently redirect a *live*
+/// runtime's audit records to the failed build's sink, or stop its export
+/// entirely.
 ///
-/// Installs `None` when neither was configured — deliberately a write, not a
-/// skip: the config is a process-wide static, so a second runtime built
-/// without a sink must not keep shipping audit records to the first runtime's
-/// destination.
-fn install_audit_export_config(built: &BuiltHarvest) {
+/// Core ships no HTTP client, so an embedder-supplied `AuditSink` is used
+/// verbatim and a `reqwest` signed-webhook sink is substituted when only a URL
+/// was configured.
+///
+/// Resolves to `None` when neither was configured. That `None` is meaningful
+/// and gets written: the config is a process-wide static, so a second runtime
+/// built without a sink must not keep shipping audit records to the first
+/// runtime's destination.
+fn prepare_audit_export_config(
+    built: &BuiltHarvest,
+) -> Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>> {
     let audit_config = built.audit_export_config();
     let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
         audit_config.sink.clone().or_else(|| {
@@ -303,10 +312,7 @@ fn install_audit_export_config(built: &BuiltHarvest) {
                     as Arc<dyn autumn_harvest::audit_export::AuditSink>
             })
         });
-    let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
-        return;
-    };
-    *lock = sink.map(|sink| {
+    sink.map(|sink| {
         // `HarvestBuilder::try_build` rejects a webhook with no secret, so
         // reaching the empty-key fallback means an embedder-supplied sink that
         // authenticates some other way (IAM, mTLS, a local file). Warn rather
@@ -328,7 +334,20 @@ fn install_audit_export_config(built: &BuiltHarvest) {
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
         })
-    });
+    })
+}
+
+/// Publish the resolved audit-export config to the process-global static.
+///
+/// Deliberately the **last** thing `PreparedHarvestRuntime::build` does, after
+/// every fallible step has succeeded — see [`prepare_audit_export_config`].
+fn commit_audit_export_config(
+    config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+) {
+    let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
+        return;
+    };
+    *lock = config;
 }
 
 impl PreparedHarvestRuntime {
@@ -340,7 +359,11 @@ impl PreparedHarvestRuntime {
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
         install_completion_callback_config(&built);
-        install_audit_export_config(&built);
+        // Resolved here, while `built` is still owned, but NOT published until
+        // every fallible step below has succeeded (issue #953, Codex review
+        // P1). `install_completion_callback_config` above still publishes
+        // eagerly; that is #605's pre-existing behaviour and out of scope here.
+        let audit_export_config = prepare_audit_export_config(&built);
         let classic_dag_names = built
             .dags()
             .iter()
@@ -439,6 +462,10 @@ impl PreparedHarvestRuntime {
         worker_runtime_config.resolve_shard_assignments();
 
         warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
+
+        // Every fallible step has succeeded; only now may this runtime's sink
+        // replace whatever a previously-built runtime installed.
+        commit_audit_export_config(audit_export_config);
 
         Ok(Self {
             registry: Arc::new(registry),

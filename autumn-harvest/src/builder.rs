@@ -6967,6 +6967,64 @@ mod tests {
         assert!(config.secret.is_none());
     }
 
+    /// A custom sink takes precedence over a webhook, so the webhook is dead
+    /// config that no request can ever reach. Validating it anyway blocked
+    /// startup on a URL nothing would call (issue #953, Codex review P2).
+    #[test]
+    fn a_custom_sink_makes_the_webhook_checks_moot() {
+        struct Noop;
+        impl crate::audit_export::AuditSink for Noop {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a crate::audit_export::AuditBatch<'a>,
+            ) -> crate::audit_export::SinkFuture<'a> {
+                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
+            }
+        }
+
+        // A URL that fails the SSRF policy outright, and no secret: both
+        // webhook checks would reject this build on their own.
+        let built = HarvestBuilder::new()
+            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
+            .audit_export_sink(Noop)
+            .try_build()
+            .expect(
+                "a custom sink wins, so neither webhook check may block the \
+                 build on a URL that can never be called",
+            );
+        let config = built.audit_export_config();
+        assert!(config.sink.is_some());
+        assert!(config.validate_webhook_url().is_ok());
+        assert!(!config.webhook_is_missing_a_secret());
+    }
+
+    /// The same URL without a sink must still be rejected — the guard above is
+    /// precedence, not a way to disable SSRF validation.
+    #[test]
+    fn the_webhook_checks_still_bite_without_a_sink() {
+        let err = HarvestBuilder::new()
+            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
+            .audit_export_secret(b"k".to_vec())
+            .try_build()
+            .expect_err("a link-local webhook with no sink must be rejected");
+        assert!(
+            matches!(err, HarvestBuilderError::AuditSinkRejected { .. }),
+            "expected AuditSinkRejected, got {err:?}"
+        );
+
+        let err = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/ingest")
+            .try_build()
+            .expect_err("a webhook with no secret and no sink must be rejected");
+        assert!(
+            matches!(err, HarvestBuilderError::AuditSinkSecretMissing),
+            "expected AuditSinkSecretMissing, got {err:?}"
+        );
+    }
+
     #[test]
     fn builder_with_no_completion_callback_config_has_empty_defaults() {
         // Identical-behavior guarantee: an embedder who never touches the

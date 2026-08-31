@@ -573,12 +573,25 @@ impl AuditExportBuilderConfig {
         self.sink.is_none() && self.webhook_url.is_some() && self.secret.is_none()
     }
 
+    /// Validate the webhook URL against the SSRF policy.
+    ///
+    /// Skipped entirely when an embedder-supplied `sink` is set, matching
+    /// [`Self::webhook_is_missing_a_secret`] and the documented precedence:
+    /// the sink wins, no `ReqwestAuditSink` is ever constructed, and no request
+    /// can reach the URL. Failing startup on a stale or non-allowlisted URL
+    /// that nothing will call is a false positive (issue #953, Codex review
+    /// P2) — the two webhook checks must agree about when a webhook is live,
+    /// or a config that skips one still trips the other.
+    ///
     /// # Errors
     /// Returns the `(url, rejection)` pair when the webhook URL fails
     /// validation.
     pub fn validate_webhook_url(
         &self,
     ) -> Result<(), (String, crate::completion_callback::SsrfRejection)> {
+        if self.sink.is_some() {
+            return Ok(());
+        }
         let Some(url) = &self.webhook_url else {
             return Ok(());
         };
