@@ -219,10 +219,11 @@ async fn a_failing_migration_rolls_back_with_its_ledger_row() {
 
 #[tokio::test]
 async fn a_unique_violation_from_the_migrations_own_sql_is_a_failure_not_a_skip() {
-    // The ledger row is inserted first so a concurrent migrator loses on THAT
-    // row and skips the migration. A unique violation raised by the migration's
-    // own body must never be read the same way: that would skip the migration
-    // and report success.
+    // "Already applied" is decided by an explicit ledger lookup under the
+    // table lock, never by matching a unique violation on the transaction's
+    // result. A unique violation raised by the migration's own body must not be
+    // read as "someone else applied this": that would skip it and report
+    // success.
     let (_container, url) = empty_postgres().await;
 
     let self_conflicting = probe_migration(
@@ -356,4 +357,59 @@ async fn ledger_rows_this_binary_does_not_know_are_reported_not_removed() {
             .contains(&"29990909000000".to_string()),
         "an unrecognized ledger row must never be removed"
     );
+}
+
+#[tokio::test]
+async fn a_migration_body_does_not_see_its_own_version_in_the_ledger() {
+    // Diesel runs a migration's body first and records its version afterwards,
+    // so a body may condition its DDL on its own version being absent. Record
+    // the version first and that body reads its own row through the
+    // transaction's writes, skips the DDL, and still commits the version —
+    // an incomplete schema permanently marked applied, from a file
+    // `diesel migration run` applies correctly.
+    let (_container, url) = empty_postgres().await;
+
+    let self_inspecting = probe_migration(
+        "29990102000000",
+        "CREATE TABLE harvest_migrate_seen AS \
+         SELECT count(*) AS n FROM __diesel_schema_migrations \
+         WHERE version = '29990102000000';",
+    );
+
+    let report = migrate::apply(&url, std::slice::from_ref(&self_inspecting))
+        .await
+        .expect("the migration applies");
+    assert_eq!(report.applied.len(), 1);
+
+    let seen = seen_count(&url).await;
+    assert_eq!(
+        seen, 0,
+        "the body must not observe its own version: Diesel records it after \
+         the body runs, so a body that checks the ledger sees no row"
+    );
+
+    // The version is still recorded once the body has run.
+    assert_eq!(
+        ledger_versions(&url).await,
+        vec!["29990102000000".to_string()]
+    );
+}
+
+/// The single count the ledger-visibility migration recorded.
+async fn seen_count(url: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Seen {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let mut conn = connect(url).await;
+    diesel::sql_query("SELECT n FROM harvest_migrate_seen")
+        .load::<Seen>(&mut conn)
+        .await
+        .expect("read the recorded count")
+        .into_iter()
+        .next()
+        .expect("one row")
+        .n
 }

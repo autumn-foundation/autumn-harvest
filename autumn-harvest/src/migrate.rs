@@ -544,12 +544,18 @@ pub async fn apply(
 ///
 /// # Concurrency
 ///
-/// Each migration's ledger row is inserted **first** inside its transaction,
-/// before the schema change runs. A second migrator racing on the same database
-/// therefore blocks on that row rather than on the schema, and once the first
-/// commits it sees a unique violation and skips the migration as already
-/// applied ([`MigrationReport::applied_concurrently`]) instead of replaying DDL
-/// that has already happened.
+/// Each migration's transaction takes a `SHARE ROW EXCLUSIVE` lock on the
+/// ledger table before running anything. A second migrator racing on the same
+/// database therefore blocks there rather than half-way through the schema
+/// change, and on acquiring the lock re-reads the ledger: finding the version
+/// already committed, it skips the migration as already applied
+/// ([`MigrationReport::applied_concurrently`]) instead of replaying DDL that
+/// has already happened. The lock does not conflict with plain readers, so
+/// `status` is unaffected.
+///
+/// The ledger row itself is **not** the contention point, because it is written
+/// after the body — Diesel's order, which a body that consults the ledger can
+/// depend on. See [`apply_in_transaction`].
 ///
 /// A `run_in_transaction = false` migration has no transaction to contend on,
 /// so that protection does not apply to it: see [`apply_without_transaction`]
@@ -647,18 +653,20 @@ enum Applied {
     Concurrently,
 }
 
-/// Transaction-body failure, split so a unique violation raised by the **ledger
-/// insert** is never confused with one raised by the migration's own SQL.
+/// Transaction-body failure, split so "already applied" is never inferred from
+/// a database error.
 ///
-/// Matching `UniqueViolation` on the transaction's result alone would classify a
-/// migration whose body legitimately hits a unique constraint as "someone else
-/// already applied this" — silently skipping it and reporting success.
+/// `AlreadyRecorded` is raised only by an explicit ledger lookup under the
+/// table lock, never by matching `UniqueViolation` on the transaction's result:
+/// a migration whose body legitimately hits a unique constraint would otherwise
+/// be classified as "someone else already applied this" and silently skipped
+/// while reporting success.
 enum ApplyError {
-    /// The ledger already carries this version: a concurrent migrator committed
-    /// it while this transaction was open.
+    /// The ledger already carries this version — a concurrent migrator
+    /// committed it before this transaction took the lock.
     AlreadyRecorded,
-    /// Anything else — the migration's own SQL, or the insert failing for a
-    /// reason other than the version already being there.
+    /// Anything else: the migration's own SQL, the lock, the lookup, or the
+    /// ledger insert.
     Db(DieselError),
 }
 
@@ -721,6 +729,30 @@ async fn apply_without_transaction(
     }
 }
 
+/// Apply a migration inside one transaction, in Diesel's order: **body first,
+/// ledger row second**.
+///
+/// That order is not cosmetic. A migration body may legitimately consult
+/// `__diesel_schema_migrations` — conditioning DDL on its own version being
+/// absent, say. Recording the version first makes it visible to the body
+/// through the transaction's own writes, so such a migration skips its DDL and
+/// still commits the version: an incomplete schema, permanently marked applied,
+/// from a file `diesel migration run` would have applied correctly. Whatever
+/// serializes concurrent migrators must therefore not be the ledger row itself.
+///
+/// A `SHARE ROW EXCLUSIVE` lock on the ledger table does the serializing
+/// instead. It conflicts with itself, so a second migrator waits here — before
+/// any DDL — rather than half-way through the schema change; it does not
+/// conflict with `ACCESS SHARE`, so `status` and any other plain reader is
+/// unaffected. It is held to the end of the transaction and needs no advisory
+/// key, keeping this path out of the keyspace shared with the claim path,
+/// `mutex`, `admission_gate` and the scheduler.
+///
+/// Holding the lock, the ledger is re-checked before the body runs: the
+/// migrator that waited must not replay DDL the winner already committed. That
+/// check is a plain `SELECT`, so "already applied" is decided deterministically
+/// rather than inferred from a unique violation — which the body's own SQL
+/// could equally have raised.
 async fn apply_in_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
@@ -729,22 +761,30 @@ async fn apply_in_transaction(
     let sql = script.sql.clone();
 
     let result: Result<(), ApplyError> = Box::pin(conn.transaction(async |tx| {
-        // Ledger row first: it is the row a concurrent migrator contends on,
-        // so the loser waits here rather than half-way through the DDL.
-        let recorded = diesel::sql_query(format!(
+        diesel::sql_query(format!(
+            "LOCK TABLE {MIGRATION_LEDGER} IN SHARE ROW EXCLUSIVE MODE"
+        ))
+        .execute(tx)
+        .await?;
+
+        let already: Vec<LedgerVersion> = diesel::sql_query(format!(
+            "SELECT version FROM {MIGRATION_LEDGER} WHERE version = $1"
+        ))
+        .bind::<Text, _>(version.as_str())
+        .load(tx)
+        .await?;
+        if !already.is_empty() {
+            return Err(ApplyError::AlreadyRecorded);
+        }
+
+        tx.batch_execute(&sql).await?;
+
+        diesel::sql_query(format!(
             "INSERT INTO {MIGRATION_LEDGER} (version) VALUES ($1)"
         ))
         .bind::<Text, _>(version.as_str())
         .execute(tx)
-        .await;
-        match recorded {
-            Ok(_) => {}
-            Err(DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
-                return Err(ApplyError::AlreadyRecorded);
-            }
-            Err(error) => return Err(ApplyError::Db(error)),
-        }
-        tx.batch_execute(&sql).await?;
+        .await?;
         Ok(())
     }))
     .await;

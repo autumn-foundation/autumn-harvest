@@ -48,11 +48,21 @@ operator decision with data loss attached.
 
 Two details worth naming:
 
-- **The ledger row is inserted first**, inside each migration's transaction and
-  before its DDL. A second migrator racing on the same database therefore blocks
-  on that row rather than part-way through the schema change, and on commit sees
-  a unique violation and skips the migration as already applied
-  (`applied_concurrently` in the report) instead of replaying DDL. No advisory
+- **The body runs before its ledger row is written**, which is Diesel's order
+  and not merely a preference: a migration body may consult
+  `__diesel_schema_migrations` and condition its DDL on its own version being
+  absent. Record the version first and that body reads its own row through the
+  transaction's own writes, skips the DDL, and still commits the version —
+  an incomplete schema permanently marked applied, from a file
+  `diesel migration run` applies correctly. So the ledger row is *not* what
+  serializes concurrent migrators. A `SHARE ROW EXCLUSIVE` lock on the ledger
+  table is: it conflicts with itself, so the second migrator waits before any
+  DDL rather than part-way through the schema change, and does not conflict
+  with plain readers, so `status` is unaffected. Holding it, the ledger is
+  re-checked before the body runs, and a version already there is reported as
+  `applied_concurrently` instead of replaying DDL. That check is a `SELECT`, so
+  "already applied" is decided outright rather than inferred from a unique
+  violation the body's own SQL could equally have raised. Still no advisory
   lock, so no new key in a keyspace shared with the claim path, `mutex`,
   `admission_gate` and the scheduler.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
