@@ -1835,19 +1835,24 @@ pub fn merge_dlq_aggregates(
         total += partial.total;
         filtered_total += partial.filtered_total;
         for group in partial.groups {
-            let entry = merged
-                .entry(group.key.clone())
-                .or_insert_with(|| DlqRawGroup {
-                    key: group.key.clone(),
-                    count: 0,
-                    first_seen: None,
-                    last_seen: None,
-                    sample_ids: Vec::new(),
-                });
-            entry.count += group.count;
-            entry.first_seen = min_instant(entry.first_seen, group.first_seen);
-            entry.last_seen = max_instant(entry.last_seen, group.last_seen);
-            for id in group.sample_ids {
+            let DlqRawGroup {
+                key,
+                count,
+                first_seen,
+                last_seen,
+                sample_ids,
+            } = group;
+            let entry = merged.entry(key.clone()).or_insert_with(|| DlqRawGroup {
+                key,
+                count: 0,
+                first_seen: None,
+                last_seen: None,
+                sample_ids: Vec::new(),
+            });
+            entry.count += count;
+            entry.first_seen = min_instant(entry.first_seen, first_seen);
+            entry.last_seen = max_instant(entry.last_seen, last_seen);
+            for id in sample_ids {
                 if entry.sample_ids.len() < params.samples_per_group as usize {
                     entry.sample_ids.push(id);
                 }
@@ -1855,10 +1860,7 @@ pub fn merge_dlq_aggregates(
         }
     }
 
-    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged
-        .into_values()
-        .map(|group| (group.key.clone(), group))
-        .collect();
+    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged.into_iter().collect();
     let limit = params.limit_groups as usize;
 
     let (groups, truncated) = rollup_top_n(
