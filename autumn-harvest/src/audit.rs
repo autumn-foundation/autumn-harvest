@@ -1490,7 +1490,8 @@ pub async fn list_audit(
 /// The guard applies when **either** signal says an exporter owes this shard
 /// records:
 ///
-/// - **A cursor row exists** for the shard. Durable, shared state, so it works
+/// - **A live (non-retired) cursor row exists** for the shard. Durable, shared
+///   state, so it works
 ///   when retention and export run in **different processes** (issue #953,
 ///   Codex review P1): a split web/worker deployment where only the worker
 ///   configures the sink would otherwise have the web app's retention sweep
@@ -1545,7 +1546,10 @@ pub async fn purge_old_audit_records(
            AND NOT ( \
                  ( \
                    $2::BOOLEAN \
-                   OR EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor \
+                        WHERE retired_at IS NULL \
+                   ) \
                  ) \
                  AND ( \
                    a.export_seq IS NULL \

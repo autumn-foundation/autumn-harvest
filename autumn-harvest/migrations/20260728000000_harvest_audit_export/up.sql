@@ -97,6 +97,15 @@ CREATE TABLE IF NOT EXISTS harvest_audit_export_cursor (
 
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Set when an operator retires audit export for this shard. The row is
+    -- NEVER deleted, because `last_assigned_seq` above must outlive the audit
+    -- rows themselves: retiring the cursor is what permits retention to purge
+    -- them, and a deleted cursor recreated later would restart the sequence at
+    -- 0 and re-issue `(shard, seq)` pairs a SIEM already holds against
+    -- different records -- which a receiver deduping on that pair, exactly as
+    -- this feature instructs, would silently discard. Retire, never delete.
+    retired_at           TIMESTAMPTZ NULL,
+
     -- A negative cursor would sort below every real sequence and silently
     -- re-export the whole retained window on every tick.
     CONSTRAINT harvest_audit_export_cursor_non_negative

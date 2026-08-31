@@ -842,25 +842,29 @@ pub async fn ensure_cursor_row(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
-    // `last_assigned_seq` is seeded from the rows already stamped, never from
-    // 0 (issue #953, Codex review round 4 P1). A cursor row can go missing
-    // while sequenced audit rows remain -- `decommission_cursor`, a manual
-    // DELETE, a partial restore -- and restarting the counter at 0 would
-    // re-issue `(shard, seq)` pairs that name *different* records. A receiver
-    // deduping on that pair, exactly as this feature tells it to, would then
-    // discard genuine new records; and acknowledging a retained batch would
-    // set `last_acked_seq > last_assigned_seq`, violating the cursor's own
-    // CHECK. Seeding from `MAX(export_seq)` makes the high-water mark a
-    // property of the stamped data rather than of the cursor row's survival.
+    // Two defences for the sequence high-water mark, because re-issuing a
+    // `(shard, seq)` pair that names a *different* record is the one way to
+    // make a receiver deduping on that pair discard genuine audit events.
     //
-    // `last_acked_seq` deliberately stays 0: a recreated cursor re-delivers
-    // the retained backlog rather than assuming it was shipped. That is
-    // at-least-once, the receiver dedupes it on a now-stable `(shard, seq)`,
-    // and it errs toward re-export rather than silent loss.
+    // 1. The row is retired rather than deleted (`decommission_cursor`), so
+    //    `last_assigned_seq` survives even when retention later purges every
+    //    stamped row (issue #953, Codex review round 7 P1). The ON CONFLICT
+    //    arm therefore only clears `retired_at` -- re-enabling export resumes
+    //    the preserved counter, and never resets it.
+    // 2. The INSERT arm still seeds from `MAX(export_seq)` rather than 0, for
+    //    the paths where the row genuinely went missing anyway: a manual
+    //    DELETE, a partial restore (round 4 P1). Restarting at 0 there would
+    //    also violate the cursor's `last_acked_seq <= last_assigned_seq` CHECK
+    //    the moment a retained batch was acknowledged.
+    //
+    // On a fresh INSERT `last_acked_seq` stays 0, so a cursor rebuilt from
+    // stamped rows re-delivers them rather than assuming they shipped:
+    // at-least-once, deduped by the receiver on a now-stable pair, erring
+    // toward re-export over silent loss.
     diesel::sql_query(
         "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
          SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
-         ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW()",
+         ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW(), retired_at = NULL",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
     .execute(conn)
@@ -890,10 +894,19 @@ pub async fn ensure_cursor_row(
 /// So retiring an export configuration is an operator action, not an inferred
 /// one. See `docs/audit-export.md`.
 ///
-/// Safe to reverse: [`ensure_cursor_row`] seeds a recreated cursor's
-/// `last_assigned_seq` from `MAX(export_seq)`, so re-enabling export later
-/// continues the sequence rather than re-issuing numbers that already name
-/// different records.
+/// The row is **retired, never deleted** (issue #953, Codex review round 7 P1).
+/// `last_assigned_seq` has to outlive the audit rows themselves, and retiring
+/// the cursor is precisely what lets retention purge them: seeding a recreated
+/// cursor from `MAX(export_seq)` preserves the counter only while at least one
+/// stamped row survives, so a decommission followed by a full purge would reset
+/// it to 0 and re-issue `(shard, seq)` pairs the SIEM still holds against
+/// different records. Keeping the row makes the high-water mark durable
+/// independently of retention.
+///
+/// Safe to reverse: the next [`ensure_cursor_row`] un-retires the row and
+/// resumes from the preserved `last_assigned_seq`, so re-enabling export
+/// continues the sequence. Records purged while retired are gone and are not
+/// re-delivered — `last_acked_seq` is preserved too.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -904,12 +917,15 @@ pub async fn decommission_cursor(
 ) -> crate::error::HarvestResult<bool> {
     use diesel_async::RunQueryDsl;
 
-    let removed = diesel::sql_query("DELETE FROM harvest_audit_export_cursor WHERE shard_id = $1")
-        .bind::<diesel::sql_types::Integer, _>(shard_id)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(removed > 0)
+    let retired = diesel::sql_query(
+        "UPDATE harvest_audit_export_cursor SET retired_at = NOW(), updated_at = NOW() \
+         WHERE shard_id = $1 AND retired_at IS NULL",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard_id)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(retired > 0)
 }
 
 /// The `MAX(export_seq)` read back from the sequence-assignment statement —

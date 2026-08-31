@@ -1649,6 +1649,64 @@ async fn a_recreated_cursor_continues_the_sequence_it_left_off_at() {
     assert_eq!(stamped, vec![1, 2, 3, 4, 5, 6]);
 }
 
+// The high-water mark must survive retention deleting every stamped row.
+// Decommissioning is what PERMITS that purge, so a counter derived from the
+// surviving rows is a counter that decommissioning can destroy.
+#[tokio::test]
+async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = Arc::new(RecordingSink::new(200));
+    let _installed = install(sink.clone(), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3]);
+    uninstall();
+
+    // Operator retires export to relieve disk pressure, exactly as the runbook
+    // describes, and retention then purges the whole aged window.
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+        .await
+        .expect("decommission");
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+    let deleted = purge_old_audit_records(&mut conn, 90).await.expect("purge");
+    assert_eq!(deleted, 3, "retiring the cursor must permit the purge");
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        remaining, 0,
+        "no stamped row survives to derive a counter from"
+    );
+
+    // Export is re-enabled later. The SIEM still holds records at seq 1-3.
+    let sink2 = Arc::new(RecordingSink::new(200));
+    let _reinstalled = install(sink2.clone(), 100);
+    insert_audit_rows(&mut conn, 2).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick after re-enable");
+    uninstall();
+
+    assert_eq!(
+        sink2.all_seqs(),
+        vec![4, 5],
+        "the new records must continue from 4. Restarting at 1 would re-issue \
+         sequences the SIEM already holds against different records, and a \
+         receiver deduping on (shard, seq) -- as this feature instructs -- \
+         would silently discard these genuine new audit events"
+    );
+}
+
 // ── The redrive's audit row commits with the rewind, on one connection ─────
 
 #[tokio::test]

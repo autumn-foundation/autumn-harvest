@@ -252,8 +252,10 @@ operator action:
 autumn_harvest::audit_export::decommission_cursor(&mut conn, shard_id).await?;
 ```
 
-Removing the cursor row is what tells retention that nothing owes this shard
-records any more; the next sweep purges its aged audit rows normally. Do this
+This marks the cursor **retired**; the row itself is never deleted, because its
+`last_assigned_seq` has to outlive the audit rows. Retiring is what tells
+retention that nothing owes this shard records any more, so the next sweep
+purges its aged audit rows normally. Do this
 only once you accept that any records the shard had not yet shipped will never
 reach the SIEM.
 
@@ -261,11 +263,13 @@ Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what
 makes it safe across a split web/worker deployment. Both steps are required.
 
-Re-enabling export afterwards is safe: a recreated cursor seeds its
-`last_assigned_seq` from `MAX(export_seq)`, so new records continue the
-sequence instead of re-issuing numbers that already name different records
-(which a receiver deduping on `(shard, seq)` would silently discard). Any
-records still in the table are re-delivered, and the receiver dedupes them.
+Re-enabling export afterwards is safe: the next exporter tick un-retires the
+cursor and resumes from the preserved `last_assigned_seq`, so new records
+continue the sequence instead of re-issuing numbers that already name different
+records — which a receiver deduping on `(shard, seq)`, exactly as this document
+instructs it to, would silently discard. This holds even when retention purged
+every stamped row in the meantime, which is why the cursor is retired rather
+than deleted. Records purged while retired are gone and are not re-delivered.
 
 Until then, a sink left down indefinitely lets the audit table grow past its
 retention window. That is the deliberate trade — unbounded growth is loud

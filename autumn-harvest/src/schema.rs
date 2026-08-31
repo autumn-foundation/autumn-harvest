@@ -564,6 +564,7 @@ diesel::table! {
         last_error -> Nullable<Text>,
         last_delivered_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
+        retired_at -> Nullable<Timestamptz>,
     }
 }
 
