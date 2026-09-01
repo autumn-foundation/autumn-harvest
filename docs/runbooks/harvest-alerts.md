@@ -2970,6 +2970,7 @@ invisible to detection is growing, and the audit table is growing with it.
   | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
   | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
   | Exporter alive but **cannot observe the shard** | **nothing in metrics.** `last_error` and `unavailable_shards` on `GET /admin/audit-export` are authoritative; poll the route if you need this covered |
+  | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
 
   The last row is a real gap, tracked as
   autumn-foundation/autumn-harvest#1268 (an explicit availability signal

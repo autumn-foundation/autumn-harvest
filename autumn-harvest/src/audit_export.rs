@@ -498,13 +498,43 @@ pub struct AuditExportBuilderConfig {
     pub lease: std::time::Duration,
 }
 
+/// A webhook URL reduced to its origin, for diagnostics.
+///
+/// A SIEM ingest endpoint routinely carries its credential in the path or the
+/// query string (`.../services/collector/<token>`, `?api_key=...`), so the full
+/// URL is a secret in the same way the HMAC key is (issue #953, Codex review
+/// round 23 P1). `AuditExportBuilderConfig`'s `Debug` is hand-written precisely
+/// to keep secrets out of logs and panic messages — it already redacts the HMAC
+/// key and the sink — but it printed the URL verbatim, which is the same leak
+/// `audit_sink::describe_without_url` exists to prevent on the error path. The
+/// origin is what makes a config dump useful ("which host is this pointed at?")
+/// and is the part that is not a credential.
+///
+/// Falls back to a marker rather than the input when the URL cannot be parsed:
+/// an unparseable string must not be echoed on the assumption it is harmless.
+fn redact_webhook_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<unparseable webhook url redacted>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Strip any userinfo (`user:pass@host`), itself a credential.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.is_empty() {
+        return "<unparseable webhook url redacted>".to_string();
+    }
+    format!("{scheme}://{host}/<redacted>")
+}
+
 impl std::fmt::Debug for AuditExportBuilderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuditExportBuilderConfig")
             .field("allowlist", &self.allowlist)
             .field("allow_http", &self.allow_http)
             .field("allow_ip_literals", &self.allow_ip_literals)
-            .field("webhook_url", &self.webhook_url)
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_deref().map(redact_webhook_url),
+            )
             .field("secret", &self.secret)
             .field("sink", &self.sink.as_ref().map(|_| "<AuditSink>"))
             .field("batch_size", &self.batch_size)
@@ -2594,6 +2624,60 @@ mod tests {
         let past = Utc::now() - chrono::Duration::seconds(1);
         let attempt = deliver_within_lease(&config, &batch, past).await;
         assert!(attempt.status.is_none());
+    }
+
+    /// A SIEM ingest URL routinely carries its credential in the path or query,
+    /// so `Debug` must not echo it (issue #953, Codex review round 23 P1). The
+    /// hand-written impl already redacted the HMAC key; the URL is a secret in
+    /// the same way.
+    #[test]
+    fn debug_never_prints_a_webhook_urls_path_or_query() {
+        let config = AuditExportBuilderConfig {
+            webhook_url: Some(
+                "https://http-inputs.example.splunkcloud.com/services/collector/\
+                 B5A79AAD-D822-46CC-80D1-819F80D7BFB0?index=audit"
+                    .to_string(),
+            ),
+            secret: Some(CallbackSecret::new(b"hmac".to_vec())),
+            ..AuditExportBuilderConfig::default()
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("B5A79AAD"),
+            "the collector token must never reach a log line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("index=audit"),
+            "nor the query string, which can carry one too: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://http-inputs.example.splunkcloud.com/<redacted>"),
+            "the origin is the useful, non-secret part and should survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hmac"),
+            "and the HMAC key stays redacted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_strips_userinfo_and_refuses_to_echo_junk() {
+        // Userinfo is itself a credential.
+        assert_eq!(
+            redact_webhook_url("https://user:s3cret@siem.example.com/ingest?k=v"),
+            "https://siem.example.com/<redacted>"
+        );
+        // A bare origin still renders.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com"),
+            "https://siem.example.com/<redacted>"
+        );
+        // Anything unparseable is NOT echoed back on the assumption it is safe.
+        for junk in ["not-a-url", "https://", ""] {
+            let rendered = redact_webhook_url(junk);
+            assert_eq!(rendered, "<unparseable webhook url redacted>");
+        }
     }
 
     #[test]
