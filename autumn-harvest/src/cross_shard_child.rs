@@ -1206,8 +1206,7 @@ async fn cross_shard_table_exists(conn: &mut AsyncPgConnection) -> bool {
     ))
     .get_result::<Option<String>>(conn)
     .await
-    .map(|found| found.is_some())
-    .unwrap_or(true)
+    .map_or(true, |found| found.is_some())
 }
 
 /// Delete the outbox row and report whether **this** transaction removed it.
