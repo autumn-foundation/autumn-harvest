@@ -14,12 +14,15 @@
 //!
 //! # Profile
 //!
-//! This is opt-in: a deployment with no `QuotaPolicy` pays nothing (AC9). But
+//! This is opt-in: a deployment with no `QuotaPolicy` pays nothing (AC9), and
+//! `enforce_quota_admission` also skips this query when the policy has no
+//! cap or the admission's input resolves no quota key. Within that scope,
 //! the trigger is `QuotaPolicy::has_any_cap()` — any declared cap — not
 //! specifically `max_history_bytes`: `load_quota_usage` computes all three
 //! counters in one round trip by design, so a workflow type declaring only
 //! `max_active_executions` or only `max_dead_letters` pays this same
-//! `history_bytes` cost on every admission too. This pass measures that cost
+//! `history_bytes` cost on every key-resolved admission too. This pass
+//! measures that cost
 //! as the target tenant's own accumulated active-execution footprint grows,
 //! and as the total `harvest_events` table (shared with every other tenant)
 //! grows around it.

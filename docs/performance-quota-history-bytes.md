@@ -28,16 +28,22 @@ why this is a human decision, not a query rewrite.
 fresh start *and* every spawned child of a workflow type with a declared
 `QuotaPolicy` — `execution::enforce_quota_admission` calls it inside the same
 transaction as the per-key advisory lock, before the `WorkflowStarted` event
-is appended. It is opt-in (AC9: a workflow type with no `QuotaPolicy` pays
-nothing), but **the trigger is `QuotaPolicy::has_any_cap()` — any declared
-cap — not specifically `max_history_bytes`.** `load_quota_usage` computes all
-three counters (`active_executions`, `history_bytes`, `dead_letters`) in one
-round trip by design (AC7), so a workflow type declaring only
-`max_active_executions` or only `max_dead_letters` pays this page's full
-`history_bytes` cost on every admission too, even though that counter never
-factors into its own admit/reject decision. This page's findings apply to
-**every** deployment with any `QuotaPolicy` cap declared, not only ones using
-`max_history_bytes`.
+is appended, **but only when the policy has a declared cap and the resolved
+quota key is present**: `enforce_quota_admission` returns before calling
+`load_quota_usage` at all when `quota_policy` is `None`, when
+`policy.has_any_cap()` is `false`, or when the key resolver produces no key
+for this admission's input (`quota_key` is `None`) — see AC9 and
+`resolve_quota_key`'s fail-open contract. Within that scope, **the trigger is
+`QuotaPolicy::has_any_cap()` — any declared cap — not specifically
+`max_history_bytes`.** `load_quota_usage` computes all three counters
+(`active_executions`, `history_bytes`, `dead_letters`) in one round trip by
+design (AC7), so a workflow type declaring only `max_active_executions` or
+only `max_dead_letters` pays this page's full `history_bytes` cost on every
+*key-resolved* admission too, even though that counter never factors into
+its own admit/reject decision. This page's findings apply to every admission
+whose workflow type declares any `QuotaPolicy` cap **and** whose input
+resolves to a quota key — not only ones using `max_history_bytes`, and not
+to admissions that fail open on an unresolvable key.
 
 `tests/integration/quota_history_bytes_perf_tests.rs::zz_capture_quota_history_bytes_evidence`
 seeds a production-shaped fixture: one target tenant
@@ -66,8 +72,14 @@ the target tenant, plus 50 dead-letter rows. A sweep (`NOISE_SWEEP = [3, 15,
 other `quota_key`s with a light, uniform history — so total `harvest_events`
 table size lands at roughly 205k / 313k / 1.08M rows while the target
 tenant's own footprint stays fixed. This mirrors how the table actually grows
-in production: more tenants accumulate over time; one tenant's own active
-footprint is bounded by the very cap this feature enforces.
+in production: more tenants accumulate over time. (It is *not* because the
+cap keeps one tenant's footprint bounded in real time — `max_history_bytes`
+is checked only at admission, never against an already-admitted execution's
+ongoing event appends, so a single long-running execution can push a
+tenant's aggregate well past its configured cap between admissions; see
+[The cost that remains](#the-cost-that-remains-and-why-this-is-not-a-ledger-fix).
+The fixture simply holds the target's footprint fixed by construction, to
+isolate the effect of the *background* table growing around it.)
 
 ## Profile
 
@@ -242,9 +254,10 @@ Even on its best (and, as shown above, self-selected) plan, this query costs
 proportional to the target tenant's own accumulated active-execution
 history — recomputed from scratch, synchronously, inside the admission
 transaction, on *every single* fresh start and spawned child for that
-tenant, **for any tenant with any `QuotaPolicy` cap declared** (see
-[Workload](#workload) above — the trigger is `has_any_cap()`, not
-specifically `max_history_bytes`). A tenant sitting anywhere near a
+tenant, **for any tenant whose workflow type declares any `QuotaPolicy`
+cap and whose admission resolves a quota key** (see [Workload](#workload)
+above — the trigger is `has_any_cap()` plus a resolved key, not specifically
+`max_history_bytes`). A tenant sitting anywhere near a
 configured `max_history_bytes` cap — exactly the tenant that specific cap
 exists to protect against — pays the most (its own footprint is largest by
 construction), but a tenant whose *only* declared cap is
