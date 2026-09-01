@@ -347,6 +347,28 @@ write the catalog row, and one idle-in-transaction reader is enough to make the
 request queue — with every append arriving after it queued behind the `ALTER`.
 Re-run the step after clearing the blocker.
 
+**The engine's role must be able to own `harvest_events`.** Every partition
+operation is DDL on that table — `CREATE TABLE ... PARTITION OF` to extend the
+write window, `DETACH`/`ATTACH` to drain the `DEFAULT` partition, `DROP TABLE`
+to reclaim — and Postgres checks **ownership** for all of it. There is no lesser
+privilege. On a split-role deployment, where migrations and `enable` run as an
+owning role while the engine connects as one granted only `SELECT`/`INSERT`,
+automatic maintenance fails every tick: the write window stops being extended,
+appends land in the `DEFAULT` partition, and nothing is reclaimed.
+
+Postgres checks ownership by role *membership*, not identity, so one grant fixes
+it and no second connection is needed:
+
+```sql
+GRANT harvest_owner TO harvest_runtime;
+```
+
+`maintain` probes this before it issues any DDL and reports the owner, the
+connected role and that grant — a raw `permission denied for table
+harvest_events_p_default` names none of the three. The message surfaces in
+`partition_maintenance.last_error` on the retention tick and in
+`harvest partition maintain`.
+
 **The partitioned layout is not compatible with a flat logical-replication
 standby.** `enable`, the CLI and step 1 of the plan all refuse to convert while
 any publication covers `harvest_events` — which the DR runbook's `CREATE

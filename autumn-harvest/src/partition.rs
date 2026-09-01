@@ -2366,6 +2366,54 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
 
 // ── Engine-automated maintenance ───────────────────────────────────────────
 
+/// The owner of `harvest_events` when the connected role cannot act as it.
+///
+/// Every partition operation is DDL on that table — `CREATE TABLE ... PARTITION
+/// OF` to extend the write window, `DETACH`/`ATTACH` to drain the `DEFAULT`
+/// partition, `DROP TABLE` to reclaim — and Postgres checks **ownership** for
+/// all of it. There is no lesser privilege that grants it.
+///
+/// That matters because this engine supports, and its preflight probes for, a
+/// split-role deployment: migrations and `harvest partition enable` run as an
+/// owning role while the engine connects as a separately granted one that needs
+/// only `SELECT`/`INSERT` on `harvest_events`. Automatic maintenance runs on
+/// the engine's pool, so on that topology every pass fails — the lookahead
+/// window stops being extended, appends pile into the `DEFAULT` partition, and
+/// nothing is ever reclaimed.
+///
+/// Postgres checks ownership by role *membership*, not identity, so
+/// `GRANT <owner> TO <engine role>` is the fix and no second connection pool is
+/// needed. Returning the owner's name lets [`maintain`] say that, instead of
+/// relaying a `permission denied for table harvest_events_p_default` that names
+/// neither the role nor the grant.
+///
+/// `None` when the connected role can act as owner — the single-role default,
+/// where this costs one catalog probe per tick.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+async fn maintenance_owner_gap(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Option<(String, String)>> {
+    let rows = diesel::sql_query(
+        "SELECT pg_get_userbyid(c.relowner) || ' ' || current_user AS v
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'harvest_events'
+            AND n.nspname = current_schema()
+            AND NOT pg_has_role(current_user, c.relowner, 'USAGE')",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().next().and_then(|r| {
+        r.v.split_once(' ')
+            .map(|(owner, me)| (owner.to_string(), me.to_string()))
+    }))
+}
+
 /// One full maintenance pass: extend the lookahead window, drain the `DEFAULT`
 /// partition, then sweep.
 ///
@@ -2397,6 +2445,24 @@ pub async fn maintain(
             ..MaintenanceOutcome::default()
         });
     }
+    // Before any DDL, because the failure is otherwise unreadable: the first
+    // thing to fail is whichever partition operation runs first, and its
+    // `permission denied for table harvest_events_p_default` names neither the
+    // role that needs the grant nor the grant itself.
+    if let Some((owner, me)) = maintenance_owner_gap(conn).await? {
+        return Err(HarvestError::Config(format!(
+            "partition maintenance requires ownership of harvest_events, and the connected \
+             role ({me}) does not have it. Every partition operation is DDL — CREATE TABLE \
+             ... PARTITION OF to extend the write window, DETACH/ATTACH to drain the \
+             DEFAULT partition, DROP TABLE to reclaim — and Postgres checks ownership for \
+             all of it. harvest_events is owned by {owner}. Postgres checks ownership by \
+             role membership, so `GRANT {owner} TO {me};` is enough; alternatively point \
+             the engine at a role that owns the table. Until then the write window stops \
+             being extended, appends land in the DEFAULT partition, and no cohort is \
+             reclaimed."
+        )));
+    }
+
     // Drain first: rows parked in the DEFAULT partition BLOCK creation of the
     // very cohort partitions that would cover them, so an ensure before a drain
     // would fail on exactly the deployment that needs it most.

@@ -2766,3 +2766,95 @@ async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
         "the enable path must build the drop gate's index"
     );
 }
+
+#[tokio::test]
+async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partitions() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The split-role topology the preflight check exists for: migrations and
+    // `harvest partition enable` run as the owning role, the engine connects as
+    // a separately granted one that needs only SELECT/INSERT on
+    // `harvest_events`.
+    //
+    // Every maintenance operation is DDL on that table — CREATE TABLE ...
+    // PARTITION OF for the lookahead window, DETACH/ATTACH for the drain, DROP
+    // TABLE for reclamation — and Postgres requires OWNERSHIP for all of it. So
+    // on this topology automatic maintenance fails every tick: the lookahead
+    // window stops being extended, appends pile into DEFAULT, and nothing is
+    // ever reclaimed. The feature does not work at all.
+    //
+    // It has to say so in terms an operator can act on. A raw
+    // `permission denied` names neither the role that must be granted nor the
+    // grant that fixes it.
+    for stmt in [
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'harvest_rt_maint_958') \
+           THEN CREATE ROLE harvest_rt_maint_958 LOGIN PASSWORD 'maint958'; END IF; END $$",
+        "GRANT USAGE ON SCHEMA public TO harvest_rt_maint_958",
+        "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO harvest_rt_maint_958",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable as the owning role");
+
+    let runtime_url = url.replace(
+        "postgres://postgres:postgres@",
+        "postgres://harvest_rt_maint_958:maint958@",
+    );
+    let mut runtime = connect(&runtime_url).await;
+
+    let err = partition::maintain(
+        &mut runtime,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &SweepOptions::default(),
+    )
+    .await;
+    let msg = match err {
+        Err(e) => e.to_string(),
+        Ok(outcome) => outcome.last_error.clone().unwrap_or_else(|| {
+            panic!(
+                "maintenance cannot succeed as a role that does not own harvest_events \
+                 — every partition operation is DDL requiring ownership. It reported {outcome:?}"
+            )
+        }),
+    };
+    assert!(
+        msg.contains("harvest_rt_maint_958") || msg.contains("own"),
+        "the failure must name the ownership problem, not just relay a raw \
+         permission error: {msg}"
+    );
+    assert!(
+        msg.contains("GRANT"),
+        "and it must name the grant that fixes it, so an operator is not left \
+         to work out that role membership is what Postgres checks: {msg}"
+    );
+
+    // Membership in the owning role is what Postgres actually checks for
+    // ownership, so this is the fix — and it must genuinely make maintenance
+    // work, not merely quiet the message.
+    diesel::sql_query("GRANT postgres TO harvest_rt_maint_958")
+        .execute(&mut conn)
+        .await
+        .expect("grant the owning role");
+    let mut runtime = connect(&runtime_url).await;
+    let outcome = partition::maintain(
+        &mut runtime,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &SweepOptions::default(),
+    )
+    .await
+    .expect("maintenance must work once the runtime role owns the table");
+    assert_eq!(
+        outcome.last_error, None,
+        "and it must report clean: {outcome:?}"
+    );
+}
