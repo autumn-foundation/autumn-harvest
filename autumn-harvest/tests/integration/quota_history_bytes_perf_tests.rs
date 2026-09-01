@@ -224,6 +224,12 @@ struct ExplainRow {
 /// snapshot at the end of the capture.
 const STAT_SNAPSHOT_ITERS: usize = 20;
 
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
 #[derive(QueryableByName, Debug)]
 struct StatRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -368,53 +374,110 @@ async fn zz_capture_quota_history_bytes_evidence() {
     // `pg_stat_statements` snapshot from the REAL `load_quota_usage()` calls
     // (not the literal EXPLAIN text above), at the largest fixture, where
     // the query is on its natural Nested-Loop-plus-index plan.
+    //
+    // Requires `shared_preload_libraries = 'pg_stat_statements'` on the
+    // server -- `CREATE EXTENSION` alone cannot enable it retroactively.
+    // Probed explicitly (rather than letting `pg_stat_statements_reset`
+    // panic obscurely) so an external `HARVEST_TEST_DATABASE_URL` server
+    // that never preloaded it degrades to a clear skip of just this
+    // secondary snapshot -- the EXPLAIN artifacts above, which are this
+    // page's primary evidence, are already written and unaffected.
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut conn)
         .await;
-    diesel::sql_query(
-        "SELECT pg_stat_statements_reset(0, \
-                (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
-    )
-    .execute(&mut conn)
-    .await
-    .expect("pg_stat_statements_reset");
-
-    for _ in 0..STAT_SNAPSHOT_ITERS {
-        load_quota_usage(&mut conn, TARGET_WORKFLOW, TARGET_KEY)
+    let available: Result<i64, _> =
+        diesel::sql_query("SELECT count(*)::BIGINT AS count FROM pg_stat_statements WHERE FALSE")
+            .get_result::<CountRow>(&mut conn)
             .await
-            .expect("load_quota_usage");
-    }
+            .map(|r| r.count);
 
-    let stats: Vec<StatRow> = diesel::sql_query(
-        "SELECT calls, shared_blks_hit, shared_blks_read, \
-                (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \
-         FROM pg_stat_statements \
-         WHERE query LIKE '%pg_column_size%' \
-         ORDER BY total_buffers DESC",
-    )
-    .load(&mut conn)
-    .await
-    .expect("query pg_stat_statements");
+    if available.is_err() {
+        eprintln!(
+            "SKIP: pg_stat_statements is not usable on this server (needs \
+             shared_preload_libraries = 'pg_stat_statements', which CREATE \
+             EXTENSION cannot enable retroactively) -- skipping the \
+             pg_stat_statements snapshot. The EXPLAIN artifacts above are the \
+             primary evidence and are unaffected."
+        );
+        std::fs::write(
+            out_dir.join("pg_stat_statements.txt"),
+            "-- SKIPPED: pg_stat_statements is not preloaded on this server \
+             (shared_preload_libraries) -- see the EXPLAIN artifacts for the \
+             primary evidence. --\n",
+        )
+        .expect("write pg_stat_statements skip notice");
+    } else {
+        // Scoped to THIS database's oid on both ends: the reset already was,
+        // but the original capture's SELECT was not, so on a shared cluster
+        // it returned other databases' (including stale, already-dropped
+        // ephemeral benchmark databases') rows for the same query text too --
+        // confirmed by the first committed artifact, which showed five
+        // distinct "calls=20" rows for what this run drives as one. Every
+        // statement between the reset and this SELECT ran on this same
+        // connection/database, so the current-dbid scope alone now makes
+        // the match exact -- asserted, not just hoped, via the exact `calls`
+        // check below.
+        diesel::sql_query(
+            "SELECT pg_stat_statements_reset(0, \
+                    (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("pg_stat_statements_reset");
 
-    let stats_text = stats
-        .iter()
-        .map(|r| {
+        for _ in 0..STAT_SNAPSHOT_ITERS {
+            load_quota_usage(&mut conn, TARGET_WORKFLOW, TARGET_KEY)
+                .await
+                .expect("load_quota_usage");
+        }
+
+        let stats: Vec<StatRow> = diesel::sql_query(
+            "SELECT calls, shared_blks_hit, shared_blks_read, \
+                    (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \
+             FROM pg_stat_statements \
+             WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND query LIKE '%pg_column_size%' \
+             ORDER BY total_buffers DESC",
+        )
+        .load(&mut conn)
+        .await
+        .expect("query pg_stat_statements");
+
+        assert_eq!(
+            stats.len(),
+            1,
+            "expected exactly one dbid-scoped pg_stat_statements row for \
+             load_quota_usage()'s query text after a scoped reset; got {}: \
+             {stats:?}",
+            stats.len()
+        );
+        assert_eq!(
+            stats[0].calls,
+            i64::try_from(STAT_SNAPSHOT_ITERS).expect("STAT_SNAPSHOT_ITERS fits in i64"),
+            "the single matched row's call count must equal exactly the \
+             number of load_quota_usage() calls just driven"
+        );
+
+        let stats_text = stats
+            .iter()
+            .map(|r| {
+                format!(
+                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={} mean_exec_time_ms={:.3}",
+                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.mean_exec_time
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            out_dir.join("pg_stat_statements.txt"),
             format!(
-                "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={} mean_exec_time_ms={:.3}",
-                r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.mean_exec_time
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(
-        out_dir.join("pg_stat_statements.txt"),
-        format!(
-            "-- pg_stat_statements after {STAT_SNAPSHOT_ITERS} real load_quota_usage() calls \
-             @ noise_mult={} (largest fixture) --\n{stats_text}\n",
-            NOISE_SWEEP[NOISE_SWEEP.len() - 1]
-        ),
-    )
-    .expect("write pg_stat_statements artifact");
+                "-- pg_stat_statements after {STAT_SNAPSHOT_ITERS} real load_quota_usage() calls \
+                 @ noise_mult={} (largest fixture), scoped to this database's dbid --\n{stats_text}\n",
+                NOISE_SWEEP[NOISE_SWEEP.len() - 1]
+            ),
+        )
+        .expect("write pg_stat_statements artifact");
+    }
 
     std::fs::write(
         out_dir.join("fixture-summary.txt"),

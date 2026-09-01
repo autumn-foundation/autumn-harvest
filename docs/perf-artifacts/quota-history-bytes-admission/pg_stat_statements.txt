@@ -1,13 +1,2 @@
--- pg_stat_statements after 20 real load_quota_usage() calls @ noise_mult=100 (largest fixture) --
-calls=20 shared_blks_hit=362223 shared_blks_read=0 total_buffers=362223 mean_exec_time_ms=57.849
-calls=20 shared_blks_hit=335380 shared_blks_read=0 total_buffers=335380 mean_exec_time_ms=48.840
-calls=20 shared_blks_hit=335360 shared_blks_read=0 total_buffers=335360 mean_exec_time_ms=46.293
-calls=20 shared_blks_hit=335360 shared_blks_read=0 total_buffers=335360 mean_exec_time_ms=41.810
-calls=20 shared_blks_hit=335360 shared_blks_read=0 total_buffers=335360 mean_exec_time_ms=49.425
-calls=2 shared_blks_hit=77001 shared_blks_read=10787 total_buffers=87788 mean_exec_time_ms=76.657
-calls=2 shared_blks_hit=23469 shared_blks_read=10091 total_buffers=33560 mean_exec_time_ms=105.018
-calls=2 shared_blks_hit=22543 shared_blks_read=10075 total_buffers=32618 mean_exec_time_ms=102.651
-calls=1 shared_blks_hit=17995 shared_blks_read=524 total_buffers=18519 mean_exec_time_ms=116.281
-calls=1 shared_blks_hit=17541 shared_blks_read=522 total_buffers=18063 mean_exec_time_ms=87.941
-calls=176 shared_blks_hit=4535 shared_blks_read=0 total_buffers=4535 mean_exec_time_ms=0.066
-calls=1 shared_blks_hit=253 shared_blks_read=0 total_buffers=253 mean_exec_time_ms=0.851
+-- pg_stat_statements after 20 real load_quota_usage() calls @ noise_mult=100 (largest fixture), scoped to this database's dbid --
+calls=20 shared_blks_hit=335360 shared_blks_read=0 total_buffers=335360 mean_exec_time_ms=41.468

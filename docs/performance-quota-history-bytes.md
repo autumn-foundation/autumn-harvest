@@ -180,13 +180,28 @@ and `enforce_quota_admission`'s call pattern are unchanged.
 | `EXPLAIN` buffers @ 205,000 total rows (Seq Scan) | 12,745 |
 | `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,766 |
 | `EXPLAIN` buffers @ 1,078,000 total rows (Nested Loop) | 16,768 |
-| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 362,223 total buffers (18,111/call), mean 57.8ms |
+| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 41.5ms |
 | `LATERAL` rewrite @ 205,000 total rows | 15,765 (vs. 12,745 unmodified — **worse**) |
 
 Tool used for every row: `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` and
 `pg_stat_statements`, both against a fresh, fully-migrated database
 (`autumn_harvest::full_migrations_sql()`), not a hand-built schema subset.
 Full artifacts: `docs/perf-artifacts/quota-history-bytes-admission/`.
+
+**Harness note.** The first captured `pg_stat_statements` snapshot scoped
+its `pg_stat_statements_reset()` call to the current database's `dbid` but
+not the follow-up `SELECT` — on a shared cluster, `pg_stat_statements`
+aggregates per `(dbid, queryid)`, so the unscoped `SELECT` also returned
+other databases' (including stale, already-dropped ephemeral benchmark
+databases') rows for the identical query text. Caught in review before
+merge: the first artifact showed five distinct `calls=20` rows for what
+this run drives as exactly one, and the reported top-buffer row
+(362,223 total / 18,111 per call) was in fact a leftover row from an
+earlier ephemeral database, not this run's. Fixed by scoping the `SELECT`
+to the current `dbid` too and asserting exactly one matching row with
+`calls` equal to the exact iteration count — the corrected number above
+(335,360 / 16,768 per call) now lands almost exactly on the `EXPLAIN`
+figure at the same table size, as it should.
 
 ## Equivalence
 
