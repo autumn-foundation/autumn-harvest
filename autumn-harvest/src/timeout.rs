@@ -4264,6 +4264,65 @@ mod tests {
         }
     }
 
+    /// Audit export must run before the first `?` in the pass, and its own
+    /// failure must never abort the pass (issue #953).
+    ///
+    /// Two directions, one hazard each:
+    ///
+    /// - **Export before the first `?`.** Every resident after the export call
+    ///   can return `Err` and end the tick. If export moved below one of them, a
+    ///   single permanently-failing resident — a task whose enforcement errors on
+    ///   every pass — would stop compliance delivery for the whole shard
+    ///   indefinitely, and the backlog would grow silently.
+    /// - **Export's own error swallowed.** Conversely, if the export call grew a
+    ///   `?`, a sink outage would abort timeout enforcement, SLA checks and
+    ///   session cleanup — letting a compliance feature take down the scanner.
+    ///
+    /// Source-level for the same reason as
+    /// `locked_deadline_reread_never_precedes_the_execution_lock` above: the
+    /// hazard is *statement order*, which no behavioural assertion can see.
+    ///
+    /// It is also the only form this guard can take. The natural dynamic test —
+    /// seed a due task whose enforcement fails, assert the export still happened
+    /// — cannot be written: `harvest_task_queue.workflow_exec_id` is a foreign
+    /// key, so a task naming a nonexistent execution cannot be inserted, and an
+    /// unregistered payload codec decodes to the `undecodable_marker` rather
+    /// than erroring (issue #608). There is no supported way to seed a
+    /// deterministically-failing resident.
+    #[test]
+    fn audit_export_runs_before_the_first_fallible_resident() {
+        let src = include_str!("timeout.rs");
+        let start = src
+            .find("pub async fn enforce_timeouts_once(")
+            .expect("enforce_timeouts_once must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub async fn ")
+            .map_or(body.len(), |o| o + 1);
+        let body = &body[..end];
+
+        let export = body
+            .find("fire_due_audit_exports(")
+            .expect("the pass must fire due audit exports");
+        let first_fallible = body
+            .find("find_timed_out_tasks(conn).await?")
+            .expect("the timed-out-task scan must stay the first fallible resident");
+        assert!(
+            export < first_fallible,
+            "audit export must run BEFORE the first resident that can `?` out of              the pass; below it, one permanently-failing task stops compliance              delivery for the whole shard"
+        );
+
+        let handled = &body[export..first_fallible];
+        assert!(
+            handled.contains("Err(error) => tracing::error!"),
+            "the export call must log and continue on error, never `?`; a sink              outage must not abort timeout enforcement for the shard"
+        );
+        assert!(
+            !handled.contains("fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"),
+            "the export call must not propagate its error with `?`"
+        );
+    }
+
     /// The two deadline queries must differ only by `FOR UPDATE`, so the fast
     /// path can never disagree with the authoritative check about expiry.
     #[test]
