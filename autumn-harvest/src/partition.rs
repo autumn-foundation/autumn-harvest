@@ -3021,11 +3021,23 @@ mod tests {
 
     #[test]
     fn the_migration_plan_keeps_the_expensive_steps_out_of_the_lock_window() {
-        let plan = migration_plan(&EnableOptions::default(), Utc::now());
-        let window = plan
-            .split("BEGIN;")
-            .nth(1)
-            .expect("the plan must contain the exclusive window");
+        let opts = EnableOptions::default();
+        let now = Utc::now();
+        let plan = migration_plan(&opts, now);
+        let steps = migration_plan_steps(&opts, now);
+
+        // The window is phase 4, located BY PHASE rather than by the first
+        // `BEGIN;` in the rendered text. Phases 2 and 3 open short bounded
+        // transactions of their own now — an invalid-index cleanup and the
+        // constraint add — so a test that assumed the first `BEGIN` was the
+        // window would quietly start asserting about one of those instead, and
+        // pass or fail for reasons unrelated to what it is guarding.
+        let window = steps
+            .iter()
+            .filter(|s| s.phase == 4)
+            .map(|s| s.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             !window.contains("VALIDATE CONSTRAINT"),
             "the validation scan must happen BEFORE the exclusive window, or \
@@ -3043,6 +3055,21 @@ mod tests {
             window.contains("lock_timeout"),
             "the window must be bounded: a conversion that cannot get the lock \
              must fail rather than stall every append behind it"
+        );
+        for step in &steps {
+            assert!(
+                !step.sql.contains("CREATE UNIQUE INDEX") || step.concurrent,
+                "every index build in the plan must be concurrent, whatever \
+                 phase it lands in:\n{}",
+                step.sql
+            );
+        }
+        // Each transaction the plan opens has to close, or the operator's
+        // session sits idle-in-transaction holding whatever it took.
+        assert_eq!(
+            steps.iter().filter(|s| s.sql == "BEGIN").count(),
+            steps.iter().filter(|s| s.sql == "COMMIT").count(),
+            "every BEGIN in the plan needs its COMMIT"
         );
     }
 
