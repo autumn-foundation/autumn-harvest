@@ -1,4 +1,4 @@
--- autumn-harvest/migrations/20260728000000_harvest_event_partitioning/up.sql
+-- autumn-harvest/migrations/20260901115500_harvest_event_partitioning/up.sql
 -- Issue #958: opt-in native declarative partitioning for `harvest_events`.
 --
 -- This migration is deliberately **INERT**. It ships the machinery — the

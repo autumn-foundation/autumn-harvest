@@ -479,10 +479,14 @@ as the cap is reverted. It needs a four-way conjunction (`PayloadTooLarge` + a
 compensating DAG + a cap change + that change landing inside the unwind's
 decision-cycle window).
 
-This is the same class as the pre-existing, engine-wide
-`known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
-(issue #601), which pins it with a plain non-DAG `spawn_child_workflow_raw`
-call. Issue #780 **enlarges** the surface rather than creating it: before the
+This is the same class as any config-dependent decision that leaves no history
+footprint. Issue #952 closed the sibling case where such a failure is *uncaught*
+and seals the run — a trailing terminal `WorkflowFailed` is now transparent to
+in-progress `match_*` calls, pinned by
+`replayer_tests::early_config_dependent_failure_replays_cleanly` — but a
+rejection the unwind **catches** and routes around records nothing at all, so it
+is still re-decided on every replay.
+Issue #780 **enlarges** the surface rather than creating it: before the
 unwind existed, a rejection sealed the run `FAILED` with no compensation events,
 so there was nothing for a later dispatch to collide with.
 

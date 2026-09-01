@@ -1826,3 +1826,33 @@ async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
         );
     }
 }
+
+// ── Audit export to a SIEM sink (issue #953) ─────────────────────────────────
+//
+// Both routes must sit in the SAME auth chain as every other admin-gated
+// route. `GET /admin/audit-export` reports the completeness posture of the
+// privileged-action log, which is exactly what an attacker would want to read
+// before acting; `POST .../redrive` mutates a compliance cursor. Neither may
+// be reachable unauthenticated, and the assertion is on `401` specifically —
+// a `404`/`405` here would mean the route is not registered at all and the
+// test would be passing for the wrong reason.
+
+#[tokio::test]
+async fn eris_require_auth_blocks_audit_export_status() {
+    let app = authenticated_app();
+    let res = app.oneshot(get("/admin/audit-export")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_audit_export_redrive() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/audit-export/redrive",
+            r#"{"shard": 0, "to_seq": 0}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}

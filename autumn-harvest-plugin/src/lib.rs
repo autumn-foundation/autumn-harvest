@@ -8,6 +8,13 @@ pub mod api_token;
 /// Implements [`autumn_harvest::completion_callback::CompletionCallbackDeliverer`],
 /// auto-wired by [`crate::plugin::HarvestPlugin`].
 pub mod callback_deliverer;
+
+/// Default `reqwest`-based signed-webhook sink for audit-record export.
+///
+/// Implements [`autumn_harvest::audit_export::AuditSink`], auto-wired by
+/// `HarvestPlugin` when an embedder configures `audit_export_webhook(...)`
+/// without supplying their own sink (issue #953).
+pub mod audit_sink;
 pub mod canary;
 pub mod config;
 /// Broker event-source connectors for workflow triggers (issue #944).

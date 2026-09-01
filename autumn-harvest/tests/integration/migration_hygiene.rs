@@ -78,6 +78,69 @@ fn duplicate_version_prefixes_is_empty_for_distinct_prefixes() {
     );
 }
 
+/// The first version at which a real time-of-day component is required.
+///
+/// Every migration before this point is `YYYYMMDD000000` and stays that way —
+/// renaming an applied migration would make Diesel re-run it. The cutover is a
+/// date, so the rule applies to what gets written from here on.
+const TIME_BEARING_VERSION_CUTOFF: &str = "20260801000000";
+
+/// Migration versions at or after the cutoff whose time component is all zeros.
+///
+/// Pure, so the guard and its RED demonstration share one predicate.
+fn day_granular_versions(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter_map(|n| n.split('_').next())
+        .filter(|v| v.len() == 14 && *v >= TIME_BEARING_VERSION_CUTOFF)
+        .filter(|v| v.ends_with("000000"))
+        .collect()
+}
+
+#[test]
+fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
+    // Before the cutoff: grandfathered, however zeroed.
+    assert!(day_granular_versions("20260101000000_old").is_empty());
+    // After it: flagged.
+    assert_eq!(
+        day_granular_versions("20260901000000_new"),
+        vec!["20260901000000"],
+        "a zero time component after the cutoff must be detected"
+    );
+    // A real time of day passes.
+    assert!(day_granular_versions("20260901115500_new").is_empty());
+}
+
+/// Migration versions must carry a real time of day, not just a date.
+///
+/// Two branches authored on the same day both reach for `YYYYMMDD000000` and
+/// collide — and the collision does not surface where it was made. It surfaces
+/// as a merge conflict in the upgrade guide, or as
+/// `real_migrations_have_unique_version_prefixes` failing once both migrations
+/// are finally in one tree, which is long after both authors have moved on.
+///
+/// This branch hit it twice: `20260727000000` against the codec-rotation cursor
+/// (#948), then `20260728000000` against the audit export (#953). Seconds
+/// granularity makes an accidental collision essentially impossible, and costs
+/// nothing — `date -u +%Y%m%d%H%M%S` is the whole convention.
+#[test]
+fn migration_versions_carry_a_time_of_day_not_just_a_date() {
+    // Both trees, for the same reason `version_collision_detection_covers_both_trees`
+    // covers both: a plugin migration collides with a core one just as easily.
+    let plugin = plugin_harvest_migration_names().join(",");
+    let all = format!("{MIGRATIONS_LIST},{plugin}");
+    let flagged = day_granular_versions(&all);
+    assert!(
+        flagged.is_empty(),
+        "these migrations use a date-only version ({flagged:?}), which collides with \
+         any other migration authored the same day — and only shows up when the two \
+         branches meet. Use a real timestamp: `date -u +%Y%m%d%H%M%S`. Migrations \
+         before {TIME_BEARING_VERSION_CUTOFF} are grandfathered and must not be \
+         renamed, because renaming an applied migration makes Diesel re-run it."
+    );
+}
+
 #[test]
 fn real_migrations_have_unique_version_prefixes() {
     let dups = duplicate_version_prefixes(MIGRATIONS_LIST);

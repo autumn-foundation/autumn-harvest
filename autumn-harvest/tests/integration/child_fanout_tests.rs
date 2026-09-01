@@ -1076,10 +1076,12 @@ async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_record
 /// case, its recorded children), silently misattributing unrelated data
 /// instead of cleanly diverging. Burning the number instead produces an
 /// honest "expected `fan_out:1`, got `fan_out:2`" divergence on replay -- which
-/// still doesn't gracefully reproduce the caught error (that's the same
-/// broader, pre-existing engine limitation documented on
-/// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`,
-/// `tests/replayer_tests.rs`), but it is never silently wrong.
+/// still doesn't gracefully reproduce the CAUGHT error (a failure the workflow
+/// catches and continues past leaves no history footprint at all, so replay
+/// re-decides it against live configuration — explicitly deferred by issue
+/// #952, which fixed the uncaught half: see
+/// `replayer_tests::early_config_dependent_failure_replays_cleanly`), but it is
+/// never silently wrong.
 #[tokio::test]
 async fn child_fan_out_raw_burns_seq_on_validation_failure_so_next_fan_out_never_reuses_it() {
     let exec_id = ExecutionId::new();

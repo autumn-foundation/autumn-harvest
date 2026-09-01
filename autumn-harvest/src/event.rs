@@ -22,6 +22,23 @@ fn default_error_type() -> String {
     "Error".to_string()
 }
 
+/// Failure reason recorded on the synthetic terminal event of a dispatch that a
+/// **failing decision cycle abandoned** (issue #952).
+///
+/// A workflow that dispatches awaited work (a child workflow, an activity) and
+/// then returns `Err` from a sibling branch in the same decision cycle never
+/// suspends, so the dispatch never becomes a queue row or an execution row. The
+/// terminal persist path records what the code actually did — a
+/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission position
+/// — immediately followed by a terminal carrying this reason, so the audit trail
+/// neither drops the dispatch nor claims work that is still in flight.
+///
+/// Deliberately a plain message on the **existing** `ChildWorkflowFailed` /
+/// `ActivityFailed` variants: issue #952 adds no `WorkflowEvent` variant, no
+/// migration, and no new `reason_code` vocabulary.
+pub const ABANDONED_DISPATCH_REASON: &str =
+    "dispatch abandoned: the workflow failed in the same decision cycle";
+
 /// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
 /// event (issue #384).
 ///

@@ -892,13 +892,21 @@ async fn failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks(
     );
 
     // (d) …and the produced history replays deterministically.
+    //
+    // This history ends in a terminal `WorkflowFailed`, so since issue #952 the
+    // verdict is `ReplaySucceeded` carrying the reproduced error rather than
+    // `ReplayStatus::WorkflowFailed`. Assert on `failure_message()`, which
+    // reads the reproduced error under either verdict, and pin the ND case
+    // separately — that is the property this test actually guards (#603 would
+    // nd-block the run permanently).
     let report = outcome.replay_check(handler).await;
     assert!(
-        matches!(
-            report.status,
-            ReplayStatus::WorkflowFailed { ref error, .. }
-                if error == "one or more DAG tasks failed"
-        ),
+        !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a mid-array FailFast history must never replay as a divergence:\n{report}"
+    );
+    assert_eq!(
+        report.failure_message(),
+        Some("one or more DAG tasks failed"),
         "a mid-array FailFast history must replay deterministically:\n{report}"
     );
 }
@@ -2308,24 +2316,24 @@ async fn fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs
         // (c) The produced history replays deterministically.
         //
         // A failing DAG's handler returns `Err("one or more DAG tasks failed")`,
-        // and `ReplayStatus::ReplaySucceeded` is reserved for a handler that
-        // returns `Ok` — so *every* failing-DAG history (compensating or not)
-        // replays to `ReplayStatus::WorkflowFailed`, which is precisely
-        // "reproduced the same terminal error with ZERO divergence". Pinning
-        // the exact error rules out `NonDeterminismDetected`, matching the
-        // repo's established failing-DAG replay shape
-        // (`dag_unified_tests.rs`, `dag_input_binding_tests.rs`,
-        // `dag_mapping_tests.rs`, `dag_signal_gate_tests.rs`).
+        // and the recorded history ends in a terminal `WorkflowFailed`. Since
+        // issue #952 that shape replays to `ReplayStatus::ReplaySucceeded`
+        // carrying the reproduced error in `reproduced_failure` — "the current
+        // code failed the same way, with zero divergence", which is exactly what
+        // this assertion has always meant. `failure_message()` reads that error
+        // under either verdict, so the assertion states the property rather than
+        // the enum variant that currently expresses it.
         let report = outcome.replay_check(handler).await;
         assert!(
-            matches!(
-                report.status,
-                ReplayStatus::WorkflowFailed { ref error, .. }
-                    if error == "one or more DAG tasks failed"
-            ),
-            "{context}: a compensating history must replay deterministically \
-             (WorkflowFailed with the original DAG error, never \
-             NonDeterminismDetected):\n{report}"
+            !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "{context}: a compensating history must never replay as a \
+             divergence:\n{report}"
+        );
+        assert_eq!(
+            report.failure_message(),
+            Some("one or more DAG tasks failed"),
+            "{context}: a compensating history must replay deterministically, \
+             reproducing the original DAG error:\n{report}"
         );
     }
 }
@@ -2510,10 +2518,14 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
 /// `ScheduleActivity` lands where history records the compensator's — a
 /// divergence.
 ///
-/// This is the same class as
-/// `replayer_tests::known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
-/// (issue #601), which pins it with a plain non-fan-out `spawn_child_workflow_raw`
-/// call. Issue #780 **enlarges** the surface rather than creating it: before the
+/// This is the same class as any config-dependent decision that leaves no
+/// history footprint. Issue #952 closed the sibling case where such a failure is
+/// *uncaught* and seals the run (a trailing terminal `WorkflowFailed` is now
+/// transparent to in-progress matches —
+/// `replayer_tests::early_config_dependent_failure_replays_cleanly`), but a
+/// rejection the unwind catches and routes around records nothing at all, so it
+/// stays re-decided on every replay.
+/// Issue #780 **enlarges** the surface rather than creating it: before the
 /// unwind existed, a rejection `?`-escaped and sealed the run FAILED with no
 /// compensation events, so there was nothing for a later dispatch to collide
 /// with.

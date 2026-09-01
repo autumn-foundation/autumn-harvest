@@ -2732,7 +2732,7 @@ fn the_inert_migration_builds_no_index_on_the_executions_table() {
     // The index is only needed once the sweeper exists, so it is built by the
     // enable path, and CONCURRENTLY by the plan for the large tables where the
     // difference is felt.
-    let up = include_str!("../../migrations/20260728000000_harvest_event_partitioning/up.sql");
+    let up = include_str!("../../migrations/20260901115500_harvest_event_partitioning/up.sql");
     let statements: String = up
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
@@ -2974,7 +2974,7 @@ async fn the_inert_migration_fails_fast_rather_than_queueing_every_append() {
     // the ALTER. Unbounded, on a migration whose entire claim is that it is
     // inert: an upgrade that a deployment may never opt into becomes a write
     // outage that ends only when the reader does.
-    let up = include_str!("../../migrations/20260728000000_harvest_event_partitioning/up.sql");
+    let up = include_str!("../../migrations/20260901115500_harvest_event_partitioning/up.sql");
     let outcome = tokio::time::timeout(
         Duration::from_secs(20),
         diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, up),

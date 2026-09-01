@@ -203,6 +203,8 @@ pub mod api_token;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Audit-record export to an external sink for SIEM compliance (issue #953).
+pub mod audit_export;
 /// Open-awaitables diagnostic projection (issue #615).
 pub mod awaitables;
 /// Post-restore resumability verification for backup/PITR drills (issue #943).
