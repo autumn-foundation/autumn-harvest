@@ -3386,7 +3386,15 @@ pub async fn enforce_timeouts_once(
     )
     .await
     {
-        Ok(exported) => count += exported,
+        // Deliberately NOT folded into `count`, for the same reason the codec
+        // re-encryption sweep below keeps its own total out of it: `count` is
+        // the timeout-enforcement total, and the caller logs
+        // `warn!("enforced timed-out tasks")` whenever it is non-zero. Folding
+        // exported records in makes every healthy export tick claim a timeout
+        // that never happened -- a 500-record batch would report
+        // `enforced_count=500`. Export reports itself through
+        // `harvest.audit.export_*` instead.
+        Ok(_exported) => {}
         Err(error) => tracing::error!(
             error = %error,
             "[audit_export] export pass failed; continuing with the rest of the scanner"
