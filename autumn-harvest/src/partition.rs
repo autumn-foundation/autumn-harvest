@@ -658,6 +658,11 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
 ///
 /// Extracted so [`list_partitions`] and its unit test share one comparator —
 /// a test that re-implements the ordering it is meant to guard tests the copy.
+// Used by `list_partitions` and by its unit test. Both are gated — the
+// former on `db`, the latter on `test` — so without this the function is
+// dead code in a `--no-default-features` build, which is how dependent
+// crates (autumn-harvest-sqlite) compile the library.
+#[cfg(any(feature = "db", test))]
 fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Ordering {
     a.is_default
         .cmp(&b.is_default)
@@ -1262,6 +1267,9 @@ pub fn cohort_function_sql(width_secs: i64) -> String {
 }
 
 /// Double-quote an identifier, escaping embedded quotes.
+// Same gating as `compare_partitions`: every caller is behind `db`, and the
+// escaping test is behind `test`.
+#[cfg(any(feature = "db", test))]
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }

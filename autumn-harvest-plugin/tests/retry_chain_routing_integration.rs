@@ -143,7 +143,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to per-test database");
-        SimpleAsyncConnection::batch_execute(&mut conn, autumn_harvest::test_init_sql())
+        SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         drop(conn);

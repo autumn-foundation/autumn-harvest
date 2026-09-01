@@ -55,7 +55,7 @@ const CONNECTOR_DLQ_SQL: &str =
     include_str!("../migrations/harvest/20260719900000_harvest_connector_dead_letters/up.sql");
 
 fn init_sql() -> Vec<u8> {
-    let mut sql = autumn_harvest::test_init_sql().to_string();
+    let mut sql = autumn_harvest::test_init_sql();
     sql.push('\n');
     sql.push_str(CONNECTOR_DLQ_SQL);
     sql.into_bytes()

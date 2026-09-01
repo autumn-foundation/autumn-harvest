@@ -51,7 +51,7 @@ const CONNECTOR_DLQ_SQL: &str =
 const TOPIC: &str = "orders.placed";
 
 fn init_sql() -> Vec<u8> {
-    let mut sql = autumn_harvest::test_init_sql().to_string();
+    let mut sql = autumn_harvest::test_init_sql();
     sql.push('\n');
     sql.push_str(CONNECTOR_DLQ_SQL);
     sql.into_bytes()
