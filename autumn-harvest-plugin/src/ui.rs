@@ -39,9 +39,9 @@ use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_API, SOURCE_UI, STATUS_FAILED,
-    STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE,
-    TARGET_WORKFLOW, insert_audit,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
+    insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -164,6 +164,18 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .flash{background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
 .shard-header{margin:20px 0 8px;font-size:13px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #1e293b;padding-bottom:6px}
 .shard-error{background:#1c1917;border:1px solid #57534e;border-radius:6px;padding:12px 16px;color:#a8a29e;font-size:13px;margin-bottom:12px}
+.degraded-banner{background:#422006;border:1px solid #a16207;border-radius:6px;padding:12px 16px;color:#fef3c7;font-size:13px;margin-bottom:16px}
+.degraded-banner strong{color:#fde68a}
+.unhealthy-summary{border-color:#b45309;background:#292524;color:#fed7aa;font-size:13px}
+.unhealthy-summary strong{color:#fdba74}
+.subtle{color:#94a3b8;font-size:11px;margin-top:2px}
+.health-badges{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+tr.schedule-unhealthy td{background:#1c1917}
+a.drilldown{font-size:12px;color:#93c5fd;border:1px solid #334155;border-radius:6px;padding:5px 9px}
+a.drilldown:hover{background:#1e293b;text-decoration:none}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;font-size:13px}
+.kv dt{color:#94a3b8}
+.kv dd{margin:0;color:#e2e8f0}
 .view-toggle{display:inline-flex;gap:2px;margin:0 0 16px;border:1px solid #334155;border-radius:6px;overflow:hidden;font-size:13px}
 .view-toggle a,.view-toggle span{padding:6px 14px;display:inline-block}
 .view-toggle a{color:#93c5fd;text-decoration:none}
@@ -651,6 +663,20 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
+        // issue #951: schedule drill-downs. Each is a presentation slice over an
+        // already-shipped endpoint, and each mirrors that endpoint's admin-auth
+        // posture: `GET /admin/schedules/{id}/runs` is the one admin-gated
+        // schedule read route, so the run history is gated here too; preview and
+        // backfill are not gated, matching their ungated API routes.
+        .route("/schedules/{id}/preview", get(schedule_preview_ui))
+        .route(
+            "/schedules/{id}/runs",
+            get(schedule_runs_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/schedules/{id}/backfill",
+            get(schedule_backfill_form_ui).post(schedule_backfill_ui),
+        )
         // issue #377: admission gates UI page and one-click lift (lift requires admin)
         .route("/admin/gates", get(list_gates_ui))
         .route(
@@ -7477,6 +7503,9 @@ pub(crate) struct ScheduleListParams {
     /// "Paused", "Active", or empty/absent for All.
     #[serde(default)]
     paused: Option<String>,
+    /// "Unhealthy", "Healthy", or empty/absent for All (issue #951).
+    #[serde(default)]
+    health: Option<String>,
     #[serde(default)]
     shard_id: Option<i32>,
     #[serde(default)]
@@ -7493,6 +7522,10 @@ struct ScheduleBulkParams {
     kind: Option<String>,
     #[serde(default)]
     paused: Option<String>,
+    /// Health filter carried through a bulk action so "pause all matching"
+    /// means the same set the operator is looking at (issue #951).
+    #[serde(default)]
+    health: Option<String>,
     #[serde(default)]
     shard_id: Option<i32>,
 }
@@ -7522,6 +7555,96 @@ impl ScheduleKindFilter {
             Self::All => "",
             Self::Workflow => "Workflow",
             Self::Dag => "Dag",
+        }
+    }
+}
+
+/// Which of the self-inflicted unhealthy states a schedule is currently in
+/// (issue #951 AC3).
+///
+/// These are the states that make an operator's 3 a.m. question — "did the
+/// nightly billing schedule fire, and if not, why not?" — answerable at a
+/// glance: a schedule that is *not* firing is almost always paused,
+/// auto-paused after repeated failures (#360), exhausted against its `end_at`
+/// or run budget (#478), or silently dropping missed slots under its catchup
+/// policy (#484). Anything else reads as one calm row.
+// The four flags are deliberately independent booleans rather than a state
+// enum: a schedule can be paused *and* exhausted *and* dropping catchup slots
+// at once, and an operator needs to see all of them.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScheduleHealth {
+    /// The schedule is paused (operator pause, or the auto-pause below).
+    paused: bool,
+    /// The pause was applied automatically after `consecutive_failure_limit`
+    /// failures (#360) — a louder signal than a hand pause.
+    auto_paused: bool,
+    /// `end_at` or the `max_runs` budget has been reached (#478); the schedule
+    /// will never fire again.
+    exhausted: bool,
+    /// The most recent recovery tick dropped missed slots (#484) — runs the
+    /// operator expected that never happened.
+    catchup_dropped: bool,
+}
+
+impl ScheduleHealth {
+    const fn is_healthy(self) -> bool {
+        !(self.paused || self.auto_paused || self.exhausted || self.catchup_dropped)
+    }
+
+    /// Sort rank: `0` for unhealthy, `1` for healthy, so unhealthy schedules
+    /// float to the top of the list (AC3) while healthy rows keep their
+    /// existing `next_run_at`-ascending order among themselves.
+    const fn rank(self) -> u8 {
+        if self.is_healthy() { 1 } else { 0 }
+    }
+}
+
+/// Derive a row's health flags. Pure: every badge, sort and summary decision on
+/// the page goes through this one function, so they can never disagree.
+const fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
+    ScheduleHealth {
+        paused: row.is_paused,
+        auto_paused: row.auto_paused_at.is_some(),
+        exhausted: row.exhausted_at.is_some(),
+        catchup_dropped: row.last_catchup_dropped > 0,
+    }
+}
+
+/// Filter the list by health (issue #951 AC3): "show me only what is wrong".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ScheduleHealthFilter {
+    #[default]
+    All,
+    Unhealthy,
+    Healthy,
+}
+
+impl ScheduleHealthFilter {
+    fn parse(raw: &str) -> Result<Self, AutumnError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::All),
+            "unhealthy" => Ok(Self::Unhealthy),
+            "healthy" => Ok(Self::Healthy),
+            other => Err(AutumnError::bad_request_msg(format!(
+                "unknown health '{other}'; expected Unhealthy, Healthy, or empty"
+            ))),
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Unhealthy => "Unhealthy",
+            Self::Healthy => "Healthy",
+        }
+    }
+
+    const fn matches(self, row: &HarvestSchedule) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unhealthy => !schedule_health(row).is_healthy(),
+            Self::Healthy => schedule_health(row).is_healthy(),
         }
     }
 }
@@ -7560,6 +7683,7 @@ struct ScheduleUiFilters {
     target: Option<String>,
     kind: ScheduleKindFilter,
     paused: SchedulePausedFilter,
+    health: ScheduleHealthFilter,
     shard_id: Option<i32>,
 }
 
@@ -7591,6 +7715,9 @@ impl ScheduleUiFilters {
         if self.shard_id.is_some_and(|sid| shard_id.as_i32() != sid) {
             return false;
         }
+        if !self.health.matches(row) {
+            return false;
+        }
         true
     }
 
@@ -7598,6 +7725,7 @@ impl ScheduleUiFilters {
         self.target.is_none()
             && matches!(self.kind, ScheduleKindFilter::All)
             && matches!(self.paused, SchedulePausedFilter::All)
+            && matches!(self.health, ScheduleHealthFilter::All)
             && self.shard_id.is_none()
     }
 }
@@ -7680,6 +7808,39 @@ async fn load_recent_decisions(
     map
 }
 
+/// Order the schedules list: unhealthy first (issue #951 AC3), then the
+/// pre-existing `next_run_at`-ascending / name / id order.
+///
+/// The health rank is a *prefix* on the existing comparator rather than a
+/// replacement for it, so healthy rows keep exactly the relative order they had
+/// before this page grew a health column.
+fn sort_schedule_rows(rows: &mut [(ShardId, HarvestSchedule)]) {
+    rows.sort_by(|(_, a), (_, b)| {
+        schedule_health(a)
+            .rank()
+            .cmp(&schedule_health(b).rank())
+            .then_with(|| match (a.next_run_at, b.next_run_at) {
+                (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    let a_name = a
+                        .workflow_name
+                        .as_deref()
+                        .or(a.dag_name.as_deref())
+                        .unwrap_or("");
+                    let b_name = b
+                        .workflow_name
+                        .as_deref()
+                        .or(b.dag_name.as_deref())
+                        .unwrap_or("");
+                    a_name.cmp(b_name)
+                }
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 async fn list_schedules_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<ScheduleListParams>,
@@ -7703,6 +7864,12 @@ async fn list_schedules_ui(
         .map(SchedulePausedFilter::parse)
         .transpose()?
         .unwrap_or(SchedulePausedFilter::All);
+    let health_filter = params
+        .health
+        .as_deref()
+        .map(ScheduleHealthFilter::parse)
+        .transpose()?
+        .unwrap_or(ScheduleHealthFilter::All);
     let target = params
         .target
         .as_deref()
@@ -7714,6 +7881,7 @@ async fn list_schedules_ui(
         target,
         kind,
         paused: paused_filter,
+        health: health_filter,
         shard_id: params.shard_id,
     };
 
@@ -7736,30 +7904,7 @@ async fn list_schedules_ui(
         .filter(|(sid, row)| filters.matches(*sid, row))
         .collect();
 
-    // Secondary sort: by name for stability when next_run_at is NULL.
-    all_rows.sort_by(|(_, a), (_, b)| {
-        let a_next = a.next_run_at;
-        let b_next = b.next_run_at;
-        match (a_next, b_next) {
-            (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => {
-                let a_name = a
-                    .workflow_name
-                    .as_deref()
-                    .or(a.dag_name.as_deref())
-                    .unwrap_or("");
-                let b_name = b
-                    .workflow_name
-                    .as_deref()
-                    .or(b.dag_name.as_deref())
-                    .unwrap_or("");
-                a_name.cmp(b_name)
-            }
-        }
-        .then_with(|| a.id.cmp(&b.id))
-    });
+    sort_schedule_rows(&mut all_rows);
 
     let total_filtered = all_rows.len();
     let distribution = schedule_kind_distribution(&all_rows);
@@ -7803,6 +7948,11 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
         .as_deref()
         .and_then(|s| SchedulePausedFilter::parse(s).ok())
         .unwrap_or(SchedulePausedFilter::All);
+    let health = params
+        .health
+        .as_deref()
+        .and_then(|s| ScheduleHealthFilter::parse(s).ok())
+        .unwrap_or(ScheduleHealthFilter::All);
     let target = params
         .target
         .as_deref()
@@ -7813,6 +7963,7 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
         target,
         kind,
         paused,
+        health,
         shard_id: params.shard_id,
     }
 }
@@ -7907,7 +8058,7 @@ async fn schedule_pause_ui(
             status: STATUS_SUCCEEDED,
             error_summary: None,
             shard_id: None,
-            source: SOURCE_API,
+            source: SOURCE_UI,
         };
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Paused {name}")
@@ -7956,7 +8107,7 @@ async fn schedule_resume_ui(
             status: STATUS_SUCCEEDED,
             error_summary: None,
             shard_id: None,
-            source: SOURCE_API,
+            source: SOURCE_UI,
         };
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Resumed {name}")
@@ -7995,7 +8146,7 @@ async fn schedule_delete_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: None,
-                source: SOURCE_API,
+                source: SOURCE_UI,
             };
             let _ = insert_audit(&mut conn, &ar).await;
             format!("Deleted {name}")
@@ -8283,7 +8434,7 @@ const fn build_trigger_audit<'a>(
         status,
         error_summary,
         shard_id: None,
-        source: SOURCE_API,
+        source: SOURCE_UI,
     }
 }
 
@@ -8445,7 +8596,7 @@ async fn schedule_bulk_pause_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
-                source: SOURCE_API,
+                source: SOURCE_UI,
             };
             let _ = insert_audit(&mut conn, &ar).await;
         }
@@ -8533,7 +8684,7 @@ async fn schedule_bulk_resume_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
-                source: SOURCE_API,
+                source: SOURCE_UI,
             };
             let _ = insert_audit(&mut conn, &ar).await;
         }
@@ -8593,6 +8744,18 @@ fn render_schedules_page(
             div.flash { (message) }
         }
 
+        @let unhealthy_summary = schedule_health_summary(rows);
+        @if !unhealthy_summary.is_empty() {
+            div.card.unhealthy-summary role="status" {
+                strong { "Needs attention: " }
+                (unhealthy_summary)
+                " — "
+                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, refresh))) } {
+                    "show only unhealthy"
+                }
+            }
+        }
+
         (render_schedule_filters(filters, limit, refresh))
         (render_schedule_bulk_actions(filters, limit, refresh, total_filtered, distribution))
 
@@ -8632,6 +8795,7 @@ fn render_schedule_filters(
     let target_val = filters.target.as_deref().unwrap_or("");
     let kind_val = filters.kind.as_label();
     let paused_val = filters.paused.as_label();
+    let health_val = filters.health.as_label();
     let shard_val = filters.shard_id.map(|s| s.to_string()).unwrap_or_default();
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
 
@@ -8655,6 +8819,14 @@ fn render_schedule_filters(
                     option value="" selected[paused_val.is_empty()] { "All" }
                     option value="Paused" selected[paused_val == "Paused"] { "Paused" }
                     option value="Active" selected[paused_val == "Active"] { "Active" }
+                }
+            }
+            label {
+                "Health"
+                select name="health" {
+                    option value="" selected[health_val.is_empty()] { "All" }
+                    option value="Unhealthy" selected[health_val == "Unhealthy"] { "Unhealthy" }
+                    option value="Healthy" selected[health_val == "Healthy"] { "Healthy" }
                 }
             }
             label {
@@ -8729,6 +8901,9 @@ fn render_schedule_hidden_filters(filters: &ScheduleUiFilters) -> Markup {
         @if !matches!(filters.paused, SchedulePausedFilter::All) {
             input type="hidden" name="paused" value=(filters.paused.as_label());
         }
+        @if !matches!(filters.health, ScheduleHealthFilter::All) {
+            input type="hidden" name="health" value=(filters.health.as_label());
+        }
         @if let Some(shard_id) = filters.shard_id {
             input type="hidden" name="shard_id" value=(shard_id);
         }
@@ -8752,7 +8927,10 @@ fn render_schedule_table(
                     th { "Timezone" }
                     th { "Next Run" }
                     th { "Last Run" }
-                    th { "State" }
+                    th { "Health" }
+                    th { "Overlap" }
+                    th { "Catchup" }
+                    th { "Bounded runs" }
                     th { "Created" }
                     @if is_multi_shard { th { "Shard" } }
                     th { "Actions" }
@@ -8766,7 +8944,8 @@ fn render_schedule_table(
                         .or(row.dag_name.as_deref())
                         .unwrap_or("—");
                     @let expr = row.schedule_expr.as_deref().unwrap_or("—");
-                    tr {
+                    @let health = schedule_health(row);
+                    tr class=[(!health.is_healthy()).then_some("schedule-unhealthy")] {
                         td { code { (short_id(&id_str)) } }
                         td { (kind_label) }
                         td {
@@ -8805,13 +8984,31 @@ fn render_schedule_table(
                                 span.badge.timezone { (row.timezone) }
                             }
                         }
-                        td { (format_timestamp(row.next_run_at)) }
+                        td { (schedule_next_fire_cell(row)) }
                         td { (format_timestamp(row.last_run_at)) }
-                        td { (schedule_state_badge(row.is_paused)) }
+                        td {
+                            @if health.is_healthy() {
+                                (schedule_state_badge(false))
+                            } @else {
+                                div.health-badges { (render_schedule_health_badges(row)) }
+                            }
+                        }
+                        td { code { (schedule_overlap_label(row)) } }
+                        td { code { (schedule_catchup_label(row)) } }
+                        td { (schedule_bounded_runs_label(row)) }
                         td { (format_timestamp(Some(row.created_at))) }
                         @if is_multi_shard { td { (shard_id.as_i32()) } }
                         td {
                             div.actions {
+                                a.drilldown href={ (schedule_leaf_path(&id_str, "preview")) } {
+                                    "Preview"
+                                }
+                                a.drilldown href={ (schedule_leaf_path(&id_str, "runs")) } {
+                                    "Runs"
+                                }
+                                a.drilldown href={ (schedule_leaf_path(&id_str, "backfill")) } {
+                                    "Backfill"
+                                }
                                 @if !row.is_paused {
                                     form method="post"
                                         action={ "schedules/" (id_str) "/pause" }
@@ -8848,6 +9045,171 @@ fn render_schedule_table(
                 }
             }
         }
+    }
+}
+
+// ── issue #951: schedule health, policy cells and drill-down links ───────────
+
+/// Badges for a row's unhealthy states (issue #951 AC3).
+///
+/// Renders **nothing** for a healthy schedule — the calm-row requirement — so
+/// the caller decides what a healthy row shows instead (the list shows the
+/// existing "Active" state badge).
+fn render_schedule_health_badges(row: &HarvestSchedule) -> Markup {
+    let health = schedule_health(row);
+    html! {
+        @if health.auto_paused {
+            span.badge.FAILED role="status"
+                aria-label="Health: auto-paused after consecutive failures" {
+                "Auto-paused"
+            }
+        } @else if health.paused {
+            span.badge.CANCELLED role="status" aria-label="Health: paused" { "Paused" }
+        }
+        @if health.exhausted {
+            span.badge.TERMINATED role="status" aria-label="Health: exhausted" {
+                "Exhausted"
+                @if let Some(ref reason) = row.exhausted_reason { ": " (reason) }
+            }
+        }
+        @if health.catchup_dropped {
+            span.badge.FAILED role="status" aria-label="Health: catchup slots dropped" {
+                "Catchup dropped ×" (row.last_catchup_dropped)
+            }
+        }
+    }
+}
+
+/// The effective catchup policy (#484) plus its window and most-recent drop
+/// count, as one compact cell.
+fn schedule_catchup_label(row: &HarvestSchedule) -> String {
+    let policy = autumn_harvest::policy::CatchupPolicy::from_db(
+        row.catchup_policy.as_deref(),
+        row.catchup_window_secs,
+        row.catchup,
+    );
+    let mut out = policy.as_str().to_string();
+    if matches!(policy, autumn_harvest::policy::CatchupPolicy::Window(_)) {
+        let secs = row.catchup_window_secs.unwrap_or(0);
+        let _ = write!(out, " ({secs}s)");
+    }
+    if row.last_catchup_dropped > 0 {
+        let _ = write!(out, " · dropped {}", row.last_catchup_dropped);
+    }
+    out
+}
+
+/// The bounded-run state (#478): remaining budget, `end_at` cutoff, and the
+/// machine-readable exhaustion reason once it has fired for the last time.
+fn schedule_bounded_runs_label(row: &HarvestSchedule) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(max) = row.max_runs {
+        let remaining = crate::api::remaining_runs_budget(max, row.runs_started);
+        parts.push(format!("{remaining} of {max} left"));
+    }
+    if let Some(end_at) = row.end_at {
+        parts.push(format!("ends {}", format_timestamp(Some(end_at))));
+    }
+    if let Some(ref reason) = row.exhausted_reason {
+        parts.push(format!("exhausted: {reason}"));
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// The overlap policy (#241), with the buffered depth (and cap) when the policy
+/// is one that buffers.
+fn schedule_overlap_label(row: &HarvestSchedule) -> String {
+    let mut out = row.overlap_policy.clone();
+    match row.overlap_policy.as_str() {
+        "buffer_one" | "buffer_all" => {
+            let depth =
+                autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
+            let _ = write!(out, " · buffered {depth}");
+            if row.overlap_policy == "buffer_all" {
+                let _ = write!(out, "/{}", row.buffer_all_max);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The next-fire cell: `next_run_at`, plus the jitter-adjusted
+/// `effective_fire_time` (#240) when — and only when — jitter is configured.
+///
+/// Delegates to `api::effective_fire_time` rather than recomputing the jitter
+/// offset, so the page can never disagree with `GET /admin/schedules`.
+fn schedule_next_fire_cell(row: &HarvestSchedule) -> Markup {
+    let effective = crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs);
+    html! {
+        (format_timestamp(row.next_run_at))
+        @if let Some(effective_at) = effective {
+            div.subtle {
+                "effective " (format_timestamp(Some(effective_at)))
+                " (jitter ≤ " (row.jitter_secs) "s)"
+            }
+        }
+    }
+}
+
+/// One-line count of the unhealthy schedules in the current result set, or the
+/// empty string when everything is healthy (AC3: nothing to shout about).
+fn schedule_health_summary(rows: &[(ShardId, HarvestSchedule)]) -> String {
+    let (mut paused, mut exhausted, mut dropped) = (0usize, 0usize, 0usize);
+    for (_, row) in rows {
+        let health = schedule_health(row);
+        if health.paused || health.auto_paused {
+            paused += 1;
+        }
+        if health.exhausted {
+            exhausted += 1;
+        }
+        if health.catchup_dropped {
+            dropped += 1;
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if paused > 0 {
+        parts.push(format!("{paused} paused"));
+    }
+    if exhausted > 0 {
+        parts.push(format!("{exhausted} exhausted"));
+    }
+    if dropped > 0 {
+        parts.push(format!("{dropped} catchup-dropped"));
+    }
+    parts.join(" · ")
+}
+
+/// The schedule's display name (workflow or DAG target), or `—`.
+fn schedule_target_name(row: &HarvestSchedule) -> &str {
+    row.workflow_name
+        .as_deref()
+        .or(row.dag_name.as_deref())
+        .unwrap_or("—")
+}
+
+/// Href from a `/schedules/{id}/{leaf}` drill-down page back into the UI tree.
+///
+/// Vantage mounts under a caller-configured prefix, so every link is relative.
+/// A drill-down lives two segments below the mount point, so `../../` returns to
+/// the root and the rest of the path is spelled out — which also keeps every
+/// link greppable as a literal `schedules/{id}/…`.
+fn schedule_drilldown_href(id: &str, leaf: &str) -> String {
+    format!("../../{}", schedule_leaf_path(id, leaf))
+}
+
+/// The `schedules/{id}/{leaf}` path fragment shared by the list's row links and
+/// the drill-downs' own cross-links.
+fn schedule_leaf_path(id: &str, leaf: &str) -> String {
+    if leaf.is_empty() {
+        format!("schedules/{id}")
+    } else {
+        format!("schedules/{id}/{leaf}")
     }
 }
 
@@ -8906,6 +9268,9 @@ fn build_schedule_query_string(
     if !matches!(filters.paused, SchedulePausedFilter::All) {
         let _ = write!(out, "&paused={}", filters.paused.as_label());
     }
+    if !matches!(filters.health, ScheduleHealthFilter::All) {
+        let _ = write!(out, "&health={}", filters.health.as_label());
+    }
     if let Some(shard_id) = filters.shard_id {
         let _ = write!(out, "&shard_id={shard_id}");
     }
@@ -8914,6 +9279,771 @@ fn build_schedule_query_string(
     }
     out
 }
+
+// ── issue #951: schedule drill-downs — preview, run history, backfill ────────
+//
+// Every one of these is a *presentation* slice over an already-shipped,
+// already-audited API:
+//
+//   * preview      → `api::compute_schedule_preview`  (`GET /admin/schedules/{id}/preview`, #348/#543)
+//   * run history  → `api::load_schedule_runs`        (`GET /admin/schedules/{id}/runs`, #534/#762)
+//   * backfill     → `api::schedule_backfill`         (`POST /admin/schedules/{id}/backfill`, #337)
+//
+// They call those functions directly rather than reimplementing them, so the
+// page cannot drift from the API on bounded-run truncation, cross-shard
+// partial results, or the audit trail. No new endpoint, no new event variant,
+// no migration.
+
+/// Query parameters for the preview drill-down.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SchedulePreviewUiParams {
+    /// Number of fire times to project. Clamped to 1..=100 by the API.
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+/// Query parameters for the run-history drill-down.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScheduleRunsUiParams {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Resolve the schedule row for a drill-down page, mapping "unknown id" to a
+/// rendered 404 rather than a blank panel.
+async fn load_schedule_for_drilldown(
+    api_state: &HarvestApiState,
+    id_str: &str,
+) -> Result<(HarvestSchedule, ShardId), AutumnError> {
+    let found = find_schedule_row(api_state, id_str)
+        .await
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid schedule id '{id_str}'")))?;
+    match found {
+        Some((row, shard_id, _conn)) => Ok((row, shard_id)),
+        None => Err(AutumnError::not_found_msg(format!("schedule {id_str}"))),
+    }
+}
+
+/// `GET /schedules/{id}/preview` — the next N fire times for one schedule
+/// (issue #951 AC5, over the #348 preview endpoint).
+///
+/// Read-only and ungated, matching `GET /admin/schedules/{id}/preview`.
+async fn schedule_preview_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(params): Query<SchedulePreviewUiParams>,
+) -> Result<Markup, AutumnError> {
+    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
+    let count = params
+        .count
+        .unwrap_or(SCHEDULE_PREVIEW_DEFAULT_COUNT)
+        .clamp(1, 100);
+    let preview =
+        crate::api::compute_schedule_preview(&api_state, row.id, count, chrono::Utc::now()).await?;
+    Ok(render_schedule_preview_page(
+        &row, shard_id, &preview, count,
+    ))
+}
+
+/// Default number of projected fire times on the preview drill-down.
+const SCHEDULE_PREVIEW_DEFAULT_COUNT: usize = 10;
+
+#[allow(clippy::too_many_lines)]
+fn render_schedule_preview_page(
+    row: &HarvestSchedule,
+    shard_id: ShardId,
+    preview: &crate::api::SchedulePreview,
+    count: usize,
+) -> Markup {
+    let id_str = row.id.to_string();
+    let body = html! {
+        h2 { "Fire-time preview — " code { (schedule_target_name(row)) } }
+        (render_schedule_drilldown_header(row, shard_id, "preview"))
+
+        @if preview.is_paused {
+            div.degraded-banner role="status" {
+                strong { "Schedule is paused. " }
+                "No fire times are projected while a schedule is paused."
+                @if let Some(ref reason) = preview.pause_reason {
+                    " Reason: " (reason)
+                }
+            }
+        }
+        @if let Some(ref reason) = preview.exhausted_reason {
+            div.degraded-banner role="status" {
+                strong { "Schedule is exhausted. " }
+                "It will never fire again (" (reason) ")."
+            }
+        }
+        @if preview.entries.is_empty() {
+            div.card.empty {
+                "No upcoming fire times."
+                @if preview.remaining_runs == Some(0) {
+                    " The run budget is spent."
+                } @else if let Some(end_at) = preview.end_at {
+                    " The window ends " (format_timestamp(Some(end_at))) "."
+                } @else if !preview.is_paused && preview.exhausted_reason.is_none() {
+                    " The schedule expression produces no future firings "
+                    "(a manual-only or unparseable expression)."
+                }
+            }
+        } @else {
+            div.card {
+                dl.kv {
+                    dt { "Projected from" } dd { (format_timestamp(Some(preview.from))) }
+                    dt { "Entries requested" } dd { (count) }
+                    @if let Some(remaining) = preview.remaining_runs {
+                        dt { "Remaining run budget" } dd { (remaining) }
+                    }
+                    @if let Some(end_at) = preview.end_at {
+                        dt { "Ends at" } dd { (format_timestamp(Some(end_at))) }
+                    }
+                }
+            }
+            table {
+                thead {
+                    tr {
+                        th { "#" }
+                        th { "Scheduled (UTC)" }
+                        th { "Local (" (row.timezone) ")" }
+                        th { "Effective (UTC)" }
+                        th { "Reason" }
+                        th { "Jitter window" }
+                        th { "Overlap risk" }
+                    }
+                }
+                tbody {
+                    @for (idx, entry) in preview.entries.iter().enumerate() {
+                        tr {
+                            td { (idx + 1) }
+                            td { (format_timestamp(Some(entry.scheduled_at))) }
+                            td { code { (entry.local_at) } }
+                            td {
+                                @match entry.effective_at {
+                                    Some(effective_at) => {
+                                        (format_timestamp(Some(effective_at)))
+                                    }
+                                    None => {
+                                        span.badge.CANCELLED { "suppressed" }
+                                    }
+                                }
+                            }
+                            td { code { (entry.reason) } }
+                            td {
+                                @match (entry.jitter_earliest_at, entry.jitter_latest_at) {
+                                    (Some(earliest), Some(latest)) => {
+                                        (format_timestamp(Some(earliest)))
+                                        " → "
+                                        (format_timestamp(Some(latest)))
+                                    }
+                                    _ => { "—" }
+                                }
+                            }
+                            td {
+                                @if entry.would_skip_if_active {
+                                    span.badge.FAILED { "may be skipped" }
+                                } @else {
+                                    "—"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p.note {
+                "\"Overlap risk\" is advisory: the preview is stateless and cannot know how "
+                "many runs will be active when the slot arrives."
+            }
+        }
+
+        div.actions {
+            a.drilldown href=(schedule_drilldown_href(&id_str, "runs")) { "Run history" }
+            a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
+        }
+    };
+    layout_schedules("Schedule preview · Vantage", &body, None)
+}
+
+/// `GET /schedules/{id}/runs` — per-schedule run history (issue #951 AC7, over
+/// the #534/#762 runs endpoint).
+///
+/// Admin-gated to match `GET /admin/schedules/{id}/runs`, which is the only
+/// schedule read route the API gates.
+async fn schedule_runs_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(params): Query<ScheduleRunsUiParams>,
+) -> Result<Markup, AutumnError> {
+    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
+
+    // Build the query through the endpoint's own parser so the UI applies the
+    // same clamping, vocabulary validation and cursor format as the API.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(limit) = params.limit {
+        pairs.push(("limit".to_string(), limit.to_string()));
+    }
+    if let Some(ref cursor) = params.cursor {
+        pairs.push(("cursor".to_string(), cursor.clone()));
+    }
+    if let Some(ref origin) = params.origin
+        && !origin.trim().is_empty()
+    {
+        pairs.push(("origin".to_string(), origin.clone()));
+    }
+    if let Some(ref state) = params.state
+        && !state.trim().is_empty()
+    {
+        pairs.push(("state".to_string(), state.clone()));
+    }
+    let runs_params =
+        crate::schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
+            .map_err(AutumnError::bad_request_msg)?;
+
+    let response = crate::api::load_schedule_runs(&api_state, row.id, runs_params).await?;
+    Ok(render_schedule_runs_page(&row, shard_id, &response))
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_schedule_runs_page(
+    row: &HarvestSchedule,
+    shard_id: ShardId,
+    response: &crate::schedule_runs::ScheduleRunsResponse,
+) -> Markup {
+    use crate::shard_fanout::FanoutStatus;
+
+    let id_str = row.id.to_string();
+    let unavailable: Vec<&crate::schedule_runs::RunsShardInspection> = response
+        .shards
+        .iter()
+        .filter(|s| s.status != "inspected")
+        .collect();
+    let any_shard_inspected = !matches!(response.status, FanoutStatus::Unavailable);
+
+    let body = html! {
+        h2 { "Run history — " code { (schedule_target_name(row)) } }
+        (render_schedule_drilldown_header(row, shard_id, "runs"))
+
+        // AC7: a partial cross-shard answer is always visible, never silently
+        // truncated data.
+        @match response.status {
+            FanoutStatus::Partial => {
+                div.degraded-banner role="status" {
+                    strong { "Some shards unreachable. " }
+                    "This history and its summary cover only the shards that answered; "
+                    "counts may be understated."
+                    (render_unavailable_shard_list(&unavailable))
+                }
+            }
+            FanoutStatus::Unavailable => {
+                div.degraded-banner role="status" {
+                    strong { "No shard could be reached. " }
+                    "No run history could be read, so this page shows nothing rather "
+                    "than an empty history — retry once shards recover."
+                    (render_unavailable_shard_list(&unavailable))
+                }
+            }
+            FanoutStatus::Complete => {}
+        }
+
+        div.card {
+            h3 { "Scheduled-run summary" }
+            p.note {
+                "Counts " strong { "scheduled-origin" } " runs only, so a backfill storm "
+                "or an ad-hoc trigger never inflates the failure ratio."
+            }
+            dl.kv {
+                dt { "Succeeded" } dd { (response.summary.succeeded) }
+                dt { "Failed" } dd { (response.summary.failed) }
+                dt { "Timed out" } dd { (response.summary.timed_out) }
+                dt { "Cancelled" } dd { (response.summary.cancelled) }
+                dt { "Terminated" } dd { (response.summary.terminated) }
+                dt { "Running" } dd { (response.summary.running) }
+                dt { "Total" } dd { (response.summary.total) }
+                dt { "Next run" } dd { (format_timestamp(response.next_run_at)) }
+            }
+            @if !response.summary.summary_complete {
+                p.note { "Some shards were unavailable, so these counts may be understated." }
+            }
+        }
+
+        @if response.runs.is_empty() {
+            @if any_shard_inspected {
+                div.card.empty {
+                    "No runs yet. This schedule has not started an execution "
+                    "in the queried window."
+                }
+            }
+        } @else {
+            table {
+                thead {
+                    tr {
+                        th { "Nominal fire time" }
+                        th { "Started" }
+                        th { "Completed" }
+                        th { "State" }
+                        th { "Origin" }
+                        th { "Error" }
+                        th { "Execution" }
+                    }
+                }
+                tbody {
+                    @for run in &response.runs {
+                        @let exec_id = run.execution_id.to_string();
+                        tr {
+                            td {
+                                @match run.nominal_fire_time {
+                                    Some(fire_time) => { (format_timestamp(Some(fire_time))) }
+                                    // A manual trigger has no logical slot (#534).
+                                    None => { span.subtle { "— (no slot)" } }
+                                }
+                            }
+                            td { (format_timestamp(Some(run.started_at))) }
+                            td { (format_timestamp(run.completed_at)) }
+                            td { (state_badge(&run.state)) }
+                            td { code { (run.origin.as_deref().unwrap_or("—")) } }
+                            td {
+                                @match run.error {
+                                    Some(ref error) => { span.subtle { (error) } }
+                                    None => { "—" }
+                                }
+                            }
+                            td {
+                                a href={ "../../workflows/" (exec_id) } {
+                                    code { (short_id(&exec_id)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div.pagination {
+                span { "Showing " (response.runs.len()) " of at most " (response.limit) }
+                @if let Some(ref cursor) = response.next_cursor {
+                    a href={ (schedule_leaf_path(&id_str, "runs")) "?limit=" (response.limit)
+                             "&cursor=" (url_encode(cursor)) } {
+                        "Next " (PreEscaped("&rarr;"))
+                    }
+                } @else {
+                    span.disabled { "Next " (PreEscaped("&rarr;")) }
+                }
+            }
+        }
+
+        div.actions {
+            a.drilldown href=(schedule_drilldown_href(&id_str, "preview")) { "Fire-time preview" }
+            a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
+        }
+    };
+    layout_schedules("Schedule runs · Vantage", &body, None)
+}
+
+fn render_unavailable_shard_list(
+    unavailable: &[&crate::schedule_runs::RunsShardInspection],
+) -> Markup {
+    html! {
+        @if !unavailable.is_empty() {
+            ul {
+                @for shard in unavailable {
+                    li {
+                        "Shard " (shard.shard_id) ": "
+                        (shard.error.as_deref().unwrap_or("unavailable"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Identity strip shared by the three drill-down pages, so an operator always
+/// knows which schedule they are looking at and can get back to the list.
+fn render_schedule_drilldown_header(
+    row: &HarvestSchedule,
+    shard_id: ShardId,
+    current: &str,
+) -> Markup {
+    let id_str = row.id.to_string();
+    let health = schedule_health(row);
+    html! {
+        div.card {
+            dl.kv {
+                dt { "Schedule" } dd { code { (id_str) } }
+                dt { "Kind" }
+                dd { (if row.dag_name.is_some() { "Dag" } else { "Workflow" }) }
+                dt { "Target" } dd { code { (schedule_target_name(row)) } }
+                dt { "Expression" }
+                dd { code { (row.schedule_expr.as_deref().unwrap_or("—")) } }
+                dt { "Timezone" } dd { (row.timezone) }
+                dt { "Shard" } dd { (shard_id.as_i32()) }
+                dt { "Health" }
+                dd {
+                    @if health.is_healthy() {
+                        (schedule_state_badge(false))
+                    } @else {
+                        div.health-badges { (render_schedule_health_badges(row)) }
+                    }
+                }
+            }
+            p.note {
+                a href="../../schedules" { (PreEscaped("&larr;")) " All schedules" }
+                " · viewing " (current)
+            }
+        }
+    }
+}
+
+// ── Backfill launcher (issue #951 AC6) ──────────────────────────────────────
+
+/// The backfill window an operator typed, normalised and re-checked.
+///
+/// Kept as strings so the confirmation step can round-trip the *exact* window
+/// that was previewed into its hidden fields — the committed backfill is then
+/// provably the one whose counts the operator was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackfillFormParams {
+    from: String,
+    to: String,
+    max_count: Option<usize>,
+    include_paused: bool,
+}
+
+impl BackfillFormParams {
+    /// Validate and normalise a submitted window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message for an unparseable instant or an
+    /// inverted window, which the caller renders as a form error — never a 500.
+    fn parse(
+        from: &str,
+        to: &str,
+        max_count: Option<usize>,
+        include_paused: bool,
+    ) -> Result<Self, String> {
+        let parse_one = |label: &str, raw: &str| {
+            chrono::DateTime::parse_from_rfc3339(raw.trim())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|_| {
+                    format!(
+                        "invalid {label} '{raw}': expected an RFC 3339 instant, \
+                         e.g. 2026-08-01T00:00:00Z"
+                    )
+                })
+        };
+        let from_at = parse_one("start", from)?;
+        let to_at = parse_one("end", to)?;
+        if to_at < from_at {
+            return Err("the backfill end must be at or after its start".to_string());
+        }
+        Ok(Self {
+            from: from_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            to: to_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            max_count,
+            include_paused,
+        })
+    }
+
+    /// Build the request for the shared `api::schedule_backfill` handler.
+    fn to_request(&self, dry_run: bool) -> Result<crate::api::ScheduleBackfillRequest, String> {
+        let parse_one = |raw: &str| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|_| "the backfill window is no longer parseable".to_string())
+        };
+        Ok(crate::api::ScheduleBackfillRequest {
+            from: parse_one(&self.from)?,
+            to: parse_one(&self.to)?,
+            dry_run,
+            include_paused: self.include_paused,
+            max_count: self.max_count,
+        })
+    }
+}
+
+/// Submitted backfill form. `stage` decides what happens, and **defaults to the
+/// dry run**: a POST that omits it can never dispatch work.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScheduleBackfillForm {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    max_count: Option<String>,
+    #[serde(default)]
+    include_paused: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
+}
+
+/// `GET /schedules/{id}/backfill` — the empty launcher form.
+///
+/// Purely a read: the dry run itself writes a `harvest_backfill_log` row and an
+/// audit record, so it may not sit on a GET (issue #951 AC9, "read path stays
+/// read-only and side-effect-free").
+async fn schedule_backfill_form_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> Result<Markup, AutumnError> {
+    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
+    Ok(render_schedule_backfill_form(&row, shard_id, None))
+}
+
+/// `POST /schedules/{id}/backfill` — the two-stage backfill launcher.
+///
+/// `stage=commit` dispatches; anything else (including an absent `stage`) runs
+/// the dry run and renders the preview-count confirmation. Both stages go
+/// through `api::schedule_backfill`, so the audit record, the backfill log row
+/// and every guard (paused, exhausted, `max_active_runs`, `max_runs`) are the
+/// API's, not a second copy.
+async fn schedule_backfill_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<ScheduleBackfillForm>,
+) -> axum::response::Response {
+    let (row, shard_id) = match load_schedule_for_drilldown(&api_state, &id_str).await {
+        Ok(found) => found,
+        Err(e) => return e.into_response(),
+    };
+
+    let max_count = match form
+        .max_count
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return render_schedule_backfill_form(
+                    &row,
+                    shard_id,
+                    Some(&format!(
+                        "invalid max count '{raw}': expected a positive integer"
+                    )),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let include_paused = form.include_paused.is_some();
+
+    let params = match BackfillFormParams::parse(&form.from, &form.to, max_count, include_paused) {
+        Ok(params) => params,
+        Err(message) => {
+            return render_schedule_backfill_form(&row, shard_id, Some(&message)).into_response();
+        }
+    };
+
+    // Default to the dry run: only an explicit `stage=commit` dispatches.
+    let commit = form.stage.as_deref() == Some("commit");
+
+    let request = match params.to_request(commit) {
+        Ok(request) => request,
+        Err(message) => {
+            return render_schedule_backfill_form(&row, shard_id, Some(&message)).into_response();
+        }
+    };
+
+    // Attribute the audit record to the UI, exactly as the pause/resume actions do.
+    let mut headers = headers;
+    headers.insert(
+        autumn_harvest::audit::HEADER_SOURCE,
+        axum::http::HeaderValue::from_static(SOURCE_UI),
+    );
+
+    let result = crate::api::schedule_backfill(
+        Extension(api_state),
+        axum::extract::Path(id_str.clone()),
+        headers,
+        axum::Json(request),
+    )
+    .await;
+
+    match result {
+        Ok(axum::Json(response)) => {
+            if commit {
+                // AC6: land the operator on this schedule's run history so the
+                // runs they just launched are one click from the confirmation.
+                let flash = format!(
+                    "Backfill dispatched {} of {} planned run(s); {} skipped, {} failed.",
+                    response.dispatched, response.total, response.skipped, response.failed
+                );
+                axum::response::Redirect::to(&format!(
+                    "../../{}?flash={}",
+                    schedule_leaf_path(&id_str, "runs"),
+                    url_encode(&flash)
+                ))
+                .into_response()
+            } else {
+                render_schedule_backfill_confirm(&row, shard_id, &response, &params).into_response()
+            }
+        }
+        // A rejected backfill (paused, exhausted, window too large, unknown DAG)
+        // comes back as the API's own message, rendered on the form rather than
+        // as a bare error page.
+        Err(e) => {
+            render_schedule_backfill_form(&row, shard_id, Some(&e.to_string())).into_response()
+        }
+    }
+}
+
+fn render_schedule_backfill_form(
+    row: &HarvestSchedule,
+    shard_id: ShardId,
+    error: Option<&str>,
+) -> Markup {
+    let id_str = row.id.to_string();
+    let body = html! {
+        h2 { "Backfill — " code { (schedule_target_name(row)) } }
+        (render_schedule_drilldown_header(row, shard_id, "backfill"))
+
+        @if let Some(message) = error {
+            div.degraded-banner role="status" { strong { "Backfill not started. " } (message) }
+        }
+
+        div.card {
+            p.note {
+                "A backfill replays this schedule's missed slots over a window. "
+                "Submitting runs a "
+                strong { "dry run" }
+                " first: nothing is dispatched until you confirm the planned count."
+            }
+            form method="post" action={ "../../" (schedule_leaf_path(&id_str, "backfill")) } {
+                input type="hidden" name="stage" value="preview";
+                div.filters {
+                    label {
+                        "Start (RFC 3339 UTC)"
+                        input type="text" name="from" required
+                            placeholder="2026-08-01T00:00:00Z";
+                    }
+                    label {
+                        "End (RFC 3339 UTC)"
+                        input type="text" name="to" required
+                            placeholder="2026-08-02T00:00:00Z";
+                    }
+                    label {
+                        "Max slots"
+                        input type="number" name="max_count" min="1"
+                            placeholder="default";
+                    }
+                    label {
+                        "Include paused"
+                        input type="checkbox" name="include_paused" value="1";
+                    }
+                }
+                div.actions { button type="submit" { "Preview backfill" } }
+            }
+        }
+
+        div.actions {
+            a.drilldown href=(schedule_drilldown_href(&id_str, "preview")) { "Fire-time preview" }
+            a.drilldown href=(schedule_drilldown_href(&id_str, "runs")) { "Run history" }
+        }
+    };
+    layout_schedules("Schedule backfill · Vantage", &body, None)
+}
+
+fn render_schedule_backfill_confirm(
+    row: &HarvestSchedule,
+    shard_id: ShardId,
+    dry_run: &crate::api::ScheduleBackfillResponse,
+    form: &BackfillFormParams,
+) -> Markup {
+    let id_str = row.id.to_string();
+    let nothing_to_do = dry_run.total == 0 || dry_run.dispatched == 0;
+    let mut skip_reasons: Vec<(&String, &usize)> = dry_run.skipped_reasons.iter().collect();
+    skip_reasons.sort_by(|a, b| a.0.cmp(b.0));
+
+    let body = html! {
+        h2 { "Confirm backfill — " code { (schedule_target_name(row)) } }
+        (render_schedule_drilldown_header(row, shard_id, "backfill"))
+
+        div.card {
+            h3 { "Dry run" }
+            p.note { "Nothing has been dispatched yet." }
+            dl.kv {
+                dt { "Window" }
+                dd { code { (form.from) } " → " code { (form.to) } }
+                dt { "Planned slots" } dd { (dry_run.total) }
+                dt { "Would dispatch" } dd { (dry_run.dispatched) }
+                dt { "Would skip" } dd { (dry_run.skipped) }
+                @if let Some(max_count) = form.max_count {
+                    dt { "Max slots" } dd { (max_count) }
+                }
+                dt { "Include paused" }
+                dd { (if form.include_paused { "yes" } else { "no" }) }
+            }
+            @if !skip_reasons.is_empty() {
+                h3 { "Skip reasons" }
+                ul {
+                    @for (reason, count) in &skip_reasons {
+                        li { code { (reason) } ": " (count) }
+                    }
+                }
+            }
+            @if let Some(ref warning) = dry_run.paused_schedule_warning {
+                div.degraded-banner role="status" { (warning) }
+            }
+            @if !dry_run.planned_timestamps.is_empty() {
+                h3 { "Planned fire times" }
+                ul {
+                    @for ts in dry_run.planned_timestamps.iter().take(SCHEDULE_BACKFILL_PREVIEW_ROWS) {
+                        li { (format_timestamp(Some(*ts))) }
+                    }
+                }
+                @if dry_run.planned_timestamps.len() > SCHEDULE_BACKFILL_PREVIEW_ROWS {
+                    p.note {
+                        "… and " (dry_run.planned_timestamps.len() - SCHEDULE_BACKFILL_PREVIEW_ROWS)
+                        " more."
+                    }
+                }
+            }
+        }
+
+        @if nothing_to_do {
+            div.card.empty {
+                "Nothing to backfill in this window — no slot would be dispatched. "
+                "Widen the window, or clear whatever is skipping these slots, and preview again."
+            }
+        } @else {
+            div.card {
+                form method="post" action={ "../../" (schedule_leaf_path(&id_str, "backfill")) }
+                    onsubmit={
+                        "return confirm('Dispatch " (dry_run.dispatched)
+                        " backfill run(s) for schedule " (js_escape(&id_str)) "?')"
+                    } {
+                    input type="hidden" name="stage" value="commit";
+                    input type="hidden" name="from" value=(form.from);
+                    input type="hidden" name="to" value=(form.to);
+                    @if let Some(max_count) = form.max_count {
+                        input type="hidden" name="max_count" value=(max_count);
+                    }
+                    @if form.include_paused {
+                        input type="hidden" name="include_paused" value="1";
+                    }
+                    div.actions {
+                        button type="submit" { "Dispatch " (dry_run.dispatched) " run(s)" }
+                        a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) {
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+        }
+    };
+    layout_schedules("Confirm backfill · Vantage", &body, None)
+}
+
+/// How many planned fire times the confirmation lists before rolling up.
+const SCHEDULE_BACKFILL_PREVIEW_ROWS: usize = 20;
 
 // ── Admission gates UI (issue #377) ──────────────────────────────────────────
 
@@ -10017,9 +11147,11 @@ mod tests {
             target: Some("payment".to_string()),
             kind: ScheduleKindFilter::Workflow,
             paused: SchedulePausedFilter::Paused,
+            health: ScheduleHealthFilter::Unhealthy,
             shard_id: Some(2),
         };
         let q = build_schedule_query_string(10, &filters, Some(30));
+        assert!(q.contains("health=Unhealthy"), "missing health: {q}");
         assert!(q.contains("limit=10"), "missing limit: {q}");
         assert!(q.contains("target=payment"), "missing target: {q}");
         assert!(q.contains("kind=Workflow"), "missing kind: {q}");
@@ -12341,5 +13473,875 @@ mod tests {
             workflow_detail_href(2, Some("error")),
             "?event_page=2&log_level=error"
         );
+    }
+
+    // ── issue #951: schedules management page — health, policy and drill-downs ──
+
+    /// A schedule with nothing wrong reports no health flags, so a healthy row
+    /// stays calm (AC3: "a healthy schedule reads as one calm row").
+    #[test]
+    fn schedule_health_healthy_row_has_no_flags() {
+        let row = make_schedule(Some("payments"), None, false);
+        let health = schedule_health(&row);
+        assert!(
+            health.is_healthy(),
+            "an untouched schedule must read healthy"
+        );
+        assert_eq!(
+            render_schedule_health_badges(&row).into_string(),
+            "",
+            "a healthy row must render no health badges"
+        );
+    }
+
+    /// Each unhealthy condition the AC names gets its own flag + badge.
+    #[test]
+    fn schedule_health_flags_paused_exhausted_and_catchup_dropped() {
+        let paused = make_schedule(Some("wf"), None, true);
+        assert!(schedule_health(&paused).paused);
+        assert!(!schedule_health(&paused).is_healthy());
+        assert!(
+            render_schedule_health_badges(&paused)
+                .into_string()
+                .contains("Paused")
+        );
+
+        let exhausted = HarvestSchedule {
+            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_reason: Some("max_runs_exhausted".to_string()),
+            ..make_schedule(Some("wf"), None, false)
+        };
+        assert!(schedule_health(&exhausted).exhausted);
+        let html = render_schedule_health_badges(&exhausted).into_string();
+        assert!(
+            html.contains("Exhausted"),
+            "exhausted badge missing: {html}"
+        );
+        assert!(
+            html.contains("max_runs_exhausted"),
+            "exhaustion reason must be surfaced: {html}"
+        );
+
+        let dropped = HarvestSchedule {
+            last_catchup_dropped: 7,
+            last_catchup_at: Some(chrono::Utc::now()),
+            ..make_schedule(Some("wf"), None, false)
+        };
+        assert!(schedule_health(&dropped).catchup_dropped);
+        let html = render_schedule_health_badges(&dropped).into_string();
+        assert!(
+            html.contains("Catchup dropped"),
+            "catchup-dropped badge missing: {html}"
+        );
+        assert!(html.contains('7'), "dropped count must be shown: {html}");
+    }
+
+    /// An auto-paused schedule (#360) is unhealthy and distinguishable from a
+    /// hand-paused one.
+    #[test]
+    fn schedule_health_flags_auto_paused_distinctly() {
+        let row = HarvestSchedule {
+            is_paused: true,
+            auto_paused_at: Some(chrono::Utc::now()),
+            consecutive_failure_count: 3,
+            ..make_schedule(Some("wf"), None, true)
+        };
+        let health = schedule_health(&row);
+        assert!(health.auto_paused && health.paused);
+        let html = render_schedule_health_badges(&row).into_string();
+        assert!(
+            html.contains("Auto-paused"),
+            "auto-paused badge missing: {html}"
+        );
+    }
+
+    /// AC3: unhealthy rows sort above healthy ones, and healthy rows keep their
+    /// existing `next_run_at`-ascending relative order.
+    #[test]
+    fn schedule_sort_puts_unhealthy_first_without_reordering_healthy_rows() {
+        let t = |mins: i64| Some(chrono::Utc::now() + chrono::Duration::minutes(mins));
+        let healthy_soon = HarvestSchedule {
+            next_run_at: t(1),
+            ..make_schedule(Some("a_soon"), None, false)
+        };
+        let healthy_later = HarvestSchedule {
+            next_run_at: t(60),
+            ..make_schedule(Some("b_later"), None, false)
+        };
+        let paused = HarvestSchedule {
+            next_run_at: t(600),
+            ..make_schedule(Some("z_paused"), None, true)
+        };
+        let mut rows = vec![
+            (ShardId::new(0), healthy_soon.clone()),
+            (ShardId::new(0), healthy_later.clone()),
+            (ShardId::new(0), paused.clone()),
+        ];
+        sort_schedule_rows(&mut rows);
+        assert_eq!(
+            rows[0].1.id, paused.id,
+            "unhealthy row must sort to the top"
+        );
+        assert_eq!(rows[1].1.id, healthy_soon.id);
+        assert_eq!(rows[2].1.id, healthy_later.id);
+    }
+
+    /// The health filter narrows to unhealthy-only / healthy-only rows.
+    #[test]
+    fn schedule_health_filter_selects_unhealthy_rows() {
+        let healthy = make_schedule(Some("ok"), None, false);
+        let paused = make_schedule(Some("bad"), None, true);
+        let filters = ScheduleUiFilters {
+            health: ScheduleHealthFilter::Unhealthy,
+            ..Default::default()
+        };
+        assert!(!filters.matches(ShardId::new(0), &healthy));
+        assert!(filters.matches(ShardId::new(0), &paused));
+
+        let filters = ScheduleUiFilters {
+            health: ScheduleHealthFilter::Healthy,
+            ..Default::default()
+        };
+        assert!(filters.matches(ShardId::new(0), &healthy));
+        assert!(!filters.matches(ShardId::new(0), &paused));
+    }
+
+    #[test]
+    fn schedule_health_filter_parses_and_rejects_unknown_values() {
+        assert_eq!(
+            ScheduleHealthFilter::parse("Unhealthy").unwrap(),
+            ScheduleHealthFilter::Unhealthy
+        );
+        assert_eq!(
+            ScheduleHealthFilter::parse("Healthy").unwrap(),
+            ScheduleHealthFilter::Healthy
+        );
+        assert_eq!(
+            ScheduleHealthFilter::parse("").unwrap(),
+            ScheduleHealthFilter::All
+        );
+        assert!(ScheduleHealthFilter::parse("bogus").is_err());
+    }
+
+    /// AC2: the catchup cell shows the effective policy (#484), its window, and
+    /// the drop count from the most recent recovery.
+    #[test]
+    fn schedule_catchup_label_reports_effective_policy_and_drops() {
+        let skip_all = make_schedule(Some("wf"), None, false);
+        assert!(schedule_catchup_label(&skip_all).contains("skip_all"));
+
+        let windowed = HarvestSchedule {
+            catchup_policy: Some("window".to_string()),
+            catchup_window_secs: Some(3600),
+            last_catchup_dropped: 4,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let label = schedule_catchup_label(&windowed);
+        assert!(label.contains("window"), "policy missing: {label}");
+        assert!(label.contains("3600"), "window seconds missing: {label}");
+        assert!(label.contains('4'), "drop count missing: {label}");
+
+        // Legacy bool fallback: catchup = true with no policy column.
+        let legacy = HarvestSchedule {
+            catchup: true,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        assert!(schedule_catchup_label(&legacy).contains("unbounded"));
+    }
+
+    /// AC2: bounded-run state — remaining budget, `end_at`, and exhaustion reason.
+    #[test]
+    fn schedule_bounded_runs_label_reports_budget_end_at_and_reason() {
+        let unbounded = make_schedule(Some("wf"), None, false);
+        assert_eq!(schedule_bounded_runs_label(&unbounded), "—");
+
+        let bounded = HarvestSchedule {
+            max_runs: Some(10),
+            runs_started: 4,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let label = schedule_bounded_runs_label(&bounded);
+        assert!(label.contains('6'), "remaining budget missing: {label}");
+        assert!(label.contains("10"), "max_runs missing: {label}");
+
+        let ends = HarvestSchedule {
+            end_at: chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            ..make_schedule(Some("wf"), None, false)
+        };
+        assert!(schedule_bounded_runs_label(&ends).contains("2027-01-01"));
+
+        let spent = HarvestSchedule {
+            max_runs: Some(3),
+            runs_started: 3,
+            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_reason: Some("max_runs_exhausted".to_string()),
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let label = schedule_bounded_runs_label(&spent);
+        assert!(
+            label.contains("max_runs_exhausted"),
+            "exhausted reason missing: {label}"
+        );
+    }
+
+    /// AC2: the next-fire cell shows the jitter-adjusted effective fire time when
+    /// jitter is configured, and only `next_run_at` when it is not.
+    #[test]
+    fn schedule_next_fire_cell_shows_effective_time_only_with_jitter() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let no_jitter = HarvestSchedule {
+            next_run_at: Some(at),
+            jitter_secs: 0,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let html = schedule_next_fire_cell(&no_jitter).into_string();
+        assert!(
+            html.contains("2026-09-01 12:00:00"),
+            "next_run_at missing: {html}"
+        );
+        assert!(
+            !html.contains("effective"),
+            "no effective line without jitter: {html}"
+        );
+
+        let jittered = HarvestSchedule {
+            next_run_at: Some(at),
+            jitter_secs: 300,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let html = schedule_next_fire_cell(&jittered).into_string();
+        assert!(
+            html.contains("effective"),
+            "jittered row must show the effective fire time: {html}"
+        );
+        assert!(html.contains("300s"), "jitter window missing: {html}");
+    }
+
+    /// AC2: the overlap policy (#241) is rendered, with the buffered depth when
+    /// the policy buffers.
+    #[test]
+    fn schedule_overlap_label_reports_policy_and_buffer_depth() {
+        let skip = make_schedule(Some("wf"), None, false);
+        assert!(schedule_overlap_label(&skip).contains("skip"));
+
+        let buffered = HarvestSchedule {
+            overlap_policy: "buffer_all".to_string(),
+            buffered_runs: serde_json::json!(["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"]),
+            buffer_all_max: 50,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let label = schedule_overlap_label(&buffered);
+        assert!(label.contains("buffer_all"), "policy missing: {label}");
+        assert!(label.contains('2'), "buffered depth missing: {label}");
+        assert!(label.contains("50"), "buffer cap missing: {label}");
+    }
+
+    /// AC3: the page header counts unhealthy schedules so triage starts before
+    /// the operator reads a single row.
+    #[test]
+    fn schedule_health_summary_counts_each_unhealthy_bucket() {
+        let rows = vec![
+            (ShardId::new(0), make_schedule(Some("ok"), None, false)),
+            (ShardId::new(0), make_schedule(Some("p"), None, true)),
+            (
+                ShardId::new(0),
+                HarvestSchedule {
+                    exhausted_at: Some(chrono::Utc::now()),
+                    ..make_schedule(Some("e"), None, false)
+                },
+            ),
+            (
+                ShardId::new(0),
+                HarvestSchedule {
+                    last_catchup_dropped: 2,
+                    ..make_schedule(Some("c"), None, false)
+                },
+            ),
+        ];
+        let summary = schedule_health_summary(&rows);
+        assert!(
+            summary.contains("1 paused"),
+            "paused count missing: {summary}"
+        );
+        assert!(
+            summary.contains("1 exhausted"),
+            "exhausted count missing: {summary}"
+        );
+        assert!(
+            summary.contains("1 catchup-dropped"),
+            "catchup-dropped count missing: {summary}"
+        );
+
+        let all_healthy = vec![(ShardId::new(0), make_schedule(Some("ok"), None, false))];
+        assert_eq!(
+            schedule_health_summary(&all_healthy),
+            "",
+            "a healthy fleet needs no unhealthy summary"
+        );
+    }
+
+    /// AC2/AC5/AC6/AC7: each row links to its preview, backfill and run-history
+    /// drill-downs.
+    #[test]
+    fn schedule_table_row_links_to_every_drill_down() {
+        let row = make_schedule(Some("payments"), None, false);
+        let id = row.id.to_string();
+        let html = render_schedule_table(
+            &[(ShardId::new(0), row)],
+            false,
+            &std::collections::HashMap::new(),
+        )
+        .into_string();
+        for suffix in ["preview", "runs", "backfill"] {
+            assert!(
+                html.contains(&format!("schedules/{id}/{suffix}")),
+                "row must link to the {suffix} drill-down: {html}"
+            );
+        }
+    }
+
+    // -- Preview drill-down (AC5) --
+
+    fn preview_entry(
+        scheduled_at: &str,
+        effective_at: Option<&str>,
+        reason: &str,
+    ) -> crate::api::ScheduleFirePreviewEntry {
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        let effective = effective_at.map(parse);
+        crate::api::ScheduleFirePreviewEntry {
+            scheduled_at: parse(scheduled_at),
+            local_at: scheduled_at.to_string(),
+            effective_at: effective,
+            effective_local_at: effective_at.map(str::to_string),
+            reason: reason.to_string(),
+            jitter_earliest_at: None,
+            jitter_latest_at: None,
+            would_skip_if_active: false,
+        }
+    }
+
+    /// AC5: the preview shows effective vs. original vs. calendar-skipped entries.
+    #[test]
+    fn preview_page_distinguishes_effective_original_and_skipped_entries() {
+        let row = make_schedule(Some("payments"), None, false);
+        let preview = crate::api::SchedulePreview {
+            entries: vec![
+                preview_entry(
+                    "2026-09-01T12:00:00Z",
+                    Some("2026-09-01T12:02:00Z"),
+                    "cron+jitter",
+                ),
+                preview_entry("2026-09-02T12:00:00Z", None, "skipped:calendar-excluded"),
+                preview_entry("2026-09-03T12:00:00Z", Some("2026-09-03T12:00:00Z"), "cron"),
+            ],
+            is_paused: false,
+            pause_reason: None,
+            from: chrono::Utc::now(),
+            count_requested: 10,
+            end_at: None,
+            remaining_runs: None,
+            exhausted_reason: None,
+        };
+        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        assert!(
+            html.contains("2026-09-01 12:00:00"),
+            "original instant missing: {html}"
+        );
+        assert!(
+            html.contains("2026-09-01 12:02:00"),
+            "effective instant missing: {html}"
+        );
+        assert!(
+            html.contains("cron+jitter"),
+            "jitter reason missing: {html}"
+        );
+        assert!(
+            html.contains("skipped:calendar-excluded"),
+            "calendar-skip reason missing: {html}"
+        );
+        assert!(!html.contains("<script"), "no script tags: {html}");
+    }
+
+    /// AC5 (#543): a bounded schedule whose preview truncates to zero entries must
+    /// say *why*, not render a blank panel (AC8).
+    #[test]
+    fn preview_page_explains_zero_entries_for_a_bounded_schedule() {
+        let row = HarvestSchedule {
+            max_runs: Some(5),
+            runs_started: 5,
+            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_reason: Some("max_runs_exhausted".to_string()),
+            ..make_schedule(Some("payments"), None, false)
+        };
+        let preview = crate::api::SchedulePreview {
+            entries: vec![],
+            is_paused: false,
+            pause_reason: None,
+            from: chrono::Utc::now(),
+            count_requested: 10,
+            end_at: None,
+            remaining_runs: Some(0),
+            exhausted_reason: Some("max_runs_exhausted".to_string()),
+        };
+        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        assert!(
+            html.contains("max_runs_exhausted"),
+            "must name the exhaustion reason: {html}"
+        );
+        assert!(
+            html.contains("no upcoming fire times") || html.contains("No upcoming fire times"),
+            "must render an explicit empty state: {html}"
+        );
+    }
+
+    /// A paused schedule's preview says so rather than rendering an empty table.
+    #[test]
+    fn preview_page_explains_zero_entries_for_a_paused_schedule() {
+        let row = make_schedule(Some("payments"), None, true);
+        let preview = crate::api::SchedulePreview {
+            entries: vec![],
+            is_paused: true,
+            pause_reason: Some("operator hold".to_string()),
+            from: chrono::Utc::now(),
+            count_requested: 10,
+            end_at: None,
+            remaining_runs: None,
+            exhausted_reason: None,
+        };
+        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        assert!(html.contains("paused") || html.contains("Paused"));
+        assert!(
+            html.contains("operator hold"),
+            "pause reason missing: {html}"
+        );
+    }
+
+    // -- Run history drill-down (AC7) --
+
+    fn run_entry(
+        state: &str,
+        origin: &str,
+        nominal: Option<&str>,
+    ) -> crate::schedule_runs::ScheduleRunEntry {
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        crate::schedule_runs::ScheduleRunEntry {
+            execution_id: uuid::Uuid::new_v4(),
+            nominal_fire_time: nominal.map(parse),
+            started_at: parse("2026-09-01T12:00:00Z"),
+            completed_at: Some(parse("2026-09-01T12:01:00Z")),
+            state: state.to_string(),
+            outcome: crate::schedule_runs::collapse_outcome(state),
+            error: None,
+            origin: Some(origin.to_string()),
+        }
+    }
+
+    fn runs_response(
+        runs: Vec<crate::schedule_runs::ScheduleRunEntry>,
+        status: crate::shard_fanout::FanoutStatus,
+        shards: Vec<crate::schedule_runs::RunsShardInspection>,
+    ) -> crate::schedule_runs::ScheduleRunsResponse {
+        crate::schedule_runs::ScheduleRunsResponse {
+            schedule_id: uuid::Uuid::new_v4(),
+            status,
+            next_run_at: None,
+            runs,
+            summary: crate::schedule_runs::ScheduleRunSummary {
+                succeeded: 3,
+                failed: 1,
+                total: 4,
+                summary_complete: matches!(status, crate::shard_fanout::FanoutStatus::Complete),
+                ..Default::default()
+            },
+            limit: 20,
+            next_cursor: None,
+            shards,
+        }
+    }
+
+    /// AC7: newest-first rows carry nominal fire time, origin, a terminal state
+    /// badge, and link to the execution detail view.
+    #[test]
+    fn runs_page_renders_rows_with_origin_state_and_execution_links() {
+        let row = make_schedule(Some("payments"), None, false);
+        let runs = vec![
+            run_entry("COMPLETED", "scheduled", Some("2026-09-01T12:00:00Z")),
+            run_entry("FAILED", "backfill", Some("2026-08-31T12:00:00Z")),
+            run_entry("RUNNING", "manual_trigger", None),
+        ];
+        let exec_ids: Vec<_> = runs.iter().map(|r| r.execution_id).collect();
+        let response = runs_response(runs, crate::shard_fanout::FanoutStatus::Complete, vec![]);
+        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+
+        for id in &exec_ids {
+            assert!(
+                html.contains(&format!("workflows/{id}")),
+                "run must link to the execution detail view: {html}"
+            );
+        }
+        assert!(html.contains("scheduled"), "origin missing: {html}");
+        assert!(html.contains("backfill"), "backfill origin missing: {html}");
+        assert!(
+            html.contains("manual_trigger"),
+            "manual_trigger origin missing: {html}"
+        );
+        assert!(html.contains("COMPLETED") && html.contains("FAILED"));
+        assert!(
+            html.contains("2026-09-01 12:00:00"),
+            "nominal fire time missing: {html}"
+        );
+        // Scheduled-only cadence summary.
+        assert!(
+            html.contains("Scheduled-run summary") || html.contains("scheduled-run summary"),
+            "cadence summary heading missing: {html}"
+        );
+    }
+
+    /// AC7: a `status: partial` response renders a visible "some shards
+    /// unreachable" banner rather than silently truncated data.
+    #[test]
+    fn runs_page_renders_partial_shard_banner() {
+        let row = make_schedule(Some("payments"), None, false);
+        let response = runs_response(
+            vec![run_entry(
+                "COMPLETED",
+                "scheduled",
+                Some("2026-09-01T12:00:00Z"),
+            )],
+            crate::shard_fanout::FanoutStatus::Partial,
+            vec![
+                crate::schedule_runs::RunsShardInspection {
+                    shard_id: 0,
+                    status: "inspected",
+                    error: None,
+                },
+                crate::schedule_runs::RunsShardInspection {
+                    shard_id: 1,
+                    status: "unavailable",
+                    error: Some("connection refused".to_string()),
+                },
+            ],
+        );
+        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        assert!(
+            html.contains("some shards unreachable") || html.contains("Some shards unreachable"),
+            "partial-shard banner missing: {html}"
+        );
+        assert!(
+            html.contains("connection refused"),
+            "shard error detail missing: {html}"
+        );
+        assert!(
+            html.contains("counts may be understated") || html.contains("may be understated"),
+            "summary must be flagged as possibly understated: {html}"
+        );
+    }
+
+    /// AC8: a schedule that has never run renders an explicit message, not a
+    /// blank panel.
+    #[test]
+    fn runs_page_renders_no_runs_yet_empty_state() {
+        let row = make_schedule(Some("payments"), None, false);
+        let response = runs_response(vec![], crate::shard_fanout::FanoutStatus::Complete, vec![]);
+        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        assert!(
+            html.contains("no runs yet") || html.contains("No runs yet"),
+            "no-runs empty state missing: {html}"
+        );
+    }
+
+    /// AC7: an `unavailable` status is louder still — no shard could be inspected.
+    #[test]
+    fn runs_page_renders_unavailable_banner_when_no_shard_answered() {
+        let row = make_schedule(Some("payments"), None, false);
+        let response = runs_response(
+            vec![],
+            crate::shard_fanout::FanoutStatus::Unavailable,
+            vec![crate::schedule_runs::RunsShardInspection {
+                shard_id: 0,
+                status: "unavailable",
+                error: Some("pool timeout".to_string()),
+            }],
+        );
+        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        assert!(
+            html.contains("No shard could be reached")
+                || html.contains("no shard could be reached"),
+            "unavailable banner missing: {html}"
+        );
+        assert!(
+            !html.contains("No runs yet"),
+            "must not claim 'no runs' when nothing could be read: {html}"
+        );
+    }
+
+    // -- Backfill launcher (AC6) --
+
+    /// AC6: the form collects a start/end window and posts to the dry-run preview
+    /// step, never straight to the dispatching endpoint.
+    #[test]
+    fn backfill_form_posts_to_the_preview_step_first() {
+        let row = make_schedule(Some("payments"), None, false);
+        let id = row.id.to_string();
+        let html = render_schedule_backfill_form(&row, ShardId::new(0), None).into_string();
+        assert!(
+            html.contains(&format!("schedules/{id}/backfill")),
+            "form must post to the backfill route: {html}"
+        );
+        assert!(
+            html.contains("name=\"stage\" value=\"preview\""),
+            "the form must submit the dry-run stage, never a bare commit: {html}"
+        );
+        assert!(
+            !html.contains("value=\"commit\""),
+            "the launcher form must never offer a direct commit: {html}"
+        );
+        assert!(
+            html.contains("name=\"from\""),
+            "start field missing: {html}"
+        );
+        assert!(html.contains("name=\"to\""), "end field missing: {html}");
+        assert!(!html.contains("<script"), "no script tags: {html}");
+    }
+
+    /// AC6: the confirmation step shows the dry-run's planned count before the
+    /// operator can dispatch anything.
+    #[test]
+    fn backfill_confirm_shows_planned_count_before_dispatch() {
+        let row = make_schedule(Some("payments"), None, false);
+        let id = row.id.to_string();
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        let dry_run = crate::api::ScheduleBackfillResponse {
+            status: "dry_run".to_string(),
+            schedule_id: row.id,
+            kind: crate::api::ScheduleKind::Workflow,
+            name: "payments".to_string(),
+            from: parse("2026-08-01T00:00:00Z"),
+            to: parse("2026-08-02T00:00:00Z"),
+            planned_timestamps: vec![parse("2026-08-01T00:00:00Z"), parse("2026-08-01T01:00:00Z")],
+            total: 24,
+            dispatched: 20,
+            skipped: 4,
+            failed: 0,
+            skipped_reasons: std::collections::HashMap::from([(
+                "already_exists".to_string(),
+                4usize,
+            )]),
+            partial_shard_failures: vec![],
+            paused_schedule_warning: None,
+        };
+        let form = BackfillFormParams {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "2026-08-02T00:00:00Z".to_string(),
+            max_count: Some(100),
+            include_paused: false,
+        };
+        let html =
+            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
+        assert!(html.contains("24"), "planned total missing: {html}");
+        assert!(html.contains("20"), "would-dispatch count missing: {html}");
+        assert!(
+            html.contains("already_exists"),
+            "skip reasons must be shown: {html}"
+        );
+        assert!(
+            html.contains(&format!("action=\"../../schedules/{id}/backfill\"")),
+            "confirm must post to the dispatching endpoint: {html}"
+        );
+        assert!(
+            html.contains("name=\"stage\" value=\"commit\""),
+            "confirm must carry the explicit commit stage: {html}"
+        );
+        // The window must round-trip so the committed backfill is the one previewed.
+        assert!(html.contains("2026-08-01T00:00:00Z"));
+        assert!(html.contains("2026-08-02T00:00:00Z"));
+    }
+
+    /// A backfill window with nothing in it must not offer a dispatch button.
+    #[test]
+    fn backfill_confirm_disables_dispatch_for_an_empty_window() {
+        let row = make_schedule(Some("payments"), None, false);
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        let dry_run = crate::api::ScheduleBackfillResponse {
+            status: "dry_run".to_string(),
+            schedule_id: row.id,
+            kind: crate::api::ScheduleKind::Workflow,
+            name: "payments".to_string(),
+            from: parse("2026-08-01T00:00:00Z"),
+            to: parse("2026-08-01T00:00:01Z"),
+            planned_timestamps: vec![],
+            total: 0,
+            dispatched: 0,
+            skipped: 0,
+            failed: 0,
+            skipped_reasons: std::collections::HashMap::new(),
+            partial_shard_failures: vec![],
+            paused_schedule_warning: None,
+        };
+        let form = BackfillFormParams {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "2026-08-01T00:00:01Z".to_string(),
+            max_count: None,
+            include_paused: false,
+        };
+        let html =
+            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
+        assert!(
+            html.contains("nothing to backfill") || html.contains("Nothing to backfill"),
+            "empty window must render an explicit message: {html}"
+        );
+        assert!(
+            !html.contains("type=\"submit\"") || html.contains("disabled"),
+            "an empty window must not offer an enabled dispatch button: {html}"
+        );
+    }
+
+    /// The backfill form parses its own inputs; a malformed window is a rendered
+    /// error, never a 500.
+    #[test]
+    fn backfill_form_params_reject_a_malformed_window() {
+        assert!(
+            BackfillFormParams::parse("not-a-date", "2026-08-02T00:00:00Z", None, false).is_err()
+        );
+        assert!(
+            BackfillFormParams::parse("2026-08-02T00:00:00Z", "2026-08-01T00:00:00Z", None, false)
+                .is_err()
+        );
+        let ok = BackfillFormParams::parse(
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T00:00:00Z",
+            Some(50),
+            true,
+        )
+        .expect("a well-formed window parses");
+        assert_eq!(ok.max_count, Some(50));
+        assert!(ok.include_paused);
+    }
+
+    /// Collect the contents of every `onsubmit="…"` attribute in a document, so a
+    /// test can assert on what actually reaches the inline JavaScript context
+    /// rather than on the document as a whole (where an escaped name is harmless
+    /// display text).
+    fn onsubmit_attribute_values(html: &str) -> Vec<String> {
+        html.match_indices("onsubmit=\"")
+            .filter_map(|(start, marker)| {
+                let value_start = start + marker.len();
+                html[value_start..]
+                    .find('"')
+                    .map(|end| html[value_start..value_start + end].to_string())
+            })
+            .collect()
+    }
+
+    /// Names never reach a JavaScript string literal: confirmations interpolate
+    /// only the schedule UUID, so a hostile workflow name cannot break out of the
+    /// inline `confirm('...')` handler.
+    #[test]
+    fn schedule_row_confirmations_never_interpolate_names() {
+        let hostile = "evil'); alert(1);//";
+        let row = make_schedule(Some(hostile), None, false);
+        let html = render_schedule_table(
+            &[(ShardId::new(0), row)],
+            false,
+            &std::collections::HashMap::new(),
+        )
+        .into_string();
+
+        let handlers = onsubmit_attribute_values(&html);
+        assert!(
+            !handlers.is_empty(),
+            "the row is expected to carry confirmation handlers: {html}"
+        );
+        for handler in &handlers {
+            assert!(
+                !handler.contains("alert"),
+                "a workflow name must never be interpolated into an inline handler: {handler}"
+            );
+            assert!(
+                !handler.contains("evil"),
+                "a workflow name must never be interpolated into an inline handler: {handler}"
+            );
+        }
+        // A markup-bearing name is escaped into display text, never rendered raw.
+        let markup_name = "</code><script>alert(1)</script>";
+        let markup_row = make_schedule(Some(markup_name), None, false);
+        let markup_html = render_schedule_table(
+            &[(ShardId::new(0), markup_row)],
+            false,
+            &std::collections::HashMap::new(),
+        )
+        .into_string();
+        assert!(
+            !markup_html.contains("<script"),
+            "a markup-bearing name must be escaped, not rendered: {markup_html}"
+        );
+        assert!(
+            markup_html.contains("&lt;script&gt;"),
+            "the name must appear escaped as display text: {markup_html}"
+        );
+    }
+
+    /// The backfill confirmation interpolates the schedule UUID into its
+    /// `confirm(...)` string, and passes it through `js_escape` on the way.
+    #[test]
+    fn backfill_confirm_handler_carries_only_escaped_identifiers() {
+        let row = make_schedule(Some("evil'); alert(1);//"), None, false);
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        let dry_run = crate::api::ScheduleBackfillResponse {
+            status: "dry_run".to_string(),
+            schedule_id: row.id,
+            kind: crate::api::ScheduleKind::Workflow,
+            name: "evil'); alert(1);//".to_string(),
+            from: parse("2026-08-01T00:00:00Z"),
+            to: parse("2026-08-02T00:00:00Z"),
+            planned_timestamps: vec![parse("2026-08-01T00:00:00Z")],
+            total: 1,
+            dispatched: 1,
+            skipped: 0,
+            failed: 0,
+            skipped_reasons: std::collections::HashMap::new(),
+            partial_shard_failures: vec![],
+            paused_schedule_warning: None,
+        };
+        let form = BackfillFormParams {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "2026-08-02T00:00:00Z".to_string(),
+            max_count: None,
+            include_paused: false,
+        };
+        let html =
+            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
+        for handler in onsubmit_attribute_values(&html) {
+            assert!(
+                !handler.contains("alert") && !handler.contains("evil"),
+                "the schedule name must never reach the inline handler: {handler}"
+            );
+        }
     }
 }

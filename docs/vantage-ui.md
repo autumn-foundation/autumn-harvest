@@ -53,6 +53,126 @@ Shows a single workflow execution in full detail.
 
 Status badges include `aria-label="Status: {state}"` and `role="status"` for screen-reader accessibility.
 
+### Schedules — `/schedules`
+
+The operator surface for cron/interval schedules: one row per schedule across every
+shard, with the health, policy and bounded-run state needed to answer *"is this
+schedule healthy, when does it fire next, and how did its last runs end?"* without
+composing API calls by hand.
+
+Every field is read from the existing `GET /admin/schedules` response fields, and every
+mutation goes through an already-audited endpoint. The page adds **no new backend
+endpoint, no new `WorkflowEvent` variant, and no migration**.
+
+**List columns**
+
+| Column | Source | Notes |
+|---|---|---|
+| Schedule ID | `harvest_schedules.id` | Truncated; links to the drill-downs |
+| Kind / Target | `dag_name` / `workflow_name` | `Dag` or `Workflow` |
+| Expression | `schedule_expr` | Cron or `interval:*` |
+| Timezone | `timezone` | UTC is subdued; other zones get a badge |
+| Next Run | `next_run_at` | Plus the jitter-adjusted **effective** fire time and the jitter window when `jitter_secs > 0` (#240) |
+| Last Run | `last_run_at` | |
+| Health | derived | See badges below |
+| Overlap | `overlap_policy` (#241) | Buffering policies also show `buffered <n>` (and `/<cap>` under `buffer_all`) |
+| Catchup | `catchup_policy` (#484) | Effective policy, the `window` duration, and `dropped <n>` from the most recent recovery tick |
+| Bounded runs | `max_runs` / `runs_started` / `end_at` / `exhausted_reason` (#478) | `<remaining> of <max> left · ends <ts> · exhausted: <reason>` |
+| Created | `created_at` | |
+| Shard | fan-out | Multi-shard deployments only |
+
+**Health badges and ordering**
+
+A healthy schedule renders one calm `Active` badge. An unhealthy one renders a badge per
+condition:
+
+| Badge | Condition |
+|---|---|
+| `Paused` | `is_paused` |
+| `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
+| `Exhausted: <reason>` | `exhausted_at` set (#478) |
+| `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
+
+Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing
+`next_run_at`-ascending order among themselves. A "Needs attention" strip at the top of
+the page counts each bucket, and the **Health** filter (`?health=Unhealthy` /
+`?health=Healthy`) narrows the list. An unrecognised value is a `400`.
+
+**Filters** — `target`, `kind`, `paused`, `health`, `shard_id`, `limit`, `refresh`.
+All of them round-trip into the bulk pause/resume actions, so "pause all matching"
+always means the set on screen.
+
+**Per-row actions** — Pause, Resume, Run now, and Delete, each behind a confirmation
+dialog and each writing an audit record with `source = ui` and the matching operation
+(`schedule.pause`, `schedule.resume`, `schedule.trigger`, `schedule.delete`). The UI
+adds no unaudited mutation path.
+
+#### Fire-time preview — `/schedules/{id}/preview`
+
+Renders the next N fire times from the same computation as
+`GET /admin/schedules/{id}/preview` (#348), so the two can never disagree:
+
+- **Scheduled** (the raw cron instant), **Local** (in the schedule's timezone), and
+  **Effective** (after calendar adjustment and jitter) side by side.
+- Calendar-excluded entries show `suppressed` with reason `skipped:calendar-excluded`;
+  rebased entries show `deferred:calendar`.
+- The jitter window (`[scheduled_at, scheduled_at + jitter_secs]`) per entry.
+- An advisory **Overlap risk** flag when `skip`/`buffer_one` could drop the firing.
+- Bounded-run truncation (#478/#543) is applied, and a preview that comes back empty
+  says *why*: paused (with the pause reason), exhausted (with `exhausted_reason`), the
+  `end_at` cutoff, or an expression with no future firings.
+
+`?count=N` (1–100, default 10) controls how many entries are projected.
+
+#### Run history — `/schedules/{id}/runs`
+
+Consumes `GET /admin/schedules/{id}/runs` (#534/#762). Newest-slot-first rows with
+`nominal_fire_time` (`— (no slot)` for a manual trigger), started/completed timestamps,
+a terminal state badge, `origin` (`scheduled` / `backfill` / `manual_trigger`), the
+first line of a terminal failure, and a link to the execution detail view.
+
+Above the table, the **scheduled-run summary** counts `scheduled`-origin runs only, so a
+backfill storm or an ad-hoc trigger never inflates the failure ratio.
+
+Cross-shard degradation is always visible, never silent:
+
+| Response `status` | Rendering |
+|---|---|
+| `complete` | No banner |
+| `partial` | "Some shards unreachable" banner listing each unavailable shard and its error; the summary is flagged as possibly understated |
+| `unavailable` | "No shard could be reached" banner; **no** "no runs yet" message, because nothing could be read |
+
+A schedule that exists but has never run renders an explicit "No runs yet." card.
+Paging uses the endpoint's own keyset cursor (`?limit=`, `?cursor=`).
+
+This page is **admin-gated**, matching `GET /admin/schedules/{id}/runs` — the one
+schedule read route the management API gates.
+
+#### Backfill launcher — `/schedules/{id}/backfill`
+
+A two-stage flow over `POST /admin/schedules/{id}/backfill` (#337):
+
+1. `GET` renders the window form (start, end, max slots, include-paused). This is a
+   pure read — it dispatches nothing.
+2. Submitting posts `stage=preview`, which runs the endpoint's **dry run** and renders
+   the planned slot count, the would-dispatch and would-skip counts, the machine-readable
+   skip reasons, and the first 20 planned fire times.
+3. Only an explicit `stage=commit` (behind a `confirm()` dialog) dispatches. A POST that
+   omits `stage` falls back to the dry run, so a bare form post can never dispatch work.
+4. On success the operator is redirected to that schedule's **run history** with a flash
+   summarising what was dispatched, so the new runs are one click away.
+
+The dry run is a POST rather than a GET because it writes a `harvest_backfill_log` row
+and an audit record — the read path stays side-effect-free. Both stages are audited
+through the API handler with `source = ui`, and every guard the endpoint enforces
+(paused, exhausted, `max_active_runs`, `max_runs`, window size) applies unchanged; a
+rejection is rendered on the form rather than as a bare error page.
+
+A malformed or inverted window is a rendered form error, never a 500.
+
+**Out of scope (tracked elsewhere):** creating or editing schedules from the UI (#771),
+overdue-schedule detection (#696), recent-runs enrichment (#762).
+
 ## Event label mapping
 
 Vantage translates raw `WorkflowEvent` type strings to friendlier labels:
@@ -86,6 +206,9 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 | `/workflows/{exec_id}` | Workflow detail |
 | `/workers` | Worker fleet |
 | `/schedules` | Cron/interval schedules |
+| `/schedules/{id}/preview` | Next-fire-time preview for one schedule |
+| `/schedules/{id}/runs` | Per-schedule run history (admin) |
+| `/schedules/{id}/backfill` | Backfill launcher (form → dry run → commit) |
 | `/dags` | DAG list |
 | `/dags/{dag_name}` | DAG detail |
 | `/dlq` | Dead letter queue |

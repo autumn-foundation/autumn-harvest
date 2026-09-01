@@ -2843,9 +2843,9 @@ struct DagPauseRequest {
 }
 
 /// Kind tag on a schedule entry returned by `GET /admin/schedules`.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum ScheduleKind {
+pub(crate) enum ScheduleKind {
     Dag,
     Workflow,
 }
@@ -25258,7 +25258,7 @@ async fn patch_dag(
     }
 }
 
-fn effective_fire_time(
+pub(crate) fn effective_fire_time(
     schedule_id: uuid::Uuid,
     next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     jitter_secs: i64,
@@ -25278,7 +25278,7 @@ fn effective_fire_time(
 /// (`scheduler.rs`, `tick_one_workflow_schedule`) in sync with this formula
 /// when either changes. Callers map this over an `Option<i32> max_runs`
 /// (`None` = unlimited, so there is no budget to derive).
-fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
+pub(crate) fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
     (max_runs - runs_started).max(0)
 }
 
@@ -25695,6 +25695,30 @@ async fn list_schedule_runs_handler(
     let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
+    Ok(Json(
+        load_schedule_runs(&api_state, schedule_id, params).await?,
+    ))
+}
+
+/// The body of `GET /admin/schedules/{id}/runs`, factored out so the Vantage
+/// run-history drill-down (issue #951) consumes exactly the response the API
+/// serves — the same keyset merge, the same scheduled-origin-only cadence
+/// summary, and above all the same `complete`/`partial`/`unavailable` status,
+/// so the page can never render a cross-shard-truncated list as if it were
+/// whole.
+///
+/// Read-only.
+///
+/// # Errors
+///
+/// Returns `400` for an invalid state/origin filter, `404` when every expected
+/// shard was reachable and none had the schedule, and `503` when the row's
+/// existence is indeterminate because a shard could not be checked.
+pub(crate) async fn load_schedule_runs(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+    params: schedule_runs::ScheduleRunsParams,
+) -> Result<schedule_runs::ScheduleRunsResponse, AutumnError> {
     validate_run_filters(&params)?;
 
     // Existence + next_run_at resolution consults the full expected shard set
@@ -25702,7 +25726,7 @@ async fn list_schedule_runs_handler(
     // checked; the runs fan-out below uses the *same* expected shard set so its
     // partial/complete status can never read `complete` while a router-known
     // shard was never queried (issue #762 review).
-    let schedule = resolve_schedule_for_runs(&api_state, schedule_id).await?;
+    let schedule = resolve_schedule_for_runs(api_state, schedule_id).await?;
     let next_run_at = schedule.next_run_at;
 
     // Fetch limit + 1 per shard so the merge can detect whether a further page
@@ -25721,8 +25745,8 @@ async fn list_schedule_runs_handler(
     // becomes an unavailable observation rather than being silently omitted, so
     // `build_runs_response` reports `partial`/`unavailable` and never a false
     // `complete`. Mirrors `workflow_count`/`workflow_reachability`.
-    let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
 
     let mut observations = Vec::new();
     for shard_id in &expected {
@@ -25740,12 +25764,12 @@ async fn list_schedule_runs_handler(
         );
     }
 
-    Ok(Json(schedule_runs::build_runs_response(
+    Ok(schedule_runs::build_runs_response(
         schedule_id,
         next_run_at,
         params.limit,
         observations,
-    )))
+    ))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -28743,21 +28767,21 @@ async fn transition_backfill_exhausted_if_reached(
 
 /// Request body for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Deserialize)]
-struct ScheduleBackfillRequest {
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+pub(crate) struct ScheduleBackfillRequest {
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
-    dry_run: bool,
+    pub dry_run: bool,
     #[serde(default)]
-    include_paused: bool,
-    max_count: Option<usize>,
+    pub include_paused: bool,
+    pub max_count: Option<usize>,
 }
 
 /// A shard that could not be reached or dispatched during a backfill.
 #[derive(Debug, Serialize)]
-struct BackfillShardFailure {
-    shard_id: i32,
-    reason: String,
+pub(crate) struct BackfillShardFailure {
+    pub shard_id: i32,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28790,32 +28814,32 @@ fn classify_backfill_running_count(result: diesel::QueryResult<i64>) -> Backfill
 
 /// Response for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Serialize)]
-struct ScheduleBackfillResponse {
+pub(crate) struct ScheduleBackfillResponse {
     /// `"dry_run"`, `"complete"`, or `"partial"`.
-    status: String,
-    schedule_id: uuid::Uuid,
-    kind: ScheduleKind,
-    name: String,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
-    planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
-    total: usize,
-    dispatched: usize,
-    skipped: usize,
-    failed: usize,
+    pub status: String,
+    pub schedule_id: uuid::Uuid,
+    pub kind: ScheduleKind,
+    pub name: String,
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    pub planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
+    pub total: usize,
+    pub dispatched: usize,
+    pub skipped: usize,
+    pub failed: usize,
     /// Machine-readable breakdown of why timestamps were skipped.
     /// Keys: `"already_exists"`, `"max_active_runs"`.
-    skipped_reasons: std::collections::HashMap<String, usize>,
-    partial_shard_failures: Vec<BackfillShardFailure>,
+    pub skipped_reasons: std::collections::HashMap<String, usize>,
+    pub partial_shard_failures: Vec<BackfillShardFailure>,
     /// Set when a DAG schedule is paused and `include_paused=true`: inserted
     /// QUEUED runs will not execute until the schedule is resumed because
     /// `activate_queued_runs` skips paused schedules.
     #[serde(skip_serializing_if = "Option::is_none")]
-    paused_schedule_warning: Option<String>,
+    pub paused_schedule_warning: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
-async fn schedule_backfill(
+pub(crate) async fn schedule_backfill(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -41990,37 +42014,37 @@ const fn default_preview_count() -> usize {
 }
 
 /// A single enriched entry in the schedule next-fires preview (issue #348).
-#[derive(Debug, Serialize)]
-struct ScheduleFirePreviewEntry {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ScheduleFirePreviewEntry {
     /// UTC wall-clock instant the cron/interval computed.
-    scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: chrono::DateTime<chrono::Utc>,
     /// `scheduled_at` rendered in the schedule's configured timezone (RFC 3339).
-    local_at: String,
+    pub local_at: String,
     /// Effective fire time after calendar adjustment and jitter application.
     /// `None` means the firing is suppressed (calendar exclusion with `skip` policy).
     #[serde(skip_serializing_if = "Option::is_none")]
-    effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `effective_at` rendered in the schedule's timezone. Omitted when `effective_at` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    effective_local_at: Option<String>,
+    pub effective_local_at: Option<String>,
     /// Human-readable reason for this instant:
     /// - `"cron"` — fires as scheduled.
     /// - `"cron+jitter"` — fires at `effective_at` after deterministic jitter.
     /// - `"skipped:calendar-excluded"` — suppressed by calendar exclusion.
     /// - `"deferred:calendar"` — moved to a different day by calendar skip-policy.
-    reason: String,
+    pub reason: String,
     /// Earliest possible fire time when jitter is enabled (`= scheduled_at`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Latest possible fire time when jitter is enabled (`= scheduled_at + jitter_secs`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `true` when the overlap policy (`"skip"` or `"buffer_one"`) could silently drop this
     /// firing if `max_active_runs` is already running at dispatch time. Preview is stateless
     /// and cannot know the future run count; treat this as an advisory warning.
-    would_skip_if_active: bool,
+    pub would_skip_if_active: bool,
 }
 
 /// Request body for `POST /admin/schedules/preview` — validate a candidate schedule
@@ -42216,23 +42240,55 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
 /// paths (e.g. `PATCH /dags/{dag_name}`) clear `is_paused` without also
 /// clearing `pause_reason`, so reading the raw column unconditionally could
 /// leak a stale reason for a schedule that is not actually paused.
+/// The `GET /admin/schedules/{id}/preview` payload (issue #348).
+///
+/// Typed rather than an ad-hoc `serde_json::json!` object so the Vantage
+/// schedules page (issue #951) can render exactly what the API returns instead
+/// of re-deriving bounded-run truncation and pause/exhaustion handling — the
+/// one thing that would let the UI and the API disagree about *why a schedule
+/// will not fire*. The field set (and its JSON key names) are unchanged from
+/// the original hand-built object, so the public response shape is identical.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SchedulePreview {
+    /// The projected fire times, already truncated by `end_at` / the remaining
+    /// run budget (issues #478 / #543). Empty for a paused, exhausted, or
+    /// unparseable schedule.
+    pub entries: Vec<ScheduleFirePreviewEntry>,
+    /// Whether the schedule is paused (a paused schedule previews zero entries).
+    pub is_paused: bool,
+    /// The recorded pause reason — surfaced **only** while `is_paused`, so a
+    /// stale reason left on an active row is never leaked.
+    pub pause_reason: Option<String>,
+    /// The instant the preview was projected from.
+    pub from: chrono::DateTime<chrono::Utc>,
+    /// The requested entry count, after clamping.
+    pub count_requested: usize,
+    /// Absolute cutoff for this schedule (issue #478), echoed so a caller can see
+    /// why a preview is short.
+    pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Remaining run budget (issue #478), `None` when the schedule is unlimited.
+    pub remaining_runs: Option<i32>,
+    /// Machine-readable exhaustion reason (issue #478), `None` when not exhausted.
+    pub exhausted_reason: Option<String>,
+}
+
 fn empty_preview_response(
     schedule: &HarvestSchedule,
     remaining_runs: Option<i32>,
     from: chrono::DateTime<chrono::Utc>,
     count: usize,
-) -> serde_json::Value {
+) -> SchedulePreview {
     let pause_reason = schedule.is_paused.then(|| schedule.pause_reason.clone());
-    serde_json::json!({
-        "entries": [],
-        "is_paused": schedule.is_paused,
-        "pause_reason": pause_reason.flatten(),
-        "from": from,
-        "count_requested": count,
-        "end_at": schedule.end_at,
-        "remaining_runs": remaining_runs,
-        "exhausted_reason": schedule.exhausted_reason,
-    })
+    SchedulePreview {
+        entries: vec![],
+        is_paused: schedule.is_paused,
+        pause_reason: pause_reason.flatten(),
+        from,
+        count_requested: count,
+        end_at: schedule.end_at,
+        remaining_runs,
+        exhausted_reason: schedule.exhausted_reason.clone(),
+    }
 }
 
 /// `GET /admin/schedules/{id}/preview?count=N&from=<ISO8601>` — preview the next N
@@ -42242,14 +42298,35 @@ async fn preview_schedule_firings_handler(
     Path(id): Path<uuid::Uuid>,
     Query(params): Query<SchedulePreviewQuery>,
 ) -> Result<impl IntoResponse, AutumnError> {
+    let count = params.count.clamp(1, 100);
+    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
+    let preview = compute_schedule_preview(&api_state, id, count, from).await?;
+    Ok((StatusCode::OK, Json(preview)))
+}
+
+/// The body of `GET /admin/schedules/{id}/preview`, factored out so the Vantage
+/// preview drill-down (issue #951) renders the *same* projection the API
+/// returns — including the #478/#543 bounded-run truncation and the
+/// paused/exhausted zero-entry branches — rather than a second implementation
+/// of them.
+///
+/// Read-only: it loads the schedule row and (when a calendar is attached) that
+/// calendar's exclusions, and writes nothing.
+///
+/// # Errors
+///
+/// Propagates the schedule lookup's `404`/`503` and any storage error.
+pub(crate) async fn compute_schedule_preview(
+    api_state: &HarvestApiState,
+    id: uuid::Uuid,
+    count: usize,
+    from: chrono::DateTime<chrono::Utc>,
+) -> Result<SchedulePreview, AutumnError> {
     use autumn_harvest::policy::SkipPolicy;
     use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
 
-    let count = params.count.clamp(1, 100);
-    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
-
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
-    let schedule = load_schedule_by_id(&api_state, id).await?;
+    let schedule = load_schedule_by_id(api_state, id).await?;
 
     // Surfaced on every branch below so a caller can see why a schedule is
     // bounded even when it returns zero entries.
@@ -42269,14 +42346,11 @@ async fn preview_schedule_firings_handler(
     // would produce an empty list for `Some(0)` regardless, so this only skips
     // the unnecessary schedule-parsing and calendar-exclusion work).
     if schedule.is_paused || schedule.exhausted_at.is_some() || remaining_runs == Some(0) {
-        return Ok((
-            StatusCode::OK,
-            Json(empty_preview_response(
-                &schedule,
-                remaining_runs,
-                from,
-                count,
-            )),
+        return Ok(empty_preview_response(
+            &schedule,
+            remaining_runs,
+            from,
+            count,
         ));
     }
 
@@ -42285,14 +42359,11 @@ async fn preview_schedule_firings_handler(
         .as_deref()
         .and_then(parse_schedule_from_expr_pub);
     let Some(ref sched) = parsed_schedule else {
-        return Ok((
-            StatusCode::OK,
-            Json(empty_preview_response(
-                &schedule,
-                remaining_runs,
-                from,
-                count,
-            )),
+        return Ok(empty_preview_response(
+            &schedule,
+            remaining_runs,
+            from,
+            count,
         ));
     };
 
@@ -42353,19 +42424,16 @@ async fn preview_schedule_firings_handler(
     // dispatch.
     let entries = truncate_preview_entries_by_bounds(entries, schedule.end_at, remaining_runs);
 
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "entries": entries,
-            "is_paused": false,
-            "pause_reason": serde_json::Value::Null,
-            "from": from,
-            "count_requested": count,
-            "end_at": schedule.end_at,
-            "remaining_runs": remaining_runs,
-            "exhausted_reason": schedule.exhausted_reason,
-        })),
-    ))
+    Ok(SchedulePreview {
+        entries,
+        is_paused: false,
+        pause_reason: None,
+        from,
+        count_requested: count,
+        end_at: schedule.end_at,
+        remaining_runs,
+        exhausted_reason: schedule.exhausted_reason,
+    })
 }
 
 /// `POST /admin/schedules/preview` — validate a candidate schedule config and return
@@ -51493,8 +51561,12 @@ mod tests {
         };
         let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
-        assert_eq!(response["is_paused"], serde_json::json!(true));
-        assert_eq!(response["pause_reason"], serde_json::json!("operator hold"));
+        assert!(response.is_paused);
+        assert_eq!(response.pause_reason.as_deref(), Some("operator hold"));
+        // The serialized shape is the API contract, so assert on it too.
+        let json = serde_json::to_value(&response).expect("preview serializes");
+        assert_eq!(json["is_paused"], serde_json::json!(true));
+        assert_eq!(json["pause_reason"], serde_json::json!("operator hold"));
     }
 
     #[test]
@@ -51510,6 +51582,7 @@ mod tests {
         };
         let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
+        let response = serde_json::to_value(&response).expect("preview serializes");
         assert_eq!(response["is_paused"], serde_json::json!(false));
         assert_eq!(
             response["pause_reason"],
