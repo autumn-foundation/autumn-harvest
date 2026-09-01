@@ -231,6 +231,146 @@ pub enum DrFormat {
     Json,
 }
 
+/// `harvest partition` — inspect and manage the opt-in partitioned
+/// `harvest_events` layout (issue #958).
+///
+/// Every subcommand is shard-local by construction: a shard is a database, so
+/// each `--shard` DSN is acted on independently and one shard's outcome never
+/// depends on another's.
+#[derive(Debug, Subcommand)]
+pub enum PartitionCommand {
+    /// Report each shard's layout, partitions, and what the sweeper would do.
+    ///
+    /// Read-only and safe at any time. This is the first thing to run when
+    /// asking "why has space not come back?": the `blocked` column names each
+    /// cohort the sweeper considered and the reason it was left alone.
+    Status {
+        /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
+        /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
+        /// POSITIONAL index as its shard id.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// Print the SQL that converts a **large live** table, without running it.
+    ///
+    /// Emits the operator-run plan whose expensive steps sit OUTSIDE the
+    /// exclusive lock window (`CREATE INDEX CONCURRENTLY`, `NOT VALID` +
+    /// `VALIDATE CONSTRAINT`), leaving a metadata-only swap. Use this instead
+    /// of `enable` on any table big enough that an index build inside a
+    /// transaction would hold `ACCESS EXCLUSIVE` longer than you can afford.
+    ///
+    /// Needs no database connection: it prints a plan for you to review.
+    Plan {
+        /// Cohort width in seconds. Governs both reclamation granularity and
+        /// the live partition count (retention horizon / width + lookahead).
+        #[arg(long, value_name = "SECONDS", default_value_t = autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS)]
+        cohort_width_secs: i64,
+
+        /// How many cohorts ahead of "now" the engine keeps pre-created.
+        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
+        lookahead_cohorts: u32,
+    },
+
+    /// **Convert this shard to the partitioned layout.**
+    ///
+    /// One transaction under a bounded `lock_timeout`, so a failure leaves the
+    /// deployment exactly as it was. Instant on an empty table; on a populated
+    /// one the existing table is attached WHOLE as the pre-cutover partition,
+    /// so no row is copied or rewritten — but the index builds and constraint
+    /// validation happen inside the lock window.
+    ///
+    /// On a large live table use `plan` instead.
+    Enable {
+        /// A shard database DSN. Repeat once per shard.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Cohort width in seconds.
+        #[arg(long, value_name = "SECONDS", default_value_t = autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS)]
+        cohort_width_secs: i64,
+
+        /// How many cohorts ahead of "now" to pre-create.
+        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
+        lookahead_cohorts: u32,
+
+        /// Seconds to wait for `ACCESS EXCLUSIVE` on `harvest_events` before
+        /// giving up. Failing fast is correct: a conversion that queues behind
+        /// a long transaction blocks every append behind it.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+        lock_timeout_secs: u64,
+
+        /// Acknowledge that this takes a brief exclusive lock on
+        /// `harvest_events`, during which appends wait.
+        ///
+        /// Deliberately unpleasant to type: on a populated table the window
+        /// covers two index builds and a full-table constraint validation.
+        #[arg(long = "i-understand-the-lock-window")]
+        confirm: bool,
+
+        /// Convert even when a logical-replication publication covers
+        /// `harvest_events` without `publish_via_partition_root`.
+        ///
+        /// Such a publication would send the partitioned table's rows under
+        /// leaf partition names the standby has no tables for, stopping the
+        /// subscription. Set this only when the subscriber runs the
+        /// partitioned layout too.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// Run one maintenance pass now instead of waiting for a retention tick.
+    ///
+    /// Drains the `DEFAULT` partition, extends the lookahead window, then
+    /// sweeps droppable cohorts. The retention janitor does exactly this every
+    /// tick; this exists for incident response and for a deployment that runs
+    /// with history retention disabled (where no janitor is running to do it).
+    Maintain {
+        /// A shard database DSN. Repeat once per shard.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// How many cohorts ahead of "now" to keep pre-created.
+        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
+        lookahead_cohorts: u32,
+
+        /// Maximum partitions to drop in this pass.
+        #[arg(long, value_name = "N", default_value_t = 32)]
+        max_drops: usize,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+
+    /// **Revert this shard to the ordinary unpartitioned table.**
+    ///
+    /// The escape hatch. Copies every surviving row back into a plain table and
+    /// restores the foreign key, so it REWRITES THE WHOLE TABLE — schedule a
+    /// window for it on anything large.
+    Disable {
+        /// A shard database DSN. Repeat once per shard.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// Acknowledge that this rewrites `harvest_events` in full.
+        #[arg(long = "i-understand-this-rewrites-the-table")]
+        confirm: bool,
+
+        /// Output format.
+        #[arg(long, short = 'o', value_enum, default_value = "text")]
+        format: DrFormat,
+    },
+}
+
 /// `harvest backup` subcommands (issue #943).
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
@@ -1115,6 +1255,17 @@ enum Commands {
     Dr {
         #[command(subcommand)]
         command: DrCommand,
+    },
+
+    /// Inspect and manage the opt-in partitioned `harvest_events` layout
+    /// (issue #958).
+    ///
+    /// Talks to shard databases directly, never to the management API: the
+    /// layout is a property of each shard's own schema, and `enable`/`disable`
+    /// are DDL that no HTTP surface should be able to trigger.
+    Partition {
+        #[command(subcommand)]
+        command: PartitionCommand,
     },
 
     /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
@@ -3088,6 +3239,9 @@ impl Cli {
             Commands::Dr { .. } => {
                 unreachable!("Dr handles its own execution locally")
             }
+            Commands::Partition { .. } => {
+                unreachable!("Partition handles its own execution locally")
+            }
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
@@ -3203,6 +3357,13 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     // unreachable (mirrors `backup verify`).
     if let Commands::Dr { command } = &cli.command {
         return run_dr(command).await;
+    }
+
+    // `partition` is shard-local DDL and inspection: it connects to each shard
+    // database directly, so it is handled in-process before the API execute
+    // path, exactly like `dr`.
+    if let Commands::Partition { command } = &cli.command {
+        return run_partition(command).await;
     }
 
     // det-check is read-only local source analysis: no HTTP, handled entirely
@@ -4481,6 +4642,514 @@ async fn dr_connect_read_only(
             ))
         })?;
     Ok(conn)
+}
+
+// ── `harvest partition` (issue #958) ───────────────────────────────────────
+
+/// What `harvest partition disable` did on one shard.
+///
+/// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
+/// successful no-op, not an absent result, and the two must not be spelled the
+/// same way in the JSON an operator's script reads.
+#[derive(Debug)]
+enum DisableOutcome {
+    /// Reverted, discarding the rows the flat layout's constraints forbid.
+    Reverted(autumn_harvest::partition::DisableReport),
+    /// Already unpartitioned; nothing to do.
+    AlreadyUnpartitioned,
+}
+
+impl DisableOutcome {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Reverted(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            Self::AlreadyUnpartitioned => json!({"already_unpartitioned": true}),
+        }
+    }
+}
+
+/// One shard's row in a `harvest partition` report.
+///
+/// A plain struct with a hand-written JSON projection rather than a
+/// `serde::Serialize` derive: this crate depends on `serde_json` but
+/// deliberately not on `serde` itself (see `DrShardStatus`), and one small
+/// projection is a better trade than a new dependency. The engine types it
+/// embeds do derive `Serialize`, so `serde_json::to_value` handles them.
+#[derive(Debug)]
+struct PartitionShardReport {
+    shard_id: i32,
+    dsn: String,
+    reachable: bool,
+    unreachable_reason: Option<String>,
+    layout: Option<autumn_harvest::partition::EventLayout>,
+    partitions: Option<Vec<autumn_harvest::partition::PartitionInfo>>,
+    maintenance: Option<autumn_harvest::partition::MaintenanceOutcome>,
+    enable: Option<autumn_harvest::partition::EnableReport>,
+    /// What a sweep WOULD do right now — read-only, from `status`.
+    would_sweep: Option<autumn_harvest::partition::SweepOutcome>,
+    /// Outcome of `disable`, when that is the verb.
+    disable: Option<DisableOutcome>,
+    error: Option<String>,
+}
+
+impl PartitionShardReport {
+    const fn unreachable(shard_id: i32, dsn: String, reason: String) -> Self {
+        Self {
+            shard_id,
+            dsn,
+            reachable: false,
+            unreachable_reason: Some(reason),
+            layout: None,
+            partitions: None,
+            maintenance: None,
+            enable: None,
+            would_sweep: None,
+            disable: None,
+            error: None,
+        }
+    }
+
+    const fn reachable(shard_id: i32, dsn: String) -> Self {
+        Self {
+            shard_id,
+            dsn,
+            reachable: true,
+            unreachable_reason: None,
+            layout: None,
+            partitions: None,
+            maintenance: None,
+            enable: None,
+            would_sweep: None,
+            disable: None,
+            error: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut obj = Map::new();
+        obj.insert("shard_id".into(), json!(self.shard_id));
+        obj.insert("dsn".into(), json!(self.dsn));
+        obj.insert("reachable".into(), json!(self.reachable));
+        let mut put = |key: &str, value: Option<Value>| {
+            if let Some(v) = value {
+                obj.insert(key.to_string(), v);
+            }
+        };
+        put(
+            "unreachable_reason",
+            self.unreachable_reason.as_ref().map(|v| json!(v)),
+        );
+        put(
+            "layout",
+            self.layout.and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "partitions",
+            self.partitions
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "maintenance",
+            self.maintenance
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "enable",
+            self.enable
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "would_sweep",
+            self.would_sweep
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+        put(
+            "disable",
+            self.disable.as_ref().map(DisableOutcome::to_json),
+        );
+        put("error", self.error.as_ref().map(|v| json!(v)));
+        Value::Object(obj)
+    }
+}
+
+/// Dispatch for `harvest partition`.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] for a malformed `--shard` spec or a missing
+/// confirmation flag on a destructive subcommand.
+pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
+    match command {
+        PartitionCommand::Plan {
+            cohort_width_secs,
+            lookahead_cohorts,
+        } => {
+            let opts = autumn_harvest::partition::EnableOptions {
+                cohort_width_secs: *cohort_width_secs,
+                lookahead_cohorts: *lookahead_cohorts,
+                ..autumn_harvest::partition::EnableOptions::default()
+            };
+            opts.validate()
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+            println!(
+                "{}",
+                autumn_harvest::partition::migration_plan(
+                    &opts,
+                    autumn_harvest::chrono::Utc::now()
+                )
+            );
+            Ok(())
+        }
+        PartitionCommand::Status { shards, format } => run_partition_status(shards, *format).await,
+        PartitionCommand::Enable {
+            shards,
+            cohort_width_secs,
+            lookahead_cohorts,
+            lock_timeout_secs,
+            confirm,
+            allow_incompatible_publications,
+            format,
+        } => {
+            if !confirm {
+                return Err(CliError::InvalidInput(
+                    "refusing to convert without --i-understand-the-lock-window: \
+                     `enable` takes a brief ACCESS EXCLUSIVE lock on harvest_events, \
+                     during which every append waits. On a populated table that window \
+                     also covers two index builds and a full-table constraint validation \
+                     — run `harvest partition plan` instead and follow its steps."
+                        .to_string(),
+                ));
+            }
+            let opts = autumn_harvest::partition::EnableOptions {
+                cohort_width_secs: *cohort_width_secs,
+                lookahead_cohorts: *lookahead_cohorts,
+                lock_timeout: std::time::Duration::from_secs((*lock_timeout_secs).max(1)),
+                allow_incompatible_publications: *allow_incompatible_publications,
+            };
+            opts.validate()
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+            run_partition_enable(shards, &opts, *format).await
+        }
+        PartitionCommand::Maintain {
+            shards,
+            lookahead_cohorts,
+            max_drops,
+            format,
+        } => run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *format).await,
+        PartitionCommand::Disable {
+            shards,
+            confirm,
+            format,
+        } => {
+            if !confirm {
+                return Err(CliError::InvalidInput(
+                    "refusing to revert without --i-understand-this-rewrites-the-table: \
+                     `disable` copies every surviving event row back into a plain table, \
+                     which rewrites harvest_events in full."
+                        .to_string(),
+                ));
+            }
+            run_partition_disable(shards, *format).await
+        }
+    }
+}
+
+async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+    let targets = parse_shard_targets(shards)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        // Read-only, like `dr status`, and enforced by Postgres rather than by
+        // care: `status` is documented as safe against a production primary.
+        let mut conn = match dr_connect_read_only(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(PartitionShardReport::unreachable(
+                    target.shard_id,
+                    redacted,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        match autumn_harvest::partition::detect_layout(&mut conn).await {
+            Ok(layout) => {
+                row.layout = Some(layout);
+                if layout.is_partitioned() {
+                    match autumn_harvest::partition::list_partitions(&mut conn).await {
+                        Ok(parts) => row.partitions = Some(parts),
+                        Err(e) => row.error = Some(e.to_string()),
+                    }
+                    // The `blocked` reasons are produced by the sweep's gate,
+                    // so a status command that only listed partitions could
+                    // never answer the question this command exists for. This
+                    // is a read-only evaluation of the same gate: no lock, no
+                    // DDL, no straggler delete.
+                    match autumn_harvest::partition::evaluate(
+                        &mut conn,
+                        autumn_harvest::chrono::Utc::now(),
+                        &autumn_harvest::partition::SweepOptions::default(),
+                    )
+                    .await
+                    {
+                        Ok(sweep) => row.would_sweep = Some(sweep),
+                        Err(e) => row.error = Some(e.to_string()),
+                    }
+                }
+            }
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        out.push(row);
+    }
+    emit_partition_report(&out, format, "status")
+}
+
+async fn run_partition_enable(
+    shards: &[String],
+    opts: &autumn_harvest::partition::EnableOptions,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    let targets = parse_shard_targets(shards)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        let mut conn = match dr_connect(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(PartitionShardReport::unreachable(
+                    target.shard_id,
+                    redacted,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        // Per-shard independence is deliberate: a shard is a database, and a
+        // half-converted cluster is a supported state (each shard's layout is
+        // detected at runtime), so one shard's lock timeout must not abort the
+        // conversion of the rest.
+        match autumn_harvest::partition::enable_partitioning(&mut conn, opts).await {
+            Ok(report) => row.enable = Some(report),
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        out.push(row);
+    }
+    emit_partition_report(&out, format, "enable")
+}
+
+async fn run_partition_maintain(
+    shards: &[String],
+    lookahead_cohorts: u32,
+    max_drops: usize,
+    format: DrFormat,
+) -> Result<(), CliError> {
+    let targets = parse_shard_targets(shards)?;
+    let sweep = autumn_harvest::partition::SweepOptions {
+        max_drops,
+        ..autumn_harvest::partition::SweepOptions::default()
+    };
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        let mut conn = match dr_connect(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(PartitionShardReport::unreachable(
+                    target.shard_id,
+                    redacted,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        match autumn_harvest::partition::maintain(
+            &mut conn,
+            autumn_harvest::chrono::Utc::now(),
+            lookahead_cohorts,
+            &sweep,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // A pass that ran but did not COMPLETE — a `drain_default` that
+                // lost its bounded lock attempt, say — comes back as `Ok` with
+                // `last_error` set, because maintenance is best-effort and must
+                // never fail a retention tick. The CLI is not a retention tick.
+                // Without this, `harvest partition maintain` would print an
+                // ordinary zero-drain report and exit 0 while the DEFAULT
+                // partition stayed undrained, and scheduled operator automation
+                // would never notice.
+                row.error.clone_from(&outcome.last_error);
+                row.maintenance = Some(outcome);
+            }
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        out.push(row);
+    }
+    emit_partition_report(&out, format, "maintain")
+}
+
+async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+    let targets = parse_shard_targets(shards)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+        let mut conn = match dr_connect(&target.dsn).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                out.push(PartitionShardReport::unreachable(
+                    target.shard_id,
+                    redacted,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        match autumn_harvest::partition::disable_partitioning(&mut conn).await {
+            Ok(report) => {
+                row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
+                // `None` = already unpartitioned. That is a successful no-op,
+                // not a failure: `enable` on an already-partitioned shard exits
+                // 0, and a deployment script must be able to run `disable`
+                // twice without the second run failing.
+                row.disable = Some(report.map_or(
+                    DisableOutcome::AlreadyUnpartitioned,
+                    DisableOutcome::Reverted,
+                ));
+            }
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        out.push(row);
+    }
+    emit_partition_report(&out, format, "disable")
+}
+
+/// Render a report, and fail the process if any shard errored.
+///
+/// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
+/// that converted `a` and failed on `b` has left a half-converted cluster, and a
+/// zero exit would let a deployment script move on as though it had not.
+fn emit_partition_report(
+    rows: &[PartitionShardReport],
+    format: DrFormat,
+    verb: &str,
+) -> Result<(), CliError> {
+    // `status` is read-only reporting and must not fail the process for an
+    // unreachable shard — that is the established `harvest dr status`
+    // behaviour, and a monitoring script should get the report for the shards
+    // it could reach. Only the MUTATING verbs exit nonzero, where a partial
+    // result means a half-converted cluster a deployment script must not move
+    // on from.
+    let fail_on_error = verb != "status";
+    match format {
+        DrFormat::Json => {
+            let payload: Vec<Value> = rows.iter().map(PartitionShardReport::to_json).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
+            );
+        }
+        DrFormat::Text => {
+            for r in rows {
+                println!("shard {} ({})", r.shard_id, r.dsn);
+                if !r.reachable {
+                    println!(
+                        "  UNREACHABLE: {}",
+                        r.unreachable_reason.as_deref().unwrap_or("unknown")
+                    );
+                    continue;
+                }
+                if let Some(layout) = &r.layout {
+                    println!("  layout: {layout:?}");
+                }
+                if let Some(report) = &r.enable {
+                    println!("  mode: {:?}", report.mode);
+                    println!(
+                        "  cohort width: {}s, partitions created: {}",
+                        report.cohort_width_secs,
+                        report.partitions_created.len()
+                    );
+                }
+                if let Some(parts) = &r.partitions {
+                    println!("  partitions: {}", parts.len());
+                    for p in parts {
+                        println!(
+                            "    {:<40} {} .. {}",
+                            p.name,
+                            p.lower
+                                .map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
+                            p.upper
+                                .map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
+                        );
+                    }
+                }
+                if let Some(m) = &r.maintenance {
+                    println!(
+                        "  created: {}, drained rows: {}, dropped: {}, straggler rows: {}",
+                        m.created.len(),
+                        m.drained,
+                        m.sweep.dropped.len(),
+                        m.sweep.straggler_rows_deleted,
+                    );
+                    if let Some(e) = &m.last_error {
+                        println!("  INCOMPLETE: {e}");
+                    }
+                    // The answer to "why has space not come back?". Printed
+                    // even when empty is noise, so only when there is
+                    // something to explain.
+                    for b in &m.sweep.blocked {
+                        println!("  blocked: {b}");
+                    }
+                }
+                if let Some(sweep) = &r.would_sweep {
+                    println!(
+                        "  droppable now: {}, blocked: {}",
+                        sweep.dropped.len(),
+                        sweep.blocked.len()
+                    );
+                    for b in &sweep.blocked {
+                        println!("  blocked: {b}");
+                    }
+                }
+                match &r.disable {
+                    Some(DisableOutcome::Reverted(d)) => println!(
+                        "  reverted: {} orphan row(s) and {} duplicate row(s) discarded \
+                         to rebuild the flat layout's constraints",
+                        d.orphans_removed, d.duplicates_removed
+                    ),
+                    Some(DisableOutcome::AlreadyUnpartitioned) => {
+                        println!("  already unpartitioned; nothing to do");
+                    }
+                    None => {}
+                }
+                if let Some(e) = &r.error {
+                    println!("  ERROR: {e}");
+                }
+            }
+        }
+    }
+    let failed: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.reachable || r.error.is_some())
+        .map(|r| r.shard_id.to_string())
+        .collect();
+    if failed.is_empty() || !fail_on_error {
+        Ok(())
+    } else {
+        Err(CliError::InvalidInput(format!(
+            "`partition {verb}` did not succeed on shard(s) {}: see the report above",
+            failed.join(", ")
+        )))
+    }
 }
 
 /// Run a `harvest dr` subcommand.
@@ -14176,7 +14845,7 @@ async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
 }
 
 fn bad_helper() -> i64 {
-    chrono::Utc::now().timestamp()
+    autumn_harvest::chrono::Utc::now().timestamp()
 }
 ";
         let text = format_det_findings_text(&report(src));

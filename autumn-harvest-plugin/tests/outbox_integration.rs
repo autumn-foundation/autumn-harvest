@@ -257,7 +257,7 @@ async fn setup_split_test_databases(
             .await
             .expect("failed to connect to harvest database");
         harvest_conn
-            .batch_execute(autumn_harvest::full_migrations_sql())
+            .batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply harvest migrations");
     }

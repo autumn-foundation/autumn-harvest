@@ -136,6 +136,62 @@ pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))
 }
 
+/// The migration bundle a testcontainers-backed suite should apply, honouring
+/// the `HARVEST_TEST_PARTITIONED` layout switch (issue #958).
+///
+/// Identical to [`full_migrations_sql`] unless `HARVEST_TEST_PARTITIONED` is
+/// set to something other than `0`/`false`/empty, in which case the opt-in
+/// partitioned layout is enabled on the fresh database as well.
+///
+/// **Why this exists.** Issue #958 requires that per-execution event semantics
+/// be "byte-identical between layouts, asserted by running the existing
+/// store/replay integration suites against both layouts". Every DB-backed suite
+/// bootstraps through this one helper, so *any* of them can be re-run against
+/// the partitioned layout by setting one environment variable — no per-suite
+/// port, and no separate set of assertions that could drift from the originals.
+///
+/// CI re-runs the subset listed with osclass `linuxpart` in
+/// `.github/ci/integration-suites.txt`: the store, replay, history, retention,
+/// legal-hold and end-to-end suites. That is a deliberate subset, not the whole
+/// corpus — every suite would double the Docker-backed CI time for suites that
+/// never touch `harvest_events`. Adding one is a single manifest line.
+///
+/// The enable script is exactly the one
+/// [`partition::enable_partitioning`](crate::partition::enable_partitioning)
+/// executes — not a test-only reimplementation — so a suite passing here is
+/// evidence about the layout operators actually get.
+///
+/// Returns `String` rather than `&'static str` because the payload now depends
+/// on the environment. Callers that need bytes can use `.as_bytes()`.
+///
+/// `#[doc(hidden)]`: test-support, not semver-stable surface. Stays `pub` so
+/// the plugin crate's integration tests can call it across the crate boundary.
+#[doc(hidden)]
+#[must_use]
+pub fn test_init_sql() -> String {
+    let mut sql = full_migrations_sql().to_string();
+    if test_partitioned_layout_requested() {
+        sql.push_str("\n\n");
+        sql.push_str(&crate::partition::enable_sql(
+            &crate::partition::EnableOptions::default(),
+        ));
+    }
+    sql
+}
+
+/// Whether `HARVEST_TEST_PARTITIONED` asks for the partitioned layout.
+///
+/// Treats `0`, `false` and empty as off so a CI matrix can set the variable
+/// unconditionally and vary only its value.
+#[doc(hidden)]
+#[must_use]
+pub fn test_partitioned_layout_requested() -> bool {
+    std::env::var("HARVEST_TEST_PARTITIONED").is_ok_and(|v| {
+        let v = v.trim();
+        !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
@@ -275,6 +331,7 @@ mod loom_sync;
 pub mod metrics_rs_adapter;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
 pub mod poison_pill;

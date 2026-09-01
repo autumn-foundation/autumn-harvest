@@ -8,7 +8,7 @@
 //! max-seen. If the mutex is correct, the max concurrent critical sections per
 //! key is exactly **1**.
 //!
-//! DB source of truth: `full_migrations_sql()` (the paved-path bundle) applied
+//! DB source of truth: `test_init_sql()` (the paved-path bundle) applied
 //! to a fresh per-test database (when `HARVEST_TEST_DATABASE_URL` points at an
 //! admin server) or a throwaway testcontainer (CI default). Run with
 //! `--test-threads=1` — several tests set the process-global mutex lease TTL.
@@ -601,7 +601,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect fresh db");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         return (url, None);
@@ -616,7 +616,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     (url, Some(container))

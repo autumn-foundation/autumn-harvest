@@ -3130,7 +3130,7 @@ pub mod db {
             with_provision_deadline(
                 "run migrations",
                 deadline,
-                conn.batch_execute(autumn_harvest::full_migrations_sql()),
+                conn.batch_execute(&autumn_harvest::test_init_sql()),
             )
             .await?
             .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
@@ -3159,7 +3159,7 @@ pub mod db {
             "start the benchmark container",
             deadline,
             Postgres::default()
-                .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
+                .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
                 .with_tag("16")
                 // Preload `pg_stat_statements` so the evidence-capture test's
                 // real-claim_task() snapshot (`zz_capture_queue_pause_claim_evidence`)

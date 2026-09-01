@@ -6,7 +6,7 @@
 //! exact class* — the issue's success metric ("detects 100% of a seeded set of
 //! >= 5 incoherence classes").
 //!
-//! DB source of truth: `full_migrations_sql()` (the paved-path bundle) applied
+//! DB source of truth: `test_init_sql()` (the paved-path bundle) applied
 //! to a fresh per-test database (when `HARVEST_TEST_DATABASE_URL` points at an
 //! admin server) or a throwaway testcontainer (CI default).
 #![cfg(feature = "db")]
@@ -61,7 +61,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect fresh db");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         return (url, None);
@@ -76,7 +76,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     (url, Some(container))
@@ -768,7 +768,7 @@ async fn an_unreachable_shard_is_undetermined_not_clean() {
 /// Must report `Unavailable` (exit 2), never a pass.
 #[tokio::test]
 async fn an_unmigrated_restore_is_undetermined_never_a_pass() {
-    // Deliberately does NOT run `full_migrations_sql()`.
+    // Deliberately does NOT run `test_init_sql()`.
     let admin = std::env::var("HARVEST_TEST_DATABASE_URL").ok();
     let (url, _c) = if let Some(admin_url) = admin {
         let mut admin_conn = AsyncPgConnection::establish(&admin_url)

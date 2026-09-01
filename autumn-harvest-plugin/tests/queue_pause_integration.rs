@@ -118,12 +118,9 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
         .await
         .expect("connect to fresh test database");
-    diesel_async::SimpleAsyncConnection::batch_execute(
-        &mut conn,
-        autumn_harvest::full_migrations_sql(),
-    )
-    .await
-    .expect("apply migrations to fresh test database");
+    diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
+        .await
+        .expect("apply migrations to fresh test database");
 
     (db_url, container)
 }

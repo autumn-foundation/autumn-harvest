@@ -323,6 +323,86 @@ pub struct RetentionConfig {
     /// byte-for-byte identical to pre-#752 behavior: hard delete, no summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SummaryPolicy>,
+    /// Partition maintenance for the opt-in partitioned `harvest_events`
+    /// layout (issue #958).
+    ///
+    /// Applies only when the shard's `harvest_events` is actually partitioned
+    /// — the janitor probes the layout each tick, so a deployment that has not
+    /// opted in pays nothing and behaves byte-for-byte as before. This is what
+    /// makes partition creation and reclamation engine-automated: no operator
+    /// cron pre-creates future partitions, and no operator script drops expired
+    /// ones.
+    pub partitions: PartitionMaintenanceConfig,
+}
+
+/// Engine-automated partition maintenance settings (issue #958).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PartitionMaintenanceConfig {
+    /// Whether the retention janitor maintains partitions at all. Disabling it
+    /// leaves an opted-in deployment with no partition creation and no
+    /// reclamation, so it exists for incident response, not for tuning.
+    pub enabled: bool,
+    /// How many cohorts ahead of "now" to keep pre-created.
+    pub lookahead_cohorts: u32,
+    /// Maximum partitions dropped per tick. Each drop takes a brief
+    /// `ACCESS EXCLUSIVE` lock on the parent, so a bounded budget keeps a
+    /// backlog from holding the append path off; successive ticks converge.
+    pub max_drops_per_tick: usize,
+    /// Seconds to wait for that lock before deferring a partition to the next
+    /// tick. Failing fast is what protects the concurrent-p99 budget.
+    pub drop_lock_timeout_secs: u64,
+    /// Seconds the exact ownership scan may run before the sweeper gives up on
+    /// a partition and retries next tick.
+    ///
+    /// Only reached when more old executions survive than
+    /// `owner_probe_cap`; the narrow probe decides the normal case. Raise it
+    /// for very large partitions, or narrow the cohort width.
+    pub exact_scan_timeout_secs: u64,
+    /// How many surviving old executions the narrow ownership probe will
+    /// enumerate before falling back to the exact scan.
+    pub owner_probe_cap: usize,
+    /// Rows per straggler `DELETE` statement.
+    pub straggler_batch: usize,
+    /// Opt-in targeted `DELETE` of orphan rows in a cohort pinned by a
+    /// long-running execution for longer than this many seconds.
+    ///
+    /// `None` (the default) means the janitor issues **zero** row-level deletes
+    /// against `harvest_events`. Set it only when long-lived executions would
+    /// otherwise pin their cohorts — and their siblings' rows — indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub straggler_grace_secs: Option<u64>,
+}
+
+impl Default for PartitionMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lookahead_cohorts: crate::partition::DEFAULT_LOOKAHEAD_COHORTS,
+            max_drops_per_tick: crate::partition::SweepOptions::default().max_drops,
+            drop_lock_timeout_secs: 2,
+            exact_scan_timeout_secs: crate::partition::SweepOptions::default()
+                .exact_scan_timeout
+                .as_secs(),
+            owner_probe_cap: crate::partition::SweepOptions::default().owner_probe_cap,
+            straggler_batch: crate::partition::SweepOptions::default().straggler_batch,
+            straggler_grace_secs: None,
+        }
+    }
+}
+
+impl PartitionMaintenanceConfig {
+    /// Translate into the [`crate::partition::SweepOptions`] the sweeper takes.
+    #[must_use]
+    pub fn sweep_options(&self) -> crate::partition::SweepOptions {
+        crate::partition::SweepOptions {
+            max_drops: self.max_drops_per_tick,
+            lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
+            exact_scan_timeout: Duration::from_secs(self.exact_scan_timeout_secs.max(1)),
+            owner_probe_cap: self.owner_probe_cap,
+            straggler_batch: self.straggler_batch,
+            straggler_grace: self.straggler_grace_secs.map(Duration::from_secs),
+        }
+    }
 }
 
 impl Default for RetentionConfig {
@@ -337,6 +417,7 @@ impl Default for RetentionConfig {
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
+            partitions: PartitionMaintenanceConfig::default(),
         }
     }
 }
@@ -589,6 +670,22 @@ impl RetentionConfig {
             // A bounded summary policy spawns the janitor so its GC pass runs
             // even if the history horizon was later removed (issue #752).
             || self.summary_gc_active()
+            // Partition maintenance is work in its own right, not a rider on
+            // history retention (issue #958). Without this, a deployment that
+            // turned every retention horizon off — `audit_retention_days = 0`,
+            // `schedule_decision_retention_days = 0`, no history or summary
+            // age — would leave `partitions.enabled` reading `true` while the
+            // runtime never spawned to honour it. On an opted-in partitioned
+            // shard the lookahead window then expires, every subsequent append
+            // lands in the DEFAULT partition, and no cohort is ever reclaimed.
+            //
+            // Note what this does NOT do: partition *creation* is not
+            // reclamation, so it must keep running even for an operator who
+            // deliberately retains everything forever. The only deployments
+            // this newly spawns for are those that had switched every horizon
+            // off — which is exactly the broken case; the stock config
+            // (`audit_retention_days: 90`) already spawned.
+            || self.partitions.enabled
     }
 }
 
@@ -626,6 +723,14 @@ pub struct RetentionTickResult {
     /// #752). Surfaced via `GET /admin/retention` for creation observability.
     /// Real deletes only — a `dry_run` tick creates no summaries.
     pub summarized_count: usize,
+    /// Partition maintenance performed on this shard this tick (issue #958).
+    ///
+    /// `None` on an unpartitioned shard — which is every deployment that has
+    /// not opted in. When `Some`, [`crate::partition::SweepOutcome::blocked`]
+    /// is the operator's answer to "why has space not come back?": it names
+    /// each cohort that was considered and the reason it was left alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_maintenance: Option<crate::partition::MaintenanceOutcome>,
 }
 
 /// The current overall status of the retention subsystem.
@@ -676,6 +781,24 @@ impl RetentionMonitor {
             .lock()
             .expect("retention monitor lock poisoned")
             .clone()
+    }
+
+    /// Record this shard's partition-maintenance outcome (issue #958) without
+    /// disturbing the history-retention counters already reported for the tick.
+    ///
+    /// Maintenance runs after the candidate loop — a cohort only becomes
+    /// droppable once the loop has archived and deleted its executions — so it
+    /// cannot ride along in the same `update`.
+    #[cfg(feature = "db")]
+    fn update_partitions(&self, shard: ShardId, outcome: crate::partition::MaintenanceOutcome) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.partition_maintenance = Some(outcome);
+        }
     }
 
     #[cfg(feature = "db")]
@@ -863,6 +986,116 @@ impl RetentionRuntime {
                             }
                         }
                         monitor_task.update(shard, result);
+                    }
+                }
+
+                // Engine-automated partition maintenance (issue #958, AC8).
+                //
+                // Deliberately OUTSIDE the history-retention phase gate above:
+                // a partitioned deployment must keep its write window covered
+                // even with no history-retention age configured, or an append
+                // would eventually reach an uncovered cohort. `maintain` probes
+                // the layout first and is a no-op on the (overwhelmingly
+                // common) unpartitioned shard, so a deployment that has not
+                // opted in pays one cheap catalog query per tick and nothing
+                // else.
+                //
+                // Deliberately AFTER the candidate loop: a cohort only becomes
+                // droppable once the loop has archived (#345), summarized
+                // (#752) and deleted its executions. Running it here reclaims
+                // in the SAME tick that frees the cohort rather than the next
+                // one.
+                //
+                // Best-effort and per-shard: a shard whose maintenance fails
+                // logs and is retried next tick. It must never fail the whole
+                // retention tick, because history retention and reclamation are
+                // independent — the executions are already safely archived and
+                // deleted by this point.
+                if config.partitions.enabled {
+                    let now = Utc::now();
+                    let mut sweep_opts = config.partitions.sweep_options();
+                    // `dry_run` means "do not destroy data". It must NOT stop
+                    // partition CREATION: `ensure_partitions` and
+                    // `drain_default` delete nothing, and a deployment running
+                    // retention in dry-run — a common posture during rollout —
+                    // would otherwise stop extending the lookahead window and,
+                    // after a few days, send every append to the DEFAULT
+                    // partition indefinitely. Only the sweep is suppressed, by
+                    // giving it a zero drop budget.
+                    if config.dry_run {
+                        sweep_opts.max_drops = 0;
+                        sweep_opts.straggler_grace = None;
+                    }
+                    for (shard, pool) in pools.iter_shards() {
+                        let mut conn = match pool.get().await {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                // Never silent: a shard that cannot be reached
+                                // gets no lookahead partitions and no
+                                // reclamation, and the operator has to be able
+                                // to tell that apart from "nothing to do".
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %error,
+                                    "harvest event-partition maintenance could not \
+                                     acquire a connection"
+                                );
+                                monitor_task.update_partitions(
+                                    shard,
+                                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::partition::maintain(
+                            &mut conn,
+                            now,
+                            config.partitions.lookahead_cohorts,
+                            &sweep_opts,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                // `blocked` is in the condition deliberately.
+                                // The steady-state failure — nothing created
+                                // (the window is already covered), nothing
+                                // dropped, everything blocked — is exactly the
+                                // state an operator needs to see, and logging
+                                // only on progress would make it the one state
+                                // that produces no output at all.
+                                if !outcome.created.is_empty()
+                                    || !outcome.sweep.dropped.is_empty()
+                                    || !outcome.sweep.blocked.is_empty()
+                                    || outcome.drained > 0
+                                {
+                                    tracing::info!(
+                                        shard = %shard,
+                                        created = outcome.created.len(),
+                                        dropped = outcome.sweep.dropped.len(),
+                                        blocked = outcome.sweep.blocked.len(),
+                                        drained = outcome.drained,
+                                        straggler_rows = outcome.sweep.straggler_rows_deleted,
+                                        "harvest event-partition maintenance"
+                                    );
+                                }
+                                monitor_task.update_partitions(shard, outcome);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %err,
+                                    "harvest event-partition maintenance failed"
+                                );
+                                // Reported, not just logged: without this a
+                                // permanently-failing shard is indistinguishable
+                                // from one that never opted in, because both
+                                // show `partition_maintenance: null`.
+                                monitor_task.update_partitions(
+                                    shard,
+                                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -2806,10 +3039,30 @@ mod tests {
         let config = RetentionConfig {
             audit_retention_days: 0,
             schedule_decision_retention_days: 0,
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
             ..Default::default()
         };
-        // default with no purging is not enabled
+        // no purging AND no partition maintenance is not enabled
         assert!(!config.enabled());
+
+        // …but partition maintenance ALONE is (issue #958). An opted-in
+        // partitioned shard whose horizons are all off still needs its
+        // lookahead window extended, or every append ends up in the DEFAULT
+        // partition and nothing is ever reclaimed.
+        let partitions_only = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
+        assert!(partitions_only.partitions.enabled);
+        assert!(
+            partitions_only.enabled(),
+            "partition maintenance must itself spawn the runtime — otherwise \
+             `partitions.enabled` reads true while nothing honours it"
+        );
 
         let config = RetentionConfig {
             max_age_secs: Some(3600),
@@ -2899,9 +3152,17 @@ mod tests {
         assert!(config.summary_enabled());
         assert!(!config.summary_gc_active());
         assert_eq!(config.summary_age(), None);
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..config
+        };
         assert!(
             !config.enabled(),
-            "an unbounded-summary-only config with no history/audit horizon is not enabled"
+            "an unbounded-summary-only config with no history/audit horizon and no \
+             partition maintenance is not enabled"
         );
 
         // But a history horizon + unbounded summary IS enabled (via history).

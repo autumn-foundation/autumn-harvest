@@ -60,7 +60,7 @@ use uuid::Uuid;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-// The test DB is seeded from `autumn_harvest::full_migrations_sql()` — the
+// The test DB is seeded from `autumn_harvest::test_init_sql()` — the
 // build.rs-generated full migration bundle (identical to `diesel migration run`),
 // regenerated automatically from the whole `migrations/` directory. There is
 // nothing to hand-maintain or regenerate here: every table/column
@@ -71,7 +71,7 @@ pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 // later migration were both missing from an earlier subset). The applied superset
 // never over-constrains a test.
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Per-workflow schedule columns the cross-shard test's fresh DBs need. These are
@@ -1923,7 +1923,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(autumn_harvest::full_migrations_sql())
+        c.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate fresh shard db");
         c.batch_execute(SCHED_COLS)
@@ -2092,7 +2092,7 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(autumn_harvest::full_migrations_sql())
+        c.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2279,7 +2279,7 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(autumn_harvest::full_migrations_sql())
+        c.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2642,7 +2642,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(autumn_harvest::full_migrations_sql())
+        c.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2874,7 +2874,7 @@ async fn run_stale_sealed_delivered_case(
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(autumn_harvest::full_migrations_sql())
+        c.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate fresh shard db");
     }

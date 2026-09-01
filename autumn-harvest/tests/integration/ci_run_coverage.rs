@@ -302,7 +302,7 @@ fn allowlisted(key: &str) -> bool {
 
 /// One manifest record: `osclass crate target features filter`.
 struct SuiteRow {
-    /// `linux` | `allos` | `compileonly`.
+    /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
     /// `autumn-harvest` | `autumn-harvest-plugin`.
     krate: String,
@@ -315,9 +315,29 @@ struct SuiteRow {
 }
 
 impl SuiteRow {
-    /// `linux`/`allos` rows execute in CI; `compileonly` never does.
+    /// Rows that CREDIT a suite as covered.
+    ///
+    /// `linuxpart` deliberately does NOT: it re-runs a suite against the
+    /// opt-in partitioned layout (issue #958), which is *additional* evidence,
+    /// never a substitute for running against the layout every deployment
+    /// actually has. A suite listed only as `linuxpart` would otherwise satisfy
+    /// this guard while never running on the default layout at all — the exact
+    /// silently-never-run gap the guard exists to catch, in a new disguise.
     fn runs(&self) -> bool {
         self.osclass == "linux" || self.osclass == "allos"
+    }
+
+    /// Rows that EXECUTE in CI, whichever layout they execute against.
+    fn executes(&self) -> bool {
+        self.runs() || self.osclass == "linuxpart"
+    }
+
+    /// Runs against a live Docker Postgres, so the `db` default feature is in
+    /// play. `linuxpart` is `linux` with `HARVEST_TEST_PARTITIONED=1` — the
+    /// same suite, re-run against the opt-in partitioned `harvest_events`
+    /// layout (issue #958, AC2).
+    fn is_live_db(&self) -> bool {
+        self.osclass == "linux" || self.osclass == "linuxpart"
     }
 
     /// The `--features` tokens as a set (`-` ⇒ empty).
@@ -336,7 +356,7 @@ fn parse_manifest() -> Vec<SuiteRow> {
     // suite, exactly the gap this guard exists to catch; an unknown `crate`
     // would never match a coverage lookup. Reject either as a typo.
     // extend this set when a new crate/osclass is introduced.
-    const VALID_OSCLASS: &[&str] = &["linux", "allos", "compileonly"];
+    const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &["autumn-harvest", "autumn-harvest-plugin"];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
@@ -386,7 +406,7 @@ fn parse_manifest() -> Vec<SuiteRow> {
 /// `module::test` filter never credits the whole module).
 ///
 /// `autumn-harvest` has `default = ["db", "unified-dag-execution"]`; the runner
-/// keeps defaults for `linux` integration rows (Docker Postgres) and strips them
+/// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
 /// (`--no-default-features`) for `allos` integration rows (no live DB). So a
 /// `linux` integration row always has `db`; an `allos` integration row has it
 /// only if it lists it explicitly. `testing` is never a default, so it must be
@@ -397,7 +417,7 @@ fn core_covers(rows: &[SuiteRow], module: &str, needs_testing: bool) -> bool {
             return false;
         }
         let feats = r.feature_set();
-        let has_db = r.osclass == "linux" || feats.contains("db");
+        let has_db = r.is_live_db() || feats.contains("db");
         let has_testing = feats.contains("testing");
         if !has_db {
             return false;

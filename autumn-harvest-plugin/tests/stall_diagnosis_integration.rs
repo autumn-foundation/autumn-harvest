@@ -252,7 +252,7 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
         .await
         .expect("db connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrate db");
     (url, guard)
