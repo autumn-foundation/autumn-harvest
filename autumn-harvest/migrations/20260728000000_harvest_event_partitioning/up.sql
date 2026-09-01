@@ -130,8 +130,18 @@ COMMENT ON COLUMN harvest_events.cohort IS
 -- When that probe says "maybe", the sweeper falls back to the exact per-row
 -- check. Without this index the fast path would be a sequential scan of the
 -- executions table per cohort per tick.
-CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at
-    ON harvest_workflow_executions (created_at);
+-- NOT built here. This migration is inert on apply, and a plain `CREATE INDEX`
+-- would not be: it holds `SHARE` on `harvest_workflow_executions` for the whole
+-- build, which conflicts with the `ROW EXCLUSIVE` every insert, state update and
+-- retention delete takes. On a large deployment every execution-state write
+-- stops for the duration of the scan — to build an index that is useless until
+-- someone opts in, and that a deployment which never opts in would pay for and
+-- never use.
+--
+-- `harvest partition enable` creates it as part of the conversion, and
+-- `harvest partition plan` emits it as a `CREATE INDEX CONCURRENTLY` in the
+-- phase that runs with the shard online. Both are the moment it starts being
+-- needed.
 
 -- ── The insert-time integrity trigger ──────────────────────────────────────
 --

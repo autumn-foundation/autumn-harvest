@@ -294,9 +294,19 @@ against.)
 ## Enabling it
 
 The migration (`20260728000000_harvest_event_partitioning`) is **inert**. It
-ships the cohort function, the `cohort` column, the drop gate's index and the
-integrity trigger, but does not convert anything. Existing deployments keep the
-ordinary table and byte-for-byte identical behaviour until an operator opts in.
+ships the cohort function, the `cohort` column and the integrity trigger, but
+does not convert anything. Existing deployments keep the ordinary table and
+byte-for-byte identical behaviour until an operator opts in.
+
+Inert extends to how it applies, not just to what it leaves behind: it builds
+**no index**. The drop gate's `idx_harvest_we_created_at` lives on
+`harvest_workflow_executions`, the busiest table in the schema, and a plain
+`CREATE INDEX` holds `SHARE` on it for the whole build — conflicting with the
+`ROW EXCLUSIVE` every insert, state update and retention delete takes. A
+deployment that never opts in would stop accepting execution writes for the
+length of that scan to build an index it will never use. `enable` creates it as
+part of the conversion; the plan builds it `CONCURRENTLY` in step 2, with the
+shard online.
 
 ### Greenfield or small table
 

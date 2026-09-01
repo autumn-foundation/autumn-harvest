@@ -271,6 +271,15 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     "autumn-harvest-plugin/tests/connector_integration.rs",
     "autumn-harvest-plugin/tests/connector_kafka_broker.rs",
     "autumn-harvest-plugin/tests/connector_sqs_broker.rs",
+    // Does not BUILD a schema from the include: it asserts on the #958
+    // migration's own text, that the migration documented as inert on apply
+    // contains no `CREATE INDEX`. A plain index build on
+    // `harvest_workflow_executions` holds SHARE for its duration and stops
+    // every execution-state write, which is the opposite of inert — and the
+    // only way to guard that property is to read the migration itself. The
+    // suite bootstraps its databases through `test_init_sql()` like every
+    // other.
+    "autumn-harvest/tests/integration/event_partitioning_tests.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a

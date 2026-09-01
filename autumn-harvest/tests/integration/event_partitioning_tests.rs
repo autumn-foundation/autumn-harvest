@@ -2717,3 +2717,52 @@ async fn the_online_phase_is_resumable_after_its_validation_fails() {
          which bakes in the same constraint name."
     );
 }
+
+#[test]
+fn the_inert_migration_builds_no_index_on_the_executions_table() {
+    // The migration is documented as inert on apply: a deployment that never
+    // opts in keeps its ordinary table and its behaviour. A plain
+    // `CREATE INDEX` breaks that promise in the one way that matters
+    // operationally — it holds SHARE on `harvest_workflow_executions` for the
+    // whole build, which conflicts with the ROW EXCLUSIVE every insert, state
+    // update and retention delete takes. On a large deployment every
+    // execution-state write stops for the duration, to build an index that
+    // exists solely for a feature they may never enable.
+    //
+    // The index is only needed once the sweeper exists, so it is built by the
+    // enable path, and CONCURRENTLY by the plan for the large tables where the
+    // difference is felt.
+    let up = include_str!("../../migrations/20260728000000_harvest_event_partitioning/up.sql");
+    let statements: String = up
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !statements.contains("CREATE INDEX"),
+        "the inert migration must not build an index; it would block every \
+         write to the table it indexes for the length of the build"
+    );
+}
+
+#[tokio::test]
+async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Without it the sweeper's tier-1 probe — the one that makes the steady
+    // state O(1) — is a sequential scan of the executions table, per cohort,
+    // per tick. Moving the build off the migration must not lose it.
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v",
+        )
+        .await,
+        "the enable path must build the drop gate's index"
+    );
+}

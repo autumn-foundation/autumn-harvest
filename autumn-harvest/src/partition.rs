@@ -1283,6 +1283,21 @@ BEGIN
     EXECUTE 'CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events '
          || 'FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()';
 
+    -- The sweeper's tier-1 drop gate reads
+    -- `harvest_workflow_executions (created_at)`; without this index that probe
+    -- is a sequential scan of the executions table, per cohort, per tick.
+    --
+    -- Built here rather than in the migration, which is inert on apply: a plain
+    -- CREATE INDEX holds SHARE on the executions table for its whole build,
+    -- blocking every insert, state update and retention delete, and a
+    -- deployment that never opts in would pay that for nothing. This
+    -- transaction is the documented fresh/small-table path and already holds
+    -- ACCESS EXCLUSIVE on harvest_events; `migration_plan` builds the same
+    -- index CONCURRENTLY, outside any lock window, for the large tables where
+    -- the difference is felt.
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at '
+         || 'ON harvest_workflow_executions (created_at)';
+
     -- The catch-all, created before any cohort partition so there is never an
     -- instant in which an append could find no partition at all.
     EXECUTE 'CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT';
@@ -2562,7 +2577,8 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  JOIN pg_namespace n ON n.oid = c.relnamespace\n               \
                  WHERE n.nspname = current_schema() AND NOT i.indisvalid\n                 \
                  AND c.relname IN ('{LEGACY_PARTITION}_pk_idx',\n                                   \
-                 '{LEGACY_PARTITION}_exec_event_idx')\n    \
+                 '{LEGACY_PARTITION}_exec_event_idx',\n                                   \
+                 'idx_harvest_we_created_at')\n    \
                  LOOP\n        \
                  EXECUTE format('DROP INDEX %I', idx);\n    \
                  END LOOP;\nEND\n$harvest_reindex_958$;"
@@ -2583,6 +2599,16 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  {LEGACY_PARTITION}_exec_event_idx\n    \
                  ON harvest_events (workflow_exec_id, event_id, cohort)"
             ),
+        ),
+        // The sweeper's tier-1 drop gate. On `harvest_workflow_executions`,
+        // the busiest table in the schema, so the concurrent form is not
+        // optional here: a plain build holds SHARE for its duration and every
+        // insert, state update and retention delete waits behind it.
+        concurrent(
+            2,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_created_at\n    \
+             ON harvest_workflow_executions (created_at)"
+                .to_string(),
         ),
         // ── 3: pre-validate so ATTACH skips its own scan ──────────────────
         //
@@ -3093,6 +3119,25 @@ mod tests {
             steps.iter().filter(|s| s.sql == "COMMIT").count(),
             "every BEGIN in the plan needs its COMMIT"
         );
+    }
+
+    #[test]
+    fn the_plan_builds_the_drop_gate_index_concurrently() {
+        // It lives on `harvest_workflow_executions`, the busiest table in the
+        // schema. A plain build holds SHARE for its duration, which conflicts
+        // with the ROW EXCLUSIVE every insert, state update and retention
+        // delete takes — so on the large tables this plan exists for, a
+        // non-concurrent build is an outage.
+        let step = migration_plan_steps(&EnableOptions::default(), Utc::now())
+            .into_iter()
+            .find(|s| s.sql.contains("idx_harvest_we_created_at") && s.sql.contains("CREATE INDEX"))
+            .expect("the plan must build the drop gate's index");
+        assert!(
+            step.concurrent && step.sql.contains("CONCURRENTLY"),
+            "{}",
+            step.sql
+        );
+        assert_eq!(step.phase, 2, "and before the lock window, not inside it");
     }
 
     #[test]
