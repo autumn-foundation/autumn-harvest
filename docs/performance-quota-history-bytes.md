@@ -81,8 +81,8 @@ and `dead_letters` are cheap partial-index lookups at every size tested
 | total `harvest_events` rows | plan for `history_bytes` | buffers (hit+read) |
 |---:|---|---:|
 | 205,000 | **`Seq Scan` of the entire table**, then `Hash Join` against the 1,000-row active set | 12,745 |
-| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,766 (5,374 hit + 11,392 read) |
-| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,768 (10,243 hit + 6,525 read) |
+| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,766 (6,100 hit + 10,666 read) |
+| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,768 (9,938 hit + 6,830 read) |
 
 Full captured plans: `docs/perf-artifacts/quota-history-bytes-admission/noise_mult-{3,15,100}.explain.txt`.
 
@@ -157,7 +157,7 @@ one size where a forced rewrite would matter if it helped):
 | variant | plan | buffers (hit+read) |
 |---|---|---:|
 | unmodified (`IN` subquery) | `Seq Scan` of the whole table | 12,745 |
-| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,765 (15,731 hit + 34 read) |
+| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,734 hit + 30 read) |
 
 The rewrite **costs 24% more**, not less. Postgres's per-row plan for the
 correlated form is a `Bitmap Heap Scan` (build a bitmap, sort, then fetch) —
@@ -187,8 +187,8 @@ and `enforce_quota_admission`'s call pattern are unchanged.
 | `EXPLAIN` buffers @ 205,000 total rows (Seq Scan) | 12,745 |
 | `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,766 |
 | `EXPLAIN` buffers @ 1,078,000 total rows (Nested Loop) | 16,768 |
-| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 41.5ms |
-| `LATERAL` rewrite @ 205,000 total rows | 15,765 (vs. 12,745 unmodified — **worse**) |
+| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 50.5ms |
+| `LATERAL` rewrite @ 205,000 total rows | 15,764 (vs. 12,745 unmodified — **worse**) |
 
 Tool used for every row: `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` and
 `pg_stat_statements`, both against a fresh, fully-migrated database
@@ -226,7 +226,7 @@ None: no index added, no schema change.
 ## The cost that remains, and why this is not a Ledger fix
 
 Even on its best (and, as shown above, self-selected) plan, this query costs
-~16,700–18,100 buffers and ~50–100ms **per admission**, and that cost is
+~16,700–16,800 buffers and ~50–100ms **per admission**, and that cost is
 proportional to the target tenant's own accumulated active-execution
 history — recomputed from scratch, synchronously, inside the admission
 transaction, on *every single* fresh start and spawned child for that
