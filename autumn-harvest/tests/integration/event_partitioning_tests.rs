@@ -3209,3 +3209,113 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
     // Blocked, not an error: the cohort is retried next tick.
     ensurer.await.expect("ensure task").ok();
 }
+
+#[tokio::test]
+async fn a_large_default_backlog_drains_in_bounded_passes() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // A maintenance outage: events parked in the DEFAULT partition across many
+    // closed cohorts. This is precisely the situation the drain exists for, and
+    // precisely the one where it was most dangerous — the whole move ran inside
+    // the transaction that holds the parent's ACCESS EXCLUSIVE from `DETACH
+    // PARTITION`, so every read and append on the shard waited for the entire
+    // copy. `lock_timeout` bounds acquiring that lock, never holding it.
+    let exec = seed_expired(&mut conn, "drain_wf", "drain-1", day(2026, 3, 1)).await;
+    let _ = exec;
+    diesel::sql_query(
+        "INSERT INTO harvest_events
+             (workflow_exec_id, event_id, event_type, event_data, timestamp, cohort)
+         SELECT e.workflow_exec_id,
+                1000 + (g.i * 10) + e.event_id,
+                e.event_type,
+                e.event_data,
+                e.timestamp,
+                '2026-03-01'::timestamptz + (g.i || ' days')::interval
+           FROM harvest_events e
+           CROSS JOIN generate_series(1, 40) AS g(i)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a multi-cohort backlog");
+
+    // Park them: detach the cohorts' partitions so the rows land in DEFAULT.
+    // Simpler and closer to the real shape — move them straight in.
+    diesel::sql_query(format!(
+        "WITH parked AS (
+             DELETE FROM harvest_events WHERE cohort > '2026-03-01'::timestamptz RETURNING *
+         )
+         INSERT INTO {} SELECT * FROM parked",
+        partition::DEFAULT_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("park the backlog in DEFAULT");
+
+    let parked = scalar_i64(
+        &mut conn,
+        &format!(
+            "SELECT COUNT(*)::bigint AS n FROM {}",
+            partition::DEFAULT_PARTITION
+        ),
+    )
+    .await;
+    assert!(parked > 0, "precondition: the backlog really is in DEFAULT");
+
+    // A small budget, so the multi-pass path is exercised without seeding tens
+    // of thousands of rows. The FIRST pass must move some but not all of the
+    // backlog: that is the whole point — the exclusive window is proportional
+    // to the budget, not to however much accumulated during the outage.
+    let first = partition::drain_default_bounded(&mut conn, 10)
+        .await
+        .expect("drain must not error");
+    assert!(first > 0, "the first pass must make progress");
+    assert!(
+        first < usize::try_from(parked).unwrap_or(usize::MAX),
+        "the first pass moved the ENTIRE {parked}-row backlog ({first} rows) inside the          transaction holding the parent's ACCESS EXCLUSIVE. Every read and append on the          shard waits for that copy, and `lock_timeout` bounds only acquiring the lock"
+    );
+
+    // And the passes together must converge — a bounded drain that never
+    // finishes is no better than an unbounded one that blocks the shard.
+    let mut passes = 1;
+    loop {
+        let moved = partition::drain_default_bounded(&mut conn, 10)
+            .await
+            .expect("drain must not error");
+        if moved == 0 {
+            break;
+        }
+        passes += 1;
+        assert!(
+            passes < 100,
+            "the drain must converge, not creep one row at a time"
+        );
+    }
+
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM {}",
+                partition::DEFAULT_PARTITION
+            ),
+        )
+        .await,
+        0,
+        "every parked row must end up in a real cohort partition"
+    );
+    // And the layout is still sound: DEFAULT re-attached, appends still route.
+    let live = insert_execution(&mut conn, "drain_wf", "drain-live", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(live),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("appends must still work after a multi-pass drain");
+}

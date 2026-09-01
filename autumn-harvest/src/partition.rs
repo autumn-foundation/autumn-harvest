@@ -485,9 +485,11 @@ struct BoolRow {
 
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
-struct TsRow {
+struct CohortCountRow {
     #[diesel(sql_type = Nullable<Timestamptz>)]
     v: Option<DateTime<Utc>>,
+    #[diesel(sql_type = BigInt)]
+    n: i64,
 }
 
 /// Report the current `harvest_events` layout for this shard.
@@ -2104,6 +2106,22 @@ async fn cohort_has_rows_for(
 #[cfg(feature = "db")]
 const DROP_UPGRADE_TIMEOUT_MS: u64 = 50;
 
+/// Rows one `drain_default` pass may move.
+///
+/// The drain runs inside the transaction that `DETACH PARTITION` opened, which
+/// holds `ACCESS EXCLUSIVE` on the parent — so every row it copies is a row the
+/// whole shard waits for. `lock_timeout` bounds *acquiring* that lock, never
+/// holding it, so an unbounded drain of a large backlog is an outage on the
+/// automatic retention tick that is supposed to be repairing things.
+///
+/// A pass therefore moves whole cohorts up to this budget and re-attaches; the
+/// next tick continues. Whole cohorts, not whole rows, because a cohort's
+/// partition cannot exist while `DEFAULT` still holds rows in its range — the
+/// re-`ATTACH` would fail its constraint check. The budget is a floor, not a
+/// ceiling: one oversized cohort is irreducible and moves in a single pass.
+#[cfg(feature = "db")]
+const DRAIN_MAX_ROWS: usize = 50_000;
+
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
 ///
@@ -2332,6 +2350,28 @@ async fn delete_orphan_rows(
 /// transaction, so a failure leaves every row where it was.
 #[cfg(feature = "db")]
 pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
+    drain_default_bounded(conn, DRAIN_MAX_ROWS).await
+}
+
+/// [`drain_default`] with an explicit per-pass row budget.
+///
+/// Exposed for tests, which need a budget small enough to force the multi-pass
+/// path without seeding tens of thousands of rows.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if any step fails; the pass is one transaction,
+/// so a failure leaves every row where it was.
+// One transaction whose steps must be read in order — detach, census, create,
+// move, re-enable, re-attach. Splitting it to satisfy a line budget would
+// scatter that sequence across helpers that only ever call each other once.
+#[allow(clippy::too_many_lines)]
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn drain_default_bounded(
+    conn: &mut AsyncPgConnection,
+    max_rows: usize,
+) -> HarvestResult<usize> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok(0),
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
@@ -2358,17 +2398,45 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
         // have no partition created for it, and the INSERT below would fail
         // with `no partition of relation found` — aborting the whole drain, and
         // with it the `ensure_partitions` that keeps the write window covered.
-        let cohorts = diesel::sql_query(format!(
-            "SELECT DISTINCT cohort AS v FROM {DEFAULT_PARTITION} ORDER BY 1"
+        let census = diesel::sql_query(format!(
+            "SELECT cohort AS v, count(*)::bigint AS n
+               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
         ))
-        .load::<TsRow>(conn)
+        .load::<CohortCountRow>(conn)
         .await
         .map_err(database_error)?;
-        for c in &cohorts {
-            if let Some(cohort) = c.v {
-                ensure_cohort_with_width(conn, cohort, width, Duration::from_secs(2)).await?;
+
+        // Take whole cohorts, oldest first, up to the budget — and always at
+        // least one, so a cohort larger than the budget still makes progress
+        // rather than the drain spinning forever on a backlog it refuses to
+        // touch.
+        //
+        // Whole cohorts is not a simplification, it is required: a cohort's
+        // partition cannot exist while `DEFAULT` still holds rows in its range,
+        // so a half-moved cohort would make the re-`ATTACH` below fail its
+        // constraint check and roll the whole pass back.
+        let mut cutoff = None;
+        let mut budget = 0usize;
+        for c in &census {
+            let Some(cohort) = c.v else { continue };
+            let n = usize::try_from(c.n).unwrap_or(usize::MAX);
+            if cutoff.is_some() && budget.saturating_add(n) > max_rows.max(1) {
+                break;
             }
+            budget = budget.saturating_add(n);
+            cutoff = Some(cohort);
+            ensure_cohort_with_width(conn, cohort, width, Duration::from_secs(2)).await?;
         }
+        let Some(cutoff) = cutoff else {
+            // Nothing with a usable cohort: re-attach and report no progress
+            // rather than leaving `DEFAULT` detached.
+            exec(
+                conn,
+                &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
+            )
+            .await?;
+            return Ok(0);
+        };
 
         // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT does
         // not re-fire and every row keeps the cohort it was written with. The
@@ -2411,8 +2479,16 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
             .ok();
         }
 
+        // One statement, so the rows leave `DEFAULT` exactly as they arrive in
+        // their cohort partitions — there is no window in which a row exists in
+        // both, and no `TRUNCATE` that could discard a row this pass did not
+        // move.
         let moved = diesel::sql_query(format!(
-            "INSERT INTO harvest_events SELECT * FROM {DEFAULT_PARTITION}"
+            "WITH moved AS (
+                 DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
+             )
+             INSERT INTO harvest_events SELECT * FROM moved",
+            ts_literal(cutoff)
         ))
         .execute(conn)
         .await
@@ -2434,7 +2510,9 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
             &format!("ALTER TABLE harvest_events ENABLE TRIGGER {EXEC_FK_TRIGGER}"),
         )
         .await?;
-        exec(conn, &format!("TRUNCATE {DEFAULT_PARTITION}")).await?;
+        // No TRUNCATE: the move above already removed exactly the rows it
+        // copied, and anything still here belongs to a cohort this pass did not
+        // take. Truncating would destroy it.
         exec(
             conn,
             &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
