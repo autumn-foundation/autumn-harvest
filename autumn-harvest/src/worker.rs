@@ -13749,11 +13749,26 @@ pub async fn apply_race_loser_cancellations(
             // so it cannot be cancelled inside this transaction. Flag its outbox
             // row instead: the flag commits with this very decision cycle, and
             // the relay delivers the (idempotent) cancel on its next sweep. This
-            // is checked FIRST because `cancel_workflow_execution_collect` would
-            // otherwise report `NotFound` for a child that is perfectly alive on
-            // its own shard, and that arm is treated as a benign no-op — the
-            // losing child would run forever.
-            if crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0 {
+            // is checked BEFORE the inline cancel because
+            // `cancel_workflow_execution_collect` would otherwise report
+            // `NotFound` for a child that is perfectly alive on its own shard,
+            // and that arm is treated as a benign no-op — the losing child would
+            // run forever.
+            //
+            // Gated on the child ACTUALLY being cross-shard, which is not a
+            // micro-optimisation: this is the race-loser path for every child in
+            // the engine, and querying `harvest_cross_shard_children`
+            // unconditionally made a shard-agnostic path hard-depend on a table
+            // this feature introduced. A deployment whose code is ahead of its
+            // migrations — the ordinary rolling-upgrade window — would fail
+            // EVERY race-loser cancellation with `relation ... does not exist`,
+            // not merely the cross-shard ones, and the error propagates out of
+            // the parent's decision cycle. A same-shard child is cancelled
+            // inline exactly as it was before this feature existed, touching no
+            // new table.
+            if crate::worker::parent_is_on_another_shard(exec_id, *child_id)
+                && crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0
+            {
                 continue;
             }
             match crate::execution::cancel_workflow_execution_collect(
