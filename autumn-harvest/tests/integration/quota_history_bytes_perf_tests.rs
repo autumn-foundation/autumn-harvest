@@ -468,40 +468,66 @@ async fn zz_capture_quota_history_bytes_evidence() {
         .await
         .expect("query pg_stat_statements");
 
-        assert_eq!(
-            stats.len(),
-            1,
-            "expected exactly one dbid-scoped pg_stat_statements row for \
-             load_quota_usage()'s query text after a scoped reset; got {}: \
-             {stats:?}",
-            stats.len()
-        );
-        assert_eq!(
-            stats[0].calls,
-            i64::try_from(STAT_SNAPSHOT_ITERS).expect("STAT_SNAPSHOT_ITERS fits in i64"),
-            "the single matched row's call count must equal exactly the \
-             number of load_quota_usage() calls just driven"
-        );
-
-        let stats_text = stats
-            .iter()
-            .map(|r| {
+        if stats.is_empty() {
+            // A third way the secondary snapshot can be unavailable, distinct
+            // from "unpreloaded" and "unauthorized to reset": an external
+            // server with `pg_stat_statements.track = 'none'` lets the probe
+            // and the reset both succeed, but records no row at all for the
+            // 20 real calls just driven. Treated the same as the other two --
+            // a skip of just this snapshot, not a panic -- while a
+            // **multiple**-row result still asserts below, since that would
+            // mean the dbid scope failed to isolate the production statement
+            // and the evidence cannot be trusted silently.
+            let reason = "pg_stat_statements recorded no row for the driven calls \
+                           (the server likely has pg_stat_statements.track = 'none')";
+            eprintln!(
+                "SKIP: {reason} -- skipping the pg_stat_statements snapshot. The \
+                 EXPLAIN artifacts above are the primary evidence and are \
+                 unaffected."
+            );
+            std::fs::write(
+                out_dir.join("pg_stat_statements.txt"),
                 format!(
-                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={} mean_exec_time_ms={:.3}",
-                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.mean_exec_time
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(
-            out_dir.join("pg_stat_statements.txt"),
-            format!(
-                "-- pg_stat_statements after {STAT_SNAPSHOT_ITERS} real load_quota_usage() calls \
-                 @ noise_mult={} (largest fixture), scoped to this database's dbid --\n{stats_text}\n",
-                NOISE_SWEEP[NOISE_SWEEP.len() - 1]
-            ),
-        )
-        .expect("write pg_stat_statements artifact");
+                    "-- SKIPPED: {reason}. See the EXPLAIN artifacts for the primary evidence. --\n"
+                ),
+            )
+            .expect("write pg_stat_statements skip notice");
+        } else {
+            assert_eq!(
+                stats.len(),
+                1,
+                "expected exactly one dbid-scoped pg_stat_statements row for \
+                 load_quota_usage()'s query text after a scoped reset; got {}: \
+                 {stats:?}",
+                stats.len()
+            );
+            assert_eq!(
+                stats[0].calls,
+                i64::try_from(STAT_SNAPSHOT_ITERS).expect("STAT_SNAPSHOT_ITERS fits in i64"),
+                "the single matched row's call count must equal exactly the \
+                 number of load_quota_usage() calls just driven"
+            );
+
+            let stats_text = stats
+                .iter()
+                .map(|r| {
+                    format!(
+                        "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={} mean_exec_time_ms={:.3}",
+                        r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.mean_exec_time
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(
+                out_dir.join("pg_stat_statements.txt"),
+                format!(
+                    "-- pg_stat_statements after {STAT_SNAPSHOT_ITERS} real load_quota_usage() calls \
+                     @ noise_mult={} (largest fixture), scoped to this database's dbid --\n{stats_text}\n",
+                    NOISE_SWEEP[NOISE_SWEEP.len() - 1]
+                ),
+            )
+            .expect("write pg_stat_statements artifact");
+        }
     }
 
     std::fs::write(

@@ -81,8 +81,8 @@ and `dead_letters` are cheap partial-index lookups at every size tested
 | total `harvest_events` rows | plan for `history_bytes` | buffers (hit+read) |
 |---:|---|---:|
 | 205,000 | **`Seq Scan` of the entire table**, then `Hash Join` against the 1,000-row active set | 12,745 |
-| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,766 (6,100 hit + 10,666 read) |
-| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,768 (9,938 hit + 6,830 read) |
+| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,767 (5,298 hit + 11,469 read) |
+| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,768 (10,519 hit + 6,249 read) |
 
 Full captured plans: `docs/perf-artifacts/quota-history-bytes-admission/noise_mult-{3,15,100}.explain.txt`.
 
@@ -94,7 +94,7 @@ Two things this table shows:
    `quota_usage_query()`'s `WHERE e.workflow_exec_id IN (SELECT id FROM
    active)` is left exactly as it ships.
 2. **Once on the `Nested Loop` plan, buffer cost is flat** across a 3.4x
-   growth in total table size (313k → 1,078,000 rows: 16,766 → 16,768
+   growth in total table size (313k → 1,078,000 rows: 16,767 → 16,768
    buffers, effectively unchanged). This confirms the query, on its intended
    plan, costs what the target tenant's own active footprint costs — not
    what the whole table costs.
@@ -105,14 +105,18 @@ subject:
 
 | total rows | estimated rows for `history_bytes`'s join | actual rows | ratio |
 |---:|---:|---:|---:|
-| 205,000 | 55,207 | 178,000 | 3.2x under |
-| 313,000 | 22,685 | 178,000 | 7.8x under |
-| 1,078,000 | 14,586 | 178,000 | 12.2x under |
+| 205,000 | 54,826 | 178,000 | 3.2x under |
+| 313,000 | 22,566 | 178,000 | 7.9x under |
+| 1,078,000 | 15,255 | 178,000 | 11.7x under |
 
-The underestimate does not change which plan is chosen at the sizes
-measured, but it is the kind of drift that could tip a borderline choice the
-wrong way at a size not tested here; extended statistics on
-`harvest_events.workflow_exec_id` were not investigated.
+These are read directly off the committed
+`noise_mult-{3,15,100}.explain.txt` plans and will drift slightly on a
+re-run — unlike the buffer counts, the planner's row estimate depends on
+`ANALYZE`'s statistical sampling, which is not deterministic even against
+byte-for-byte identical seeded data. The underestimate does not change which
+plan is chosen at the sizes measured, but it is the kind of drift that could
+tip a borderline choice the wrong way at a size not tested here; extended
+statistics on `harvest_events.workflow_exec_id` were not investigated.
 
 ## Hypothesis
 
@@ -164,7 +168,7 @@ correlated form is a `Bitmap Heap Scan` (build a bitmap, sort, then fetch) —
 more expensive per probe at this row count (~178 rows/execution) than either
 the unmodified query's own sequential scan at this size, or the plain
 `Index Scan` the *unmodified* query reaches on its own once the table is
-larger (see the Plan table above: 16,766–16,768 buffers on a table 1.5x–5.3x
+larger (see the Plan table above: 16,767–16,768 buffers on a table 1.5x–5.3x
 bigger). Forcing the plan shape traded a cost that already goes away on its
 own past 300k rows for a permanent tax below that point.
 
@@ -185,9 +189,9 @@ and `enforce_quota_admission`'s call pattern are unchanged.
 | method | value |
 |---|---:|
 | `EXPLAIN` buffers @ 205,000 total rows (Seq Scan) | 12,745 |
-| `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,766 |
+| `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,767 |
 | `EXPLAIN` buffers @ 1,078,000 total rows (Nested Loop) | 16,768 |
-| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 50.5ms |
+| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 43.6ms |
 | `LATERAL` rewrite @ 205,000 total rows | 15,764 (vs. 12,745 unmodified — **worse**) |
 
 Tool used for every row: `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` and
