@@ -29,7 +29,14 @@ fresh start *and* every spawned child of a workflow type with a declared
 `QuotaPolicy` — `execution::enforce_quota_admission` calls it inside the same
 transaction as the per-key advisory lock, before the `WorkflowStarted` event
 is appended. It is opt-in (AC9: a workflow type with no `QuotaPolicy` pays
-nothing), so this page's findings apply only to deployments that declare
+nothing), but **the trigger is `QuotaPolicy::has_any_cap()` — any declared
+cap — not specifically `max_history_bytes`.** `load_quota_usage` computes all
+three counters (`active_executions`, `history_bytes`, `dead_letters`) in one
+round trip by design (AC7), so a workflow type declaring only
+`max_active_executions` or only `max_dead_letters` pays this page's full
+`history_bytes` cost on every admission too, even though that counter never
+factors into its own admit/reject decision. This page's findings apply to
+**every** deployment with any `QuotaPolicy` cap declared, not only ones using
 `max_history_bytes`.
 
 `tests/integration/quota_history_bytes_perf_tests.rs::zz_capture_quota_history_bytes_evidence`
@@ -223,11 +230,17 @@ Even on its best (and, as shown above, self-selected) plan, this query costs
 proportional to the target tenant's own accumulated active-execution
 history — recomputed from scratch, synchronously, inside the admission
 transaction, on *every single* fresh start and spawned child for that
-tenant. A tenant sitting anywhere near its configured `max_history_bytes` cap
-— exactly the tenant this feature exists to protect against — pays this on
-every admission attempt, forever, and the bill grows monotonically with that
-tenant's own footprint. There is currently no upper bound on this
-per-admission cost.
+tenant, **for any tenant with any `QuotaPolicy` cap declared** (see
+[Workload](#workload) above — the trigger is `has_any_cap()`, not
+specifically `max_history_bytes`). A tenant sitting anywhere near a
+configured `max_history_bytes` cap — exactly the tenant that specific cap
+exists to protect against — pays the most (its own footprint is largest by
+construction), but a tenant whose *only* declared cap is
+`max_active_executions` or `max_dead_letters` pays the identical query on
+every admission too, for a counter that never even factors into its
+admit/reject decision. Either way, this is paid on every admission attempt,
+forever, and the bill grows monotonically with that tenant's own footprint.
+There is currently no upper bound on this per-admission cost.
 
 A structural fix exists in principle: an incrementally-maintained running
 byte counter per `(workflow_name, quota_key)`, updated on event append and

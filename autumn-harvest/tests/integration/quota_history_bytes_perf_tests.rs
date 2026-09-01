@@ -14,13 +14,15 @@
 //!
 //! # Profile
 //!
-//! This is opt-in: a deployment with no `QuotaPolicy` pays nothing (AC9).
-//! For a deployment that *does* declare `max_history_bytes`, this query runs
-//! on the hot admission path for exactly the tenant the cap exists to
-//! protect against — the busiest one. This pass measures its cost as that
-//! tenant's own accumulated active-execution footprint grows, and as the
-//! total `harvest_events` table (shared with every other tenant) grows
-//! around it.
+//! This is opt-in: a deployment with no `QuotaPolicy` pays nothing (AC9). But
+//! the trigger is `QuotaPolicy::has_any_cap()` — any declared cap — not
+//! specifically `max_history_bytes`: `load_quota_usage` computes all three
+//! counters in one round trip by design, so a workflow type declaring only
+//! `max_active_executions` or only `max_dead_letters` pays this same
+//! `history_bytes` cost on every admission too. This pass measures that cost
+//! as the target tenant's own accumulated active-execution footprint grows,
+//! and as the total `harvest_events` table (shared with every other tenant)
+//! grows around it.
 //!
 //! # Fixture
 //!
@@ -375,13 +377,19 @@ async fn zz_capture_quota_history_bytes_evidence() {
     // (not the literal EXPLAIN text above), at the largest fixture, where
     // the query is on its natural Nested-Loop-plus-index plan.
     //
-    // Requires `shared_preload_libraries = 'pg_stat_statements'` on the
-    // server -- `CREATE EXTENSION` alone cannot enable it retroactively.
-    // Probed explicitly (rather than letting `pg_stat_statements_reset`
-    // panic obscurely) so an external `HARVEST_TEST_DATABASE_URL` server
-    // that never preloaded it degrades to a clear skip of just this
-    // secondary snapshot -- the EXPLAIN artifacts above, which are this
-    // page's primary evidence, are already written and unaffected.
+    // Two independent ways this can be unusable on an external
+    // `HARVEST_TEST_DATABASE_URL` server, both degrading to the same skip of
+    // just this secondary snapshot rather than a panic -- the EXPLAIN
+    // artifacts above, which are this page's primary evidence, are already
+    // written either way:
+    // 1. `shared_preload_libraries = 'pg_stat_statements'` was never set --
+    //    `CREATE EXTENSION` alone cannot enable it retroactively. Caught by
+    //    the availability probe below.
+    // 2. The connected role can read `pg_stat_statements` but lacks
+    //    permission to call `pg_stat_statements_reset()`, which defaults to
+    //    superuser-only (or an explicit `GRANT EXECUTE`) -- a realistic
+    //    external-admin configuration distinct from (1), so it needs its own
+    //    check rather than assuming the probe above already covered it.
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut conn)
         .await;
@@ -391,46 +399,63 @@ async fn zz_capture_quota_history_bytes_evidence() {
             .await
             .map(|r| r.count);
 
-    if available.is_err() {
-        eprintln!(
-            "SKIP: pg_stat_statements is not usable on this server (needs \
+    let reset_result = if available.is_ok() {
+        Some(
+            diesel::sql_query(
+                "SELECT pg_stat_statements_reset(0, \
+                        (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+            )
+            .execute(&mut conn)
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let skip_reason = match (&available, &reset_result) {
+        (Err(_), _) => Some(
+            "pg_stat_statements is not usable on this server (needs \
              shared_preload_libraries = 'pg_stat_statements', which CREATE \
-             EXTENSION cannot enable retroactively) -- skipping the \
-             pg_stat_statements snapshot. The EXPLAIN artifacts above are the \
-             primary evidence and are unaffected."
+             EXTENSION cannot enable retroactively)",
+        ),
+        (Ok(_), Some(Err(_))) => Some(
+            "pg_stat_statements_reset() failed -- the connected role can \
+             likely read pg_stat_statements but lacks permission to reset it \
+             (reset defaults to superuser-only)",
+        ),
+        _ => None,
+    };
+
+    if let Some(reason) = skip_reason {
+        eprintln!(
+            "SKIP: {reason} -- skipping the pg_stat_statements snapshot. The \
+             EXPLAIN artifacts above are the primary evidence and are \
+             unaffected."
         );
         std::fs::write(
             out_dir.join("pg_stat_statements.txt"),
-            "-- SKIPPED: pg_stat_statements is not preloaded on this server \
-             (shared_preload_libraries) -- see the EXPLAIN artifacts for the \
-             primary evidence. --\n",
+            format!(
+                "-- SKIPPED: {reason}. See the EXPLAIN artifacts for the primary evidence. --\n"
+            ),
         )
         .expect("write pg_stat_statements skip notice");
     } else {
-        // Scoped to THIS database's oid on both ends: the reset already was,
-        // but the original capture's SELECT was not, so on a shared cluster
-        // it returned other databases' (including stale, already-dropped
-        // ephemeral benchmark databases') rows for the same query text too --
-        // confirmed by the first committed artifact, which showed five
-        // distinct "calls=20" rows for what this run drives as one. Every
-        // statement between the reset and this SELECT ran on this same
-        // connection/database, so the current-dbid scope alone now makes
-        // the match exact -- asserted, not just hoped, via the exact `calls`
-        // check below.
-        diesel::sql_query(
-            "SELECT pg_stat_statements_reset(0, \
-                    (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
-        )
-        .execute(&mut conn)
-        .await
-        .expect("pg_stat_statements_reset");
-
         for _ in 0..STAT_SNAPSHOT_ITERS {
             load_quota_usage(&mut conn, TARGET_WORKFLOW, TARGET_KEY)
                 .await
                 .expect("load_quota_usage");
         }
 
+        // Scoped to THIS database's oid on both ends: the reset above already
+        // was, but an earlier revision's follow-up SELECT was not, so on a
+        // shared cluster it also returned other databases' (including stale,
+        // already-dropped ephemeral benchmark databases') rows for the same
+        // query text -- confirmed by that revision's committed artifact,
+        // which showed five distinct "calls=20" rows for what this run
+        // drives as one. Every statement between the reset and this SELECT
+        // ran on this same connection/database, so the current-dbid scope
+        // alone now makes the match exact -- asserted, not just hoped, via
+        // the exact `calls` check below.
         let stats: Vec<StatRow> = diesel::sql_query(
             "SELECT calls, shared_blks_hit, shared_blks_read, \
                     (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \
