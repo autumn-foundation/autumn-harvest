@@ -1165,11 +1165,6 @@ async fn apply_cascade_bookkeeping(
     .await
 }
 
-async fn delete_row(conn: &mut AsyncPgConnection, child_exec_id: uuid::Uuid) -> HarvestResult<()> {
-    claim_row_by_delete(conn, child_exec_id).await?;
-    Ok(())
-}
-
 /// Delete the outbox row and report whether **this** transaction removed it.
 ///
 /// This is the exactly-once gate for the two relay steps that append to the
