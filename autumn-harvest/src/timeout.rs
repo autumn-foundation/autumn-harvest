@@ -4318,7 +4318,9 @@ mod tests {
             "the export call must log and continue on error, never `?`; a sink              outage must not abort timeout enforcement for the shard"
         );
         assert!(
-            !handled.contains("fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"),
+            !handled.contains(
+                "fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"
+            ),
             "the export call must not propagate its error with `?`"
         );
     }
