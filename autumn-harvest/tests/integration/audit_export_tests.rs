@@ -1604,41 +1604,62 @@ async fn an_idle_tick_never_calls_the_sink_but_still_emits_lag() {
     );
 }
 
-// The scoped per-shard scanner exports through the connection it was handed.
-// A one-connection shard pool is the case that matters: the scanner is already
-// holding that pool's only connection, so any second checkout fails and the
-// shard would never export at all.
+// A mismatched (conn, shard_assignments) pair must never stamp rows in the
+// connection's own database under the assigned shard's key.
+//
+// `enforce_timeouts_once` is a `pub` primitive an embedder may drive by hand,
+// and nothing inside it can verify which database `conn` points at. An earlier
+// revision inferred from `shard_assignments.len() == 1` that `conn` belonged
+// to that shard and exported through it directly; this pins the reason that
+// inference is gone. Getting it wrong is silent cross-shard corruption of the
+// `(shard, seq)` identity the whole feature rests on, whereas acquiring the
+// exact pool can at worst skip a shard, loudly.
 #[tokio::test]
-async fn a_scoped_shard_exports_through_the_held_connection() {
+async fn a_mismatched_connection_never_stamps_another_shards_rows() {
     let _guard = TEST_SERIAL.lock().await;
-    let sink = Arc::new(RecordingSink::new(200));
-    let _installed = install(sink.clone(), 100);
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
     let (mut conn, container) = make_conn().await;
-    insert_audit_rows(&mut conn, 4).await;
+    insert_audit_rows(&mut conn, 3).await;
 
-    // A pool that can hand out exactly one connection -- and `conn` above is
-    // standing in for that one being already checked out by the scanner.
-    let single = single_connection_pool(&container).await;
-    let sharded = autumn_harvest::shard::ShardedDbPool::single(single);
+    // The sharded pool maps shard 0 to this same database, but we claim the
+    // assignment is shard 7 -- the shape a hand-driving embedder can produce.
+    let pool = single_connection_pool(&container).await;
+    let sharded = autumn_harvest::shard::ShardedDbPool::single(pool);
 
-    let exported = fire_due_audit_exports(
+    let _ = fire_due_audit_exports(
         &mut conn,
         &Some(sharded),
-        &[autumn_harvest::types::ShardId::new(0)],
+        &[autumn_harvest::types::ShardId::new(7)],
         &NoOpMetrics,
     )
-    .await
-    .expect("tick");
+    .await;
     uninstall();
 
+    // Whatever happened, nothing in THIS database may carry shard 7's key.
+    let stamped: i64 = harvest_audit_log::table
+        .filter(harvest_audit_log::export_seq.is_not_null())
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
     assert_eq!(
-        exported, 4,
-        "the scoped shard must export through the connection already held; a \
-         second checkout on a one-connection pool can never succeed, so \
-         acquiring one would mean this shard is never exported"
+        stamped, 0,
+        "rows in this database must not be sequenced on behalf of shard 7: \
+         the exporter cannot know that `conn` points here, so it must acquire \
+         shard 7's own pool rather than assume"
     );
-    assert_eq!(cursor_acked(&mut conn, 0).await, 4);
-    assert_eq!(sink.all_seqs(), vec![1, 2, 3, 4]);
+
+    use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+    let cursors: i64 = cur::harvest_audit_export_cursor
+        .filter(cur::shard_id.eq(7))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        cursors, 0,
+        "nor may a cursor for shard 7 be provisioned in this database"
+    );
 }
 
 // ── Retention must not depend on the local process's sink registration ─────

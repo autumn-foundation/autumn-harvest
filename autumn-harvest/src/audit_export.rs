@@ -1867,21 +1867,19 @@ async fn emit_lag(
 /// A no-op (returns `Ok(0)` **before any query**) when no audit sink has been
 /// configured (AC8).
 ///
-/// # Caller contract
+/// # Connection handling
 ///
-/// When `shard_assignments` names **exactly one** shard, `conn` must be a
-/// connection to *that* shard's database. Every scanner caller satisfies this:
-/// `spawn_timeout_checker_for_shard` checks `conn` out of the shard's own pool
-/// and passes `monitor_shard_scope(shard, ..) == [shard]`. This function then
-/// exports that shard **through `conn` itself** rather than checking out a
-/// second connection (issue #953, Codex review round 3 P1).
+/// `conn` is used **only** for the unsharded fallback. When a `sharded_pool` is
+/// present, every assigned shard — including a lone one — is exported through
+/// that shard's own pool, acquired under [`SHARD_ACQUIRE_BOUND`].
 ///
-/// That is not an optimisation, it is what makes export work at all on a
-/// one-connection pool: the scanner is already holding that pool's only
-/// connection, so asking for a second one can never succeed. An earlier
-/// revision bounded the wait to avoid deadlocking the scanner, which fixed the
-/// wedge but left the shard silently never exported — a bounded wait that
-/// times out on every tick is still "never".
+/// Deliberately no inference that a single `shard_assignments` entry means
+/// `conn` belongs to it. This is a `pub` primitive an embedder may drive by
+/// hand, nothing here can verify which database `conn` points at, and being
+/// wrong stamps one shard's audit rows under another shard's key — silent
+/// corruption of the `(shard, seq)` identity the whole feature rests on.
+/// Acquiring the exact pool can at worst skip a shard, loudly. See the comment
+/// in the match arm for the full reasoning and its cost.
 ///
 /// # Errors
 /// Returns `HarvestError` if a database query fails. A sink's transport
@@ -1901,23 +1899,34 @@ pub async fn fire_due_audit_exports(
     let mut total = 0usize;
 
     match sharded_pool {
-        // The scoped per-shard scanner: `conn` already belongs to this shard
-        // (see the caller contract above), so use it directly. No second
-        // checkout means no self-deadlock and no bounded-wait skip.
-        Some(_) if shard_assignments.len() == 1 => {
-            let shard = shard_assignments[0];
-            match export_once_on_conn(conn, &config, shard.as_i32(), metrics).await {
-                Ok(n) => total += n,
-                Err(e) => tracing::error!(
-                    shard = shard.as_i32(),
-                    error = %e,
-                    "[audit_export] shard export failed"
-                ),
-            }
-        }
         Some(sp) if !shard_assignments.is_empty() => {
-            // The process-wide loop across several shards. Here `conn`'s shard
-            // is not knowable, so each shard is exported through its own pool.
+            // EVERY shard is exported through its own pool, including a single
+            // assignment. An earlier revision reused the caller's `conn` when
+            // `shard_assignments.len() == 1`, inferring from that alone that
+            // `conn` belonged to the named shard (issue #953, Codex review
+            // rounds 3, 14 and 18 -- the same question, answered three times).
+            //
+            // The inference is not sound for a `pub` primitive. A caller that
+            // hands over a default-pool connection with a single NON-default
+            // assignment -- which `enforce_timeouts_once` cannot detect --
+            // would have its rows stamped in the default database under
+            // another shard's key, a cursor created there under that key, the
+            // real shard left unexported, and the mislabelled records deduped
+            // against the true shard's sequence stream by the receiver.
+            //
+            // That is silent cross-shard corruption of the very `(shard, seq)`
+            // identity this feature exists to guarantee. Acquiring the exact
+            // pool can at worst SKIP a shard, loudly and recoverably. For an
+            // audit exporter a visible skip beats invisible corruption, so the
+            // inference is gone.
+            //
+            // The cost is that a shard pool sized 1 cannot export while the
+            // scanner holds its only connection. That is already true of every
+            // other per-shard resident of this loop (#605's delivery included),
+            // so such a pool is not a supported configuration; the skip is
+            // logged with that cause, and
+            // autumn-foundation/autumn-harvest#1269 removes the constraint
+            // outright by giving export its own task.
             for shard in shard_assignments {
                 let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
                     continue;
