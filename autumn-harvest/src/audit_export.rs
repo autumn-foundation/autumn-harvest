@@ -817,6 +817,19 @@ pub struct ClaimedBatch {
     /// Records to deliver, ascending by `seq`. Never empty — a claim with
     /// nothing to send is released instead.
     pub records: Vec<AuditExportRecord>,
+    /// When this claim's database lease expires — the same `lease_until`
+    /// written to the cursor row inside the claim transaction.
+    ///
+    /// Delivery is bounded by what **remains** of this, not by the full lease
+    /// (issue #953, Codex review round 19 P1). The lease starts running when
+    /// the claim commits; serializing the batch and reaching the sink consumes
+    /// some of it. Bounding the sink call by the whole lease therefore lets a
+    /// delivery outlive the row lease, at which point another exporter can
+    /// reclaim the shard and bump the epoch, so this attempt's acknowledgement
+    /// is refused. With sink latency consistently near the lease that repeats
+    /// indefinitely: the cursor never advances and the sink is handed the same
+    /// batch over and over.
+    pub lease_until: DateTime<Utc>,
 }
 
 /// Create this shard's cursor row if it does not exist, and stamp it as alive.
@@ -1144,6 +1157,7 @@ pub async fn claim_shard(
                 claim_epoch,
                 consecutive_failures: cursor.consecutive_failures,
                 records,
+                lease_until,
             }))
         }),
     )
@@ -1681,6 +1695,40 @@ pub async fn rewind_cursor_locked(
 // M9: the scanner
 // ---------------------------------------------------------------------
 
+/// Deliver `batch`, bounded by what remains of this claim's database lease.
+///
+/// Never the full `config.lease` (issue #953, Codex review round 19 P1). The
+/// lease starts running when the claim commits, and claiming, serializing and
+/// signing the batch have already consumed part of it. Bounding by the whole
+/// lease would let the call outlive the row lease, after which another exporter
+/// can reclaim the shard and bump the epoch — so this attempt's acknowledgement
+/// is refused and the batch is redelivered. At sink latencies consistently near
+/// the lease that never converges: the cursor stays put while the sink receives
+/// the same batch forever.
+///
+/// An already-elapsed remainder is not skipped, it is an immediate timeout —
+/// classified like any other transport failure, so the cursor is held and the
+/// batch retried under a fresh claim. Never a loss.
+async fn deliver_within_lease(
+    config: &AuditExportRuntimeConfig,
+    batch: &AuditBatch<'_>,
+    lease_until: DateTime<Utc>,
+) -> SinkAttempt {
+    let remaining = (lease_until - Utc::now())
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    tokio::time::timeout(remaining, config.sink.deliver(batch))
+        .await
+        .unwrap_or_else(|_| {
+            SinkAttempt::transport_error(format!(
+                "audit sink did not respond within the {}s remaining on this claim's {}s \
+                 export lease",
+                remaining.as_secs(),
+                config.lease.as_secs()
+            ))
+        })
+}
+
 /// Export one batch for one shard on one connection.
 ///
 /// Three phases, deliberately separated: claim (transaction 1), deliver (no
@@ -1768,14 +1816,7 @@ async fn export_once_on_conn(
     //
     // A timeout is classified exactly like any other transport failure: the
     // cursor is held and the batch is retried. Never a loss.
-    let attempt = tokio::time::timeout(config.lease, config.sink.deliver(&batch))
-        .await
-        .unwrap_or_else(|_| {
-            SinkAttempt::transport_error(format!(
-                "audit sink did not respond within the {}s export lease",
-                config.lease.as_secs()
-            ))
-        });
+    let attempt = deliver_within_lease(config, &batch, claim.lease_until).await;
     let outcome = classify_export_outcome(
         &attempt,
         last_seq,
@@ -2495,6 +2536,62 @@ mod tests {
         fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
             Box::pin(async { SinkAttempt::success(200) })
         }
+    }
+
+    /// Delivery is bounded by what REMAINS of the claim's lease, not the full
+    /// lease (issue #953, Codex review round 19 P1). A sink that answers just
+    /// inside the full lease but outside the remainder must be timed out here,
+    /// because the database lease has expired and another exporter may already
+    /// have reclaimed the shard and bumped the epoch — an acknowledgement from
+    /// this attempt would be refused, and at consistently near-lease latency
+    /// the cursor would never advance.
+    #[tokio::test]
+    async fn delivery_is_bounded_by_the_remaining_lease_not_the_whole_one() {
+        struct SlowSink;
+        impl AuditSink for SlowSink {
+            fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    SinkAttempt::success(200)
+                })
+            }
+        }
+
+        let config = AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(SlowSink),
+            secret: CallbackSecret::new(b"k".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            // A generous lease: bounding by THIS would let the 300ms sink win.
+            lease: std::time::Duration::from_secs(60),
+        };
+        let batch = AuditBatch {
+            shard: 0,
+            first_seq: 1,
+            last_seq: 1,
+            body: b"{}",
+            headers: &[],
+            records: &[],
+        };
+
+        // Most of the lease is already spent: only 50ms remain.
+        let nearly_expired = Utc::now() + chrono::Duration::milliseconds(50);
+        let attempt = deliver_within_lease(&config, &batch, nearly_expired).await;
+        assert!(
+            attempt.status.is_none(),
+            "a sink answering after the lease remainder must be a transport \
+             failure, not a success: the claim is gone by then"
+        );
+
+        // Ample remainder: the same sink succeeds.
+        let fresh = Utc::now() + chrono::Duration::seconds(5);
+        let attempt = deliver_within_lease(&config, &batch, fresh).await;
+        assert_eq!(attempt.status, Some(200));
+
+        // An already-elapsed lease is an immediate timeout, never a skip.
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        let attempt = deliver_within_lease(&config, &batch, past).await;
+        assert!(attempt.status.is_none());
     }
 
     #[test]

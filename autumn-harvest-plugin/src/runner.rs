@@ -215,10 +215,10 @@ struct PreparedHarvestRuntime {
     /// automatically, without a separate `set_effective_config` call the
     /// integrator must remember.
     effective_config: EffectiveConfigView,
-    /// Held un-committed until `HarvestRunner::start` finishes every fallible
-    /// step. Dropping this struct on an early return restores whatever
-    /// audit-export config was installed before this runtime was built.
-    audit_export_guard: Option<AuditExportInstallGuard>,
+    /// Held unpublished until `HarvestRunner::start` finishes every fallible
+    /// step. Dropping this struct on an early return simply never publishes,
+    /// leaving whatever audit-export config the process already had.
+    audit_export_guard: Option<DeferredAuditExportInstall>,
 }
 
 /// Install the process-global completion-callback runtime config (issue #605).
@@ -354,71 +354,42 @@ fn commit_audit_export_config(
     *lock = config;
 }
 
-/// Restores the process-global audit-export config unless the build succeeds
-/// (issue #953, Codex review round 3 P1).
+/// This runtime's audit-export config, held **unpublished** until every
+/// fallible step of `HarvestRunner::start` has succeeded (issue #953, Codex
+/// review rounds 2, 5, 16 and 19).
 ///
-/// Deferring the runner's own publish was not sufficient. `BuiltHarvest::
-/// into_worker_parts_with_extra_state` *also* installs the global config —
-/// `install_global_audit_export_config_for_direct_worker`, which exists so a
-/// core embedder who never touches the plugin runner still gets their sink —
-/// and the runner calls that conversion **before** `compile_dag_catalog`, which
-/// is fallible. So a catalog failure could still leave a live runtime's sink
-/// replaced, or cleared outright for a webhook-only build (the direct-worker
-/// path writes `None` when it finds no embedder sink, since it has no HTTP
-/// client to build one with).
+/// Publishing early is what the earlier revisions got wrong: the global is
+/// shared with any runtime already running in this process, so a build that
+/// then failed could redirect a live runtime's audit records to a sink that
+/// never came into service, or (for a webhook-only build, where the
+/// direct-worker path installs `None`) silence it outright.
 ///
-/// A guard rather than a restore call at each `?`: it covers every failure
-/// path after the conversion, including ones added later, and cannot be
-/// forgotten. `commit` consumes it on the success path.
-///
-/// Round 5 note: this is now the *second* line of defence. Restoring the
-/// previous value repairs the config but leaves an observable interval — a
-/// live runtime's scanner can tick while the global is clobbered, and no
-/// restore un-sends the audit records it exported to the wrong sink. So the
-/// conversion's own write is suppressed at the source
-/// (`BuiltHarvest::deferring_audit_export_install`) and this guard remains
-/// only to catch anything else that might publish before `commit`.
-struct AuditExportInstallGuard {
-    /// Restored if this guard drops without `commit`.
-    previous: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
-    /// Published by `commit`. Carried here rather than passed in so the guard
-    /// can be handed across function boundaries as one value.
+/// **Deliberately no restore-on-drop.** An earlier revision snapshotted the
+/// previous config and put it back if the guard dropped uncommitted. That was
+/// needed only while `into_worker_parts*` still wrote the global mid-build;
+/// once that write was suppressed at the source
+/// (`BuiltHarvest::deferring_audit_export_install`), a failed startup makes no
+/// global change at all and has nothing to undo — and restoring anyway is
+/// worse than doing nothing. Two overlapping `start` calls snapshot the same
+/// old value; if the first succeeds and publishes while the second fails, the
+/// second's restore silently replaces the *running* runtime's sink with a
+/// stale snapshot (round 19 P1). Doing nothing on failure is both simpler and
+/// correct under concurrency.
+struct DeferredAuditExportInstall {
     pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
-    committed: bool,
 }
 
-impl AuditExportInstallGuard {
-    /// Snapshot the global config. Take this immediately *before* the
-    /// conversion that may clobber it.
-    fn arm(pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>) -> Self {
-        let previous = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
-            .read()
-            .ok()
-            .and_then(|lock| lock.clone());
-        Self {
-            previous,
-            pending,
-            committed: false,
-        }
+impl DeferredAuditExportInstall {
+    const fn new(
+        pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    ) -> Self {
+        Self { pending }
     }
 
-    /// Publish this runtime's config; the snapshot is discarded.
-    fn commit(mut self) {
-        self.committed = true;
-        let pending = self.pending.take();
-        commit_audit_export_config(pending);
-    }
-}
-
-impl Drop for AuditExportInstallGuard {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        // The build failed after the conversion already wrote the global.
-        // Put back whatever was there, so a runtime that never started cannot
-        // redirect or silence a running runtime's audit export.
-        commit_audit_export_config(self.previous.take());
+    /// Publish this runtime's config. Called only once startup has fully
+    /// succeeded; dropping this value instead leaves the global untouched.
+    fn commit(self) {
+        commit_audit_export_config(self.pending);
     }
 }
 
@@ -509,14 +480,13 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
-        // Armed here and carried on the returned `PreparedHarvestRuntime`, so
-        // it stays live for the whole of `HarvestRunner::start` — not just this
+        // Carried on the returned `PreparedHarvestRuntime` so it stays
+        // unpublished for the whole of `HarvestRunner::start` — not just this
         // function (issue #953, Codex review round 16 P1). `start` has more
         // fallible work after `build` returns (completion-trigger sync, worker
-        // construction, shard-pool validation), and an early return there must
-        // also leave a previously running runtime's export untouched. Dropping
-        // `prepared` on any such error restores it.
-        let audit_export_guard = AuditExportInstallGuard::arm(audit_export_config);
+        // construction, shard-pool validation); an early return there drops
+        // this without publishing, leaving the global exactly as it was.
+        let audit_export_guard = DeferredAuditExportInstall::new(audit_export_config);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -1020,7 +990,7 @@ pub(crate) fn injected_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditExportInstallGuard, resolve_runtime_storage_pool, select_runtime_shard0_pool,
+        DeferredAuditExportInstall, resolve_runtime_storage_pool, select_runtime_shard0_pool,
         uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
@@ -1030,12 +1000,14 @@ mod tests {
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
-    /// A build that fails after the worker-parts conversion must leave the
-    /// process-global audit-export config exactly as it found it (issue #953,
-    /// Codex review round 3 P1). The conversion installs the config itself, so
-    /// deferring only the runner's own publish was not enough.
+    /// A startup that fails must leave the process-global audit-export config
+    /// exactly as it found it — and, crucially, must do so by NOT publishing
+    /// rather than by restoring (issue #953, Codex review rounds 16 and 19).
+    /// Restoring a snapshot races a concurrent successful startup: both
+    /// snapshot the same old value, and the loser's restore would replace the
+    /// winner's live sink.
     #[test]
-    fn a_failed_build_restores_the_previous_audit_export_config() {
+    fn a_failed_startup_leaves_the_global_exactly_as_it_found_it() {
         struct Marker;
         impl autumn_harvest::audit_export::AuditSink for Marker {
             fn deliver<'a>(
@@ -1045,69 +1017,65 @@ mod tests {
                 Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
             }
         }
-
-        // A live runtime's config.
-        let live = std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
-            sink: std::sync::Arc::new(Marker),
-            secret: autumn_harvest::completion_callback::CallbackSecret::new(b"live".to_vec()),
-            batch_size: 7,
-            backoff: autumn_harvest::audit_export::ExportBackoff::default(),
-            lease: std::time::Duration::from_secs(30),
-        });
-        super::commit_audit_export_config(Some(live));
-
-        {
-            // The guard now spans the whole of `HarvestRunner::start`, so this
-            // stands in for a failure ANYWHERE after `build` returns --
-            // completion-trigger sync, worker construction, shard validation --
-            // each of which drops `prepared` and with it this guard.
-            let guard = AuditExportInstallGuard::arm(None);
-            super::commit_audit_export_config(None);
-            drop(guard);
+        fn config(
+            batch_size: i64,
+        ) -> std::sync::Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig> {
+            std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+                sink: std::sync::Arc::new(Marker),
+                secret: autumn_harvest::completion_callback::CallbackSecret::new(b"k".to_vec()),
+                batch_size,
+                backoff: autumn_harvest::audit_export::ExportBackoff::default(),
+                lease: std::time::Duration::from_secs(30),
+            })
         }
 
-        let restored = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
-            .read()
-            .expect("lock")
-            .clone()
-            .expect("the live runtime's config must be restored, not cleared");
-        assert_eq!(
-            restored.batch_size, 7,
-            "a runtime that never started must not silence a running one's export"
-        );
+        // A runtime is already exporting in this process.
+        super::commit_audit_export_config(Some(config(7)));
 
-        // And the success path publishes what it was armed with.
-        let second = std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
-            sink: std::sync::Arc::new(Marker),
-            secret: autumn_harvest::completion_callback::CallbackSecret::new(b"second".to_vec()),
-            batch_size: 21,
-            backoff: autumn_harvest::audit_export::ExportBackoff::default(),
-            lease: std::time::Duration::from_secs(30),
-        });
-        AuditExportInstallGuard::arm(Some(second)).commit();
+        // A second startup is prepared and then fails: dropped, never
+        // committed.
+        drop(DeferredAuditExportInstall::new(Some(config(99))));
         assert_eq!(
             autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
                 .read()
                 .expect("lock")
                 .clone()
-                .expect("commit must publish")
+                .expect("the live config must still be installed")
                 .batch_size,
-            21,
+            7,
+            "a runtime that never started must neither publish its own sink \
+             nor disturb the running one's"
         );
 
-        // A deliberate `None` is meaningful too: a runtime built with no sink
-        // must stop a previous runtime's export rather than leave it running.
-        AuditExportInstallGuard::arm(None).commit();
+        // The concurrency case the restore got wrong: startup A succeeds and
+        // publishes while startup B, prepared earlier from the same old value,
+        // fails. B must not undo A.
+        let b = DeferredAuditExportInstall::new(Some(config(99)));
+        DeferredAuditExportInstall::new(Some(config(21))).commit(); // A wins
+        drop(b); // B fails afterwards
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("A's config must survive")
+                .batch_size,
+            21,
+            "a failed startup must not roll a concurrent successful one back"
+        );
+
+        // Success publishes, including a deliberate None.
+        DeferredAuditExportInstall::new(None).commit();
         assert!(
             autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
                 .read()
                 .expect("lock")
                 .is_none(),
-            "commit must publish, including a deliberate None"
+            "a runtime built with no sink must stop a previous one's export"
         );
     }
 
-    /// Build a pool tagged by its `max_size` (readable without connecting) so
+    /// Build a pool tagged by its `max_size` (readable without connecting) so    /// Build a pool tagged by its `max_size` (readable without connecting) so
     /// two pools are distinguishable in a DB-free test.
     fn tagged_pool(max_size: usize) -> DbPool {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
