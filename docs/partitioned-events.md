@@ -323,7 +323,7 @@ The plan moves the expensive work out of the lock window:
 | Step | What | Lock |
 |---|---|---|
 | 1 | Bake the cohort width into `harvest_event_cohort` | none |
-| 2 | `CREATE UNIQUE INDEX CONCURRENTLY` ×2 | none that blocks appends |
+| 2 | Drop any index a failed build left invalid, then `CREATE UNIQUE INDEX CONCURRENTLY` ×2 | none that blocks appends |
 | 3 | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` | brief `ACCESS EXCLUSIVE` for the catalog row, then `SHARE UPDATE EXCLUSIVE` for the scan — readers and writers proceed |
 | 4 | Rename, create parent, attach legacy | **`ACCESS EXCLUSIVE`, metadata only — seconds** |
 | 5 | Hand back to the engine | none |
@@ -336,6 +336,23 @@ does: `NOT VALID` skips the table scan but still takes `ACCESS EXCLUSIVE` to
 write the catalog row, and one idle-in-transaction reader is enough to make the
 request queue — with every append arriving after it queued behind the `ALTER`.
 Re-run the step after clearing the blocker.
+
+**A lost `CONCURRENTLY` build is expected, and step 2 is re-runnable.** A
+cancelled or failed `CREATE INDEX CONCURRENTLY` leaves the index behind marked
+invalid, and `IF NOT EXISTS` would report success on a re-run without noticing.
+Step 2 drops invalid copies of its own two indexes before rebuilding them, and
+step 4 refuses to open its lock window unless both are present and valid —
+because `ATTACH PARTITION` cannot reuse an invalid index and would build a
+replacement with the exclusive lock already held, turning a metadata-only
+window into a full index build.
+
+**Grants and ownership are carried across.** Every conversion path replaces
+`harvest_events` with a freshly created table, and `CREATE TABLE ... LIKE`
+copies no ACLs and no owner. Both `enable`, the scripted plan and `disable`
+replay the original table's owner and table-level `GRANT`s onto the
+replacement, so a deployment that runs migrations as one role and connects the
+engine as another keeps the `SELECT`/`INSERT` the preflight check requires.
+Column-level grants are not replayed; nothing in the engine issues them.
 
 **Recheck the cutover before running step 3.** The plan bakes in the value
 computed when it was printed. A *stale* (older) cutover is safe — every

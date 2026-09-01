@@ -2385,3 +2385,204 @@ async fn the_online_migration_phases_bound_their_lock_wait() {
         .await
         .expect("release the blocker");
 }
+
+/// Can the split-role test's runtime role still read and append?
+async fn granted(conn: &mut AsyncPgConnection) -> (bool, bool) {
+    (
+        scalar_bool(
+            conn,
+            "SELECT has_table_privilege('harvest_runtime_958', 'harvest_events', 'SELECT') AS v",
+        )
+        .await,
+        scalar_bool(
+            conn,
+            "SELECT has_table_privilege('harvest_runtime_958', 'harvest_events', 'INSERT') AS v",
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn conversion_preserves_the_grants_a_split_role_deployment_runs_on() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The deployment shape this engine documents and probes for: migrations run
+    // as the owning role, the runtime connects as a separately granted role.
+    // `HARVEST_WRITE_PRIVILEGE_REQUIREMENTS` in the plugin's preflight demands
+    // SELECT + INSERT on `harvest_events` precisely because a missing grant
+    // there is a total history outage, not a degraded feature.
+    for stmt in [
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'harvest_runtime_958') \
+           THEN CREATE ROLE harvest_runtime_958 NOLOGIN; END IF; END $$",
+        "GRANT SELECT, INSERT ON harvest_events TO harvest_runtime_958",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    assert_eq!(
+        granted(&mut conn).await,
+        (true, true),
+        "precondition: the runtime role can read and append before conversion"
+    );
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    assert_eq!(
+        granted(&mut conn).await,
+        (true, true),
+        "AC1: enabling replaces `harvest_events` with a new parent table, and \
+         `CREATE TABLE ... LIKE` copies no ACLs. The grants stay on the renamed \
+         legacy table and the runtime role loses SELECT/INSERT on the table it \
+         reads and appends every event through — a history outage that starts \
+         the moment the conversion commits and lasts until someone re-issues \
+         the GRANTs by hand."
+    );
+
+    let report = partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert")
+        .expect("the shard was partitioned");
+    let _ = report;
+    assert_eq!(
+        granted(&mut conn).await,
+        (true, true),
+        "and reverting replaces the table again — the escape hatch must not \
+         leave the runtime role locked out either"
+    );
+}
+
+/// Name of the unique index phase 2 builds for the partitioned primary key.
+fn plan_pk_index() -> String {
+    format!("{}_pk_idx", partition::LEGACY_PARTITION)
+}
+
+/// Mark an index invalid, exactly as a cancelled `CREATE INDEX CONCURRENTLY`
+/// leaves it.
+///
+/// Postgres offers no supported way to produce that state on demand, so the
+/// catalog is edited directly. Requires superuser, which the suite's
+/// testcontainers Postgres is.
+async fn invalidate_index(conn: &mut AsyncPgConnection, name: &str) {
+    diesel::sql_query(format!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{name}'::regclass"
+    ))
+    .execute(conn)
+    .await
+    .unwrap_or_else(|e| panic!("invalidate {name}: {e}"));
+}
+
+async fn index_is_valid(conn: &mut AsyncPgConnection, name: &str) -> bool {
+    scalar_bool(
+        conn,
+        &format!(
+            "SELECT COALESCE((SELECT i.indisvalid FROM pg_index i
+                               WHERE i.indexrelid = to_regclass('{name}')), false) AS v"
+        ),
+    )
+    .await
+}
+
+async fn run_plan_phases(conn: &mut AsyncPgConnection, phases: std::ops::RangeInclusive<u8>) {
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| phases.contains(&s.phase))
+    {
+        diesel::sql_query(&step.sql)
+            .execute(conn)
+            .await
+            .unwrap_or_else(|e| panic!("plan step (phase {}):\n{}\nerror: {e}", step.phase, e));
+    }
+}
+
+#[tokio::test]
+async fn re_running_the_plan_rebuilds_an_index_a_cancelled_build_left_invalid() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=2).await;
+    let pk = plan_pk_index();
+    assert!(
+        index_is_valid(&mut conn, &pk).await,
+        "precondition: a clean phase 2 leaves a valid index"
+    );
+
+    // `CREATE INDEX CONCURRENTLY` is the one build an operator is most likely
+    // to lose: it runs for hours on a large table and a cancel, a deploy or a
+    // lock conflict leaves the index behind, INVALID.
+    invalidate_index(&mut conn, &pk).await;
+
+    // Re-running the plan from the top is exactly what the runbook tells them
+    // to do. `IF NOT EXISTS` sees the name and reports success, so the invalid
+    // index survives — and `ATTACH PARTITION` in phase 4 cannot reuse it, so it
+    // silently builds a replacement while holding the parent-wide exclusive
+    // lock the plan promises is metadata-only.
+    run_plan_phases(&mut conn, 1..=2).await;
+    assert!(
+        index_is_valid(&mut conn, &pk).await,
+        "phase 2 must detect the invalid index and rebuild it — otherwise the \
+         plan's 'seconds, metadata only' lock window becomes a full index build \
+         with every append queued behind it"
+    );
+}
+
+#[tokio::test]
+async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "inv_wf", "inv-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    run_plan_phases(&mut conn, 1..=3).await;
+    invalidate_index(&mut conn, &plan_pk_index()).await;
+
+    // An operator who lost a build, fixed something else, and picked the
+    // runbook back up at the lock window. Phase 4 must refuse rather than take
+    // ACCESS EXCLUSIVE and then discover it has an index to build.
+    let mut failed = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            failed = true;
+        }
+    }
+    assert!(
+        failed,
+        "phase 4 must abort before the rename when an index it depends on is invalid"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "and it must abort BEFORE changing anything — the table is still flat"
+    );
+    assert_eq!(
+        autumn_harvest::store::load_history(&mut conn, ExecutionId::from_uuid(exec))
+            .await
+            .expect("history is untouched by the refused conversion")
+            .events
+            .len(),
+        3
+    );
+}
