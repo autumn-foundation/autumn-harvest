@@ -22,7 +22,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::AppState;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {

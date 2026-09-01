@@ -125,6 +125,21 @@ CREATE SUBSCRIPTION harvest_dr_shard0
 > slot creation waits for older transactions to end, so it would wait for
 > itself. Across two real instances you can let it create its own slot.
 
+> **The partitioned `harvest_events` layout (#958) needs the partitioned layout
+> on BOTH sides.** Two things break otherwise. `publish_via_partition_root`
+> defaults to false, so a partitioned table's rows publish under their leaf
+> partition names, which a standby built from the migrations has no tables for —
+> the apply worker stops on the first event. And the partitioned layout drops the
+> events foreign key, so reclamation happens by `DROP TABLE` on a partition,
+> which is DDL and is never replicated; the subscriber's own cascade does not
+> fire either, because apply runs with replica trigger behaviour. A flat standby
+> therefore accumulates dangling events and `harvest backup verify` reports it
+> **Incoherent**, which blocks the failover this publication exists for. Setting
+> `publish_via_partition_root = true` fixes only the first. `harvest partition
+> enable` refuses while any publication covers `harvest_events`; run the
+> partitioned layout on the standby too and pass
+> `--allow-incompatible-publications`.
+
 > **The `harvest_dr` prefix in those slot names is load-bearing, not cosmetic.**
 > Harvest identifies *its* replication by slot-name prefix
 > (`replication_slot_prefix`, default `harvest_dr`). Without that filter every

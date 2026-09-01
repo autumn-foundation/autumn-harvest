@@ -53,7 +53,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 fn rewrite_pg_db(base: &str, db: &str) -> String {
@@ -85,7 +85,7 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("failed to connect to per-test database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply migrations to per-test database");
         return (new_url, None);
@@ -2399,6 +2399,7 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         Duration::from_secs(60),
         &Some(sharded_pool),
         &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("cancel outbox sweep should succeed");
@@ -2609,6 +2610,7 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         Duration::from_secs(60),
         &Some(sharded_pool),
         &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -2776,6 +2778,7 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
             Duration::from_secs(60),
             &Some(sharded_pool),
             &[caller_exec_id.shard()],
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
         ),
     )
     .await;

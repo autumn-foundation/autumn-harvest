@@ -16,7 +16,15 @@
 # Columns (whitespace-separated; `-` = none/absent):
 #   osclass   crate                    target       features            filter
 #
-#   osclass  = linux       -> run on Linux, serial (`--test-threads=1`) against
+#   osclass  = linuxpart   -> exactly `linux`, but with HARVEST_TEST_PARTITIONED=1,
+#                            re-running the suite against the opt-in partitioned
+#                            `harvest_events` layout (issue #958, AC2: per-execution
+#                            event semantics must be byte-identical between layouts,
+#                            "asserted by running the existing store/replay
+#                            integration suites against both layouts"). Pair each
+#                            such row with its plain `linux` row -- the point is
+#                            that the SAME suite passes both ways.
+#              linux       -> run on Linux, serial (`--test-threads=1`) against
 #                            live Docker Postgres; also compile-checked on every
 #                            OS (plugin rows via `compile` mode; core rows via
 #                            the blanket core `--no-run` step in ci.yml).
@@ -38,6 +46,7 @@
 # ordering correct by construction.
 #
 # osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
@@ -57,6 +66,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          activity_pause_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
+linux        autumn-harvest         integration                      -                          audit_export_tests
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
@@ -66,16 +76,19 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
+linux        autumn-harvest         integration                      -                          cross_shard_children_tests
 linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          event_batch_tests
+linux        autumn-harvest         integration                      -                          event_partitioning_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
+linux        autumn-harvest         integration                      -                          mixed_suspension_tests
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
@@ -101,6 +114,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_tests
+linux        autumn-harvest         integration                      testing                    codec_rotation_db_tests
 linux        autumn-harvest         integration                      testing                    cross_region_dr_tests
 linux        autumn-harvest         integration                      testing                    dag_compensation
 linux        autumn-harvest         integration                      testing                    nd_block
@@ -114,6 +128,7 @@ linux        autumn-harvest-plugin  batch_operations_integration     -          
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  canary_integration               -                          -
+linux        autumn-harvest-plugin  codec_rotation_admin_integration  -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  concurrency_admin_integration    -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
@@ -158,3 +173,12 @@ linux        autumn-harvest-plugin  workflow_logs_integration        -          
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -
+linuxpart    autumn-harvest         integration                      -                          cache_delta_load_tests
+linuxpart    autumn-harvest         integration                      -                          event_batch_tests
+linuxpart    autumn-harvest         integration                      -                          event_partitioning_tests::the_test_bootstrap_honours_the_partitioned_layout_switch
+linuxpart    autumn-harvest         integration                      -                          integration_e2e
+linuxpart    autumn-harvest         integration                      -                          legal_hold_tests
+linuxpart    autumn-harvest         integration                      -                          lineage_store_tests
+linuxpart    autumn-harvest         integration                      -                          retention_overrides_tests
+linuxpart    autumn-harvest         integration                      -                          retention_summary_tests
+linuxpart    autumn-harvest         integration                      -                          workflow_retry_tests

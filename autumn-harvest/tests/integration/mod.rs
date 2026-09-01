@@ -13,6 +13,8 @@ mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
+#[cfg(feature = "db")]
+mod audit_export_tests;
 mod audit_tests;
 #[cfg(feature = "db")]
 mod auto_heartbeat_tests;
@@ -46,6 +48,8 @@ mod circuit_breaker_wiring_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod codec_rotation_db_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
 mod concurrency_supersede_tests;
@@ -53,6 +57,10 @@ mod context_headers_tests;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]
 mod cross_region_dr_tests;
+mod cross_shard_child_context_tests;
+mod cross_shard_child_placement_unit;
+#[cfg(feature = "db")]
+mod cross_shard_children_tests;
 #[cfg(feature = "db")]
 mod cross_type_continue_as_new_tests;
 mod cross_workflow_await_tests;
@@ -76,6 +84,7 @@ mod debugger_tests;
 mod delayed_start_tests;
 mod det_check_tests;
 mod event_batch_tests;
+mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
@@ -106,9 +115,12 @@ mod migrate_tests;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
 #[cfg(feature = "db")]
+mod mixed_suspension_tests;
+#[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
 mod panic_containment_tests;
+mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
@@ -142,6 +154,7 @@ mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
 mod retention_overrides_tests;
+mod retention_reclaim_support;
 mod retention_summary_tests;
 mod retry_after_tests;
 mod retry_chain_routing_tests;

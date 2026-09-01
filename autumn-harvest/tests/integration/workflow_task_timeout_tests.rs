@@ -119,7 +119,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
         let mut conn = AsyncPgConnection::establish(&test_url)
             .await
             .expect("connect to test DB");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migration");
 
@@ -141,7 +141,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
 
@@ -304,6 +304,7 @@ async fn quarantine_writes_dlq_and_fails_execution() {
         "timeout_wf",
         "default",
         &*metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -358,6 +359,7 @@ async fn quarantine_writes_typed_dlq_reason() {
         "timeout_wf",
         "default",
         &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -402,8 +404,16 @@ async fn quarantine_with_no_exec_id_only_fails_task() {
 
     let metrics = RecordingMetrics::default();
     quarantine_workflow_task_timeout(
-        &pool, task_id, None, // no exec_id
-        "worker-1", 3, 10, "unknown", "default", &metrics,
+        &pool,
+        task_id,
+        None, // no exec_id
+        "worker-1",
+        3,
+        10,
+        "unknown",
+        "default",
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -468,6 +478,7 @@ async fn quarantine_does_not_overwrite_an_execution_that_already_completed() {
         "timeout_wf",
         "default",
         &*metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 

@@ -164,13 +164,15 @@ async fn terminal_activity_failure_decodes_typed_envelope_and_replays() {
         !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a decoded typed-activity-failure history must replay without drift:\n{report}"
     );
-    match &report.status {
-        ReplayStatus::WorkflowFailed { error, .. } => assert!(
-            error.contains("card was declined"),
-            "the decoded human message flows through replay identically, got {error:?}"
-        ),
-        other => panic!("expected deterministic WorkflowFailed, got {other:?}"),
-    }
+    // Issue #952: a reproduced failure on a terminal-failure history reports
+    // `ReplaySucceeded` and carries its error in `failure_message()`.
+    let error = report
+        .failure_message()
+        .unwrap_or_else(|| panic!("expected a deterministic reproduced failure:\n{report}"));
+    assert!(
+        error.contains("card was declined"),
+        "the decoded human message flows through replay identically, got {error:?}"
+    );
 }
 
 // ── FIX 2(a): a retry is DELAYED by the policy's backoff, not immediate ────────

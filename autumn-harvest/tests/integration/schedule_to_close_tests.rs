@@ -39,7 +39,7 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
     (conn, container)
@@ -157,6 +157,8 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -253,6 +255,8 @@ async fn scanner_times_out_running_task_with_expired_schedule_to_close() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -342,6 +346,8 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -429,6 +435,8 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -543,6 +551,8 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("enforce_timeouts_once");

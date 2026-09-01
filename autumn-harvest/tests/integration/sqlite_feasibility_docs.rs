@@ -732,6 +732,42 @@ fn derived_totals_agree_with_the_table_and_the_tree() {
         rows.len()
     );
 
+    // The same figures again, as the *prose* quotes them.
+    //
+    // The table above is guarded, but a reader making a decision quotes the
+    // sentences, not the table — "19 of 43 coupled modules are portable only by
+    // dropping a capability" is the line that gets pasted into a design review.
+    // Those sentences drifted: they were a coherent snapshot of an earlier audit
+    // (43 coupled, 19 class (c), 26 raw-SQL) left behind by a table that had
+    // since grown, so the document contradicted itself in the one place it is
+    // most likely to be quoted from. Each figure below is pure arithmetic over
+    // the inventory rows, so it is derivable and therefore guardable; the
+    // estimates that are *not* derivable (`~13 modules` for the scanner rewrite)
+    // are deliberately left alone.
+    let raw_sql = detect_coupled_modules()
+        .values()
+        .filter(|ms| ms.contains("raw-sql"))
+        .count();
+    for phrase in [
+        format!("{c} of {} coupled modules", rows.len()),
+        format!(
+            "That {raw_sql} of the {} coupled modules hand-write SQL",
+            rows.len()
+        ),
+        format!("~{} modules touched", rows.len()),
+        format!("**{c} modules are class (c)**"),
+        format!("against {a} that are trivially trait-able"),
+        format!("**{raw_sql} modules reach for raw SQL**"),
+    ] {
+        assert!(
+            report.contains(&phrase),
+            "the report's prose must quote the same figures as its own table; \
+             expected to find {phrase:?}. A live audit finds {} coupled modules, \
+             {a} class (a), {c} class (c), {raw_sql} reaching for raw SQL.",
+            rows.len()
+        );
+    }
+
     // Migration count.
     let migrations = std::fs::read_dir(repo_root().join("autumn-harvest/migrations"))
         .expect("migrations dir readable")

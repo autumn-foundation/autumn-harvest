@@ -2325,7 +2325,8 @@ async fn inline_cancel(
     deferred_checks: &mut Vec<(ExecutionId, String)>,
 ) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = "terminated to start new execution";
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     store::append_events(
         conn,
         exec_id,
@@ -2402,9 +2403,20 @@ async fn inline_cancel(
 /// skipped. There is no `ChildWorkflowCancelled` event variant, so a cancel and
 /// a terminate both surface to the parent as `ChildWorkflowFailed` (the
 /// child-await resolves `Err`) — matching the worker failure path and adding no
-/// new event variant. Awaited children are co-located on the parent's shard
-/// (the worker append-on-child-conn path relies on the same invariant), so this
-/// append on the child's connection targets the correct shard.
+/// new event variant.
+///
+/// # Shard scope (issue #956)
+///
+/// This appends on the **child's** connection, so it only reaches a parent that
+/// lives on the child's own shard. That was universally true before cross-shard
+/// child placement; it is now the common case rather than an invariant. A
+/// cross-shard child's parent row is simply absent from this connection, so the
+/// `parent_state` lookup below returns `None` and this function correctly does
+/// nothing — the wake is owed by the cross-shard relay
+/// (`cross_shard_child::deliver_terminal`), which pulls the child's terminal
+/// state and appends on the *parent's* shard. That handoff is by construction,
+/// not by luck: the relay polls a durable row on the parent's shard and does not
+/// depend on this path having run.
 async fn notify_awaited_parent_of_child_terminal(
     conn: &mut AsyncPgConnection,
     child_exec_id: ExecutionId,
@@ -2537,7 +2549,8 @@ pub async fn cancel_workflow_execution_collect(
             .await
             .map_err(database_error)?;
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3238,7 +3251,8 @@ pub async fn pause_workflow_execution(
                 }
             }
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3558,7 +3572,8 @@ pub async fn resume_workflow_execution(
                 new_sla_deadline_at,
             } = resume_deadline_shifts(&execution, resumed_at);
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -3889,7 +3904,8 @@ pub async fn reactivate_failed_execution(
     let new_deadline_at = execution.execution_timeout.map(|d| now + d);
     let new_sla_deadline_at = execution.sla.map(|d| now + d);
 
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     store::append_events(
         conn,
         exec_id,
@@ -4287,7 +4303,8 @@ pub async fn terminate_workflow_execution_collect(
                 ));
             }
 
-            let history = store::load_history(conn, exec_id).await?;
+            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -7646,7 +7663,8 @@ pub async fn check_and_report_unfinished_handlers(
     workflow_name: &str,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
-    let history = store::load_history(conn, exec_id).await?;
+    // Undecoded: this reads `next_event_id` only (see the loader's docs).
+    let history = store::load_history_undecoded(conn, exec_id).await?;
     let matcher = crate::replay::HistoryMatcher::new(history.events);
     let count = matcher.unfinished_update_handler_count_at_end();
     if count > 0 {

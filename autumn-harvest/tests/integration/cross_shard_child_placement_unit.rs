@@ -1,0 +1,775 @@
+//! Pure-logic coverage for cross-shard child placement (issue #956).
+//!
+//! No database, no feature gate — these run in the cheap
+//! `cargo test -p autumn-harvest --no-default-features` CI step on every OS.
+//!
+//! Two surfaces are covered here:
+//!
+//! 1. **Placement resolution** (`shard::resolve_child_placement`) — the pure
+//!    function every `spawn_child_workflow*` call site routes through to decide
+//!    which shard a child lands on. The default (`ParentShard`) must never
+//!    consult the router at all, so a deployment with no installed router keeps
+//!    working byte-for-byte.
+//! 2. **The relay state machine** (`shard::next_cross_shard_child_action`) — the
+//!    decision the cross-shard scanner makes for one outbox row, factored out of
+//!    the database so every branch (start, cancel, terminal delivery, close
+//!    cascade, retire) is exhaustively testable without Postgres.
+//!
+//! The multi-shard *runtime* coverage (real child rows on a second database,
+//! real parent wakes) lives in `cross_shard_children_tests.rs`, which needs
+//! Docker/Postgres.
+
+#[cfg(feature = "db")]
+use autumn_harvest::cross_shard_child::preflight_target_shard;
+use autumn_harvest::shard::{
+    ChildPlacement, CrossShardChildAction, CrossShardChildObservation, CrossShardChildStatus,
+    next_cross_shard_child_action, resolve_child_placement,
+};
+use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
+use autumn_harvest::{HarvestError, ShardRouter};
+
+fn four_shard_router() -> ShardRouter {
+    ShardRouter::new(
+        vec![
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+        ],
+        vec![
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+        ],
+        ShardId::new(0),
+    )
+}
+
+// ── AC1: the default is parent-shard pinning, unchanged ───────────────────────
+
+#[test]
+fn parent_shard_is_the_default_placement() {
+    assert_eq!(ChildPlacement::default(), ChildPlacement::ParentShard);
+}
+
+#[test]
+fn parent_shard_placement_resolves_to_the_parent_shard_with_no_router() {
+    // The load-bearing property: `ParentShard` must resolve without a router,
+    // because that is what every single-shard deployment (and every existing
+    // test) runs with. Passing `None` here is the strongest possible assertion
+    // that the router is not consulted.
+    for shard in [0, 1, 7, 65534] {
+        let parent = ShardId::new(shard);
+        let resolved =
+            resolve_child_placement(None, &ChildPlacement::ParentShard, parent, "child_wf", "k")
+                .expect("parent-shard placement never fails");
+        assert_eq!(resolved, parent);
+    }
+}
+
+#[test]
+fn parent_shard_placement_ignores_the_router_even_when_one_is_installed() {
+    let router = four_shard_router();
+    let parent = ShardId::new(2);
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::ParentShard,
+        parent,
+        "child_wf",
+        "parent#0",
+    )
+    .expect("parent-shard placement never fails");
+    assert_eq!(resolved, parent);
+}
+
+// ── AC2: rendezvous over writable_shards, restart-stable ─────────────────────
+
+#[test]
+fn distributed_placement_matches_the_top_level_start_rendezvous_pick() {
+    let router = four_shard_router();
+    let key = "01234567-89ab-cdef-0123-456789abcdef#3";
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Distributed,
+        ShardId::new(0),
+        "child_wf",
+        key,
+    )
+    .expect("distributed placement resolves");
+    // Identical to what a *top-level* start with the same (name, id) would get:
+    // one rendezvous function, one restart-stability contract.
+    assert_eq!(resolved, router.pick_for_new_workflow("child_wf", key));
+}
+
+#[test]
+fn distributed_placement_is_deterministic_for_the_same_key() {
+    let router = four_shard_router();
+    let first = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Distributed,
+        ShardId::new(1),
+        "child_wf",
+        "parent#7",
+    )
+    .unwrap();
+    for _ in 0..32 {
+        let again = resolve_child_placement(
+            Some(&router),
+            &ChildPlacement::Distributed,
+            ShardId::new(1),
+            "child_wf",
+            "parent#7",
+        )
+        .unwrap();
+        assert_eq!(first, again, "placement must be restart-stable");
+    }
+}
+
+#[test]
+fn distributed_placement_never_picks_a_drained_shard() {
+    // Shard 3 is readable but drained out of the writable set. A child must
+    // never be placed there, exactly like a top-level start.
+    let router = ShardRouter::new(
+        vec![
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+        ],
+        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        ShardId::new(0),
+    );
+    for i in 0..500 {
+        let resolved = resolve_child_placement(
+            Some(&router),
+            &ChildPlacement::Distributed,
+            ShardId::new(0),
+            "child_wf",
+            &format!("parent#{i}"),
+        )
+        .unwrap();
+        assert_ne!(resolved, ShardId::new(3), "drained shard was selected");
+    }
+}
+
+#[test]
+fn distributed_placement_on_a_single_shard_router_stays_on_the_parent_shard() {
+    // AC1's "every existing single-shard deployment is unaffected" also has to
+    // hold for code that opts *in*: with one writable shard the rendezvous pick
+    // is that shard, which is the parent's, so nothing goes cross-shard.
+    let router = ShardRouter::single();
+    for i in 0..64 {
+        let resolved = resolve_child_placement(
+            Some(&router),
+            &ChildPlacement::Distributed,
+            ShardId::new(0),
+            "child_wf",
+            &format!("parent#{i}"),
+        )
+        .unwrap();
+        assert_eq!(resolved, ShardId::new(0));
+    }
+}
+
+// ── Success metric: ±10% of the rendezvous-uniform distribution ──────────────
+
+const FAN_OUT_N: usize = 10_000;
+
+#[test]
+#[allow(clippy::cast_precision_loss)] // counts are bounded by FAN_OUT_N
+fn a_ten_thousand_child_fan_out_spreads_within_ten_percent_of_uniform() {
+    let router = four_shard_router();
+    let parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut counts = [0usize; 4];
+    let n = FAN_OUT_N;
+    for seq in 0..n {
+        let key = autumn_harvest::shard::child_placement_key(parent, u32::try_from(seq).unwrap());
+        let shard = resolve_child_placement(
+            Some(&router),
+            &ChildPlacement::Distributed,
+            ShardId::new(0),
+            "child_wf",
+            &key,
+        )
+        .unwrap();
+        counts[usize::try_from(shard.as_i32()).unwrap()] += 1;
+    }
+
+    let expected = n as f64 / 4.0;
+    for (shard, &count) in counts.iter().enumerate() {
+        let deviation = (count as f64 - expected).abs() / expected;
+        assert!(
+            deviation <= 0.10,
+            "shard {shard} got {count} of {n} children ({:.2}% off uniform); \
+             the success metric allows ±10%",
+            deviation * 100.0
+        );
+    }
+}
+
+#[test]
+fn child_placement_keys_are_distinct_per_sequence_and_stable_per_parent() {
+    let parent = ExecutionId::new_for_shard(ShardId::new(1));
+    let other = ExecutionId::new_for_shard(ShardId::new(1));
+    assert_eq!(
+        autumn_harvest::shard::child_placement_key(parent, 4),
+        autumn_harvest::shard::child_placement_key(parent, 4),
+        "same (parent, seq) must re-derive the same key after a crash"
+    );
+    assert_ne!(
+        autumn_harvest::shard::child_placement_key(parent, 4),
+        autumn_harvest::shard::child_placement_key(parent, 5),
+    );
+    assert_ne!(
+        autumn_harvest::shard::child_placement_key(parent, 4),
+        autumn_harvest::shard::child_placement_key(other, 4),
+        "two parents' Nth children must not collide onto one shard by construction"
+    );
+}
+
+// ── Out of scope carve-out: an explicit pin is honoured ──────────────────────
+
+#[test]
+fn an_explicit_shard_pin_is_honoured_verbatim() {
+    let router = four_shard_router();
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Shard(ShardId::new(2)),
+        ShardId::new(0),
+        "child_wf",
+        "parent#0",
+    )
+    .unwrap();
+    assert_eq!(resolved, ShardId::new(2));
+}
+
+#[test]
+fn an_explicit_residency_key_is_honoured_verbatim() {
+    let router = four_shard_router().with_residency_map([("eu".to_string(), ShardId::new(3))]);
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::ResidencyKey("eu".to_string()),
+        ShardId::new(0),
+        "child_wf",
+        "parent#0",
+    )
+    .unwrap();
+    assert_eq!(resolved, ShardId::new(3));
+}
+
+#[test]
+fn an_undeclared_residency_key_is_rejected_never_hashed() {
+    let router = four_shard_router().with_residency_map([("eu".to_string(), ShardId::new(3))]);
+    let err = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::ResidencyKey("mars".to_string()),
+        ShardId::new(0),
+        "child_wf",
+        "parent#0",
+    )
+    .expect_err("an unmapped residency key must never silently hash");
+    assert!(
+        matches!(err, HarvestError::Config(ref m) if m.contains("mars")),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// A drain is a *transient* operational state, so it must not be rejected inside
+/// the workflow handler — where the ABI erases the error type and the executor
+/// turns it into a terminal failure. The resolver therefore returns the shard
+/// the caller named, and the rejection happens at the persist boundary.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
+#[test]
+fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    // The resolver does NOT reject it — rejecting here would be terminal.
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Shard(ShardId::new(1)),
+        ShardId::new(0),
+        "child_wf",
+        "parent#0",
+    )
+    .expect("a drain must not fail the handler");
+    assert_eq!(
+        resolved,
+        ShardId::new(1),
+        "the resolver must never quietly swap the requested shard"
+    );
+
+    // The preflight does, retryably. `None` for the pool map exercises the
+    // fail-closed arm; the drain check is asserted separately below.
+    let err = preflight_target_shard(None, Some(&router), resolved)
+        .expect_err("a drained shard must not accept new children");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+}
+
+/// A fully-drained fleet degenerates a `Distributed` placement to the default
+/// shard — deliberately, and with a trace.
+///
+/// Every alternative is worse. Failing the spawn would be terminal (the handler
+/// ABI erases the error type). Requeuing it would *deadlock the drain*: a drained
+/// shard is one that should let its in-flight work finish, and a parent cannot
+/// finish while the children it awaits are refused. And with zero writable
+/// shards the default shard is where an *unplaced* child would go and where the
+/// parent already lives, so no cross-shard contract is broken — none was made.
+/// AC8 requires that a fallback never happen "without trace", which the `warn!`
+/// on this path provides.
+#[test]
+fn distributed_placement_with_no_writable_shard_degenerates_to_the_default_shard() {
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![],
+        ShardId::new(0),
+    );
+    let resolved = resolve_child_placement(
+        Some(&router),
+        &ChildPlacement::Distributed,
+        ShardId::new(0),
+        "child_wf",
+        "parent#1",
+    )
+    .expect("a drained fleet must not fail the handler");
+    assert_eq!(
+        resolved,
+        router.default_shard(),
+        "the degenerate pick is the default shard, not an arbitrary one"
+    );
+}
+
+/// A *cross-shard* drained target is still rejected at the persist boundary —
+/// that is the case the preflight exists for, and it does not deadlock any
+/// drain because the parent is not on that shard.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
+#[test]
+fn a_drained_cross_shard_target_is_rejected_by_the_preflight() {
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    let err = preflight_target_shard(None, Some(&router), ShardId::new(1))
+        .expect_err("a drained cross-shard target must not accept new children");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+}
+
+/// The preflight fails closed with no pool map at all — a reachable
+/// misconfiguration, since the router and the pool map are independent globals.
+// `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
+#[cfg(feature = "db")]
+#[test]
+fn the_preflight_fails_closed_with_no_pool_map() {
+    let router = four_shard_router();
+    let err = preflight_target_shard(None, Some(&router), ShardId::new(2))
+        .expect_err("no pool map must not admit a cross-shard placement");
+    assert!(err.is_shard_unavailable(), "got {err:?}");
+    assert!(
+        err.to_string().contains('2'),
+        "the message must name the shard: {err}"
+    );
+}
+
+/// A genuine misconfiguration stays a terminal `Config` error: retrying an
+/// unknown shard or an undeclared residency key never helps.
+#[test]
+fn static_misconfiguration_stays_a_terminal_config_error() {
+    let router = four_shard_router();
+    for placement in [
+        ChildPlacement::Shard(ShardId::new(99)),
+        ChildPlacement::ResidencyKey("mars".to_string()),
+    ] {
+        let err =
+            resolve_child_placement(Some(&router), &placement, ShardId::new(0), "child_wf", "k")
+                .expect_err("must be rejected");
+        assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
+        assert!(!err.is_shard_unavailable(), "got {err:?}");
+    }
+}
+
+#[test]
+fn opting_in_without_an_installed_router_is_a_typed_error_not_a_silent_fallback() {
+    // AC8's anti-goal: never a silent fallback that breaks the placement
+    // contract without trace.
+    for placement in [
+        ChildPlacement::Distributed,
+        ChildPlacement::Shard(ShardId::new(1)),
+        ChildPlacement::ResidencyKey("eu".to_string()),
+    ] {
+        let err =
+            resolve_child_placement(None, &placement, ShardId::new(0), "child_wf", "parent#0")
+                .expect_err("no router installed must fail, not fall back");
+        assert!(matches!(err, HarvestError::Config(_)), "got {err:?}");
+    }
+}
+
+// ── AC8: an unreachable target shard is typed and retryable ──────────────────
+
+#[test]
+fn shard_unavailable_is_a_distinct_retryable_error() {
+    let err = HarvestError::ShardUnavailable {
+        shard_id: 3,
+        reason: "no pool configured on this node".to_string(),
+    };
+    assert!(err.is_shard_unavailable());
+    assert!(
+        err.to_string().contains('3'),
+        "the message must name the shard: {err}"
+    );
+    assert!(
+        !HarvestError::Config("x".into()).is_shard_unavailable(),
+        "the predicate must not over-match"
+    );
+}
+
+// ── The relay state machine ──────────────────────────────────────────────────
+
+const fn awaited(status: CrossShardChildStatus) -> CrossShardChildObservation<'static> {
+    CrossShardChildObservation {
+        status,
+        cancel_requested: false,
+        parent_close_policy: None,
+        parent_terminal: Some(false),
+        child_state: None,
+    }
+}
+
+const fn detached(
+    status: CrossShardChildStatus,
+    policy: ParentClosePolicy,
+) -> CrossShardChildObservation<'static> {
+    CrossShardChildObservation {
+        status,
+        cancel_requested: false,
+        parent_close_policy: Some(policy),
+        parent_terminal: Some(false),
+        child_state: None,
+    }
+}
+
+#[test]
+fn a_pending_row_starts_the_child_on_the_target_shard() {
+    assert_eq!(
+        next_cross_shard_child_action(&awaited(CrossShardChildStatus::PendingStart)),
+        CrossShardChildAction::StartChild
+    );
+    assert_eq!(
+        next_cross_shard_child_action(&detached(
+            CrossShardChildStatus::PendingStart,
+            ParentClosePolicy::Abandon
+        )),
+        CrossShardChildAction::StartChild
+    );
+}
+
+#[test]
+fn a_started_child_with_no_news_waits() {
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Wait
+    );
+}
+
+#[test]
+fn a_requested_cancel_is_delivered_before_anything_else() {
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.cancel_requested = true;
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::CancelChild
+    );
+}
+
+#[test]
+fn every_terminal_child_state_delivers_the_terminal_to_an_awaited_parent() {
+    for state in [
+        "COMPLETED",
+        "FAILED",
+        "TIMED_OUT",
+        "CANCELLED",
+        "TERMINATED",
+    ] {
+        let mut obs = awaited(CrossShardChildStatus::Started);
+        obs.child_state = Some(state);
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::DeliverTerminal,
+            "state {state} must wake the awaiting parent"
+        );
+    }
+}
+
+#[test]
+fn a_detached_child_never_delivers_a_terminal_to_its_parent() {
+    for policy in [
+        ParentClosePolicy::Abandon,
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.child_state = Some("COMPLETED");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::Retire,
+            "a detached child's terminal is not the parent's business"
+        );
+    }
+}
+
+#[test]
+fn a_closed_parent_cascades_to_its_running_cross_shard_detached_children() {
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.parent_terminal = Some(true);
+        obs.child_state = Some("RUNNING");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::ApplyCloseCascade,
+            "policy {policy:?} must reach a cross-shard child"
+        );
+    }
+}
+
+#[test]
+fn abandon_never_cascades() {
+    let mut obs = detached(CrossShardChildStatus::Started, ParentClosePolicy::Abandon);
+    obs.parent_terminal = Some(true);
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Retire,
+        "Abandon means the child keeps running and the row is owed nothing"
+    );
+}
+
+/// **Regression (Codex round 4, P2).** An `Abandon` row must be retired as soon
+/// as the child exists — not held until the child or the parent terminates.
+///
+/// `Abandon` is owed nothing after the start: no terminal to deliver, and by
+/// definition no cascade. Holding the row until the child ends is unbounded in
+/// exactly the case the policy exists for — a long-lived or never-terminating
+/// detached child — so repeated detached fan-out would grow the table and the
+/// per-sweep poll set without limit.
+#[test]
+fn an_abandon_row_retires_once_the_child_has_started() {
+    // Still starting: the row's one job is not done yet.
+    let pending = detached(
+        CrossShardChildStatus::PendingStart,
+        ParentClosePolicy::Abandon,
+    );
+    assert_eq!(
+        next_cross_shard_child_action(&pending),
+        CrossShardChildAction::StartChild
+    );
+
+    // Started, child running, parent alive: nothing further is owed.
+    let mut started = detached(CrossShardChildStatus::Started, ParentClosePolicy::Abandon);
+    started.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&started),
+        CrossShardChildAction::Retire,
+        "an Abandon row must not be held for the child's whole lifetime"
+    );
+
+    // Even with the parent state unreadable — the decision does not depend on it.
+    started.parent_terminal = None;
+    assert_eq!(
+        next_cross_shard_child_action(&started),
+        CrossShardChildAction::Retire
+    );
+}
+
+/// The non-`Abandon` policies still hold their row until the cascade is owed.
+#[test]
+fn a_cascading_policy_holds_its_row_until_the_parent_closes() {
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.child_state = Some("RUNNING");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::Wait,
+            "{policy:?} still owes a cascade if the parent closes"
+        );
+    }
+}
+
+#[test]
+fn an_awaited_child_outliving_a_closed_parent_retires_the_row() {
+    // Parity with the same-shard contract: an awaited child can outlive a
+    // cancelled or terminated parent. There is nobody left to wake, so the row
+    // must be dropped rather than polled forever.
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = Some(true);
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Retire
+    );
+}
+
+#[test]
+fn a_terminal_child_still_delivers_even_when_the_parent_has_closed() {
+    // The delivery step itself re-checks the parent under `FOR UPDATE` and
+    // skips the append when it is terminal (mirroring
+    // `notify_awaited_parent_of_child_terminal`), so preferring delivery here
+    // is the safe ordering: it can degrade to a row-delete, whereas retiring
+    // first would drop a wake the parent could still legitimately consume.
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = Some(true);
+    obs.child_state = Some("COMPLETED");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::DeliverTerminal
+    );
+}
+
+#[test]
+fn a_child_row_not_yet_visible_on_the_target_shard_waits() {
+    let obs = awaited(CrossShardChildStatus::Started);
+    assert_eq!(obs.child_state, None);
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Wait
+    );
+}
+
+/// **Regression (Codex round 1, P1).** A sweep that could not read the parents
+/// must decide nothing destructive.
+///
+/// `Retire` deletes the outbox row outright with no second look at the parent,
+/// so collapsing a transient parent-read failure into "the parent is terminal"
+/// permanently loses the terminal wake of every awaited cross-shard child in the
+/// batch — and cascade-cancels detached children whose parents are alive. The
+/// unknown state is `None`, and only `Some(true)` retires or cascades.
+#[test]
+fn an_unreadable_parent_state_never_retires_or_cascades() {
+    // Awaited, child still running, parent unknown -> wait, never retire.
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = None;
+    obs.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::Wait,
+        "an unread parent must not retire an awaited child's row"
+    );
+
+    // Detached with a CASCADING policy, child still running, parent unknown ->
+    // wait, never cascade. `Abandon` is excluded deliberately: it retires
+    // regardless of the parent (it is owed no cascade at all), and retiring an
+    // Abandon row destroys nothing — the child is meant to outlive its parent
+    // and the row tracks no pending obligation.
+    for policy in [
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Terminate,
+    ] {
+        let mut obs = detached(CrossShardChildStatus::Started, policy);
+        obs.parent_terminal = None;
+        obs.child_state = Some("RUNNING");
+        assert_eq!(
+            next_cross_shard_child_action(&obs),
+            CrossShardChildAction::Wait,
+            "an unread parent must not cascade {policy:?} onto a live child"
+        );
+    }
+}
+
+/// The steps that do not depend on the parent still make progress while the
+/// parent read is failing — a parent-side blip must not stall child creation or
+/// a pending cancel.
+#[test]
+fn an_unreadable_parent_state_still_starts_and_cancels() {
+    let mut pending = awaited(CrossShardChildStatus::PendingStart);
+    pending.parent_terminal = None;
+    assert_eq!(
+        next_cross_shard_child_action(&pending),
+        CrossShardChildAction::StartChild
+    );
+
+    let mut cancelling = awaited(CrossShardChildStatus::Started);
+    cancelling.parent_terminal = None;
+    cancelling.cancel_requested = true;
+    cancelling.child_state = Some("RUNNING");
+    assert_eq!(
+        next_cross_shard_child_action(&cancelling),
+        CrossShardChildAction::CancelChild
+    );
+}
+
+/// A terminal child is still delivered while the parent read is failing: the
+/// delivery step re-reads the parent under `FOR UPDATE` and skips the append
+/// itself if it has sealed, so this is safe and avoids stalling every wake.
+#[test]
+fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
+    let mut obs = awaited(CrossShardChildStatus::Started);
+    obs.parent_terminal = None;
+    obs.child_state = Some("COMPLETED");
+    assert_eq!(
+        next_cross_shard_child_action(&obs),
+        CrossShardChildAction::DeliverTerminal
+    );
+}
+
+/// **Regression (Codex round 2, P1).** The child-terminal wake must be skipped
+/// when the parent lives on another shard.
+///
+/// `wake_parent_for_child_*` appends to the parent's history on the *child's*
+/// own connection. For a cross-shard child that connection is the target
+/// shard's database, where the parent row does not exist — and
+/// `store::append_single_event` requires it — so the append would `NotFound` and
+/// roll back the **child's entire terminal transaction**. The child would never
+/// settle, the relay would never have a terminal to deliver, and the parent
+/// would park forever: a silent, total failure of the feature.
+#[cfg(feature = "db")]
+#[test]
+fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
+    use autumn_harvest::worker::parent_is_on_another_shard;
+
+    let on_0 = ExecutionId::new_for_shard(ShardId::new(0));
+    let on_2 = ExecutionId::new_for_shard(ShardId::new(2));
+    assert!(
+        parent_is_on_another_shard(on_0, on_2),
+        "a parent on shard 0 and a child on shard 2 must be recognised as split"
+    );
+
+    // Same shard: the inline wake is correct and must NOT be skipped.
+    let also_0 = ExecutionId::new_for_shard(ShardId::new(0));
+    assert!(!parent_is_on_another_shard(on_0, also_0));
+
+    // The unencoded sentinel means "the parent's shard" by construction, on
+    // either side, so it is never cross-shard — the same normalisation the
+    // spawn path applies. Getting this wrong would divert an ordinary
+    // single-shard child's wake into a relay that will never run for it.
+    let unencoded = ExecutionId::new();
+    assert!(!parent_is_on_another_shard(unencoded, on_0));
+    assert!(!parent_is_on_another_shard(on_0, unencoded));
+    assert!(!parent_is_on_another_shard(unencoded, unencoded));
+}
+
+#[test]
+fn status_round_trips_through_its_database_representation() {
+    for status in [
+        CrossShardChildStatus::PendingStart,
+        CrossShardChildStatus::Started,
+    ] {
+        assert_eq!(
+            CrossShardChildStatus::from_db(status.as_db_str()),
+            Some(status)
+        );
+    }
+    assert_eq!(CrossShardChildStatus::from_db("NONSENSE"), None);
+}

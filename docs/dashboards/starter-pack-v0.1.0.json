@@ -1728,6 +1728,55 @@
           "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
         },
         {
+          "id": 933,
+          "type": "timeseries",
+          "title": "Codec key re-encryption",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 70
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (rate(harvest_codec_reencrypted_total[$__rate_interval]))",
+              "legendFormat": "shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Stored harvest_events rows re-encrypted from a retired payload-codec key onto the active one by the lazy rotation sweep (issue #948). Flat at zero while GET /api/harvest/admin/codec/rotation still reports rows remaining under a retired key id means the rotation has stalled."
+        },
+        {
           "id": 31,
           "type": "timeseries",
           "title": "Admission gates active",
@@ -5881,6 +5930,117 @@
         }
       ],
       "description": "Alert: harvest_replication_unobservable (docs/runbooks/harvest-alerts.md#harvest_replication_unobservable) Whether this shard's replication views can be read at all \u2014 usually a GRANT pg_monitor question. Read this panel FIRST: a Prometheus gauge keeps exporting its last value, so while this is 0 the RPO, standby-count and backlog panels above are frozen at their last healthy reading rather than reflecting reality."
+    },
+    {
+      "id": 950,
+      "type": "row",
+      "title": "Audit export to SIEM (issue #953)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 150
+      },
+      "panels": []
+    },
+    {
+      "id": 951,
+      "type": "timeseries",
+      "title": "Audit export lag (oldest unshipped audit record)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 151
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (shard) (harvest_audit_export_lag{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_audit_export_lag_high (docs/runbooks/harvest-alerts.md#harvest_audit_export_lag_high) Age in seconds of the OLDEST audit record the SIEM sink has not acknowledged, per shard. This is the compliance signal: a rising line means privileged-action logs are not reaching the SIEM, and the cursor is deliberately held rather than advanced past the failure, so nothing is lost \u2014 only late. A flat 0 means every audit record on the shard is acknowledged. A MISSING series means no exporter is running for that shard at all (check GET /admin/audit-export's sink_configured), which is worse than a high value, not better."
+    },
+    {
+      "id": 952,
+      "type": "timeseries",
+      "title": "Audit records exported (acknowledged by the sink)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 151
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard) (rate(harvest_audit_exported_total{shard=~\"$shard\"}[5m]))",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of audit records the sink acknowledged, per shard \u2014 counted only after the export cursor actually advanced, so this is a delivery rate, not an attempt rate. Delivery is at-least-once, so a redelivered batch counts again; receiver-side (shard, seq) accounting is the completeness proof, not this counter. Pair with the lag panel: throughput at zero while lag climbs is a sink outage; both healthy is a working export."
     }
   ]
 }

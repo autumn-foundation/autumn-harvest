@@ -227,8 +227,10 @@ mod tests {
         );
 
         // The FailRun timeout is a deterministic outcome, not a bug: the
-        // timer-first history replays to the same clean WorkflowFailed on every
-        // pass, never a NonDeterminismDetected.
+        // timer-first history reproduces the same failure on every pass, never a
+        // NonDeterminismDetected. (Issue #952: reproducing a recorded terminal
+        // failure IS a clean replay, so the verdict is `ReplaySucceeded` with the
+        // error in `failure_message()`.)
         let report = WorkflowReplayer::new()
             .register_fn(
                 "order_approval_pipeline",
@@ -236,8 +238,10 @@ mod tests {
             )
             .replay_from_events(outcome.events().to_vec())
             .await;
+        // Issue #952: a reproduced failure on a terminal-failure history reports
+        // `ReplaySucceeded`, carrying the error in `failure_message()`.
         assert!(
-            matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+            report.failure_message().is_some(),
             "AC5: a FailRun timeout must replay to the same deterministic FAILED \
              outcome, got: {report}"
         );

@@ -3422,6 +3422,74 @@ async fn park_workflow_task_inner(
     Ok(row.had_wake_requested)
 }
 
+/// Atomically read **and clear** a workflow task's `wake_requested` flag
+/// (issue #950).
+///
+/// [`park_workflow_task`] already does this as part of the same statement that
+/// parks the row, but the timer sub-path of a suspension parks via
+/// [`reschedule_task`] (`RUNNING` → `PENDING @ fires_at`), which does not touch
+/// the flag. A wake that landed on the still-claimed row *before* this
+/// transaction took its lock is recorded only as `wake_requested = TRUE`, and
+/// would otherwise be silently discarded by the reschedule — leaving the task
+/// asleep until its deadline even though the event it was waiting for already
+/// arrived. The generalized mixed-batch persist path calls this so the flag is
+/// honoured on the reschedule sub-path too.
+///
+/// A wake landing *after* this call blocks on the row lock this statement takes
+/// and is re-evaluated against the committed row, where
+/// [`primary_repend_workflow_task_query`]'s `mixed_signal_suspension` arm pulls
+/// the `PENDING` row forward — so no wake can fall between the two.
+///
+/// Returns `true` only when the flag was set; `false` both when it was already
+/// clear and when the task row no longer exists.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn take_wake_requested(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<bool> {
+    use diesel::deserialize::QueryableByName;
+    use diesel::sql_types::Bool;
+
+    #[derive(QueryableByName)]
+    struct WakeRequestedRow {
+        #[diesel(sql_type = Bool)]
+        had_wake_requested: bool,
+    }
+
+    let rows: Vec<WakeRequestedRow> = diesel::sql_query(take_wake_requested_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .next()
+        .is_some_and(|r| r.had_wake_requested))
+}
+
+/// SQL for [`take_wake_requested`]. Extracted as a `const fn` so the
+/// `candidate`/`updated` CTE split (which captures `wake_requested` before
+/// clearing it) is unit-testable without a database.
+const fn take_wake_requested_query() -> &'static str {
+    "WITH candidate AS ( \
+         SELECT id, wake_requested FROM harvest_task_queue \
+         WHERE id = $1 AND task_type = 'workflow' \
+         FOR UPDATE \
+     ), \
+     updated AS ( \
+         UPDATE harvest_task_queue t \
+         SET wake_requested = FALSE \
+         FROM candidate \
+         WHERE t.id = candidate.id \
+         RETURNING candidate.wake_requested AS had_wake_requested \
+     ) \
+     SELECT had_wake_requested FROM updated"
+}
+
 /// SQL for [`park_workflow_task`] when a sticky hint is supplied. Extracted as
 /// a `const fn` so its shape (the `candidate`/`updated` CTE split that captures
 /// `wake_requested` before clearing it) is unit-testable without a database.
@@ -5837,6 +5905,44 @@ mod tests {
              release_task_for_capability_miss_query's AfterHandler phase, which \
              resets crash_strikes for the identical 'the body reached a conclusion \
              on this worker' reason (Codex review round 4 of #1182)",
+        );
+    }
+
+    /// [`take_wake_requested`]'s SQL must read `wake_requested` under the row
+    /// lock and return the **pre-update** value, exactly like the park queries —
+    /// a plain `UPDATE ... RETURNING wake_requested` would return the
+    /// just-cleared `FALSE` and silently swallow every wake it exists to catch.
+    #[test]
+    fn take_wake_requested_query_captures_the_flag_before_clearing_it() {
+        let sql = take_wake_requested_query();
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "must lock the row before reading wake_requested, closing the gap with \
+             wake_workflow_task's fallback UPDATE",
+        );
+        assert!(sql.contains("SELECT id, wake_requested FROM harvest_task_queue"));
+        assert!(
+            sql.contains("wake_requested = FALSE"),
+            "must clear the flag as part of the same statement that reads it",
+        );
+        assert!(
+            sql.contains("RETURNING candidate.wake_requested AS had_wake_requested"),
+            "must return the PRE-update value (from the candidate CTE), not the \
+             just-cleared post-update value",
+        );
+        // Deliberately NOT filtered on `state = 'RUNNING'` (unlike the park
+        // queries): this runs from inside the persist transaction against a row
+        // this worker already holds claimed, and on the reschedule sub-path it is
+        // called either side of the `RUNNING` -> `PENDING` transition. Scoped to
+        // workflow rows so it can never touch an activity task.
+        assert!(
+            sql.contains("task_type = 'workflow'"),
+            "must be scoped to workflow task rows",
+        );
+        assert!(
+            !sql.contains("state = 'RUNNING'"),
+            "must NOT require RUNNING: the reschedule sub-path calls this around \
+             the state transition itself",
         );
     }
 

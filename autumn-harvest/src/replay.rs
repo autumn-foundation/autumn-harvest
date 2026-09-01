@@ -727,6 +727,24 @@ pub struct HistoryMatcher {
     /// blocked scan as a divergence in NORMAL worker replay too, not only under
     /// strict `WorkflowReplayer` mode (Codex P2 round 12, issue #768).
     timer_scan_stopped_at_command: bool,
+    /// Index of the first event of a **terminal-failure tail** (issue #952), or
+    /// `None` when this history does not end in a failure.
+    ///
+    /// A failing decision cycle's history is truncated by construction: the
+    /// commands the cycle issued were never turned into events, and no further
+    /// event can ever be appended to the sealed run. So a trailing terminal
+    /// `WorkflowFailed` (together with any post-terminal bookkeeping appended
+    /// after it) is made transparent in [`Self::new`] — every `match_*` at that
+    /// cursor answers `NoMatch` ("the run is failing") instead of `Diverged` —
+    /// and, once every pre-terminal event is consumed, the cursor is said to be
+    /// at the **failing frontier** ([`Self::at_terminal_failure_frontier`]),
+    /// where the strict-replay layers above stop reporting divergence.
+    ///
+    /// Deliberately failure-only: a `WorkflowCompleted`/`WorkflowCancelled`
+    /// history is verified in full, and a `WorkflowFailed` that is *reopened* by
+    /// a `WorkflowRedriven` (#510) is not a tail — that case keeps its own,
+    /// redrive-anchored transparency rule.
+    terminal_failure_tail: Option<usize>,
 }
 
 impl HistoryMatcher {
@@ -753,15 +771,24 @@ impl HistoryMatcher {
         // made transparent. A bare trailing `WorkflowFailed` with no following
         // redrive stays non-transparent — it is a genuinely failed run and its
         // replay (queries, the replayer harness) must be unaffected.
+        let mut last_redrive: Option<usize> = None;
         for (i, event) in events.iter().enumerate() {
             if Self::is_redrive_lifecycle_event(event) {
+                last_redrive = Some(i);
                 transparent_events.insert(i);
                 // Scan backward to the nearest WorkflowFailed, skipping events
-                // already settled transparent (e.g. an interleaved pause pair).
+                // already settled transparent (e.g. an interleaved pause pair)
+                // and post-terminal bookkeeping appended AFTER the terminal
+                // (a workflow-level retry's `WorkflowRetryScheduled` (#523), a
+                // parent-close cascade's `ChildWorkflowCascadeApplied` (#347)) —
+                // without that skip a retried-then-redriven run would leave its
+                // superseded terminal opaque and diverge against it.
                 let mut j = i;
                 while j > 0 {
                     j -= 1;
-                    if transparent_events.contains(&j) {
+                    if transparent_events.contains(&j)
+                        || Self::is_post_terminal_bookkeeping(&events[j])
+                    {
                         continue;
                     }
                     if matches!(events[j], WorkflowEvent::WorkflowFailed { .. }) {
@@ -769,6 +796,38 @@ impl HistoryMatcher {
                     }
                     break;
                 }
+            }
+        }
+        // Issue #952 x #510: a redrive REOPENS a run that a failing cycle sealed,
+        // and that cycle recorded the awaited work it abandoned (see
+        // `crate::event::ABANDONED_DISPATCH_REASON`). Those records exist to keep
+        // the audit trail honest about a run that is over — they must never
+        // become history the reopened run replays, or the redriven cycle would
+        // read back "this activity/child failed" and could never re-issue the
+        // dispatch the operator redrove it to complete. Mark each abandoned pair
+        // transparent so the reopened run emits it live, exactly as it did
+        // before #952 recorded anything at all.
+        //
+        // Bounded by the LAST redrive (Codex P1 round 1): only a cycle a
+        // redrive actually superseded is re-opened work. A run that was
+        // redriven and then failed AGAIN wrote fresh abandoned pairs after that
+        // redrive; those belong to the terminal-failure tail's own cycle and
+        // stay opaque, so a replay resolves them from their synthetic terminal
+        // and re-derives the failure path the recorded run took instead of
+        // parking on a dispatch that never resolves.
+        if let Some(redrive_idx) = last_redrive {
+            for i in Self::abandoned_dispatch_indices(&events[..redrive_idx]) {
+                transparent_events.insert(i);
+            }
+        }
+        // Terminal-failure tail (issue #952): a run sealed FAILED can never
+        // grow another event, so everything from its terminal event onward is
+        // transparent to command-dispatch replay — mirroring how the
+        // pause/resume and redrive events above are pre-marked consumed.
+        let terminal_failure_tail = Self::terminal_failure_tail_start(&events);
+        if let Some(start) = terminal_failure_tail {
+            for i in start..events.len() {
+                transparent_events.insert(i);
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
@@ -788,7 +847,156 @@ impl HistoryMatcher {
             deprecated_patches: HashMap::new(),
             patch_ids_recorded_this_cycle: HashSet::new(),
             timer_scan_stopped_at_command: false,
+            terminal_failure_tail,
         }
+    }
+
+    /// Index of the first event of this history's **terminal-failure tail**, or
+    /// `None` if it has none (issue #952).
+    ///
+    /// Walks backwards from the end over events that carry no workflow command
+    /// and are never consumed by the workflow function — operator pause/resume
+    /// (#383) and post-terminal bookkeeping appended *after* a terminal event
+    /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
+    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). If the
+    /// first event it lands on is a `WorkflowFailed`, that index opens the tail.
+    ///
+    /// A `WorkflowRedriven` (#510) is deliberately **not** skipped: a redriven
+    /// run is reopened, not failing, and keeps the narrower redrive-anchored
+    /// transparency instead.
+    ///
+    /// Public so [`crate::testing`] can ask the same question of a snapshot's
+    /// events without building a matcher — one definition, two callers.
+    #[must_use]
+    pub fn terminal_failure_tail_start(events: &[WorkflowEvent]) -> Option<usize> {
+        let mut idx = events.len();
+        while idx > 0 {
+            idx -= 1;
+            let event = &events[idx];
+            if Self::is_pause_lifecycle_event(event) || Self::is_post_terminal_bookkeeping(event) {
+                continue;
+            }
+            // `idx > 0` guard: a history whose FIRST event is the terminal
+            // failure is not a run that failed after doing something — it is a
+            // truncated or corrupt export (a real run always opens with
+            // `WorkflowStarted`). Excusing everything a candidate build does
+            // against such a fixture would let a malformed export pass the gate
+            // unconditionally, so it keeps the pre-#952 strict treatment.
+            return (idx > 0 && matches!(event, WorkflowEvent::WorkflowFailed { .. }))
+                .then_some(idx);
+        }
+        None
+    }
+
+    /// Events appended **after** a run's terminal event as durable bookkeeping.
+    /// They have no workflow-command counterpart and are never consumed by the
+    /// workflow function, so they cannot end a terminal-failure tail.
+    const fn is_post_terminal_bookkeeping(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::WorkflowRetryScheduled { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+        )
+    }
+
+    /// Indices of the **abandoned-dispatch records** a failing cycle wrote
+    /// (issue #952): each `ActivityFailed` / `ChildWorkflowFailed` carrying
+    /// [`crate::event::ABANDONED_DISPATCH_REASON`], together with the
+    /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
+    /// precedes it.
+    ///
+    /// `events` is the **prefix of history the caller wants scanned** (see
+    /// [`Self::new`]: everything before the last `WorkflowRedriven`), so the
+    /// returned indices are always valid indices into the full history too.
+    ///
+    /// The reason constant is the engine's own reserved marker — the same device
+    /// as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
+    /// `fan_out:{n}` markers (#601). For a child terminal, whose `error` carries
+    /// the CHILD's own author string, the reason is matched together with the
+    /// exact shape the engine writes (untyped, non-retryable) so an author
+    /// message that happens to collide keeps its genuine terminal.
+    fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
+        let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                // An activity's `error` is the ACTIVITY author's own message,
+                // exactly as a child's is (Codex P2 round 2), so the reason
+                // string alone is not proof the engine wrote this event. Pair it
+                // with the full shape `abandoned_dispatch_events` writes —
+                // first attempt, untyped `"Error"` class, non-retryable, no
+                // structured details — so a genuine activity failure that
+                // happens to return this message keeps its real terminal
+                // instead of being re-dispatched (and its side effects
+                // repeated) by a redriven run.
+                WorkflowEvent::ActivityFailed {
+                    activity_id,
+                    error,
+                    attempt: 1,
+                    error_type,
+                    non_retryable: true,
+                    details: None,
+                } if error == crate::event::ABANDONED_DISPATCH_REASON && error_type == "Error" => {
+                    abandoned_activities.insert(*activity_id);
+                    indices.push(i);
+                }
+                // A child's `error` is normally the CHILD's own author-produced
+                // string, so the reason alone is not proof the engine wrote this
+                // event. Pair it with the exact shape the engine writes — untyped
+                // and non-retryable — so a child that coincidentally returns the
+                // same message keeps its genuine terminal.
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id,
+                    error,
+                    error_type: None,
+                    details: None,
+                    non_retryable: Some(true),
+                } if error == crate::event::ABANDONED_DISPATCH_REASON => {
+                    abandoned_children.insert(*child_id);
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        if indices.is_empty() {
+            return indices;
+        }
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                    if abandoned_activities.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                    if abandoned_children.contains(child_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
+    }
+
+    /// Whether this history ends in a terminal failure (issue #952).
+    #[must_use]
+    pub const fn has_terminal_failure_tail(&self) -> bool {
+        self.terminal_failure_tail.is_some()
+    }
+
+    /// Whether the cursor has consumed every pre-terminal event of a history
+    /// that ends in a terminal failure — the **failing frontier** (issue #952).
+    ///
+    /// Past this point the recorded history says only "the run failed here", so
+    /// a new command, an early return, or a park is not a divergence: there is
+    /// nothing left to compare against. Callers use it to suppress strict-replay
+    /// divergence reporting; it is never used to skip a *positional* match
+    /// against a real recorded event.
+    #[must_use]
+    pub fn at_terminal_failure_frontier(&self) -> bool {
+        self.has_terminal_failure_tail() && !self.is_replaying()
     }
 
     /// Returns whether the most recent cancellable-timer forward scan STOPPED at
@@ -4362,6 +4570,48 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, None)
+    }
+
+    /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
+    ///
+    /// Identical scanning, with one difference: an interleaved event this scan
+    /// does not recognise never diverges — it is crossed as a sibling command
+    /// and the scan continues, and reaching the end of history without the
+    /// signal returns [`HistoryMatch::NoMatch`] rather than a divergence.
+    ///
+    /// `match_signal`'s divergence-on-stray-event behaviour exists for a *solo*
+    /// `wait_for_signal`: if the workflow expected a signal at this cursor and
+    /// history holds something else, that is a real code/history disagreement,
+    /// and parking on a signal that will never arrive would hang the workflow
+    /// forever (issue #768 round 13). Inside a `ctx.race()` neither premise
+    /// holds. Sibling branches legitimately record their own dispatch and
+    /// terminal events around this one — that is the whole point of a mixed
+    /// batch — and a signal branch that simply lost the race has **no recorded
+    /// event at all**, which is the normal outcome, not a divergence. A race
+    /// branch also cannot hang the workflow on a never-arriving signal: some
+    /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
+    /// outcome for every later replay.
+    /// `settle_marker` is this race's own `race_winner:{seq}` marker name; it
+    /// **bounds** the scan. A `SignalReceived` recorded at or after that marker
+    /// was delivered once the race had already resolved, so it cannot be this
+    /// branch's resolution — it belongs to a later waiter. Without the bound a
+    /// *losing* signal branch would scan to end-of-history and silently consume
+    /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
+    /// a signal already delivered.
+    pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, Some(settle_marker))
+    }
+
+    /// `tolerate_interleaved` carries the race's settlement-marker name when the
+    /// caller is a `ctx.race()` branch, and is `None` for a solo
+    /// `wait_for_signal`.
+    #[allow(clippy::too_many_lines)]
+    fn match_signal_inner(
+        &mut self,
+        signal_name: &str,
+        tolerate_interleaved: Option<&str>,
+    ) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
             .iter()
@@ -4378,6 +4628,13 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_command = None;
+        // `first_interleaved_command` is the rewind target: on a win the cursor
+        // returns to the first sibling command crossed, so each one is claimed by
+        // its own matcher in program order. It is NOT a verdict — a crossed
+        // command may belong to a sibling branch of this decision (a #950 mixed
+        // batch, which parks) or be stray (issue #768 round 13, which must
+        // nd-block), and this scan runs too early to tell. See the sibling-command
+        // arm below for why that verdict is deferred to the end of the cycle.
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
@@ -4448,23 +4705,96 @@ impl HistoryMatcher {
                 {
                     scan_cursor += 1;
                 }
-                // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
-                // — e.g. a `[CancelTimer, TimerStarted]` reset, or a
-                // `[CancelTimer, WaitForSignal]` batch from a
-                // `cancel_timer()`/`reset()` in the same cycle as a
-                // `wait_for_signal`, or a push signal handler resetting a timer
-                // — is transparent to the signal scan. A `reset()` records
-                // `[TimerCancelled, TimerStarted]`, so BOTH must be skipped: on a
-                // `wait_for_signal` polled before a same-cycle reset branch, the
-                // history before the signal is `TimerCancelled, TimerStarted`, and
-                // stopping on the re-arm would wrongly report a missing signal
-                // (Codex P2, issue #768). Rewind WITHOUT consuming so each event's
-                // own claimer (`match_timer_cancel` / `match_timer_arm`) can still
-                // claim it exactly once (mirrors `scan_activity_terminal`).
-                WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                // Issue #950: a race branch's scan stops at its OWN settlement
+                // marker. This arm MUST precede the generic sibling-command arm
+                // below, which also matches `MarkerRecorded` and would otherwise
+                // swallow the bound — letting a losing signal branch scan past
+                // the resolved race and consume a signal belonging to a later
+                // `ctx.wait_for_signal`.
+                WorkflowEvent::MarkerRecorded { name, .. }
+                    if tolerate_interleaved == Some(name.as_str()) =>
+                {
+                    return HistoryMatch::NoMatch;
+                }
+                // An interleaved sibling COMMAND. Cross it as an interleaved
+                // command (rewind to it on a win, so its own matcher claims it in
+                // program order) and keep scanning for the awaited signal.
+                //
+                // Two histories put a command here and they are NOT
+                // distinguishable at this point:
+                //
+                //   * a sibling branch of THIS decision (issue #950) —
+                //     `join!(ctx.wait_for_signal(..), ctx.timer(..))` or
+                //     `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`.
+                //     `join!` polls the signal first, so the batch records the
+                //     sibling's `TimerStarted`/`ActivityScheduled` and nothing for
+                //     the signal wait; on the next drive this scan starts ON that
+                //     event, and the sibling's own `match_timer_strict` /
+                //     `scan_activity_terminal` claims it later in the same cycle.
+                //     The correct outcome is a park.
+                //   * a STRAY command left by code that no longer runs (issue #768
+                //     round 13, and the `[TimerCancelled, TimerStarted]` pair a
+                //     same-cycle `reset()` records). Nothing claims it, and
+                //     parking would wait forever on a signal that never arrives.
+                //
+                // What separates them is not the event, it is whether anything in
+                // this decision claims it — which this scan cannot know, because it
+                // runs BEFORE the sibling branches are polled. So it crosses
+                // everything NON-CONSUMINGLY (each event stays claimable exactly
+                // once by `match_timer_cancel` / `match_timer_arm` / etc.) and
+                // leaves the verdict to the end of the cycle, where `executor.rs`
+                // fails the workflow if `history_has_unconsumed_events()`.
+                //
+                // Round 13's protection is preserved in OUTCOME — pinned by
+                // `interleaved_sibling_signal_stray_timer_started_still_diverges`
+                // — while the mixed batch parks, pinned by
+                // `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`.
+                // Deciding here instead is what left an advertised mixed
+                // composition nd-blocked on its first wake (Codex round 3 on PR
+                // #1245); it is also the choice already made for
+                // `wait_for_signal_timeout`'s strict-`Suspended` arm.
+                //
+                // This completes the "full mixed-batch parity for the signal
+                // wait" that issue #1071 scoped out; the sets mirror
+                // `match_timer_strict` / `scan_activity_terminal` — keep them in
+                // sync.
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
                 | WorkflowEvent::TimerCancelled { .. }
                 | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Progress and terminal events of those concurrent siblings —
+                // and a foreign timer's fire (a sibling deadline that fired
+                // before the awaited signal arrived, e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same batch whose
+                // `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`, issue #1071 manifestation #3) — are
+                // transparent to this scan. Cross them NON-CONSUMINGLY, leaving
+                // each for its own matcher to claim, and keep scanning for the
+                // awaited signal. The same treatment `match_timer_strict` and
+                // `scan_activity_terminal` give their sibling terminals; keep the
+                // three sets in sync (issue #1071 / #950).
+                //
+                // Crossing non-consumingly is what keeps round 13's protection
+                // intact without a scan-time guess: a lone stale `TimerFired` (or
+                // any other event here) that no branch of this decision claims is
+                // still unconsumed at suspend and nd-blocks there.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
                 // ExternalSignal event triplets can appear before SignalReceived
@@ -4594,31 +4924,27 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // A foreign timer's fire — a sibling deadline timer that fired
-                // before the awaited signal arrived (e.g. a concurrent
-                // `receive_signal_timeout`/`ctx.timer` in the same suspension
-                // batch, whose `TimerFired` is recorded ahead of the delivered
-                // `SignalReceived`) — is transparent to the signal scan. Cross
-                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
-                // keep scanning for the awaited signal (issue #1071
-                // manifestation #3). This does NOT set `first_interleaved_command`,
-                // so the round-13 stray-`TimerStarted` park-forever guard below
-                // (an interleaved timer with NO resolving signal → diverge) is
-                // untouched: a lone `TimerStarted` still diverges.
-                //
-                // DELIBERATE PARTIAL SCOPE (issue #1071): only the TIMER sibling
-                // is tolerated in `match_signal` — the sole case the issue's
-                // three comments name. An interleaved activity/child/local-activity
-                // sibling in a `join!(wait_for_signal, activity)` mixed batch is
-                // NOT crossed here and still falls through to `other =>` as a
-                // divergence. Full mixed-batch parity for the signal wait is out
-                // of scope; the fuller interleaved sets live in
-                // `match_timer_strict` / `scan_activity_terminal` /
-                // `match_signal_or_timer`.
-                WorkflowEvent::TimerFired { .. } => {
-                    scan_cursor += 1;
-                }
                 other => {
+                    // Issue #950: inside a race, an unrecognised event is a
+                    // sibling branch's own command/terminal, not a divergence —
+                    // cross it as an interleaved command (so a later win rewinds
+                    // the cursor to it for its own claimer) and keep scanning,
+                    // bounded by the race's own settlement marker.
+                    //
+                    // Checked BEFORE the `is_some()` early-return below. That
+                    // guard is what makes the SOLO wait stop after one crossed
+                    // event, and since this arm is what SETS
+                    // `first_interleaved_command`, ordering it second would let a
+                    // race branch cross exactly one event and then bail — while
+                    // the normal shape is two (`ActivityScheduled` +
+                    // `ActivityStarted`) before the signal.
+                    // The settlement-marker bound is applied by its own arm
+                    // above, ahead of the sibling-command arm.
+                    if tolerate_interleaved.is_some() {
+                        first_interleaved_command.get_or_insert(scan_cursor);
+                        scan_cursor += 1;
+                        continue;
+                    }
                     if first_interleaved_command.is_some() {
                         return HistoryMatch::NoMatch;
                     }
@@ -4633,26 +4959,27 @@ impl HistoryMatcher {
         }
 
         // The signal scan reached the end of history without finding the
-        // signal. If it crossed one or more UNCONSUMED interleaved
-        // timer/detached-spawn commands (issue #768) on the way, those events
-        // are a divergence boundary — NOT a swallowed suspend. An already-
-        // consumed reset's timers (claimed by a companion `match_timer_cancel`/
-        // `match_timer_arm` earlier this cycle) are skipped at the top of the
-        // loop and never set `first_interleaved_command`, so a genuine
-        // "signal has not arrived yet" suspend still returns `NoMatch` and
-        // parks correctly. But a STRAY unconsumed `TimerStarted`/`TimerCancelled`
-        // where the workflow expected a signal must diverge (→ NonDeterministic
-        // / #603 nd-block) rather than push a `WaitForSignal` command and park
-        // the workflow forever on a signal that will never arrive
-        // (round 13 regression fix, issue #768).
-        if let Some(first) = first_interleaved_command {
-            return HistoryMatch::Diverged {
-                expected: format!("SignalReceived({signal_name})"),
-                actual: Self::actual_event_name(&self.events[first]),
-                event_index: i32::try_from(first).ok(),
-            };
-        }
-
+        // signal: the awaited signal has not arrived yet, so this wait parks.
+        //
+        // Any interleaved command crossed on the way (a sibling's
+        // `ActivityScheduled`/`ChildWorkflowStarted`, or a `TimerStarted`/
+        // `TimerCancelled`/detached spawn) was crossed NON-CONSUMINGLY, so it is
+        // left for its own claimer. That is what makes returning `NoMatch` here
+        // safe for BOTH readings of a crossed command:
+        //
+        //   * a sibling branch of this decision claims it later in the same
+        //     cycle (the #950 mixed batch) → the frontier is clean when the body
+        //     suspends and the park is correct;
+        //   * nothing claims it (a stray left by code that no longer runs, issue
+        //     #768 round 13) → it is still unconsumed at suspend, and
+        //     `executor.rs`'s `history_has_unconsumed_events()` guard nd-blocks
+        //     the workflow instead of letting it park forever on a signal that
+        //     will never arrive.
+        //
+        // Deciding that here instead would mean guessing, since this scan runs
+        // before the sibling branches of the same decision are polled — which is
+        // exactly how an advertised `join!(wait_for_signal, ctx.timer)` came to
+        // be nd-blocked on its first wake (Codex round 3 on PR #1245).
         HistoryMatch::NoMatch
     }
 
@@ -6699,6 +7026,58 @@ impl HistoryMatcher {
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in
     /// both cases safe to call speculatively.
+    /// Whether any unclaimed `SignalReceived { signal_name }` remains — either
+    /// already stashed in `pending_signals`, or still unconsumed at/after the
+    /// current cursor (issue #950).
+    ///
+    /// A **pure read**: consumes nothing and never moves the cursor. Used by the
+    /// strict/canary replay frontier test for a signal wait, where "cursor at end
+    /// of history" is the wrong question: a mixed suspension batch legitimately
+    /// leaves a SIBLING branch's events unconsumed ahead of the cursor while the
+    /// signal wait itself has nothing to match. What actually distinguishes a
+    /// healthy in-flight park from a real divergence is whether a matching signal
+    /// is still available anywhere.
+    #[must_use]
+    pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
+        if self
+            .pending_signals
+            .iter()
+            .any(|(name, _, _)| name == signal_name)
+        {
+            return true;
+        }
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(
+                        e,
+                        WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                    )
+            })
+    }
+
+    /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
+    /// after the current cursor (issue #950).
+    ///
+    /// A **pure read**: unlike [`Self::peek_u64_marker`] it consumes nothing and
+    /// never moves the cursor, so it is safe to call mid-decision (e.g. between
+    /// a race's branch checks) where a consuming peek would steal the marker
+    /// from the settling step that owns it.
+    #[must_use]
+    pub fn has_unconsumed_marker(&self, marker_name: &str) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name)
+            })
+    }
+
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;
@@ -9572,18 +9951,39 @@ mod tests {
     }
 
     #[test]
-    fn matcher_signal_scan_diverges_on_unconsumed_stray_timer() {
-        // Round 13 regression fix (issue #768): a `wait_for_signal` over a
-        // history carrying a STRAY, unconsumed `TimerStarted` and NO matching
-        // signal must DIVERGE — not silently reach the end of the scan and
-        // return `NoMatch` (which `wait_for_signal` would turn into a
-        // `WaitForSignal` command + `rx.await`, parking a genuinely-diverged
-        // workflow forever instead of nd-blocking, #603).
+    fn matcher_signal_scan_leaves_a_stray_timer_unconsumed_for_the_cycle_guard() {
+        // Round 13 (issue #768) requires that a `wait_for_signal` over a history
+        // carrying a STRAY, unconsumed `TimerStarted` and no matching signal
+        // nd-blocks rather than parking forever on a signal that will never
+        // arrive (#603).
+        //
+        // Issue #950 moved WHERE that is decided. The matcher used to diverge
+        // here, but at scan time a stray timer is indistinguishable from the
+        // timer of an advertised `join!(wait_for_signal, ctx.timer)` mixed batch,
+        // whose sibling branch has not been polled yet — so diverging here
+        // nd-blocked a supported composition on its first wake (Codex round 3 on
+        // PR #1245). The scan now returns `NoMatch` and, crucially, leaves the
+        // event UNCONSUMED; the decision is made at the end of the cycle, where
+        // `executor.rs`'s `history_has_unconsumed_events()` sees that nothing
+        // claimed it and fails the workflow.
+        //
+        // So this asserts the two halves the cycle guard needs, not a verdict:
+        // park, and the stray event still unclaimed. The round-13 OUTCOME is
+        // pinned end-to-end by the integration test
+        // `interleaved_sibling_signal_stray_timer_started_still_diverges`, which
+        // asserts the replay is reported as non-determinism.
         let events = vec![ts("timer-1", 10)];
         let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_signal("my-signal"),
+            HistoryMatch::NoMatch,
+            "the scan must park rather than guess; the stray timer is caught at \
+             the end of the cycle"
+        );
         assert!(
-            matches!(m.match_signal("my-signal"), HistoryMatch::Diverged { .. }),
-            "a stray unconsumed TimerStarted where a signal was expected must diverge, not suspend"
+            !m.is_consumed(0),
+            "the stray timer must be left UNCONSUMED — that is the whole signal \
+             `history_has_unconsumed_events()` keys on to nd-block the run"
         );
     }
 
@@ -9852,11 +10252,15 @@ mod tests {
         );
     }
 
+    // ── Terminal-failure tail transparency tests (issue #952) ─────────────
+
+    /// Superseded by issue #952: a bare trailing `WorkflowFailed` used to stay
+    /// opaque, which made every in-progress `match_*` on a failed run diverge
+    /// (see the two known-limitation tests in `tests/integration/replayer_tests.rs`).
+    /// It is now transparent — a failing cycle's history is truncated by
+    /// construction, so there is nothing past the failure point to verify.
     #[test]
-    fn bare_trailing_failed_stays_non_transparent() {
-        // Regression guard: a genuinely failed run (no following WorkflowRedriven)
-        // must keep its terminal WorkflowFailed non-transparent so the replay of
-        // failed workflows (queries, the replayer harness) is unaffected.
+    fn bare_trailing_failed_is_transparent() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -9869,8 +10273,483 @@ mod tests {
         ];
         let matcher = HistoryMatcher::new(events);
         assert!(
+            matcher.is_consumed(1),
+            "a bare trailing WorkflowFailed must be transparent to in-progress matches"
+        );
+        assert!(matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn in_progress_match_past_a_trailing_failed_is_no_match_not_diverged() {
+        // The whole point of the tail: a workflow that issues a match attempt
+        // and only then fails (a payload-cap / missing-handler / missing-store
+        // check) must observe "the run is failing" (NoMatch), not a divergence.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("payload too large"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("some_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a match attempt at the failing frontier must not diverge"
+        );
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "all pre-terminal events consumed → the cursor is at the failing frontier"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_tail_spans_post_terminal_bookkeeping() {
+        // A workflow-level retry (#523) appends WorkflowRetryScheduled AFTER the
+        // sealed run's WorkflowFailed. The tail must still be recognised, and
+        // every event in it transparent, or the retried run's history would keep
+        // false-flagging.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the WorkflowFailed must be transparent"
+        );
+        assert!(
+            matcher.is_consumed(2),
+            "post-terminal bookkeeping in the tail must be transparent too"
+        );
+    }
+
+    #[test]
+    fn a_failed_event_followed_by_real_history_is_not_a_tail() {
+        // Guard against over-reach: only the LAST terminal block is transparent.
+        // A WorkflowFailed with genuine command history after it (the #510
+        // redrive shape, here without the redrive marker) must keep today's
+        // behaviour — the redrive-anchored rule, not the tail rule, decides.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
             !matcher.is_consumed(1),
-            "a bare trailing WorkflowFailed must not be marked transparent"
+            "a WorkflowFailed with real history after it is not a terminal tail"
+        );
+        assert!(!matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn completed_and_cancelled_tails_are_not_terminal_failure_tails() {
+        // The relaxation is failure-only: a COMPLETED history is verified in
+        // full, so its terminal event must stay opaque (an extra command at that
+        // cursor is a genuine early-completion divergence).
+        for terminal in [
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+        ] {
+            let events = vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: chrono::Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+                terminal,
+            ];
+            let matcher = HistoryMatcher::new(events);
+            assert!(
+                !matcher.has_terminal_failure_tail(),
+                "only WorkflowFailed opens a terminal-failure tail"
+            );
+            assert!(!matcher.is_consumed(1));
+        }
+    }
+
+    #[test]
+    fn redrive_tail_is_not_a_terminal_failure_tail() {
+        // A redriven run is REOPENED, not failing: the #510 rule already makes
+        // its superseded terminal transparent, and the failing-frontier
+        // relaxations (which suppress strict-replay divergence reporting) must
+        // NOT apply to it.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.has_terminal_failure_tail(),
+            "a redrive reopens the run; it is not a failing tail"
+        );
+        assert!(
+            matcher.is_consumed(1) && matcher.is_consumed(2),
+            "the #510 redrive-anchored transparency is unchanged"
+        );
+    }
+
+    /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch
+    /// records its failing cycle wrote must become transparent — otherwise the
+    /// reopened cycle reads back "this dispatch failed" and can never re-issue
+    /// the work the operator redrove it to complete.
+    #[test]
+    fn a_redrive_makes_abandoned_dispatch_records_transparent() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=4 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the abandoned pair must be transparent after a redrive"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the reopened run must re-dispatch the child live"
+        );
+    }
+
+    /// A redrive reopens only the cycles it superseded (Codex P1 round 1,
+    /// issue #952 x #510). A run that was redriven and then failed AGAIN wrote
+    /// fresh abandoned-dispatch records *after* that redrive: those belong to
+    /// the terminal-failure tail's own cycle, so they stay positionally
+    /// matchable and the replay resolves the branch from its synthetic terminal
+    /// instead of parking on a dispatch that will never resolve.
+    #[test]
+    fn abandoned_records_written_after_the_last_redrive_stay_opaque() {
+        let superseded_child = ExecutionId::new();
+        let latest_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: superseded_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: superseded_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: latest_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: latest_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} preceded the redrive, so it must be transparent"
+            );
+        }
+        for idx in [5_usize, 6] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} was written by the cycle that failed AFTER the \
+                 redrive, so it must stay positionally matchable"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { ref error, .. } if error == crate::event::ABANDONED_DISPATCH_REASON
+            ),
+            "the re-dispatched child must resolve from its own synthetic terminal"
+        );
+    }
+
+    /// An ACTIVITY's error string is the activity author's own message, so the
+    /// reserved reason alone can be produced by ordinary user code (Codex P2
+    /// round 2). Only the full shape the engine writes counts as synthetic — a
+    /// genuine failure that happens to carry the same message keeps its real
+    /// terminal, so a redriven run replays it instead of re-dispatching the
+    /// activity and repeating its side effects.
+    #[test]
+    fn a_genuine_activity_failure_quoting_the_reason_is_not_an_abandoned_record() {
+        let engine_written = ActivityExecId::new();
+        let author_written = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: author_written,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // Same message, but a real activity terminal: a retried attempt,
+            // retryable, and carrying structured details.
+            WorkflowEvent::ActivityFailed {
+                activity_id: author_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 2,
+                error_type: "Error".into(),
+                details: Some(serde_json::json!({"code": 42})),
+                non_retryable: false,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: engine_written,
+                name: "refund".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: engine_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+        for idx in [3_usize, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} carries the engine's exact abandoned shape, so a redrive \
+                 must make it transparent"
+            );
+        }
+    }
+
+    /// Without a redrive the same records are ordinary, positionally-matched
+    /// history: they are what makes a failing cycle's own replay resolvable.
+    #[test]
+    fn abandoned_dispatch_records_stay_opaque_without_a_redrive() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(!matcher.is_consumed(1) && !matcher.is_consumed(2));
+        matcher.advance();
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { .. }
+            ),
+            "the failing cycle's own replay resolves the branch from its record"
+        );
+    }
+
+    /// A retried-then-redriven run: the redrive scan must skip the
+    /// post-terminal `WorkflowRetryScheduled` to reach the terminal it
+    /// supersedes.
+    #[test]
+    fn a_redrive_after_a_workflow_retry_still_supersedes_the_terminal() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the superseded terminal must be transparent even behind a retry record"
+        );
+    }
+
+    #[test]
+    fn failing_frontier_requires_every_pre_terminal_event_consumed() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            !matcher.at_terminal_failure_frontier(),
+            "the recorded activity is still unconsumed — not at the frontier"
+        );
+        assert!(matches!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "with the activity consumed the cursor sits in the transparent tail"
         );
     }
 

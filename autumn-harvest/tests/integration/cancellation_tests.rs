@@ -32,7 +32,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -476,6 +476,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "heartbeat-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
@@ -715,6 +716,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "uncooperative-worker".to_string(),
                 queues: vec!["default".to_string()],
@@ -889,6 +891,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "ac-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
@@ -1057,6 +1060,7 @@ async fn activity_without_cancellation_check_completes_normally() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "no-hb-worker".to_string(),
                 queues: vec!["default".to_string()],

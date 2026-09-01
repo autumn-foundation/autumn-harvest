@@ -281,6 +281,16 @@ name = "claim_bench"
 required-features = ["db"]
 harness = false
 
+# Retention-reclamation benchmark for the opt-in partitioned `harvest_events`
+# layout (issue #958). `harness = false` for the same reason as `claim_bench`:
+# the measured operation is destructive and enormous (it collects half the
+# corpus and drops partitions), so criterion's repeat-until-stable loop would
+# end up timing a pass against an already-empty database.
+[[bench]]
+name = "retention_reclaim_bench"
+required-features = ["db"]
+harness = false
+
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `ReplayVerifier::verify_dir` (issue #251's batch-fixture-verification
 # budget). Exercises real filesystem I/O and `serde_json` deserialize of
@@ -324,12 +334,33 @@ required-features = ["db"]
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `dlq::merge_dlq_aggregates` -- the cross-shard merge stage behind
+# `GET /admin/dead-letters/aggregate` (issue #385/#613), distinct from
+# `dlq_aggregate_profile`'s per-shard `group_dead_letter_rows` target above.
+# Same `db` requirement, same reason (dlq.rs uses diesel_async
+# unconditionally). See `benches/dlq_merge_profile.rs`.
+[[bench]]
+name = "dlq_merge_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `stall_diagnosis::classify_execution` -- the pure root-cause classifier
 # behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809). No feature
 # requirement: `stall_diagnosis` is pure and unconditional (no DB access). See
 # `benches/stall_diagnosis_profile.rs`.
 [[bench]]
 name = "stall_diagnosis_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`
+# -- the per-row body of the lazy codec-key re-encryption sweep (issue #948).
+# No feature requirement: both functions are pure and unconditional (the
+# `db`-gated sweep loop that calls them is not exercised here). See
+# `benches/codec_rotation_reencrypt_profile.rs`.
+[[bench]]
+name = "codec_rotation_reencrypt_profile"
 harness = false
 
 [lints]

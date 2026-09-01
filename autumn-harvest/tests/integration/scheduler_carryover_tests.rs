@@ -102,7 +102,7 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
     (conn, url, container)
@@ -169,6 +169,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],

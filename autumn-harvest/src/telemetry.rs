@@ -369,6 +369,37 @@ pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
 /// `docs/cross-region-dr.md` describes. Labelled `{shard}`.
 pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
 
+/// Gauge: audit-export delivery lag for a shard, in seconds (issue #953).
+///
+/// The **age of the oldest audit record the sink has not acknowledged** — the
+/// answer to "how far behind is the SIEM right now?". `0` means every audit
+/// record on the shard has been acknowledged at least once.
+///
+/// Note the deliberate choice of *oldest*, not newest, unacknowledged record:
+/// under sustained mutating load a stuck exporter always has a brand-new
+/// unexported record, so a newest-based gauge would read ~0 during exactly the
+/// outage an operator needs to see. Oldest-based lag is what the issue's own
+/// success metric ("export lag stays < 30s p99") is measurable against.
+///
+/// Emitted on **every** exporter tick, including ticks that deliver nothing —
+/// the signal must not go stale precisely when delivery has stopped.
+///
+/// Labelled `{shard}` only: bounded cardinality per ADR-0001 §7. The audit
+/// `actor`, `operation`, and `target_id` are deliberately never labels — they
+/// are unbounded, user-supplied, and tenant-identifying.
+pub const METRIC_AUDIT_EXPORT_LAG: &str = "harvest.audit.export_lag";
+
+/// Counter: audit records acknowledged by the sink for a shard (issue #953).
+///
+/// Incremented by the batch size only after the cursor has actually advanced,
+/// so `rate(harvest_audit_exported)` is a true delivery rate, not an attempt
+/// rate. At-least-once delivery means a redelivered batch counts again;
+/// receiver-side `(shard, seq)` accounting, not this counter, is the
+/// completeness proof.
+///
+/// Labelled `{shard}` only, for the same cardinality reason as above.
+pub const METRIC_AUDIT_EXPORTED: &str = "harvest.audit.exported";
+
 /// Counter: this worker was fenced off a shard it is pinned to (issue #954).
 ///
 /// Incremented once, immediately before the worker stops. A non-zero value in
@@ -957,6 +988,24 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// and exposes it through the equivalent read route instead. Per ADR-0001 §7,
 /// `execution.id` is never a label here either.
 pub const METRIC_QUOTA_REJECTED: &str = "harvest.quota.rejected";
+
+/// Counter: incremented by the number of `harvest_events` rows the lazy
+/// payload-codec re-encryption sweep rewrote onto the active key (issue #948).
+///
+/// Label:
+///   - `"shard"` (= [`METRIC_LABEL_SHARD`]) — the shard swept.
+///
+/// The **codec key id is deliberately not a label.** Key ids are
+/// operator-chosen and accumulate over a deployment's life, so labelling by key
+/// would grow a new series on every rotation and never retire the old ones.
+/// Per-key rows-remaining is instead surfaced by `GET /admin/codec/rotation`,
+/// mirroring how `harvest.quota.rejected` (#946) keeps its per-key detail on the
+/// equivalent admin read.
+///
+/// `rate(harvest_codec_reencrypted_total{shard="..."}[5m]) == 0` while
+/// `GET /admin/codec/rotation` still reports rows remaining under a retired key
+/// is the alerting shape for "the rotation has stalled".
+pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
 
 /// Counter: incremented each time a start producer that is **exempt-by-design**
 /// from the admission gate relays a workflow start (issue #618).
@@ -2093,6 +2142,19 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow, resource);
     }
 
+    /// The lazy payload-codec re-encryption sweep (issue #948) rewrote `count`
+    /// `harvest_events` rows on `shard` onto the active key.
+    ///
+    /// `shard` is the shard id rendered as a string — a bounded label, one
+    /// series per shard. The key id is intentionally not passed here; see
+    /// [`METRIC_CODEC_REENCRYPTED`] for why.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_codec_reencrypted(&self, shard: &str, count: u64) {
+        let _ = (shard, count);
+    }
+
     /// A workflow task entered the executor on a worker.
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
@@ -2624,6 +2686,27 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge [`METRIC_SHARD_GENERATION`].
     fn record_shard_generation(&self, shard: u16, generation: i64) {
         let _ = (shard, generation);
+    }
+
+    /// Audit-export delivery lag for a shard, in seconds (issue #953).
+    ///
+    /// Emitted on every exporter tick, delivering or not — see
+    /// [`METRIC_AUDIT_EXPORT_LAG`] for why it is the *oldest* unacknowledged
+    /// record's age rather than the newest.
+    ///
+    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_LAG`].
+    fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
+        let _ = (shard, seconds);
+    }
+
+    /// Audit records the sink acknowledged for a shard (issue #953).
+    ///
+    /// Called once per acknowledged batch with that batch's record count,
+    /// only after the cursor advanced.
+    ///
+    /// Maps to the counter [`METRIC_AUDIT_EXPORTED`].
+    fn record_audit_exported(&self, shard: u16, count: u64) {
+        let _ = (shard, count);
     }
 
     /// This worker was fenced off `shard` and is stopping (issue #954).

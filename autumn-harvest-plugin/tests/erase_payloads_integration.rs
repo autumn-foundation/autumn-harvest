@@ -51,7 +51,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -99,6 +99,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "erase-worker".to_string(),
                 queues: vec!["default".to_string()],

@@ -2,12 +2,21 @@
 //!
 //! ## Design
 //!
-//! This module implements the **only sanctioned in-place mutation** of
-//! `harvest_events.event_data` rows (alongside heartbeat checkpoints in
-//! `queue::record_heartbeat`). Payload-bearing fields inside each event's
-//! `data` object are replaced with a tombstone marker while the append-only
-//! event log structure — variant `type`, event IDs, timestamps, sequence —
-//! is left completely intact.
+//! This module implements **sanctioned in-place mutation exception #2** of
+//! `harvest_events.event_data` rows. There are exactly two such writers: this
+//! one and codec key re-encryption (`crate::codec_rotation`, issue #948,
+//! exception #3); both are enumerated with their scope guarantees in the
+//! "Engine Invariants" section of `CLAUDE.md`. (The heartbeat checkpoint this
+//! comment used to name alongside them mutates `harvest_task_queue`, not the
+//! event log — see that section.) Payload-bearing fields inside each event's
+//! `data` object are
+//! replaced with a tombstone marker while the append-only event log structure —
+//! variant `type`, event IDs, timestamps, sequence — is left completely intact.
+//!
+//! Erasure always **wins** a race with the re-encryption sweep: that sweep
+//! writes with a compare-and-swap on the row's previous bytes, so a tombstone
+//! committed between its read and its write makes its update match zero rows
+//! rather than resurrecting the ciphertext this module just destroyed.
 //!
 //! Erasure is **terminal-only**: the gate rejects any execution that is not
 //! in a finished state (`COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`,
@@ -439,6 +448,22 @@ mod db {
     ) -> OptEraseFuture<'a> {
         Box::pin(async move {
             let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
+
+            // Issue #958: on the opt-in partitioned layout the execution row's
+            // deletion no longer cascades into `harvest_events`, so a
+            // retention-collected (or summarized, #752) execution's full
+            // PII-bearing `event_data` can still be sitting there as orphan
+            // rows until the partition sweeper reclaims the whole cohort —
+            // which a legal hold or long-running sibling can defer
+            // indefinitely.
+            //
+            // Without this, a data-subject erasure request for such an
+            // execution returned 200 with `events_scrubbed: 0` and "summary
+            // scrubbed" while the plaintext survived in the event log, breaking
+            // the #495 tombstoning contract exactly where #752 promised it
+            // still held. `scrub_events` already works on orphans — it filters
+            // on `workflow_exec_id` alone — so it only had to be called.
+            let (events_scrubbed, fields_tombstoned) = scrub_events(conn, exec_id).await?;
             // The live execution row is gone, but retention deliberately leaves
             // non-DELIVERED completion deliveries and CALLBACK DLQ rows behind
             // (both keyed on `workflow_exec_id`) — each holds a frozen copy of
@@ -455,13 +480,14 @@ mod db {
                 && children.is_empty()
                 && skipped_children.is_empty()
                 && failures.is_empty()
+                && events_scrubbed == 0
             {
                 return Ok(None);
             }
             Ok(Some(EraseOutcome {
                 execution_id: exec_id.to_string(),
-                events_scrubbed: 0,
-                fields_tombstoned: 0,
+                events_scrubbed,
+                fields_tombstoned,
                 execution_row_scrubbed: false,
                 summary_scrubbed,
                 signals_scrubbed: 0,
@@ -494,11 +520,31 @@ mod db {
         for (row_id, mut event_data) in raw_events {
             let count = tombstone_payload_fields(&mut event_data);
             if count > 0 {
-                diesel::update(harvest_events::table.find(row_id))
-                    .set(harvest_events::event_data.eq(event_data))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
+                // Keyed on `workflow_exec_id` as well as the row id.
+                //
+                // This does NOT prune partitions — the partition key is
+                // `cohort`, the row's append instant, so an execution's history
+                // genuinely spans partitions and no predicate on
+                // `workflow_exec_id` can narrow the set. What it does buy is a
+                // usable index: on the partitioned layout a bare `id` predicate
+                // has no index to use at all (the primary key is
+                // `(id, cohort)`), so every partition would be sequentially
+                // scanned per row; `(workflow_exec_id, id)` matches
+                // `idx_harvest_events_history_page` in each of them.
+                //
+                // The predicate is strictly narrower than `find(row_id)` — the
+                // rows were just selected FOR this execution, and `id` is
+                // globally unique from a single sequence — so the unpartitioned
+                // layout behaves identically.
+                diesel::update(
+                    harvest_events::table
+                        .filter(harvest_events::id.eq(row_id))
+                        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
+                )
+                .set(harvest_events::event_data.eq(event_data))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
                 events_scrubbed += 1;
                 fields_tombstoned += count;
             }

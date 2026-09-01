@@ -31,7 +31,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Prefer an operator-supplied database (a local Postgres) and fall back to
@@ -55,7 +55,7 @@ async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
                 .await
                 .expect("HARVEST_TEST_DATABASE_URL must be reachable");
             fresh
-                .batch_execute(autumn_harvest::full_migrations_sql())
+                .batch_execute(&autumn_harvest::test_init_sql())
                 .await
                 .expect("migrations should apply");
         }
@@ -161,6 +161,8 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
         None,
         60,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     );
 
     // Poll (bounded) rather than sleeping a fixed span: fast when the loop is
@@ -258,6 +260,8 @@ async fn enforce_timeouts_once_records_no_scanner_ticks() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("a no-work enforcement pass must succeed");
@@ -305,6 +309,8 @@ async fn the_loop_advances_liveness_without_a_metrics_recorder() {
         None,
         60,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -360,6 +366,7 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
         60,
         telemetry,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
     );
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::PoisonPill),
@@ -476,6 +483,7 @@ fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
         i32,
         i64,
         std::sync::Arc<autumn_harvest::telemetry::TelemetryConfig>,
+        autumn_harvest::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()>;
 
     let _: TimeoutCheckerFn = timeout::spawn_timeout_checker;

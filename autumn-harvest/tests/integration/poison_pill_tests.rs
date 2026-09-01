@@ -53,7 +53,7 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
     (conn, container)
@@ -210,9 +210,15 @@ async fn orphan_under_threshold_is_requeued() {
     let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-1", 0).await;
     let metrics = RecordingMetrics::default();
 
-    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
-        .await
-        .expect("reclaim");
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
 
     assert_eq!(summary.requeued, 1, "orphan should be re-queued");
     assert_eq!(summary.quarantined, 0);
@@ -240,9 +246,15 @@ async fn orphan_at_threshold_is_quarantined() {
     let sibling_id = insert_pending_task(&mut conn, exec_id).await;
     let metrics = RecordingMetrics::default();
 
-    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
-        .await
-        .expect("reclaim");
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
 
     assert_eq!(summary.quarantined, 1, "orphan should be quarantined");
     assert_eq!(summary.requeued, 0);
@@ -303,9 +315,15 @@ async fn live_worker_task_is_not_reclaimed() {
     insert_live_worker(&mut conn, "live-worker").await;
     let metrics = RecordingMetrics::default();
 
-    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
-        .await
-        .expect("reclaim");
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
 
     assert_eq!(
         summary.total(),
@@ -326,9 +344,15 @@ async fn threshold_zero_never_quarantines() {
     let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-3", 99).await;
     let metrics = RecordingMetrics::default();
 
-    let summary = reclaim_orphaned_tasks(&mut conn, 0, 10, &metrics)
-        .await
-        .expect("reclaim");
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        0,
+        10,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
 
     assert_eq!(summary.quarantined, 0, "threshold 0 disables quarantine");
     assert_eq!(summary.requeued, 1, "still re-queued (legacy loop)");
@@ -433,9 +457,15 @@ async fn poison_pill_counts_toward_schedule_auto_pause() {
     let _task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-x", 2).await;
     let metrics = RecordingMetrics::default();
 
-    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
-        .await
-        .expect("reclaim");
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
     assert_eq!(summary.quarantined, 1);
 
     // The terminal poison-pill failure was counted toward the schedule's

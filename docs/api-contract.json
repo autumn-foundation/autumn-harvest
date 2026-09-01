@@ -498,7 +498,7 @@
       "path": "/workflows/{id}/children",
       "category": "workflow",
       "read_only": true,
-      "description": "List child workflow executions spawned by a parent execution.",
+      "description": "List child workflow executions spawned by a parent execution. The walk fans out across every readable shard, so a child placed on a different shard than its parent (issue #956 cross-shard child placement) still appears. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call. BEHAVIOUR CHANGE in 0.5.0: this previously returned 500 when any shard was unreachable; it now returns 200 with the reachable children and a non-`complete` status. The 500 below is retained for a database error on the parent lookup itself, which is not a partial-result case.",
       "params": [
         {
           "name": "id",
@@ -543,7 +543,9 @@
         "status": 200,
         "fields": [
           "items",
-          "next_cursor"
+          "next_cursor",
+          "status",
+          "unavailable_shards"
         ]
       },
       "error_responses": [
@@ -939,7 +941,7 @@
       "category": "workflow",
       "read_only": true,
       "post_for_body_only": true,
-      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will — or did — this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). All five verdicts return 200 — the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
+      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will — or did — this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). Since issue #952 a terminal FAILED run whose history REPRODUCES its recorded failure under the current code is 'clean' (reproducing a recorded failure is not a divergence) and carries that error in the failure object, with message 'no divergence under current code; the recorded failure was reproduced'; 'workflow_failed' remains for a replay that failed where the recorded history did not. All five verdicts return 200 — the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
       "idempotency": "Read-only (no events written, no state recomputed); safe to retry.",
       "params": [
         {
@@ -5076,6 +5078,114 @@
         {
           "status": 503,
           "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/codec/rotation",
+      "category": "admin",
+      "read_only": true,
+      "description": "Report payload-codec key rotation progress per shard (issue #948). Lists every registered codec key id, which one is active for new writes, and -- per shard -- how many harvest_events rows still carry each key id plus the lazy re-encryption sweep's durable resume cursor. This is the screen an operator watches to know when an outgoing key has zero remaining rows. A zero census is NECESSARY but NOT SUFFICIENT for retirement: it proves no row references the key right now on the shards this process can reach, not that no worker is still encoding under it and no already-encoded append is still in flight. Retirement additionally requires an attested fleet write fence -- see the procedure in docs/operations/codec-key-rotation.md. Treating zero here as authorization to destroy key material can leave a late-committing row permanently unreadable. Admin-gated: the body names operator-chosen key identifiers and exposes the encryption posture of stored history. It carries NO key material and NO payload content.",
+      "idempotency": "Read-only; always idempotent. It runs the per-key census and reads the cursor -- it never rewrites a row and never advances the sweep.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "active_key_id",
+          "registered_key_ids",
+          "shards",
+          "rows_remaining_total",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry in `shards` is {shard_id, rows_by_key_id, rows_remaining, cursor}. `rows_by_key_id` maps every observed codec key id to the number of rows referencing it on that shard; rows written before key ids existed carry no `kid` and are counted under the designated legacy key id (\"legacy\"). `rows_remaining` is the sum over NON-active key ids -- the number that must reach zero before that key can be retired. `cursor` is {last_event_id, rows_reencrypted, completed_at, updated_at} for the active key's sweep pass, or null before the first batch runs; it is keyed on (shard, active key id), so flipping the active key starts a fresh pass. An unreachable shard degrades the response to `status: \"partial\"` and is named in `unavailable_shards`; `rows_remaining_total` is then a LOWER BOUND, not a count -- an unread shard's rows are unknown, never zero. The retirement gate applies the same fail-closed rule and refuses to retire a key while any expected shard is unreadable. On a deployment with no keyed codecs registered -- every deployment that has not adopted key rotation -- `registered_key_ids` is empty, `active_key_id` is the legacy sentinel, and every count is zero."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/audit-export",
+      "category": "admin",
+      "read_only": true,
+      "description": "Per-shard status of the audit-record export to an external SIEM sink (issue #953): cursor position, delivery lag, delivery state, and the last sink error. Admin-gated: it reports the completeness posture of the privileged-action log, which is exactly what an attacker would want to know before acting. It never returns audit record CONTENTS -- use `GET /audit` for those.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "sink_configured",
+          "shards",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "`sink_configured` reports ONLY whether the process serving this request has an audit sink installed. It is not a fleet-wide signal and must not be diagnosed from: in a split web/worker deployment an API process legitimately reports false while export is healthy on the worker fleet, and true would not establish that the process actually running the scanner is configured. The database-backed signals -- `pending_records` growing across two reads, `lag_seconds` rising, or a persistent NOT_STARTED -- describe the shard rather than whichever process answered. Each entry in `shards` carries {shard, cursor_seq, last_assigned_seq, pending_records, lag_seconds, delivery_state, consecutive_failures, last_status, last_error, last_delivered_at, next_attempt_at}. `cursor_seq` is the highest per-shard export sequence the sink has acknowledged: every record at or below it has been delivered at least once. `lag_seconds` is the age of the OLDEST unacknowledged record (not the newest -- under sustained load a stuck exporter always has a brand-new unexported record, so a newest-based lag would read ~0 during exactly the outage that matters). `delivery_state` is one of IDLE, DELIVERING, BACKOFF, RETRYING, RETIRED, or NOT_STARTED; NOT_STARTED means no exporter has ever claimed that shard, and the entry still reports the live backlog it would face. RETIRED means an operator ran decommission_cursor: the cursor row survives only to preserve the sequence high-water mark, no exporter owes the shard records, and retention may purge them, so the entry's other fields are a frozen snapshot rather than live state. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/audit-export/redrive",
+      "category": "admin",
+      "read_only": false,
+      "description": "Rewind one shard's audit-export cursor so already-delivered audit records are re-exported to the SIEM sink (issue #953), for recovery after sink-side data loss. Re-exported records are byte-identical -- the per-record export sequence is never re-stamped, so a record carries the same (shard, seq) and the same JSON on every delivery and the receiver dedupes on that pair. A cursor may only ever move BACKWARDS: a request that would move it forward, or leave it where it is, is refused with 400 rather than applied, because advancing it would mark records delivered that never were. The `before` form resolves to one below the LOWEST sequence assigned to a record at or after that instant, so any clock/commit-order skew makes the rewind reach further back (costing duplicate deliveries the receiver dedupes) rather than skipping records. The redrive itself writes an audit record (`audit_export.redrive`) in the same transaction as the rewind, so re-exporting is as auditable as the operations being exported.",
+      "idempotency": "Idempotent in effect: the cursor ends up at the requested position. A repeat of the same request is refused with 400 rather than applied a second time, because a request that would not move the cursor BACKWARDS (at or above the current position) is never applied. Each accepted call writes its own audit record.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "shard",
+            "required": true,
+            "description": "Shard whose export cursor to rewind."
+          },
+          {
+            "name": "to_seq",
+            "required": false,
+            "description": "Rewind to this exact export sequence; records with seq > to_seq re-export. Exactly one of to_seq or before must be supplied. A negative value is clamped to 0 (re-export everything still retained)."
+          },
+          {
+            "name": "before",
+            "required": false,
+            "description": "RFC 3339 instant; rewind so every audit record that occurred at or after it re-exports. Exactly one of to_seq or before must be supplied."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "shard",
+          "outcome",
+          "from",
+          "to"
+        ],
+        "notes": "`outcome` is `rewound`. `from` is where the cursor was, `to` where it now is; records with seq > to will be re-delivered by the exporter on its next tick. The rewind also bumps the shard's claim epoch and clears its lease, so a delivery already in flight when the rewind lands cannot acknowledge over it and silently undo the redrive. The rewind and the `audit_export.redrive` audit record are one transaction on one connection, so an applied-but-unaudited redrive is not representable; that audit row lands in the TARGET shard's audit log (not the default shard's, unlike other audited routes) because it describes a shard-scoped mutation and a second connection could neither be atomic with the rewind nor safely acquired while holding it. and the audit row's target_id records the shard AND the requested position (`shard=0;to_seq=42`), since a redrive is the one operation here that can trigger a mass re-export."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Neither or both of to_seq/before supplied, or the request would not move the cursor backwards -- it is at or above the current position (the message reports both the current cursor and the requested one). Advancing a cursor would mark records delivered that never were."
+        },
+        {
+          "status": 404,
+          "description": "The named shard has no LIVE audit-export cursor: export has either never run there, or has been retired with decommission_cursor. A retired shard is refused rather than rewound -- retention no longer protects its records and no exporter is running to ship them, so reporting a successful rewind would be a promise the system cannot keep."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage is not configured, the named shard is unreachable, or the audit record for this redrive could not be written. The rewind and its audit record commit together, so a 503 from the audit write means the cursor was NOT moved."
         }
       ]
     },

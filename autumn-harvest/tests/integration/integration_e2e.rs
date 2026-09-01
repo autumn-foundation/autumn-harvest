@@ -1165,6 +1165,7 @@ pub(crate) fn runtime_config(
     workflow_task_timeout: Duration,
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
         dr_fencing: false,
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
@@ -2106,6 +2107,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-deadline-echo".to_string(),
                 queues: vec!["default".to_string()],
@@ -2339,6 +2341,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-deadline-echo-shifted".to_string(),
                 queues: vec!["default".to_string()],
@@ -2506,6 +2509,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-complete".to_string(),
                 queues: vec!["default".to_string()],
@@ -2645,6 +2649,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-fail".to_string(),
                 queues: vec!["default".to_string()],
@@ -2818,6 +2823,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-activity-round-trip".to_string(),
                 queues: vec!["default".to_string()],
@@ -3056,6 +3062,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-activity-orphaned".to_string(),
                 queues: vec!["default".to_string()],
@@ -3250,6 +3257,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("timeout enforcement should succeed");
@@ -3317,6 +3326,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-activity-timeout".to_string(),
                 queues: vec!["default".to_string()],
@@ -3491,6 +3501,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-e2e-timer-round-trip".to_string(),
                 queues: vec!["default".to_string()],
@@ -4336,6 +4347,176 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
         ],
         vec![],
     ))
+}
+
+/// Dispatches three awaited children concurrently and then fails from a sibling
+/// branch in the SAME decision cycle, so the cycle never suspends (issue #952).
+fn parent_workflow_dispatches_three_children_then_fails<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let dispatch = async {
+            futures::future::try_join_all((0..3).map(|slot| {
+                ctx.spawn_child_workflow_raw("fan_child", serde_json::json!({ "item": slot }))
+            }))
+            .await
+            .map_err(|e| e.to_string())
+        };
+        let sibling =
+            async { Err::<Vec<serde_json::Value>, String>("budget exceeded".to_string()) };
+        futures::try_join!(dispatch, sibling)?;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+fn abandoned_child_dispatch_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_dispatches_three_children_then_fails,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "fan_child",
+                module: "integration_e2e",
+                handler: fan_child_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// Issue #952's success metric against a real database: in a failing decision
+/// cycle the persisted history's dispatched-children count matches the commands
+/// the code issued.
+///
+/// Before #952, `persist_terminal_outcome_commands` replayed only
+/// `RecordMarker`/`RecordSideEffect`/`SpawnDetachedChildWorkflow` from the
+/// pending-command list, so all three `StartChildWorkflow` commands vanished:
+/// no `ChildWorkflowStarted`, no child rows, an audit trail that lied about what
+/// the code did. Now each dispatch is recorded at its emission position with a
+/// synthetic terminal marking it never-started — and still no child execution
+/// rows, because nothing was ever started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_records_every_dispatched_child_when_the_cycle_fails() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-abandoned-child-dispatch",
+        6,
+        2,
+        abandoned_child_dispatch_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution = wait_for_execution_state(&database_url, parent_exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert!(
+        parent_execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("budget exceeded")),
+        "the sibling branch's error must seal the run: {:?}",
+        parent_execution.error
+    );
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(
+        parent_history
+            .events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
+            .count(),
+        3,
+        "every dispatched child must appear in the persisted history: {:?}",
+        parent_history.events
+    );
+    let abandoned = parent_history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ChildWorkflowFailed { error, .. }
+                    if error == autumn_harvest::event::ABANDONED_DISPATCH_REASON
+            )
+        })
+        .count();
+    assert_eq!(
+        abandoned, 3,
+        "each dispatch must carry its synthetic terminal so replay resolves it: {:?}",
+        parent_history.events
+    );
+    assert!(
+        matches!(
+            parent_history.events.last(),
+            Some(WorkflowEvent::WorkflowFailed { .. })
+        ),
+        "the terminal failure must still be the last event: {:?}",
+        parent_history.events
+    );
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        child_execs.is_empty(),
+        "an abandoned dispatch starts no child execution: {child_execs:?}"
+    );
 }
 
 /// End-to-end proof that the worker persists a `spawn_child_workflow_fan_out_raw`
@@ -7864,6 +8045,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-sched-baseline".to_string(),
                 queues: vec!["default".to_string()],
@@ -7998,6 +8180,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-sched-maxruns".to_string(),
                 queues: vec!["default".to_string()],
@@ -8121,6 +8304,7 @@ async fn workflow_schedule_pause_and_resume() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: "worker-sched-pause".to_string(),
                 queues: vec!["default".to_string()],

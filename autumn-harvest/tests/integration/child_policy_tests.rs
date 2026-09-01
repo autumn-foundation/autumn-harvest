@@ -33,7 +33,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -67,6 +67,7 @@ fn build_pool(url: &str) -> DbPool {
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
             dr_fencing: false,
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
@@ -1278,6 +1279,8 @@ async fn workflow_task_timeout_cascades_detached_children() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("timeout enforcement should succeed");

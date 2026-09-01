@@ -69,6 +69,25 @@ const DR_PREFIX: &str = autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX;
 static REGISTRY_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// A codec that always succeeds and changes the bytes -- enough for the sweep
+/// to have real work to do, without pulling a real cipher into a DR test.
+struct DrXorCodec(u8);
+
+impl autumn_harvest::payload_codec::PayloadCodec for DrXorCodec {
+    fn codec_id(&self) -> &'static str {
+        "dr-xor"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(raw.iter().map(|b| b ^ self.0).collect())
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(encoded.iter().map(|b| b ^ self.0).collect())
+    }
+}
+
+struct NoOpMetrics;
+impl autumn_harvest::telemetry::MetricsRecorder for NoOpMetrics {}
+
 async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
     REGISTRY_SERIAL.lock().await
 }
@@ -158,7 +177,7 @@ async fn fresh_db(tag: &str) -> Option<(String, String)> {
     let url = with_db_name(&admin, &db);
     let mut fresh = connect(&url).await;
     fresh
-        .batch_execute(autumn_harvest::full_migrations_sql())
+        .batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     Some((url, db))
@@ -391,6 +410,104 @@ async fn a_fenced_worker_cannot_persist_events() {
         .await
         .unwrap();
     assert_eq!(rows[0].n, 0, "a fenced append must write nothing");
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
+async fn a_fenced_worker_cannot_re_encrypt_history() {
+    // The codec re-encryption sweep (issue #948) is sanctioned exception #3 to
+    // the append-only invariant: it is the only path that UPDATEs
+    // `harvest_events` in place. `store.rs` fences every INSERT, but this
+    // UPDATE is a different statement in a different module, so it needs its
+    // own assertion.
+    //
+    // The failure this prevents is the worst one the sweep has. A worker still
+    // pinned to the old generation reconnects to the promoted primary; its
+    // appends are refused, but an unfenced sweep would happily re-encode rows
+    // the new region now owns -- under *its* active key, which the promoted
+    // region may already have retired. That is silent, permanent, and destroys
+    // payloads rather than merely forking history.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rotate");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'rotate-1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // A history row encoded under `k1`, with `k2` now active: exactly what the
+    // sweep exists to convert.
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("k1", std::sync::Arc::new(DrXorCodec(0x5a)))
+        .unwrap();
+    codecs
+        .register_key("k2", std::sync::Arc::new(DrXorCodec(0x33)))
+        .unwrap();
+    codecs.set_active_key("k1").unwrap();
+    let encoded = codecs
+        .encode_payload(&serde_json::json!({"secret": "value"}))
+        .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data) \
+         VALUES ($1, 0, 'WorkflowStarted', $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({
+        "type": "WorkflowStarted",
+        "data": {"input": encoded, "timestamp": "2026-08-31T00:00:00Z"}
+    }))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    codecs.set_active_key("k2").unwrap();
+
+    // This worker is pinned to generation 0; the region has been promoted past
+    // it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let swept = autumn_harvest::codec_rotation::sweep_codec_reencryption_once(
+        &mut conn,
+        0,
+        &codecs,
+        100,
+        &NoOpMetrics,
+    )
+    .await;
+
+    // Whether the sweep surfaces the fence as an error or simply converts
+    // nothing, the row must be untouched -- that is the guarantee.
+    #[derive(diesel::QueryableByName)]
+    struct Kid {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        kid: Option<String>,
+    }
+    let rows: Vec<Kid> =
+        diesel::sql_query("SELECT event_data->'data'->'input'->>'kid' AS kid FROM harvest_events")
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows[0].kid.as_deref(),
+        Some("k1"),
+        "a fenced worker must not re-encrypt history the promoted region owns; \
+         sweep returned {swept:?}"
+    );
     FenceRegistry::clear();
 }
 

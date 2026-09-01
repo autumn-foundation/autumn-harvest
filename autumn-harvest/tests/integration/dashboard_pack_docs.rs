@@ -127,6 +127,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_admission_blocked_total",
     "harvest_admission_bypassed_total",
     "harvest_quota_rejected_total",
+    "harvest_codec_reencrypted_total",
     "harvest_rate_limit_throttled_total",
     "harvest_webhook_received_total",
     "harvest_webhook_rejected_total",
@@ -191,7 +192,11 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_replication_standbys",
     "harvest_replication_observable",
     "harvest_shard_generation",
+    // Issue #953 — audit export to a SIEM sink (gauge, bare).
+    "harvest_audit_export_lag",
     "harvest_shard_fenced_total",
+    // Audit export to a SIEM sink (issue #953).
+    "harvest_audit_exported_total",
     "harvest_schedule_overdue",
     "harvest_admission_gates_active",
     "harvest_workflow_history_oversized",
@@ -304,6 +309,11 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),
+    // Audit export to a SIEM sink (issue #953). Labelled `{shard}` only:
+    // `actor`/`operation`/`target_id` are unbounded and tenant-identifying,
+    // so they are deliberately never labels (ADR-0001 §7).
+    ("harvest_audit_export_lag", &["shard"]),
+    ("harvest_audit_exported", &["shard"]),
     ("harvest_replication_lag_bytes", &["shard"]),
     ("harvest_replication_standbys", &["shard"]),
     ("harvest_replication_observable", &["shard"]),
@@ -342,6 +352,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_admission_bypassed", &["producer"]),
     ("harvest_admission_gates_active", &[]),
     ("harvest_quota_rejected", &["workflow", "resource"]),
+    ("harvest_codec_reencrypted", &["shard"]),
     (
         "harvest_payload_bytes",
         &["payload_kind", "workflow_type", "activity_name"],

@@ -43,7 +43,7 @@ use tracing_subscriber::layer::SubscriberExt;
 // -------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // -------------------------------------------------------------------------
@@ -366,6 +366,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
             let worker = Arc::new(
                 Worker::new(
                     WorkerRuntimeConfig {
+                        codec_rotation_batch_size: 0,
                         dr_fencing: false,
                         worker_id: "telem-test-worker".to_string(),
                         queues: vec!["default".to_string()],

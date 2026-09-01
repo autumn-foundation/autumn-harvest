@@ -538,6 +538,33 @@ diesel::table! {
         error_summary -> Nullable<Text>,
         shard_id -> Nullable<Int4>,
         source -> Text,
+        /// Dense per-shard export sequence assigned by the audit exporter
+        /// (issue #953). `NULL` until assigned; stays `NULL` forever when no
+        /// audit sink is configured.
+        export_seq -> Nullable<Int8>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Per-shard audit-export delivery cursor (issue #953). One row per shard,
+    /// living in that shard's own database and provisioned by the exporter
+    /// (a database cannot know its own shard id). `last_acked_seq` advances
+    /// only after the sink acknowledges a batch.
+    harvest_audit_export_cursor (shard_id) {
+        shard_id -> Int4,
+        last_assigned_seq -> Int8,
+        last_acked_seq -> Int8,
+        claim_epoch -> Int8,
+        lease_until -> Nullable<Timestamptz>,
+        next_attempt_at -> Timestamptz,
+        consecutive_failures -> Int4,
+        last_status -> Nullable<Int4>,
+        last_error -> Nullable<Text>,
+        last_delivered_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+        retired_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -671,6 +698,40 @@ diesel::table! {
         priority -> Jsonb,
         max_workflow_input_bytes -> BigInt,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// One in-flight **cross-shard child workflow**, recorded on the PARENT's
+    /// shard in the same transaction as the parent's `ChildWorkflowStarted` /
+    /// `ChildWorkflowSpawnedDetached` event (issue #956).
+    ///
+    /// Not a message queue: this is the child's lifecycle record on the
+    /// parent's side. Start, cancel, terminal delivery and close-cascade are
+    /// transitions of this one row.
+    harvest_cross_shard_children (child_exec_id) {
+        /// The child's `ExecutionId` — also the PK on the target shard, which
+        /// is what makes a repeated relay a no-op.
+        child_exec_id -> Uuid,
+        /// The parent, always on this shard.
+        parent_exec_id -> Uuid,
+        /// Denormalised from `child_exec_id`'s encoded shard.
+        target_shard -> Integer,
+        /// `PENDING_START` | `STARTED`.
+        status -> Text,
+        /// A parent-side cancel not yet delivered to the target shard.
+        cancel_requested -> Bool,
+        /// NULL = awaited child; otherwise the detached child's `ParentClosePolicy`.
+        parent_close_policy -> Nullable<Text>,
+        workflow_name -> Text,
+        /// Fully-resolved child creation spec (see `CrossShardChildSpec`).
+        child_spec -> Jsonb,
+        created_at -> Timestamptz,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        last_attempt_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -983,6 +1044,27 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable resume cursor for the lazy payload-codec re-encryption sweep
+    /// (issue #948).
+    ///
+    /// One row per shard, with the target key stored as a COLUMN: any change of
+    /// active key — including a rollback to a key that already completed a pass
+    /// — must restart the scan, which keying the row on the key id could not
+    /// express.
+    harvest_codec_rotation_cursor (shard_id) {
+        shard_id -> Int4,
+        active_key_id -> Text,
+        last_event_id -> Int8,
+        rows_reencrypted -> Int8,
+        unresolved_rows -> Int8,
+        completed_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -997,6 +1079,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workers,
     harvest_batch_jobs,
     harvest_audit_log,
+    harvest_audit_export_cursor,
     harvest_api_tokens,
     harvest_build_policies,
     harvest_build_compat,
@@ -1008,6 +1091,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
+    harvest_cross_shard_children,
     harvest_debounce,
     harvest_start_throttle,
     harvest_start_idempotency,
@@ -1020,4 +1104,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_locks,
     harvest_mutex_waiters,
     harvest_workflow_logs,
+    harvest_codec_rotation_cursor,
 );

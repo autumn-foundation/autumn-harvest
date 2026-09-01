@@ -86,7 +86,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -151,6 +151,7 @@ fn build_registry(
 
 fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
         dr_fencing: false,
         worker_id: worker_id.to_string(),
         // Two queues so `info().queue_name` is falsifiable: with a single

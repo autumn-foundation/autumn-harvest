@@ -52,7 +52,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +507,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
@@ -4159,6 +4160,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 
     // Worker with a build_id
     let config = WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
         dr_fencing: false,
         worker_id: "nd-worker-1".to_string(),
         queues: vec!["default".to_string()],

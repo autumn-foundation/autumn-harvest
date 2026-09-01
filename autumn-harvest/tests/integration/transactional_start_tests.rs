@@ -183,12 +183,12 @@ fn all_test_workflows() -> Vec<autumn_harvest::info::WorkflowInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// DB setup helpers (mirrors the established `full_migrations_sql()` +
+// DB setup helpers (mirrors the established `test_init_sql()` +
 // per-test-database convention used throughout this test suite).
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 fn rewrite_pg_db(base: &str, db: &str) -> String {
@@ -219,7 +219,7 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&new_url)
             .await
             .expect("failed to connect to per-test database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply migrations to per-test database");
         create_domain_table(&mut conn).await;

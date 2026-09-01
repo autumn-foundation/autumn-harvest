@@ -16,7 +16,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded; each test scrubs first); otherwise a
 //! fresh testcontainers Postgres is booted with the full migration bundle
-//! (`autumn_harvest::full_migrations_sql()`).
+//! (`autumn_harvest::test_init_sql()`).
 
 use autumn_harvest::HarvestBuilder;
 use autumn_harvest::event::WorkflowEvent;
@@ -57,7 +57,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -909,6 +909,7 @@ fn build_worker_with_shards(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec![queue.to_string()],

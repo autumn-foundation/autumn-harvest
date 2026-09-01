@@ -215,6 +215,182 @@ struct PreparedHarvestRuntime {
     /// automatically, without a separate `set_effective_config` call the
     /// integrator must remember.
     effective_config: EffectiveConfigView,
+    /// Held unpublished until `HarvestRunner::start` finishes every fallible
+    /// step. Dropping this struct on an early return simply never publishes,
+    /// leaving whatever audit-export config the process already had.
+    audit_export_guard: Option<DeferredAuditExportInstall>,
+}
+
+/// Install the process-global completion-callback runtime config (issue #605).
+///
+/// Extracted from `PreparedHarvestRuntime::build` so it sits alongside its
+/// audit-export sibling below; the reasoning is unchanged.
+///
+// Install the process-global completion-callback runtime config
+// (issue #605): the deliverer/secret/allowlist/defaults/retry policy
+// the core scanner (`fire_due_completion_deliveries`) and enqueue
+// path (`enqueue_completion_deliveries`) read via
+// `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
+// `HarvestPlugin` web-app path and the standalone runner) funnels
+// through this one construction point, so this is set exactly once
+// regardless of which path started the runtime. Core ships no HTTP
+// client, so an embedder-supplied deliverer is used verbatim and a
+// `reqwest`-based default is substituted otherwise.
+// issue #605 code review: signing with an empty key is not a
+// silent no-op -- HMAC-SHA256 accepts any key length and
+// produces a valid, deterministic (and trivially
+// reproducible by anyone) signature, so a caller who never
+// configures `completion_callback_secret(...)` gets a
+// `X-Harvest-Signature` header that carries no real
+// authenticity guarantee at all. This is reachable for both
+// builder-default AND per-execution targets (the latter
+// bypass builder config entirely), so warn unconditionally
+// rather than only when default targets are configured.
+fn install_completion_callback_config(built: &BuiltHarvest) {
+    let callback_config = built.completion_callback_config();
+    let deliverer = callback_config
+        .deliverer
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new()));
+    let secret = callback_config.secret.clone().unwrap_or_else(|| {
+        // issue #605 code review: signing with an empty key is not a
+        // silent no-op -- HMAC-SHA256 accepts any key length and
+        // produces a valid, deterministic (and trivially
+        // reproducible by anyone) signature, so a caller who never
+        // configures `completion_callback_secret(...)` gets a
+        // `X-Harvest-Signature` header that carries no real
+        // authenticity guarantee at all. This is reachable for both
+        // builder-default AND per-execution targets (the latter
+        // bypass builder config entirely), so warn unconditionally
+        // rather than only when default targets are configured.
+        tracing::warn!(
+            "completion-callback HMAC secret was never configured via \
+                 HarvestBuilder::completion_callback_secret(...) -- every \
+                 delivered callback will be signed with an empty key, which \
+                 defeats the X-Harvest-Signature authenticity guarantee for \
+                 any receiver relying on it"
+        );
+        autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+    });
+    if let Ok(mut lock) = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write() {
+        *lock = Some(Arc::new(
+            autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                deliverer,
+                secret,
+                ssrf_policy: callback_config.ssrf_policy(),
+                default_targets: callback_config.default_targets.clone(),
+                retry_policy: callback_config.retry_policy.clone(),
+            },
+        ));
+    }
+}
+
+/// Resolve the audit-export runtime config from a `BuiltHarvest` (issue #953).
+///
+/// **Pure**: it reads `built` and allocates, but touches no process-global
+/// state. Installing is a separate step ([`commit_audit_export_config`]) so
+/// that a runtime whose construction later *fails* cannot leave the global
+/// config replaced (issue #953, Codex review P1) — `PreparedHarvestRuntime::build`
+/// has several fallible steps after this point, and the config is a
+/// process-wide static shared with any runtime already running in this process.
+/// Clobbering it from a failed build would silently redirect a *live*
+/// runtime's audit records to the failed build's sink, or stop its export
+/// entirely.
+///
+/// Core ships no HTTP client, so an embedder-supplied `AuditSink` is used
+/// verbatim and a `reqwest` signed-webhook sink is substituted when only a URL
+/// was configured.
+///
+/// Resolves to `None` when neither was configured. That `None` is meaningful
+/// and gets written: the config is a process-wide static, so a second runtime
+/// built without a sink must not keep shipping audit records to the first
+/// runtime's destination.
+fn prepare_audit_export_config(
+    built: &BuiltHarvest,
+) -> Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>> {
+    let audit_config = built.audit_export_config();
+    let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
+        audit_config.sink.clone().or_else(|| {
+            audit_config.webhook_url.as_ref().map(|url| {
+                Arc::new(crate::audit_sink::ReqwestAuditSink::new(url.clone()))
+                    as Arc<dyn autumn_harvest::audit_export::AuditSink>
+            })
+        });
+    sink.map(|sink| {
+        // `HarvestBuilder::try_build` rejects a webhook with no secret, so
+        // reaching the empty-key fallback means an embedder-supplied sink that
+        // authenticates some other way (IAM, mTLS, a local file). Warn rather
+        // than fail: a signature is not always the relevant control there.
+        let secret = audit_config.secret.clone().unwrap_or_else(|| {
+            tracing::warn!(
+                "no audit-export HMAC secret was configured via \
+                 HarvestBuilder::audit_export_secret(...) -- exported batches will carry \
+                 an X-Harvest-Signature computed with an empty key, which any third party \
+                 can reproduce; it conveys no authenticity and a receiver must not treat \
+                 it as tamper evidence"
+            );
+            autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+        });
+        Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+            sink,
+            secret,
+            batch_size: audit_config.effective_batch_size(),
+            backoff: audit_config.backoff.clone(),
+            lease: audit_config.effective_lease(),
+        })
+    })
+}
+
+/// Publish the resolved audit-export config to the process-global static.
+///
+/// Deliberately the **last** thing `PreparedHarvestRuntime::build` does, after
+/// every fallible step has succeeded — see [`prepare_audit_export_config`].
+fn commit_audit_export_config(
+    config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+) {
+    let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
+        return;
+    };
+    *lock = config;
+}
+
+/// This runtime's audit-export config, held **unpublished** until every
+/// fallible step of `HarvestRunner::start` has succeeded (issue #953, Codex
+/// review rounds 2, 5, 16 and 19).
+///
+/// Publishing early is what the earlier revisions got wrong: the global is
+/// shared with any runtime already running in this process, so a build that
+/// then failed could redirect a live runtime's audit records to a sink that
+/// never came into service, or (for a webhook-only build, where the
+/// direct-worker path installs `None`) silence it outright.
+///
+/// **Deliberately no restore-on-drop.** An earlier revision snapshotted the
+/// previous config and put it back if the guard dropped uncommitted. That was
+/// needed only while `into_worker_parts*` still wrote the global mid-build;
+/// once that write was suppressed at the source
+/// (`BuiltHarvest::deferring_audit_export_install`), a failed startup makes no
+/// global change at all and has nothing to undo — and restoring anyway is
+/// worse than doing nothing. Two overlapping `start` calls snapshot the same
+/// old value; if the first succeeds and publishes while the second fails, the
+/// second's restore silently replaces the *running* runtime's sink with a
+/// stale snapshot (round 19 P1). Doing nothing on failure is both simpler and
+/// correct under concurrency.
+struct DeferredAuditExportInstall {
+    pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+}
+
+impl DeferredAuditExportInstall {
+    const fn new(
+        pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    ) -> Self {
+        Self { pending }
+    }
+
+    /// Publish this runtime's config. Called only once startup has fully
+    /// succeeded; dropping this value instead leaves the global untouched.
+    fn commit(self) {
+        commit_audit_export_config(self.pending);
+    }
 }
 
 impl PreparedHarvestRuntime {
@@ -225,55 +401,19 @@ impl PreparedHarvestRuntime {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
-        // Install the process-global completion-callback runtime config
-        // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
-        // the core scanner (`fire_due_completion_deliveries`) and enqueue
-        // path (`enqueue_completion_deliveries`) read via
-        // `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
-        // `HarvestPlugin` web-app path and the standalone runner) funnels
-        // through this one construction point, so this is set exactly once
-        // regardless of which path started the runtime. Core ships no HTTP
-        // client, so an embedder-supplied deliverer is used verbatim and a
-        // `reqwest`-based default is substituted otherwise.
-        {
-            let callback_config = built.completion_callback_config();
-            let deliverer = callback_config.deliverer.clone().unwrap_or_else(|| {
-                Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
-            });
-            let secret = callback_config.secret.clone().unwrap_or_else(|| {
-                // issue #605 code review: signing with an empty key is not a
-                // silent no-op -- HMAC-SHA256 accepts any key length and
-                // produces a valid, deterministic (and trivially
-                // reproducible by anyone) signature, so a caller who never
-                // configures `completion_callback_secret(...)` gets a
-                // `X-Harvest-Signature` header that carries no real
-                // authenticity guarantee at all. This is reachable for both
-                // builder-default AND per-execution targets (the latter
-                // bypass builder config entirely), so warn unconditionally
-                // rather than only when default targets are configured.
-                tracing::warn!(
-                    "completion-callback HMAC secret was never configured via \
-                     HarvestBuilder::completion_callback_secret(...) -- every \
-                     delivered callback will be signed with an empty key, which \
-                     defeats the X-Harvest-Signature authenticity guarantee for \
-                     any receiver relying on it"
-                );
-                autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
-            });
-            if let Ok(mut lock) =
-                autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
-            {
-                *lock = Some(Arc::new(
-                    autumn_harvest::completion_callback::CallbackRuntimeConfig {
-                        deliverer,
-                        secret,
-                        ssrf_policy: callback_config.ssrf_policy(),
-                        default_targets: callback_config.default_targets.clone(),
-                        retry_policy: callback_config.retry_policy.clone(),
-                    },
-                ));
-            }
-        }
+        install_completion_callback_config(&built);
+        // Resolved here, while `built` is still owned, but NOT published until
+        // every fallible step below has succeeded (issue #953, Codex review
+        // P1). `install_completion_callback_config` above still publishes
+        // eagerly; that is #605's pre-existing behaviour and out of scope here.
+        let audit_export_config = prepare_audit_export_config(&built);
+        // ...and the conversion below must not publish it either (round 5 P1).
+        // Suppressing that write is what keeps the global *untouched* for the
+        // whole build, rather than clobbered and later repaired: a live
+        // runtime's scanner can tick during `compile_dag_catalog`, and a
+        // restore afterwards cannot un-send the records it exported to a sink
+        // that never came into service.
+        let built = built.deferring_audit_export_install();
         let classic_dag_names = built
             .dags()
             .iter()
@@ -340,6 +480,13 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
+        // Carried on the returned `PreparedHarvestRuntime` so it stays
+        // unpublished for the whole of `HarvestRunner::start` — not just this
+        // function (issue #953, Codex review round 16 P1). `start` has more
+        // fallible work after `build` returns (completion-trigger sync, worker
+        // construction, shard-pool validation); an early return there drops
+        // this without publishing, leaving the global exactly as it was.
+        let audit_export_guard = DeferredAuditExportInstall::new(audit_export_config);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -374,6 +521,7 @@ impl PreparedHarvestRuntime {
         warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
 
         Ok(Self {
+            audit_export_guard: Some(audit_export_guard),
             registry: Arc::new(registry),
             dag_catalog,
             registered_dag_names,
@@ -463,7 +611,7 @@ impl HarvestRunner {
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
         let completion_triggers = built.completion_triggers().to_vec();
-        let prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -521,6 +669,17 @@ impl HarvestRunner {
         } else {
             None
         };
+
+        // Every fallible step of startup has now succeeded -- `build`, the
+        // completion-trigger sync above, worker construction and its shard-pool
+        // validation. Only here may this runtime's sink replace whatever a
+        // previously started runtime installed (issue #953, Codex review round
+        // 16 P1). Returning `Err` anywhere above instead drops `prepared`,
+        // whose guard restores the previous config.
+        if let Some(guard) = prepared.audit_export_guard.take() {
+            guard.commit();
+        }
+
         let worker_id = worker
             .as_ref()
             .map(|_| prepared.worker_runtime_config.worker_id.clone());
@@ -831,7 +990,8 @@ pub(crate) fn injected_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_runtime_storage_pool, select_runtime_shard0_pool, uncovered_writable_shards,
+        DeferredAuditExportInstall, resolve_runtime_storage_pool, select_runtime_shard0_pool,
+        uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;
@@ -840,7 +1000,82 @@ mod tests {
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
-    /// Build a pool tagged by its `max_size` (readable without connecting) so
+    /// A startup that fails must leave the process-global audit-export config
+    /// exactly as it found it — and, crucially, must do so by NOT publishing
+    /// rather than by restoring (issue #953, Codex review rounds 16 and 19).
+    /// Restoring a snapshot races a concurrent successful startup: both
+    /// snapshot the same old value, and the loser's restore would replace the
+    /// winner's live sink.
+    #[test]
+    fn a_failed_startup_leaves_the_global_exactly_as_it_found_it() {
+        struct Marker;
+        impl autumn_harvest::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        fn config(
+            batch_size: i64,
+        ) -> std::sync::Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig> {
+            std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+                sink: std::sync::Arc::new(Marker),
+                secret: autumn_harvest::completion_callback::CallbackSecret::new(b"k".to_vec()),
+                batch_size,
+                backoff: autumn_harvest::audit_export::ExportBackoff::default(),
+                lease: std::time::Duration::from_secs(30),
+            })
+        }
+
+        // A runtime is already exporting in this process.
+        super::commit_audit_export_config(Some(config(7)));
+
+        // A second startup is prepared and then fails: dropped, never
+        // committed.
+        drop(DeferredAuditExportInstall::new(Some(config(99))));
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("the live config must still be installed")
+                .batch_size,
+            7,
+            "a runtime that never started must neither publish its own sink \
+             nor disturb the running one's"
+        );
+
+        // The concurrency case the restore got wrong: startup A succeeds and
+        // publishes while startup B, prepared earlier from the same old value,
+        // fails. B must not undo A.
+        let b = DeferredAuditExportInstall::new(Some(config(99)));
+        DeferredAuditExportInstall::new(Some(config(21))).commit(); // A wins
+        drop(b); // B fails afterwards
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("A's config must survive")
+                .batch_size,
+            21,
+            "a failed startup must not roll a concurrent successful one back"
+        );
+
+        // Success publishes, including a deliberate None.
+        DeferredAuditExportInstall::new(None).commit();
+        assert!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .is_none(),
+            "a runtime built with no sink must stop a previous one's export"
+        );
+    }
+
+    /// Build a pool tagged by its `max_size` (readable without connecting) so    /// Build a pool tagged by its `max_size` (readable without connecting) so
     /// two pools are distinguishable in a DB-free test.
     fn tagged_pool(max_size: usize) -> DbPool {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(

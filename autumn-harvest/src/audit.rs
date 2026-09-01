@@ -113,6 +113,15 @@ pub const OP_RATE_LIMIT_PACING_OVERRIDE_SET: &str = "rate_limit.pacing_override.
 /// Audit operation: Cleared a TTL'd runtime pacing override on a declared
 /// per-activity rate limit before its TTL elapsed (issue #945).
 pub const OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR: &str = "rate_limit.pacing_override.clear";
+/// Audit operation: Rewound a shard's audit-export cursor so already-delivered
+/// audit records are re-exported to the SIEM sink (issue #953).
+///
+/// The redrive is itself a privileged action — it causes records to be
+/// re-shipped, and a cursor an operator can move is a control an auditor will
+/// ask about — so it produces an audit record like any other mutation. Note
+/// that a rewind can only ever move a cursor BACKWARDS; the route refuses a
+/// forward request rather than recording one.
+pub const OP_AUDIT_EXPORT_REDRIVE: &str = "audit_export.redrive";
 /// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
 /// declared workflow-start throttle (issue #945).
 ///
@@ -233,6 +242,8 @@ pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
 pub const TARGET_TOKEN: &str = "token";
 /// Target type: a named task queue (issue #619).
 pub const TARGET_QUEUE: &str = "queue";
+/// Audit target type: a shard's audit-export cursor (issue #953).
+pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -350,6 +361,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
+    // Audit-export status (issue #953): read-only, admin-gated. Reports cursor
+    // position, lag, and last error — never audit record contents.
+    ("GET /admin/audit-export", RouteClass::ReadOnly),
     ("GET /workflows/count", RouteClass::ReadOnly),
     // Tiered/summary retention list (issue #752): read-only, admin-guarded.
     ("GET /workflows/summaries", RouteClass::ReadOnly),
@@ -435,6 +449,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/start-throttle", RouteClass::ReadOnly),
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     ("GET /admin/quotas", RouteClass::ReadOnly),
+    // Payload-codec key rotation progress (issue #948): read-only. Classifying
+    // it matters — an unclassified path defaults to `Mutating`, which would
+    // deny a read-only operator the very screen they watch to decide when an
+    // outgoing key is safe to retire.
+    ("GET /admin/codec/rotation", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
         "GET /admin/workflow-types/reachability",
@@ -748,6 +767,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         RouteClass::Mutating,
     ),
+    // Rewinds a shard's audit-export cursor (issue #953): mutating, audited.
+    ("POST /admin/audit-export/redrive", RouteClass::Mutating),
     // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
     // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
     ("POST /admin/completion-triggers", RouteClass::Mutating),
@@ -800,6 +821,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
     OP_START_THROTTLE_PACING_OVERRIDE_SET,
     OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+    // Audit-export cursor redrive (issue #953)
+    OP_AUDIT_EXPORT_REDRIVE,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -858,6 +881,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
 /// coverage guard test to ensure no route is accidentally omitted from either
 /// [`ALL_MUTATION_ROUTES`] or this exclusion list.
 pub const EXCLUDED_ROUTES: &[&str] = &[
+    "GET /admin/audit-export",
     "GET /workflows/count",
     "GET /workflows/summaries",
     "GET /workflows",
@@ -901,6 +925,11 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/start-throttle",
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     "GET /admin/quotas",
+    // Payload-codec key rotation progress (issue #948): read-only, and it
+    // surfaces only key IDENTIFIERS and row counts — no key material, no
+    // payload content — so there is nothing here to audit that the admin gate
+    // does not already cover.
+    "GET /admin/codec/rotation",
     // Read-only pacing-override lookup (issue #945); the SET/DELETE mutations
     // above (OP_START_THROTTLE_PACING_OVERRIDE_SET/CLEAR) are audited.
     "GET /admin/start-throttle/{workflow_name}/override",
@@ -1079,6 +1108,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/start-throttle", None),
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     ("GET /admin/quotas", None),
+    // Issue #948: read-only, no audit operation.
+    ("GET /admin/codec/rotation", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
@@ -1321,6 +1352,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         Some(OP_CIRCUIT_FORCE_CLOSE),
     ),
+    // Audit export (issue #953): read-only status, and the audited redrive.
+    ("GET /admin/audit-export", None),
+    (
+        "POST /admin/audit-export/redrive",
+        Some(OP_AUDIT_EXPORT_REDRIVE),
+    ),
     ("POST /admin/completion-triggers", None),
     ("POST /calendars", None),
     ("PUT /calendars/{name}", None),
@@ -1442,6 +1479,55 @@ pub async fn list_audit(
 /// Called by the retention subsystem on its configured cadence. Returns the
 /// number of rows deleted.
 ///
+/// **Never deletes a record the audit exporter has not shipped** (issue #953).
+/// A retention sweep that removed an unexported row would be a silent
+/// compliance gap — the record would be gone from the database *and* absent
+/// from the SIEM, with nothing anywhere to show it was lost, which is exactly
+/// what "zero silent record loss by construction" rules out.
+///
+/// ## Deciding whether export is live
+///
+/// The guard applies when **either** signal says an exporter owes this shard
+/// records:
+///
+/// - **A live (non-retired) cursor row exists** for the shard. Durable, shared
+///   state, so it works
+///   when retention and export run in **different processes** (issue #953,
+///   Codex review P1): a split web/worker deployment where only the worker
+///   configures the sink would otherwise have the web app's retention sweep
+///   delete rows the worker still owes.
+/// - **A sink is configured in this process**
+///   ([`crate::audit_export::is_configured`]) — covers the window before the
+///   exporter's first tick on a shard has created the cursor row at all
+///   (freshly enabled, newly added to the fleet, or a shard whose pool has
+///   been failing).
+///
+/// Deliberately **not** time-based. An earlier revision expired the guard 24h
+/// after the exporter's last heartbeat, so a long worker outage lifted it; a
+/// timeout cannot distinguish "export was intentionally removed" from "the
+/// worker has been down since Friday", and it resolves that ambiguity by
+/// deleting audit records during exactly the outage where they matter most
+/// (issue #953, Codex review round 3 P1).
+///
+/// Retiring export is therefore an explicit operator action —
+/// [`crate::audit_export::decommission_cursor`] — not an inferred one. The
+/// cost is that a sink left down indefinitely lets the audit table grow past
+/// its retention window. That is the deliberate trade, and the growth is
+/// bounded by the genuine unexported backlog rather than the whole table:
+/// fully-acknowledged records are purged on the normal schedule. Dropping a
+/// privileged-action log to reclaim disk is not a choice this function gets to
+/// make on an operator's behalf; `harvest.audit.export_lag` and the
+/// `last_error` on `GET /admin/audit-export` are how the condition is
+/// surfaced. See `docs/audit-export.md`.
+///
+/// With export inactive by both signals the guard is skipped entirely and the
+/// delete is byte-identical to the pre-#953 statement.
+///
+/// The pending-check subquery is uncorrelated by shard because a shard's
+/// database holds at most one cursor row (the exporter provisions only the
+/// shard it is scanning). Should two ever coexist, `EXISTS` errs toward
+/// retaining, never deleting.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
@@ -1449,11 +1535,36 @@ pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
 ) -> HarvestResult<usize> {
+    use diesel_async::RunQueryDsl as _;
+
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-    diesel::delete(harvest_audit_log::table.filter(harvest_audit_log::occurred_at.lt(cutoff)))
-        .execute(conn)
-        .await
-        .map_err(database_error)
+
+    // Delete an aged row UNLESS export is live AND that row is still pending.
+    diesel::sql_query(
+        "DELETE FROM harvest_audit_log a \
+         WHERE a.occurred_at < $1 \
+           AND NOT ( \
+                 ( \
+                   $2::BOOLEAN \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor \
+                        WHERE retired_at IS NULL \
+                   ) \
+                 ) \
+                 AND ( \
+                   a.export_seq IS NULL \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor c \
+                        WHERE a.export_seq > c.last_acked_seq \
+                   ) \
+                 ) \
+           )",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
+    .execute(conn)
+    .await
+    .map_err(database_error)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

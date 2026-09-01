@@ -63,7 +63,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -121,6 +121,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
                 dr_fencing: false,
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
@@ -453,6 +454,8 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }
@@ -662,6 +665,8 @@ async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }

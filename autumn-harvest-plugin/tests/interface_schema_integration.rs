@@ -60,11 +60,11 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 /// The full migration schema, mirroring every other plugin integration
-/// suite (e.g. `query_integration.rs`) — uses `full_migrations_sql()` so the
+/// suite (e.g. `query_integration.rs`) — uses `test_init_sql()` so the
 /// test schema always tracks trunk and never hand-rolls a bundle (which the
 /// `migration_hygiene` guard forbids).
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ── Published schemas ──────────────────────────────────────────────────────

@@ -518,10 +518,13 @@ pub(crate) fn pending_activity_id_for_task(
 pub(crate) async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<store::EventHistory> {
-    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
-        .await?
-        .1)
+    Ok(
+        lock_workflow_execution_row_and_load_history(conn, exec_id, codecs)
+            .await?
+            .1,
+    )
 }
 
 /// Like [`lock_workflow_execution_and_load_history`], but also returns the
@@ -533,6 +536,7 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
 async fn lock_workflow_execution_row_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
     let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -544,7 +548,10 @@ async fn lock_workflow_execution_row_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    let history = store::load_history(conn, exec_id).await?;
+    // Codec-aware, NOT `store::load_history` -- the same reason as `worker.rs`'s
+    // sibling: the engine's writes encode through the configured registry, so an
+    // identity read raises `UnknownCodecKey` on the first keyed envelope.
+    let history = store::load_history_with_codecs(conn, exec_id, codecs).await?;
     Ok((execution, history))
 }
 
@@ -870,6 +877,19 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // Issue #956: a cross-shard parent is not on this connection, and appending
+    // to it here would `NotFound` and roll back the child's own timeout
+    // transaction — leaving the child non-terminal forever. The cross-shard
+    // relay delivers this wake instead, from the parent's own shard. Mirrors the
+    // identical guard in `worker::wake_parent_for_child_completion`/`_failure`.
+    if crate::worker::parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+        tracing::debug!(
+            parent_execution_id = %parent_exec_id,
+            child_execution_id = %child_exec_id,
+            "cross-shard child timed out; the parent wake is the relay's to deliver"
+        );
+        return Ok(());
+    }
     // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the child
     // terminal (mirrors worker::wake_parent_for_child_completion/_failure) so an
     // over-deadline child that hits its OWN execution timeout resolves the
@@ -972,6 +992,8 @@ async fn enforce_activity_timeout(
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
@@ -1097,7 +1119,7 @@ async fn enforce_activity_timeout(
         }
 
         let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
         let Some((state, row_schedule_to_close_at)) =
             task_state_and_deadline_for_update(conn, task.id).await?
         else {
@@ -1187,7 +1209,14 @@ async fn enforce_activity_timeout(
             activity_id,
             timeout_type: reason.timeout_type(),
         };
-        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[timeout_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await?;
         Ok(true)
@@ -1384,6 +1413,8 @@ pub async fn force_fail_activity(
     workflow_exec_id: uuid::Uuid,
     task_id: uuid::Uuid,
     reason: Option<&str>,
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ForceFailActivityOutcome> {
     use crate::failure::IntoActivityErrorString;
     use crate::schema::harvest_task_queue::dsl;
@@ -1397,7 +1428,7 @@ pub async fn force_fail_activity(
             // `enforce_external_task_timeouts`): execution row FIRST, then the
             // task row.
             let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
 
             let task: Option<TaskQueueItem> = dsl::harvest_task_queue
                 .filter(dsl::id.eq(task_id))
@@ -1536,7 +1567,14 @@ pub async fn force_fail_activity(
                 non_retryable: parsed.non_retryable,
                 details: parsed.details,
             };
-            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[failed_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
             queue::fail_task(conn, task.id, &envelope).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
 
@@ -1558,6 +1596,8 @@ async fn enforce_workflow_timeout(
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
     // `enforce_activity_timeout` — see the note there (issue #619 round-24
@@ -1622,7 +1662,7 @@ async fn enforce_workflow_timeout(
         // execution-row -> task-row order. Locking here also loads the history
         // in the same call, replacing a separate `store::load_history`.
         let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
         // Authoritative deadline re-read, now correctly ordered after the
         // execution lock. See the activity path for why the unlocked check
         // above cannot be trusted on its own.
@@ -1634,7 +1674,14 @@ async fn enforce_workflow_timeout(
         let error = timeout_error(&execution.workflow_name, reason);
         let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
-        store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+        store::append_events_with_codecs(
+            conn,
+            exec_id,
+            &[workflow_event],
+            history.next_event_id,
+            codecs,
+        )
+        .await?;
         update_workflow_execution_timed_out(conn, exec_id, &error).await?;
         queue::fail_task(conn, task.id, &error).await?;
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
@@ -2282,9 +2329,16 @@ pub async fn enforce_external_signals_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -2449,12 +2503,13 @@ pub async fn enforce_external_signals_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                    store::append_events(
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -2629,9 +2684,16 @@ pub async fn enforce_external_cancels_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -2878,12 +2940,13 @@ pub async fn enforce_external_cancels_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                    store::append_events(
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -3037,9 +3100,16 @@ pub async fn enforce_external_awaits_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    let codecs = crate::payload_codec::PayloadCodecs::default();
+    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
+    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
+    // caller's history to append the terminal event; with the identity
+    // registry both raise `UnknownCodecKey` the moment a keyed codec is
+    // configured, stranding every outbox row on the shard.
+    let codecs = codecs.clone();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -3227,7 +3297,7 @@ pub async fn enforce_external_awaits_outbox(
                     // If present, skip the duplicate append (the inline path
                     // owns the awaiter's own wake/resolution).
                     let history =
-                        lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                        lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
                     let already_resolved = history.events.iter().any(|e| match e {
                         WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
                         | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
@@ -3236,11 +3306,12 @@ pub async fn enforce_external_awaits_outbox(
                     if already_resolved {
                         return Ok(Some((false, Some(row.id))));
                     }
-                    store::append_events(
+                    store::append_events_with_codecs(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
+                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -3279,6 +3350,12 @@ pub async fn enforce_external_awaits_outbox(
 /// poison-pill reclaimer's `worker_stale_secs` convention (`2 ×
 /// worker_heartbeat_interval`, computed once by the caller).
 ///
+/// `payload_codecs` / `codec_rotation_batch_size` drive the lazy payload-codec
+/// re-encryption sweep (issue #948). The sweep is a no-op — not one statement
+/// issued — unless the registry holds a keyed codec, so it costs nothing on
+/// every deployment that has not adopted key rotation. A batch size of `0`
+/// disables it outright.
+///
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
@@ -3292,9 +3369,53 @@ pub async fn enforce_timeouts_once(
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Off-box audit-record export (issue #953) runs FIRST, and its failures are
+    // logged rather than propagated. Both halves are deliberate, and both were
+    // wrong in an earlier revision that simply appended the call to the end of
+    // this function (Codex review round 26 P1).
+    //
+    // First, because a resident BEFORE it can `return Err` on every tick -- a
+    // task whose history will not decode, say, because its payload codec is
+    // unavailable -- and audit export would then never run on that shard again.
+    // Records would accumulate unexported, and because the lag gauge is written
+    // inside the export pass it would go stale rather than climb, so neither
+    // the threshold alert nor the absent-series alert could fire. A compliance
+    // gap that hides its own signal.
+    //
+    // Logged rather than propagated, because the mirror of that hazard is just
+    // as bad: an export failure must not stop timeout enforcement, SLA checks,
+    // session cleanup or codec rotation. This is the same "one failure must
+    // never stop the others" rule already applied per-shard inside
+    // `fire_due_audit_exports`, lifted to the residents of this loop.
+    let mut count = 0usize;
+    match crate::audit_export::fire_due_audit_exports(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+    )
+    .await
+    {
+        // Deliberately NOT folded into `count`, for the same reason the codec
+        // re-encryption sweep below keeps its own total out of it: `count` is
+        // the timeout-enforcement total, and the caller logs
+        // `warn!("enforced timed-out tasks")` whenever it is non-zero. Folding
+        // exported records in makes every healthy export tick claim a timeout
+        // that never happened -- a 500-record batch would report
+        // `enforced_count=500`. Export reports itself through
+        // `harvest.audit.export_*` instead.
+        Ok(_exported) => {}
+        Err(error) => tracing::error!(
+            error = %error,
+            "[audit_export] export pass failed; continuing with the rest of the scanner"
+        ),
+    }
+
     let timed_out = find_timed_out_tasks(conn).await?;
-    let mut count = timed_out.len();
+    count += timed_out.len();
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -3306,6 +3427,7 @@ pub async fn enforce_timeouts_once(
                     &reason,
                     circuit_breakers,
                     metrics,
+                    payload_codecs,
                 )
                 .await
             }
@@ -3316,6 +3438,7 @@ pub async fn enforce_timeouts_once(
                     execution_id_from_uuid(exec_uuid),
                     &reason,
                     metrics,
+                    payload_codecs,
                 )
                 .await
             }
@@ -3347,6 +3470,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += enforce_external_cancels_outbox(
@@ -3355,6 +3479,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += enforce_external_awaits_outbox(
@@ -3362,6 +3487,7 @@ pub async fn enforce_timeouts_once(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     count += crate::completion_trigger::enforce_completion_triggers_outbox(
@@ -3369,6 +3495,25 @@ pub async fn enforce_timeouts_once(
         metrics,
         sharded_pool,
         shard_assignments,
+    )
+    .await?;
+    // Cross-shard child workflows (issue #956). Runs on this shard's own
+    // `harvest_cross_shard_children` rows: creates opt-in cross-shard children on
+    // their target shard, delivers their terminals back to the parent parked
+    // here, relays parent-side cancels, and applies the `ParentClosePolicy`
+    // cascade across the shard boundary. A no-op — one indexed, empty-relation
+    // scan — in every deployment that never opts in.
+    //
+    // Placed after the #492 outbox scanners deliberately: those deliver signals
+    // and cancels that a workflow is parked on, and a parent woken by this
+    // scanner will re-enter its decision cycle on the next claim either way, so
+    // ordering costs nothing but keeps the cheap always-empty scan last among
+    // the delivery family.
+    count += crate::cross_shard_child::enforce_cross_shard_children(
+        conn,
+        sharded_pool,
+        payload_codecs,
+        metrics,
     )
     .await?;
     count +=
@@ -3389,7 +3534,9 @@ pub async fn enforce_timeouts_once(
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
-    count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
+    count +=
+        crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
+            .await?;
     // Sweep expired request-scoped start-idempotency claims (issue #808). Best
     // effort table growth control; the reserve upsert overwrites an expired row
     // in place regardless, so correctness does not depend on this running.
@@ -3399,6 +3546,55 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    // Lazy payload-codec re-encryption (issue #948): convert a bounded batch of
+    // stored rows per shard from a retired key id onto the active one.
+    //
+    // ⚠️ This is the ONLY resident of this pass that mutates
+    // `harvest_events.event_data` in place — sanctioned exception #3, see
+    // `crate::codec_rotation` and CLAUDE.md. Only the ciphertext bytes inside
+    // payload fields change; decoded plaintext, event `type`, ids, ordering and
+    // timestamps are untouched, so replay is unaffected by construction.
+    //
+    // Returns without issuing a statement unless a keyed codec is registered,
+    // so a deployment that has never rotated pays nothing for it.
+    // Shard-local by design: it sweeps THIS connection's shard through THIS
+    // connection. Reaching back into the same shard pool for a second
+    // connection would park forever on a single-connection pool (deadpool is
+    // configured with no acquisition timeout), wedging every later resident of
+    // this tick as well as rotation itself.
+    //
+    // Isolated from the rest of the pass on purpose: a rotation failure is
+    // logged and skipped, never propagated. Rotation is new and optional; the
+    // durable-mutex lease reclamation below is neither, and a workflow waiting
+    // on a lease this pass would have freed stays stuck for as long as the
+    // sweep keeps failing. Missing grants on `harvest_codec_rotation_cursor`
+    // or on `UPDATE harvest_events` are exactly the kind of persistent,
+    // deployment-shaped failure that repeats identically every tick, so
+    // propagating would not be a transient blip — it would take mutex
+    // reclamation down on that shard indefinitely. A new feature must not be
+    // able to break an old one by failing.
+    match crate::codec_rotation::sweep_codec_reencryption(
+        conn,
+        shard_assignments,
+        payload_codecs,
+        codec_rotation_batch_size,
+        metrics,
+    )
+    .await
+    {
+        // Deliberately NOT folded into `count`. That value is the
+        // timeout-enforcement total: the caller logs `warn!("enforced timed-out
+        // tasks")` whenever it is non-zero, and embedders read it as "this many
+        // tasks timed out". Adding rotation rewrites to it makes every
+        // productive sweep tick claim a timeout that never happened. Rotation
+        // reports itself through `harvest.codec.reencrypted` instead.
+        Ok(_swept) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "codec re-encryption sweep failed; continuing with the remaining \
+             timeout-pass residents"
+        ),
+    }
     // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
     // each freed key's new head of line. Shard-local: it runs against this
     // connection's own database (like `enforce_broken_sessions`), and is a no-op
@@ -3458,6 +3654,13 @@ pub fn spawn_timeout_checker(
         max_workflow_history_events,
         session_worker_stale_secs,
         None,
+        // Issue #948: this legacy single-shard entry point carries no codec
+        // registry, so it drives the sweep with an empty one — which is an
+        // unconditional no-op. A deployment that has adopted key rotation
+        // reaches the sweep through `spawn_timeout_checker_for_shard`, wired
+        // from `WorkerConfig::payload_codecs` by `HarvestBuilder::build`.
+        crate::payload_codec::PayloadCodecs::default(),
+        0,
     )
 }
 
@@ -3484,6 +3687,8 @@ pub fn spawn_timeout_checker_for_shard(
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
     shard: Option<crate::types::ShardId>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
 ) -> tokio::task::JoinHandle<()> {
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
@@ -3535,6 +3740,8 @@ pub fn spawn_timeout_checker_for_shard(
                     Some(&circuit_breakers),
                     max_workflow_history_events,
                     session_worker_stale_secs,
+                    &payload_codecs,
+                    codec_rotation_batch_size,
                 )
                 .await
                 {
@@ -4095,6 +4302,67 @@ mod tests {
                  execution lock and history load; after it, it is pointless"
             );
         }
+    }
+
+    /// Audit export must run before the first `?` in the pass, and its own
+    /// failure must never abort the pass (issue #953).
+    ///
+    /// Two directions, one hazard each:
+    ///
+    /// - **Export before the first `?`.** Every resident after the export call
+    ///   can return `Err` and end the tick. If export moved below one of them, a
+    ///   single permanently-failing resident — a task whose enforcement errors on
+    ///   every pass — would stop compliance delivery for the whole shard
+    ///   indefinitely, and the backlog would grow silently.
+    /// - **Export's own error swallowed.** Conversely, if the export call grew a
+    ///   `?`, a sink outage would abort timeout enforcement, SLA checks and
+    ///   session cleanup — letting a compliance feature take down the scanner.
+    ///
+    /// Source-level for the same reason as
+    /// `locked_deadline_reread_never_precedes_the_execution_lock` above: the
+    /// hazard is *statement order*, which no behavioural assertion can see.
+    ///
+    /// It is also the only form this guard can take. The natural dynamic test —
+    /// seed a due task whose enforcement fails, assert the export still happened
+    /// — cannot be written: `harvest_task_queue.workflow_exec_id` is a foreign
+    /// key, so a task naming a nonexistent execution cannot be inserted, and an
+    /// unregistered payload codec decodes to the `undecodable_marker` rather
+    /// than erroring (issue #608). There is no supported way to seed a
+    /// deterministically-failing resident.
+    #[test]
+    fn audit_export_runs_before_the_first_fallible_resident() {
+        let src = include_str!("timeout.rs");
+        let start = src
+            .find("pub async fn enforce_timeouts_once(")
+            .expect("enforce_timeouts_once must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub async fn ")
+            .map_or(body.len(), |o| o + 1);
+        let body = &body[..end];
+
+        let export = body
+            .find("fire_due_audit_exports(")
+            .expect("the pass must fire due audit exports");
+        let first_fallible = body
+            .find("find_timed_out_tasks(conn).await?")
+            .expect("the timed-out-task scan must stay the first fallible resident");
+        assert!(
+            export < first_fallible,
+            "audit export must run BEFORE the first resident that can `?` out of              the pass; below it, one permanently-failing task stops compliance              delivery for the whole shard"
+        );
+
+        let handled = &body[export..first_fallible];
+        assert!(
+            handled.contains("Err(error) => tracing::error!"),
+            "the export call must log and continue on error, never `?`; a sink              outage must not abort timeout enforcement for the shard"
+        );
+        assert!(
+            !handled.contains(
+                "fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"
+            ),
+            "the export call must not propagate its error with `?`"
+        );
     }
 
     /// The two deadline queries must differ only by `FOR UPDATE`, so the fast

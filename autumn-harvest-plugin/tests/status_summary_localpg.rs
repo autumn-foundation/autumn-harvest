@@ -75,7 +75,7 @@ async fn reset_and_migrate(url: &str) {
     conn.batch_execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
         .await
         .expect("reset schema");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
     populate_migration_ledger(&mut conn).await;

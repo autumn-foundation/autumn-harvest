@@ -1472,19 +1472,52 @@ mod probes {
         }
 
         // ── Incoherent: shard-local referential breaks ──────────────────────
-        let dangling: Vec<(FindingClass, String)> = vec![
-            (
-                FindingClass::DanglingTaskExecution,
-                bounded(
-                    "SELECT t.id FROM harvest_task_queue t \
+        let mut dangling: Vec<(FindingClass, String)> = vec![(
+            FindingClass::DanglingTaskExecution,
+            bounded(
+                "SELECT t.id FROM harvest_task_queue t \
                      WHERE t.workflow_exec_id IS NOT NULL \
                        AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions e \
                                        WHERE e.id = t.workflow_exec_id)",
-                    "sub.id::text",
-                    limit,
-                ),
+                "sub.id::text",
+                limit,
             ),
-            (
+        )];
+        // Issue #958: on the opt-in PARTITIONED layout an orphan event row is
+        // the designed steady state, not a torn restore. That layout drops the
+        // `harvest_events` foreign key — its `ON DELETE CASCADE` is the delete
+        // storm the partitioning exists to remove — so collecting an execution
+        // deliberately leaves its events behind for the partition sweeper to
+        // reclaim at whole-partition granularity.
+        //
+        // Running the probe there would report EVERY healthy partitioned shard
+        // as `Incoherent` ("a broken invariant; do not start workers", exit 1)
+        // — permanently, and including the cross-region failover runbook's
+        // pre-flight. The invariant is real and worth checking; it just is not
+        // an invariant of that layout.
+        // A FAILED probe is not "unpartitioned". `detect_layout` errors when the
+        // catalog cannot be read or when `harvest_event_cohort` is missing or
+        // has an unexpected body — and a partitioned shard whose cohort
+        // function is damaged is precisely the kind of thing a restore drill
+        // should surface. Defaulting to `false` there would run the
+        // dangling-event invariant against a partitioned shard, report its
+        // designed orphans as `Incoherent` ("do not start workers", exit 1),
+        // block the restore, and discard the real catalog error that explains
+        // why. Record it as a soft error and skip the layout-dependent probe.
+        let layout = match crate::partition::detect_layout(&mut conn).await {
+            Ok(layout) => Some(layout),
+            Err(e) => {
+                soft_errors.push(format!(
+                    "could not determine the harvest_events layout, so the \
+                     dangling-event invariant was skipped (it does not hold on the \
+                     partitioned layout, where orphan event rows are reclaimed by \
+                     the partition sweeper): {e}"
+                ));
+                None
+            }
+        };
+        if layout.is_some_and(|l| !l.is_partitioned()) {
+            dangling.push((
                 FindingClass::DanglingEventExecution,
                 bounded(
                     "SELECT DISTINCT ev.workflow_exec_id AS id FROM harvest_events ev \
@@ -1493,8 +1526,8 @@ mod probes {
                     "sub.id::text",
                     limit,
                 ),
-            ),
-        ];
+            ));
+        }
         for (class, sql) in dangling {
             match probe(&mut conn, class, shard_id, sql, None).await {
                 Ok(Some(f)) => findings.push(f),

@@ -39,7 +39,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -385,7 +385,14 @@ async fn test_poll_update_result_orphaned() {
         .expect("append completed event");
 
     // Poll the result — it should immediately resolve with 409 Conflict
-    let response = poll_update_result(&harvest_pool, exec_id, update_id, 1).await;
+    let response = poll_update_result(
+        &harvest_pool,
+        exec_id,
+        update_id,
+        1,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

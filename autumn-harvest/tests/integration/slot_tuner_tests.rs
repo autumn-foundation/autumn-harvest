@@ -37,7 +37,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 // -------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db() -> (String, ContainerAsync<Postgres>) {
@@ -165,6 +165,7 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
 
 fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
         dr_fencing: false,
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],

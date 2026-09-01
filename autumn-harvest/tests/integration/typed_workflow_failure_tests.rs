@@ -188,7 +188,7 @@ mod db_handle_surface {
     use uuid::Uuid;
 
     fn init_sql() -> Vec<u8> {
-        autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+        autumn_harvest::test_init_sql().as_bytes().to_vec()
     }
 
     /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
@@ -216,7 +216,7 @@ mod db_handle_surface {
                 .expect("connect to the per-test database");
             diesel_async::SimpleAsyncConnection::batch_execute(
                 &mut conn,
-                autumn_harvest::full_migrations_sql(),
+                &autumn_harvest::test_init_sql(),
             )
             .await
             .expect("apply migrations");
