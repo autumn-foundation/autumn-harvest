@@ -1022,6 +1022,95 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
     Ok(rows.into_iter().map(|r| r.v).collect())
 }
 
+/// Row-level security configured on the events table, if any.
+///
+/// Returns the policy names, plus whether row security is enabled at all — a
+/// table can have `ENABLE ROW LEVEL SECURITY` with no policy yet, which denies
+/// all rows to non-owners and is very much a configuration a swap must not
+/// silently discard.
+///
+/// **Why this blocks the conversion.** Both conversion paths replace
+/// `harvest_events` with a table built by `CREATE TABLE ... (LIKE ...)`, and
+/// `LIKE` copies neither `relrowsecurity`/`relforcerowsecurity` nor any
+/// `pg_policy` entry — measured, not assumed. `copy_acl_sql` then faithfully
+/// replays the original's owner and grants onto that replacement, so the same
+/// roles reach a parent on which row security is simply off. Rows a policy had
+/// been filtering become readable the moment the conversion commits, and
+/// nothing about it is loud.
+///
+/// That is the same failure the ACL clearing exists to prevent, arriving by a
+/// different route, which is why this refuses rather than warns.
+///
+/// It refuses rather than recreating the configuration deliberately. A policy
+/// carries a command, a permissive/restrictive mode, a role list and two
+/// separate expressions, and on a partitioned parent the policies that matter
+/// are the ones on the parent AND on every partition. Replaying that wrongly
+/// is itself an exposure, so this reports what it found and leaves the decision
+/// with the operator, exactly as the publication guard does.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if either catalog query fails.
+#[cfg(feature = "db")]
+pub async fn row_security_config(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<(bool, Vec<String>)> {
+    let enabled = scalar_bool(
+        conn,
+        "SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false) AS v
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()",
+    )
+    .await?;
+    let policies = diesel::sql_query(
+        "SELECT p.polname AS v
+           FROM pg_policy p
+           JOIN pg_class c ON c.oid = p.polrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok((enabled, policies.into_iter().map(|r| r.v).collect()))
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> HarvestResult<()> {
+    let (enabled, policies) = row_security_config(conn).await?;
+    if !enabled && policies.is_empty() {
+        return Ok(());
+    }
+    let what = if policies.is_empty() {
+        "row level security is enabled on it (with no policy, which denies every row to \
+         non-owners)"
+            .to_string()
+    } else {
+        format!(
+            "it carries row security {} ({})",
+            if policies.len() == 1 {
+                "policy"
+            } else {
+                "policies"
+            },
+            policies.join(", ")
+        )
+    };
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {what}. The conversion replaces the table with \
+         one built by CREATE TABLE ... (LIKE ...), which copies neither the row-security \
+         flags nor any policy, while the owner and grants ARE replayed onto it — so the \
+         same roles would reach a table with row security off, and rows a policy had been \
+         filtering would become readable the moment this commits. Recreating the policies \
+         automatically is not offered because replaying one wrongly is the same exposure by \
+         another route. Drop the policies (and DISABLE ROW LEVEL SECURITY) if they are \
+         obsolete, or reproduce them on the converted layout by hand afterwards."
+    )))
+}
+
 /// Convert this shard's `harvest_events` to the partitioned layout.
 ///
 /// Idempotent: on an already-partitioned shard it reports
@@ -1084,6 +1173,8 @@ pub async fn enable_partitioning(
             )));
         }
     }
+
+    refuse_if_row_security(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -1559,6 +1650,10 @@ pub async fn disable_partitioning(
     if !detect_layout(conn).await?.is_partitioned() {
         return Ok(None);
     }
+    // The reverse swap has the identical property: `disable` rebuilds a flat
+    // table with `LIKE` and replays the grants onto it, so a policy added after
+    // the conversion would be dropped while access is restored.
+    refuse_if_row_security(conn, "revert").await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             let index_defs = capture_index_defs(conn).await?;
@@ -2871,6 +2966,31 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              fixes only the first. Run the partitioned layout on the subscriber too, or \
              drop the publication, before re-running this plan.', bad;\n    \
              END IF;\nEND\n$harvest_pub_958$;"
+                .to_string(),
+        ),
+        // ── 1: refuse early if row security would be silently dropped ─────
+        //
+        // Same reason as the publication guard, and same phase: before
+        // anything mutates. `enable_partitioning` makes this check in Rust;
+        // the scripted path needs its own because it never calls it. See
+        // `row_security_config` — the swap keeps the grants and loses the
+        // policies, so the rows a policy was filtering become readable.
+        step(
+            1,
+            "DO $harvest_rls_958$\nDECLARE pols text; rls bool;\nBEGIN\n    \
+             SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false)\n      \
+             INTO rls\n      \
+             FROM pg_class c\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+             SELECT string_agg(p.polname, ', ' ORDER BY p.polname) INTO pols\n      \
+             FROM pg_policy p\n      \
+             JOIN pg_class c ON c.oid = p.polrelid\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+             IF rls OR pols IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events has row level security              configured (policies: %). Phase 4 replaces it with a table built by CREATE              TABLE ... (LIKE ...), which copies neither the row-security flags nor any              policy, while the owner and grants ARE replayed onto the replacement — so the              same roles would reach a table with row security off and rows a policy had              been filtering would become readable. Drop the policies if obsolete, or              reproduce them on the converted layout by hand, before running this plan.',              COALESCE(pols, 'none, but row security is enabled');\n    \
+             END IF;\nEND\n$harvest_rls_958$;"
                 .to_string(),
         ),
         // ── 1: bake the chosen width into the cohort function ─────────────

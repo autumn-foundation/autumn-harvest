@@ -3459,3 +3459,91 @@ async fn a_drain_pass_bounds_the_ddl_it_runs_under_the_parent_lock() {
     .await
     .expect("appends must still work after a bounded multi-pass drain");
 }
+
+/// Converting must not silently drop row-level security.
+///
+/// Both conversion paths replace `harvest_events` with a table built by
+/// `CREATE TABLE ... (LIKE ...)`, and `LIKE` copies neither
+/// `relrowsecurity`/`relforcerowsecurity` nor any `pg_policy` entry — measured
+/// against PG16, not assumed. `copy_acl_sql` then faithfully replays the
+/// original's owner and grants onto that replacement, so the same roles reach a
+/// parent with row security switched off: every row a policy had been filtering
+/// becomes readable the instant the conversion commits, and nothing says so.
+///
+/// The same failure the ACL clearing exists to prevent, by another route. The
+/// conversion refuses instead, in both directions, naming the policies.
+#[tokio::test]
+async fn converting_refuses_to_drop_the_row_security_it_cannot_carry() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("ALTER TABLE harvest_events ENABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("enable RLS");
+    diesel::sql_query(
+        "CREATE POLICY harvest_events_tenant ON harvest_events \
+         USING (workflow_exec_id IS NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create policy");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "converting a table under row-level security replays its GRANTS onto a \
+             replacement that has no policies, so rows a policy was filtering become \
+             readable. It must refuse.",
+        )
+        .to_string();
+    assert!(
+        err.contains("harvest_events_tenant"),
+        "the refusal must name the policy that would be lost; got: {err}"
+    );
+    assert!(
+        err.contains("readable"),
+        "the refusal must say what the operator is being protected from; got: {err}"
+    );
+
+    // And it refused before mutating: the table is still flat, still under RLS,
+    // and the policy is still there.
+    assert!(
+        !partition::detect_layout(&mut conn)
+            .await
+            .expect("layout")
+            .is_partitioned(),
+        "the refusal must come before anything mutates"
+    );
+    let (enabled, policies) = partition::row_security_config(&mut conn)
+        .await
+        .expect("row security config");
+    assert!(enabled, "row security must be left enabled");
+    assert_eq!(policies, vec!["harvest_events_tenant".to_string()]);
+
+    // The scripted large-table path refuses in phase 1, before any index build.
+    let plan = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
+    let guard = plan
+        .iter()
+        .find(|s| s.sql.contains("harvest_rls_958"))
+        .expect("the plan must carry its own row-security guard — it never calls the Rust one");
+    assert_eq!(
+        guard.phase, 1,
+        "the guard must run before hours of CONCURRENTLY index building, not after"
+    );
+
+    // Once the policy is gone the conversion proceeds, so the guard gates on
+    // the real condition rather than refusing a table that merely once had one.
+    diesel::sql_query("DROP POLICY harvest_events_tenant ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop policy");
+    diesel::sql_query("ALTER TABLE harvest_events DISABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("disable RLS");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("conversion must proceed once the row security is gone");
+}

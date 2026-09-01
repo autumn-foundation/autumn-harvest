@@ -347,6 +347,21 @@ write the catalog row, and one idle-in-transaction reader is enough to make the
 request queue — with every append arriving after it queued behind the `ALTER`.
 Re-run the step after clearing the blocker.
 
+**Row-level security on `harvest_events` blocks the conversion.** Both
+directions replace the table with one built by `CREATE TABLE ... (LIKE ...)`,
+and `LIKE` copies neither the row-security flags nor any policy — while the
+owner and grants *are* replayed onto the replacement. The same roles would
+therefore reach a table with row security switched off, and every row a policy
+had been filtering would become readable the moment the conversion commits.
+`enable`, `disable` and phase 1 of the scripted plan all refuse while row
+security is enabled or any policy exists, naming the policies. Recreating them
+automatically is deliberately not offered: a policy carries a command, a
+permissive/restrictive mode, a role list and two separate expressions, and on a
+partitioned table the policies that matter are the parent's *and* every
+partition's — replaying one wrongly is the same exposure by another route. Drop
+the policies if they are obsolete, or reproduce them by hand on the converted
+layout.
+
 **The engine's role must be able to own `harvest_events`.** Every partition
 operation is DDL on that table — `CREATE TABLE ... PARTITION OF` to extend the
 write window, `DETACH`/`ATTACH` to drain the `DEFAULT` partition, `DROP TABLE`
