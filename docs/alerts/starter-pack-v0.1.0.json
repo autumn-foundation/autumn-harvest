@@ -1332,12 +1332,17 @@
       ],
       "prometheus": {
         "mode": "native",
-        "notes": "Pair with the absent-series case: `absent(harvest_audit_export_lag)` fires when no exporter is running at all, which this threshold alert cannot see.",
+        "notes": "Two expressions, because the threshold alone is blind to the worst case. harvest_audit_export_lag_high catches an exporter that is running and falling behind. harvest_audit_export_absent catches no exporter running ANYWHERE: the gauge then has no series, so the threshold evaluates over an empty vector and can never fire. absent() is safe here, unlike in harvest_scanner_stalled where an API-only replica legitimately exports no series - it is false as soon as any one process exports any shard, so a mixed fleet does not trip it. What NEITHER catches is an exporter that is alive but cannot read a shard: the gauge keeps serving its last value, commonly 0, so the series is neither high nor absent. There is no metric-only detection for that today (autumn-foundation/autumn-harvest#1268); treat last_error and unavailable_shards on GET /admin/audit-export as authoritative. Do NOT substitute a `time() - timestamp(...)` staleness rule - Prometheus stamps each scraped sample with the scrape time, so it never fires on a stale-but-exposed gauge.",
         "expressions": [
           {
             "name": "harvest_audit_export_lag_high",
             "expr": "max by (shard) (harvest_audit_export_lag) > 300",
             "for": "10m"
+          },
+          {
+            "name": "harvest_audit_export_absent",
+            "expr": "absent(harvest_audit_export_lag)",
+            "for": "15m"
           }
         ]
       },

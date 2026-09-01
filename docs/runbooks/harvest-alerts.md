@@ -2942,9 +2942,10 @@ invisible to detection is growing, and the audit table is growing with it.
   `false` there.
 - Raise `audit_export_lease` above the sink's own request timeout if
   `last_error` reports the lease timeout.
-- Add `absent(harvest_audit_export_lag)` as a companion alert — this threshold
-  rule structurally cannot fire when no exporter has *ever* run for a shard in
-  this process's lifetime.
+- The starter pack ships `absent(harvest_audit_export_lag)` as a companion rule
+  (`harvest_audit_export_absent`) — the threshold rule structurally cannot fire
+  when no exporter is running anywhere, because the gauge then has no series
+  and `max(...)` evaluates over an empty vector.
 
   ⚠️ **`absent()` alone is not sufficient once a shard has reported.** The
   gauge is only written on a successful observation: if the exporter cannot
