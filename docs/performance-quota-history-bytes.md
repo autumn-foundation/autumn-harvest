@@ -94,9 +94,19 @@ or a `pg_stat_statements` snapshot after driving the real, compiled
 
 ## Plan
 
-The `history_bytes` `InitPlan` is the one that matters; `active_executions`
-and `dead_letters` are cheap partial-index lookups at every size tested
-(under 30 buffers each) and are not discussed further.
+**The buffer column below is the whole query's root-node total** (all three
+`InitPlan`s combined — that is what `pg_stat_statements` attributes to the
+statement too, so it is the figure the Measurement section's two methods can
+actually be compared against). The `history_bytes` `InitPlan` is not broken
+out as its own column, but it is what the total is *of*: 99.6-99.8% of it at
+every size tested (12,713/12,745, 16,732/16,766, 16,708/16,768). The other
+two `InitPlan`s are `active_executions` (29-57 buffers, growing with total
+noise-table size since it walks a `Bitmap Heap Scan`+`CTE Scan`, not the flat
+`dead_letters` count) and `dead_letters` (a constant 3, an index-only partial
+lookup) — neither changes which plan is chosen or the conclusions below, so
+neither is discussed further, but "the whole total is basically
+`history_bytes`" is the load-bearing approximation, not "the whole total
+*is* `history_bytes`."
 
 | total `harvest_events` rows | plan for `history_bytes` | buffers (hit+read) |
 |---:|---|---:|
