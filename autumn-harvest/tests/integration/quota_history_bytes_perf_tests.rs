@@ -35,12 +35,15 @@
 //!
 //! | share of 1,000 | events per execution | mechanism |
 //! |---:|---:|---|
-//! | 5% (i % 20 == 0) | 2,000-2,499 | long-running saga tail |
-//! | 20% (i % 20 in 1..=4) | 200-299 | medium workflow |
-//! | 75% | 10-29 | typical short workflow |
+//! | 5% (i % 20 == 0) | 2,001-2,481 | long-running saga tail |
+//! | 20% (i % 20 in 1..=4) | 202-285 | medium workflow |
+//! | 75% | 16-30 | typical short workflow |
 //!
-//! This totals 178,000 events / ~80.2 MB of history for the target tenant,
-//! reproducing byte-for-byte on every run. [`NOISE_SWEEP`] scales
+//! This totals 178,000 events / ~80.2 MB of history for the target tenant --
+//! the seeded fixture itself reproduces byte-for-byte on every run, though
+//! downstream `EXPLAIN`/`pg_stat_statements` output does not (wall-clock timing,
+//! cache-dependent hit/read splits, and ANALYZE's statistical row estimates
+//! all vary run to run; only buffer totals are stable). [`NOISE_SWEEP`] scales
 //! *background* tenants sharing the same tables — other `quota_key`s, each
 //! with a light uniform history — independently of the target's own
 //! footprint, matching how `harvest_events` actually grows in production

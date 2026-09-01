@@ -44,13 +44,21 @@ seeds a production-shaped fixture: one target tenant
 (`workflow_name = 'order_saga'`, `quota_key = 'acme'`) with 1,000 active
 (`RUNNING`/`PAUSED`) executions whose event-history length is **deterministically
 skewed** by execution index rather than uniform — no `random()`, so the
-fixture and every downstream number reproduce byte-for-byte on every run:
+seeded fixture itself (row counts, event counts per execution, and the
+resulting `history_bytes` total) reproduces byte-for-byte on every run.
+**Downstream measurements do not**: `EXPLAIN ANALYZE` embeds wall-clock
+timings and cache-state-dependent hit/read splits, and the planner's row
+*estimates* depend on `ANALYZE`'s statistical sampling (see [the
+row-estimate table](#plan) below) — only the buffer *totals* are stable
+run to run, per this persona's own admissibility rule. The table below
+describes the fixture that is reproducible; it is not a claim about the
+`EXPLAIN`/`pg_stat_statements` artifacts:
 
 | share of 1,000 executions | events per execution | role |
 |---:|---:|---|
-| 5% (`i % 20 == 0`) | 2,000–2,499 | long-running saga tail |
-| 20% (`i % 20` in 1..=4) | 200–299 | medium workflow |
-| 75% | 10–29 | typical short workflow |
+| 5% (`i % 20 == 0`) | 2,001–2,481 | long-running saga tail |
+| 20% (`i % 20` in 1..=4) | 202–285 | medium workflow |
+| 75% | 16–30 | typical short workflow |
 
 This totals **178,000 events / 80,192,528 bytes (~80.2 MB)** of history for
 the target tenant, plus 50 dead-letter rows. A sweep (`NOISE_SWEEP = [3, 15,
