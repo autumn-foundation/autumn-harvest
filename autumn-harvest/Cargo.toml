@@ -336,5 +336,15 @@ harness = false
 name = "stall_diagnosis_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`
+# -- the per-row body of the lazy codec-key re-encryption sweep (issue #948).
+# No feature requirement: both functions are pure and unconditional (the
+# `db`-gated sweep loop that calls them is not exercised here). See
+# `benches/codec_rotation_reencrypt_profile.rs`.
+[[bench]]
+name = "codec_rotation_reencrypt_profile"
+harness = false
+
 [lints]
 workspace = true
