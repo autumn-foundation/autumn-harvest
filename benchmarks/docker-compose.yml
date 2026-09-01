@@ -1,0 +1,63 @@
+# End-to-end benchmark topology (issue #941).
+#
+# Four INDEPENDENT Postgres servers, one per Harvest shard. Independent servers
+# rather than four databases on one server is not decoration: a Harvest shard is
+# a database with its own pool, and four "shards" sharing one server's buffer
+# cache, WAL writer and CPU would make a shard-count sweep a measurement of that
+# one server contending with itself. `benchmarks/run.sh` starts as many of these
+# as the sweep needs (1, then 2, then 4).
+#
+# Ports are in the 55432+ range so this never collides with a Postgres already
+# listening on 5432.
+#
+# The settings below are deliberately close to stock. This suite publishes
+# reference numbers for an untuned Postgres, because that is what a reader
+# reproducing them on a laptop will have; `docs/benchmarks.md` says so, and says
+# which knobs move the numbers.
+
+name: harvest-bench
+
+x-shard: &shard
+  image: postgres:16
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    POSTGRES_DB: postgres
+  # `fsync=off` is unsafe for real data and correct here: every run creates a
+  # throwaway database and the suite measures engine throughput, not the
+  # reference machine's disk. Stated in `docs/benchmarks.md` alongside the
+  # numbers, because it is the single biggest thing separating these figures
+  # from a durable production deployment.
+  command:
+    - postgres
+    - -c
+    - fsync=off
+    - -c
+    - synchronous_commit=off
+    - -c
+    - max_connections=200
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+    interval: 1s
+    timeout: 3s
+    retries: 30
+  tmpfs:
+    - /var/lib/postgresql/data
+
+services:
+  shard-0:
+    <<: *shard
+    container_name: harvest-bench-shard-0
+    ports: ["55432:5432"]
+  shard-1:
+    <<: *shard
+    container_name: harvest-bench-shard-1
+    ports: ["55433:5432"]
+  shard-2:
+    <<: *shard
+    container_name: harvest-bench-shard-2
+    ports: ["55434:5432"]
+  shard-3:
+    <<: *shard
+    container_name: harvest-bench-shard-3
+    ports: ["55435:5432"]

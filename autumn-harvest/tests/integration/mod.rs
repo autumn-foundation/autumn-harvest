@@ -21,6 +21,7 @@ mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
+mod benchmarks_docs;
 #[cfg(feature = "db")]
 mod build_routing_tests;
 #[cfg(feature = "testing")]
@@ -83,6 +84,7 @@ mod debounce_tests;
 mod debugger_tests;
 mod delayed_start_tests;
 mod det_check_tests;
+mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;
