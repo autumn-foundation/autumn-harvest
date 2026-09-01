@@ -223,6 +223,64 @@ terminal. A cross-shard `WorkflowFailure` now reaches its parent with
 `error_type`, `details` and `non_retryable` intact, asserted end-to-end against
 two real shard databases.
 
+**Three bugs that only a real multi-shard run could find.** The DB suite in this
+change was authored where no Postgres was available, so it had never executed
+anywhere until CI ran it. Standing up a real four-database cluster turned up
+three defects in the feature's own core, none of which had been caught by the
+multi-angle review or by nine rounds of automated review, and all three of which
+fail **silently** — no error is raised, the workflow simply never finishes or the
+child never dies.
+
+*Duplicate `ChildWorkflowStarted` for every cross-shard child.* Cross-shard
+children were de-duplicated against their `harvest_cross_shard_children` row.
+That row is written with the first `ChildWorkflowStarted`, so "row exists" does
+imply "already started" — but the row is *deleted* on terminal delivery, and a
+decision cycle spans two transactions. History loads at T0 with the child in
+progress, the relay delivers the terminal and deletes the row at T1, and the
+persist at T2 finds the child in neither the executions table (its row is on
+another shard) nor the outbox, calls it new, and appends a second start event.
+Measured: a 32-child fan-out recorded 49 start events, every duplicate a
+cross-shard child, and the parents then parked forever. The dedupe now keys on
+the parent's own `ChildWorkflowStarted` history, which is append-only and is
+written in the same transaction as the child's creation — so "the event is there"
+and "the child was started" are the same fact at every point in a child's life,
+which is exactly what the outbox row could not provide.
+
+*A cancel discarded on the way out.* `cancel_requested` is the only thing keeping
+a row in the relay's actionable set, and the `CancelChild` arm cleared it as soon
+as the cancel call returned, without establishing that the cancel was observable
+on the target shard. It is now cleared only once the child has actually settled.
+This restores AC4's stated contract: cross-shard cancellation is at-least-once
+with idempotent application, and discarding the request before confirming the
+effect made it at-most-once — the one thing a cancel may not be.
+
+*A cancel discarded on the way in.* The sharpest of the three, and visible only
+as an interleaving. A sweep reads its work-list and the parents' terminal states
+in two statements, deliberately holding no transaction on the parent's shard
+while it reaches across to another database — so under READ COMMITTED each gets
+its own snapshot. A parent completing between them is observed with a **fresh**
+terminal against a **stale** row; since the parent's terminal and its race-loser
+cancel flag commit together, the flag is precisely what the torn read loses. The
+awaited arm then reads "parent closed, child still running" and retires the row,
+deleting a durably-requested cancellation. Captured 21ms apart against real
+databases: the flag committed at `15.307`, and at `15.328` the sweep decided
+`cancel=false parent_terminal=Some(true) -> Retire`. `Retire` now re-checks the
+flag inside the `DELETE`, a compare-and-swap on exactly the field whose staleness
+causes the harm — the same technique the codec-rotation sweep uses against the
+erasure path. Losing that CAS is not a failure; it is the flag arriving.
+
+The suite went from 5 failures in 441s to 10/10 in ~25s, held over six
+consecutive full-suite runs in the context where the last of these reproduced
+roughly one run in three.
+
+**A note on what is not directly guarded.** The torn-read CAS cannot be pinned by
+a test without a seam that lets the flag commit *between* a sweep's two reads: by
+the time any test can observe the row, a fresh read shows `cancel_requested` and
+the decision table returns `CancelChild` rather than `Retire`, so the CAS is never
+reached. The evidence for it is the captured interleaving above and the six clean
+suite runs, not a dedicated regression test — recorded here rather than papered
+over with a test that would pass equally well without the fix.
+
 **Test evidence.** 38 no-database tests covering the pure placement resolver
 (including a 10k-child ±10% distribution check against the success metric) and
 every branch of the relay's decision table, plus workflow-context tests that drive
