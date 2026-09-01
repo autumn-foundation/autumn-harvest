@@ -1020,17 +1020,39 @@ async fn apply_action(
             Ok(true)
         }
         CrossShardChildAction::CancelChild => {
-            cancel_child_on_target(pool, row, acquire_bound, metrics).await?;
-            diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
-                .set((
-                    harvest_cross_shard_children::cancel_requested.eq(false),
-                    harvest_cross_shard_children::last_error.eq(None::<String>),
-                    harvest_cross_shard_children::attempts.eq(0),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            Ok(true)
+            // Clearing `cancel_requested` is what takes this row OUT of the
+            // actionable set, so it must not happen until the cancel is
+            // observable on the target shard. Clearing it eagerly is a silent
+            // child leak, not a cosmetic ordering choice: with the flag gone and
+            // the parent already terminal, the very next sweep reads an awaited
+            // child that is neither cancelled nor finished and correctly decides
+            // `Retire` — deleting the row and abandoning a child that then runs
+            // forever with nothing left tracking it (issue #956).
+            //
+            // Leaving the flag set costs one more sweep in the common case and
+            // is idempotent by construction: `cancel_workflow_execution` on an
+            // already-`CANCELLED` execution returns the idempotent success arm.
+            if cancel_child_on_target(pool, row, acquire_bound, metrics).await? {
+                diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
+                    .set((
+                        harvest_cross_shard_children::cancel_requested.eq(false),
+                        harvest_cross_shard_children::last_error.eq(None::<String>),
+                        harvest_cross_shard_children::attempts.eq(0),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                return Ok(true);
+            }
+            // Not settled yet. Record it as an attempt so the row backs off
+            // rather than spinning at full poll cadence, and stays actionable.
+            record_attempt_failure(
+                conn,
+                row.child_exec_id,
+                "cancel issued but the child is not terminal yet",
+            )
+            .await;
+            Ok(false)
         }
         CrossShardChildAction::ApplyCloseCascade => {
             let policy = observation
@@ -1366,7 +1388,7 @@ async fn cancel_child_on_target(
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let result = crate::execution::cancel_workflow_execution(
@@ -1376,7 +1398,22 @@ async fn cancel_child_on_target(
         metrics,
     )
     .await;
-    absorb_already_settled(&mut conn, child_exec_id, result).await
+    absorb_already_settled(&mut conn, child_exec_id, result).await?;
+
+    // Re-read the child under the SAME connection and report whether the cancel
+    // is actually observable yet. The caller clears `cancel_requested` only on
+    // `true`; see its call site for why an unobserved cancel must NOT clear it.
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(child_exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut *conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    // An absent row is settled as far as the parent is concerned: retention or
+    // erase collected it, and the vanished-child arm reports that separately.
+    Ok(state.is_none_or(|s| crate::erase::is_terminal_state(&s)))
 }
 
 /// Apply a `ParentClosePolicy` to a detached cross-shard child.
