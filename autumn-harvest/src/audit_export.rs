@@ -512,7 +512,7 @@ pub struct AuditExportBuilderConfig {
 ///
 /// Falls back to a marker rather than the input when the URL cannot be parsed:
 /// an unparseable string must not be echoed on the assumption it is harmless.
-fn redact_webhook_url(url: &str) -> String {
+pub(crate) fn redact_webhook_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "<unparseable webhook url redacted>".to_string();
     };
@@ -640,7 +640,20 @@ impl AuditExportBuilderConfig {
         let policy = self.ssrf_policy();
         crate::completion_callback::validate_target_url(url, &policy)
             .map(|_| ())
-            .map_err(|rejection| (url.clone(), rejection))
+            // The REDACTED origin, never the full URL (issue #953, Codex
+            // review round 24 P1). This pair becomes
+            // `HarvestBuilderError::AuditSinkRejected`, whose `Display` a
+            // startup failure writes straight to the logs -- and a SIEM ingest
+            // URL carries its credential in the path or query. Redacting here
+            // rather than at the construction site means the full URL cannot
+            // escape through this result at all.
+            //
+            // Nothing diagnostic is lost: every `SsrfRejection` variant
+            // discriminates on an ORIGIN property -- scheme, host, port, IP
+            // literal, userinfo -- so the origin is exactly what explains the
+            // rejection, and the part that is dropped is exactly the part that
+            // is a secret.
+            .map_err(|rejection| (redact_webhook_url(url), rejection))
     }
 
     /// The claim lease, floored at one second.

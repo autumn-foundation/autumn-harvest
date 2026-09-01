@@ -867,7 +867,15 @@ pub enum HarvestBuilderError {
     /// never delivers is a compliance gap that surfaces only at audit time.
     #[error("audit-export sink URL '{url}' rejected: {rejection}")]
     AuditSinkRejected {
-        /// The rejected sink URL.
+        /// The rejected sink URL, **redacted to its origin**
+        /// (`https://host/<redacted>`) by
+        /// [`crate::audit_export::AuditExportBuilderConfig::validate_webhook_url`].
+        ///
+        /// A startup failure's `Display` goes straight to the logs, and a SIEM
+        /// ingest URL carries its credential in the path or query. Every
+        /// `SsrfRejection` variant discriminates on an origin property, so the
+        /// origin is what explains the rejection and the redacted remainder is
+        /// exactly the secret.
         url: String,
         /// The machine-readable SSRF rejection reason.
         rejection: crate::completion_callback::SsrfRejection,
@@ -6926,13 +6934,17 @@ mod tests {
             .audit_export_webhook("https://evil.com/audit")
             .audit_export_secret(b"k".to_vec())
             .try_build();
+        // The URL is carried REDACTED to its origin: a SIEM ingest endpoint's
+        // path can be its credential, and this error's Display goes to the
+        // startup log (issue #953, Codex review round 24 P1). The host still
+        // identifies what was rejected, which is all the rejection is about.
         assert!(
             matches!(
                 result,
                 Err(HarvestBuilderError::AuditSinkRejected { ref url, .. })
-                    if url == "https://evil.com/audit"
+                    if url == "https://evil.com/<redacted>"
             ),
-            "expected AuditSinkRejected, got {result:?}"
+            "expected AuditSinkRejected with a redacted origin, got {result:?}"
         );
     }
 
@@ -7036,6 +7048,36 @@ mod tests {
         assert!(config.sink.is_some());
         assert!(config.validate_webhook_url().is_ok());
         assert!(!config.webhook_is_missing_a_secret());
+    }
+
+    /// A rejected sink URL must not carry its credential into the error, which
+    /// a startup failure writes straight to the logs (issue #953, Codex review
+    /// round 24 P1).
+    #[test]
+    fn a_rejected_sink_url_is_redacted_in_the_build_error() {
+        let err = HarvestBuilder::new()
+            .audit_export_webhook(
+                "https://http-inputs.attacker.example.com/services/collector/\
+                 B5A79AAD-D822-46CC-80D1-819F80D7BFB0?index=audit",
+            )
+            .audit_export_secret(b"k".to_vec())
+            .try_build()
+            .expect_err("a non-allowlisted host must be rejected");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("B5A79AAD"),
+            "the collector token must not reach the startup log: {rendered}"
+        );
+        assert!(
+            !rendered.contains("index=audit"),
+            "nor the query string: {rendered}"
+        );
+        assert!(
+            rendered.contains("http-inputs.attacker.example.com"),
+            "the host must survive -- it is what the rejection is ABOUT, and \
+             an operator cannot act without it: {rendered}"
+        );
     }
 
     /// The same URL without a sink must still be rejected — the guard above is
