@@ -195,7 +195,7 @@ one size where a forced rewrite would matter if it helped):
 | variant | plan | buffers (hit+read) |
 |---|---|---:|
 | unmodified (`IN` subquery) | `Seq Scan` of the whole table | 12,745 |
-| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,727 hit + 37 read) |
+| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec_last`, 1,000 loops | 15,764 (15,727 hit + 37 read) |
 
 The rewrite **costs 24% more**, not less. Postgres's per-row plan for the
 correlated form is a `Bitmap Heap Scan` (build a bitmap, sort, then fetch) —
@@ -273,7 +273,7 @@ None: no index added, no schema change.
 ## The cost that remains, and why this is not a Ledger fix
 
 Even on its best (and, as shown above, self-selected) plan, this query costs
-~16,700–16,800 buffers and ~50–100ms **per admission**, and that cost is
+~16,700–16,800 buffers and ~60–130ms **per admission**, and that cost is
 proportional to the target tenant's own accumulated active-execution
 history — recomputed from scratch, synchronously, inside the admission
 transaction, on *every single* fresh start and spawned child for that
