@@ -1778,13 +1778,55 @@ async fn deliver_within_lease(
 /// Three phases, deliberately separated: claim (transaction 1), deliver (no
 /// transaction, no locks), apply (transaction 2). Returns the number of
 /// records delivered.
+/// Discard a delivery whose sink was replaced while it was in flight.
+///
+/// `read_global_audit_export_config` clones the `Arc` at the top of a tick, so
+/// a second runtime publishing a different sink does not disturb that clone and
+/// the batch reaches the OLD destination (issue #953, Codex review round 25
+/// P1). `apply_outcome` is guarded on `claim_epoch`, which a config swap does
+/// not change, so a 2xx from the old sink would advance the cursor: the records
+/// would be delivered, marked delivered, and absent from the SIEM the operator
+/// actually configured.
+///
+/// Comparing the `Arc` this attempt used against the one now installed closes
+/// that window. A mismatch becomes a transport failure, so the cursor is held
+/// and the batch is redelivered under the new sink. The old sink keeps its
+/// copy — that is the at-least-once contract, not a leak.
+///
+/// A `current` of `None` also counts as swapped: export was turned off
+/// mid-flight, and advancing the cursor on the strength of the retired sink's
+/// answer would strand those records.
+///
+/// Takes `current` rather than reading the global itself, so the decision is a
+/// pure function of its inputs — the same shape as [`classify_export_outcome`].
+/// That is deliberate: a version of this that read the process-wide static
+/// internally could only be tested by mutating that static, and two tests in
+/// this PR have already failed on CI for exactly that reason while passing
+/// locally.
+#[cfg(feature = "db")]
+fn fence_against_sink_swap(
+    attempt: SinkAttempt,
+    delivered_with: &std::sync::Arc<AuditExportRuntimeConfig>,
+    current: Option<&std::sync::Arc<AuditExportRuntimeConfig>>,
+) -> SinkAttempt {
+    if current.is_some_and(|current| std::sync::Arc::ptr_eq(current, delivered_with)) {
+        return attempt;
+    }
+    SinkAttempt::transport_error(
+        "the audit sink was replaced while this batch was in flight; holding the cursor so \
+         the batch is redelivered to the newly configured sink"
+            .to_string(),
+    )
+}
+
 #[cfg(feature = "db")]
 async fn export_once_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
-    config: &AuditExportRuntimeConfig,
+    config_arc: &std::sync::Arc<AuditExportRuntimeConfig>,
     shard_id: i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
+    let config = config_arc.as_ref();
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
@@ -1861,6 +1903,13 @@ async fn export_once_on_conn(
     // A timeout is classified exactly like any other transport failure: the
     // cursor is held and the batch is retried. Never a loss.
     let attempt = deliver_within_lease(config, &batch, claim.lease_until).await;
+
+    let attempt = fence_against_sink_swap(
+        attempt,
+        config_arc,
+        read_global_audit_export_config().as_ref(),
+    );
+
     let outcome = classify_export_outcome(
         &attempt,
         last_seq,
@@ -2691,6 +2740,66 @@ mod tests {
             let rendered = redact_webhook_url(junk);
             assert_eq!(rendered, "<unparseable webhook url redacted>");
         }
+    }
+
+    /// A delivery whose sink was swapped mid-flight must not advance the
+    /// cursor: the records went to the OLD destination, and marking them
+    /// delivered would leave the newly configured SIEM without them (issue
+    /// #953, Codex review round 25 P1).
+    ///
+    /// Fully deterministic — the decision is a pure function of its arguments,
+    /// so this touches no process-wide state and cannot race the 33 other tests
+    /// in this binary that write `GLOBAL_AUDIT_EXPORT_CONFIG`.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_sink_swapped_mid_flight_holds_the_cursor() {
+        fn config(batch_size: i64) -> std::sync::Arc<AuditExportRuntimeConfig> {
+            std::sync::Arc::new(AuditExportRuntimeConfig {
+                sink: std::sync::Arc::new(NoopSink),
+                secret: CallbackSecret::new(b"k".to_vec()),
+                batch_size,
+                backoff: ExportBackoff::default(),
+                lease: std::time::Duration::from_secs(30),
+            })
+        }
+
+        let delivered_with = config(10);
+
+        // Same Arc still installed: the outcome is untouched.
+        let kept = fence_against_sink_swap(
+            SinkAttempt::success(200),
+            &delivered_with,
+            Some(&delivered_with),
+        );
+        assert_eq!(
+            kept.status,
+            Some(200),
+            "an unchanged sink must leave the outcome alone"
+        );
+
+        // A different runtime's sink is now installed: the 2xx must not count.
+        let replacement = config(99);
+        let fenced = fence_against_sink_swap(
+            SinkAttempt::success(200),
+            &delivered_with,
+            Some(&replacement),
+        );
+        assert!(
+            fenced.status.is_none(),
+            "a 2xx from the sink that was replaced mid-flight must be held, or \
+             the cursor advances past records the new SIEM never received"
+        );
+
+        // An equal-but-distinct config is still a different sink: identity,
+        // not value, is what decides where the bytes actually went.
+        let twin = config(10);
+        let fenced =
+            fence_against_sink_swap(SinkAttempt::success(200), &delivered_with, Some(&twin));
+        assert!(fenced.status.is_none());
+
+        // Export switched off mid-flight counts as swapped too.
+        let fenced = fence_against_sink_swap(SinkAttempt::success(200), &delivered_with, None);
+        assert!(fenced.status.is_none());
     }
 
     #[test]

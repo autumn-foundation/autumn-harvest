@@ -6,8 +6,17 @@
 -- the exporter only READS `harvest_audit_log` and writes its own bookkeeping.
 --
 -- Nothing here is seeded and nothing runs on the hot path: with no sink
--- configured, `export_seq` stays NULL on every row forever, the cursor table
--- stays empty, and behaviour is byte-identical to before this migration.
+-- configured, `export_seq` stays NULL on every row forever and the cursor
+-- table stays empty.
+--
+-- One cost is NOT zero, and saying otherwise would be wrong: the partial index
+-- below is predicated on `export_seq IS NULL`, which for an unconfigured
+-- deployment matches EVERY row. Such a deployment therefore pays a full index
+-- build at migration time and index maintenance on every subsequent audit
+-- insert, for a feature it never turns on. Bounded by the audit retention
+-- window rather than unbounded, but real. Tracked as
+-- autumn-foundation/autumn-harvest#1272, which weighs creating the index
+-- lazily on first opt-in against leaving it here.
 
 -- ── The per-shard monotonic sequence (AC4) ────────────────────────────────
 --
