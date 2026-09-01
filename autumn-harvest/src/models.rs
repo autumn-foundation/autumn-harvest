@@ -14,10 +14,11 @@ use crate::schema::{
     harvest_backfill_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
     harvest_calendar_exclusions, harvest_calendars, harvest_completion_deliveries,
     harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
-    harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_execution_summaries,
-    harvest_external_tasks, harvest_mutex_locks, harvest_mutex_waiters, harvest_payload_refs,
-    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
-    harvest_signals, harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
+    harvest_completion_triggers, harvest_cross_shard_children, harvest_dead_letters,
+    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
+    harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
+    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions, harvest_workflow_logs,
 };
 
@@ -1317,6 +1318,47 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+}
+
+// ── Cross-shard child workflows (issue #956) ─────────────────────────────────
+
+/// One in-flight cross-shard child, as stored on the **parent's** shard.
+///
+/// See `harvest_cross_shard_children` in `schema.rs` and
+/// [`crate::cross_shard_child`] for the lifecycle this row drives.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_cross_shard_children)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CrossShardChildRow {
+    pub child_exec_id: Uuid,
+    pub parent_exec_id: Uuid,
+    pub target_shard: i32,
+    pub status: String,
+    pub cancel_requested: bool,
+    /// `None` = awaited child; `Some(policy)` = detached child.
+    pub parent_close_policy: Option<String>,
+    pub workflow_name: String,
+    /// A serialized `crate::cross_shard_child::CrossShardChildSpec`.
+    pub child_spec: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable form of [`CrossShardChildRow`], written inside the parent's own
+/// decision transaction so the row and the parent's `ChildWorkflowStarted`
+/// event commit together or not at all.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_cross_shard_children)]
+pub struct NewCrossShardChildRow {
+    pub child_exec_id: Uuid,
+    pub parent_exec_id: Uuid,
+    pub target_shard: i32,
+    pub status: String,
+    pub parent_close_policy: Option<String>,
+    pub workflow_name: String,
+    pub child_spec: serde_json::Value,
 }
 
 // ── AdmissionGate ─────────────────────────────────────────────────────────────

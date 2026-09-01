@@ -101,16 +101,28 @@ do_run() {
       a+=(-- "${post[@]}")
     fi
 
+    # The failure label carries the FILTER. Without it every failing row of the
+    # same (crate, target, osclass) prints an identical line — and the core rows
+    # are all `autumn-harvest/integration (linux)`, so "3 suites failed" named
+    # none of them. The per-suite `::group::` output that would identify them
+    # is often outside the log window the API will return for a long job, so
+    # the summary is the only place the name reliably survives.
+    local label
+    label="$crate/$target ($want)"
+    if [ "$filter" != "-" ]; then
+      label="$label -- $filter"
+    fi
+
     # `linuxpart` is `linux` with the layout switch flipped: identical cargo
     # invocation, run against the opt-in partitioned `harvest_events` layout.
     # Exported only for this invocation so a mixed run cannot leak the flag into
     # the plain `linux` pass.
     if [ "$want" = "linuxpart" ]; then
       if ! HARVEST_TEST_PARTITIONED=1 run_cargo "${a[@]}"; then
-        note_failure "$crate/$target ($want)"
+        note_failure "$label"
       fi
     elif ! run_cargo "${a[@]}"; then
-      note_failure "$crate/$target ($want)"
+      note_failure "$label"
     fi
   done < <(records)
 }

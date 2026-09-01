@@ -877,6 +877,19 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
+    // Issue #956: a cross-shard parent is not on this connection, and appending
+    // to it here would `NotFound` and roll back the child's own timeout
+    // transaction — leaving the child non-terminal forever. The cross-shard
+    // relay delivers this wake instead, from the parent's own shard. Mirrors the
+    // identical guard in `worker::wake_parent_for_child_completion`/`_failure`.
+    if crate::worker::parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+        tracing::debug!(
+            parent_execution_id = %parent_exec_id,
+            child_execution_id = %child_exec_id,
+            "cross-shard child timed out; the parent wake is the relay's to deliver"
+        );
+        return Ok(());
+    }
     // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the child
     // terminal (mirrors worker::wake_parent_for_child_completion/_failure) so an
     // over-deadline child that hits its OWN execution timeout resolves the
@@ -3482,6 +3495,25 @@ pub async fn enforce_timeouts_once(
         metrics,
         sharded_pool,
         shard_assignments,
+    )
+    .await?;
+    // Cross-shard child workflows (issue #956). Runs on this shard's own
+    // `harvest_cross_shard_children` rows: creates opt-in cross-shard children on
+    // their target shard, delivers their terminals back to the parent parked
+    // here, relays parent-side cancels, and applies the `ParentClosePolicy`
+    // cascade across the shard boundary. A no-op — one indexed, empty-relation
+    // scan — in every deployment that never opts in.
+    //
+    // Placed after the #492 outbox scanners deliberately: those deliver signals
+    // and cancels that a workflow is parked on, and a parent woken by this
+    // scanner will re-enter its decision cycle on the next claim either way, so
+    // ordering costs nothing but keeps the cheap always-empty scan last among
+    // the delivery family.
+    count += crate::cross_shard_child::enforce_cross_shard_children(
+        conn,
+        sharded_pool,
+        payload_codecs,
+        metrics,
     )
     .await?;
     count +=

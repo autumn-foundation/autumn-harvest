@@ -498,7 +498,7 @@
       "path": "/workflows/{id}/children",
       "category": "workflow",
       "read_only": true,
-      "description": "List child workflow executions spawned by a parent execution.",
+      "description": "List child workflow executions spawned by a parent execution. The walk fans out across every readable shard, so a child placed on a different shard than its parent (issue #956 cross-shard child placement) still appears. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call. BEHAVIOUR CHANGE in 0.5.0: this previously returned 500 when any shard was unreachable; it now returns 200 with the reachable children and a non-`complete` status. The 500 below is retained for a database error on the parent lookup itself, which is not a partial-result case.",
       "params": [
         {
           "name": "id",
@@ -543,7 +543,9 @@
         "status": 200,
         "fields": [
           "items",
-          "next_cursor"
+          "next_cursor",
+          "status",
+          "unavailable_shards"
         ]
       },
       "error_responses": [

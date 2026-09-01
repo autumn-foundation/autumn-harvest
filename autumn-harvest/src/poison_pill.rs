@@ -365,13 +365,30 @@ mod scanner {
             && let Some(parent_uuid) = parent_id
         {
             let parent_exec_id = execution_id_from_uuid(parent_uuid);
-            crate::store::append_single_event(
-                conn,
-                parent_exec_id,
-                WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
-            )
-            .await?;
-            crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
+            // Issue #956: a cross-shard parent is not on this connection.
+            // `append_single_event` requires the parent row, so appending here
+            // would `NotFound` and roll back this poison-pill seal — leaving the
+            // child neither sealed nor retried. The cross-shard relay delivers
+            // the wake instead, from the parent's own shard, once it observes
+            // this child terminal. Mirrors the identical guard in
+            // `worker::wake_parent_for_child_completion`/`_failure` and
+            // `timeout::wake_parent_for_child_timeout`.
+            if crate::worker::parent_is_on_another_shard(parent_exec_id, exec_id) {
+                tracing::debug!(
+                    parent_execution_id = %parent_exec_id,
+                    child_execution_id = %exec_id,
+                    "cross-shard child poison-pilled; the parent wake is the \
+                     relay's to deliver"
+                );
+            } else {
+                crate::store::append_single_event(
+                    conn,
+                    parent_exec_id,
+                    WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
+                )
+                .await?;
+                crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
+            }
         }
         Ok((
             Some((workflow_id, workflow_name, schedule_id, origin)),

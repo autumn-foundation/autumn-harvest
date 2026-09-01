@@ -78,14 +78,18 @@ fn duplicate_version_prefixes_is_empty_for_distinct_prefixes() {
     );
 }
 
-/// The first version at which a real time-of-day component is required.
+/// The last grandfathered version — anything *after* it must carry a real
+/// time-of-day component.
 ///
-/// Every migration before this point is `YYYYMMDD000000` and stays that way —
-/// renaming an applied migration would make Diesel re-run it. The cutover is a
-/// date, so the rule applies to what gets written from here on.
-const TIME_BEARING_VERSION_CUTOFF: &str = "20260801000000";
+/// Every migration up to and including this point is `YYYYMMDD000000` and stays
+/// that way: renaming an applied migration would orphan its
+/// `__diesel_schema_migrations` row and make Diesel re-run it. The boundary is
+/// the one CLAUDE.md states under *Name every migration with a second-precision
+/// UTC timestamp*, and the two must not drift — an operator reading the rule and
+/// a contributor tripping the guard have to be told the same thing.
+const TIME_BEARING_VERSION_CUTOFF: &str = "20260728000000";
 
-/// Migration versions at or after the cutoff whose time component is all zeros.
+/// Migration versions after the cutoff whose time component is all zeros.
 ///
 /// Pure, so the guard and its RED demonstration share one predicate.
 fn day_granular_versions(list: &str) -> Vec<&str> {
@@ -93,7 +97,7 @@ fn day_granular_versions(list: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .filter_map(|n| n.split('_').next())
-        .filter(|v| v.len() == 14 && *v >= TIME_BEARING_VERSION_CUTOFF)
+        .filter(|v| v.len() == 14 && *v > TIME_BEARING_VERSION_CUTOFF)
         .filter(|v| v.ends_with("000000"))
         .collect()
 }
@@ -102,6 +106,10 @@ fn day_granular_versions(list: &str) -> Vec<&str> {
 fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
     // Before the cutoff: grandfathered, however zeroed.
     assert!(day_granular_versions("20260101000000_old").is_empty());
+    // The cutoff itself is the last grandfathered version, not the first
+    // flagged one — `20260728000000_harvest_audit_export` is on disk and must
+    // keep its name.
+    assert!(day_granular_versions("20260728000000_audit_export").is_empty());
     // After it: flagged.
     assert_eq!(
         day_granular_versions("20260901000000_new"),
@@ -136,8 +144,9 @@ fn migration_versions_carry_a_time_of_day_not_just_a_date() {
         "these migrations use a date-only version ({flagged:?}), which collides with \
          any other migration authored the same day — and only shows up when the two \
          branches meet. Use a real timestamp: `date -u +%Y%m%d%H%M%S`. Migrations \
-         before {TIME_BEARING_VERSION_CUTOFF} are grandfathered and must not be \
-         renamed, because renaming an applied migration makes Diesel re-run it."
+         up to and including {TIME_BEARING_VERSION_CUTOFF} are grandfathered and \
+         must not be renamed, because renaming an applied migration makes Diesel \
+         re-run it."
     );
 }
 

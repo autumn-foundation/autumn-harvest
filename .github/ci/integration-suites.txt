@@ -76,6 +76,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
+linux        autumn-harvest         integration                      -                          cross_shard_children_tests
 linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
