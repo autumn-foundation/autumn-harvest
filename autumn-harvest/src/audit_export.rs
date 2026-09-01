@@ -1709,6 +1709,7 @@ pub async fn rewind_cursor_locked(
 /// An already-elapsed remainder is not skipped, it is an immediate timeout —
 /// classified like any other transport failure, so the cursor is held and the
 /// batch retried under a fresh claim. Never a loss.
+#[cfg(feature = "db")]
 async fn deliver_within_lease(
     config: &AuditExportRuntimeConfig,
     batch: &AuditBatch<'_>,
