@@ -1,2 +1,2 @@
 -- pg_stat_statements after 20 real load_quota_usage() calls @ noise_mult=100 (largest fixture), scoped to this database's dbid --
-calls=20 shared_blks_hit=335360 shared_blks_read=0 total_buffers=335360 mean_exec_time_ms=43.600
+calls=20 shared_blks_hit=335380 shared_blks_read=0 total_buffers=335380 mean_exec_time_ms=52.345

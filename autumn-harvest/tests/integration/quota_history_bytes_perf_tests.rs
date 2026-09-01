@@ -53,8 +53,8 @@
 //! (more tenants over time, not one tenant's history growing without
 //! bound): 205k / 313k / 1.08M total table rows.
 //!
-//! `#[ignore]`d: a one-shot evidence-capture tool, not a repeatable CI
-//! assertion. Run via
+//! The evidence-capture test below is ignored by default: a one-shot tool,
+//! not a repeatable CI assertion. Run via
 //! `autumn-harvest/scripts/quota_history_bytes_perf_repro.sh`. Full writeup:
 //! `docs/performance-quota-history-bytes.md`.
 
@@ -543,4 +543,81 @@ async fn zz_capture_quota_history_bytes_evidence() {
     .expect("write fixture summary");
 
     eprintln!("== capture complete: artifacts in {} ==", out_dir.display());
+}
+
+/// Event count `seed_fixture`'s SQL assigns to execution index `i` (1-indexed,
+/// matching `generate_series(1, TARGET_ACTIVE)`).
+///
+/// A pure Rust mirror of the `CASE` expression and `generate_series(0, upper)`
+/// event-count formula in `seed_fixture`'s SQL string — kept here so the
+/// module doc's per-bucket ranges are a checked regression, not a hand
+/// re-derivation that can silently drift from the SQL the way the doc page
+/// itself did (see PR #1276 review). If `seed_fixture`'s `CASE` changes,
+/// this must change with it, or [`event_count_ranges_match_documentation`]
+/// below will fail.
+#[allow(dead_code)] // exercised only by the test below
+const fn event_count_for_index(i: i64) -> i64 {
+    let r = i % 20;
+    let upper = if r == 0 {
+        2000 + (i % 500)
+    } else if r >= 1 && r <= 4 {
+        200 + (i % 100)
+    } else {
+        10 + (i % 20)
+    };
+    upper + 1 // generate_series(0, upper) is inclusive
+}
+
+/// Locks in the exact per-bucket event-count ranges the module doc and
+/// `docs/performance-quota-history-bytes.md` publish (2,001-2,481 /
+/// 202-285 / 16-30), so a future edit to the fixture's skew formula that
+/// silently changes those bounds fails a fast, no-database test instead of
+/// only being caught by a slow manual review of a committed artifact.
+///
+/// No live Postgres required — pure arithmetic over [`event_count_for_index`]
+/// — but it lives in this `#[cfg(feature = "db")]` module because it exists
+/// to guard the DB-backed fixture this file seeds, and splitting it into a
+/// separate always-on file would separate the guard from the code it guards.
+#[test]
+fn event_count_ranges_match_documentation() {
+    let (mut long, mut medium, mut short) = (
+        Vec::new() as Vec<i64>,
+        Vec::new() as Vec<i64>,
+        Vec::new() as Vec<i64>,
+    );
+    let mut total = 0i64;
+    for i in 1..=TARGET_ACTIVE {
+        let count = event_count_for_index(i);
+        total += count;
+        match i % 20 {
+            0 => long.push(count),
+            1..=4 => medium.push(count),
+            _ => short.push(count),
+        }
+    }
+
+    assert_eq!(long.len(), 50, "long bucket must be 5% of 1,000");
+    assert_eq!(medium.len(), 200, "medium bucket must be 20% of 1,000");
+    assert_eq!(short.len(), 750, "short bucket must be 75% of 1,000");
+
+    assert_eq!(
+        (long.iter().min(), long.iter().max()),
+        (Some(&2001), Some(&2481)),
+        "long-bucket event-count range drifted from the documented 2,001-2,481"
+    );
+    assert_eq!(
+        (medium.iter().min(), medium.iter().max()),
+        (Some(&202), Some(&285)),
+        "medium-bucket event-count range drifted from the documented 202-285"
+    );
+    assert_eq!(
+        (short.iter().min(), short.iter().max()),
+        (Some(&16), Some(&30)),
+        "short-bucket event-count range drifted from the documented 16-30"
+    );
+
+    assert_eq!(
+        total, 178_000,
+        "total seeded event count drifted from the documented 178,000"
+    );
 }
