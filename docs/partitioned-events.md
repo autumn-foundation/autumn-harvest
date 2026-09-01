@@ -166,6 +166,33 @@ execution**. Two tiers answer that:
    huge partition cannot stall a tick. A timeout retains and retries — an
    unfinished proof is not a proof.
 
+### What a drop locks
+
+The gate runs unlocked, so its answer can be stale by the time the drop starts.
+The drop therefore re-proves it — and the lock it re-proves it under is
+`SHARE` on the **one child partition**, not `ACCESS EXCLUSIVE` on the parent:
+
+- `SHARE` conflicts with `ROW EXCLUSIVE`, so no INSERT, UPDATE or DELETE can
+  touch that partition while the proof runs. That is the whole guarantee the
+  re-check needs, and appends to every other cohort — which is all of them,
+  this one being closed — are unaffected.
+- `SHARE` does not conflict with `ACCESS SHARE`, so readers are unaffected.
+  That matters more than it looks: the insert trigger's cross-partition
+  `(workflow_exec_id, event_id)` uniqueness check reads the partitioned parent
+  and so locks *every* child in `ACCESS SHARE`. An exclusive lock on any one
+  child would stall every append on the shard, whichever cohort it belongs to.
+
+`ACCESS EXCLUSIVE` is taken by the `DROP` alone — on the child, and on the
+parent to update its partition descriptor. That is a catalog change: immediate.
+The distinction is not academic. Waiting for a lock is bounded by
+`drop_lock_timeout_secs`; the re-check that follows it is bounded by
+`exact_scan_timeout`, and a `lock_timeout` bounds *acquiring* a lock, never
+holding one. Proving a large partition under an exclusive lock would stall the
+shard for the length of the scan, once per drop attempt, on every tick.
+
+A drop that deadlocks with a concurrent append into its own closed cohort, or
+that cannot get its lock in time, is reported blocked and retried next tick.
+
 **Legal holds (#747), per-type retention overrides (#737) and long-running
 executions need no special-casing at all.** Each keeps its execution row alive,
 which keeps its rows owned, which blocks the drop. There is no second copy of
@@ -297,14 +324,18 @@ The plan moves the expensive work out of the lock window:
 |---|---|---|
 | 1 | Bake the cohort width into `harvest_event_cohort` | none |
 | 2 | `CREATE UNIQUE INDEX CONCURRENTLY` ×2 | none that blocks appends |
-| 3 | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` — readers and writers proceed |
+| 3 | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` | brief `ACCESS EXCLUSIVE` for the catalog row, then `SHARE UPDATE EXCLUSIVE` for the scan — readers and writers proceed |
 | 4 | Rename, create parent, attach legacy | **`ACCESS EXCLUSIVE`, metadata only — seconds** |
 | 5 | Hand back to the engine | none |
 
 Step 3 is what lets step 4's `ATTACH PARTITION` skip its own full-table
-verification scan. Step 4 is bounded by an explicit `lock_timeout`, so a
-conversion that cannot get the lock **fails** rather than stalling the
-deployment behind it.
+verification scan. Steps 3 and 4 are each bounded by an explicit
+`lock_timeout`, so a conversion that cannot get the lock **fails** rather than
+stalling the deployment behind it. Step 3 needs that bound as much as step 4
+does: `NOT VALID` skips the table scan but still takes `ACCESS EXCLUSIVE` to
+write the catalog row, and one idle-in-transaction reader is enough to make the
+request queue — with every append arriving after it queued behind the `ALTER`.
+Re-run the step after clearing the blocker.
 
 **Recheck the cutover before running step 3.** The plan bakes in the value
 computed when it was printed. A *stale* (older) cutover is safe — every
@@ -374,10 +405,10 @@ The sweeper reports every cohort it considered and left alone, with the reason:
 - `ownership scan exceeded its budget` — the exact gate timed out; it retries
   next tick. Persistent, on a very large partition, means raising
   `exact_scan_timeout` or narrowing the cohort width.
-- `lock not acquired, or an owner appeared before the drop` — either a long
-  transaction is holding `harvest_events`, or the authoritative re-check taken
-  under the exclusive lock found an owner that appeared after the gate ran.
-  Expected under load, and self-correcting.
+- `lock not acquired, or an owner appeared before the drop` — either a writer
+  or a competing maintenance pass is holding the partition, or the
+  authoritative re-check taken under `SHARE` found an owner that appeared after
+  the gate ran. Expected under load, and self-correcting.
 - `unbounded upper bound` — a partition with no upper bound, which this engine
   never creates. It means something else attached one by hand; it can never be
   swept.
@@ -393,7 +424,7 @@ The same information is on every retention tick's per-shard status
 |---|---|---|
 | `enabled` | `true` | For incident response, not tuning: disabling it stops both partition creation and reclamation. |
 | `lookahead_cohorts` | `7` | Cohorts kept pre-created ahead of now. |
-| `max_drops_per_tick` | `32` | Each drop takes a brief `ACCESS EXCLUSIVE` lock; a bounded budget keeps a backlog from holding the append path off. Successive ticks converge. |
+| `max_drops_per_tick` | `32` | Each drop ends in a brief `ACCESS EXCLUSIVE` catalog lock; a bounded budget keeps a backlog from holding the append path off. Successive ticks converge. |
 | `drop_lock_timeout_secs` | `2` | Fail fast and retry rather than making every append queue behind the sweep. |
 | `exact_scan_timeout_secs` | `15` | Budget for the exact ownership scan, reached only when more than `owner_probe_cap` old executions survive. |
 | `owner_probe_cap` | `1000` | How many surviving old executions the cheap narrow probe enumerates before falling back to the exact scan. |

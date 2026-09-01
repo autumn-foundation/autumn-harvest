@@ -827,6 +827,15 @@ pub fn is_statement_timeout(msg: &str) -> bool {
     msg.contains("57014") || msg.contains("statement timeout")
 }
 
+/// Postgres broke a lock cycle by aborting this transaction (SQLSTATE `40P01`).
+///
+/// Retryable by construction: the work the loser was doing is still there to be
+/// done, and the winner has moved on.
+#[must_use]
+pub fn is_deadlock(msg: &str) -> bool {
+    msg.contains("40P01") || msg.contains("deadlock detected")
+}
+
 /// Is `name` attached to `harvest_events` with exactly these bounds?
 #[cfg(feature = "db")]
 async fn cohort_partition_is_attached(
@@ -1582,7 +1591,9 @@ async fn sweep_inner(
             continue;
         }
 
-        if let Some(reason) = cohort_occupancy(conn, part.lower, upper, opts).await? {
+        if let Some(reason) =
+            cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
+        {
             outcome.blocked.push(format!("{} ({reason})", part.name));
             // Deliberately NOT after a scan timeout. That reason means the
             // partition was too big to prove anything about; following it with
@@ -1615,6 +1626,75 @@ async fn sweep_inner(
         }
     }
     Ok(outcome)
+}
+
+/// Where an occupancy proof looks for events.
+///
+/// Two shapes, and the difference between them is the whole reason the drop
+/// path does not stall a shard:
+///
+/// - [`EventScope::cohort`] reads the partitioned **parent** under a cohort
+///   range predicate. That is the right shape for the unlocked gate, which
+///   runs before any lock is taken and is free to touch every partition.
+/// - [`EventScope::partition`] reads **one child table** directly, with no
+///   predicate at all — the child's boundaries *are* the cohort. That is the
+///   shape the re-check under `ACCESS EXCLUSIVE` uses, so the lock it needs is
+///   the one partition's, not the parent's.
+///
+/// The child form also sidesteps the `MINVALUE` trap described below outright:
+/// with no cohort predicate there is no lower bound to get wrong.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone)]
+struct EventScope {
+    /// `FROM` target, already quoted.
+    table: String,
+    /// Predicate on `e`, ending in `AND ` when non-empty.
+    cohort_pred: String,
+}
+
+#[cfg(feature = "db")]
+impl EventScope {
+    /// The partitioned parent, narrowed to one cohort range.
+    ///
+    /// The bounds are inlined as literals rather than bound as parameters so
+    /// Postgres can prune to the partitions that can match at plan time.
+    ///
+    /// A `MINVALUE` lower bound is **omitted rather than substituted**: the
+    /// legacy partition's rows carry the migration's `-infinity` cohort, which
+    /// sorts BELOW every finite timestamptz. Binding any finite value for
+    /// `MINVALUE` would make `cohort >= $lower` exclude 100% of the legacy
+    /// partition's rows — so a scan would find no live owner, declare the
+    /// partition reclaimable, and DROP the entire pre-conversion history of a
+    /// deployment that had just opted in, running executions and legal holds
+    /// included.
+    fn cohort(lower: Option<DateTime<Utc>>, upper: DateTime<Utc>) -> Self {
+        use std::fmt::Write as _;
+        let mut cohort_pred = String::new();
+        if let Some(lower) = lower {
+            let _ = write!(
+                cohort_pred,
+                "e.cohort >= {}::timestamptz AND ",
+                ts_literal(lower)
+            );
+        }
+        let _ = write!(
+            cohort_pred,
+            "e.cohort < {}::timestamptz AND ",
+            ts_literal(upper)
+        );
+        Self {
+            table: "harvest_events".to_string(),
+            cohort_pred,
+        }
+    }
+
+    /// One child partition, read directly.
+    fn partition(name: &str) -> Self {
+        Self {
+            table: quote_ident(name),
+            cohort_pred: String::new(),
+        }
+    }
 }
 
 /// Is any row in this closed cohort still owned by a live execution?
@@ -1658,7 +1738,7 @@ async fn sweep_inner(
 #[cfg(feature = "db")]
 async fn cohort_occupancy(
     conn: &mut AsyncPgConnection,
-    lower: Option<DateTime<Utc>>,
+    scope: &EventScope,
     upper: DateTime<Utc>,
     opts: &SweepOptions,
 ) -> HarvestResult<Option<String>> {
@@ -1692,7 +1772,7 @@ async fn cohort_occupancy(
 
     if i64::try_from(survivors.len()).unwrap_or(i64::MAX) <= cap {
         let ids: Vec<uuid::Uuid> = survivors.into_iter().map(|r| r.id).collect();
-        let owned = cohort_has_rows_for(conn, lower, upper, &ids).await?;
+        let owned = cohort_has_rows_for(conn, scope, &ids).await?;
         return Ok(owned.then(|| OWNED_REASON.to_string()));
     }
 
@@ -1702,34 +1782,17 @@ async fn cohort_occupancy(
         .max(1);
     let scan = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
-        // `lower_predicate` rather than a substituted sentinel: the legacy
-        // partition's lower bound is `MINVALUE`, and its rows carry the
-        // migration's `-infinity` cohort, which sorts BELOW every finite
-        // timestamptz. Binding any finite value for `MINVALUE` here would make
-        // `cohort >= $lower` exclude 100% of the legacy partition's rows — so
-        // the scan would find no live owner, declare the partition reclaimable,
-        // and DROP the entire pre-conversion history of a deployment that had
-        // just opted in, running executions and legal holds included.
         let sql = format!(
             "SELECT EXISTS (
-                 SELECT 1 FROM harvest_events e
-                  WHERE {} e.cohort < $1
-                    AND EXISTS (
+                 SELECT 1 FROM {} e
+                  WHERE {} EXISTS (
                         SELECT 1 FROM harvest_workflow_executions x
                          WHERE x.id = e.workflow_exec_id
                     )
              ) AS v",
-            lower.map_or(String::new(), |_| "e.cohort >= $2 AND".to_string())
+            scope.table, scope.cohort_pred
         );
-        let query = diesel::sql_query(sql).bind::<Timestamptz, _>(upper);
-        let row = if let Some(lower) = lower {
-            query
-                .bind::<Timestamptz, _>(lower)
-                .get_result::<BoolRow>(conn)
-                .await
-        } else {
-            query.get_result::<BoolRow>(conn).await
-        };
+        let row = diesel::sql_query(sql).get_result::<BoolRow>(conn).await;
         Ok(row.map_err(database_error)?.v)
     }))
     .await;
@@ -1753,43 +1816,33 @@ async fn cohort_occupancy(
 #[cfg(feature = "db")]
 async fn cohort_has_rows_for(
     conn: &mut AsyncPgConnection,
-    lower: Option<DateTime<Utc>>,
-    upper: DateTime<Utc>,
+    scope: &EventScope,
     ids: &[uuid::Uuid],
 ) -> HarvestResult<bool> {
     if ids.is_empty() {
         return Ok(false);
     }
-    // The `MINVALUE` lower bound is omitted rather than substituted — see the
-    // comment in `cohort_occupancy`'s tier 3.
     let sql = format!(
         "SELECT EXISTS (
-             SELECT 1 FROM harvest_events e
-              WHERE e.workflow_exec_id = ANY($1) AND {} e.cohort < $2
+             SELECT 1 FROM {} e
+              WHERE {} e.workflow_exec_id = ANY($1)
          ) AS v",
-        lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
+        scope.table, scope.cohort_pred
     );
-    let query = diesel::sql_query(sql)
+    let row = diesel::sql_query(sql)
         .bind::<Array<SqlUuid>, _>(ids.to_vec())
-        .bind::<Timestamptz, _>(upper);
-    let row = if let Some(lower) = lower {
-        query
-            .bind::<Timestamptz, _>(lower)
-            .get_result::<BoolRow>(conn)
-            .await
-    } else {
-        query.get_result::<BoolRow>(conn).await
-    };
+        .get_result::<BoolRow>(conn)
+        .await;
     Ok(row.map_err(database_error)?.v)
 }
 
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
 ///
-/// Returns `false` (not an error) when the partition was left in place: either
-/// the `ACCESS EXCLUSIVE` lock could not be taken in time, or the re-check
-/// found an owner. Leaving it for the next tick is the correct response to
-/// both; making every concurrent append wait is not.
+/// Returns `false` (not an error) when the partition was left in place: the
+/// lock could not be taken in time, a concurrent writer deadlocked with the
+/// attempt, or the re-check found an owner. Leaving it for the next tick is the
+/// correct response to all three; making every concurrent append wait is not.
 ///
 /// **The re-check is not belt-and-braces.** `cohort_occupancy` runs in its own
 /// transaction and commits before this one starts, so between the two a row can
@@ -1804,9 +1857,46 @@ async fn cohort_has_rows_for(
 ///   same shard concurrently — candidates are leased per execution, maintenance
 ///   is not.
 ///
-/// Repeating the check *after* `LOCK TABLE … ACCESS EXCLUSIVE` makes it exact:
-/// that lock conflicts with every writer, so no row can appear between the
-/// re-check and the `DROP` in the same transaction.
+/// So the check has to be repeated under a lock that excludes every writer that
+/// could land such a row — and, critically, under **no more than that**. It
+/// takes `SHARE` on the one child partition:
+///
+/// - `SHARE` conflicts with `ROW EXCLUSIVE`, so nothing can INSERT, UPDATE or
+///   DELETE in this partition while the proof runs, which is exactly the
+///   guarantee the re-check needs. Tuple routing locks the destination
+///   partition, so appends to every *other* cohort — which is all of them, this
+///   one being closed — are untouched.
+/// - `SHARE` does **not** conflict with `ACCESS SHARE`, so readers are
+///   untouched. That is not a nicety: the insert trigger's cross-partition
+///   `(workflow_exec_id, event_id)` uniqueness check reads the partitioned
+///   parent, which locks every child in `ACCESS SHARE`. An exclusive lock on
+///   *any* child therefore stalls *every* append on the shard, whichever
+///   cohort it belongs to.
+///
+/// `ACCESS EXCLUSIVE` — on the parent or on the child — would be correct and
+/// unusable. The wait for the lock is bounded by `lock_timeout`, but the
+/// re-check that follows it is bounded by
+/// [`SweepOptions::exact_scan_timeout`], 15 seconds by default, and a
+/// `lock_timeout` bounds *acquiring* a lock, never holding one. On a shard
+/// where tier 3 is reached — more surviving old executions than
+/// `owner_probe_cap`, which is the shape this feature exists for — every append
+/// and every read on the table would queue for that whole scan, once per drop
+/// attempt, on every tick.
+///
+/// The re-check reads the child table **directly** ([`EventScope::partition`]),
+/// which keeps the proof inside the relation the lock covers and is also
+/// strictly less work: no cohort predicate, no pruning, no sibling partitions.
+///
+/// `ACCESS EXCLUSIVE` is taken only by the `DROP` itself, on the child and (to
+/// update the partition descriptor) on the parent. That is a catalog change:
+/// metadata-only and immediate.
+///
+/// Taking the child's lock before the parent's inverts the order a concurrent
+/// insert uses (parent, then destination child), so an append landing in *this*
+/// closed cohort at exactly the wrong moment can deadlock with the drop — as
+/// can the `SHARE`-to-`ACCESS EXCLUSIVE` upgrade at the `DROP`. Postgres
+/// detects both and aborts one side; if it is ours, the partition is reported
+/// blocked and retried next tick, exactly as for a lock timeout.
 #[cfg(feature = "db")]
 async fn drop_partition(
     conn: &mut AsyncPgConnection,
@@ -1818,14 +1908,17 @@ async fn drop_partition(
         .unwrap_or(u64::MAX)
         .max(1);
     let name = part.name.clone();
-    let lower = part.lower;
     let opts = *opts;
     let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
         // Taken explicitly, before the re-check, rather than relying on the
         // DROP to take it afterwards — the whole point is that the check runs
-        // under the lock.
-        exec(conn, "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE").await?;
+        // under a lock that freezes this partition's contents.
+        exec(
+            conn,
+            &format!("LOCK TABLE {} IN SHARE MODE", quote_ident(&name)),
+        )
+        .await?;
 
         // The SAME three-tier proof, re-run under the lock — not a narrower
         // one. An earlier revision bailed out whenever more executions survived
@@ -1834,7 +1927,10 @@ async fn drop_partition(
         // to prove itself droppable was then rejected here, forever, so
         // reclamation stopped entirely on high-volume or legal-hold-heavy
         // shards — the deployments this feature exists for.
-        if cohort_occupancy(conn, lower, upper, &opts).await?.is_some() {
+        if cohort_occupancy(conn, &EventScope::partition(&name), upper, &opts)
+            .await?
+            .is_some()
+        {
             return Ok(false);
         }
 
@@ -1848,7 +1944,7 @@ async fn drop_partition(
     .await;
     match result {
         Ok(dropped) => Ok(dropped),
-        Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) => Ok(false),
+        Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) || is_deadlock(&msg) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -2239,6 +2335,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             ),
         ),
         // ── 3: pre-validate so ATTACH skips its own scan ──────────────────
+        //
+        // Both statements carry a bounded lock wait, and neither may be run
+        // bare. `NOT VALID` skips the table scan but still takes
+        // `ACCESS EXCLUSIVE` to write the catalog row, and `VALIDATE` takes
+        // `SHARE UPDATE EXCLUSIVE`; behind one idle-in-transaction reader
+        // either request queues — and because Postgres queues lock requests in
+        // order, every append arriving after it queues behind the ALTER. That
+        // is the opposite of what this phase is for: it exists so the
+        // conversion's expensive work happens with the shard *online*. Failing
+        // fast leaves the operator a bounded, retryable error instead.
+        step(3, "BEGIN".to_string()),
+        step(3, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
             3,
             format!(
@@ -2247,10 +2355,17 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  CHECK (cohort < {cutover_lit}) NOT VALID"
             ),
         ),
+        step(3, "COMMIT".to_string()),
+        // A separate transaction, deliberately: the whole point of `NOT VALID`
+        // is that the scan below happens outside the window that added the
+        // constraint.
+        step(3, "BEGIN".to_string()),
+        step(3, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
             3,
             format!("ALTER TABLE harvest_events VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck"),
         ),
+        step(3, "COMMIT".to_string()),
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),

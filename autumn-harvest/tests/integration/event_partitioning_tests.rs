@@ -2230,3 +2230,158 @@ async fn the_layout_works_when_harvest_is_installed_outside_public() {
         .await
         .expect("cleanup");
 }
+
+#[tokio::test]
+async fn a_drop_attempt_never_blocks_appends_while_it_waits_for_its_partition() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // One closed, fully orphaned cohort: the drop path's happy case.
+    let exec = seed_expired(&mut conn, "lock_wf", "lock-old", day(2026, 1, 5)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(&mut conn)
+        .await
+        .expect("collect the execution so the cohort is reclaimable");
+    let target =
+        diesel::sql_query("SELECT tableoid::regclass::text AS v FROM harvest_events LIMIT 1")
+            .get_result::<TextRow>(&mut conn)
+            .await
+            .expect("locate the partition holding the seeded rows")
+            .v;
+
+    // A writer is mid-transaction in that partition — a `drain_default` pass, a
+    // long transaction whose clock still stamps the closed cohort, a second
+    // maintenance runtime. `ROW EXCLUSIVE` is exactly what an INSERT holds, and
+    // it does not conflict with readers. The sweeper is entitled to wait for it
+    // (bounded by `lock_timeout`) and to give up; it is NOT entitled to make
+    // every append on the shard wait with it.
+    let mut blocker = connect(&url).await;
+    for stmt in [
+        "BEGIN".to_string(),
+        format!("LOCK TABLE {target} IN ROW EXCLUSIVE MODE"),
+    ] {
+        diesel::sql_query(&stmt)
+            .execute(&mut blocker)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    let sweep_url = url.clone();
+    let sweeper = tokio::spawn(async move {
+        let mut c = connect(&sweep_url).await;
+        partition::sweep(
+            &mut c,
+            Utc::now(),
+            &SweepOptions {
+                lock_timeout: Duration::from_secs(8),
+                ..SweepOptions::default()
+            },
+        )
+        .await
+    });
+
+    // Let the sweeper reach its lock wait, then append to a LIVE cohort — a
+    // different partition entirely, which the blocker does not touch.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let mut writer = connect(&url).await;
+    let live = insert_execution(&mut writer, "lock_wf", "lock-live", Utc::now(), None).await;
+    let appended = tokio::time::timeout(
+        Duration::from_secs(3),
+        autumn_harvest::store::append_events(
+            &mut writer,
+            ExecutionId::from_uuid(live),
+            &sample_events(),
+            0,
+        ),
+    )
+    .await;
+
+    // Release the blocker before asserting, so a failure does not leave the
+    // sweeper wedged for the rest of the suite.
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("release the blocker");
+
+    let appended = appended.expect(
+        "AC3: a drop attempt held an exclusive lock while it waited — for the partition, \
+         or for its own occupancy re-check, which is bounded by `exact_scan_timeout` and \
+         not by `lock_timeout`. Every append on the shard queues behind it for the whole \
+         wait: on the parent directly, or on any child, because the insert trigger's \
+         cross-partition uniqueness check reads the parent and so locks every child in \
+         ACCESS SHARE. The proof needs a lock that excludes writers to this one closed \
+         cohort and nothing else; the exclusive window belongs to the DROP alone.",
+    );
+    appended.expect("the concurrent append itself must succeed");
+
+    sweeper
+        .await
+        .expect("sweeper task")
+        .expect("a partition it could not lock is a blocked partition, not an error");
+}
+
+#[tokio::test]
+async fn the_online_migration_phases_bound_their_lock_wait() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // An idle-in-transaction reader — a reporting query, a leaked session. It
+    // holds ACCESS SHARE on `harvest_events` and nothing else.
+    let mut blocker = connect(&url).await;
+    for stmt in ["BEGIN", "SELECT 1 FROM harvest_events LIMIT 1"] {
+        diesel::sql_query(stmt)
+            .execute(&mut blocker)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    // Phase 3 is documented as the ONLINE phase — the one an operator runs on a
+    // live shard before the short exclusive window. `ADD CONSTRAINT ... NOT
+    // VALID` skips the table scan but still needs ACCESS EXCLUSIVE to change
+    // the catalog, so behind this reader it queues; and because a lock request
+    // queues *ahead* of every later one, every append then queues behind the
+    // ALTER. Unbounded. The plan has to fail fast instead.
+    let opts = EnableOptions {
+        lock_timeout: Duration::from_secs(1),
+        ..EnableOptions::default()
+    };
+    let mut saw_lock_timeout = false;
+    for step in partition::migration_plan_steps(&opts, Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 3)
+    {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            diesel::sql_query(&step.sql).execute(&mut conn),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the online phase queued behind an idle reader instead of failing fast, \
+                 taking every append on the shard with it:\n{}",
+                step.sql
+            )
+        });
+        if let Err(e) = outcome
+            && partition::is_lock_timeout(&e.to_string())
+        {
+            saw_lock_timeout = true;
+        }
+    }
+    assert!(
+        saw_lock_timeout,
+        "and it must fail *because of the lock*, so an operator sees a bounded, \
+         retryable error rather than a mystery"
+    );
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("release the blocker");
+}
