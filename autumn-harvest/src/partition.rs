@@ -2122,6 +2122,35 @@ const DROP_UPGRADE_TIMEOUT_MS: u64 = 50;
 #[cfg(feature = "db")]
 const DRAIN_MAX_ROWS: usize = 50_000;
 
+/// Cohorts one `drain_default` pass may take.
+///
+/// The row budget does not bound the pass on its own. Each cohort taken needs
+/// its partition created — one `CREATE TABLE ... PARTITION OF` apiece — and
+/// that DDL cannot run before the `DETACH`, because a cohort's partition may
+/// not be created while `DEFAULT` still holds rows in its range. So it runs
+/// under the parent's `ACCESS EXCLUSIVE` by necessity, and a maintenance gap
+/// spanning hundreds of closed cohorts parks few rows in each: the row budget
+/// never binds, and one pass stopped the shard for hundreds of DDL statements.
+///
+/// Bounding the cohort count bounds that DDL directly. Like the row budget it
+/// is a floor, not a ceiling — a pass always takes at least one cohort, so a
+/// backlog always converges.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub const DRAIN_MAX_COHORTS: usize = 32;
+
+/// How long any single statement inside the drain's exclusive window may run.
+///
+/// The last unbounded step under the lock is the move itself: `cohort` carries
+/// no index, so the `DELETE ... WHERE cohort <= …` scans the whole `DEFAULT`
+/// partition however few rows it takes. A bound turns that from an outage into
+/// a retry — the statement fails, the transaction rolls back, the `DETACH` is
+/// undone with it, and `maintain` records the failure and comes back next tick.
+/// It already treats a failed drain that way, precisely so a heavy pass cannot
+/// take `ensure_partitions` down with it.
+#[cfg(feature = "db")]
+const DRAIN_STATEMENT_TIMEOUT_MS: u64 = 10_000;
+
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
 ///
@@ -2362,9 +2391,10 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
 ///
 /// [`HarvestError::Database`] if any step fails; the pass is one transaction,
 /// so a failure leaves every row where it was.
-// One transaction whose steps must be read in order — detach, census, create,
-// move, re-enable, re-attach. Splitting it to satisfy a line budget would
-// scatter that sequence across helpers that only ever call each other once.
+// A census, then one transaction whose steps must be read in order — detach,
+// create, move, re-enable, re-attach. Splitting it to satisfy a line budget
+// would scatter that sequence across helpers that only ever call each other
+// once, and the order is the whole correctness argument.
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -2385,47 +2415,83 @@ pub async fn drain_default_bounded(
         return Ok(0);
     }
 
+    // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
+    // partition, and `cohort` carries no index — on the large backlog a
+    // maintenance gap leaves, exactly the case this budget exists for, it is
+    // the most expensive thing the pass does. Run after the `DETACH` it was
+    // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
+    // bounded only what was MOVED while the shard stayed stopped for the whole
+    // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
+    let census = diesel::sql_query(format!(
+        "SELECT cohort AS v, count(*)::bigint AS n
+           FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
+    ))
+    .load::<CohortCountRow>(&mut *conn)
+    .await
+    .map_err(database_error)?;
+
+    // Take whole cohorts, oldest first, up to BOTH budgets — and always at
+    // least one, so a cohort larger than the row budget still makes progress
+    // rather than the drain spinning forever on a backlog it refuses to touch.
+    //
+    // Whole cohorts is not a simplification, it is required: a cohort's
+    // partition cannot exist while `DEFAULT` still holds rows in its range, so
+    // a half-moved cohort would make the re-`ATTACH` below fail its constraint
+    // check and roll the whole pass back.
+    let mut work: Vec<DateTime<Utc>> = Vec::new();
+    let mut cutoff = None;
+    let mut budget = 0usize;
+    for c in &census {
+        let Some(cohort) = c.v else { continue };
+        let n = usize::try_from(c.n).unwrap_or(usize::MAX);
+        if cutoff.is_some()
+            && (budget.saturating_add(n) > max_rows.max(1) || work.len() >= DRAIN_MAX_COHORTS)
+        {
+            break;
+        }
+        budget = budget.saturating_add(n);
+        cutoff = Some(cohort);
+        work.push(cohort);
+    }
+
     Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
         exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
+        // Bounds every statement inside the window, so the one remaining
+        // unbounded step — the move's scan of `DEFAULT` — fails and rolls back
+        // for retry rather than holding the shard still for as long as it takes.
+        exec(
+            conn,
+            &format!("SET LOCAL statement_timeout = '{DRAIN_STATEMENT_TIMEOUT_MS}ms'"),
+        )
+        .await?;
         exec(
             conn,
             &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
         )
         .await?;
 
-        // Read the work list AFTER the DETACH, not before. A cohort that
-        // arrived between an outside-the-transaction read and this point would
-        // have no partition created for it, and the INSERT below would fail
-        // with `no partition of relation found` — aborting the whole drain, and
-        // with it the `ensure_partitions` that keeps the write window covered.
-        let census = diesel::sql_query(format!(
-            "SELECT cohort AS v, count(*)::bigint AS n
-               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
-        ))
-        .load::<CohortCountRow>(conn)
-        .await
-        .map_err(database_error)?;
-
-        // Take whole cohorts, oldest first, up to the budget — and always at
-        // least one, so a cohort larger than the budget still makes progress
-        // rather than the drain spinning forever on a backlog it refuses to
-        // touch.
+        for cohort in &work {
+            ensure_cohort_with_width(conn, *cohort, width, Duration::from_secs(2)).await?;
+        }
+        // The work list was read before the lock, so a row could have landed in
+        // `DEFAULT` between the census and the `DETACH`. Only ONE cohort can
+        // have: an append's cohort is `clock_timestamp()` floored, so a late
+        // arrival carries the currently-open cohort (or the next one, if the
+        // boundary rolled while the `DETACH` waited for its lock). Covering
+        // both makes the pre-lock list valid without re-scanning to revalidate
+        // it — and both are no-ops when a partition already exists.
         //
-        // Whole cohorts is not a simplification, it is required: a cohort's
-        // partition cannot exist while `DEFAULT` still holds rows in its range,
-        // so a half-moved cohort would make the re-`ATTACH` below fail its
-        // constraint check and roll the whole pass back.
-        let mut cutoff = None;
-        let mut budget = 0usize;
-        for c in &census {
-            let Some(cohort) = c.v else { continue };
-            let n = usize::try_from(c.n).unwrap_or(usize::MAX);
-            if cutoff.is_some() && budget.saturating_add(n) > max_rows.max(1) {
-                break;
+        // Without this the move could meet a row with no partition and fail
+        // with `no partition of relation found`, rolling the pass back. Not
+        // data loss, but a drain that never converges on a shard whose write
+        // window is uncovered, which is the shard that needs it.
+        if let Some(cutoff) = cutoff {
+            let now = Utc::now();
+            for ts in [now, now + chrono::Duration::seconds(width)] {
+                if cohort_start(ts, width) <= cutoff {
+                    ensure_cohort_with_width(conn, ts, width, Duration::from_secs(2)).await?;
+                }
             }
-            budget = budget.saturating_add(n);
-            cutoff = Some(cohort);
-            ensure_cohort_with_width(conn, cohort, width, Duration::from_secs(2)).await?;
         }
         let Some(cutoff) = cutoff else {
             // Nothing with a usable cohort: re-attach and report no progress

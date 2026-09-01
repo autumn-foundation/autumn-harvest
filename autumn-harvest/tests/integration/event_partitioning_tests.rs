@@ -3319,3 +3319,143 @@ async fn a_large_default_backlog_drains_in_bounded_passes() {
     .await
     .expect("appends must still work after a multi-pass drain");
 }
+
+/// Park a backlog spanning `cohorts` closed cohorts in the DEFAULT partition.
+///
+/// Few rows per cohort on purpose: that is the shape a long maintenance gap
+/// leaves, and the shape the drain's ROW budget cannot bound.
+async fn park_backlog_across_cohorts(conn: &mut AsyncPgConnection, cohorts: i32, label: &str) {
+    let _exec = seed_expired(conn, "drain_wf", label, day(2026, 3, 1)).await;
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_events
+             (workflow_exec_id, event_id, event_type, event_data, timestamp, cohort)
+         SELECT e.workflow_exec_id,
+                1000 + (g.i * 10) + e.event_id,
+                e.event_type,
+                e.event_data,
+                e.timestamp,
+                '2026-03-01'::timestamptz + (g.i || ' days')::interval
+           FROM harvest_events e
+           CROSS JOIN generate_series(1, {cohorts}) AS g(i)"
+    ))
+    .execute(conn)
+    .await
+    .expect("seed a many-cohort backlog");
+    diesel::sql_query(format!(
+        "WITH parked AS (
+             DELETE FROM harvest_events WHERE cohort > '2026-03-01'::timestamptz RETURNING *
+         )
+         INSERT INTO {} SELECT * FROM parked",
+        partition::DEFAULT_PARTITION
+    ))
+    .execute(conn)
+    .await
+    .expect("park the backlog in DEFAULT");
+}
+
+/// A pass must bound the DDL it runs while holding the parent's ACCESS EXCLUSIVE.
+///
+/// The row budget alone does not bound the pass. Every cohort the pass takes
+/// needs its partition created — `CREATE TABLE ... PARTITION OF`, one DDL
+/// statement each — and all of it runs after `DETACH PARTITION` has taken
+/// ACCESS EXCLUSIVE on the parent. A maintenance outage that spans hundreds of
+/// closed cohorts parks few rows in each, so the row budget never binds and a
+/// single pass ran hundreds of DDL statements with the whole shard stopped
+/// behind it.
+///
+/// The census had the same shape and was worse: a `GROUP BY` over the entire
+/// DEFAULT partition, also inside the lock, and unbounded by anything at all.
+/// It is now taken before the lock, where it costs bystanders nothing.
+#[tokio::test]
+async fn a_drain_pass_bounds_the_ddl_it_runs_under_the_parent_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    park_backlog_across_cohorts(&mut conn, 120, "drain-ddl-1").await;
+
+    let distinct_cohorts = scalar_i64(
+        &mut conn,
+        &format!(
+            "SELECT COUNT(DISTINCT cohort)::bigint AS n FROM {}",
+            partition::DEFAULT_PARTITION
+        ),
+    )
+    .await;
+    assert!(
+        distinct_cohorts > i64::try_from(partition::DRAIN_MAX_COHORTS).unwrap(),
+        "precondition: the backlog must span more cohorts ({distinct_cohorts}) than one \
+         pass is allowed to take ({})",
+        partition::DRAIN_MAX_COHORTS
+    );
+
+    // The generous production row budget, so it is the COHORT bound under test
+    // and not the row one.
+    let before = partition::list_partitions(&mut conn)
+        .await
+        .expect("list")
+        .len();
+    let moved = partition::drain_default_bounded(&mut conn, 50_000)
+        .await
+        .expect("drain must not error");
+    assert!(moved > 0, "the pass must make progress");
+    let created = partition::list_partitions(&mut conn)
+        .await
+        .expect("list")
+        .len()
+        - before;
+    assert!(
+        created <= partition::DRAIN_MAX_COHORTS,
+        "one pass created {created} partitions inside the transaction holding the parent's \
+         ACCESS EXCLUSIVE — every append and read on the shard waits for all of them. A pass \
+         may create at most {}",
+        partition::DRAIN_MAX_COHORTS
+    );
+    assert!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM {}",
+                partition::DEFAULT_PARTITION
+            ),
+        )
+        .await
+            > 0,
+        "a bounded pass must leave the rest of the backlog for the next tick"
+    );
+
+    // Still converges, and the layout is sound afterwards.
+    let mut passes = 1;
+    while partition::drain_default_bounded(&mut conn, 50_000)
+        .await
+        .expect("drain must not error")
+        > 0
+    {
+        passes += 1;
+        assert!(passes < 200, "the drain must converge");
+    }
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM {}",
+                partition::DEFAULT_PARTITION
+            ),
+        )
+        .await,
+        0,
+        "every parked row must end up in a real cohort partition"
+    );
+    let live = insert_execution(&mut conn, "drain_wf", "drain-ddl-live", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(live),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("appends must still work after a bounded multi-pass drain");
+}

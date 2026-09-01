@@ -474,6 +474,29 @@ cohort partitions.
 It is never dropped, and it sorts last in the sweep so a bounded pass can never
 spend its budget reaching it.
 
+**Draining is bounded in three ways, because the move runs under the parent's
+`ACCESS EXCLUSIVE`.** `DETACH PARTITION` takes that lock, and everything after
+it in the transaction is time the whole shard is stopped — `lock_timeout` bounds
+*acquiring* a lock, never holding one. So a pass takes at most 50,000 rows and
+at most 32 cohorts (each cohort taken needs a `CREATE TABLE ... PARTITION OF`,
+which cannot run before the `DETACH`), and every statement inside the window
+carries a 10s `statement_timeout`. Both budgets are floors rather than ceilings:
+a pass always takes at least one cohort, so a backlog always converges, however
+large.
+
+The census that decides which cohorts to take is deliberately run *before* the
+lock, where it costs bystanders nothing — it is a `GROUP BY` over the whole
+`DEFAULT` partition, `cohort` carries no index, and on the large backlog a long
+maintenance gap leaves it is the most expensive thing the pass does. Reading it
+under the lock would have meant the row budget bounded only what was *moved*,
+while the shard stayed stopped for the entire scan.
+
+A pass that exceeds its statement budget rolls back — the `DETACH` with it, so
+`DEFAULT` is re-attached and no row moves — and is retried next tick.
+`maintain` records a failed drain and continues to `ensure_partitions`
+regardless, because extending the write window is the one step that must never
+stop.
+
 ### "Why has space not come back?"
 
 ```bash
