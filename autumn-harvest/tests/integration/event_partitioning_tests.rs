@@ -2858,3 +2858,97 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         "and it must report clean: {outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn a_drop_blocked_by_a_reader_does_not_queue_appends_behind_its_upgrade() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let exec = seed_expired(&mut conn, "up_wf", "up-old", day(2026, 1, 5)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(&mut conn)
+        .await
+        .expect("collect the execution so the cohort is reclaimable");
+    let target =
+        diesel::sql_query("SELECT tableoid::regclass::text AS v FROM harvest_events LIMIT 1")
+            .get_result::<TextRow>(&mut conn)
+            .await
+            .expect("locate the partition holding the seeded rows")
+            .v;
+
+    // One long history query still reading the partition being dropped. It
+    // holds ACCESS SHARE, which does NOT conflict with the SHARE the re-check
+    // takes — so the drop gets its lock, proves the partition reclaimable, and
+    // only then has to upgrade to ACCESS EXCLUSIVE for the DROP itself.
+    //
+    // That upgrade is where the damage is. Postgres queues a new request behind
+    // an existing WAITER it conflicts with, not just behind held locks, so
+    // every append arriving while the upgrade waits queues behind it — the
+    // insert trigger's cross-partition uniqueness probe reads the parent and
+    // takes ACCESS SHARE on every child, so it conflicts whatever cohort the
+    // append belongs to. Bounding the upgrade by `lock_timeout` would stall the
+    // entire shard for that long, per drop attempt, on every tick.
+    let mut reader = connect(&url).await;
+    for stmt in [
+        "BEGIN".to_string(),
+        format!("SELECT count(*) AS n FROM {target}"),
+    ] {
+        diesel::sql_query(&stmt)
+            .execute(&mut reader)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    let sweep_url = url.clone();
+    let sweeper = tokio::spawn(async move {
+        let mut c = connect(&sweep_url).await;
+        partition::sweep(
+            &mut c,
+            Utc::now(),
+            &SweepOptions {
+                lock_timeout: Duration::from_secs(8),
+                ..SweepOptions::default()
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let mut writer = connect(&url).await;
+    let live = insert_execution(&mut writer, "up_wf", "up-live", Utc::now(), None).await;
+    let appended = tokio::time::timeout(
+        Duration::from_secs(3),
+        autumn_harvest::store::append_events(
+            &mut writer,
+            ExecutionId::from_uuid(live),
+            &sample_events(),
+            0,
+        ),
+    )
+    .await;
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut reader)
+        .await
+        .expect("release the reader");
+
+    appended
+        .expect(
+            "AC3: the DROP's SHARE-to-ACCESS-EXCLUSIVE upgrade waited under the same \
+             `lock_timeout` as acquiring the lock, and an exclusive waiter makes every \
+             later conflicting request queue behind it. Appends to unrelated cohorts \
+             stalled for the whole wait, once per drop attempt. The upgrade needs its own \
+             near-zero bound; the partition can wait for the next tick.",
+        )
+        .expect("the concurrent append itself must succeed");
+
+    sweeper
+        .await
+        .expect("sweeper task")
+        .expect("a partition it could not drop is a blocked partition, not an error");
+}

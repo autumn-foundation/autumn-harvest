@@ -2044,6 +2044,19 @@ async fn cohort_has_rows_for(
     Ok(row.map_err(database_error)?.v)
 }
 
+/// How long the `DROP`'s `SHARE` → `ACCESS EXCLUSIVE` upgrade may wait, in
+/// milliseconds — capped by [`SweepOptions::lock_timeout`] when that is
+/// smaller.
+///
+/// Deliberately near zero, and deliberately not the same bound as acquiring the
+/// initial `SHARE`. An exclusive *waiter* makes every later conflicting request
+/// queue behind it, so each millisecond spent waiting here is a millisecond of
+/// stalled appends across the whole shard — see [`drop_partition`]. A partition
+/// that cannot be dropped in that window is retried next tick, which costs
+/// nothing but time.
+#[cfg(feature = "db")]
+const DROP_UPGRADE_TIMEOUT_MS: u64 = 50;
+
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
 ///
@@ -2142,6 +2155,27 @@ async fn drop_partition(
             return Ok(false);
         }
 
+        // A near-zero bound on the lock UPGRADE, separate from the bound on
+        // acquiring the SHARE above, because the two cost different things.
+        //
+        // Waiting for `SHARE` is free to bystanders: it conflicts with
+        // `ROW EXCLUSIVE` — writers to this closed cohort, of which there are
+        // none — and not with `ACCESS SHARE`, so a pending `SHARE` request
+        // queues nobody behind it.
+        //
+        // The `DROP`'s upgrade to `ACCESS EXCLUSIVE` is the opposite. Postgres
+        // queues a new request behind an existing *waiter* it conflicts with,
+        // not merely behind held locks, so while this upgrade waits — for one
+        // long history query still holding `ACCESS SHARE` on this child — every
+        // append's cross-partition uniqueness probe, which takes `ACCESS SHARE`
+        // on every child, queues behind it. Whatever cohort it is writing.
+        // Bounding that by `lock_timeout` would stall the whole shard for two
+        // seconds per drop attempt, per tick.
+        //
+        // So the upgrade gets one brief attempt and the partition waits for the
+        // next tick, where reclamation is bounded and retried by design.
+        let upgrade_ms = ms.min(DROP_UPGRADE_TIMEOUT_MS);
+        exec(conn, &format!("SET LOCAL lock_timeout = '{upgrade_ms}ms'")).await?;
         exec(
             conn,
             &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
