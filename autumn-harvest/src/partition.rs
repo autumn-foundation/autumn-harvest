@@ -291,12 +291,13 @@ pub struct EnableOptions {
     /// that queues behind a long transaction would block every append behind
     /// it.
     pub lock_timeout: Duration,
-    /// Convert even when a logical-replication publication would break.
+    /// Convert even when a logical-replication publication covers
+    /// `harvest_events`.
     ///
-    /// See [`incompatible_publications`] for what "break" means and why the
-    /// default is to refuse. Set this only when the subscriber runs the
-    /// partitioned layout too, or when the publication is not feeding a
-    /// Harvest standby at all.
+    /// See [`incompatible_publications`] for the two ways that breaks a standby
+    /// and why `publish_via_partition_root` alone is not enough. Set this only
+    /// when the subscriber runs the partitioned layout too, or when the
+    /// publication is not feeding a Harvest standby at all.
     pub allow_incompatible_publications: bool,
 }
 
@@ -931,31 +932,48 @@ pub async fn ensure_partitions(
 
 // ── Enabling the layout ────────────────────────────────────────────────────
 
-/// Publications that would stop replicating `harvest_events` the moment it
-/// becomes partitioned.
+/// Publications that cover `harvest_events`, all of which the partitioned
+/// layout is incompatible with.
 ///
 /// `docs/cross-region-dr.md` tells an operator to run `CREATE PUBLICATION
 /// harvest_dr FOR ALL TABLES` on the primary and to apply Harvest's migrations
-/// on the standby first, "logical replication does not carry DDL". Both halves
-/// of that are what make this dangerous.
+/// on the standby first, "logical replication does not carry DDL". Converting
+/// under that breaks the standby **twice**, and only the first break looks like
+/// a configuration problem.
 ///
-/// `publish_via_partition_root` defaults to **false**, which means a
+/// **The leaf names.** `publish_via_partition_root` defaults to false, so a
 /// partitioned table's changes are published under the names of the *leaf*
 /// partitions — `harvest_events_p20260901000000`, `harvest_events_legacy`. The
 /// standby has only the flat `harvest_events` the migrations created, and the
-/// partitions are created by DDL that is not replicated, so those relations
-/// will never exist there. The subscription's apply worker stops on the first
-/// event after the conversion.
+/// partitions come from DDL that is not replicated, so those relations will
+/// never exist there. The subscription's apply worker stops on the first event
+/// after the conversion.
 ///
-/// Nothing about that is loud. The primary keeps accepting writes, the standby
-/// silently stops receiving them, and WAL piles up behind a slot nobody is
-/// draining — a DR outage caused by opting into an unrelated storage feature.
+/// **The deletes, which `publish_via_partition_root = true` does not fix.**
+/// The partitioned layout drops the `ON DELETE CASCADE` foreign key on purpose
+/// — that cascade *is* the delete storm being eliminated — so deleting an
+/// execution no longer deletes its events. The rows go away when their
+/// partition is dropped, and `DROP TABLE` is DDL: logical replication does not
+/// carry it in any configuration. The subscriber's own cascade cannot cover for
+/// that either, because apply runs with replica trigger behaviour and
+/// referential-integrity triggers do not fire under it. So the standby's
+/// `harvest_events` keeps every event forever, and
+/// [`crate::backup_verify::FindingKind::DanglingEventExecution`] is an
+/// *Incoherent* finding — "do not start workers". The standby stops being
+/// failover-capable, which is the one thing it exists for.
 ///
-/// So [`enable_partitioning`] refuses, and names the remedy: `ALTER PUBLICATION
-/// <name> SET (publish_via_partition_root = true)`, which republishes the
-/// partitioned table's changes as the root's, keeping the standby's flat table
-/// a valid target. [`EnableOptions::allow_incompatible_publications`] overrides
-/// the refusal for a deployment whose standby runs the partitioned layout too.
+/// Nothing about either break is loud. The primary keeps accepting writes, and
+/// the second one does not even stop the subscription: it just quietly makes
+/// the copy unrestorable.
+///
+/// So [`enable_partitioning`] refuses while any publication covers the table,
+/// rather than only the ones with `pubviaroot = false` — treating
+/// `publish_via_partition_root` as sufficient is precisely the trap. The
+/// workable configuration is the partitioned layout on **both** sides with
+/// `publish_via_partition_root = true`, where the standby's own maintenance can
+/// reclaim once promoted; [`EnableOptions::allow_incompatible_publications`] is
+/// the operator's statement that they have done that, or that the publication
+/// is not feeding a Harvest standby at all.
 ///
 /// # Errors
 ///
@@ -964,14 +982,11 @@ pub async fn ensure_partitions(
 pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     // `pg_publication_tables` resolves FOR ALL TABLES, FOR TABLES IN SCHEMA and
     // explicit table lists alike, so there is one query rather than three
-    // catalog shapes to keep in step. `pubviaroot` is Postgres 13+; the
-    // partitioned layout already requires 14+.
+    // catalog shapes to keep in step.
     let rows = diesel::sql_query(
-        "SELECT DISTINCT p.pubname AS v
-           FROM pg_publication p
-           JOIN pg_publication_tables t ON t.pubname = p.pubname
-          WHERE NOT p.pubviaroot
-            AND t.schemaname = current_schema()
+        "SELECT DISTINCT t.pubname AS v
+           FROM pg_publication_tables t
+          WHERE t.schemaname = current_schema()
             AND t.tablename = 'harvest_events'
           ORDER BY 1",
     )
@@ -1027,12 +1042,18 @@ pub async fn enable_partitioning(
         let pubs = incompatible_publications(conn).await?;
         if !pubs.is_empty() {
             return Err(HarvestError::Config(format!(
-                "harvest_events is published by {} with publish_via_partition_root = false, \
-                 so partitioning it would publish its rows under leaf partition names the \
-                 standby has no tables for and stop the subscription. Run `ALTER PUBLICATION \
-                 <name> SET (publish_via_partition_root = true)` on each, then retry — or set \
-                 EnableOptions::allow_incompatible_publications if the subscriber runs the \
-                 partitioned layout too.",
+                "harvest_events is published by {}, and the partitioned layout is not \
+                 compatible with a flat logical-replication subscriber. Two separate \
+                 breaks: with publish_via_partition_root = false the rows publish under \
+                 leaf partition names the standby has no tables for, which stops the \
+                 subscription; and reclamation becomes DROP TABLE, which is DDL and is \
+                 never replicated, while the execution delete no longer cascades — so the \
+                 standby keeps every event forever and `harvest backup verify` reports it \
+                 Incoherent (DanglingEventExecution). Setting \
+                 publish_via_partition_root = true fixes only the first. Run the \
+                 partitioned layout on the subscriber too, with \
+                 `ALTER PUBLICATION <name> SET (publish_via_partition_root = true)`, then \
+                 set EnableOptions::allow_incompatible_publications to proceed.",
                 pubs.join(", ")
             )));
         }
@@ -2498,17 +2519,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         step(
             1,
             "DO $harvest_pub_958$\nDECLARE bad text;\nBEGIN\n    \
-             SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad\n      \
-             FROM pg_publication p\n      \
-             JOIN pg_publication_tables t ON t.pubname = p.pubname\n     \
-             WHERE NOT p.pubviaroot AND t.schemaname = current_schema()\n       \
+             SELECT string_agg(DISTINCT t.pubname, ', ') INTO bad\n      \
+             FROM pg_publication_tables t\n     \
+             WHERE t.schemaname = current_schema()\n       \
              AND t.tablename = 'harvest_events';\n    \
              IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: harvest_events is published by % with \
-             publish_via_partition_root = false. Partitioning it would publish rows under \
-             leaf partition names the standby has no tables for and stop the subscription. \
-             Run ALTER PUBLICATION <name> SET (publish_via_partition_root = true) on each, \
-             then re-run this plan.', bad;\n    \
+             RAISE EXCEPTION 'harvest #958: harvest_events is published by %. The \
+             partitioned layout is not compatible with a flat logical-replication \
+             subscriber: leaf partition names the standby has no tables for, and \
+             reclamation by DROP TABLE which is never replicated, leaving the standby \
+             with dangling events it reports as Incoherent. publish_via_partition_root \
+             fixes only the first. Run the partitioned layout on the subscriber too, or \
+             drop the publication, before re-running this plan.', bad;\n    \
              END IF;\nEND\n$harvest_pub_958$;"
                 .to_string(),
         ),

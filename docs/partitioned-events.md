@@ -337,26 +337,34 @@ write the catalog row, and one idle-in-transaction reader is enough to make the
 request queue — with every append arriving after it queued behind the `ALTER`.
 Re-run the step after clearing the blocker.
 
-**Logical replication has to be told about this first.** `enable`, the CLI and
-step 1 of the plan all refuse to convert while a publication covers
-`harvest_events` with `publish_via_partition_root = false` — which is the
-default, and which the DR runbook's `CREATE PUBLICATION harvest_dr FOR ALL
-TABLES` produces. Such a publication sends a partitioned table's rows under
-their *leaf* partition names, and the standby — provisioned by the inert
-migrations, since logical replication carries no DDL — has only the flat
-`harvest_events`. The subscription's apply worker would stop on the first event
-after the conversion, silently: the primary keeps accepting writes and WAL
-accumulates behind a slot nobody is draining. Run
+**The partitioned layout is not compatible with a flat logical-replication
+standby.** `enable`, the CLI and step 1 of the plan all refuse to convert while
+any publication covers `harvest_events` — which the DR runbook's `CREATE
+PUBLICATION harvest_dr FOR ALL TABLES` produces. There are two independent
+breaks, and only the first looks like a configuration problem:
 
-```sql
-ALTER PUBLICATION harvest_dr SET (publish_via_partition_root = true);
-```
+1. **Leaf names.** `publish_via_partition_root` defaults to false, so the rows
+   publish under their *leaf* partition names. The standby — provisioned by the
+   inert migrations, since logical replication carries no DDL — has only the
+   flat `harvest_events`, and the apply worker stops on the first event.
+2. **Deletes stop being replicated at all.** The partitioned layout drops the
+   `ON DELETE CASCADE` foreign key on purpose, so deleting an execution no
+   longer deletes its events; the rows go away when their partition is dropped,
+   and `DROP TABLE` is DDL, which is never replicated in any configuration. The
+   subscriber's own cascade cannot cover for it either — apply runs with replica
+   trigger behaviour, under which referential-integrity triggers do not fire. So
+   the standby's `harvest_events` keeps every event forever and
+   `harvest backup verify` reports `DanglingEventExecution`, an **Incoherent**
+   finding: do not start workers. The standby stops being failover-capable.
 
-on each publication first, which republishes the partitioned table's changes as
-the root's and keeps the standby's flat table a valid target. If your standby
-runs the partitioned layout too, override the refusal with
-`EnableOptions::allow_incompatible_publications` (CLI:
-`--allow-incompatible-publications`).
+`ALTER PUBLICATION harvest_dr SET (publish_via_partition_root = true);` fixes
+only the first, which is exactly the trap — the subscription keeps applying
+while the copy quietly stops being restorable. The workable configuration is the
+partitioned layout on **both** sides with `publish_via_partition_root = true`,
+where the standby's own maintenance reclaims once it is promoted. Having done
+that (or established that the publication is not feeding a Harvest standby),
+override the refusal with `EnableOptions::allow_incompatible_publications`
+(CLI: `--allow-incompatible-publications`).
 
 **Step 3 is re-runnable, including after a failed validation.** Its two
 statements are separate transactions so the validation scan can fail fast

@@ -2588,24 +2588,30 @@ async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
 }
 
 #[tokio::test]
-async fn converting_refuses_while_a_publication_would_break_the_standby() {
+async fn converting_refuses_while_any_publication_covers_harvest_events() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
     // The exact logical-DR setup `docs/cross-region-dr.md` tells an operator to
-    // build. `publish_via_partition_root` defaults to false, so a publication
-    // that covers `harvest_events` publishes a partitioned table's changes
-    // under its LEAF relation names — `harvest_events_p20260901000000`,
-    // `harvest_events_legacy`. The standby was provisioned by the inert
-    // migrations and has only the flat `harvest_events`; logical replication
-    // does not carry DDL, so those relations will never exist there.
+    // build. Converting the publisher under it breaks the standby in TWO
+    // independent ways, and only the first looks like a configuration problem.
     //
-    // Converting the publisher therefore stops the subscription's apply worker
-    // on the very next event, silently: the primary keeps accepting writes, the
-    // standby stops receiving them, and WAL accumulates behind a slot nobody is
-    // draining. That is a DR outage introduced by opting into an unrelated
-    // storage feature.
+    // 1. `publish_via_partition_root` defaults to false, so a partitioned
+    //    table's rows publish under their LEAF names — which the standby, whose
+    //    schema came from the inert migrations, has no tables for. The apply
+    //    worker stops on the first event.
+    //
+    // 2. Reclamation stops producing DELETEs at all. The partitioned layout
+    //    drops the `ON DELETE CASCADE` foreign key, so deleting an execution no
+    //    longer deletes its events, and the rows go away by DROP TABLE — DDL,
+    //    which logical replication does not carry. The subscriber's own
+    //    cascade cannot cover for that either: apply runs with replica trigger
+    //    behaviour, where referential-integrity triggers do not fire. So the
+    //    standby's `harvest_events` keeps every event forever, and
+    //    `DanglingEventExecution` is an *Incoherent* finding — "do not start
+    //    workers". The standby is no longer failover-capable, which is the one
+    //    thing it exists for.
     diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_dr_958")
         .execute(&mut conn)
         .await
@@ -2615,16 +2621,15 @@ async fn converting_refuses_while_a_publication_would_break_the_standby() {
         .await
         .expect("create the documented publication");
 
-    let refused = partition::enable_partitioning(&mut conn, &EnableOptions::default()).await;
-    let err = match refused {
+    let err = match partition::enable_partitioning(&mut conn, &EnableOptions::default()).await {
         Err(e) => e.to_string(),
         Ok(report) => {
-            panic!("enabling must refuse while an incompatible publication exists, got {report:?}")
+            panic!("enabling must refuse while a publication covers harvest_events, got {report:?}")
         }
     };
     assert!(
         err.contains("harvest_dr_958") && err.contains("publish_via_partition_root"),
-        "and the refusal must name the publication and the remedy, not just fail: {err}"
+        "the refusal must name the publication and the naming remedy: {err}"
     );
     assert_eq!(
         events_relkind(&mut conn).await,
@@ -2632,16 +2637,38 @@ async fn converting_refuses_while_a_publication_would_break_the_standby() {
         "and it must refuse BEFORE converting anything"
     );
 
-    // Once the operator makes the publication publish through the partition
-    // root, the standby's flat `harvest_events` keeps matching and the
-    // conversion is safe.
+    // Publishing through the partition root fixes the naming half and NOTHING
+    // about the deletes, so it must not on its own unlock the conversion. This
+    // is the trap: `pubviaroot` looks like the whole answer, the subscription
+    // keeps applying, and the standby quietly stops being restorable.
     diesel::sql_query("ALTER PUBLICATION harvest_dr_958 SET (publish_via_partition_root = true)")
         .execute(&mut conn)
         .await
-        .expect("fix the publication");
-    partition::enable_partitioning(&mut conn, &EnableOptions::default())
-        .await
-        .expect("a root-publishing publication must not block the conversion");
+        .expect("set publish_via_partition_root");
+    let err = match partition::enable_partitioning(&mut conn, &EnableOptions::default()).await {
+        Err(e) => e.to_string(),
+        Ok(report) => panic!(
+            "publish_via_partition_root fixes the leaf-name problem only — reclamation              still becomes DROP TABLE, which is never replicated, so a flat subscriber              accumulates dangling events and reports Incoherent. Got {report:?}"
+        ),
+    };
+    assert!(
+        err.contains("harvest_dr_958"),
+        "the refusal must still name the publication: {err}"
+    );
+    assert_eq!(events_relkind(&mut conn).await, "r");
+
+    // The override is the operator's statement that they have dealt with both
+    // halves — typically by running the partitioned layout on the subscriber
+    // too, where its own maintenance can reclaim once promoted.
+    partition::enable_partitioning(
+        &mut conn,
+        &EnableOptions {
+            allow_incompatible_publications: true,
+            ..EnableOptions::default()
+        },
+    )
+    .await
+    .expect("the override must let an operator who understands it proceed");
     assert_eq!(events_relkind(&mut conn).await, "p");
 
     diesel::sql_query("DROP PUBLICATION harvest_dr_958")
