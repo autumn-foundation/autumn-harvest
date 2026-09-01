@@ -79,7 +79,7 @@
 //! |---|---|
 //! | `occurred_at` | `timeObservedUnixNano` / `timeUnixNano` |
 //! | `operation` | `body` (or `event.name`) |
-//! | `status` | `severityText` (`SUCCEEDED` -> `INFO`, `FAILED` -> `ERROR`) |
+//! | `status` | `severityText` (`"succeeded"` -> `INFO`, `"failed"` -> `ERROR`). **Lowercase on the wire** — these are `audit::STATUS_SUCCEEDED` / `STATUS_FAILED` passed through verbatim, so a receiver matching `"FAILED"` silently files every failed privileged action as `INFO` |
 //! | `error_summary` | `attributes["exception.message"]` |
 //! | `shard` | `attributes["harvest.audit.source_shard"]` — the database the record was read from, and half the dedup key |
 //! | `seq` | `attributes["harvest.audit.seq"]` |

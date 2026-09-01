@@ -115,7 +115,7 @@ X-Harvest-Audit-Shard: 0
 X-Harvest-Audit-First-Seq: 4181
 X-Harvest-Audit-Last-Seq: 4680
 
-{"shard":0,"seq":4181,"id":"...","occurred_at":"2026-08-31T04:11:02.117Z","actor":"alice@example.com","operation":"workflow.cancel","target_type":"workflow","target_id":"exec-9f2…","route_or_command":"POST /workflows/{id}/cancel","request_id":null,"idempotency_key":null,"status":"succeeded","error_summary":null,"source":"api"}
+{"shard":0,"seq":4181,"id":"...","shard_id":0,"occurred_at":"2026-08-31T04:11:02.117Z","actor":"alice@example.com","operation":"workflow.cancel","target_type":"workflow","target_id":"exec-9f2…","route_or_command":"POST /workflows/{id}/cancel","request_id":null,"idempotency_key":null,"status":"succeeded","error_summary":null,"source":"api"}
 {"shard":0,"seq":4182, …}
 ```
 
@@ -182,10 +182,19 @@ collector:
 | `operation` | `body` (or `event.name`) |
 | `status` | `severityText` — `"succeeded"` → `INFO`, `"failed"` → `ERROR`. **Lowercase on the wire**: these are the audit table's own values (`audit::STATUS_SUCCEEDED` / `STATUS_FAILED`), passed through verbatim. A receiver matching `"FAILED"` will silently classify every failed privileged action as `INFO`. |
 | `error_summary` | `attributes["exception.message"]` |
-| `shard` | `attributes["harvest.shard.id"]` |
+| `shard_id` | `attributes["harvest.shard.id"]` — the shard the **operation acted on**, and the one a correlation should key off |
+| `shard` | `attributes["harvest.audit.source_shard"]` — the shard whose **database this record was read from**. Together with `seq` it is the dedup and gap-detection key, *not* an operation attribute |
 | `seq` | `attributes["harvest.audit.seq"]` |
 | `id` | `attributes["harvest.audit.id"]` |
 | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
+
+**`shard` and `shard_id` are different things and both are exported.** They
+normally agree, but a control-plane mutation writes its audit row on the
+default shard while naming the shard it acted on, so `shard` is `0` and
+`shard_id` is the target. A bridge that maps `shard` to `harvest.shard.id` will
+attribute those actions to the wrong shard — quietly, since every
+single-shard-per-operation record still looks right. `shard_id` is `null` for
+an operation that names no shard.
 
 Vendor-specific integrations (Splunk HEC, Datadog intake) are embedder glue on
 top of this surface, not engine features.
