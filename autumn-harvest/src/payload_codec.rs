@@ -995,17 +995,26 @@ impl PayloadCodecs {
         Ok(serde_json::from_slice(&decoded)?)
     }
 
-    /// [`PayloadCodecs::decode_payload`], stopping at the raw plaintext bytes
-    /// rather than parsing them as JSON (issue #948).
+    /// [`PayloadCodecs::decode_payload`], returning the raw plaintext bytes
+    /// instead of a parsed `Value` (issue #948).
     ///
     /// The re-encryption sweep ([`crate::codec_rotation`]) migrates a field's
     /// ciphertext from one registered key to another; it never inspects or
-    /// modifies the decoded structure, so parsing it into a `Value` here only
-    /// for [`PayloadCodecs::encode_payload_bytes_under`] to immediately
-    /// re-serialize it back to bytes is a deserialize-then-reserialize round
-    /// trip through `serde_json::Value`'s heap-backed `Map` that buys
-    /// nothing — paid on every field, of every row, of every sweep batch,
-    /// forever, on any deployment that rotates keys.
+    /// modifies the decoded structure, so materializing a full `Value` here
+    /// only for [`PayloadCodecs::encode_payload_bytes_under`] to immediately
+    /// re-serialize it back to bytes is a `serde_json::Value` tree — with its
+    /// heap-backed `Map` — built and torn down for nothing, on every field,
+    /// of every row, of every sweep batch, forever, on any deployment that
+    /// rotates keys.
+    ///
+    /// The bytes are still **validated** as well-formed JSON — via
+    /// `serde_json::from_slice::<serde::de::IgnoredAny>`, which walks the
+    /// document to confirm its syntax without allocating a `Value` for it —
+    /// so a codec that "successfully" decodes corrupt or mismatched
+    /// ciphertext into garbage bytes is caught here exactly as
+    /// [`PayloadCodecs::decode_payload`] would catch it, and the sweep counts
+    /// the row unresolved rather than writing the garbage back out under a
+    /// new key.
     ///
     /// Returns `Ok(None)` when `payload` is not a codec envelope, exactly
     /// like [`codec_envelope_key_id`] returning `None`. The re-encryption
@@ -1017,12 +1026,16 @@ impl PayloadCodecs {
     ///
     /// # Errors
     ///
-    /// As [`PayloadCodecs::decode_payload`].
+    /// As [`PayloadCodecs::decode_payload`], including
+    /// [`HarvestError::Serialization`] when the decoded bytes are not valid
+    /// JSON.
     pub(crate) fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(None);
         };
-        Ok(Some(self.decode_envelope_bytes(&parts)?))
+        let decoded = self.decode_envelope_bytes(&parts)?;
+        serde_json::from_slice::<serde::de::IgnoredAny>(&decoded)?;
+        Ok(Some(decoded))
     }
 
     /// Decode one already-shape-verified envelope's ciphertext to raw

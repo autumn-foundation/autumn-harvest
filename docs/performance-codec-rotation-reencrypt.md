@@ -98,59 +98,81 @@ profile, well past the 5%-of-workload floor.
 
 Added byte-level siblings to the two `PayloadCodecs` methods, `pub(crate)`
 (no public API change): `decode_payload_bytes` stops at the raw plaintext
-bytes instead of calling `serde_json::from_slice`; `encode_payload_bytes_under`
+bytes instead of building a `serde_json::Value`; `encode_payload_bytes_under`
 takes raw bytes instead of calling `serde_json::to_vec` on a `Value`. Both
 existing `pub fn` methods (`decode_payload`, `encode_payload_under`) are
-now thin wrappers that add the JSON step, used unchanged by every caller
+now thin wrappers that add the `Value` step, used unchanged by every caller
 that actually needs the parsed value. `reencrypt_event_payload_fields_under`
 switches to the byte-level pair, so migrating a field's ciphertext never
-touches `serde_json::Value` at all:
+builds a `Value` tree for the plaintext:
 
 ```rust
 let plaintext_bytes = codecs.decode_payload_bytes(field)?.ok_or_else(|| { ... })?;
 staged.push((key, codecs.encode_payload_bytes_under(target_key_id, &plaintext_bytes)?));
 ```
 
-Behavior is unchanged: the stored ciphertext bytes end up identical to what
-the old bytes-through-`Value`-through-bytes path produced (both paths ask the
-same codec to encode the same decoded plaintext bytes), and the field's
-plaintext is not merely equal but literally untouched — it never leaves byte
-form. All 60 existing `codec_rotation`/`payload_codec` unit tests pass
-unchanged, including `decoded_plaintext_is_byte_identical_and_structure_is_untouched`.
+`decode_payload_bytes` still **validates** the decoded bytes as well-formed
+JSON — via `serde_json::from_slice::<serde::de::IgnoredAny>`, which walks the
+document to confirm its syntax without allocating a `Value` for it — so a
+codec that "successfully" decodes corrupt or mismatched ciphertext into
+garbage bytes still fails the row exactly as `decode_payload` would, and the
+sweep counts it unresolved rather than writing the garbage back out under a
+new key. (An earlier version of this change dropped that validation
+entirely; caught in review — see `a_field_that_decodes_to_non_json_bytes_is_left_completely_untouched`,
+added as a regression test.)
+
+Behavior is otherwise unchanged: the stored ciphertext bytes end up
+identical to what the old bytes-through-`Value`-through-bytes path produced
+(both paths ask the same codec to encode the same decoded, JSON-validated
+plaintext bytes), and the field's plaintext is not merely equal but
+literally untouched — it never leaves byte form. All 61 `codec_rotation`/
+`payload_codec` unit tests (60 pre-existing plus the new regression test)
+pass, including `decoded_plaintext_is_byte_identical_and_structure_is_untouched`.
 
 ## Measurement
 
 | Metric | Before | After | Δ |
 |---|---:|---:|---:|
-| Instructions (`callgrind`, 5,000 row conversions) | 295,601,805 | 119,934,241 | **-59.43%** |
-| Allocated bytes (`dhat`) | 52,914,292 | 27,658,742 | **-47.73%** |
-| Allocated blocks (`dhat`) | 387,224 | 177,224 | **-54.23%** |
+| Instructions (`callgrind`, 5,000 row conversions) | 295,601,805 | 149,902,120 | **-49.29%** |
+| Allocated bytes (`dhat`) | 52,914,292 | 27,698,742 | **-47.65%** |
+| Allocated blocks (`dhat`) | 387,224 | 182,224 | **-52.94%** |
 
-Post-change profile — the JSON-machinery lines (`format_escaped_str_contents`,
-`Value::deserialize`, `skip_to_escape`, `parse_str`, `from_utf8`) are gone
-entirely; what remains is the base64 codec boundary and the envelope
-`Map`/`BTreeMap` bookkeeping that both paths still need:
+Post-change profile — `format_escaped_str_contents` and `Value::deserialize`
+(building the `Value` tree) are gone; `skip_to_escape`/`from_trait`/
+`ignore_str` remain because `IgnoredAny` still walks and validates every
+string and structural token in the document, it just doesn't allocate a
+container to hold them:
 
 ```
-119,934,241 (100.0%)  PROGRAM TOTALS
+149,902,120 (100.0%)  PROGRAM TOTALS
 
- 17,289,650 (14.42%)  base64::engine::general_purpose::GeneralPurpose::internal_decode
- 13,948,688 (11.63%)  base64::engine::general_purpose::GeneralPurpose::internal_encode
- 11,526,237 ( 9.61%)  _int_free
-  7,526,365 ( 6.28%)  __memcmp_avx2_movbe
-  7,252,289 ( 6.05%)  malloc
-  4,945,416 ( 4.12%)  free
-  4,862,960 ( 4.05%)  _int_malloc
-  4,657,500 ( 3.88%)  autumn_harvest::codec_rotation::reencrypt_event_payload_fields_under
-  4,414,235 ( 3.68%)  alloc::collections::btree::map::IntoIter<K,V,A>::dying_next
-  4,230,000 ( 3.53%)  autumn_harvest::payload_codec::codec_envelope_parts
+ 17,289,650 (11.53%)  base64::engine::general_purpose::GeneralPurpose::internal_decode
+ 13,948,688 ( 9.31%)  base64::engine::general_purpose::GeneralPurpose::internal_encode
+ 11,796,237 ( 7.87%)  _int_free
+ 11,585,000 ( 7.73%)  serde_json::read::SliceRead::skip_to_escape
+ 10,305,000 ( 6.87%)  serde_json::de::from_trait
+  7,667,492 ( 5.11%)  __memcmp_avx2_movbe
+  7,462,289 ( 4.98%)  malloc
+  5,440,000 ( 3.63%)  <SliceRead as Read>::ignore_str
+  5,085,416 ( 3.39%)  free
+  4,855,460 ( 3.24%)  _int_malloc
+  4,592,500 ( 3.06%)  autumn_harvest::codec_rotation::reencrypt_event_payload_fields_under
+  4,414,235 ( 2.94%)  alloc::collections::btree::map::IntoIter<K,V,A>::dying_next
+  4,230,000 ( 2.82%)  autumn_harvest::payload_codec::codec_envelope_parts
+  3,295,824 ( 2.20%)  alloc::collections::btree::map::BTreeMap<K,V,A>::insert
 ```
+
+The remaining `BTreeMap` traffic (`IntoIter::dying_next`, `BTreeMap::insert`)
+is the envelope object itself (`codec_id`/`kid`/`data`), not the payload
+content — that part is inherent to the stored shape, not this function's to
+remove.
 
 **Correctness**: `cargo test -p autumn-harvest --no-default-features --lib
-codec_rotation::` (13 tests) and `cargo test -p autumn-harvest
---no-default-features --lib payload_codec::` (47 tests) both pass unchanged.
-`cargo clippy -p autumn-harvest --lib --all-features -- -D warnings` and
-`cargo clippy -p autumn-harvest --bench codec_rotation_reencrypt_profile
+codec_rotation::` (14 tests) and `cargo test -p autumn-harvest
+--no-default-features --lib payload_codec::` (47 tests) both pass. Full
+`cargo test -p autumn-harvest --no-default-features --lib` (2,256 tests)
+passes. `cargo clippy -p autumn-harvest --lib --all-features -- -D warnings`
+and `cargo clippy -p autumn-harvest --bench codec_rotation_reencrypt_profile
 --all-features -- -D warnings` are clean. `cargo fmt --all -- --check` is
 clean.
 

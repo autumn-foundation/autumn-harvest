@@ -1577,6 +1577,52 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct GarbageDecodeCodec;
+
+    impl PayloadCodec for GarbageDecodeCodec {
+        fn codec_id(&self) -> &'static str {
+            "garbage"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(raw.to_vec())
+        }
+        fn decode(&self, _encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            // Simulates a codec that "succeeds" but returns non-JSON bytes --
+            // e.g. corrupt ciphertext an unauthenticated cipher decodes
+            // without detecting the tampering.
+            Ok(b"not valid json".to_vec())
+        }
+    }
+
+    #[test]
+    fn a_field_that_decodes_to_non_json_bytes_is_left_completely_untouched() {
+        // Regression test (PR #1275 review): decode_payload_bytes must still
+        // validate the decoded bytes as JSON. A codec that "successfully"
+        // decodes corrupt or mismatched ciphertext into non-JSON garbage must
+        // fail the row, not be silently re-encrypted and written back out as
+        // new ciphertext wrapping the garbage.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k-garbage", Arc::new(GarbageDecodeCodec))
+            .expect("register k-garbage");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(0x22)))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+
+        let mut event = event_under(&codecs, "k-garbage", json!({"user": "alice"}));
+        let before = event.clone();
+
+        let err = reencrypt_event_payload_fields(&codecs, &mut event)
+            .expect_err("non-JSON decoded bytes must fail the row");
+        assert!(matches!(err, HarvestError::Serialization(_)), "{err:?}");
+        assert_eq!(
+            event, before,
+            "the row is byte-identical after a failed sweep"
+        );
+    }
+
     #[test]
     fn every_payload_bearing_field_is_swept() {
         let codecs = rotated_registry();
