@@ -462,7 +462,13 @@ async fn zz_capture_quota_history_bytes_evidence() {
         // ran on this same connection/database, so the current-dbid scope
         // alone now makes the match exact -- asserted, not just hoped, via
         // the exact `calls` check below.
-        let stats: Vec<StatRow> = diesel::sql_query(
+        // A fourth way this can fail, distinct from the three below: PG12
+        // (this crate's stated minimum -- see README's "Postgres 12+") names
+        // this column `mean_time`, renamed to `mean_exec_time` only in PG13.
+        // Queried as `Result` rather than a version probe, so it folds into
+        // the same skip path as the others instead of adding a second way to
+        // detect "can't get this snapshot here".
+        let stats_result: Result<Vec<StatRow>, _> = diesel::sql_query(
             "SELECT calls, shared_blks_hit, shared_blks_read, \
                     (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \
              FROM pg_stat_statements \
@@ -471,10 +477,9 @@ async fn zz_capture_quota_history_bytes_evidence() {
              ORDER BY total_buffers DESC",
         )
         .load(&mut conn)
-        .await
-        .expect("query pg_stat_statements");
+        .await;
 
-        if stats.is_empty() {
+        if matches!(&stats_result, Ok(s) if s.is_empty()) {
             // A third way the secondary snapshot can be unavailable, distinct
             // from "unpreloaded" and "unauthorized to reset": an external
             // server with `pg_stat_statements.track = 'none'` lets the probe
@@ -498,7 +503,25 @@ async fn zz_capture_quota_history_bytes_evidence() {
                 ),
             )
             .expect("write pg_stat_statements skip notice");
+        } else if let Err(e) = &stats_result {
+            let reason = format!(
+                "querying pg_stat_statements failed ({e}) -- likely a pre-PG13 server, \
+                 where this view names the column `mean_time` rather than `mean_exec_time`"
+            );
+            eprintln!(
+                "SKIP: {reason} -- skipping the pg_stat_statements snapshot. The \
+                 EXPLAIN artifacts above are the primary evidence and are \
+                 unaffected."
+            );
+            std::fs::write(
+                out_dir.join("pg_stat_statements.txt"),
+                format!(
+                    "-- SKIPPED: {reason}. See the EXPLAIN artifacts for the primary evidence. --\n"
+                ),
+            )
+            .expect("write pg_stat_statements skip notice");
         } else {
+            let stats = stats_result.expect("checked Ok and non-empty above");
             assert_eq!(
                 stats.len(),
                 1,

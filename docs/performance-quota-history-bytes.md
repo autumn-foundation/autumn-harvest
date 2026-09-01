@@ -101,8 +101,8 @@ and `dead_letters` are cheap partial-index lookups at every size tested
 | total `harvest_events` rows | plan for `history_bytes` | buffers (hit+read) |
 |---:|---|---:|
 | 205,000 | **`Seq Scan` of the entire table**, then `Hash Join` against the 1,000-row active set | 12,745 |
-| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,767 (5,254 hit + 11,513 read) |
-| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,769 (10,355 hit + 6,414 read) |
+| 313,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,766 (5,359 hit + 11,407 read) |
+| 1,078,000 | `Nested Loop` over `active`, `Index Scan using idx_harvest_events_exec_last`, 1,000 loops | 16,768 (10,037 hit + 6,731 read) |
 
 Full captured plans: `docs/perf-artifacts/quota-history-bytes-admission/noise_mult-{3,15,100}.explain.txt`.
 
@@ -114,7 +114,7 @@ Two things this table shows:
    `quota_usage_query()`'s `WHERE e.workflow_exec_id IN (SELECT id FROM
    active)` is left exactly as it ships.
 2. **Once on the `Nested Loop` plan, buffer cost is flat** across a 3.4x
-   growth in total table size (313k → 1,078,000 rows: 16,767 → 16,769
+   growth in total table size (313k → 1,078,000 rows: 16,766 → 16,768
    buffers, effectively unchanged). This confirms the query, on its intended
    plan, costs what the target tenant's own active footprint costs — not
    what the whole table costs.
@@ -125,9 +125,9 @@ subject:
 
 | total rows | estimated rows for `history_bytes`'s join | actual rows | ratio |
 |---:|---:|---:|---:|
-| 205,000 | 53,890 | 178,000 | 3.3x under |
-| 313,000 | 22,318 | 178,000 | 8.0x under |
-| 1,078,000 | 15,200 | 178,000 | 11.7x under |
+| 205,000 | 54,129 | 178,000 | 3.3x under |
+| 313,000 | 22,182 | 178,000 | 8.0x under |
+| 1,078,000 | 14,894 | 178,000 | 12.0x under |
 
 These are read directly off the committed
 `noise_mult-{3,15,100}.explain.txt` plans and will drift slightly on a
@@ -185,14 +185,14 @@ one size where a forced rewrite would matter if it helped):
 | variant | plan | buffers (hit+read) |
 |---|---|---:|
 | unmodified (`IN` subquery) | `Seq Scan` of the whole table | 12,745 |
-| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,725 hit + 39 read) |
+| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,727 hit + 37 read) |
 
 The rewrite **costs 24% more**, not less. Postgres's per-row plan for the
 correlated form is a `Bitmap Heap Scan` (build a bitmap, sort, then fetch) —
 more expensive per probe at this row count (~178 rows/execution) than either
 the unmodified query's own sequential scan at this size, or the plain
 `Index Scan` the *unmodified* query reaches on its own once the table is
-larger (see the Plan table above: 16,767–16,769 buffers on a table 1.5x–5.3x
+larger (see the Plan table above: 16,766–16,768 buffers on a table 1.5x–5.3x
 bigger). Forcing the plan shape traded a cost that already goes away on its
 own past 300k rows for a permanent tax below that point.
 
@@ -213,9 +213,9 @@ and `enforce_quota_admission`'s call pattern are unchanged.
 | method | value |
 |---|---:|
 | `EXPLAIN` buffers @ 205,000 total rows (Seq Scan) | 12,745 |
-| `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,767 |
-| `EXPLAIN` buffers @ 1,078,000 total rows (Nested Loop) | 16,769 |
-| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,380 total buffers (16,769/call), mean 52.3ms |
+| `EXPLAIN` buffers @ 313,000 total rows (Nested Loop) | 16,766 |
+| `EXPLAIN` buffers @ 1,078,000 total rows (Nested Loop) | 16,768 |
+| `pg_stat_statements`, 20 real `load_quota_usage()` calls @ 1,078,000 rows | 335,360 total buffers (16,768/call), mean 63.4ms |
 | `LATERAL` rewrite @ 205,000 total rows | 15,764 (vs. 12,745 unmodified — **worse**) |
 
 Tool used for every row: `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` and
@@ -235,8 +235,17 @@ this run drives as exactly one, and the reported top-buffer row
 earlier ephemeral database, not this run's. Fixed by scoping the `SELECT`
 to the current `dbid` too and asserting exactly one matching row with
 `calls` equal to the exact iteration count — the corrected number above
-(335,380 / 16,769 per call) now lands almost exactly on the `EXPLAIN`
+(335,360 / 16,768 per call) now lands almost exactly on the `EXPLAIN`
 figure at the same table size, as it should.
+
+**On re-running this capture.** The buffer *totals* in this page were
+re-verified against the currently committed artifacts as of the last
+commit that touched this file. Any *further* re-run of the capture will
+again change the row-estimate table's exact values and the hit/read
+*split* (not total) of every buffer figure — that is expected, described
+above and in the Plan section, and is not by itself evidence this page is
+out of sync. Only a changed buffer *total* is a real discrepancy worth
+re-syncing.
 
 ## Equivalence
 
