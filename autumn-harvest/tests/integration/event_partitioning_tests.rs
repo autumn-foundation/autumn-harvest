@@ -3070,3 +3070,142 @@ async fn conversion_does_not_widen_who_can_read_event_data() {
         "and neither must the revert, which replaces the table again"
     );
 }
+
+#[tokio::test]
+async fn re_running_the_plan_over_a_converted_table_cannot_break_appends() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "rerun_wf", "rerun-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+    run_plan_phases(&mut conn, 1..=4).await;
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "precondition: converted"
+    );
+
+    // The runbook tells an operator to re-run step 3 after a failed validation,
+    // and an operator who has lost track of where they were will re-run the
+    // plan. Over a CONVERTED table that was not a no-op: step 3's guard looks
+    // for its constraint by name on `harvest_events`, the conversion renamed
+    // the legacy one onto the legacy partition, so the guard found nothing and
+    // added `CHECK (cohort < cutover) NOT VALID` to the live partitioned
+    // parent. NOT VALID skips existing rows but still enforces for NEW ones,
+    // whose cohort is at or after the cutover by construction — so every
+    // append on a working shard failed from that moment.
+    let mut refused = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1 || s.phase == 3)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    assert!(
+        refused,
+        "the plan must refuse over an already-partitioned table, not proceed"
+    );
+
+    // The assertion that actually matters: the shard still works.
+    let live = insert_execution(&mut conn, "rerun_wf", "rerun-2", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(live),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect(
+        "appends must still succeed after a re-run — a cohort CHECK added to the live \
+         parent would reject every one of them",
+    );
+    assert_eq!(
+        autumn_harvest::store::load_history(&mut conn, ExecutionId::from_uuid(exec))
+            .await
+            .expect("history intact")
+            .events
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn extending_the_write_window_never_queues_appends_indefinitely() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // A long history query holding ACCESS SHARE on the parent — a report, a
+    // stuck session. `CREATE TABLE ... PARTITION OF` takes ACCESS EXCLUSIVE on
+    // that parent, and Postgres queues later conflicting requests behind a
+    // WAITER, not merely behind held locks. Unbounded, a routine maintenance
+    // tick extending the lookahead window becomes a shard-wide write outage
+    // that ends only when the reader does.
+    let mut reader = connect(&url).await;
+    for stmt in ["BEGIN", "SELECT count(*) AS n FROM harvest_events"] {
+        diesel::sql_query(stmt)
+            .execute(&mut reader)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    // A cohort far enough ahead that it certainly does not exist yet, so the
+    // creation really is attempted.
+    let far = Utc::now() + chrono::Duration::days(400);
+    let ensure_url = url.clone();
+    let ensurer = tokio::spawn(async move {
+        let mut c = connect(&ensure_url).await;
+        partition::ensure_partitions(&mut c, far, 0, Duration::from_secs(2)).await
+    });
+
+    // Let the creation reach its lock wait before appending — otherwise the
+    // append can slip in ahead of it and the test passes without exercising
+    // anything.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let mut writer = connect(&url).await;
+    let live = insert_execution(&mut writer, "win_wf", "win-live", Utc::now(), None).await;
+    let appended = tokio::time::timeout(
+        Duration::from_secs(6),
+        autumn_harvest::store::append_events(
+            &mut writer,
+            ExecutionId::from_uuid(live),
+            &sample_events(),
+            0,
+        ),
+    )
+    .await;
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut reader)
+        .await
+        .expect("release the reader");
+
+    appended
+        .expect(
+            "AC8: extending the lookahead window waited for its parent lock with no bound, \
+             and every append arriving meanwhile queued behind that waiting ALTER. \
+             Maintenance must bound the attempt and report the cohort blocked for the \
+             next tick.",
+        )
+        .expect("the concurrent append itself must succeed");
+
+    // Blocked, not an error: the cohort is retried next tick.
+    ensurer.await.expect("ensure task").ok();
+}

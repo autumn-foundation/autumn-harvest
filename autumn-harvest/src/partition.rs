@@ -708,7 +708,7 @@ pub async fn ensure_cohort(
         EventLayout::Unpartitioned => return Ok((String::new(), false)),
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
     };
-    ensure_cohort_with_width(conn, ts, width).await
+    ensure_cohort_with_width(conn, ts, width, Duration::from_secs(2)).await
 }
 
 #[cfg(feature = "db")]
@@ -716,6 +716,7 @@ async fn ensure_cohort_with_width(
     conn: &mut AsyncPgConnection,
     ts: DateTime<Utc>,
     width: i64,
+    lock_timeout: Duration,
 ) -> HarvestResult<(String, bool)> {
     let lower = cohort_start(ts, width);
     let Some(upper) = lower.checked_add_signed(chrono::Duration::seconds(width)) else {
@@ -739,10 +740,30 @@ async fn ensure_cohort_with_width(
         ts_literal(lower),
         ts_literal(upper)
     );
-    match diesel::sql_query(&sql).execute(conn).await {
+    // Bounded, and in its own transaction so the bound is scoped to it.
+    //
+    // `CREATE TABLE ... PARTITION OF` takes ACCESS EXCLUSIVE on the parent, and
+    // Postgres queues later conflicting requests behind a WAITER rather than
+    // only behind held locks — so behind one long history query still holding
+    // ACCESS SHARE, this statement waits and every append arriving after it
+    // queues behind this statement. Unbounded, that turns a routine maintenance
+    // tick into a shard-wide write outage that ends when the reader does.
+    //
+    // A cohort that cannot be carved out in time is reported blocked and
+    // retried next tick, which is what `ensure_partitions` already does with
+    // every other per-cohort failure.
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let create = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
+        exec(conn, &sql).await
+    }))
+    .await;
+    match create {
         // Verified rather than assumed, for the same reason: the statement can
         // succeed without having created the partition we asked for.
-        Ok(_) => {
+        Ok(()) => {
             if cohort_partition_is_attached(conn, &name, lower, upper).await? {
                 Ok((name, true))
             } else {
@@ -761,7 +782,7 @@ async fn ensure_cohort_with_width(
         // cohort width was changed under a live grid) — both would otherwise
         // report the cohort as covered when it is not, and the next append
         // would land in the DEFAULT partition with nothing said.
-        Err(e) if is_benign_partition_race(&e) => {
+        Err(e) if is_benign_partition_race(&e.to_string()) => {
             if cohort_partition_is_attached(conn, &name, lower, upper).await? {
                 Ok((name, false))
             } else {
@@ -777,12 +798,14 @@ async fn ensure_cohort_with_width(
         // violated by some row") tells an operator nothing about the remedy,
         // which is a drain — something `maintain` does automatically before it
         // ever gets here.
-        Err(e) if is_default_partition_conflict(&e) => Err(HarvestError::Database(format!(
-            "cannot create {name}: the DEFAULT partition holds rows for its range; \
+        Err(e) if is_default_partition_conflict(&e.to_string()) => {
+            Err(HarvestError::Database(format!(
+                "cannot create {name}: the DEFAULT partition holds rows for its range; \
              drain it first (partition::drain_default, or `harvest partition maintain`). \
              underlying error: {e}"
-        ))),
-        Err(e) => Err(database_error(e)),
+            )))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -808,8 +831,7 @@ async fn ensure_cohort_with_width(
 /// way: the partition this call wanted now exists, which is the outcome it
 /// wanted — and the caller verifies the bounds before believing it.
 #[cfg(feature = "db")]
-fn is_benign_partition_race(e: &diesel::result::Error) -> bool {
-    let msg = e.to_string();
+fn is_benign_partition_race(msg: &str) -> bool {
     msg.contains("already exists")
         || msg.contains("would overlap")
         || msg.contains("overlaps with existing")
@@ -822,11 +844,12 @@ fn is_benign_partition_race(e: &diesel::result::Error) -> bool {
 /// Postgres reports the default partition's updated partition constraint as a
 /// check violation, which Diesel does classify.
 #[cfg(feature = "db")]
-fn is_default_partition_conflict(e: &diesel::result::Error) -> bool {
-    matches!(
-        e,
-        diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, _)
-    ) || e.to_string().contains("default partition")
+fn is_default_partition_conflict(msg: &str) -> bool {
+    // Matched on the message rather than on `DatabaseErrorKind`: the DDL now
+    // runs inside a transaction helper that reports failures as
+    // `HarvestError::Database`, so the typed variant is no longer in hand. The
+    // SQLSTATE is carried in the message either way.
+    msg.contains("default partition") || msg.contains("23514")
 }
 
 /// `lock_timeout` fired (SQLSTATE `55P03`).
@@ -877,6 +900,7 @@ pub async fn ensure_partitions(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
+    lock_timeout: Duration,
 ) -> HarvestResult<Vec<String>> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok(Vec::new()),
@@ -888,7 +912,7 @@ pub async fn ensure_partitions(
         let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
             break;
         };
-        match ensure_cohort_with_width(conn, at, width).await {
+        match ensure_cohort_with_width(conn, at, width, lock_timeout).await {
             Ok((name, true)) => created.push(name),
             Ok((_, false)) => {}
             // One cohort that cannot be carved out must not stop the REST of
@@ -1091,7 +1115,8 @@ pub async fn enable_partitioning(
         None => EnableMode::Fresh,
     };
 
-    let partitions_created = ensure_partitions(conn, now, opts.lookahead_cohorts).await?;
+    let partitions_created =
+        ensure_partitions(conn, now, opts.lookahead_cohorts, opts.lock_timeout).await?;
     Ok(EnableReport {
         mode,
         partitions_created,
@@ -2341,7 +2366,7 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
         .map_err(database_error)?;
         for c in &cohorts {
             if let Some(cohort) = c.v {
-                ensure_cohort_with_width(conn, cohort, width).await?;
+                ensure_cohort_with_width(conn, cohort, width, Duration::from_secs(2)).await?;
             }
         }
 
@@ -2533,7 +2558,7 @@ pub async fn maintain(
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
-    let created = ensure_partitions(conn, now, lookahead_cohorts).await?;
+    let created = ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
     let sweep = sweep(conn, now, sweep_opts).await?;
     Ok(MaintenanceOutcome {
         at: Some(Utc::now()),
@@ -2646,6 +2671,35 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     };
 
     vec![
+        // ── 1: refuse outright if the table is already partitioned ────────
+        //
+        // Re-running the plan after a completed step 4 is not a no-op, it is
+        // destructive. Step 3's guard looks for its constraint BY NAME on
+        // `harvest_events`, and the conversion renamed the legacy constraint
+        // onto the legacy partition — so on the new parent the guard finds
+        // nothing and adds `CHECK (cohort < cutover) NOT VALID` to the live
+        // partitioned parent. `NOT VALID` skips the scan of existing rows but
+        // still enforces the check for NEW ones, whose cohort is at or after
+        // the cutover by construction. Every subsequent append fails, on a
+        // shard that was working.
+        //
+        // First, before anything mutates, and repeated inside step 3 because
+        // the runbook explicitly tells an operator to re-run that step alone
+        // after a failed validation.
+        step(
+            1,
+            "DO $harvest_relkind_958$\nBEGIN\n    \
+             IF (SELECT c.relkind FROM pg_class c\n          \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n         \
+             WHERE c.relname = 'harvest_events'\n           \
+             AND n.nspname = current_schema()) = 'p' THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is already partitioned. This \
+             plan converts an ordinary table, and re-running it over a converted one adds \
+             the legacy cohort CHECK to the live parent, where NOT VALID still enforces it \
+             for new rows and every append then fails. Nothing to do.';\n    \
+             END IF;\nEND\n$harvest_relkind_958$;"
+                .to_string(),
+        ),
         // ── 1: refuse early if logical replication would break ────────────
         //
         // First, before hours of `CONCURRENTLY` index building, because the
@@ -2757,6 +2811,14 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             3,
             format!(
                 "DO $harvest_cohort_ck_958$\nBEGIN\n    \
+                 IF (SELECT c.relkind FROM pg_class c\n          \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n         \
+                 WHERE c.relname = 'harvest_events'\n           \
+                 AND n.nspname = current_schema()) = 'p' THEN\n        \
+                 RAISE EXCEPTION 'harvest #958: harvest_events is already partitioned; \
+                 adding the legacy cohort CHECK to the live parent would make every \
+                 append fail. Nothing to do.';\n    \
+                 END IF;\n    \
                  IF NOT EXISTS (SELECT 1 FROM pg_constraint\n                    \
                  WHERE conname = '{LEGACY_PARTITION}_cohort_ck'\n                      \
                  AND conrelid = 'harvest_events'::regclass) THEN\n        \
