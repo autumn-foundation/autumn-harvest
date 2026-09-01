@@ -474,15 +474,15 @@ cohort partitions.
 It is never dropped, and it sorts last in the sweep so a bounded pass can never
 spend its budget reaching it.
 
-**Draining is bounded in three ways, because the move runs under the parent's
-`ACCESS EXCLUSIVE`.** `DETACH PARTITION` takes that lock, and everything after
-it in the transaction is time the whole shard is stopped — `lock_timeout` bounds
+**Draining is budgeted, because the move runs under the parent's `ACCESS
+EXCLUSIVE`.** `DETACH PARTITION` takes that lock, and everything after it in the
+transaction is time the whole shard is stopped — `lock_timeout` bounds
 *acquiring* a lock, never holding one. So a pass takes at most 50,000 rows and
-at most 32 cohorts (each cohort taken needs a `CREATE TABLE ... PARTITION OF`,
-which cannot run before the `DETACH`), and every statement inside the window
-carries a 10s `statement_timeout`. Both budgets are floors rather than ceilings:
-a pass always takes at least one cohort, so a backlog always converges, however
-large.
+at most 32 cohorts; each cohort taken needs a `CREATE TABLE ... PARTITION OF`,
+which cannot run before the `DETACH` (a cohort's partition may not be created
+while `DEFAULT` still holds rows in its range), so the row budget alone would
+not bound the DDL. Both budgets are floors rather than ceilings: a pass always
+takes at least one cohort, so a backlog always converges, however large.
 
 The census that decides which cohorts to take is deliberately run *before* the
 lock, where it costs bystanders nothing — it is a `GROUP BY` over the whole
@@ -491,8 +491,23 @@ maintenance gap leaves it is the most expensive thing the pass does. Reading it
 under the lock would have meant the row budget bounded only what was *moved*,
 while the shard stayed stopped for the entire scan.
 
-A pass that exceeds its statement budget rolls back — the `DETACH` with it, so
-`DEFAULT` is re-attached and no row moves — and is retried next tick.
+**There is deliberately no `statement_timeout` on the window.** It looks like
+the obvious extra bound and it is a trap. Every statement in the transaction
+scans `DEFAULT` in proportion to the backlog — the move's `DELETE` does, and so
+does the mandatory re-`ATTACH ... DEFAULT`, because Postgres must prove no
+remaining row belongs to an existing partition (~160ms per 3M rows on PG16, and
+cancellable, so the timeout does fire). A timeout small relative to the backlog
+therefore does not bound the work, it *discards* it: the transaction rolls back,
+the rows just moved go back, and the next tick retries against an identical
+table and fails at the same point — a permanent livelock on exactly the
+deployment the drain exists for. The budgets bound the work without ever
+throwing away a pass that succeeded.
+
+What remains proportional to the backlog is that one scan per pass, and it is
+irreducible — the re-`ATTACH` cannot be skipped and cannot be made not to scan.
+Keeping the lookahead window covered is what keeps `DEFAULT` empty and the scan
+trivial.
+
 `maintain` records a failed drain and continues to `ensure_partitions`
 regardless, because extending the write window is the one step that must never
 stop.

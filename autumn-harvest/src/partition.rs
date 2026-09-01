@@ -2139,17 +2139,27 @@ const DRAIN_MAX_ROWS: usize = 50_000;
 #[doc(hidden)]
 pub const DRAIN_MAX_COHORTS: usize = 32;
 
-/// How long any single statement inside the drain's exclusive window may run.
-///
-/// The last unbounded step under the lock is the move itself: `cohort` carries
-/// no index, so the `DELETE ... WHERE cohort <= …` scans the whole `DEFAULT`
-/// partition however few rows it takes. A bound turns that from an outage into
-/// a retry — the statement fails, the transaction rolls back, the `DETACH` is
-/// undone with it, and `maintain` records the failure and comes back next tick.
-/// It already treats a failed drain that way, precisely so a heavy pass cannot
-/// take `ensure_partitions` down with it.
-#[cfg(feature = "db")]
-const DRAIN_STATEMENT_TIMEOUT_MS: u64 = 10_000;
+// A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
+// this is the second thing to know about the pass after the budgets.
+//
+// It looks like the obvious bound and it is a trap. Every statement in the
+// transaction scans `DEFAULT` in proportion to the backlog — `cohort` carries
+// no index, so the move's `DELETE` scans it, and the mandatory re-`ATTACH ...
+// DEFAULT` scans it too, because Postgres must prove no remaining row belongs
+// to an existing partition (measured: ~160ms per 3M rows on PG16, and it is
+// cancellable, so the timeout really does fire).
+//
+// So a timeout small relative to the backlog does not bound the work; it
+// discards it. The transaction rolls back, the rows just moved go back, the
+// next tick retries against an identical table and times out at the same
+// point. The backlog never shrinks and its partitions are never reclaimed —
+// a permanent livelock on exactly the deployment the drain exists for, and one
+// that gets worse every tick.
+//
+// The work is bounded by the row and cohort budgets instead, which bound it
+// without ever throwing away a pass that succeeded. What remains unbounded is
+// the per-pass scan of whatever is still parked, and that is irreducible: the
+// re-`ATTACH` cannot be skipped and cannot be made to not scan.
 
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
@@ -2456,14 +2466,8 @@ pub async fn drain_default_bounded(
 
     Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
         exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
-        // Bounds every statement inside the window, so the one remaining
-        // unbounded step — the move's scan of `DEFAULT` — fails and rolls back
-        // for retry rather than holding the shard still for as long as it takes.
-        exec(
-            conn,
-            &format!("SET LOCAL statement_timeout = '{DRAIN_STATEMENT_TIMEOUT_MS}ms'"),
-        )
-        .await?;
+        // No `statement_timeout` here — see the note above the budgets. It
+        // would discard a completed pass rather than bound one.
         exec(
             conn,
             &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
