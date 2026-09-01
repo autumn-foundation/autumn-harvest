@@ -215,6 +215,10 @@ struct PreparedHarvestRuntime {
     /// automatically, without a separate `set_effective_config` call the
     /// integrator must remember.
     effective_config: EffectiveConfigView,
+    /// Held un-committed until `HarvestRunner::start` finishes every fallible
+    /// step. Dropping this struct on an early return restores whatever
+    /// audit-export config was installed before this runtime was built.
+    audit_export_guard: Option<AuditExportInstallGuard>,
 }
 
 /// Install the process-global completion-callback runtime config (issue #605).
@@ -375,31 +379,34 @@ fn commit_audit_export_config(
 /// (`BuiltHarvest::deferring_audit_export_install`) and this guard remains
 /// only to catch anything else that might publish before `commit`.
 struct AuditExportInstallGuard {
+    /// Restored if this guard drops without `commit`.
     previous: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    /// Published by `commit`. Carried here rather than passed in so the guard
+    /// can be handed across function boundaries as one value.
+    pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
     committed: bool,
 }
 
 impl AuditExportInstallGuard {
     /// Snapshot the global config. Take this immediately *before* the
     /// conversion that may clobber it.
-    fn arm() -> Self {
+    fn arm(pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>) -> Self {
         let previous = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
             .read()
             .ok()
             .and_then(|lock| lock.clone());
         Self {
             previous,
+            pending,
             committed: false,
         }
     }
 
     /// Publish this runtime's config; the snapshot is discarded.
-    fn commit(
-        mut self,
-        config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
-    ) {
+    fn commit(mut self) {
         self.committed = true;
-        commit_audit_export_config(config);
+        let pending = self.pending.take();
+        commit_audit_export_config(pending);
     }
 }
 
@@ -502,11 +509,14 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
-        // Belt and braces behind the suppression above: the guard restores the
-        // previous value should anything else in this build publish the global
-        // before `commit`. With the conversion's write suppressed there should
-        // be nothing to restore, and the guard costs one clone.
-        let audit_export_guard = AuditExportInstallGuard::arm();
+        // Armed here and carried on the returned `PreparedHarvestRuntime`, so
+        // it stays live for the whole of `HarvestRunner::start` — not just this
+        // function (issue #953, Codex review round 16 P1). `start` has more
+        // fallible work after `build` returns (completion-trigger sync, worker
+        // construction, shard-pool validation), and an early return there must
+        // also leave a previously running runtime's export untouched. Dropping
+        // `prepared` on any such error restores it.
+        let audit_export_guard = AuditExportInstallGuard::arm(audit_export_config);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -540,11 +550,8 @@ impl PreparedHarvestRuntime {
 
         warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
 
-        // Every fallible step has succeeded; only now may this runtime's sink
-        // replace whatever a previously-built runtime installed.
-        audit_export_guard.commit(audit_export_config);
-
         Ok(Self {
+            audit_export_guard: Some(audit_export_guard),
             registry: Arc::new(registry),
             dag_catalog,
             registered_dag_names,
@@ -634,7 +641,7 @@ impl HarvestRunner {
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
         let completion_triggers = built.completion_triggers().to_vec();
-        let prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -692,6 +699,17 @@ impl HarvestRunner {
         } else {
             None
         };
+
+        // Every fallible step of startup has now succeeded -- `build`, the
+        // completion-trigger sync above, worker construction and its shard-pool
+        // validation. Only here may this runtime's sink replace whatever a
+        // previously started runtime installed (issue #953, Codex review round
+        // 16 P1). Returning `Err` anywhere above instead drops `prepared`,
+        // whose guard restores the previous config.
+        if let Some(guard) = prepared.audit_export_guard.take() {
+            guard.commit();
+        }
+
         let worker_id = worker
             .as_ref()
             .map(|_| prepared.worker_runtime_config.worker_id.clone());
@@ -1039,9 +1057,11 @@ mod tests {
         super::commit_audit_export_config(Some(live));
 
         {
-            let guard = AuditExportInstallGuard::arm();
-            // Stand in for the conversion clobbering the global, then a later
-            // fallible step failing: the guard drops without `commit`.
+            // The guard now spans the whole of `HarvestRunner::start`, so this
+            // stands in for a failure ANYWHERE after `build` returns --
+            // completion-trigger sync, worker construction, shard validation --
+            // each of which drops `prepared` and with it this guard.
+            let guard = AuditExportInstallGuard::arm(None);
             super::commit_audit_export_config(None);
             drop(guard);
         }
@@ -1056,9 +1076,28 @@ mod tests {
             "a runtime that never started must not silence a running one's export"
         );
 
-        // And the success path still publishes.
-        let guard = AuditExportInstallGuard::arm();
-        guard.commit(None);
+        // And the success path publishes what it was armed with.
+        let second = std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(Marker),
+            secret: autumn_harvest::completion_callback::CallbackSecret::new(b"second".to_vec()),
+            batch_size: 21,
+            backoff: autumn_harvest::audit_export::ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(30),
+        });
+        AuditExportInstallGuard::arm(Some(second)).commit();
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("commit must publish")
+                .batch_size,
+            21,
+        );
+
+        // A deliberate `None` is meaningful too: a runtime built with no sink
+        // must stop a previous runtime's export rather than leave it running.
+        AuditExportInstallGuard::arm(None).commit();
         assert!(
             autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
                 .read()
