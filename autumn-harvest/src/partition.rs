@@ -291,6 +291,13 @@ pub struct EnableOptions {
     /// that queues behind a long transaction would block every append behind
     /// it.
     pub lock_timeout: Duration,
+    /// Convert even when a logical-replication publication would break.
+    ///
+    /// See [`incompatible_publications`] for what "break" means and why the
+    /// default is to refuse. Set this only when the subscriber runs the
+    /// partitioned layout too, or when the publication is not feeding a
+    /// Harvest standby at all.
+    pub allow_incompatible_publications: bool,
 }
 
 impl Default for EnableOptions {
@@ -299,6 +306,7 @@ impl Default for EnableOptions {
             cohort_width_secs: DEFAULT_COHORT_WIDTH_SECS,
             lookahead_cohorts: DEFAULT_LOOKAHEAD_COHORTS,
             lock_timeout: Duration::from_secs(5),
+            allow_incompatible_publications: false,
         }
     }
 }
@@ -923,6 +931,56 @@ pub async fn ensure_partitions(
 
 // ── Enabling the layout ────────────────────────────────────────────────────
 
+/// Publications that would stop replicating `harvest_events` the moment it
+/// becomes partitioned.
+///
+/// `docs/cross-region-dr.md` tells an operator to run `CREATE PUBLICATION
+/// harvest_dr FOR ALL TABLES` on the primary and to apply Harvest's migrations
+/// on the standby first, "logical replication does not carry DDL". Both halves
+/// of that are what make this dangerous.
+///
+/// `publish_via_partition_root` defaults to **false**, which means a
+/// partitioned table's changes are published under the names of the *leaf*
+/// partitions — `harvest_events_p20260901000000`, `harvest_events_legacy`. The
+/// standby has only the flat `harvest_events` the migrations created, and the
+/// partitions are created by DDL that is not replicated, so those relations
+/// will never exist there. The subscription's apply worker stops on the first
+/// event after the conversion.
+///
+/// Nothing about that is loud. The primary keeps accepting writes, the standby
+/// silently stops receiving them, and WAL piles up behind a slot nobody is
+/// draining — a DR outage caused by opting into an unrelated storage feature.
+///
+/// So [`enable_partitioning`] refuses, and names the remedy: `ALTER PUBLICATION
+/// <name> SET (publish_via_partition_root = true)`, which republishes the
+/// partitioned table's changes as the root's, keeping the standby's flat table
+/// a valid target. [`EnableOptions::allow_incompatible_publications`] overrides
+/// the refusal for a deployment whose standby runs the partitioned layout too.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    // `pg_publication_tables` resolves FOR ALL TABLES, FOR TABLES IN SCHEMA and
+    // explicit table lists alike, so there is one query rather than three
+    // catalog shapes to keep in step. `pubviaroot` is Postgres 13+; the
+    // partitioned layout already requires 14+.
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT p.pubname AS v
+           FROM pg_publication p
+           JOIN pg_publication_tables t ON t.pubname = p.pubname
+          WHERE NOT p.pubviaroot
+            AND t.schemaname = current_schema()
+            AND t.tablename = 'harvest_events'
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
 /// Convert this shard's `harvest_events` to the partitioned layout.
 ///
 /// Idempotent: on an already-partitioned shard it reports
@@ -948,6 +1006,9 @@ pub async fn ensure_partitions(
 /// [`HarvestError::Config`] for invalid options; [`HarvestError::Database`] if
 /// any step fails — including the lock timeout, which is the designed outcome
 /// when a long transaction is holding `harvest_events`.
+///
+/// [`HarvestError::Config`] also when a logical-replication publication would
+/// break — see [`incompatible_publications`].
 #[cfg(feature = "db")]
 pub async fn enable_partitioning(
     conn: &mut AsyncPgConnection,
@@ -960,6 +1021,21 @@ pub async fn enable_partitioning(
             partitions_created: Vec::new(),
             cohort_width_secs,
         });
+    }
+
+    if !opts.allow_incompatible_publications {
+        let pubs = incompatible_publications(conn).await?;
+        if !pubs.is_empty() {
+            return Err(HarvestError::Config(format!(
+                "harvest_events is published by {} with publish_via_partition_root = false, \
+                 so partitioning it would publish its rows under leaf partition names the \
+                 standby has no tables for and stop the subscription. Run `ALTER PUBLICATION \
+                 <name> SET (publish_via_partition_root = true)` on each, then retry — or set \
+                 EnableOptions::allow_incompatible_publications if the subscriber runs the \
+                 partitioned layout too.",
+                pubs.join(", ")
+            )));
+        }
     }
 
     let width = opts.cohort_width_secs;
@@ -2412,6 +2488,30 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     };
 
     vec![
+        // ── 1: refuse early if logical replication would break ────────────
+        //
+        // First, before hours of `CONCURRENTLY` index building, because the
+        // remedy is one `ALTER PUBLICATION` on the primary. `enable_partitioning`
+        // makes the same check in Rust; the scripted path needs its own, since
+        // it never calls it. See `incompatible_publications` for why a
+        // leaf-publishing publication silently stops the standby.
+        step(
+            1,
+            "DO $harvest_pub_958$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad\n      \
+             FROM pg_publication p\n      \
+             JOIN pg_publication_tables t ON t.pubname = p.pubname\n     \
+             WHERE NOT p.pubviaroot AND t.schemaname = current_schema()\n       \
+             AND t.tablename = 'harvest_events';\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is published by % with \
+             publish_via_partition_root = false. Partitioning it would publish rows under \
+             leaf partition names the standby has no tables for and stop the subscription. \
+             Run ALTER PUBLICATION <name> SET (publish_via_partition_root = true) on each, \
+             then re-run this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_pub_958$;"
+                .to_string(),
+        ),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
         // ── 2: the partition-key indexes, built without blocking ──────────
@@ -2475,12 +2575,25 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // fast leaves the operator a bounded, retryable error instead.
         step(3, "BEGIN".to_string()),
         step(3, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
+        // Guarded rather than bare, because this phase is now TWO transactions
+        // and the half-done state is reachable by design: the constraint lands,
+        // the validation scan then hits its bounded lock wait and rolls back.
+        // The runbook's answer to that is "clear the blocker and re-run step
+        // 3", and an unconditional ADD CONSTRAINT fails with `duplicate_object`
+        // before the validation is ever retried — so bounding the lock wait
+        // would have traded a hang for a dead end, with regenerating the plan
+        // no help either since it bakes in the same constraint name.
         step(
             3,
             format!(
-                "ALTER TABLE harvest_events\n    \
-                 ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck\n    \
-                 CHECK (cohort < {cutover_lit}) NOT VALID"
+                "DO $harvest_cohort_ck_958$\nBEGIN\n    \
+                 IF NOT EXISTS (SELECT 1 FROM pg_constraint\n                    \
+                 WHERE conname = '{LEGACY_PARTITION}_cohort_ck'\n                      \
+                 AND conrelid = 'harvest_events'::regclass) THEN\n        \
+                 ALTER TABLE harvest_events\n            \
+                 ADD CONSTRAINT {LEGACY_PARTITION}_cohort_ck\n            \
+                 CHECK (cohort < {cutover_lit}) NOT VALID;\n    \
+                 END IF;\nEND\n$harvest_cohort_ck_958$;"
             ),
         ),
         step(3, "COMMIT".to_string()),

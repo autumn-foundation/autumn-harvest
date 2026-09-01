@@ -2586,3 +2586,107 @@ async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
         3
     );
 }
+
+#[tokio::test]
+async fn converting_refuses_while_a_publication_would_break_the_standby() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The exact logical-DR setup `docs/cross-region-dr.md` tells an operator to
+    // build. `publish_via_partition_root` defaults to false, so a publication
+    // that covers `harvest_events` publishes a partitioned table's changes
+    // under its LEAF relation names — `harvest_events_p20260901000000`,
+    // `harvest_events_legacy`. The standby was provisioned by the inert
+    // migrations and has only the flat `harvest_events`; logical replication
+    // does not carry DDL, so those relations will never exist there.
+    //
+    // Converting the publisher therefore stops the subscription's apply worker
+    // on the very next event, silently: the primary keeps accepting writes, the
+    // standby stops receiving them, and WAL accumulates behind a slot nobody is
+    // draining. That is a DR outage introduced by opting into an unrelated
+    // storage feature.
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_dr_958")
+        .execute(&mut conn)
+        .await
+        .expect("clean slate");
+    diesel::sql_query("CREATE PUBLICATION harvest_dr_958 FOR ALL TABLES")
+        .execute(&mut conn)
+        .await
+        .expect("create the documented publication");
+
+    let refused = partition::enable_partitioning(&mut conn, &EnableOptions::default()).await;
+    let err = match refused {
+        Err(e) => e.to_string(),
+        Ok(report) => {
+            panic!("enabling must refuse while an incompatible publication exists, got {report:?}")
+        }
+    };
+    assert!(
+        err.contains("harvest_dr_958") && err.contains("publish_via_partition_root"),
+        "and the refusal must name the publication and the remedy, not just fail: {err}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "and it must refuse BEFORE converting anything"
+    );
+
+    // Once the operator makes the publication publish through the partition
+    // root, the standby's flat `harvest_events` keeps matching and the
+    // conversion is safe.
+    diesel::sql_query("ALTER PUBLICATION harvest_dr_958 SET (publish_via_partition_root = true)")
+        .execute(&mut conn)
+        .await
+        .expect("fix the publication");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("a root-publishing publication must not block the conversion");
+    assert_eq!(events_relkind(&mut conn).await, "p");
+
+    diesel::sql_query("DROP PUBLICATION harvest_dr_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the publication");
+}
+
+#[tokio::test]
+async fn the_online_phase_is_resumable_after_its_validation_fails() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Phase 3 is two transactions now, because the second one — the validation
+    // scan — must be able to fail fast rather than queue every append behind
+    // it. So the half-done state is reachable by design: the constraint is
+    // added and NOT validated, and the runbook's answer is "clear the blocker
+    // and re-run step 3".
+    diesel::sql_query(format!(
+        "UPDATE pg_constraint SET convalidated = false
+          WHERE conname = '{}_cohort_ck'",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("simulate a validation that timed out after the constraint landed");
+
+    run_plan_phases(&mut conn, 3..=3).await;
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT COALESCE((SELECT convalidated FROM pg_constraint
+                                   WHERE conname = '{}_cohort_ck'), false) AS v",
+                partition::LEGACY_PARTITION
+            ),
+        )
+        .await,
+        "re-running phase 3 must finish the validation. An unconditional \
+         ADD CONSTRAINT fails with duplicate_object before it ever gets there, \
+         so bounding the phase's lock wait would have traded a hang for a dead \
+         end: the operator can neither re-run the step nor regenerate the plan, \
+         which bakes in the same constraint name."
+    );
+}

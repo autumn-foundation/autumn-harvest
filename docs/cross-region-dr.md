@@ -125,6 +125,15 @@ CREATE SUBSCRIPTION harvest_dr_shard0
 > slot creation waits for older transactions to end, so it would wait for
 > itself. Across two real instances you can let it create its own slot.
 
+> **If you use the partitioned `harvest_events` layout (#958), the publication
+> must publish through the partition root.** `publish_via_partition_root`
+> defaults to false, which publishes a partitioned table's rows under their leaf
+> partition names — and the standby, whose schema came from the migrations, has
+> only the flat `harvest_events`. The apply worker would stop on the first event
+> and the failure is silent from the primary's side. Run
+> `ALTER PUBLICATION harvest_dr SET (publish_via_partition_root = true);` before
+> converting; `harvest partition enable` refuses until you have.
+
 > **The `harvest_dr` prefix in those slot names is load-bearing, not cosmetic.**
 > Harvest identifies *its* replication by slot-name prefix
 > (`replication_slot_prefix`, default `harvest_dr`). Without that filter every

@@ -312,6 +312,16 @@ pub enum PartitionCommand {
         #[arg(long = "i-understand-the-lock-window")]
         confirm: bool,
 
+        /// Convert even when a logical-replication publication covers
+        /// `harvest_events` without `publish_via_partition_root`.
+        ///
+        /// Such a publication would send the partitioned table's rows under
+        /// leaf partition names the standby has no tables for, stopping the
+        /// subscription. Set this only when the subscriber runs the
+        /// partitioned layout too.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
+
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
         format: DrFormat,
@@ -4801,6 +4811,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             lookahead_cohorts,
             lock_timeout_secs,
             confirm,
+            allow_incompatible_publications,
             format,
         } => {
             if !confirm {
@@ -4817,6 +4828,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                 cohort_width_secs: *cohort_width_secs,
                 lookahead_cohorts: *lookahead_cohorts,
                 lock_timeout: std::time::Duration::from_secs((*lock_timeout_secs).max(1)),
+                allow_incompatible_publications: *allow_incompatible_publications,
             };
             opts.validate()
                 .map_err(|e| CliError::InvalidInput(e.to_string()))?;

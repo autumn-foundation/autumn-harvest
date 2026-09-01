@@ -337,6 +337,33 @@ write the catalog row, and one idle-in-transaction reader is enough to make the
 request queue — with every append arriving after it queued behind the `ALTER`.
 Re-run the step after clearing the blocker.
 
+**Logical replication has to be told about this first.** `enable`, the CLI and
+step 1 of the plan all refuse to convert while a publication covers
+`harvest_events` with `publish_via_partition_root = false` — which is the
+default, and which the DR runbook's `CREATE PUBLICATION harvest_dr FOR ALL
+TABLES` produces. Such a publication sends a partitioned table's rows under
+their *leaf* partition names, and the standby — provisioned by the inert
+migrations, since logical replication carries no DDL — has only the flat
+`harvest_events`. The subscription's apply worker would stop on the first event
+after the conversion, silently: the primary keeps accepting writes and WAL
+accumulates behind a slot nobody is draining. Run
+
+```sql
+ALTER PUBLICATION harvest_dr SET (publish_via_partition_root = true);
+```
+
+on each publication first, which republishes the partitioned table's changes as
+the root's and keeps the standby's flat table a valid target. If your standby
+runs the partitioned layout too, override the refusal with
+`EnableOptions::allow_incompatible_publications` (CLI:
+`--allow-incompatible-publications`).
+
+**Step 3 is re-runnable, including after a failed validation.** Its two
+statements are separate transactions so the validation scan can fail fast
+rather than queue every append behind it — which means the constraint can be
+present and unvalidated. Re-running the step finishes the validation instead of
+failing on the constraint that is already there.
+
 **A lost `CONCURRENTLY` build is expected, and step 2 is re-runnable.** A
 cancelled or failed `CREATE INDEX CONCURRENTLY` leaves the index behind marked
 invalid, and `IF NOT EXISTS` would report success on a re-run without noticing.
