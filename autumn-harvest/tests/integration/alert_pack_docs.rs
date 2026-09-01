@@ -34,6 +34,8 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_replication_lag_high",
     "harvest_shard_fenced",
     "harvest_replication_unobservable",
+    // Issue #953 — audit export to a SIEM sink.
+    "harvest_audit_export_lag_high",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -96,6 +98,9 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_task_capability_miss_total",
     // Issue #954 — cross-region DR.
     "harvest_replication_lag_seconds",
+    // Issue #953 — audit export to a SIEM sink.
+    "harvest_audit_export_lag",
+    "harvest_audit_exported_total",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",

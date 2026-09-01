@@ -153,6 +153,7 @@ pub struct HarvestBuilder {
     /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
     /// optional custom deliverer.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// A repeated `idempotency_key` within this window deduplicates onto the same
     /// execution; after it elapses the key is reusable. `None` uses
@@ -210,6 +211,7 @@ impl Default for HarvestBuilder {
             usage_max_groups: None,
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
+            audit_export_config: crate::audit_export::AuditExportBuilderConfig::default(),
             start_idempotency_window: None,
             #[cfg(feature = "wasm-activities")]
             wasm_bindings: std::collections::HashMap::new(),
@@ -269,6 +271,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field(
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
+            )
+            .field(
+                "audit_export_enabled",
+                &self.audit_export_config.is_enabled(),
             )
             .finish_non_exhaustive()
     }
@@ -343,6 +349,20 @@ pub struct BuiltHarvest {
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
+    /// When set, `into_worker_parts*` does **not** install the process-global
+    /// audit-export config (issue #953, Codex review round 5 P1).
+    ///
+    /// The plugin runner publishes it itself, once its whole build has
+    /// succeeded. Without this, the conversion installs the config partway
+    /// through a still-fallible build, and a scanner belonging to a runtime
+    /// already running in this process can tick inside that window and ship
+    /// audit records to a sink that never came into service — or, for a
+    /// webhook-only build, stop exporting entirely, since the direct-worker
+    /// path writes `None` when it finds no embedder sink. Restoring the value
+    /// afterwards repairs the config but cannot un-send those records, so the
+    /// write is suppressed rather than compensated.
+    defer_audit_export_install: bool,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
@@ -406,6 +426,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field(
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
+            )
+            .field(
+                "audit_export_enabled",
+                &self.audit_export_config.is_enabled(),
             )
             .finish_non_exhaustive()
     }
@@ -836,6 +860,43 @@ pub enum HarvestBuilderError {
         rejection: crate::completion_callback::SsrfRejection,
     },
 
+    /// An `audit_export_webhook(...)` sink URL failed SSRF validation against
+    /// the configured audit-export host allowlist (issue #953).
+    ///
+    /// Fails the build rather than warning: an audit export that silently
+    /// never delivers is a compliance gap that surfaces only at audit time.
+    #[error("audit-export sink URL '{url}' rejected: {rejection}")]
+    AuditSinkRejected {
+        /// The rejected sink URL, **redacted to its origin**
+        /// (`https://host/<redacted>`) by
+        /// [`crate::audit_export::AuditExportBuilderConfig::validate_webhook_url`].
+        ///
+        /// A startup failure's `Display` goes straight to the logs, and a SIEM
+        /// ingest URL carries its credential in the path or query. Every
+        /// `SsrfRejection` variant discriminates on an origin property, so the
+        /// origin is what explains the rejection and the redacted remainder is
+        /// exactly the secret.
+        url: String,
+        /// The machine-readable SSRF rejection reason.
+        rejection: crate::completion_callback::SsrfRejection,
+    },
+
+    /// `audit_export_webhook(...)` was configured without
+    /// `audit_export_secret(...)` (issue #953).
+    ///
+    /// Fails the build rather than warning: HMAC-SHA256 accepts a zero-length
+    /// key and produces a well-formed, trivially reproducible signature, so an
+    /// unconfigured secret does not yield a *missing* `X-Harvest-Signature` —
+    /// it yields one any third party can forge, which is worse than none for a
+    /// receiver that verifies it. The signature is the tamper-evidence control
+    /// this feature exists to provide.
+    #[error(
+        "audit_export_webhook(...) requires audit_export_secret(...): batches would \
+         otherwise be signed with an empty HMAC key, which any third party can \
+         reproduce, defeating the X-Harvest-Signature tamper-evidence guarantee"
+    )]
+    AuditSinkSecretMissing,
+
     /// A native `#[activity]` registration shares its name with a WASM activity
     /// binding (issue #965 review). The native registration would win in the
     /// handler registry while the WASM binding lingered, so the worker's WASM
@@ -1043,6 +1104,34 @@ impl BuiltHarvest {
         &self.completion_callback_config
     }
 
+    /// Resolved builder-wide audit-export configuration (issue #953).
+    #[must_use]
+    pub const fn audit_export_config(&self) -> &crate::audit_export::AuditExportBuilderConfig {
+        &self.audit_export_config
+    }
+
+    /// Suppress the process-global audit-export install that
+    /// [`Self::into_worker_parts`] and [`Self::into_worker_parts_with_extra_state`]
+    /// otherwise perform (issue #953, Codex review round 5 P1).
+    ///
+    /// For a caller that publishes the config itself **after** its whole build
+    /// has succeeded — the plugin runner does exactly this. The conversion
+    /// happens partway through a still-fallible build, and a runtime already
+    /// running in this process has a live scanner that can tick inside that
+    /// window: it would ship audit records to a sink that never came into
+    /// service, or (for a webhook-only build, where the direct-worker path
+    /// installs `None`) stop exporting during it. Repairing the global
+    /// afterwards cannot un-send those records, so the write is suppressed
+    /// rather than compensated.
+    ///
+    /// A caller that sets this **must** install the config itself, or audit
+    /// export silently never starts.
+    #[must_use]
+    pub const fn deferring_audit_export_install(mut self) -> Self {
+        self.defer_audit_export_install = true;
+        self
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -1070,6 +1159,17 @@ impl BuiltHarvest {
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
+        // Same reasoning for audit export (issue #953): a direct core embedder
+        // never routes through the plugin runner, so without this an
+        // `audit_export_sink(...)` registration would silently never deliver.
+        // Only an embedder-supplied sink can be installed here — core ships no
+        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
+        // deliver with on this path and is reported rather than ignored.
+        if !self.defer_audit_export_install {
+            crate::audit_export::install_global_audit_export_config_for_direct_worker(
+                &self.audit_export_config,
+            );
+        }
         // issue #808 review (Codex P2): the start-idempotency expiry sweep
         // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
         // its retention window from a process-global static, mirroring the
@@ -1164,6 +1264,17 @@ impl BuiltHarvest {
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
+        // Same reasoning for audit export (issue #953): a direct core embedder
+        // never routes through the plugin runner, so without this an
+        // `audit_export_sink(...)` registration would silently never deliver.
+        // Only an embedder-supplied sink can be installed here — core ships no
+        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
+        // deliver with on this path and is reported rather than ignored.
+        if !self.defer_audit_export_install {
+            crate::audit_export::install_global_audit_export_config_for_direct_worker(
+                &self.audit_export_config,
+            );
+        }
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
         #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
@@ -1781,6 +1892,112 @@ impl HarvestBuilder {
         self
     }
 
+    // ── Audit export to an external sink (issue #953) ────────────────────
+
+    /// Ship every management-API audit record to an operator-run
+    /// signed-webhook endpoint (issue #953).
+    ///
+    /// Enables the exporter. Batches are `POSTed` as JSON lines, HMAC-signed
+    /// with the same `X-Harvest-Signature` scheme as completion callbacks;
+    /// see `docs/audit-export.md` for the receiver contract and the
+    /// OTLP-logs mapping.
+    ///
+    /// The URL is SSRF-validated at [`try_build`](Self::try_build) time
+    /// against the audit-export allowlist — call
+    /// [`audit_export_allowlist`](Self::audit_export_allowlist) first, or
+    /// `try_build` returns [`HarvestBuilderError::AuditSinkRejected`].
+    ///
+    /// The `reqwest` transport lives in `autumn-harvest-plugin`; a direct
+    /// core embedder must supply
+    /// [`audit_export_sink`](Self::audit_export_sink) instead.
+    #[must_use]
+    pub fn audit_export_webhook(mut self, url: impl Into<String>) -> Self {
+        self.audit_export_config.webhook_url = Some(url.into());
+        self
+    }
+
+    /// Supply a custom [`crate::audit_export::AuditSink`] — a Kinesis writer,
+    /// an OTLP-logs bridge, a file appender — instead of the plugin's default
+    /// signed webhook. Takes precedence over
+    /// [`audit_export_webhook`](Self::audit_export_webhook).
+    #[must_use]
+    pub fn audit_export_sink(mut self, sink: impl crate::audit_export::AuditSink) -> Self {
+        self.audit_export_config.sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Allowlist of hosts an audit-export webhook URL may point at.
+    #[must_use]
+    pub fn audit_export_allowlist(
+        mut self,
+        allowlist: crate::completion_callback::HostAllowlist,
+    ) -> Self {
+        self.audit_export_config.allowlist = allowlist;
+        self
+    }
+
+    /// Permit `http://` audit-export sink URLs (default: HTTPS only).
+    ///
+    /// Audit records name who acted on which tenant; shipping them in
+    /// cleartext is itself a finding, so this is opt-in.
+    #[must_use]
+    pub const fn audit_export_allow_http(mut self, allow: bool) -> Self {
+        self.audit_export_config.allow_http = allow;
+        self
+    }
+
+    /// Permit IP-literal audit-export sink hosts (default: rejected).
+    #[must_use]
+    pub const fn audit_export_allow_ip_literals(mut self, allow: bool) -> Self {
+        self.audit_export_config.allow_ip_literals = allow;
+        self
+    }
+
+    /// HMAC key for the `X-Harvest-Signature` header on exported batches.
+    #[must_use]
+    pub fn audit_export_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.audit_export_config.secret =
+            Some(crate::completion_callback::CallbackSecret::new(secret));
+        self
+    }
+
+    /// Records per exported batch. Clamped to
+    /// `[1, crate::audit_export::MAX_EXPORT_BATCH_SIZE]`; defaults to
+    /// [`crate::audit_export::DEFAULT_EXPORT_BATCH_SIZE`].
+    #[must_use]
+    pub const fn audit_export_batch_size(mut self, size: i64) -> Self {
+        self.audit_export_config.batch_size = size;
+        self
+    }
+
+    /// Capped exponential backoff applied after a sink failure.
+    ///
+    /// There is deliberately no attempt ceiling: an audit record is a
+    /// compliance artifact and is retried until the sink accepts it.
+    #[must_use]
+    pub const fn audit_export_backoff(
+        mut self,
+        backoff: crate::audit_export::ExportBackoff,
+    ) -> Self {
+        self.audit_export_config.backoff = backoff;
+        self
+    }
+
+    /// How long one exporter holds a shard's cursor while a batch is in
+    /// flight — and the timeout applied to the sink call itself. Defaults to
+    /// [`crate::audit_export::DEFAULT_EXPORT_LEASE`] (60s); floored at 1s.
+    ///
+    /// **Set this above your sink's own per-request timeout.** A sink that
+    /// can outlive its lease would have every attempt superseded by the next
+    /// tick's claim, so the cursor would never advance while the sink received
+    /// the same batch forever. The bundled `ReqwestAuditSink` defaults to a
+    /// 30s request timeout against this 60s lease.
+    #[must_use]
+    pub const fn audit_export_lease(mut self, lease: std::time::Duration) -> Self {
+        self.audit_export_config.lease = lease;
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -2165,6 +2382,12 @@ impl HarvestBuilder {
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
+        if let Err((url, rejection)) = self.audit_export_config.validate_webhook_url() {
+            return Err(HarvestBuilderError::AuditSinkRejected { url, rejection });
+        }
+        if self.audit_export_config.webhook_is_missing_a_secret() {
+            return Err(HarvestBuilderError::AuditSinkSecretMissing);
+        }
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -2203,6 +2426,7 @@ impl HarvestBuilder {
             ))
         });
         Ok(BuiltHarvest {
+            defer_audit_export_install: false,
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
@@ -2236,6 +2460,7 @@ impl HarvestBuilder {
             usage_window_ceiling,
             usage_max_groups,
             completion_callback_config: self.completion_callback_config,
+            audit_export_config: self.audit_export_config,
             start_idempotency_window: self
                 .start_idempotency_window
                 .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
@@ -6695,6 +6920,260 @@ mod tests {
                     if url == "https://evil.com/hook"
             ),
             "expected CallbackTargetRejected, got {result:?}"
+        );
+    }
+
+    // ── Audit export (issue #953) ────────────────────────────────────────
+
+    #[test]
+    fn builder_rejects_a_non_allowlisted_audit_export_webhook() {
+        // No allowlist configured -> every domain host is rejected. The build
+        // FAILS rather than warning: an audit export that silently never
+        // delivers is a compliance gap discovered at audit time.
+        let result = HarvestBuilder::new()
+            .audit_export_webhook("https://evil.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        // The URL is carried REDACTED to its origin: a SIEM ingest endpoint's
+        // path can be its credential, and this error's Display goes to the
+        // startup log (issue #953, Codex review round 24 P1). The host still
+        // identifies what was rejected, which is all the rejection is about.
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::AuditSinkRejected { ref url, .. })
+                    if url == "https://evil.com/<redacted>"
+            ),
+            "expected AuditSinkRejected with a redacted origin, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_plain_http_audit_export_webhook_by_default() {
+        let result = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("http://siem.example.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::AuditSinkRejected { .. })),
+            "audit records name who acted on which tenant; cleartext must be \
+             opt-in, got {result:?}"
+        );
+
+        // ...and the documented escape hatch works.
+        let allowed = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_allow_http(true)
+            .audit_export_webhook("http://siem.example.com/audit")
+            .audit_export_secret(b"k".to_vec())
+            .try_build();
+        assert!(allowed.is_ok(), "got {allowed:?}");
+    }
+
+    #[test]
+    fn builder_rejects_an_audit_export_webhook_with_no_hmac_secret() {
+        let result = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/audit")
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::AuditSinkSecretMissing)),
+            "HMAC-SHA256 accepts an empty key and emits a signature anyone can \
+             recompute, so an unconfigured secret is worse than none -- it must \
+             fail the build, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_an_allowlisted_audit_export_webhook() {
+        let built = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("*.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/harvest/audit")
+            .audit_export_secret(b"k".to_vec())
+            .audit_export_batch_size(250)
+            .try_build()
+            .expect("an allowlisted https webhook with a secret must build");
+        let config = built.audit_export_config();
+        assert!(config.is_enabled());
+        assert_eq!(config.effective_batch_size(), 250);
+    }
+
+    #[test]
+    fn builder_with_no_audit_export_config_is_inert() {
+        // AC8: an embedder who never touches the audit-export API gets a
+        // config that installs nothing at all.
+        let built = HarvestBuilder::new().build();
+        let config = built.audit_export_config();
+        assert!(!config.is_enabled());
+        assert!(config.sink.is_none());
+        assert!(config.webhook_url.is_none());
+        assert!(config.secret.is_none());
+    }
+
+    /// A custom sink takes precedence over a webhook, so the webhook is dead
+    /// config that no request can ever reach. Validating it anyway blocked
+    /// startup on a URL nothing would call (issue #953, Codex review P2).
+    #[test]
+    fn a_custom_sink_makes_the_webhook_checks_moot() {
+        struct Noop;
+        impl crate::audit_export::AuditSink for Noop {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a crate::audit_export::AuditBatch<'a>,
+            ) -> crate::audit_export::SinkFuture<'a> {
+                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
+            }
+        }
+
+        // A URL that fails the SSRF policy outright, and no secret: both
+        // webhook checks would reject this build on their own.
+        let built = HarvestBuilder::new()
+            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
+            .audit_export_sink(Noop)
+            .try_build()
+            .expect(
+                "a custom sink wins, so neither webhook check may block the \
+                 build on a URL that can never be called",
+            );
+        let config = built.audit_export_config();
+        assert!(config.sink.is_some());
+        assert!(config.validate_webhook_url().is_ok());
+        assert!(!config.webhook_is_missing_a_secret());
+    }
+
+    /// A rejected sink URL must not carry its credential into the error, which
+    /// a startup failure writes straight to the logs (issue #953, Codex review
+    /// round 24 P1).
+    #[test]
+    fn a_rejected_sink_url_is_redacted_in_the_build_error() {
+        let err = HarvestBuilder::new()
+            .audit_export_webhook(
+                "https://http-inputs.attacker.example.com/services/collector/\
+                 B5A79AAD-D822-46CC-80D1-819F80D7BFB0?index=audit",
+            )
+            .audit_export_secret(b"k".to_vec())
+            .try_build()
+            .expect_err("a non-allowlisted host must be rejected");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("B5A79AAD"),
+            "the collector token must not reach the startup log: {rendered}"
+        );
+        assert!(
+            !rendered.contains("index=audit"),
+            "nor the query string: {rendered}"
+        );
+        assert!(
+            rendered.contains("http-inputs.attacker.example.com"),
+            "the host must survive -- it is what the rejection is ABOUT, and \
+             an operator cannot act without it: {rendered}"
+        );
+    }
+
+    /// The same URL without a sink must still be rejected — the guard above is
+    /// precedence, not a way to disable SSRF validation.
+    #[test]
+    fn the_webhook_checks_still_bite_without_a_sink() {
+        let err = HarvestBuilder::new()
+            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
+            .audit_export_secret(b"k".to_vec())
+            .try_build()
+            .expect_err("a link-local webhook with no sink must be rejected");
+        assert!(
+            matches!(err, HarvestBuilderError::AuditSinkRejected { .. }),
+            "expected AuditSinkRejected, got {err:?}"
+        );
+
+        let err = HarvestBuilder::new()
+            .audit_export_allowlist(
+                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
+            )
+            .audit_export_webhook("https://siem.example.com/ingest")
+            .try_build()
+            .expect_err("a webhook with no secret and no sink must be rejected");
+        assert!(
+            matches!(err, HarvestBuilderError::AuditSinkSecretMissing),
+            "expected AuditSinkSecretMissing, got {err:?}"
+        );
+    }
+
+    /// The plugin runner publishes the global itself after its build succeeds,
+    /// so the conversion must not write it at all — not write it and have it
+    /// repaired later (issue #953, Codex review round 5 P1). A live runtime's
+    /// scanner ticking mid-build would otherwise export records to a sink that
+    /// never came into service, and no restore un-sends those.
+    ///
+    /// Asserts an **absence**, deliberately. `GLOBAL_AUDIT_EXPORT_CONFIG` is a
+    /// process-wide static and 33 other tests in this binary call
+    /// `into_worker_parts*`, each of which writes it; a test that asserted some
+    /// particular config was still installed afterwards would race them and
+    /// fail intermittently — which is exactly how the first version of this
+    /// test failed on CI while passing locally. "The global does not hold *this
+    /// builder's* uniquely identifiable config" cannot be made false by another
+    /// test installing something else, so it is stable under any interleaving.
+    ///
+    /// The complement — that a direct core embedder, having no later publish
+    /// step, still gets their sink installed — is deliberately NOT asserted
+    /// here. It is inherently a *presence* claim about that same global, and a
+    /// serial mutex does not help because the 33 contending tests do not take
+    /// it; an attempt at it failed under
+    /// `--no-default-features --features db --lib` while passing under
+    /// `--all-features --lib`, purely on interleaving. A dedicated test binary
+    /// would isolate it, but no CI command actually *runs* the crate's
+    /// standalone test binaries with `db` enabled, so that would be coverage in
+    /// name only. The behaviour is exercised through the runner's
+    /// `DeferredAuditExportInstall` tests and the production path instead.
+    #[cfg(feature = "db")]
+    #[test]
+    fn deferring_the_install_leaves_the_global_untouched_through_conversion() {
+        struct Marker;
+        impl crate::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a crate::audit_export::AuditBatch<'a>,
+            ) -> crate::audit_export::SinkFuture<'a> {
+                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
+            }
+        }
+
+        // A batch size no other test uses, so its presence in the global could
+        // only have come from this conversion.
+        const FINGERPRINT: i64 = 4_242;
+
+        let built = HarvestBuilder::new()
+            .audit_export_sink(Marker)
+            .audit_export_secret(b"deferred".to_vec())
+            .audit_export_batch_size(FINGERPRINT)
+            .build()
+            .deferring_audit_export_install();
+        assert!(
+            built.defer_audit_export_install,
+            "the opt-out must set the flag the conversion reads"
+        );
+
+        let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
+
+        let installed_batch_size = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+            .read()
+            .expect("lock")
+            .as_ref()
+            .map(|config| config.batch_size);
+        assert_ne!(
+            installed_batch_size,
+            Some(FINGERPRINT),
+            "the conversion must not publish this runtime's sink: a live \
+             scanner ticking here would export to a runtime that may never \
+             start, and the runner publishes it itself once startup succeeds"
         );
     }
 

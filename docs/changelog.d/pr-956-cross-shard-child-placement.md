@@ -89,7 +89,7 @@ propagated a pool error with `?`, so one unreachable shard `500`d the whole call
 It now degrades through `shard_fanout::collect_fanout_rows` and reports `status` +
 `unavailable_shards` additively, matching `/tree` and the rest of #756's contract.
 
-Migration `20260728000000_harvest_cross_shard_children` adds one table, empty in
+Migration `20260901130054_harvest_cross_shard_children` adds one table, empty in
 every deployment that never opts in. Documented in the new *Cross-shard child
 placement* section of `docs/sharding.md` (including the deliberate residency
 carve-out and the operator queries over the in-flight gauge).

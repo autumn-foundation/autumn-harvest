@@ -1541,34 +1541,56 @@ fn build_suspension_events<F>(
 where
     F: FnMut(&WorkflowCommand) -> Option<WorkflowEvent>,
 {
+    build_suspension_events_multi(commands, timer_events, |cmd| {
+        branch_event(cmd).into_iter().collect()
+    })
+}
+
+/// [`build_suspension_events`] for callers whose branch mapping can produce
+/// **more than one** event at a single command's position — the terminal
+/// abandoned-dispatch records of issue #952, which pair a
+/// `ChildWorkflowStarted`/`ActivityScheduled` with its synthetic terminal.
+///
+/// Ordering is the whole point of routing both callers through one walker: the
+/// replay matcher is strictly positional, so each command's events must land at
+/// that command's emission position, interleaved with the markers, side effects,
+/// detached spawns and timer-lifecycle events around them.
+fn build_suspension_events_multi<F>(
+    commands: &[WorkflowCommand],
+    timer_events: &mut [Option<WorkflowEvent>],
+    mut branch_events: F,
+) -> Vec<WorkflowEvent>
+where
+    F: FnMut(&WorkflowCommand) -> Vec<WorkflowEvent>,
+{
     commands
         .iter()
         .enumerate()
-        .filter_map(|(i, cmd)| match cmd {
+        .flat_map(|(i, cmd)| match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
-                Some(WorkflowEvent::MarkerRecorded {
+                vec![WorkflowEvent::MarkerRecorded {
                     name: name.clone(),
                     details: details.clone(),
-                })
+                }]
             }
             WorkflowCommand::RecordSideEffect { kind, name, value } => {
-                Some(WorkflowEvent::SideEffectRecorded {
+                vec![WorkflowEvent::SideEffectRecorded {
                     kind: *kind,
                     name: name.clone(),
                     value: value.clone(),
-                })
+                }]
             }
             WorkflowCommand::SpawnDetachedChildWorkflow {
                 child_id,
                 workflow_name,
                 input,
                 parent_close_policy,
-            } => Some(WorkflowEvent::ChildWorkflowSpawnedDetached {
+            } => vec![WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id: *child_id,
                 workflow_name: workflow_name.clone(),
                 input: input.clone(),
                 parent_close_policy: *parent_close_policy,
-            }),
+            }],
             // Cancellable/renewable timer bookkeeping (issue #768): the
             // `TimerStarted` / `TimerCancelled` event resolved by the DB-mutation
             // phase (`plan_timer_lifecycle`) is interleaved here at the
@@ -1577,12 +1599,545 @@ where
             // positional `match_timer_arm` sees the same order the live cycle
             // emitted. (Pre-FINDING-1 these were appended at the END of the
             // batch, nd-blocking a `start_timer` + `side_effect` same-cycle run.)
-            WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. } => {
-                timer_events.get_mut(i).and_then(Option::take)
-            }
-            other => branch_event(other),
+            WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. } => timer_events
+                .get_mut(i)
+                .and_then(Option::take)
+                .into_iter()
+                .collect(),
+            other => branch_events(other),
         })
         .collect()
+}
+
+/// What [`persist_terminal_outcome_commands`] does with one command drained in a
+/// **terminal** decision cycle (issue #952).
+///
+/// The terminal persist path used to work off a hand-maintained allowlist: three
+/// command kinds became events, seven were persisted through side paths, and
+/// every other kind — including `StartChildWorkflow` and `ScheduleActivity` —
+/// fell through a `filter_map` and vanished with no event, no row and no log
+/// line. This enum replaces that silence with an **exhaustive** classification:
+/// adding a `WorkflowCommand` variant is a compile error here until someone
+/// states what a terminal cycle does with it.
+///
+/// | Policy | Meaning |
+/// | --- | --- |
+/// | [`PreTerminalEvent`](Self::PreTerminalEvent) | appended to `harvest_events` by the pre-terminal batch builder |
+/// | [`SidePath`](Self::SidePath) | persisted outside `harvest_events` (a column, a table, a row mutation, a notify) |
+/// | [`AbandonedDispatch`](Self::AbandonedDispatch) | dispatched work the failing cycle abandoned — recorded as its `*Started`/`*Scheduled` event plus a synthetic terminal |
+/// | [`NoRecord`](Self::NoRecord) | deliberately records nothing, for the stated reason |
+/// | [`Unreachable`](Self::Unreachable) | cannot appear in a drained terminal batch |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalCommandPolicy {
+    /// Turned into a `harvest_events` row by
+    /// [`terminal_pre_outcome_events_from_commands`], at the command's own
+    /// emission position.
+    PreTerminalEvent,
+    /// Durably persisted somewhere other than `harvest_events`; the `&str` names
+    /// the function that owns it.
+    SidePath(&'static str),
+    /// Awaited work the cycle dispatched and then abandoned by failing before it
+    /// could suspend (issue #952). Recorded by
+    /// [`abandoned_dispatch_events`] as the `*Started`/`*Scheduled` event the
+    /// suspension path would have written, immediately followed by a synthetic
+    /// terminal carrying [`crate::event::ABANDONED_DISPATCH_REASON`].
+    AbandonedDispatch,
+    /// Nothing is recorded, for the stated reason. Every entry here records
+    /// nothing on the **suspension** path either, or has no durable footprint to
+    /// reconstruct — never "we forgot".
+    NoRecord(&'static str),
+    /// Cannot appear in a drained terminal batch, for the stated reason.
+    Unreachable(&'static str),
+}
+
+/// Dense index of `cmd`'s variant, used only to prove the terminal-policy audit
+/// table covers **every** `WorkflowCommand` (issue #952, AC4).
+///
+/// Exhaustive and dense by construction: adding a variant is a compile error
+/// here, and `every_workflow_command_variant_is_classified` asserts the table's
+/// indices are exactly `0..WORKFLOW_COMMAND_VARIANTS`. Without this the audit
+/// test could only compare the table against a hand-written literal, which a new
+/// variant would not move — the table would silently stop covering it.
+#[cfg(test)]
+const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
+    match cmd {
+        WorkflowCommand::ScheduleActivity { .. } => 0,
+        WorkflowCommand::WaitForActivity { .. } => 1,
+        WorkflowCommand::StartTimer { .. } => 2,
+        WorkflowCommand::StartChildWorkflow { .. } => 3,
+        WorkflowCommand::RecordMarker { .. } => 4,
+        WorkflowCommand::RecordSideEffect { .. } => 5,
+        WorkflowCommand::ScheduleExternalActivity { .. } => 6,
+        WorkflowCommand::WaitForSignal { .. } => 7,
+        WorkflowCommand::Complete { .. } => 8,
+        WorkflowCommand::Fail { .. } => 9,
+        WorkflowCommand::ContinueAsNew { .. } => 10,
+        WorkflowCommand::RunLocalActivity { .. } => 11,
+        WorkflowCommand::RecordUpdateResult { .. } => 12,
+        WorkflowCommand::UpsertSearchAttributes { .. } => 13,
+        WorkflowCommand::SetCurrentDetails { .. } => 14,
+        WorkflowCommand::PublishProgress { .. } => 15,
+        WorkflowCommand::RecordLog { .. } => 16,
+        WorkflowCommand::SpawnDetachedChildWorkflow { .. } => 17,
+        WorkflowCommand::SignalExternalWorkflow { .. } => 18,
+        WorkflowCommand::RequestCancelExternalWorkflow { .. } => 19,
+        WorkflowCommand::AwaitExternalWorkflow { .. } => 20,
+        WorkflowCommand::CancelRaceLosers { .. } => 21,
+        WorkflowCommand::ArmTimer { .. } => 22,
+        WorkflowCommand::CancelTimer { .. } => 23,
+        WorkflowCommand::AcquireMutex { .. } => 24,
+        WorkflowCommand::ReleaseMutex { .. } => 25,
+    }
+}
+
+/// Number of `WorkflowCommand` variants, as indexed by
+/// [`workflow_command_variant_index`].
+#[cfg(test)]
+const WORKFLOW_COMMAND_VARIANTS: usize = 26;
+
+impl TerminalCommandPolicy {
+    /// Discriminant label, so the AC4 audit table can state each variant's
+    /// EXPECTED policy without duplicating the (long, prose) reason strings —
+    /// and therefore without deriving the expectation from the function under
+    /// test, which would make the row tautological.
+    #[cfg(test)]
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::PreTerminalEvent => "pre-terminal-event",
+            Self::SidePath(_) => "side-path",
+            Self::AbandonedDispatch => "abandoned-dispatch",
+            Self::NoRecord(_) => "no-record",
+            Self::Unreachable(_) => "unreachable",
+        }
+    }
+}
+
+/// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
+///
+/// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
+/// as a compile-time invariant rather than a comment that can rot.
+pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+    match cmd {
+        // ── Recorded as pre-terminal events, in command-emission order ──────
+        WorkflowCommand::RecordMarker { .. }
+        | WorkflowCommand::RecordSideEffect { .. }
+        | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+        | WorkflowCommand::ArmTimer { .. }
+        | WorkflowCommand::CancelTimer { .. } => TerminalCommandPolicy::PreTerminalEvent,
+
+        // ── Dispatched work abandoned by the failing cycle (issue #952) ─────
+        // Both would have become work other subsystems can see — a child
+        // execution row, a task-queue row — had the cycle suspended instead of
+        // failing. Recording them is what keeps the audit trail honest about
+        // what the code did.
+        WorkflowCommand::StartChildWorkflow { .. } | WorkflowCommand::ScheduleActivity { .. } => {
+            TerminalCommandPolicy::AbandonedDispatch
+        }
+
+        // ── Persisted outside `harvest_events` ──────────────────────────────
+        WorkflowCommand::RecordUpdateResult { .. } => {
+            TerminalCommandPolicy::SidePath("persist_update_result_commands")
+        }
+        WorkflowCommand::UpsertSearchAttributes { .. } => {
+            TerminalCommandPolicy::SidePath("persist_search_attrs_from_commands")
+        }
+        WorkflowCommand::SetCurrentDetails { .. } => {
+            TerminalCommandPolicy::SidePath("persist_current_details_from_commands")
+        }
+        WorkflowCommand::RecordLog { .. } => {
+            TerminalCommandPolicy::SidePath("persist_workflow_logs_from_commands")
+        }
+        WorkflowCommand::PublishProgress { .. } => {
+            TerminalCommandPolicy::SidePath("notify_progress_from_commands")
+        }
+        WorkflowCommand::CancelRaceLosers { .. } => {
+            TerminalCommandPolicy::SidePath("apply_race_loser_cancellations")
+        }
+        WorkflowCommand::ReleaseMutex { .. } => {
+            // Event-less by design (#691). The terminal seal runs
+            // `mutex::sweep_terminal_holder_and_wake`, which releases EVERY lock
+            // this execution holds and wakes each freed key's new head-of-line —
+            // a superset of this command, and the only correct behaviour for a
+            // run that is about to become terminal.
+            TerminalCommandPolicy::SidePath("mutex::sweep_terminal_holder_and_wake")
+        }
+
+        // ── Deliberately unrecorded ─────────────────────────────────────────
+        WorkflowCommand::WaitForActivity { .. } => TerminalCommandPolicy::NoRecord(
+            "a re-park of an activity already recorded (and already running): its \
+             ActivityScheduled is in history and its terminal will be appended by the \
+             activity's own completion path. The suspension path emits no event for it either",
+        ),
+        WorkflowCommand::WaitForSignal { .. } => TerminalCommandPolicy::NoRecord(
+            "a signal wait creates no durable footprint and emits no event on any path — \
+             the SignalReceived that resolves it is written by the sender",
+        ),
+        WorkflowCommand::StartTimer { .. } => TerminalCommandPolicy::NoRecord(
+            "no positional replay needs it. `ArmTimer` (#768) records a TimerStarted here \
+             because a cancellable timer's later cancel/reset must match POSITIONALLY against \
+             it; a StartTimer suspension emits its TimerStarted only when it durably parks, \
+             and this cycle never did — no harvest_timers row exists, and the sealed run \
+             will never re-derive the wait",
+        ),
+        WorkflowCommand::RunLocalActivity { .. } => TerminalCommandPolicy::NoRecord(
+            "a local activity runs INLINE in the worker's dispatch loop, which appends its \
+             own LocalActivityScheduled/Completed/Failed/Exhausted events as it runs. One \
+             still pending at terminal never entered that loop, so no attempt exists to record",
+        ),
+        WorkflowCommand::ScheduleExternalActivity { .. } => TerminalCommandPolicy::NoRecord(
+            "the external-completion handshake (token issue + ActivityAwaitingExternal) is \
+             what makes the dispatch real; the failing cycle performed none of it, and the \
+             command is re-emitted on every re-park, so recording it here could also \
+             duplicate an already-recorded dispatch",
+        ),
+        WorkflowCommand::SignalExternalWorkflow { .. }
+        | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+        | WorkflowCommand::AwaitExternalWorkflow { .. } => TerminalCommandPolicy::NoRecord(
+            "an outbound external op is requested and attempted in one transaction; the \
+             failing cycle ran neither, so no signal/cancel/await left this execution. \
+             Recording a *Requested event would claim an outbound side effect that never \
+             happened, and its *Failed twin would need a reason_code outside the \
+             documented vocabulary (issue #952 adds none)",
+        ),
+        WorkflowCommand::AcquireMutex { .. } => TerminalCommandPolicy::NoRecord(
+            "an acquire records MutexGranted only when a grant is durable; an abandoned \
+             acquire granted nothing and enqueued nothing",
+        ),
+
+        // ── Never present in a drained terminal batch ───────────────────────
+        WorkflowCommand::Complete { .. } | WorkflowCommand::Fail { .. } => {
+            TerminalCommandPolicy::Unreachable(
+                "the context never pushes these: a workflow's return value reaches the \
+                 worker as the executor's WorkflowOutcome, not as a command",
+            )
+        }
+        WorkflowCommand::ContinueAsNew { .. } => TerminalCommandPolicy::Unreachable(
+            "consumed by the executor into WorkflowOutcome::ContinuedAsNew; the terminal \
+             persist path receives the outcome, and continue-as-new is not a failing cycle",
+        ),
+    }
+}
+
+/// The child dispatches in a failing batch that must NOT be recorded because
+/// they are re-parks of children that genuinely started in an earlier cycle
+/// (issue #952).
+///
+/// Three sites re-emit `StartChildWorkflow` carrying an **existing** `child_id`
+/// so the worker can re-park without creating a duplicate child:
+/// `spawn_child_workflow_raw`'s `HistoryMatch::ChildInProgress` arm, the
+/// child-with-deadline race (#779), and `ctx.race()`'s child dispatcher (#600). Recording that as an abandoned
+/// dispatch would append a second `ChildWorkflowStarted` and synthesise a
+/// failure for a child that is still running. The suspension path answers the
+/// same question the same way — by the presence of the child's execution row —
+/// so this mirrors [`persist_all_started_child_workflows`]'s `existing_child_ids`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AbandonedDispatchPlan {
+    /// Child ids that already have an execution row: skip them.
+    started_child_ids: HashSet<uuid::Uuid>,
+    /// Dispatch ids this execution's history ALREADY records (issue #952,
+    /// review round 1). The row check above answers "did a child row get
+    /// created"; this answers the question the matcher actually asked — "is this
+    /// dispatch already in history" — so the two disagreeing (a retention sweep
+    /// or a partial restore removed the row while the `ChildWorkflowStarted`
+    /// remains) can never produce a duplicate start plus a synthetic failure for
+    /// a child that is genuinely running. It is also what makes
+    /// `ScheduleActivity` safe mechanically rather than by the
+    /// "fresh by construction" argument alone.
+    recorded: RecordedDispatchIds,
+    /// `false` for a non-failing terminal outcome, which keeps its pre-#952
+    /// behaviour exactly (see [`AbandonedDispatchPlan::disabled`]).
+    enabled: bool,
+}
+
+/// The dispatches an execution's recorded history already carries (issue #952).
+///
+/// Pure and cheap: one pass over the loaded history the worker already holds.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RecordedDispatchIds {
+    child_ids: HashSet<ExecutionId>,
+    activity_ids: HashSet<ActivityExecId>,
+}
+
+impl RecordedDispatchIds {
+    /// Collect the ids of every dispatch already recorded in `history`.
+    pub(crate) fn from_history(history: &[WorkflowEvent]) -> Self {
+        let mut ids = Self::default();
+        for event in history {
+            match event {
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                    ids.child_ids.insert(*child_id);
+                }
+                WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+                    ids.activity_ids.insert(*activity_id);
+                }
+                _ => {}
+            }
+        }
+        ids
+    }
+}
+
+impl AbandonedDispatchPlan {
+    /// A plan that records nothing — used for `Completed` / `ContinuedAsNew`.
+    ///
+    /// Issue #952 is scoped to *failing* cycles, and deliberately so: a
+    /// completed history is verified in full by strict replay, so injecting a
+    /// synthetic terminal into it would resolve a branch that the live cycle
+    /// left parked and could flip a `select!` on the next replay of a healthy
+    /// run. A failing history carries a transparent terminal-failure tail, which
+    /// is exactly what makes the same records safe there.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            started_child_ids: HashSet::new(),
+            recorded: RecordedDispatchIds::default(),
+            enabled: false,
+        }
+    }
+
+    /// Resolve the dedup set for a failing cycle's batch.
+    #[cfg(feature = "db")]
+    async fn resolve(
+        conn: &mut AsyncPgConnection,
+        commands: &[WorkflowCommand],
+        recorded: RecordedDispatchIds,
+    ) -> HarvestResult<Self> {
+        let child_ids: Vec<uuid::Uuid> = commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(child_id.as_uuid()),
+                _ => None,
+            })
+            .collect();
+        let started_child_ids = if child_ids.is_empty() {
+            HashSet::new()
+        } else {
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq_any(&child_ids))
+                .select(harvest_workflow_executions::id)
+                .load::<uuid::Uuid>(conn)
+                .await
+                .map_err(crate::error::database_error)?
+                .into_iter()
+                .collect()
+        };
+        Ok(Self {
+            started_child_ids,
+            recorded,
+            enabled: true,
+        })
+    }
+
+    /// Test constructor: a failing cycle whose listed child ids already exist.
+    #[cfg(test)]
+    fn with_started_children(started: impl IntoIterator<Item = uuid::Uuid>) -> Self {
+        Self {
+            started_child_ids: started.into_iter().collect(),
+            recorded: RecordedDispatchIds::default(),
+            enabled: true,
+        }
+    }
+
+    /// Test constructor: a failing cycle whose history already records the
+    /// given dispatches.
+    #[cfg(test)]
+    fn with_recorded_history(history: &[WorkflowEvent]) -> Self {
+        Self {
+            started_child_ids: HashSet::new(),
+            recorded: RecordedDispatchIds::from_history(history),
+            enabled: true,
+        }
+    }
+}
+
+/// Whether this terminal outcome records the dispatches it abandoned (issue
+/// #952).
+///
+/// **Failing cycles only.** A completed (or continue-as-new) cycle keeps its
+/// pre-#952 behaviour byte for byte: its history is verified in full by strict
+/// replay, so a synthetic terminal there would resolve a branch the live cycle
+/// left parked and could flip a `select!` on the next replay of a healthy run. A
+/// failing cycle's history instead carries a transparent terminal-failure tail,
+/// which is what makes the same records safe.
+const fn records_abandoned_dispatches(outcome: &WorkflowOutcome) -> bool {
+    matches!(outcome, WorkflowOutcome::Failed { .. })
+}
+
+/// The events recording one dispatch a failing cycle abandoned (issue #952), or
+/// an empty vec when this command is not an abandoned dispatch.
+///
+/// The pair is `*Started`/`*Scheduled` — what the code actually asked for, so a
+/// post-mortem sees the children and activities the failing cycle dispatched —
+/// immediately followed by the matching terminal, so replay RESOLVES the branch
+/// instead of parking forever on work that can never arrive. Both are existing
+/// `WorkflowEvent` variants (issue #952 adds none) and both are written with the
+/// same untyped/`non_retryable` shape
+/// [`apply_race_loser_cancellations`] already uses for its synthetic terminals.
+///
+/// No metric is emitted: nothing was enqueued and nothing ran, so counting an
+/// activity or child failure here would inflate failure rates with work that
+/// never existed.
+fn abandoned_dispatch_events(
+    cmd: &WorkflowCommand,
+    plan: &AbandonedDispatchPlan,
+) -> Vec<WorkflowEvent> {
+    if !plan.enabled || terminal_command_policy(cmd) != TerminalCommandPolicy::AbandonedDispatch {
+        return Vec::new();
+    }
+    match cmd {
+        WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            ..
+        } => {
+            if plan.started_child_ids.contains(&child_id.as_uuid())
+                || plan.recorded.child_ids.contains(child_id)
+            {
+                // A re-park of a child that genuinely started earlier — its row
+                // exists, or its `ChildWorkflowStarted` is already in history.
+                return Vec::new();
+            }
+            vec![
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: *child_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                },
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: *child_id,
+                    error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                    error_type: None,
+                    details: None,
+                    non_retryable: Some(true),
+                },
+            ]
+        }
+        WorkflowCommand::ScheduleActivity {
+            activity_id,
+            name,
+            input,
+            queue,
+            ..
+        } => {
+            // Fresh by construction — `ScheduleActivity` is pushed only from
+            // `execute_activity`'s `HistoryMatch::NoMatch` arm and from the
+            // `ctx.race()` dispatcher's `is_new` branch; an activity already
+            // scheduled in an earlier cycle re-parks with `WaitForActivity`
+            // (classified `NoRecord` above). The history check below makes that
+            // mechanical rather than an argument: a future emitter that re-emits
+            // a recorded dispatch cannot double-write its `ActivityScheduled`.
+            if plan.recorded.activity_ids.contains(activity_id) {
+                return Vec::new();
+            }
+            vec![
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: *activity_id,
+                    name: name.clone(),
+                    input: input.clone(),
+                    queue: queue.clone(),
+                },
+                WorkflowEvent::ActivityFailed {
+                    activity_id: *activity_id,
+                    error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                    attempt: 1,
+                    error_type: "Error".to_string(),
+                    non_retryable: true,
+                    details: None,
+                },
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Pre-terminal events for a terminal cycle: the bookkeeping events
+/// [`pre_suspension_events_from_commands`] collects, plus (for a **failing**
+/// cycle) the abandoned-dispatch records of issue #952 — every event at its own
+/// command's emission position.
+fn terminal_pre_outcome_events_from_commands(
+    commands: &[WorkflowCommand],
+    timer_events: &mut [Option<WorkflowEvent>],
+    plan: &AbandonedDispatchPlan,
+) -> Vec<WorkflowEvent> {
+    if !plan.enabled {
+        // A completed / continue-as-new cycle keeps its pre-#952 behaviour and
+        // drops any dispatch left in the batch — but never SILENTLY, which is the
+        // failure mode issue #952 exists to end. One line per cycle, naming what
+        // was dropped, so an operator can see it in the logs even though the
+        // event log deliberately stays unchanged for this outcome.
+        let dropped = abandoned_dispatch_event_count(commands) / 2;
+        if dropped > 0 {
+            tracing::warn!(
+                dropped_dispatches = dropped,
+                "terminal cycle completed with dispatched work still pending; the dispatches \
+                 are not recorded (issue #952 records them only for FAILING cycles, where the \
+                 history's terminal-failure tail makes the synthetic terminals safe)"
+            );
+        }
+    }
+    build_suspension_events_multi(commands, timer_events, |cmd| {
+        abandoned_dispatch_events(cmd, plan)
+    })
+}
+
+/// Upper bound on the events [`abandoned_dispatch_events`] appends, counted
+/// **before** the dedup: every dispatch command scores `+2`.
+///
+/// Used for the `!enabled` warn line (where nothing is deduped because nothing
+/// is recorded at all) and as the pre-dedup half of
+/// [`abandoned_dispatch_event_count_resolved`], which is what the history
+/// hard-cap preflight uses.
+fn abandoned_dispatch_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| terminal_command_policy(cmd) == TerminalCommandPolicy::AbandonedDispatch)
+            .count()
+            .saturating_mul(2),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Exactly the events a FAILING cycle's [`abandoned_dispatch_events`] will
+/// append, for the history hard-cap preflight (Codex P2 round 3).
+///
+/// Resolves the same dedup persistence will — a child already backed by an
+/// execution row, or a dispatch this execution's history already records, is
+/// skipped — because over-counting here is NOT the safe direction it is for
+/// `timer_lifecycle_event_count`. Breaching the cap dead-letters the execution
+/// and replaces its real failure with a history-cap error, so a workflow
+/// re-parking many already-started children could be terminally mis-routed on
+/// events that were never going to be appended.
+///
+/// Persistence re-resolves under the execution row lock, so its own dedup set
+/// can only ever be a superset of this one (a concurrent attempt starting a
+/// child in between): the count stays an upper bound, but of what will actually
+/// be written rather than of the whole batch.
+#[cfg(feature = "db")]
+async fn abandoned_dispatch_event_count_resolved(
+    conn: &mut AsyncPgConnection,
+    commands: &[WorkflowCommand],
+    recorded: RecordedDispatchIds,
+) -> HarvestResult<u64> {
+    if abandoned_dispatch_event_count(commands) == 0 {
+        return Ok(0);
+    }
+    let plan = AbandonedDispatchPlan::resolve(conn, commands, recorded).await?;
+    Ok(abandoned_dispatch_event_count_for_plan(commands, &plan))
+}
+
+/// The counting half of [`abandoned_dispatch_event_count_resolved`], split out
+/// so the "the preflight counts exactly what persistence appends" invariant is
+/// testable without a database.
+fn abandoned_dispatch_event_count_for_plan(
+    commands: &[WorkflowCommand],
+    plan: &AbandonedDispatchPlan,
+) -> u64 {
+    let total: usize = commands
+        .iter()
+        .map(|cmd| abandoned_dispatch_events(cmd, plan).len())
+        .sum();
+    u64::try_from(total).unwrap_or(u64::MAX)
 }
 
 /// Collects `MarkerRecorded`, `SideEffectRecorded`, `ChildWorkflowSpawnedDetached`,
@@ -16394,6 +16949,7 @@ async fn run_deferred_schedule_counter(
 /// `FOR UPDATE` pause guard — in a single transaction (issue #383). Schedule
 /// counters are deferred to the caller via [`run_deferred_schedule_counter`]
 /// and run only after that outer transaction commits.
+#[allow(clippy::too_many_arguments)]
 async fn persist_terminal_outcome_commands(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -16401,13 +16957,26 @@ async fn persist_terminal_outcome_commands(
     persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
     pending_cmds: &[WorkflowCommand],
+    // Dispatches this execution's history already records (issue #952), so an
+    // abandoned-dispatch record can never duplicate one.
+    recorded_dispatches: &RecordedDispatchIds,
     execute_span: &tracing::Span,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
 )> {
-    let mut next_event_id = persistence.next_event_id;
+    // Re-read the true next event id under the execution row lock this
+    // transaction already holds. `persistence.next_event_id` was snapshotted at
+    // task preparation, BEFORE the handler ran: a child terminal
+    // (`notify_awaited_parent_of_child_terminal`) or a materialized child-timeout
+    // deadline that committed onto this execution's history in between would
+    // leave it stale, and the whole terminal batch would then collide on
+    // `UNIQUE(workflow_exec_id, event_id)` and roll back — taking this cycle's
+    // race-loser cancellations (pushed exactly once, never re-emitted) with it.
+    // Same defence, same reason as `apply_race_loser_cancellations`'s own
+    // re-read; issue #952 only made the batch bigger.
+    let mut next_event_id = store::next_event_id_for(conn, persistence.exec_id).await?;
     persist_update_result_commands(
         conn,
         persistence.exec_id,
@@ -16442,18 +17011,40 @@ async fn persist_terminal_outcome_commands(
     // (FINDING 1).
     let (mut timer_events, _armed) =
         plan_timer_lifecycle(conn, persistence.exec_id, pending_cmds).await?;
-    let pre_terminal = pre_suspension_events_from_commands(pending_cmds, &mut timer_events);
+    // Issue #952: a FAILING cycle also records the awaited work it dispatched
+    // and then abandoned by returning `Err` before it could suspend — otherwise
+    // the persisted history silently drops `StartChildWorkflow` /
+    // `ScheduleActivity` and lies about what the code did. Scoped to `Failed`:
+    // see `AbandonedDispatchPlan::disabled` for why a completed cycle keeps its
+    // pre-#952 behaviour exactly.
+    let abandoned_dispatches = if records_abandoned_dispatches(&outcome) {
+        AbandonedDispatchPlan::resolve(conn, pending_cmds, recorded_dispatches.clone()).await?
+    } else {
+        AbandonedDispatchPlan::disabled()
+    };
+    let pre_terminal = terminal_pre_outcome_events_from_commands(
+        pending_cmds,
+        &mut timer_events,
+        &abandoned_dispatches,
+    );
     if !pre_terminal.is_empty() {
-        store::append_events_with_codecs(
+        // Offloaded and codec-encoded like the suspension path (issues #524,
+        // #948): with no offloader configured this is byte-identical to the
+        // plain codec append. It matters once one IS configured, because an
+        // abandoned `ScheduleActivity` (issue #952) carries the activity input
+        // verbatim, and an above-cap input is admitted precisely BECAUSE the
+        // dispatch path expects the event append to offload it.
+        let inserted = store::append_events_offloaded_with_codecs(
             conn,
             persistence.exec_id,
             &pre_terminal,
             next_event_id,
+            registry.payload_offloader(),
             registry.payload_codecs(),
         )
         .await?;
         next_event_id = next_event_id
-            .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
+            .checked_add(i32::try_from(inserted).unwrap_or(i32::MAX))
             .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
     }
 
@@ -16521,10 +17112,24 @@ fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowCommand]) -> u64 {
+fn terminal_history_event_count(
+    next_event_id: i32,
+    pending_cmds: &[WorkflowCommand],
+    // Issue #952: `true` for a FAILING terminal, whose batch also appends the
+    // abandoned-dispatch records. The hard-cap preflight counts them, and this
+    // `harvest.workflow.history_size` gauge is meant to describe the same
+    // number, so it counts them too.
+    records_abandoned_dispatches: bool,
+) -> u64 {
+    let abandoned = if records_abandoned_dispatches {
+        abandoned_dispatch_event_count(pending_cmds)
+    } else {
+        0
+    };
     u64::try_from(next_event_id)
         .unwrap_or(0)
         .saturating_add(pending_update_result_event_count(pending_cmds))
+        .saturating_add(abandoned)
         .saturating_add(1)
 }
 
@@ -18521,10 +19126,37 @@ async fn process_workflow_task(
         }
         WorkflowOutcome::ContinuedAsNew { .. } => pending_update_result_event_count(&pending_cmds)
             .saturating_add(pre_suspension_event_count(&pending_cmds)),
-        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. } => {
+        WorkflowOutcome::Completed { .. } => pending_update_result_event_count(&pending_cmds)
+            .saturating_add(pre_suspension_event_count(&pending_cmds))
+            .saturating_add(terminal_parent_close_cascade_events),
+        WorkflowOutcome::Failed { .. } => {
+            // Issue #952: the abandoned-dispatch records this failing cycle is
+            // about to append — resolved against the same dedup persistence
+            // applies, so a re-park of already-started children cannot trip the
+            // cap on events that will never be written (Codex P2 round 3).
+            let abandoned = match abandoned_dispatch_event_count_resolved(
+                conn,
+                &pending_cmds,
+                RecordedDispatchIds::from_history(&history_events),
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    return fail_execution_on_error(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(error),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+            };
             pending_update_result_event_count(&pending_cmds)
                 .saturating_add(pre_suspension_event_count(&pending_cmds))
                 .saturating_add(terminal_parent_close_cascade_events)
+                .saturating_add(abandoned)
         }
     };
     let current_history_event_count = u64::try_from(history_events.len())
@@ -18582,8 +19214,12 @@ async fn process_workflow_task(
         if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
             telemetry.metrics.record_workflow_history_size(
                 &prepared.execution.workflow_name,
-                terminal_history_event_count(next_event_id, &pending_cmds)
-                    .saturating_add(terminal_parent_close_cascade_events),
+                terminal_history_event_count(
+                    next_event_id,
+                    &pending_cmds,
+                    records_abandoned_dispatches(&outcome),
+                )
+                .saturating_add(terminal_parent_close_cascade_events),
             );
         }
         if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
@@ -18790,6 +19426,11 @@ async fn process_workflow_task(
     // continue-as-new paths — `update_result_command_source` picks the right
     // one. Emitted only post-commit in the `Persisted` arm so a persist failure
     // (and the ParkedPaused discard) never over-counts.
+    // Issue #952: the dispatches this execution's history already records,
+    // computed once (pure) before the persist transaction so an
+    // abandoned-dispatch record can never duplicate a dispatch that is genuinely
+    // in flight.
+    let recorded_dispatches = RecordedDispatchIds::from_history(&history_events);
     let update_result_metrics = collect_update_result_metrics(
         &history_events,
         update_result_command_source(&outcome, &pending_cmds),
@@ -18860,6 +19501,7 @@ async fn process_workflow_task(
                         persistence,
                         outcome,
                         &pending_cmds,
+                        &recorded_dispatches,
                         &execute_span,
                     )
                     .await?
@@ -34389,6 +35031,896 @@ mod tests {
         assert!(
             defaults.sla.is_none() && defaults.sla_deadline_at.is_none(),
             "a zero-length SLA must not persist an already-breached deadline"
+        );
+    }
+
+    // ── Issue #952: terminal-cycle command audit + abandoned dispatches ─────
+
+    /// One constructed value per `WorkflowCommand` variant, with the policy
+    /// `terminal_command_policy` must report for it.
+    ///
+    /// This is the AC4 audit of issue #952 in executable form: the classifier is
+    /// an exhaustive `match` (a new variant fails to compile until it is
+    /// classified) and this table is the assertion that each classification is
+    /// the intended one. Keep it in sync — `every_workflow_command_variant_is_
+    /// classified` fails if a variant is missing from the table.
+    #[allow(clippy::too_many_lines)]
+    fn terminal_policy_cases() -> Vec<(&'static str, WorkflowCommand, &'static str)> {
+        vec![
+            (
+                "RecordMarker",
+                WorkflowCommand::RecordMarker {
+                    name: "m".to_string(),
+                    details: serde_json::json!(1),
+                },
+                "pre-terminal-event",
+            ),
+            (
+                "RecordSideEffect",
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Uuid,
+                    name: None,
+                    value: serde_json::json!("id"),
+                },
+                "pre-terminal-event",
+            ),
+            (
+                "SpawnDetachedChildWorkflow",
+                WorkflowCommand::SpawnDetachedChildWorkflow {
+                    child_id: ExecutionId::new(),
+                    workflow_name: "detached".to_string(),
+                    input: Value::Null,
+                    parent_close_policy: ParentClosePolicy::Abandon,
+                },
+                "pre-terminal-event",
+            ),
+            (
+                "ArmTimer",
+                WorkflowCommand::ArmTimer {
+                    timer_id: crate::types::TimerId::new("t"),
+                    duration_secs: 5,
+                    for_await: false,
+                },
+                "pre-terminal-event",
+            ),
+            (
+                "CancelTimer",
+                WorkflowCommand::CancelTimer {
+                    timer_id: crate::types::TimerId::new("t"),
+                },
+                "pre-terminal-event",
+            ),
+            (
+                "StartChildWorkflow",
+                abandoned_child_cmd(ExecutionId::new(), "worker_child", serde_json::json!({})),
+                "abandoned-dispatch",
+            ),
+            (
+                "ScheduleActivity",
+                abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+                "abandoned-dispatch",
+            ),
+            (
+                "RecordUpdateResult",
+                WorkflowCommand::RecordUpdateResult {
+                    update_id: crate::types::UpdateId::new(),
+                    result: Ok(Value::Null),
+                },
+                "side-path",
+            ),
+            (
+                "UpsertSearchAttributes",
+                WorkflowCommand::UpsertSearchAttributes {
+                    patch: std::collections::HashMap::new(),
+                },
+                "side-path",
+            ),
+            (
+                "SetCurrentDetails",
+                WorkflowCommand::SetCurrentDetails {
+                    value: "step 2".to_string(),
+                    explicit_clear: false,
+                },
+                "side-path",
+            ),
+            (
+                "RecordLog",
+                WorkflowCommand::RecordLog {
+                    seq: 1,
+                    level: crate::context::WorkflowLogLevel::Info,
+                    message: "hi".to_string(),
+                },
+                "side-path",
+            ),
+            (
+                "PublishProgress",
+                WorkflowCommand::PublishProgress {
+                    seq: 1,
+                    chunk: Value::Null,
+                },
+                "side-path",
+            ),
+            (
+                "CancelRaceLosers",
+                WorkflowCommand::CancelRaceLosers {
+                    activities: Vec::new(),
+                    children: Vec::new(),
+                    timers: Vec::new(),
+                },
+                "side-path",
+            ),
+            (
+                "ReleaseMutex",
+                WorkflowCommand::ReleaseMutex {
+                    key: "k".to_string(),
+                    lock_seq: 1,
+                },
+                "side-path",
+            ),
+            (
+                "WaitForActivity",
+                WorkflowCommand::WaitForActivity {
+                    activity_id: crate::types::ActivityExecId::new(),
+                    result_tx: oneshot::channel::<Result<Value, String>>().0,
+                },
+                "no-record",
+            ),
+            (
+                "WaitForSignal",
+                WorkflowCommand::WaitForSignal {
+                    signal_name: "go".to_string(),
+                    result_tx: oneshot::channel::<Value>().0,
+                },
+                "no-record",
+            ),
+            (
+                "StartTimer",
+                WorkflowCommand::StartTimer {
+                    timer_id: crate::types::TimerId::new("t"),
+                    duration_secs: 1,
+                    result_tx: oneshot::channel::<()>().0,
+                },
+                "no-record",
+            ),
+            (
+                "RunLocalActivity",
+                WorkflowCommand::RunLocalActivity {
+                    activity_id: crate::types::ActivityExecId::new(),
+                    name: "compute".to_string(),
+                    input: Value::Null,
+                    start_to_close: None,
+                    retry_policy: None,
+                    result_tx: oneshot::channel::<Result<Value, String>>().0,
+                    already_scheduled: false,
+                    failed_attempts: 0,
+                    last_error: None,
+                },
+                "no-record",
+            ),
+            (
+                "ScheduleExternalActivity",
+                WorkflowCommand::ScheduleExternalActivity {
+                    activity_id: crate::types::ActivityExecId::new(),
+                    token: crate::types::ExternalActivityToken::new(),
+                    name: "ext".to_string(),
+                    input: Value::Null,
+                    queue: String::new(),
+                    schedule_to_close_secs: 60,
+                    result_tx: oneshot::channel::<Result<Value, String>>().0,
+                },
+                "no-record",
+            ),
+            (
+                "SignalExternalWorkflow",
+                WorkflowCommand::SignalExternalWorkflow {
+                    signal_id: crate::types::ExternalSignalId::new(),
+                    target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                    signal_name: "go".to_string(),
+                    payload: Value::Null,
+                    result_tx: oneshot::channel::<Result<(), String>>().0,
+                    already_requested: false,
+                    idempotency_key: None,
+                },
+                "no-record",
+            ),
+            (
+                "RequestCancelExternalWorkflow",
+                WorkflowCommand::RequestCancelExternalWorkflow {
+                    cancel_id: crate::types::ExternalCancelId::new(),
+                    target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                    result_tx: oneshot::channel::<Result<(), String>>().0,
+                    already_requested: false,
+                },
+                "no-record",
+            ),
+            (
+                "AwaitExternalWorkflow",
+                WorkflowCommand::AwaitExternalWorkflow {
+                    await_id: crate::types::ExternalAwaitId::new(),
+                    target: ExecutionId::new(),
+                    result_tx: oneshot::channel::<Result<(), String>>().0,
+                    already_requested: false,
+                },
+                "no-record",
+            ),
+            (
+                "AcquireMutex",
+                WorkflowCommand::AcquireMutex {
+                    key: "k".to_string(),
+                    result_tx: oneshot::channel::<i64>().0,
+                },
+                "no-record",
+            ),
+            (
+                "Complete",
+                WorkflowCommand::Complete {
+                    output: Value::Null,
+                },
+                "unreachable",
+            ),
+            (
+                "Fail",
+                WorkflowCommand::Fail {
+                    error: "boom".to_string(),
+                },
+                "unreachable",
+            ),
+            (
+                "ContinueAsNew",
+                WorkflowCommand::ContinueAsNew {
+                    input: Value::Null,
+                    new_workflow_type: None,
+                },
+                "unreachable",
+            ),
+        ]
+    }
+
+    fn abandoned_child_cmd(child_id: ExecutionId, name: &str, input: Value) -> WorkflowCommand {
+        WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name: name.to_string(),
+            input,
+            result_tx: oneshot::channel::<Result<Value, String>>().0,
+        }
+    }
+
+    fn abandoned_activity_cmd(
+        activity_id: crate::types::ActivityExecId,
+        name: &str,
+    ) -> WorkflowCommand {
+        WorkflowCommand::ScheduleActivity {
+            activity_id,
+            name: name.to_string(),
+            input: serde_json::json!({ "a": 1 }),
+            queue: "default".to_string(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_tx: oneshot::channel::<Result<Value, String>>().0,
+        }
+    }
+
+    /// AC4: every `WorkflowCommand` variant reachable in a failing cycle's
+    /// pending batch has a stated terminal-cycle policy. The classifier's
+    /// exhaustive `match` guarantees a NEW variant cannot compile without one;
+    /// this guarantees the table above still covers them all, so the policy
+    /// assertions below cannot silently stop testing a variant.
+    #[test]
+    fn every_workflow_command_variant_is_classified() {
+        let cases = terminal_policy_cases();
+        // Derived from an exhaustive `match`, never a hand-written literal: a new
+        // `WorkflowCommand` variant makes `workflow_command_variant_index` fail
+        // to compile, and until the table gains a row for it this assertion
+        // fails — so the table can never silently stop covering a variant.
+        let mut indices: Vec<usize> = cases
+            .iter()
+            .map(|(_, cmd, _)| workflow_command_variant_index(cmd))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(
+            indices,
+            (0..WORKFLOW_COMMAND_VARIANTS).collect::<Vec<_>>(),
+            "the audit table must cover every WorkflowCommand variant exactly once"
+        );
+        for (label, cmd, expected_kind) in cases {
+            let policy = terminal_command_policy(&cmd);
+            assert_eq!(
+                policy.kind(),
+                expected_kind,
+                "{label} classified unexpectedly"
+            );
+            assert_eq!(
+                workflow_command_name(&cmd),
+                label,
+                "the audit table's label must be the command's own name"
+            );
+            // AC4 asks for a *documented* policy, not merely a classification:
+            // every non-recorded and unreachable kind must carry its reason.
+            match policy {
+                TerminalCommandPolicy::SidePath(owner) => assert!(
+                    !owner.is_empty(),
+                    "{label}: a side-path policy must name the function that owns it"
+                ),
+                TerminalCommandPolicy::NoRecord(reason)
+                | TerminalCommandPolicy::Unreachable(reason) => {
+                    // A reason has to be an explanation, not a label: it must say
+                    // why (a causal clause) and name something concrete about
+                    // this command's own machinery.
+                    assert!(
+                        reason.len() > 40,
+                        "{label}: a no-record/unreachable policy must state WHY, got {reason:?}"
+                    );
+                    assert!(
+                        !reason.contains("TODO") && !reason.contains("unknown"),
+                        "{label}: an unresolved policy is not an audit, got {reason:?}"
+                    );
+                }
+                TerminalCommandPolicy::PreTerminalEvent
+                | TerminalCommandPolicy::AbandonedDispatch => {}
+            }
+        }
+    }
+
+    /// The audit table compares `kind()` discriminants, which collapse every
+    /// `SidePath` to one label. This pins the other half AC4 asks for: WHICH
+    /// function owns each side path, so moving a command's handling to a
+    /// different persister (or dropping it) fails here rather than silently
+    /// leaving the audit pointing at a function that no longer runs.
+    #[test]
+    fn every_side_path_names_the_function_that_actually_persists_it() {
+        let expected: Vec<(&str, &str)> = vec![
+            ("RecordUpdateResult", "persist_update_result_commands"),
+            (
+                "UpsertSearchAttributes",
+                "persist_search_attrs_from_commands",
+            ),
+            ("SetCurrentDetails", "persist_current_details_from_commands"),
+            ("RecordLog", "persist_workflow_logs_from_commands"),
+            ("PublishProgress", "notify_progress_from_commands"),
+            ("CancelRaceLosers", "apply_race_loser_cancellations"),
+            ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
+        ];
+        let mut seen: Vec<(&str, &str)> = terminal_policy_cases()
+            .iter()
+            .filter_map(|(label, cmd, _)| match terminal_command_policy(cmd) {
+                TerminalCommandPolicy::SidePath(owner) => Some((*label, owner)),
+                _ => None,
+            })
+            .collect();
+        seen.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "the set of side-path commands, and the function each names, must both be pinned"
+        );
+    }
+
+    /// The dispatch kinds are exactly the two that would have become work other
+    /// subsystems can see (a child execution row, a task-queue row).
+    #[test]
+    fn only_child_and_activity_dispatches_are_abandoned_dispatches() {
+        let mut dispatches: Vec<&str> = terminal_policy_cases()
+            .iter()
+            .filter(|(_, _, kind)| *kind == "abandoned-dispatch")
+            .map(|(label, _, _)| *label)
+            .collect();
+        dispatches.sort_unstable();
+        assert_eq!(dispatches, vec!["ScheduleActivity", "StartChildWorkflow"]);
+    }
+
+    /// Nothing outside the two dispatch kinds produces an abandoned-dispatch
+    /// event — the regression guard for "someone widened the match arm".
+    #[test]
+    fn non_dispatch_commands_produce_no_abandoned_dispatch_events() {
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        for (label, cmd, kind) in terminal_policy_cases() {
+            if kind == "abandoned-dispatch" {
+                continue;
+            }
+            assert!(
+                abandoned_dispatch_events(&cmd, &plan).is_empty(),
+                "{label} must record no abandoned-dispatch event"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_child_dispatch_records_started_then_synthetic_terminal() {
+        let child_id = ExecutionId::new();
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        let events = abandoned_dispatch_events(
+            &abandoned_child_cmd(child_id, "worker_child", serde_json::json!({ "slot": 0 })),
+            &plan,
+        );
+        assert_eq!(events.len(), 2, "got {events:?}");
+        match &events[0] {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: id,
+                workflow_name,
+                input,
+            } => {
+                assert_eq!(*id, child_id);
+                assert_eq!(workflow_name, "worker_child");
+                assert_eq!(input, &serde_json::json!({ "slot": 0 }));
+            }
+            other => panic!("expected ChildWorkflowStarted, got {other:?}"),
+        }
+        match &events[1] {
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: id,
+                error,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(*id, child_id, "the terminal must resolve the SAME child");
+                assert_eq!(error, crate::event::ABANDONED_DISPATCH_REASON);
+                assert_eq!(*non_retryable, Some(true));
+            }
+            other => panic!("expected ChildWorkflowFailed, got {other:?}"),
+        }
+    }
+
+    /// A `StartChildWorkflow` carrying a child id that ALREADY has an execution
+    /// row is `spawn_child_workflow_raw`'s `ChildInProgress` re-park, not a new
+    /// dispatch: recording it would append a second `ChildWorkflowStarted` and
+    /// synthesise a failure for a child that is genuinely running.
+    #[test]
+    fn abandoned_child_dispatch_skips_a_child_that_already_started() {
+        let running = ExecutionId::new();
+        let plan = AbandonedDispatchPlan::with_started_children([running.as_uuid()]);
+        assert!(
+            abandoned_dispatch_events(
+                &abandoned_child_cmd(running, "worker_child", Value::Null),
+                &plan
+            )
+            .is_empty()
+        );
+        // A different child in the same batch is still recorded.
+        let fresh = ExecutionId::new();
+        assert_eq!(
+            abandoned_dispatch_events(
+                &abandoned_child_cmd(fresh, "worker_child", Value::Null),
+                &plan
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn abandoned_activity_dispatch_records_scheduled_then_synthetic_terminal() {
+        let activity_id = crate::types::ActivityExecId::new();
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        let events =
+            abandoned_dispatch_events(&abandoned_activity_cmd(activity_id, "charge"), &plan);
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            WorkflowEvent::ActivityScheduled { activity_id: id, name, queue, .. }
+                if *id == activity_id && name == "charge" && queue == "default"
+        ));
+        assert!(matches!(
+            &events[1],
+            WorkflowEvent::ActivityFailed { activity_id: id, error, non_retryable, .. }
+                if *id == activity_id
+                    && error == crate::event::ABANDONED_DISPATCH_REASON
+                    && *non_retryable
+        ));
+    }
+
+    /// Issue #952 is scoped to FAILING cycles: a completed (or continue-as-new)
+    /// terminal cycle keeps its pre-#952 behaviour byte for byte, because a
+    /// completed history is verified in full by strict replay and a synthetic
+    /// terminal there would resolve a branch the live cycle left parked.
+    #[test]
+    fn a_non_failing_terminal_cycle_records_no_abandoned_dispatches() {
+        let plan = AbandonedDispatchPlan::disabled();
+        let commands = vec![
+            abandoned_child_cmd(ExecutionId::new(), "worker_child", Value::Null),
+            abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+        ];
+        let mut timer_events = vec![None, None];
+        assert!(
+            terminal_pre_outcome_events_from_commands(&commands, &mut timer_events, &plan)
+                .is_empty()
+        );
+    }
+
+    /// Positional replay depends on emission order: each dispatch's pair must
+    /// land at its own command position, interleaved with the markers and side
+    /// effects around it.
+    #[test]
+    fn terminal_events_interleave_dispatch_records_in_emission_order() {
+        let child_id = ExecutionId::new();
+        let activity_id = crate::types::ActivityExecId::new();
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "fan_out:0".to_string(),
+                details: serde_json::json!(1),
+            },
+            abandoned_child_cmd(child_id, "worker_child", Value::Null),
+            WorkflowCommand::RecordSideEffect {
+                kind: crate::event::SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!("id"),
+            },
+            abandoned_activity_cmd(activity_id, "charge"),
+        ];
+        let mut timer_events = vec![None, None, None, None];
+        let events = terminal_pre_outcome_events_from_commands(
+            &commands,
+            &mut timer_events,
+            &AbandonedDispatchPlan::with_started_children([]),
+        );
+        let names: Vec<&str> = events.iter().map(WorkflowEvent::type_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "MarkerRecorded",
+                "ChildWorkflowStarted",
+                "ChildWorkflowFailed",
+                "SideEffectRecorded",
+                "ActivityScheduled",
+                "ActivityFailed",
+            ],
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn abandoned_dispatch_event_count_is_a_conservative_upper_bound() {
+        let already_started = ExecutionId::new();
+        let commands = vec![
+            abandoned_child_cmd(already_started, "worker_child", Value::Null),
+            abandoned_child_cmd(ExecutionId::new(), "worker_child", Value::Null),
+            abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+            WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: Value::Null,
+            },
+        ];
+        // 3 dispatch commands x 2 events, counted BEFORE the dedup drops one.
+        assert_eq!(abandoned_dispatch_event_count(&commands), 6);
+        let mut timer_events = vec![None, None, None, None];
+        let actual = terminal_pre_outcome_events_from_commands(
+            &commands,
+            &mut timer_events,
+            &AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]),
+        );
+        // Compare like with like: the bound covers ONLY the abandoned-dispatch
+        // events, so exclude the marker `pre_suspension_event_count` counts.
+        let dispatch_events = actual
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::ChildWorkflowStarted { .. }
+                        | WorkflowEvent::ChildWorkflowFailed { .. }
+                        | WorkflowEvent::ActivityScheduled { .. }
+                        | WorkflowEvent::ActivityFailed { .. }
+                )
+            })
+            .count();
+        assert_eq!(dispatch_events, 4, "one child deduped away: {actual:?}");
+        assert!(
+            u64::try_from(dispatch_events).unwrap_or(u64::MAX)
+                <= abandoned_dispatch_event_count(&commands),
+            "the pre-dedup bound must never under-count"
+        );
+    }
+
+    /// The history hard-cap preflight counts what will actually be APPENDED, not
+    /// the whole batch (Codex P2 round 3). Over-counting is not the safe
+    /// direction here: breaching the cap dead-letters the execution and replaces
+    /// its real failure with a history-cap error, so a re-park of already-started
+    /// children must not be counted.
+    #[test]
+    fn the_cap_preflight_counts_only_the_dispatches_that_will_be_written() {
+        let already_started = ExecutionId::new();
+        let commands = vec![
+            abandoned_child_cmd(already_started, "worker_child", Value::Null),
+            abandoned_child_cmd(ExecutionId::new(), "worker_child", Value::Null),
+            abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+            WorkflowCommand::RecordMarker {
+                name: "m".to_string(),
+                details: Value::Null,
+            },
+        ];
+        let plan = AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]);
+        let counted = abandoned_dispatch_event_count_for_plan(&commands, &plan);
+        assert_eq!(
+            counted, 4,
+            "the already-started child contributes nothing to the preflight"
+        );
+        assert!(
+            counted < abandoned_dispatch_event_count(&commands),
+            "the resolved count must be strictly tighter than the pre-dedup bound here"
+        );
+
+        // The invariant that matters: preflight count == events persistence writes.
+        let mut timer_events = vec![None, None, None, None];
+        let written =
+            terminal_pre_outcome_events_from_commands(&commands, &mut timer_events, &plan)
+                .into_iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        WorkflowEvent::ChildWorkflowStarted { .. }
+                            | WorkflowEvent::ChildWorkflowFailed { .. }
+                            | WorkflowEvent::ActivityScheduled { .. }
+                            | WorkflowEvent::ActivityFailed { .. }
+                    )
+                })
+                .count();
+        assert_eq!(
+            u64::try_from(written).unwrap_or(u64::MAX),
+            counted,
+            "the preflight must count exactly the abandoned-dispatch events appended"
+        );
+    }
+
+    /// Issue #952 is scoped to FAILING cycles — pinned at the branch that
+    /// actually chooses, not only at the plan it produces.
+    #[test]
+    fn only_a_failing_terminal_outcome_records_abandoned_dispatches() {
+        assert!(records_abandoned_dispatches(&WorkflowOutcome::Failed {
+            error: "boom".to_string(),
+            non_deterministic_details: None,
+            handler_panic: false,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        }));
+        assert!(!records_abandoned_dispatches(&WorkflowOutcome::Completed {
+            output: Value::Null,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        }));
+        assert!(!records_abandoned_dispatches(
+            &WorkflowOutcome::ContinuedAsNew {
+                input: Value::Null,
+                new_workflow_type: None,
+            }
+        ));
+        assert!(!records_abandoned_dispatches(&WorkflowOutcome::Suspended {
+            commands: Vec::new(),
+        }));
+    }
+
+    /// The dedup asks the question the MATCHER asked — "is this dispatch already
+    /// in history" — not only "does a child row exist". The two can disagree
+    /// (a retention sweep or a partial restore removes the row while the
+    /// `ChildWorkflowStarted` remains), and recording then would append a second
+    /// start plus a synthetic failure for a child that is genuinely running.
+    #[test]
+    fn a_dispatch_already_in_history_is_never_recorded_again() {
+        let child_id = ExecutionId::new();
+        let activity_id = crate::types::ActivityExecId::new();
+        let history = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".to_string(),
+                input: serde_json::json!({ "a": 1 }),
+                queue: "default".to_string(),
+            },
+        ];
+        let plan = AbandonedDispatchPlan::with_recorded_history(&history);
+        assert!(
+            abandoned_dispatch_events(
+                &abandoned_child_cmd(child_id, "worker_child", Value::Null),
+                &plan
+            )
+            .is_empty(),
+            "a child whose ChildWorkflowStarted is already recorded is a re-park"
+        );
+        assert!(
+            abandoned_dispatch_events(&abandoned_activity_cmd(activity_id, "charge"), &plan)
+                .is_empty(),
+            "an activity whose ActivityScheduled is already recorded is not a new dispatch"
+        );
+        // A different id in the same batch is still recorded.
+        assert_eq!(
+            abandoned_dispatch_events(
+                &abandoned_child_cmd(ExecutionId::new(), "worker_child", Value::Null),
+                &plan
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            abandoned_dispatch_events(
+                &abandoned_activity_cmd(crate::types::ActivityExecId::new(), "charge"),
+                &plan
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn recorded_dispatch_ids_collects_both_kinds_from_history() {
+        let child_id = ExecutionId::new();
+        let activity_id = crate::types::ActivityExecId::new();
+        let ids = RecordedDispatchIds::from_history(&[
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "c".to_string(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: String::new(),
+            },
+        ]);
+        assert!(ids.child_ids.contains(&child_id));
+        assert!(ids.activity_ids.contains(&activity_id));
+        assert_eq!(ids.child_ids.len(), 1);
+        assert_eq!(ids.activity_ids.len(), 1);
+    }
+
+    /// Dispatches three awaited children concurrently and fails from a sibling
+    /// branch in the same decision cycle, never suspending — the shape issue
+    /// #952's second seam is about.
+    fn dispatch_three_children_then_fail<'a>(
+        ctx: &'a crate::context::WorkflowContext,
+        _input: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let dispatch = futures::future::try_join_all((0..3).map(|slot| {
+                ctx.spawn_child_workflow_raw("worker_child", serde_json::json!({ "slot": slot }))
+            }));
+            let sibling = async {
+                Err::<Vec<Value>, HarvestError>(HarvestError::Config("budget exceeded".to_string()))
+            };
+            futures::try_join!(dispatch, sibling).map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Issue #952's success metric, end to end without a database: run the REAL
+    /// workflow through the REAL executor, hand its REAL drained commands to the
+    /// REAL terminal event planner, and assert the history that path persists
+    /// contains all three dispatched children.
+    #[tokio::test]
+    async fn a_failing_cycle_persists_every_dispatched_child() {
+        let (outcome, pending, _span) = crate::executor::run_workflow_with_state(
+            ExecutionId::new(),
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            dispatch_three_children_then_fail,
+            Value::Null,
+            crate::context::empty_shared_state(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Failed { .. }),
+            "the sibling branch must fail the cycle, got {outcome:?}"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. }))
+                .count(),
+            3,
+            "the code issued three child dispatches"
+        );
+
+        let mut timer_events: Vec<Option<WorkflowEvent>> = vec![None; pending.len()];
+        let events = terminal_pre_outcome_events_from_commands(
+            &pending,
+            &mut timer_events,
+            &AbandonedDispatchPlan::with_started_children([]),
+        );
+        let dispatched_inputs: Vec<&Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::ChildWorkflowStarted { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dispatched_inputs,
+            vec![
+                &serde_json::json!({ "slot": 0 }),
+                &serde_json::json!({ "slot": 1 }),
+                &serde_json::json!({ "slot": 2 }),
+            ],
+            "every dispatched child must appear, with its own input, in emission \
+             order — positional replay depends on it: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowFailed { .. }))
+                .count(),
+            3,
+            "each dispatch must carry its synthetic terminal so replay resolves it"
+        );
+
+        // Pre-#952 behaviour, for contrast: the old builder dropped all three.
+        let mut timer_events: Vec<Option<WorkflowEvent>> = vec![None; pending.len()];
+        assert!(
+            pre_suspension_events_from_commands(&pending, &mut timer_events).is_empty(),
+            "the suspension-shaped builder is what silently dropped the dispatches"
+        );
+    }
+
+    /// The history that failing cycle persists replays cleanly — the two halves
+    /// of issue #952 meeting: the abandoned-dispatch records resolve every
+    /// branch, and the transparent terminal-failure tail absorbs whatever the
+    /// code does after the failure point.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_failing_cycle_history_replays_cleanly() {
+        let exec_id = ExecutionId::new();
+        let started = WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+        let (_outcome, pending, _span) = crate::executor::run_workflow_with_state(
+            exec_id,
+            vec![started.clone()],
+            dispatch_three_children_then_fail,
+            Value::Null,
+            crate::context::empty_shared_state(),
+            None,
+        )
+        .await;
+        let mut timer_events: Vec<Option<WorkflowEvent>> = vec![None; pending.len()];
+        let mut history = vec![started];
+        history.extend(terminal_pre_outcome_events_from_commands(
+            &pending,
+            &mut timer_events,
+            &AbandonedDispatchPlan::with_started_children([]),
+        ));
+        history.push(WorkflowEvent::workflow_failed("budget exceeded"));
+
+        let report = crate::testing::WorkflowReplayer::new()
+            .register_fn(
+                "dispatch_three_children_then_fail",
+                dispatch_three_children_then_fail,
+            )
+            .replay_from_snapshot(crate::testing::HistorySnapshot {
+                workflow_name: "dispatch_three_children_then_fail".to_string(),
+                execution_id: exec_id,
+                events: history,
+                context_headers: None,
+                execution_timeout: None,
+                deadline_at: None,
+                parent_execution_id: None,
+                workflow_id: None,
+                queue_name: None,
+            })
+            .await;
+        assert!(
+            matches!(report.status, crate::testing::ReplayStatus::ReplaySucceeded),
+            "a failing cycle's own persisted history must replay cleanly: {report}"
         );
     }
 }

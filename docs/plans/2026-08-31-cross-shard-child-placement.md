@@ -138,7 +138,7 @@ byte-identical.
 
 ### 4.3 The cross-shard child outbox
 
-Migration `20260728000000_harvest_cross_shard_children` adds one table on every
+Migration `20260901130054_harvest_cross_shard_children` adds one table on every
 shard:
 
 | column | meaning |

@@ -10,12 +10,13 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_admission_gates, harvest_api_tokens, harvest_audit_log, harvest_backfill_log,
-    harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
-    harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
-    harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_cross_shard_children,
-    harvest_dead_letters, harvest_events, harvest_execution_summaries, harvest_external_tasks,
-    harvest_mutex_locks, harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
+    harvest_admission_gates, harvest_api_tokens, harvest_audit_export_cursor, harvest_audit_log,
+    harvest_backfill_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
+    harvest_calendar_exclusions, harvest_calendars, harvest_completion_deliveries,
+    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
+    harvest_completion_triggers, harvest_cross_shard_children, harvest_dead_letters,
+    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
+    harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions, harvest_workflow_logs,
@@ -982,6 +983,57 @@ pub struct NewAuditRecord<'a> {
     pub error_summary: Option<&'a str>,
     pub shard_id: Option<i32>,
     pub source: &'a str,
+}
+
+// ── Audit export (issue #953) ─────────────────────────────────────────────────
+
+/// One audit row as read by the exporter.
+///
+/// A separate struct from [`AuditRecord`] deliberately: `AuditRecord` is the
+/// shape the management API serializes for `GET /audit`, and must not grow an
+/// internal bookkeeping column just because the exporter needs it.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = harvest_audit_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuditExportRow {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub actor: String,
+    pub operation: String,
+    pub target_type: String,
+    pub target_id: Option<String>,
+    pub route_or_command: String,
+    pub request_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub shard_id: Option<i32>,
+    pub source: String,
+    pub export_seq: Option<i64>,
+}
+
+/// The per-shard audit-export delivery cursor (issue #953).
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = harvest_audit_export_cursor)]
+#[diesel(primary_key(shard_id))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuditExportCursor {
+    pub shard_id: i32,
+    pub last_assigned_seq: i64,
+    pub last_acked_seq: i64,
+    pub claim_epoch: i64,
+    pub lease_until: Option<DateTime<Utc>>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub consecutive_failures: i32,
+    pub last_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    /// Set when an operator retired audit export for this shard. The row is
+    /// kept rather than deleted so `last_assigned_seq` outlives the audit rows
+    /// themselves; a retired cursor is inert — retention ignores it and a
+    /// redrive refuses it.
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────
