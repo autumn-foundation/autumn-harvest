@@ -147,8 +147,12 @@ actually the more expensive choice once the table is realistically large in
 production, or does the planner keep making the right call?** Measured: the
 planner keeps making the right call — the crossover already happens well
 below typical production table sizes (300k rows is a modest, early-life
-`harvest_events` table), and the query's cost is flat past that point
-regardless of how much bigger the table gets.
+`harvest_events` table), and the query's cost is flat across the 3.4x growth
+actually measured (313k → 1,078,000 rows). That is not evidence the cost
+stays flat at every larger scale: only two points on the `Nested Loop` plan
+were tested, and index traversal/cache costs can still grow as an index
+itself grows much larger than either fixture here — untested beyond 1.08M
+rows.
 
 ## Negative result: forcing the plan shape structurally
 
@@ -181,7 +185,7 @@ one size where a forced rewrite would matter if it helped):
 | variant | plan | buffers (hit+read) |
 |---|---|---:|
 | unmodified (`IN` subquery) | `Seq Scan` of the whole table | 12,745 |
-| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,734 hit + 30 read) |
+| `LATERAL` rewrite | `Nested Loop` → `Bitmap Heap Scan` via `idx_harvest_events_exec`, 1,000 loops | 15,764 (15,730 hit + 34 read) |
 
 The rewrite **costs 24% more**, not less. Postgres's per-row plan for the
 correlated form is a `Bitmap Heap Scan` (build a bitmap, sort, then fetch) —
