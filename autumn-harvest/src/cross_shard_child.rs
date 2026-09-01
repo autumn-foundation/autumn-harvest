@@ -536,7 +536,30 @@ pub async fn enforce_cross_shard_children(
         return Ok(0);
     }
 
-    let rows = load_sweep_batch(conn, &reachable).await?;
+    // A missing `harvest_cross_shard_children` is "this deployment has not run
+    // #956's migration yet", NOT a failure — and it must not be one, because
+    // this relay is sequenced inside `enforce_timeouts_once`. Propagating the
+    // error there aborts the WHOLE tick: activity/workflow timeout enforcement,
+    // and every scanner ordered after this one (debounce, throttle, event
+    // batches). A deployment whose code is ahead of its migrations — the
+    // ordinary rolling-upgrade window — would lose its entire timeout subsystem,
+    // not merely cross-shard delivery.
+    //
+    // Detected by re-checking the catalog only AFTER a failed sweep, so the
+    // happy path pays nothing and the check never depends on parsing a
+    // localised Postgres message.
+    let rows = match load_sweep_batch(conn, &reachable).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            if !cross_shard_table_exists(conn).await {
+                tracing::warn!(
+                    "harvest: harvest_cross_shard_children is absent; skipping the                      cross-shard child relay until this deployment's migrations                      have run. Cross-shard children (#956) cannot be delivered                      until then; every other scanner duty is unaffected."
+                );
+                return Ok(0);
+            }
+            return Err(e);
+        }
+    };
     if rows.is_empty() {
         return Ok(0);
     }
@@ -1163,6 +1186,28 @@ async fn apply_cascade_bookkeeping(
         Ok(())
     }))
     .await
+}
+
+/// Is this database's `harvest_cross_shard_children` present?
+///
+/// Asked only after a sweep query has already failed, to tell "the migration has
+/// not run here yet" (skip quietly) from a real database fault (propagate). Uses
+/// `to_regclass`, which answers from the catalog and returns NULL rather than
+/// raising for an absent relation — so this check cannot itself fail the way the
+/// query it is diagnosing did. A failure to answer is reported as "present", so
+/// an ambiguous catalog read surfaces the ORIGINAL error rather than silently
+/// disabling the relay.
+async fn cross_shard_table_exists(conn: &mut AsyncPgConnection) -> bool {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Nullable, Text};
+
+    diesel::select(sql::<Nullable<Text>>(
+        "to_regclass('harvest_cross_shard_children')::text",
+    ))
+    .get_result::<Option<String>>(conn)
+    .await
+    .map(|found| found.is_some())
+    .unwrap_or(true)
 }
 
 /// Delete the outbox row and report whether **this** transaction removed it.
