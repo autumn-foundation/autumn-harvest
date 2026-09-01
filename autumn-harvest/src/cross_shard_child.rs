@@ -999,8 +999,37 @@ async fn apply_action(
     match action {
         CrossShardChildAction::Wait => Ok(false),
         CrossShardChildAction::Retire => {
-            delete_row(conn, row.child_exec_id).await?;
-            Ok(true)
+            // Conditional on `NOT cancel_requested`, and that condition is
+            // load-bearing rather than defensive.
+            //
+            // One sweep reads its work-list and the parents' terminal states in
+            // TWO statements, deliberately holding no transaction on the parent's
+            // shard while it reaches across to another database. Under READ
+            // COMMITTED each statement therefore gets its own snapshot, and a
+            // parent that completes BETWEEN them is observed with a fresh
+            // terminal state against a stale row. The parent's terminal and its
+            // race-loser cancel flag commit together, so the flag is exactly what
+            // goes missing from that torn read — and `Retire` would then delete
+            // the row, discarding a cancellation that was durably requested and
+            // abandoning a child that runs forever with nothing tracking it.
+            //
+            // Observed against real shard databases, 21ms apart:
+            //   flag committed        cancel_requested = true
+            //   sweep decided         cancel=false parent_terminal=Some(true) -> Retire
+            //
+            // Re-checking the flag inside the DELETE closes it without a lock or
+            // a wider snapshot: the row either still has no cancel pending (safe
+            // to retire) or has gained one (leave it; the next sweep cancels).
+            // Losing this CAS is not a failure — it is the flag arriving.
+            let deleted = diesel::delete(
+                harvest_cross_shard_children::table
+                    .find(row.child_exec_id)
+                    .filter(harvest_cross_shard_children::cancel_requested.eq(false)),
+            )
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            Ok(deleted > 0)
         }
         CrossShardChildAction::StartChild => {
             start_child_on_target(pool, row, acquire_bound, codecs, metrics).await?;
