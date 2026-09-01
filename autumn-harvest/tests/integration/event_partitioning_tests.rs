@@ -2952,3 +2952,121 @@ async fn a_drop_blocked_by_a_reader_does_not_queue_appends_behind_its_upgrade() 
         .expect("sweeper task")
         .expect("a partition it could not drop is a blocked partition, not an error");
 }
+
+#[tokio::test]
+async fn the_inert_migration_fails_fast_rather_than_queueing_every_append() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    // An idle-in-transaction reader — a reporting query, a leaked session.
+    let mut blocker = connect(&url).await;
+    for stmt in ["BEGIN", "SELECT 1 FROM harvest_events LIMIT 1"] {
+        diesel::sql_query(stmt)
+            .execute(&mut blocker)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    // `ADD COLUMN` with a constant default is metadata-only — no rewrite — but
+    // it still takes ACCESS EXCLUSIVE to write the catalog row. Behind this
+    // reader the ALTER queues, and because Postgres queues later conflicting
+    // requests behind a waiter, every append arriving after it queues behind
+    // the ALTER. Unbounded, on a migration whose entire claim is that it is
+    // inert: an upgrade that a deployment may never opt into becomes a write
+    // outage that ends only when the reader does.
+    let up = include_str!("../../migrations/20260728000000_harvest_event_partitioning/up.sql");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, up),
+    )
+    .await;
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("release the blocker");
+
+    let outcome = outcome.expect(
+        "the migration queued behind an idle reader instead of failing fast, taking \
+         every append on the shard with it. It must bound its own lock wait.",
+    );
+    match outcome {
+        Err(e) => assert!(
+            partition::is_lock_timeout(&e.to_string()),
+            "and it must fail *because of the lock*, so an operator sees a bounded, \
+             retryable error rather than a mystery: {e}"
+        ),
+        Ok(()) => panic!("the ALTER cannot have succeeded while the reader held its lock"),
+    }
+}
+
+#[tokio::test]
+async fn conversion_does_not_widen_who_can_read_event_data() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A role the operator deliberately does NOT want reading history, but which
+    // the creating role's default privileges would hand access to. Every
+    // conversion path replaces `harvest_events` with a freshly created table,
+    // and `CREATE TABLE` applies those defaults — so a helper that only ever
+    // ADDS the source's grants leaves the replacement carrying access the
+    // original never had.
+    for stmt in [
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'harvest_nosy_958') \
+           THEN CREATE ROLE harvest_nosy_958 NOLOGIN; END IF; END $$",
+        "REVOKE ALL ON harvest_events FROM harvest_nosy_958",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO harvest_nosy_958",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            "SELECT has_table_privilege('harvest_nosy_958', 'harvest_events', 'SELECT') AS v",
+        )
+        .await,
+        "precondition: the role cannot read history before the conversion"
+    );
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    let leaked_by_enable = scalar_bool(
+        &mut conn,
+        "SELECT has_table_privilege('harvest_nosy_958', 'harvest_events', 'SELECT') AS v",
+    )
+    .await;
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert")
+        .expect("the shard was partitioned");
+    let leaked_by_disable = scalar_bool(
+        &mut conn,
+        "SELECT has_table_privilege('harvest_nosy_958', 'harvest_events', 'SELECT') AS v",
+    )
+    .await;
+
+    diesel::sql_query(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM harvest_nosy_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clean up the default privilege");
+
+    assert!(
+        !leaked_by_enable,
+        "AC1: enabling must not grant a role access the original table did not \
+         give it — the replacement inherits the creating role's default \
+         privileges, and replaying the source's grants only adds"
+    );
+    assert!(
+        !leaked_by_disable,
+        "and neither must the revert, which replaces the table again"
+    );
+}

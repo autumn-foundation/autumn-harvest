@@ -1,12 +1,27 @@
--- autumn-harvest/migrations/20260727000000_harvest_event_partitioning/up.sql
+-- autumn-harvest/migrations/20260728000000_harvest_event_partitioning/up.sql
 -- Issue #958: opt-in native declarative partitioning for `harvest_events`.
 --
 -- This migration is deliberately **INERT**. It ships the machinery — the
--- cohort function, the cohort column, the integrity trigger and the index the
--- drop gate needs — but does NOT convert `harvest_events`. An existing
--- deployment keeps its ordinary (relkind = 'r') table and byte-for-byte
--- identical behaviour until an operator runs `harvest partition enable`
--- (see docs/partitioned-events.md).
+-- cohort function, the cohort column and the integrity trigger — but does NOT
+-- convert `harvest_events`. An existing deployment keeps its ordinary
+-- (relkind = 'r') table and byte-for-byte identical behaviour until an operator
+-- runs `harvest partition enable` (see docs/partitioned-events.md).
+--
+-- Inert is a claim about how it APPLIES, too, not only about what it leaves
+-- behind. Two things follow from that, and both are load-bearing:
+--
+--   * It builds no index. See the note at the drop gate below.
+--   * It bounds its own lock wait, immediately. `ADD COLUMN` with a constant
+--     default rewrites nothing, but it still takes ACCESS EXCLUSIVE to write
+--     the catalog row — and Postgres queues later conflicting requests behind a
+--     WAITER, not merely behind held locks. So behind one idle-in-transaction
+--     reader the ALTER waits, and every append arriving after it queues behind
+--     the ALTER. Unbounded, on an upgrade a deployment may never opt into.
+--
+-- Failing fast is the right answer: the operator clears the blocker and re-runs
+-- the migration, which costs a retry. Waiting costs the shard's write
+-- availability for as long as the blocker lives.
+SET LOCAL lock_timeout = '5s';
 --
 -- ## The partition key, and why it is not `timestamp`
 --

@@ -1402,6 +1402,28 @@ fn copy_acl_body(source: &str, target: &str) -> String {
         "    SELECT pg_get_userbyid(relowner) INTO harvest_acl_owner
       FROM pg_class WHERE oid = '{source}'::regclass;
     EXECUTE format('ALTER TABLE {target} OWNER TO %I', harvest_acl_owner);
+    -- Clear what the replacement was BORN with before replaying the source's
+    -- grants. `CREATE TABLE` applies the creating role's default privileges
+    -- (ALTER DEFAULT PRIVILEGES), which have no relationship to what the
+    -- original table actually carried: a default grant added after the original
+    -- was created, or a role deliberately REVOKEd from it, would silently
+    -- reappear on the replacement. Replaying grants only ADDS, so without this
+    -- the conversion — and the revert — can widen who can read event data.
+    --
+    -- The owner is left alone: revoking from them would strip the privileges
+    -- the replay may not restore (a source with a default NULL ACL grants
+    -- nothing explicitly), and ownership is being set to the source's owner
+    -- immediately above.
+    FOR harvest_acl_row IN
+        SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC'
+                    ELSE quote_ident(pg_get_userbyid(e.grantee)) END AS grantee
+          FROM pg_class c, aclexplode(c.relacl) e
+         WHERE c.oid = '{target}'::regclass
+           AND e.grantee <> c.relowner
+         GROUP BY 1
+    LOOP
+        EXECUTE format('REVOKE ALL ON TABLE {target} FROM %s', harvest_acl_row.grantee);
+    END LOOP;
     FOR harvest_acl_row IN
         SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC'
                     ELSE quote_ident(pg_get_userbyid(e.grantee)) END AS grantee,
