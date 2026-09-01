@@ -326,15 +326,15 @@ fn service_unavailable(msg: &'static str) -> Response {
     AutumnError::service_unavailable_msg(msg).into_response()
 }
 
-/// Extract a harvest-prefixed bearer secret, or `None` to pass through (AC7).
+/// Extract a harvest-prefixed bearer secret.
 ///
 /// The `Authorization` **scheme** is matched case-insensitively per RFC 7235
 /// §2.1 (the scheme is a case-insensitive token), so `Bearer`, `bearer`,
 /// `BEARER`, `bEaReR`, … all authenticate identically. Only the scheme is
 /// case-folded — the credential (`hvst_…`) is taken verbatim and never altered,
 /// since the token secret is case-sensitive. A non-`hvst_` credential (any
-/// scheme case) still returns `None` so a non-Harvest bearer passes through to
-/// the embedder untouched.
+/// scheme case) returns `None`; [`enforce_token_scope`] passes it to an
+/// embedder boundary when one exists and rejects it in token-only mode.
 fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -389,9 +389,10 @@ fn strip_reserved_actor(request: &mut Request) {
 /// caller can spoof a different actor (AC6). A `read` token attempting a
 /// mutating route is denied 403 here, before any handler runs.
 ///
-/// On the pass-through path (no/invalid `hvst_` bearer) it still reserves the
-/// `token:` audit-actor namespace via [`strip_reserved_actor`], so a non-token
-/// caller admitted by other means cannot forge a token-namespaced audit actor.
+/// When an embedder admin boundary is present, the pass-through path (no/invalid
+/// `hvst_` bearer) reserves the `token:` audit-actor namespace via
+/// [`strip_reserved_actor`] before delegating to that boundary. Without that
+/// boundary, token-only mode rejects requests lacking a valid Harvest token.
 pub async fn enforce_token_scope(
     State(api_state): State<HarvestApiState>,
     mut request: Request,
@@ -404,12 +405,15 @@ pub async fn enforce_token_scope(
         return next.run(request).await;
     }
 
-    // AC7: absent or non-`hvst_` bearer → pass through (it is the embedder's
-    // credential, or an unauthenticated read). Reserve the `token:` actor
-    // namespace so a non-token caller cannot forge a token-namespaced actor.
+    // Compose with an embedder boundary, but fail closed in token-only mode.
+    // Otherwise unguarded management routes would be reachable without a token.
     let Some(secret) = harvest_bearer(request.headers()) else {
         strip_reserved_actor(&mut request);
-        return next.run(request).await;
+        return if api_state.admin_auth_boundary() {
+            next.run(request).await
+        } else {
+            unauthorized("api token required")
+        };
     };
 
     // A claimed `hvst_` token that we cannot verify (store unavailable) must
