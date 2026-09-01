@@ -1490,6 +1490,57 @@ async fn a_retired_cursor_cannot_be_claimed() {
     assert_eq!(unsequenced, 2, "a refused claim must assign no sequences");
 }
 
+// A resident of `enforce_timeouts_once` that fails on every tick must not stop
+// audit export. Export runs first and its own failures do not propagate, so a
+// poisoned task cannot starve compliance delivery -- and an export failure
+// cannot starve timeout enforcement either.
+#[tokio::test]
+async fn a_failing_scanner_resident_does_not_starve_audit_export() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = Arc::new(RecordingSink::new(200));
+    let _installed = install(sink.clone(), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    // A task that is due and whose enforcement will fail: an "activity" task
+    // naming a workflow execution that does not exist. `enforce_timeouts_once`
+    // returns Err on it, which before this fix short-circuited the whole pass
+    // before audit export ran.
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue          (id, queue_name, task_type, workflow_exec_id, status, run_at, timeout_at, attempts)          VALUES (gen_random_uuid(), 'default', 'activity', gen_random_uuid(), 'RUNNING',                  NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour', 0)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a poisoned due task");
+
+    let result = autumn_harvest::timeout::enforce_timeouts_once(
+        &mut conn,
+        &NoOpMetrics,
+        std::time::Duration::from_secs(300),
+        &None,
+        &[],
+        None,
+        None,
+        600,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        100,
+    )
+    .await;
+    uninstall();
+
+    // The pass may well report the enforcement failure -- that is not what this
+    // test is about. What matters is that the audit records went out anyway.
+    let _ = result;
+    assert_eq!(
+        sink.all_seqs(),
+        vec![1, 2, 3],
+        "audit export must run even when an earlier scanner resident fails on \
+         every tick; otherwise one undecodable task silently stops compliance \
+         delivery for the whole shard"
+    );
+    assert_eq!(cursor_acked(&mut conn, 0).await, 3);
+}
+
 // ── Redrive edge cases ──────────────────────────────────────────────────────
 
 #[tokio::test]

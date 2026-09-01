@@ -3359,8 +3359,42 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Off-box audit-record export (issue #953) runs FIRST, and its failures are
+    // logged rather than propagated. Both halves are deliberate, and both were
+    // wrong in an earlier revision that simply appended the call to the end of
+    // this function (Codex review round 26 P1).
+    //
+    // First, because a resident BEFORE it can `return Err` on every tick -- a
+    // task whose history will not decode, say, because its payload codec is
+    // unavailable -- and audit export would then never run on that shard again.
+    // Records would accumulate unexported, and because the lag gauge is written
+    // inside the export pass it would go stale rather than climb, so neither
+    // the threshold alert nor the absent-series alert could fire. A compliance
+    // gap that hides its own signal.
+    //
+    // Logged rather than propagated, because the mirror of that hazard is just
+    // as bad: an export failure must not stop timeout enforcement, SLA checks,
+    // session cleanup or codec rotation. This is the same "one failure must
+    // never stop the others" rule already applied per-shard inside
+    // `fire_due_audit_exports`, lifted to the residents of this loop.
+    let mut count = 0usize;
+    match crate::audit_export::fire_due_audit_exports(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+    )
+    .await
+    {
+        Ok(exported) => count += exported,
+        Err(error) => tracing::error!(
+            error = %error,
+            "[audit_export] export pass failed; continuing with the rest of the scanner"
+        ),
+    }
+
     let timed_out = find_timed_out_tasks(conn).await?;
-    let mut count = timed_out.len();
+    count += timed_out.len();
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -3457,13 +3491,6 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
-    // Off-box audit-record export (issue #953). Folded into this existing
-    // scanner cadence rather than spawning a background task of its own, like
-    // the residents above; a no-op returning `Ok(0)` before any query when no
-    // audit sink is configured.
-    count +=
-        crate::audit_export::fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
