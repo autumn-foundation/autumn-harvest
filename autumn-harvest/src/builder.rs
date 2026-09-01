@@ -4357,6 +4357,13 @@ impl WorkerConfig {
     }
 }
 
+// `GLOBAL_AUDIT_EXPORT_CONFIG` is a process-wide static, so the tests that
+// drive its installer directly must serialize against each other, exactly as
+// `completion_callback`'s `DIRECT_WORKER_INSTALL_TEST_SERIAL` does for the
+// #605 global (issue #953).
+#[cfg(all(test, feature = "db"))]
+static AUDIT_EXPORT_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7065,11 +7072,20 @@ mod tests {
         );
     }
 
-    /// The plugin runner publishes the global itself after its build
-    /// succeeds, so the conversion must not write it at all — not write it and
-    /// have it repaired later (issue #953, Codex review round 5 P1). A live
-    /// runtime's scanner ticking mid-build would otherwise export records to a
-    /// sink that never came into service, and no restore un-sends those.
+    /// The plugin runner publishes the global itself after its build succeeds,
+    /// so the conversion must not write it at all — not write it and have it
+    /// repaired later (issue #953, Codex review round 5 P1). A live runtime's
+    /// scanner ticking mid-build would otherwise export records to a sink that
+    /// never came into service, and no restore un-sends those.
+    ///
+    /// Asserts an **absence**, deliberately. `GLOBAL_AUDIT_EXPORT_CONFIG` is a
+    /// process-wide static and 33 other tests in this binary call
+    /// `into_worker_parts*`, each of which writes it; a test that asserted some
+    /// particular config was still installed afterwards would race them and
+    /// fail intermittently — which is exactly how the first version of this
+    /// test failed on CI while passing locally. "The global does not hold *this
+    /// builder's* uniquely identifiable config" cannot be made false by another
+    /// test installing something else, so it is stable under any interleaving.
     #[cfg(feature = "db")]
     #[test]
     fn deferring_the_install_leaves_the_global_untouched_through_conversion() {
@@ -7083,61 +7099,83 @@ mod tests {
             }
         }
 
-        let _serial = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
-            .write()
-            .map(|mut lock| *lock = None);
+        // A batch size no other test uses, so its presence in the global could
+        // only have come from this conversion.
+        const FINGERPRINT: i64 = 4_242;
 
-        // Stand in for a runtime already exporting in this process.
-        let live = std::sync::Arc::new(crate::audit_export::AuditExportRuntimeConfig {
-            sink: std::sync::Arc::new(Marker),
-            secret: crate::completion_callback::CallbackSecret::new(b"live".to_vec()),
-            batch_size: 11,
-            backoff: crate::audit_export::ExportBackoff::default(),
-            lease: std::time::Duration::from_secs(30),
-        });
-        if let Ok(mut lock) = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-            *lock = Some(live);
-        }
-
-        // A second runtime is built with its OWN sink and converted. With the
-        // install deferred, the conversion must not disturb the live config.
         let built = HarvestBuilder::new()
             .audit_export_sink(Marker)
-            .audit_export_secret(b"second".to_vec())
-            .audit_export_batch_size(99)
+            .audit_export_secret(b"deferred".to_vec())
+            .audit_export_batch_size(FINGERPRINT)
             .build()
             .deferring_audit_export_install();
-        let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
-
-        let observed = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
-            .read()
-            .expect("lock")
-            .clone()
-            .expect("the live runtime's config must still be installed");
-        assert_eq!(
-            observed.batch_size, 11,
-            "the conversion must not publish the second runtime's sink: a live \
-             scanner ticking here would export to a runtime that may never start"
+        assert!(
+            built.defer_audit_export_install,
+            "the opt-out must set the flag the conversion reads"
         );
 
-        // And without the opt-out the conversion still installs, so a direct
-        // core embedder is unaffected.
-        let built = HarvestBuilder::new()
-            .audit_export_sink(Marker)
-            .audit_export_secret(b"direct".to_vec())
-            .audit_export_batch_size(42)
-            .build();
         let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
-        let observed = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+
+        let installed_batch_size = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
             .read()
             .expect("lock")
-            .clone()
-            .expect("the direct-worker path must still install");
-        assert_eq!(observed.batch_size, 42);
+            .as_ref()
+            .map(|config| config.batch_size);
+        assert_ne!(
+            installed_batch_size,
+            Some(FINGERPRINT),
+            "the conversion must not publish this runtime's sink: a live \
+             scanner ticking here would export to a runtime that may never \
+             start, and the runner publishes it itself once startup succeeds"
+        );
+    }
 
-        if let Ok(mut lock) = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-            *lock = None;
+    /// The complement: a direct core embedder, who has no later publish step,
+    /// must still get their sink installed. Exercises the installer itself
+    /// rather than driving it through `into_worker_parts*`, so it does not race
+    /// the other 33 conversions in this binary — the same reason
+    /// `completion_callback`'s `direct_worker_install_tests` calls its
+    /// installer directly.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_direct_worker_path_still_installs_without_the_opt_out() {
+        struct Marker;
+        impl crate::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a crate::audit_export::AuditBatch<'a>,
+            ) -> crate::audit_export::SinkFuture<'a> {
+                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
+            }
         }
+
+        let _serial = AUDIT_EXPORT_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = crate::audit_export::AuditExportBuilderConfig {
+            sink: Some(std::sync::Arc::new(Marker)),
+            secret: Some(crate::completion_callback::CallbackSecret::new(
+                b"k".to_vec(),
+            )),
+            batch_size: 4_243,
+            ..crate::audit_export::AuditExportBuilderConfig::default()
+        };
+        crate::audit_export::install_global_audit_export_config_for_direct_worker(&config);
+        assert!(
+            crate::audit_export::is_configured(),
+            "a direct core worker with a sink must have it installed"
+        );
+
+        // And a later build with no sink must clear it, not leave the first
+        // runtime's destination in place.
+        crate::audit_export::install_global_audit_export_config_for_direct_worker(
+            &crate::audit_export::AuditExportBuilderConfig::default(),
+        );
+        assert!(
+            !crate::audit_export::is_configured(),
+            "a runtime built without a sink must stop the previous one's export"
+        );
     }
 
     #[test]
