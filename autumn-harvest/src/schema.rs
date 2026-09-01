@@ -538,6 +538,33 @@ diesel::table! {
         error_summary -> Nullable<Text>,
         shard_id -> Nullable<Int4>,
         source -> Text,
+        /// Dense per-shard export sequence assigned by the audit exporter
+        /// (issue #953). `NULL` until assigned; stays `NULL` forever when no
+        /// audit sink is configured.
+        export_seq -> Nullable<Int8>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Per-shard audit-export delivery cursor (issue #953). One row per shard,
+    /// living in that shard's own database and provisioned by the exporter
+    /// (a database cannot know its own shard id). `last_acked_seq` advances
+    /// only after the sink acknowledges a batch.
+    harvest_audit_export_cursor (shard_id) {
+        shard_id -> Int4,
+        last_assigned_seq -> Int8,
+        last_acked_seq -> Int8,
+        claim_epoch -> Int8,
+        lease_until -> Nullable<Timestamptz>,
+        next_attempt_at -> Timestamptz,
+        consecutive_failures -> Int4,
+        last_status -> Nullable<Int4>,
+        last_error -> Nullable<Text>,
+        last_delivered_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+        retired_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -1018,6 +1045,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workers,
     harvest_batch_jobs,
     harvest_audit_log,
+    harvest_audit_export_cursor,
     harvest_api_tokens,
     harvest_build_policies,
     harvest_build_compat,

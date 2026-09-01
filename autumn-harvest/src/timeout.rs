@@ -3359,8 +3359,50 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Off-box audit-record export (issue #953) runs FIRST, and its failures are
+    // logged rather than propagated. Both halves are deliberate, and both were
+    // wrong in an earlier revision that simply appended the call to the end of
+    // this function (Codex review round 26 P1).
+    //
+    // First, because a resident BEFORE it can `return Err` on every tick -- a
+    // task whose history will not decode, say, because its payload codec is
+    // unavailable -- and audit export would then never run on that shard again.
+    // Records would accumulate unexported, and because the lag gauge is written
+    // inside the export pass it would go stale rather than climb, so neither
+    // the threshold alert nor the absent-series alert could fire. A compliance
+    // gap that hides its own signal.
+    //
+    // Logged rather than propagated, because the mirror of that hazard is just
+    // as bad: an export failure must not stop timeout enforcement, SLA checks,
+    // session cleanup or codec rotation. This is the same "one failure must
+    // never stop the others" rule already applied per-shard inside
+    // `fire_due_audit_exports`, lifted to the residents of this loop.
+    let mut count = 0usize;
+    match crate::audit_export::fire_due_audit_exports(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+    )
+    .await
+    {
+        // Deliberately NOT folded into `count`, for the same reason the codec
+        // re-encryption sweep below keeps its own total out of it: `count` is
+        // the timeout-enforcement total, and the caller logs
+        // `warn!("enforced timed-out tasks")` whenever it is non-zero. Folding
+        // exported records in makes every healthy export tick claim a timeout
+        // that never happened -- a 500-record batch would report
+        // `enforced_count=500`. Export reports itself through
+        // `harvest.audit.export_*` instead.
+        Ok(_exported) => {}
+        Err(error) => tracing::error!(
+            error = %error,
+            "[audit_export] export pass failed; continuing with the rest of the scanner"
+        ),
+    }
+
     let timed_out = find_timed_out_tasks(conn).await?;
-    let mut count = timed_out.len();
+    count += timed_out.len();
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -4228,6 +4270,67 @@ mod tests {
                  execution lock and history load; after it, it is pointless"
             );
         }
+    }
+
+    /// Audit export must run before the first `?` in the pass, and its own
+    /// failure must never abort the pass (issue #953).
+    ///
+    /// Two directions, one hazard each:
+    ///
+    /// - **Export before the first `?`.** Every resident after the export call
+    ///   can return `Err` and end the tick. If export moved below one of them, a
+    ///   single permanently-failing resident — a task whose enforcement errors on
+    ///   every pass — would stop compliance delivery for the whole shard
+    ///   indefinitely, and the backlog would grow silently.
+    /// - **Export's own error swallowed.** Conversely, if the export call grew a
+    ///   `?`, a sink outage would abort timeout enforcement, SLA checks and
+    ///   session cleanup — letting a compliance feature take down the scanner.
+    ///
+    /// Source-level for the same reason as
+    /// `locked_deadline_reread_never_precedes_the_execution_lock` above: the
+    /// hazard is *statement order*, which no behavioural assertion can see.
+    ///
+    /// It is also the only form this guard can take. The natural dynamic test —
+    /// seed a due task whose enforcement fails, assert the export still happened
+    /// — cannot be written: `harvest_task_queue.workflow_exec_id` is a foreign
+    /// key, so a task naming a nonexistent execution cannot be inserted, and an
+    /// unregistered payload codec decodes to the `undecodable_marker` rather
+    /// than erroring (issue #608). There is no supported way to seed a
+    /// deterministically-failing resident.
+    #[test]
+    fn audit_export_runs_before_the_first_fallible_resident() {
+        let src = include_str!("timeout.rs");
+        let start = src
+            .find("pub async fn enforce_timeouts_once(")
+            .expect("enforce_timeouts_once must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub async fn ")
+            .map_or(body.len(), |o| o + 1);
+        let body = &body[..end];
+
+        let export = body
+            .find("fire_due_audit_exports(")
+            .expect("the pass must fire due audit exports");
+        let first_fallible = body
+            .find("find_timed_out_tasks(conn).await?")
+            .expect("the timed-out-task scan must stay the first fallible resident");
+        assert!(
+            export < first_fallible,
+            "audit export must run BEFORE the first resident that can `?` out of              the pass; below it, one permanently-failing task stops compliance              delivery for the whole shard"
+        );
+
+        let handled = &body[export..first_fallible];
+        assert!(
+            handled.contains("Err(error) => tracing::error!"),
+            "the export call must log and continue on error, never `?`; a sink              outage must not abort timeout enforcement for the shard"
+        );
+        assert!(
+            !handled.contains(
+                "fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"
+            ),
+            "the export call must not propagate its error with `?`"
+        );
     }
 
     /// The two deadline queries must differ only by `FOR UPDATE`, so the fast
