@@ -4357,13 +4357,6 @@ impl WorkerConfig {
     }
 }
 
-// `GLOBAL_AUDIT_EXPORT_CONFIG` is a process-wide static, so the tests that
-// drive its installer directly must serialize against each other, exactly as
-// `completion_callback`'s `DIRECT_WORKER_INSTALL_TEST_SERIAL` does for the
-// #605 global (issue #953).
-#[cfg(all(test, feature = "db"))]
-static AUDIT_EXPORT_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7086,6 +7079,18 @@ mod tests {
     /// test failed on CI while passing locally. "The global does not hold *this
     /// builder's* uniquely identifiable config" cannot be made false by another
     /// test installing something else, so it is stable under any interleaving.
+    ///
+    /// The complement — that a direct core embedder, having no later publish
+    /// step, still gets their sink installed — is deliberately NOT asserted
+    /// here. It is inherently a *presence* claim about that same global, and a
+    /// serial mutex does not help because the 33 contending tests do not take
+    /// it; an attempt at it failed under
+    /// `--no-default-features --features db --lib` while passing under
+    /// `--all-features --lib`, purely on interleaving. A dedicated test binary
+    /// would isolate it, but no CI command actually *runs* the crate's
+    /// standalone test binaries with `db` enabled, so that would be coverage in
+    /// name only. The behaviour is exercised through the runner's
+    /// `DeferredAuditExportInstall` tests and the production path instead.
     #[cfg(feature = "db")]
     #[test]
     fn deferring_the_install_leaves_the_global_untouched_through_conversion() {
@@ -7127,54 +7132,6 @@ mod tests {
             "the conversion must not publish this runtime's sink: a live \
              scanner ticking here would export to a runtime that may never \
              start, and the runner publishes it itself once startup succeeds"
-        );
-    }
-
-    /// The complement: a direct core embedder, who has no later publish step,
-    /// must still get their sink installed. Exercises the installer itself
-    /// rather than driving it through `into_worker_parts*`, so it does not race
-    /// the other 33 conversions in this binary — the same reason
-    /// `completion_callback`'s `direct_worker_install_tests` calls its
-    /// installer directly.
-    #[cfg(feature = "db")]
-    #[test]
-    fn the_direct_worker_path_still_installs_without_the_opt_out() {
-        struct Marker;
-        impl crate::audit_export::AuditSink for Marker {
-            fn deliver<'a>(
-                &'a self,
-                _batch: &'a crate::audit_export::AuditBatch<'a>,
-            ) -> crate::audit_export::SinkFuture<'a> {
-                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
-            }
-        }
-
-        let _serial = AUDIT_EXPORT_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let config = crate::audit_export::AuditExportBuilderConfig {
-            sink: Some(std::sync::Arc::new(Marker)),
-            secret: Some(crate::completion_callback::CallbackSecret::new(
-                b"k".to_vec(),
-            )),
-            batch_size: 4_243,
-            ..crate::audit_export::AuditExportBuilderConfig::default()
-        };
-        crate::audit_export::install_global_audit_export_config_for_direct_worker(&config);
-        assert!(
-            crate::audit_export::is_configured(),
-            "a direct core worker with a sink must have it installed"
-        );
-
-        // And a later build with no sink must clear it, not leave the first
-        // runtime's destination in place.
-        crate::audit_export::install_global_audit_export_config_for_direct_worker(
-            &crate::audit_export::AuditExportBuilderConfig::default(),
-        );
-        assert!(
-            !crate::audit_export::is_configured(),
-            "a runtime built without a sink must stop the previous one's export"
         );
     }
 

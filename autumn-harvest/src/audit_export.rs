@@ -2546,6 +2546,7 @@ mod tests {
     /// have reclaimed the shard and bumped the epoch — an acknowledgement from
     /// this attempt would be refused, and at consistently near-lease latency
     /// the cursor would never advance.
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn delivery_is_bounded_by_the_remaining_lease_not_the_whole_one() {
         struct SlowSink;
