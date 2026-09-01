@@ -233,8 +233,23 @@ pub fn reencrypt_event_payload_fields_under(
             outcome.fields_already_active += 1;
             continue;
         }
-        let plaintext = codecs.decode_payload(field)?;
-        staged.push((key, codecs.encode_payload_under(target_key_id, &plaintext)?));
+        // `field` was just confirmed to be a codec envelope by
+        // `codec_envelope_key_id` above, so `decode_payload_bytes` always
+        // returns `Some` here. Re-encryption migrates ciphertext only and
+        // never needs the plaintext parsed as JSON, so it stays as raw bytes
+        // straight through to `encode_payload_bytes_under` -- skipping the
+        // deserialize-then-reserialize round trip `decode_payload` +
+        // `encode_payload_under` would otherwise pay for every field.
+        let plaintext_bytes = codecs.decode_payload_bytes(field)?.ok_or_else(|| {
+            HarvestError::Config(
+                "field matched codec_envelope_key_id but decode_payload_bytes found no envelope"
+                    .to_string(),
+            )
+        })?;
+        staged.push((
+            key,
+            codecs.encode_payload_bytes_under(target_key_id, &plaintext_bytes)?,
+        ));
     }
 
     if staged.is_empty() {

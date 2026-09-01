@@ -905,6 +905,27 @@ impl PayloadCodecs {
     ///   the identity codec (see reason 1 above).
     /// - [`HarvestError`] when serialization or the codec's `encode` fails.
     pub fn encode_payload_under(&self, key_id: &str, payload: &Value) -> HarvestResult<Value> {
+        let raw = serde_json::to_vec(payload)?;
+        self.encode_payload_bytes_under(key_id, &raw)
+    }
+
+    /// [`PayloadCodecs::encode_payload_under`], taking raw plaintext bytes
+    /// rather than a `Value` to serialize (issue #948).
+    ///
+    /// Pairs with [`PayloadCodecs::decode_payload_bytes`] so the
+    /// re-encryption sweep ([`crate::codec_rotation`]) can migrate a field's
+    /// ciphertext onto a new key without ever parsing or re-serializing its
+    /// JSON structure — it rewrites ciphertext only and never needs the
+    /// decoded value.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_payload_under`].
+    pub(crate) fn encode_payload_bytes_under(
+        &self,
+        key_id: &str,
+        raw: &[u8],
+    ) -> HarvestResult<Value> {
         let codec = self
             .codec_for_key(key_id)
             .ok_or_else(|| HarvestError::UnknownCodecKey {
@@ -918,9 +939,8 @@ impl PayloadCodecs {
                  plaintext"
             )));
         }
-        let raw = serde_json::to_vec(payload)?;
         let encoded = codec
-            .encode(&raw)
+            .encode(raw)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
         Ok(Self::envelope(codec.codec_id(), key_id, &encoded))
     }
@@ -971,7 +991,46 @@ impl PayloadCodecs {
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(payload.clone());
         };
-        let codec = self.resolve_decoder(&parts).ok_or_else(|| {
+        let decoded = self.decode_envelope_bytes(&parts)?;
+        Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    /// [`PayloadCodecs::decode_payload`], stopping at the raw plaintext bytes
+    /// rather than parsing them as JSON (issue #948).
+    ///
+    /// The re-encryption sweep ([`crate::codec_rotation`]) migrates a field's
+    /// ciphertext from one registered key to another; it never inspects or
+    /// modifies the decoded structure, so parsing it into a `Value` here only
+    /// for [`PayloadCodecs::encode_payload_bytes_under`] to immediately
+    /// re-serialize it back to bytes is a deserialize-then-reserialize round
+    /// trip through `serde_json::Value`'s heap-backed `Map` that buys
+    /// nothing — paid on every field, of every row, of every sweep batch,
+    /// forever, on any deployment that rotates keys.
+    ///
+    /// Returns `Ok(None)` when `payload` is not a codec envelope, exactly
+    /// like [`codec_envelope_key_id`] returning `None`. The re-encryption
+    /// sweep has already confirmed `payload` names a key id via that function
+    /// before calling this one, so `None` is unreachable at its call site —
+    /// but it is returned rather than assumed, the same defensive choice
+    /// [`crate::codec_rotation::reencrypt_event_payload_fields_under`] makes
+    /// for its own "cannot happen" branch.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_payload`].
+    pub(crate) fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
+        let Some(parts) = codec_envelope_parts(payload) else {
+            return Ok(None);
+        };
+        Ok(Some(self.decode_envelope_bytes(&parts)?))
+    }
+
+    /// Decode one already-shape-verified envelope's ciphertext to raw
+    /// plaintext bytes. Shared by [`PayloadCodecs::decode_payload`] (which
+    /// parses the result as JSON) and [`PayloadCodecs::decode_payload_bytes`]
+    /// (which does not).
+    fn decode_envelope_bytes(&self, parts: &CodecEnvelopeParts<'_>) -> HarvestResult<Vec<u8>> {
+        let codec = self.resolve_decoder(parts).ok_or_else(|| {
             if parts.kid.is_some() {
                 HarvestError::UnknownCodecKey {
                     key_id: parts.key_id().to_string(),
@@ -986,10 +1045,9 @@ impl PayloadCodecs {
         let encoded = base64::engine::general_purpose::STANDARD
             .decode(parts.encoded_b64)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
-        let decoded = codec
+        codec
             .decode(&encoded)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
-        Ok(serde_json::from_slice(&decoded)?)
+            .map_err(|e| HarvestError::Config(e.to_string()))
     }
 
     /// Decode one already-shape-verified envelope, mapping every failure mode
