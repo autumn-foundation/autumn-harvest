@@ -55,11 +55,19 @@ fn init_sql() -> Vec<u8> {
 struct CapturingMetrics {
     deleted: Mutex<Vec<(String, u64)>>,
     summary_deleted: Mutex<Vec<(String, u64)>>,
+    /// Completed retention-loop iterations, counted from the janitor's
+    /// end-of-iteration liveness tick (#797). This is the only signal that a
+    /// whole tick finished — see `run_one_tick`.
+    completed_ticks: Mutex<u64>,
 }
 
 impl CapturingMetrics {
     fn summary_deleted(&self) -> Vec<(String, u64)> {
         self.summary_deleted.lock().unwrap().clone()
+    }
+
+    fn completed_ticks(&self) -> u64 {
+        *self.completed_ticks.lock().unwrap()
     }
 }
 
@@ -76,6 +84,10 @@ impl MetricsRecorder for CapturingMetrics {
             .lock()
             .unwrap()
             .push((workflow.to_string(), count));
+    }
+
+    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {
+        *self.completed_ticks.lock().unwrap() += 1;
     }
 }
 
@@ -300,13 +312,37 @@ async fn run_one_tick(
     metrics: Arc<CapturingMetrics>,
 ) -> autumn_harvest::retention::RetentionTickResult {
     let pools = ShardedDbPool::single(pool);
-    let runtime = RetentionRuntime::spawn(pools, config, metrics, None, None)
-        .expect("retention runtime should spawn when enabled");
+    let runtime = RetentionRuntime::spawn(
+        pools,
+        config,
+        Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+        None,
+        None,
+    )
+    .expect("retention runtime should spawn when enabled");
     runtime.run_now();
 
+    // Wait for the tick to FINISH, not for `ran_at`.
+    //
+    // `ran_at` is stamped by the history-retention phase, and later phases —
+    // the execution-summary GC, and partition maintenance on a partitioned
+    // shard — run after it in the same iteration. Waiting on `ran_at` and then
+    // calling `shutdown()` can therefore cancel the loop before the phase
+    // under test has run, which is a race every summary-GC assertion in this
+    // file depends on losing. It surfaced as a CI-only failure of
+    // `summary_gc_deletes_expired_and_emits_metric` under the partitioned
+    // layout, where the extra maintenance phase widened the window enough for
+    // the shutdown to win.
+    //
+    // The end-of-iteration liveness tick (#797) is unconditional and runs
+    // last, so observing it is exactly "the whole iteration completed".
+    let baseline = metrics.completed_ticks();
     let mut result = None;
-    for _ in 0..200 {
+    for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        if metrics.completed_ticks() <= baseline {
+            continue;
+        }
         let snap = runtime.monitor().snapshot();
         if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
             && r.ran_at.is_some()
