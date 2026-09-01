@@ -193,6 +193,9 @@ Everything spawned under a pinned parent stays on the parent's shard — this is
 
 So pinning the **root** of a workflow tree confines the whole tree.
 
+> **One deliberate exception (issue #956).** A spawn can opt *out* of that inheritance per call, with `ChildPlacement`. The default is unchanged and permanent — every entry in the table above still reads ✅ unless the calling code explicitly passes a non-default placement. A residency-bound tree must therefore keep the default; use `ChildPlacement::ResidencyKey` when a child genuinely has its own declared jurisdiction, and never `ChildPlacement::Distributed`. See *Cross-shard child placement* below.
+
+
 ### Worked example — a two-region EU/US deployment
 
 1. **Provision two databases**, one per region, and run `diesel migration run` against each.
@@ -254,6 +257,105 @@ When a worker crashes and its heartbeat times out, the `timeout.rs` scanner tran
 This is handled entirely within the shard where the task lives — no cross-shard coordination is needed for crash recovery.
 
 ---
+
+## Cross-shard child placement (issue #956)
+
+Children are pinned to the parent's shard by default, and that default is permanent. That is the right default — it keeps a whole workflow tree's ACID, residency and observability story shard-local — but it means a single orchestrator concentrates its entire fan-out's write load on one database. Adding shards helps top-level starts and does nothing for the child-heavy workloads that need sharding most.
+
+`ChildPlacement` is the opt-in, **per-spawn** escape hatch.
+
+```rust
+use autumn_harvest::shard::ChildPlacement;
+
+// Today's behaviour. The router is never even consulted.
+let a: Receipt = ctx.spawn_child_workflow(&process_one_info(), item).await?;
+
+// The same call, spread across `writable_shards`.
+let b: Vec<Receipt> = ctx
+    .spawn_child_workflow_fan_out_placed(
+        &process_one_info(),
+        items,
+        &ChildPlacement::Distributed,
+    )
+    .await?;
+```
+
+Every `spawn_child_workflow*` entry point has a `_placed` sibling taking a `&ChildPlacement`; the original methods delegate with `ChildPlacement::ParentShard`.
+
+| Variant | Resolution |
+|---|---|
+| `ParentShard` (default) | The parent's shard. Short-circuits **before** the router is consulted, so a deployment with no router installed is unaffected. |
+| `Distributed` | `ShardRouter::pick_for_new_workflow` over `writable_shards` — the same rendezvous function a top-level start uses. |
+| `Shard(id)` | An explicit pin, validated exactly like `ShardPlacement::Shard` (unknown or drained ⇒ rejected). |
+| `ResidencyKey(key)` | An explicit residency pin, resolved through the declared map (undeclared ⇒ rejected, never hashed). |
+
+### Restart stability
+
+A top-level start's rendezvous key is the caller-supplied `workflow_id`, which is stable by construction. A child's `ExecutionId` is minted fresh on every dispatch, so hashing *it* would re-roll the shard whenever a decision cycle is retried after a crash. `Distributed` instead hashes a deterministic per-parent key, `"{parent_exec_id}#{n}"`, so a retried cycle re-derives the identical shard for every slot — the same restart-stability contract top-level starts have.
+
+Placement is decided exactly once in a child's lifetime, on the **fresh dispatch**. Replay reuses the `child_id` recorded in `ChildWorkflowStarted` verbatim and never re-derives anything, so widening `writable_shards` cannot move an already-started child.
+
+### What crosses the shard boundary, and how
+
+The parent's decision transaction stays shard-local. Always. It never opens a second database.
+
+Instead, a cross-shard spawn writes **one row** into `harvest_cross_shard_children` on the parent's shard, in the same transaction as the parent's `ChildWorkflowStarted` / `ChildWorkflowSpawnedDetached` event. That row is not a message — it is the cross-shard child's lifecycle record on the parent's side, and all four cross-shard edges are transitions of it. `enforce_cross_shard_children` (part of the ordinary scanner tick, alongside #492's outbox scanners) drives them:
+
+| Edge | What the relay does | Dedupe key |
+|---|---|---|
+| Child start | Creates the child on the target shard, then marks the row `STARTED` | the child's `ExecutionId` is the primary key over there |
+| Cancel | Delivers an idempotent `cancel_workflow_execution` | a terminal target absorbs the cancel |
+| Terminal notify | Reads the child's terminal state, appends `ChildWorkflowCompleted`/`Failed` to the parent, wakes it, deletes the row — one transaction on the **parent's** shard | the append and the delete commit together |
+| Close cascade | Applies `RequestCancel`/`Terminate` on the target shard, records `ChildWorkflowCascadeApplied`, deletes the row | the cascade only acts on a `RUNNING`/`PAUSED` child |
+
+Note that the terminal notify is a **pull**, not a push. A push from the child's shard would leave a crash window between the child's terminal commit and the parent's notify; here there is nothing in flight to lose, so a crash at any instant simply leaves the durable row for the next sweep.
+
+### Consistency contract
+
+- **Per-execution ACID stays shard-local.** The parent's decision transaction touches one database; so does the child's. There is no two-phase commit and no cross-shard join.
+- **Cross-shard effects are at-least-once with dedupe** (the table above) — the same contract `enforce_external_signals_outbox` / `enforce_external_cancels_outbox` (#492) established.
+- **Latency, not correctness, is the price.** A cross-shard child's start and its terminal wake are each one scanner tick away rather than one transaction away.
+- **Placement never falls back silently.** A target shard this node has no pool for fails the spawn with the typed, retryable `HarvestError::ShardUnavailable`; the parent's decision cycle rolls back with nothing recorded and is re-driven once the shard is reachable. It is never quietly re-placed on the parent's shard.
+- **Zero event-schema impact.** No new `WorkflowEvent` variant and no change to the adjacently-tagged JSON contract. The child's shard is recoverable from the `child_id` recorded in `ChildWorkflowStarted`, so a parent replays byte-identically regardless of where its children live.
+- **Replay never re-resolves placement.** The router is consulted once, on the fresh dispatch; every later wake reuses the `child_id` already in history. This is what makes the byte-identical replay above true, and it also means a topology edit after dispatch — a shard removed, a residency mapping changed, a worker that has not installed its router yet — cannot fail a parent that is merely replaying.
+- **Restore every shard to the same instant.** A point-in-time restore that rolls shards back to *different* instants can leave a child alive on a target shard whose parent-side `ChildWorkflowStarted` and lifecycle row were rolled away — an orphan the relay cannot see, because it is driven entirely off that row. `harvest backup verify` derives its child checks from parent-side events, so it does not currently catch the reverse direction either (tracked in issue #1263). The same hazard exists for same-shard children; more databases simply make skew easier to produce. Restoring all shards to one common instant avoids it entirely.
+
+### Operating it
+
+`harvest_cross_shard_children` is the in-flight gauge:
+
+```sql
+-- In-flight cross-shard children on this shard, by target and lifecycle state.
+SELECT target_shard, status, cancel_requested, count(*)
+FROM harvest_cross_shard_children
+GROUP BY 1, 2, 3
+ORDER BY 1, 2;
+
+-- Rows that are not making progress name their own last failure.
+SELECT child_exec_id, target_shard, attempts, last_attempt_at, last_error
+FROM harvest_cross_shard_children
+WHERE attempts > 0
+ORDER BY attempts DESC
+LIMIT 20;
+
+-- Oldest still-unsettled child, per target shard: the backlog-age signal.
+SELECT target_shard, min(created_at) AS oldest, count(*) AS in_flight
+FROM harvest_cross_shard_children
+GROUP BY 1
+ORDER BY 2;
+```
+
+Every settled child deletes its row, so a steadily growing count means the relay is not draining — check `last_error` for an unreachable target shard first. `attempts` is written on **every** non-progress path (a failed step, an unreadable target shard, an unrecognised stored value), and it also drives the retry backoff: a row is re-tried after `min(attempts, 6) x 5s`, so one permanently-broken row backs off instead of consuming a slot in every sweep.
+
+There is **no dedicated metric** for the relay yet; the queries above and the `Timeout` scanner's existing `harvest.scanner.tick` liveness are the current signals. A `harvest.cross_shard_child.*` counter family is tracked in issue #1263, along with the payload-offloader gap on the relayed child's start event and the retention-window question for undelivered terminals. Per-execution metrics are unaffected: the relay threads the scanner's real recorder into its cancel, terminate and quota-admission calls, so `harvest.workflow.terminal` counts do not depend on where a child was placed.
+
+### Reading a cross-shard tree
+
+`GET /workflows/{id}/children` and `GET /workflows/{id}/tree` already traverse every shard, so a cross-shard child is visible without any new endpoint. Both now degrade rather than `500` when a shard is unreachable: they return the children they could see and name the rest in `unavailable_shards`, with `status` dropping to `partial` — the #756 contract, which cross-shard placement makes routine rather than exotic.
+
+> **Behaviour change for existing `/children` callers.** Before this, an unreachable shard produced a `500`. Now it produces a `200` whose `items` array is *incomplete*. A client that treated `200` as "this is the whole child list" must read `status` (or check `unavailable_shards` is empty) before drawing that conclusion. The fields are additive; the status code is the part that changed.
+
+The parent **detail** view (`GET /workflows/{id}`) resolves no children — it returns the execution row's own `parent_id` and nothing else — so there is nothing there to degrade.
 
 ## Operational Checklist
 

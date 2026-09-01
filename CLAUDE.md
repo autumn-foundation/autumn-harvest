@@ -18,6 +18,34 @@
 - Open pull requests as ready for review by default.
 - Create a draft PR only when the user explicitly asks for a draft.
 - Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
+## Database Migrations
+
+### Name every migration with a second-precision UTC timestamp
+
+Migration directories are `YYYYMMDDHHMMSS_snake_case_name`. Generate the prefix
+from the real clock at the moment you create it:
+
+```sh
+date -u +%Y%m%d%H%M%S      # e.g. 20260901130054
+```
+
+**Never use a day-only prefix with a zeroed time** (`YYYYMMDD000000`). Diesel
+takes the digits before the first underscore as the migration *version*, so a
+day-granularity prefix gives every migration authored on the same day the same
+version. Two branches in flight then collide, and the collision does not look
+like one: git sees two differently-named directories and merges them cleanly, so
+nothing conflicts until the duplicate version reaches a database.
+
+Migrations up to and including `20260728000000` predate this rule and keep their
+names — renaming a migration that has already been applied anywhere would orphan
+its `__diesel_schema_migrations` row. The rule binds new migrations only.
+
+When you renumber a migration that has not shipped, update every reference to its
+version string in the same commit (`grep -rn '<old-version>' docs/ autumn-harvest/`
+finds them): the upgrade guide's migration table, the changelog fragment and any
+plan or design doc that cites it. Those are how an operator matches a migration
+on disk to the note explaining what it does.
+
 ## Engine Invariants
 
 ### `harvest_events` is append-only — the sanctioned exceptions

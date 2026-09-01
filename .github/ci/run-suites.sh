@@ -98,7 +98,17 @@ do_run() {
     fi
 
     if ! run_cargo "${a[@]}"; then
-      note_failure "$crate/$target ($want)"
+      # Include the FILTER. Without it every failing row of the same
+      # (crate, target, osclass) prints an identical line — and the core rows
+      # are all `autumn-harvest/integration (linux)`, so "3 suites failed" named
+      # none of them. The per-suite `::group::` output that would identify them
+      # is often outside the log window the API will return for a long job, so
+      # the summary is the only place the name reliably survives.
+      if [ "$filter" != "-" ]; then
+        note_failure "$crate/$target ($want) -- $filter"
+      else
+        note_failure "$crate/$target ($want)"
+      fi
     fi
   done < <(records)
 }

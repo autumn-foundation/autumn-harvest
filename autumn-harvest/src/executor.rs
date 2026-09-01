@@ -801,6 +801,25 @@ pub async fn run_workflow(
     outcome
 }
 
+/// Run one decision cycle against a **caller-supplied** [`WorkflowContext`].
+///
+/// [`run_workflow`] builds the context itself from `(exec_id, history)`, which
+/// leaves no way to exercise the context's builder knobs — notably
+/// [`WorkflowContext::with_shard_router`] (issue #956), whose whole point is to
+/// resolve child placement without mutating the process-global router that every
+/// other test in the same binary shares.
+///
+/// Identical to [`run_workflow`] in every other respect: same suspension
+/// timeout, same panic containment, same outcome mapping.
+pub async fn run_workflow_with_context(
+    ctx: crate::context::WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> WorkflowOutcome {
+    let (outcome, _pending, _span) = drive_workflow(ctx, handler, input, None).await;
+    outcome
+}
+
 /// Register a candidate's declarative handlers onto a replay context.
 ///
 /// Mirrors the live worker's own registration loop so the two cannot drift; see

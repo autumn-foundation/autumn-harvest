@@ -596,6 +596,32 @@ pub enum HarvestError {
         current: Option<i64>,
     },
 
+    /// A shard this operation must reach is not available from this process.
+    ///
+    /// Raised when an opt-in cross-shard child placement (issue #956) resolves
+    /// to a shard that this node has no pool for, or whose pool cannot hand out
+    /// a connection. It is deliberately **not** a fallback: placing the child on
+    /// the parent's shard instead would break the placement contract silently,
+    /// which is exactly the failure mode issue #956 AC8 rules out.
+    ///
+    /// **Retryable.** Nothing was written — the caller (a parked parent whose
+    /// decision cycle rolled back, or the cross-shard relay) should retry once
+    /// the shard is reachable again. Classify it with
+    /// [`HarvestError::is_shard_unavailable`] rather than by matching the
+    /// variant, so a caller keeps compiling as this enum grows.
+    ///
+    /// Distinct from [`HarvestError::ShardFenced`], which means the shard *is*
+    /// reachable but this process has lost write authority over it and must
+    /// **not** retry.
+    #[error("shard {shard_id} is unavailable from this process: {reason}")]
+    ShardUnavailable {
+        /// The shard that could not be reached.
+        shard_id: i32,
+        /// Why it could not be reached (no pool configured, pool checkout
+        /// failed, ...).
+        reason: String,
+    },
+
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
     /// call failed permanently.
     ///
@@ -1159,6 +1185,16 @@ impl HarvestError {
             Self::WorkflowFailed { non_retryable, .. } => non_retryable.unwrap_or(false),
             _ => false,
         }
+    }
+
+    /// Is this a [`HarvestError::ShardUnavailable`]?
+    ///
+    /// A retryable "I cannot reach that shard right now" classification, kept
+    /// as a predicate so callers can classify without matching the variant —
+    /// this enum grows over releases (issue #956).
+    #[must_use]
+    pub const fn is_shard_unavailable(&self) -> bool {
+        matches!(self, Self::ShardUnavailable { .. })
     }
 
     /// Returns `true` if this is a
