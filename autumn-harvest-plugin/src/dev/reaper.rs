@@ -367,8 +367,11 @@ fn owner_is_the_recorded_one(record: &SessionRecord) -> bool {
 /// A live pid alone is not enough: pids are reused, and the window between a
 /// `SIGKILL`ed run and the next `cargo dev` is exactly where that happens. When
 /// the record predates start-token recording (or the platform cannot supply
-/// one), fall back to plain liveness — the `pg_ctl`-only stop path below is
-/// what keeps that case safe.
+/// one), this falls back to plain liveness.
+///
+/// **That fallback is not safe, and issue #1295 tracks fixing it.** The
+/// rationale it was written with — that the `pg_ctl`-only stop path below
+/// cannot signal the wrong process — does not hold: see `stop_orphan`.
 fn postmaster_is_the_recorded_one(record: &SessionRecord, pid: u32) -> bool {
     if !process_is_alive(pid) {
         return false;
@@ -381,13 +384,27 @@ fn postmaster_is_the_recorded_one(record: &SessionRecord, pid: u32) -> bool {
 
 /// Stop an orphaned cluster. Returns whether it is now confirmed stopped.
 ///
-/// `pg_ctl` is the only path that may signal, because it derives the pid from
-/// the data directory itself rather than trusting the record. A direct `kill`
-/// is used **only** when the recorded start token still matches, which proves
-/// the pid has not been reused — and on Windows there is no such token, so
-/// `pg_ctl` is the *only* path at all. That is why the record carries the
-/// `bin_dir` that started the cluster: without it, a force-killed run that had
-/// downloaded its own `PostgreSQL` would be unstoppable on Windows.
+/// A direct `kill` is used **only** when the recorded start token still matches,
+/// which proves the pid has not been reused — and on Windows there is no such
+/// token, so `pg_ctl` is the only path at all. That is why the record carries
+/// the `bin_dir` that started the cluster: without it, a force-killed run that
+/// had downloaded its own `PostgreSQL` would be unstoppable on Windows.
+///
+/// # `pg_ctl` is not the identity guarantee this once claimed (issue #1295)
+///
+/// An earlier version of this comment argued that `pg_ctl` is safe to run on a
+/// tokenless record "because it derives the pid from the data directory itself
+/// rather than trusting the record". That is wrong, and stating it stopped the
+/// gap being noticed. `pg_ctl stop` reads `postmaster.pid`, which a `SIGKILL`
+/// leaves **stale** — PostgreSQL only removes it on a clean shutdown — then
+/// checks `kill(pid, 0)` and signals. A reused pid passes that liveness check
+/// and nothing there verifies identity, so `pg_ctl` trusts a stale pid file
+/// exactly as much as this code would have trusted a stale record. The liveness
+/// check below runs only *after* the signal has gone out.
+///
+/// The fix is to treat unknown identity as a reason not to act, which needs a
+/// Windows `process_start_token` to avoid stranding every Windows session;
+/// tracked in #1295 alongside #1287.
 fn stop_orphan(
     binaries: Option<&PostgresBinaries>,
     record: &SessionRecord,
