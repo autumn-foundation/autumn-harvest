@@ -1,0 +1,451 @@
+# harvest-verify corpus oracle (issue #962)
+# ============================================================================
+#
+# This file is the SINGLE SOURCE OF TRUTH for what the analyzer must say about
+# every `#[workflow]` fn in `autumn-harvest-verify/corpus/`. It is consumed by
+# `autumn-harvest-verify/tests/corpus.rs`, which asserts a *bijection* between
+# the rows here and the workflows actually present in the corpus sources — so a
+# new corpus module without a row, or a row without a module, fails the build.
+#
+# ── Naming convention ───────────────────────────────────────────────────────
+#
+# Each corpus module file `src/wf_<case>.rs` contains exactly ONE `#[workflow]`
+# fn, and that fn has THE SAME NAME as its module. The `workflow` key is
+# therefore always three segments:
+#
+#     <rust_crate_name>::<module>::<fn>
+#     e.g. harvest_verify_corpus_seeded::wf_uuid_in_helper::wf_uuid_in_helper
+#
+# `<rust_crate_name>` is the Cargo package name with hyphens replaced by
+# underscores (what `rustc --emit=mir` prints and what
+# `WorkflowVerdict::workflow` carries). The `crate` key below is the *Cargo
+# package* name, hyphens intact, as passed to `cargo -p`.
+#
+# ── Schema ──────────────────────────────────────────────────────────────────
+#
+#   schema_version   int      Bumped when the key set changes.
+#   [[workflow]]              One table per `#[workflow]` fn. Keys:
+#     crate          string   Cargo package name (hyphenated).
+#     workflow       string   Fully-qualified path, see above.
+#     verdict        string   "proven-deterministic" | "nondeterminism-found"
+#                             | "unknown". Matches `Verdict::name()`.
+#     mechanism      string   What actually diverges, in one line.
+#     launder        string   Why the syntactic layer (HVG001-HVG011 +
+#                             DET001-DET011) reports nothing. Every seeded row
+#                             must name a concrete structural reason, not "it is
+#                             in another file".
+#     trace_contains array    Substrings that must ALL appear somewhere in the
+#                             finding — its hops' `step`, its `source.what`, its
+#                             `sink.what` or its `message`. Helper fn names,
+#                             static names, and `[T := HashMap` for the generic
+#                             case. Only meaningful for "nondeterminism-found";
+#                             empty otherwise.
+#     boundary       string   Kebab-case `BoundaryKind::name()` that MUST be
+#                             among the reported boundaries. Required for
+#                             "unknown", absent otherwise.
+#     mandatory      string   Optional AC3 tag, "AC3-1".."AC3-5", marking the
+#                             five cases the acceptance criterion names
+#                             explicitly.
+#
+# ── Counts the test enforces ────────────────────────────────────────────────
+#
+#   >= 22 rows with verdict "nondeterminism-found"  (the seeded corpus; AC3 and
+#         the >= 90% detection metric are computed against exactly these)
+#   >= 10 rows with verdict "proven-deterministic"  (the false-positive corpus)
+#   >=  4 rows with verdict "unknown"               (the honesty corpus)
+#   all of AC3-1 .. AC3-5 present exactly once
+#
+# `unknown` NEVER counts as a detection. A seeded row that comes back `unknown`
+# is a miss, and the detection ratio is computed live from the run — never
+# hard-coded.
+
+schema_version = 1
+
+# ════════════════════════════════════════════════════════════════════════════
+# SEEDED — must be `nondeterminism-found` with a named trace (29 rows)
+# ════════════════════════════════════════════════════════════════════════════
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashmap_generic_dispatch::wf_hashmap_generic_dispatch"
+verdict = "nondeterminism-found"
+mandatory = "AC3-1"
+mechanism = "HashMap iteration order fixes the activity dispatch order"
+launder = "map is a fn PARAMETER (HVG011/DET010 track only local bindings) and the iteration is `<T as IntoIterator>` inside a generic helper in another crate"
+trace_contains = ["pairs", "[T := HashMap", "execute_activity_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_static_counter_in_helper::wf_static_counter_in_helper"
+verdict = "nondeterminism-found"
+mandatory = "AC3-2"
+mechanism = "static AtomicU64 counter becomes the activity idempotency key"
+launder = "HVG007 matches only `.lock()` on an uppercase receiver IN THE BODY; `fetch_add` is unmodeled and the static is one crate away"
+trace_contains = ["next_seq", "SEQ", "execute_activity_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_refcell_captured_state::wf_refcell_captured_state"
+verdict = "nondeterminism-found"
+mandatory = "AC3-3"
+mechanism = "ambient thread-local RefCell cursor incremented into a command argument"
+launder = "neither layer has ANY interior-mutability rule; the mutation is in a caller closure invoked from another crate"
+trace_contains = ["with_page_cursor", "PAGE_CURSOR", "borrow_mut"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_systemtime_two_crates_deep::wf_systemtime_two_crates_deep"
+verdict = "nondeterminism-found"
+mandatory = "AC3-4"
+mechanism = "SystemTime::now two crates deep becomes the child workflow input"
+launder = "HVG001 is body-only; DET001 resolves one hop SAME-FILE SAME-MODULE, and the clock read is two crates away"
+trace_contains = ["batch_label", "stamp", "SystemTime::now", "spawn_child_workflow_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_rand_behind_dyn::wf_rand_behind_dyn"
+verdict = "nondeterminism-found"
+mandatory = "AC3-5"
+mechanism = "rand::random behind `dyn Jitter` sets a StartTimer duration"
+launder = "call site is `<dyn Jitter as Jitter>::ms`; no rand token in the body or any same-module helper. Exactly ONE impl is unsized in the analyzed set, so RTA-lite must devirtualize to `Live` rather than report unknown"
+trace_contains = ["default_jitter", "Live", "random", "timer"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_cell_ambient_counter::wf_cell_ambient_counter"
+verdict = "nondeterminism-found"
+mechanism = "thread-local Cell hit counter written into an activity argument"
+launder = "`Cell` and `LocalKey::with` appear in no HVG rule and no DET pattern; read is one crate away"
+trace_contains = ["bump_hits", "HITS"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_static_mutex_queue::wf_static_mutex_queue"
+verdict = "nondeterminism-found"
+mechanism = "static Mutex<Vec<_>> drained; both the elements and their count are ambient"
+launder = "HVG007 needs `.lock()` on an uppercase receiver IN THE BODY; DET has no lock rule at all"
+trace_contains = ["drain_pending", "PENDING"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_rwlock_config_read::wf_rwlock_config_read"
+verdict = "nondeterminism-found"
+mechanism = "static RwLock read sizes the fan-out window recorded in history"
+launder = "`.read()` is not `.lock()`, so HVG007 misses it even written inline; DET has no RwLock pattern"
+trace_contains = ["window_size", "WINDOW"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_atomic_shard_pick::wf_atomic_shard_pick"
+verdict = "nondeterminism-found"
+mechanism = "atomic round-robin cursor selects WHICH activity is emitted; every argument is constant"
+launder = "no ambient token in the body; only Control taint finds it, and neither layer models control dependence"
+trace_contains = ["shard_of", "ROUND"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashset_via_trait_method::wf_hashset_via_trait_method"
+verdict = "nondeterminism-found"
+mechanism = "HashSet iteration inside a trait impl fixes the dispatch order"
+launder = "the call is `<HashSet<String> as Plan>::steps` in another crate; the body's `for` iterates a Vec, so HVG011/DET010 see nothing"
+trace_contains = ["steps", "HashSet"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_collect_into_hashmap_then_reiterate::wf_collect_into_hashmap_then_reiterate"
+verdict = "nondeterminism-found"
+mechanism = "order destroyed inside a helper by collecting clean input into a HashMap and re-iterating it"
+launder = "no HashMap token in the body at all; the re-iteration is a 2-adaptor chain on a temporary, which `iterated_hash_local` rejects by design"
+trace_contains = ["normalize", "HashMap"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashmap_keys_next::wf_hashmap_keys_next"
+verdict = "nondeterminism-found"
+mechanism = "`keys().next()` picks a key by hash position; it becomes the child workflow input"
+launder = "the map is a fn PARAMETER of the helper, never tracked; `keys()` outside a `for` header is unmodeled by both layers"
+trace_contains = ["any_key", "keys"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashmap_adaptor_chain_fanout::wf_hashmap_adaptor_chain_fanout"
+verdict = "nondeterminism-found"
+mechanism = "four-adaptor chain over a HashMap struct field selects and orders the fan-out"
+launder = "in the BODY, with no hiding: HVG011 fires only from `visit_expr_for_loop`; struct fields are never tracked and chains longer than one method are rejected by design"
+trace_contains = ["HashMap", "wf_hashmap_adaptor_chain_fanout", "execute_activity_fan_out_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_instant_elapsed_field::wf_instant_elapsed_field"
+verdict = "nondeterminism-found"
+mechanism = "Instant::elapsed against a process-start Instant feeds an activity argument"
+launder = "HVG001 and DET001 both match only the CONSTRUCTORS `Instant::now`/`SystemTime::now`; neither has an `.elapsed()` pattern, so this escapes even written inline"
+trace_contains = ["remaining_secs", "elapsed_secs", "elapsed"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_time_dependent_timer_duration::wf_time_dependent_timer_duration"
+verdict = "nondeterminism-found"
+mechanism = "wall-clock value used as a StartTimer DURATION; no activity argument changes"
+launder = "HVG001 body-only, DET001 one hop same-module; the clock read is two crates away"
+trace_contains = ["backoff_secs", "stamp", "timer"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_tainted_child_workflow_input::wf_tainted_child_workflow_input"
+verdict = "nondeterminism-found"
+mechanism = "static atomic wrapped in a serde struct and sent as the child workflow input"
+launder = "HVG007 needs `.lock()` on an uppercase body receiver; `SEQ.load` is unmodeled and one crate away. Taint must survive a struct aggregate and a by-value move"
+trace_contains = ["seed", "SEQ", "spawn_child_workflow_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_conditional_command_emission::wf_conditional_command_emission"
+verdict = "nondeterminism-found"
+mechanism = "an env-derived OnceLock flag decides whether the `mirror` command is emitted at all"
+launder = "DET004 has NO `var_os` pattern; HVG003 has one but is body-only; the memoizing OnceLock is unmodeled by both. The trace must name exactly ONE sink - `primary` post-dominates the join and is not control-dependent"
+trace_contains = ["flag", "FLAGS", "env_region", "var_os"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_order_dependence_which_first::wf_order_dependence_which_first"
+verdict = "nondeterminism-found"
+mechanism = "an ambient bool decides WHICH of two activities runs first; both argument sets are constant"
+launder = "no argument is tainted anywhere, so a value-only model reports nothing; HVG007 wants `.lock()` in the body and DET has no atomic rule"
+trace_contains = ["hot_path", "ROUND"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_closure_captures_ambient::wf_closure_captures_ambient"
+verdict = "nondeterminism-found"
+mechanism = "a closure whose body reads a static multiplier, invoked in another crate over every item"
+launder = "the closure body is a SEPARATE MIR item reached only via `<{closure@..} as Fn>::call`; a closure has no name for det_check's one-hop resolver to match"
+trace_contains = ["apply_all", "closure#0", "factor", "FACTOR"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_env_var_os_in_helper::wf_env_var_os_in_helper"
+verdict = "nondeterminism-found"
+mechanism = "`std::env::var_os` two crates deep selects the child workflow name"
+launder = "a PATTERN-TABLE GAP: DET004 lists `env::var(`/`env::vars(`/`env::args(` but NOT `var_os`, so this passes det_check even same-module; HVG003 has `var_os` but is body-only"
+trace_contains = ["region", "env_region", "var_os", "spawn_child_workflow_raw"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_thread_id_branch::wf_thread_id_branch"
+verdict = "nondeterminism-found"
+mechanism = "a hash of the OS thread id decides which activity is emitted"
+launder = "no rule in either layer mentions `thread::current`, `ThreadId` or `DefaultHasher`; HVG005/DET007 cover `thread::spawn`, a different thing"
+trace_contains = ["worker_slot_parity", "worker_slot", "thread"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_process_id_payload::wf_process_id_payload"
+verdict = "nondeterminism-found"
+mechanism = "std::process::id embedded in an activity payload"
+launder = "DET005 knows `process::id(` but is a WARNING (never blocks) and resolves one hop same-module; there is no HVG twin at all"
+trace_contains = ["origin_tag", "process"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_uuid_in_helper::wf_uuid_in_helper"
+verdict = "nondeterminism-found"
+mechanism = "Uuid::new_v4 in a helper becomes the activity idempotency key"
+launder = "HVG002 and DET003 both list this EXACT call - one crate boundary turns fully-covered rules into a false negative. The cleanest proof that rule coverage is not protection"
+trace_contains = ["idem_key", "new_v4"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_tokio_sleep_in_helper::wf_tokio_sleep_in_helper"
+verdict = "nondeterminism-found"
+mechanism = "a FORBIDDEN EFFECT, not a taint flow: tokio::time::sleep awaited from a helper"
+launder = "HVG004/DET006 list the call exactly and are body-only / same-module. Taint analysis alone reports nothing here - the sleep feeds no sink - so a reachability-only forbidden-effect table is required"
+trace_contains = ["pace", "sleep"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_rand_in_helper_branch::wf_rand_in_helper_branch"
+verdict = "nondeterminism-found"
+mechanism = "rand::random in a helper decides whether a command is emitted at all"
+launder = "HVG002/DET002 are body-only / same-module; and the tainted value reaches only a BRANCH, never an argument, so a value-only model would miss it even across the crate boundary"
+trace_contains = ["coin", "random"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_three_hop_chain::wf_three_hop_chain"
+verdict = "nondeterminism-found"
+mechanism = "SystemTime::now at the leaf of a three-call chain reaches an activity argument"
+launder = "det_check resolves exactly ONE hop, same file and same module, so even the first link is out of reach; the trace must render every intermediate hop"
+trace_contains = ["::a", "::b", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_replay_varying_ctx_read::wf_replay_varying_ctx_read"
+verdict = "nondeterminism-found"
+mechanism = "`ctx.history_event_count()` read in a helper - short live, long on replay - feeds an activity argument"
+launder = "neither layer models WorkflowContext semantics at all, so this is invisible even inline; the helper is also in a different module and file, where `resolve_helper` stops"
+trace_contains = ["replay_phase", "history_event_count"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_threadlocal_refcell_seq::wf_threadlocal_refcell_seq"
+verdict = "nondeterminism-found"
+mechanism = "thread_local RefCell sequence incremented in a helper feeds an activity argument"
+launder = "no HVG or DET rule mentions `thread_local`, `LocalKey`, `RefCell` or `borrow_mut`; the analyzer must follow `LocalKey::with`'s closure and the promoted-const indirection"
+trace_contains = ["next_tl_seq", "TL_SEQ", "borrow_mut"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashmap_join_string::wf_hashmap_join_string"
+verdict = "nondeterminism-found"
+mechanism = "hash order collapsed into a value by `join` - a NON-commutative fold over HashMap::values"
+launder = "no HashMap token in the body; the iteration is an adaptor chain in another crate over a fn parameter. Pins the order-killing reduction list to len/count/integer sum/max/min - if `join` ever leaks into it, this flips to proven"
+trace_contains = ["values_joined", "values", "join"]
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLEAN — must be `proven-deterministic` (13 rows)
+# ════════════════════════════════════════════════════════════════════════════
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_ctx_system_now::wf_ctx_system_now"
+verdict = "proven-deterministic"
+mechanism = "ctx.system_now() -> activity argument"
+launder = "n/a - sanctioned primitive (AC4); the instant is recorded in history and replayed verbatim, so its value is a clean root"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_ctx_random::wf_ctx_random"
+verdict = "proven-deterministic"
+mechanism = "ctx.random_u64() and ctx.random_uuid(label) -> activity arguments"
+launder = "n/a - sanctioned primitives (AC4); both lower onto a recorded side-effect event"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_ctx_side_effect::wf_ctx_side_effect"
+verdict = "proven-deterministic"
+mechanism = "ctx.side_effect whose CLOSURE reads SystemTime::now two crates deep"
+launder = "n/a - the sharpest AC4 test: the analyzer must NOT descend into a side_effect closure. The value is recorded once and replayed; descending finds a real source and reports a false positive"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_ctx_version_branch::wf_ctx_version_branch"
+verdict = "proven-deterministic"
+mechanism = "`ctx.version(..)` gate emitting a different command sequence per branch"
+launder = "n/a - `version` is deterministic, so the branch is control-CLEAN. A naive 'switchInt on any call result' rule flags every versioned workflow in the repo: the most likely false positive in real code"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_btreemap_dispatch::wf_btreemap_dispatch"
+verdict = "proven-deterministic"
+mechanism = "BTreeMap iteration drives activity dispatch"
+launder = "n/a - BTreeMap iterates in key order, fixed by the data and not by a per-process hash seed; Order sources must be restricted to hash-backed containers"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_sorted_keys::wf_sorted_keys"
+verdict = "proven-deterministic"
+mechanism = "HashMap keys collected, sorted, then iterated"
+launder = "n/a - this is verbatim the `alternative` text DET010/HVG011 print as the recommended fix. An analyzer that flags its own layer's fix will be turned off"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_collect_into_btreemap::wf_collect_into_btreemap"
+verdict = "proven-deterministic"
+mechanism = "hash-ordered data sanitized by `collect::<BTreeMap<_, _>>()` before iteration"
+launder = "n/a - the sanitizer is the collect TARGET TYPE. Mirror image of wf_collect_into_hashmap_then_reiterate, which must be found"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_metrics_with_ambient_label::wf_metrics_with_ambient_label"
+verdict = "proven-deterministic"
+mechanism = "a genuinely ambient (process-id derived) label passed to ctx.metrics().counter"
+launder = "n/a - AC4: UserMetrics is replay-suppressed and emits NO command, so it is a non-sink. Tainted data reaching a non-sink is not a finding"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_logger_ambient::wf_logger_ambient"
+verdict = "proven-deterministic"
+mechanism = "a static-derived sequence formatted into ctx.logger().info(..)"
+launder = "n/a - the replay-aware logger pushes no durable command; it is the blessed FIX for DET009/HVG009 and must not itself be flagged"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_hashmap_lookup_only::wf_hashmap_lookup_only"
+verdict = "proven-deterministic"
+mechanism = "a HashMap used only for keyed `get`, `len`, and an integer `values().sum()`"
+launder = "n/a - order-killing reductions. Counterexample: wf_hashmap_join_string uses `join` over the same iterator and must be found"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_local_refcell_no_escape::wf_local_refcell_no_escape"
+verdict = "proven-deterministic"
+mechanism = "a RefCell constructed in the body, mutated over deterministic input, never escaping"
+launder = "n/a - what matters is the ROOT of the place, not the type: a locally-allocated cell is a clean root. Mirror image of wf_refcell_captured_state, whose cell is ambient"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_try_on_clean_result::wf_try_on_clean_result"
+verdict = "proven-deterministic"
+mechanism = "`?` on a clean Result: a `switchInt` on a ControlFlow discriminant with sinks after it"
+launder = "n/a - Control taint follows the TAINT OF THE SWITCH OPERAND, not the presence of a branch; otherwise every `?` in every workflow is a finding"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_helper_emits_clean_activity::wf_helper_emits_clean_activity"
+verdict = "proven-deterministic"
+mechanism = "a helper taking &WorkflowContext emits the commands itself, with arguments derived only from its parameters"
+launder = "n/a - sinks are not confined to the workflow body; a helper containing a sink is ordinary good code. The analyzer must not treat 'touches ctx' as unanalyzable"
+trace_contains = []
+
+# ════════════════════════════════════════════════════════════════════════════
+# BOUNDARY — must be `unknown` with a NAMED boundary (4 rows)
+# ════════════════════════════════════════════════════════════════════════════
+
+[[workflow]]
+crate = "harvest-verify-corpus-boundary"
+workflow = "harvest_verify_corpus_boundary::wf_dyn_unknown_impl::wf_dyn_unknown_impl"
+verdict = "unknown"
+boundary = "dyn-dispatch"
+mechanism = "two concrete types are unsized into `dyn Fetcher` in the analyzed set; which one reaches `.get()` is a runtime choice"
+launder = "n/a - RTA-lite has TWO candidates and must not pick one. `proven` would be unsound (one impl reads the clock); `found` would be a false positive on the other path. Paired with wf_rand_behind_dyn (one impl, resolvable, must be FOUND) so the metric cannot be gamed by guessing"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-boundary"
+workflow = "harvest_verify_corpus_boundary::wf_fn_pointer::wf_fn_pointer"
+verdict = "unknown"
+boundary = "indirect-call"
+mechanism = "a `fn(&[u32]) -> u32` obtained from a helper and called indirectly"
+launder = "n/a - MIR emits `_0 = move _1(move _2)`: the callee operand is a local, not a path, so there is no name to resolve and not even a trait whose implementors could be enumerated"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-boundary"
+workflow = "harvest_verify_corpus_boundary::wf_extern_c::wf_extern_c"
+verdict = "unknown"
+boundary = "ffi"
+mechanism = "a helper calls `abs` from an `unsafe extern \"C\"` block"
+launder = "n/a - a foreign function has no MIR body to summarize. `abs` is in fact pure, which is the point: the verdict is `unknown` because the analyzer CANNOT KNOW, not because the call is suspicious"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-boundary"
+workflow = "harvest_verify_corpus_boundary::wf_raw_pointer_static_mut::wf_raw_pointer_static_mut"
+verdict = "unknown"
+boundary = "unsafe-raw-pointer"
+mechanism = "`static mut TICK` read through `std::ptr::read(&raw const TICK)` in a helper"
+launder = "n/a - the place's root is a pointer local, so the `allocN (static: NAME)` footer that resolves ordinary static reads does not apply. `static mut` specifically IS knowable with a points-to pass; the rule that fires is the general raw-pointer one, and the conservative answer is pinned here deliberately"
+trace_contains = []
