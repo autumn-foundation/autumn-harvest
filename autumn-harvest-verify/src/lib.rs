@@ -92,6 +92,9 @@ pub struct Cli {
     /// Analyze this binary target (repeatable).
     #[arg(long = "bin", value_name = "NAME")]
     pub bin: Vec<String>,
+    /// Analyze this integration-test target — `tests/NAME.rs` (repeatable).
+    #[arg(long = "test", value_name = "NAME")]
+    pub test: Vec<String>,
     /// Comma-separated feature list passed to cargo (repeatable).
     #[arg(long, value_name = "FEATURES")]
     pub features: Vec<String>,
@@ -99,6 +102,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_default_features: bool,
     /// Build into this directory instead of `<workspace>/target/harvest-verify`.
+    /// A relative path resolves against the workspace root, not the current
+    /// directory, so one emit directory is not silently split into several.
     #[arg(long, value_name = "DIR")]
     pub target_dir: Option<std::path::PathBuf>,
     /// Analyze pre-emitted `.mir` files or directories instead of building (repeatable).
@@ -215,6 +220,7 @@ fn run(cli: &Cli) -> Result<Report> {
         examples: cli.example.clone(),
         all_examples: cli.all_examples,
         bins: cli.bin.clone(),
+        tests: cli.test.clone(),
         features: cli.features.clone(),
         no_default_features: cli.no_default_features,
         target_dir: cli.target_dir.clone(),

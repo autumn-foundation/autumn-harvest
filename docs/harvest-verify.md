@@ -139,7 +139,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.09.0, rustc rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.09.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -158,10 +158,9 @@ Three things about that footer are worth knowing before you quote it:
   the same order. It says what the analyzer *cannot* see in general; the
   boundaries actually hit in a run appear on the individual workflows, as
   `unknown:` lines.
-- **`rustc rustc 1.98.0 …` really does print the word twice.** The recorded
-  version string already begins with `rustc`, and the header prefixes it again.
-  Cosmetic, and left described rather than quietly tidied so the page matches the
-  binary.
+- **The rustc string is the whole `rustc -V` line.** It already begins with the
+  word `rustc`, so the header does not prefix it again. (It used to, and printed
+  `rustc rustc 1.98.0 …`; the header now interpolates the line as it stands.)
 - **The version-mismatch warning overstates its guarantee.** A change to the MIR
   *grammar* does surface as a `mir-parse` boundary. A change to how rustc
   *spells a type* does not: the parser reads it fine and a model row silently

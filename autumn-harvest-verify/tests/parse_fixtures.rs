@@ -2,7 +2,7 @@
 //!
 //! Every expectation in this file was read off the fixture by hand; see
 //! `tests/fixtures/RUSTC_VERSION.txt` for the exact toolchain and the commands
-//! that produced each `.mir`. RED phase: `mir::parse` is `todo!()`.
+//! that produced each `.mir`.
 
 use std::path::{Path, PathBuf};
 
@@ -221,6 +221,7 @@ fn spike_call_terminator_shape_is_exact() {
         args,
         target,
         unwind,
+        ..
     } = &block(wf, "bb1").terminator
     else {
         panic!(
@@ -742,12 +743,13 @@ fn empty_and_whitespace_input_is_an_empty_doc() {
     }
 }
 
-// ── pure-logic sanity (already implemented in the scaffold: expected GREEN) ──
+// ── pure-logic sanity ───────────────────────────────────────────────────────
 
 #[test]
 fn terminator_successors_excludes_unwind_edges() {
     let call = Terminator::Call {
         dest: local(0),
+        dest_ty: None,
         callee: Some("f".to_string()),
         indirect: None,
         args: Vec::new(),
@@ -762,6 +764,7 @@ fn terminator_successors_excludes_unwind_edges() {
 
     let diverging = Terminator::Call {
         dest: local(0),
+        dest_ty: None,
         callee: Some("panic".to_string()),
         indirect: None,
         args: Vec::new(),

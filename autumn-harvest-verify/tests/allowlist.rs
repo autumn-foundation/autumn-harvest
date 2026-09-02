@@ -1,6 +1,4 @@
 //! Allowlist loading and validation (D9): an escape hatch that cannot be used silently.
-//!
-//! RED phase: `Allowlist::load`, `validate`, `justification` and `unused` are `todo!()`.
 
 use std::collections::BTreeSet;
 use std::io::Write;

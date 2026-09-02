@@ -1,7 +1,4 @@
 //! CLI surface and exit-code contract (D10), exercised through the real binary.
-//!
-//! RED phase: `cli_main` is `todo!()`, so every invocation currently aborts with
-//! a panic (exit 101) instead of the contracted 0/1/2.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -72,8 +69,9 @@ fn the_cargo_subcommand_token_is_tolerated() {
 
 #[test]
 fn list_boundaries_prints_every_boundary_name() {
-    // API GAP: the `--list-boundaries` flag proposed below. It is what the
-    // core-crate docs guard (D11) diffs the report's boundary table against.
+    // `--list-boundaries` is the machine-readable half of the docs guard in
+    // D11: the feasibility report's boundary table is diffed against this
+    // output, so a boundary cannot be added to the code without appearing there.
     let out = run(&["--list-boundaries"]);
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
     let text = stdout(&out);
@@ -283,13 +281,3 @@ fn an_unknown_flag_is_a_usage_error() {
     assert_ne!(code(&out), 0);
     assert!(!stderr(&out).is_empty());
 }
-
-// ── API GAP ─────────────────────────────────────────────────────────────────
-//
-// ```rust
-// // The CLI must accept, in addition to the D10 list:
-// //   --list-boundaries   print one `BoundaryKind::name()` per line and exit 0.
-// // It is the machine-readable half of the docs guard in D11: the report's
-// // boundary table is diffed against this output, so a boundary can never be
-// // added to the code without appearing in the feasibility report.
-// ```

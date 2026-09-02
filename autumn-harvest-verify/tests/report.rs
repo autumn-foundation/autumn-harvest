@@ -1,7 +1,7 @@
 //! Report rendering, the summary triple and the exit-code contract (D9, D10).
 //!
-//! RED phase: `Report::summary`, `exit_code` and `render_text` are `todo!()`;
-//! `render_json` is already real, so the round-trip half is the JSON contract.
+//! `Report::summary`, `exit_code` and `render_text` are exercised here, plus
+//! the `render_json` round trip that is the machine-readable half of D10.
 
 use autumn_harvest_verify::report::{Report, Summary};
 use autumn_harvest_verify::verdict::{

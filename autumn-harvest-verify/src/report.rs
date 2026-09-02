@@ -78,9 +78,12 @@ impl Report {
     #[must_use]
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        // `rustc_version` is the whole `rustc -V` line — "rustc 1.98.0 (…)" —
+        // so it already carries the word. Prefixing it again printed
+        // `rustc rustc 1.98.0 (…)` in every report and every CI log.
         let _ = writeln!(
             out,
-            "harvest-verify: model {}, rustc {}",
+            "harvest-verify: model {}, {}",
             self.model_version, self.rustc_version
         );
         if !self.workflows.is_empty() {
@@ -239,7 +242,11 @@ mod tests {
             ..Report::default()
         }
         .render_text();
-        assert!(text.contains("harvest-verify: model 2026.09.0, rustc rustc 1.94.1"));
+        assert!(
+            text.contains("harvest-verify: model 2026.09.0, rustc 1.94.1"),
+            "the `rustc -V` line already begins with the word `rustc`; the \
+             header must not prefix it a second time:\n{text}"
+        );
         assert!(text.contains("analyzed 0: proven 0, unknown 0, found 0, allowed 0"));
         assert!(text.contains("verdicts hold under model 2026.09.0; boundaries not analyzed:"));
     }

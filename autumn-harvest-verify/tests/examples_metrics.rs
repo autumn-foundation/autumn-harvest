@@ -13,6 +13,11 @@
 //!
 //! Env-gated on `HARVEST_VERIFY_EXAMPLES=1` because it builds the examples with
 //! `--emit=mir` into its own target directory, which is minutes on a cold cache.
+//! The gate is an env var rather than `#[ignore]` so that CI runs it as part of
+//! the ordinary suite, and the skip path prints a **loud** line: a metric that
+//! quietly reports success when it measured nothing is worse than no metric.
+//! `tests/ci_wiring.rs` asserts that the CI step which sets the variable still
+//! exists, so the measurement cannot lapse unnoticed either.
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +44,10 @@ fn run() -> Report {
         all_examples: true,
         no_default_features: true,
         features: vec!["testing".to_string()],
-        target_dir: Some(root.join("target/harvest-verify")),
+        // Its own emit directory. `corpus.rs` drives cargo over the same
+        // workspace with a different feature set; sharing one directory makes
+        // each test binary invalidate the other's units for no benefit.
+        target_dir: Some(root.join("target/harvest-verify/examples")),
         ..BuildRequest::default()
     };
     let options = Options {
@@ -97,8 +105,16 @@ fn describe(report: &Report) {
 fn examples_corpus_allowlist_ratio_within_budget() {
     if !enabled() {
         println!(
-            "skipped: set HARVEST_VERIFY_EXAMPLES=1 to build \
-             `-p autumn-harvest --all-examples` and measure the precision budget"
+            "\n\
+             ============================================================\n\
+             examples_metrics: SKIPPED (set HARVEST_VERIFY_EXAMPLES=1)\n\
+             ============================================================\n\
+             Nothing was measured. This test is the precision half of issue\n\
+             #962's success metric — `(found + allowed) / analyzed <= 10 %`\n\
+             over autumn-harvest's own examples — and it reports `ok` when it\n\
+             is skipped, so read this line as `not run`, not as `passed`.\n\
+             The CI step that sets the variable is asserted by\n\
+             `tests/ci_wiring.rs::examples_metric_step_is_wired_into_ci`."
         );
         return;
     }

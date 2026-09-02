@@ -2,8 +2,6 @@
 //! auditing. Zero `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!`/
 //! `unreachable!` in non-test code — a parser boundary is reported as
 //! `BoundaryKind::MirParse`, never as a crash.
-//!
-//! RED phase: the scaffold is a wall of `todo!("RED phase: implemented in GREEN")`.
 
 use std::path::{Path, PathBuf};
 

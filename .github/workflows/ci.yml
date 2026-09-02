@@ -647,8 +647,14 @@ jobs:
   # load-bearing here, not a nicety, and `target/harvest-verify` — the analyzer's
   # own emit directory — is cached alongside the normal workspace target dir.
   # The gate run is wrapped in `time` so the wall clock of both phases (MIR emit
-  # and analysis) lands in the job log rather than in a claim; the tool itself
-  # prints the split under `--report`.
+  # and analysis) lands in the job log rather than in a claim. There is no phase
+  # split: `--report` prints only the analyzed/proven/unknown/found/allowed
+  # counts on stderr, so `time` measures emit + analysis as one wall clock.
+  #
+  # Every step below is asserted by `autumn-harvest-verify/tests/ci_wiring.rs`,
+  # which fails if one is deleted or renamed. Two of them are env-gated or
+  # non-strict and would go quiet rather than red if they simply stopped
+  # running.
   harvest-verify:
     name: Semantic determinism analysis (harvest-verify)
     needs: changes
@@ -665,7 +671,11 @@ jobs:
           workspaces: ". -> target"
           cache-directories: target/harvest-verify
       # Corpus + engine tests. The corpus test builds MIR into
-      # `target/harvest-verify`, which the cache above preserves between runs.
+      # `target/harvest-verify/corpus`, which the cache above preserves between
+      # runs. (Each test binary and each gate owns a subdirectory of
+      # `target/harvest-verify`: they drive cargo over the same workspace with
+      # different feature sets, and one shared directory makes each invalidate
+      # the others' units.)
       - name: Analyzer, corpus and boundary tests
         run: cargo test -p autumn-harvest-verify
       # The false-positive metric, over this repo's own examples — the only
@@ -682,6 +692,62 @@ jobs:
             harvest-verify -p autumn-harvest --all-examples \
             --no-default-features --features testing \
             --allowlist harvest-verify.allow.toml --report
+
+  # Issue #962, AC6's *second* corpus: "the repo's own examples/ + test workflow
+  # corpus". The job above covers `examples/`. This one covers
+  # `autumn-harvest/tests/`, whose `#[workflow]` fns are the largest body of
+  # workflow code in the repository that the analyzer's author did not write —
+  # i.e. the highest-value false-positive sample after the examples.
+  #
+  # A SEPARATE JOB, not a fourth step above, because of what it costs. Measured
+  # cold on a 4-core dev box at the audited revision: 478 s wall (almost all of
+  # it the `cargo rustc --test integration` build), a 175 MB `.mir`, a 7.0 GB
+  # target directory, and ~6 GB peak rustc RSS. Folded into `harvest-verify`
+  # that pushes the job well past the < 5 min budget the examples gate is
+  # measured against, and the two numbers stop being comparable. As its own job
+  # it runs in parallel and carries its own cache entry.
+  #
+  # Result at the audited revision: `analyzed 88: proven 88, unknown 0, found 0,
+  # allowed 0`. No allowlist entry was needed for any of the 88 — which is the
+  # precision claim this corpus exists to test, on code the analyzer's author
+  # did not write. The `unused allowlist entry` warning for the examples-only
+  # entry is expected here and is not a failure; see harvest-verify.allow.toml.
+  #
+  # Non-strict, like the examples gate: `unknown` warns, only a
+  # `nondeterminism-found` fails. Asserted by
+  # `autumn-harvest-verify/tests/ci_wiring.rs::tests_corpus_step_is_wired_into_ci`.
+  harvest-verify-tests:
+    name: Semantic determinism analysis (test workflow corpus)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-directories: target/harvest-verify
+      # Same reasoning as the `test` job's free-disk step, and more acute here:
+      # `--emit=mir` for the `integration` test binary writes a ~175 MB `.mir`
+      # on top of a multi-GB target directory, and a runner image that grows
+      # would make this the first job to fail on disk rather than on a verdict.
+      - name: Free runner disk before the MIR emit
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      - name: harvest-verify gate over the autumn-harvest test workflow corpus (non-strict)
+        run: |
+          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
+            harvest-verify -p autumn-harvest --test integration \
+            --features db,testing,schema,debugger,unified-dag-execution \
+            --allowlist harvest-verify.allow.toml --report \
+            --target-dir target/harvest-verify/tests
 
   # Opt-in fuzz smoke. NEVER runs on push/PR — GitHub Actions minutes are tight
   # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab

@@ -16,7 +16,13 @@
 #   * A duplicate `workflow` is a hard error — two justifications for one
 #     workflow means one of them is stale.
 #   * An UNUSED entry (its workflow no longer exists, or no longer needs it) is
-#     reported as a warning, and is an error under `--strict`.
+#     reported as a warning, and is an error under `--strict`. Expect that
+#     warning whenever the file is passed to a run that does not cover the
+#     entry's workflow: CI passes this one file to BOTH the examples gate and
+#     the test-workflow-corpus gate, and every entry is unused in one of them.
+#     Both gates are non-strict, so the warning is a note, not a failure —
+#     read an unused entry as "not covered by this run", and only chase it when
+#     the run that *should* cover it reports it.
 #
 # The size of this file IS the success metric: `≤ 10%` of the analyzed workflow
 # fns may need an entry. If it grows past that, the tool is wrong, not the code.

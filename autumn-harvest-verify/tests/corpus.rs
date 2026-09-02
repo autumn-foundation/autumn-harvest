@@ -21,13 +21,20 @@
 //! 4. [`detection_rate_meets_the_success_metric`] — ≥ 90 % of the seeded cases
 //!    come back found *with a named trace*, computed live from the run.
 //! 5. [`every_unknown_names_its_boundary`] — AC2's three-valued honesty.
+//! 6. [`every_seeded_case_is_detected`] — the *ratchet*. Claim 4 is a floor;
+//!    this one pins the live count to the number of seeded rows, so a model
+//!    that quietly stops matching (the rustc 1.94 → 1.98 `Atomic<T>` incident)
+//!    turns red at the first lost case instead of at the sixth.
 //!
-//! Tests 3–5 share one analyzer run through a [`OnceLock`], so the (slow) MIR
-//! build happens once per test binary.
-//!
-//! **RED phase.** Tests 1 and 2 pass today. Tests 3–5 fail with the `todo!()`
-//! panic from `autumn_harvest_verify::verify` until the analyzer is
-//! implemented; that is the intended state.
+//! Tests 3–6 share one analyzer run through a [`OnceLock`], so the (slow) MIR
+//! build happens once per test binary. It emits into
+//! `target/harvest-verify/corpus`, its own directory: `examples_metrics.rs`
+//! drives cargo with a different feature set, and one shared emit directory
+//! doubles the cargo work for no benefit. (Since the driver accepts only
+//! artifacts whose `package_id` is one of the packages *this* run asked for, a
+//! shared directory would no longer poison a verdict — the split is now cache
+//! hygiene, not correctness. `tests/cli.rs` needs no emit directory at all: it
+//! analyzes the checked-in `.mir` fixtures.)
 
 // The matrix printers are long by nature: they exist to make a failure
 // diagnosable at a glance, and splitting them would hide the shape of the
@@ -319,8 +326,18 @@ fn seeded_corpus_is_clean_under_the_syntactic_layer() {
     let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
     cargo
         .current_dir(workspace_root())
+        // BOTH spellings. Cargo's precedence is `CARGO_ENCODED_RUSTFLAGS` >
+        // `RUSTFLAGS` > `build.rustflags`, so in any environment that already
+        // exports the encoded form — a wrapper, a shim, some CI images — setting
+        // only `RUSTFLAGS` means the corpus builds with the *ambient* flags and
+        // `-D warnings` is silently dropped. The assertion below would then pass
+        // while proving nothing, which is the one thing this test may not do.
+        // The encoded form is `\x1f`-separated, one flag per field.
         .env("RUSTFLAGS", "-D warnings")
+        .env("CARGO_ENCODED_RUSTFLAGS", "-D\u{1f}warnings")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
         .arg("build")
+        .arg("--message-format=json")
         .arg("--manifest-path")
         .arg(workspace_root().join("Cargo.toml"))
         .arg("--target-dir")
@@ -331,11 +348,35 @@ fn seeded_corpus_is_clean_under_the_syntactic_layer() {
     let output = cargo.output().expect("failed to run cargo");
     assert!(
         output.status.success(),
-        "the corpus must build with `RUSTFLAGS=-D warnings` — that build is the \
+        "the corpus must build with `-D warnings` — that build is the \
          proof that HVG001–HVG011 report nothing at any severity.\n\
          --- stderr ---\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    // …and it must actually have built the corpus. A `cargo build` that
+    // selected nothing exits 0 too, so without this the proof is a no-op the
+    // day a package is renamed or a `-p` argument is lost.
+    let built: BTreeSet<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|m| {
+            m.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+        })
+        .filter_map(|m| {
+            m.get("package_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    for package in WORKFLOW_PACKAGES {
+        assert!(
+            built.iter().any(|id| id.contains(package)),
+            "the `-D warnings` build reported no artifact for {package}; it \
+             compiled nothing, so it proves nothing about HVG001–HVG011. \
+             Artifacts seen: {built:?}"
+        );
+    }
 }
 
 // ── Test 2: the oracle is a bijection with the corpus ────────────────────────
@@ -491,7 +532,7 @@ fn analyzer_report() -> &'static Report {
                 .map(|p| (*p).to_string())
                 .collect(),
             lib: true,
-            target_dir: Some(workspace_root().join("target/harvest-verify")),
+            target_dir: Some(workspace_root().join("target/harvest-verify/corpus")),
             ..BuildRequest::default()
         };
         verify(&build, &Options::default()).expect("harvest-verify run failed")
@@ -669,6 +710,89 @@ fn detection_rate_meets_the_success_metric() {
          success metric. Missed with no named trace:\n{}",
         rate * 100.0,
         misses.join("\n")
+    );
+}
+
+// ── Test 6: the ratchet ──────────────────────────────────────────────────────
+
+/// The floor in test 4 is a *threshold*, and a threshold has slack: at 29
+/// seeded rows, two cases can stop being detected and 27/29 = 93 % still passes.
+/// The rustc 1.94 → 1.98 `Atomic<T>` regression cost five at once and would have
+/// been caught, but nothing says the next one arrives in fives.
+///
+/// So this test has no slack at all: every seeded row must come back
+/// `nondeterminism-found` with the trace it claims. It is the "detection
+/// ratchet" the feasibility report's C1 condition asks for, and the number it
+/// pins is not written down anywhere — it is the count of seeded rows in
+/// `corpus/expectations.toml`, so adding a case raises the bar automatically.
+#[test]
+fn every_seeded_case_is_detected() {
+    let verdicts = verdicts();
+    let seeded: Vec<&Expectation> = oracle()
+        .workflow
+        .iter()
+        .filter(|e| e.verdict == "nondeterminism-found")
+        .collect();
+
+    let mut matrix = Vec::new();
+    let mut undetected = Vec::new();
+    for expectation in &seeded {
+        let actual = verdicts.get(expectation.workflow.as_str()).copied();
+        let missing_needles: Vec<&str> = match actual {
+            Some(Verdict::NondeterminismFound { findings }) => {
+                let haystack = findings
+                    .iter()
+                    .map(finding_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                expectation
+                    .trace_contains
+                    .iter()
+                    .filter(|needle| !haystack.contains(needle.as_str()))
+                    .map(String::as_str)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let detected = matches!(actual, Some(Verdict::NondeterminismFound { .. }))
+            && missing_needles.is_empty();
+        matrix.push(format!(
+            "  {} {:<58} {}",
+            if detected { "ok  " } else { "LOST" },
+            expectation.workflow,
+            actual.map_or("<not analyzed>", Verdict::name)
+        ));
+        if !detected {
+            undetected.push(format!(
+                "{} — got {}{}",
+                expectation.workflow,
+                actual.map_or("<not analyzed>", Verdict::name),
+                if missing_needles.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (trace does not name {missing_needles:?})")
+                }
+            ));
+        }
+    }
+
+    let detected = seeded.len() - undetected.len();
+    println!(
+        "seeded-case ratchet: {detected}/{} detected with a named trace\n{}",
+        seeded.len(),
+        matrix.join("\n")
+    );
+    assert_eq!(
+        detected,
+        seeded.len(),
+        "the detection ratchet dropped from {}/{} to {detected}/{}. Every seeded \
+         row in corpus/expectations.toml must come back `nondeterminism-found` \
+         with the trace it claims — a case that stops being detected is coverage \
+         rot, and the >= 90% metric has enough slack to hide two of them. Lost:\n{}",
+        seeded.len(),
+        seeded.len(),
+        seeded.len(),
+        undetected.join("\n")
     );
 }
 
