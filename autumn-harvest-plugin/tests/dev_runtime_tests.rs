@@ -945,9 +945,14 @@ fn dev_runtime_adds_no_migration_and_no_event_variant() {
 
 /// Drop whole-line comments, so the invariant guard reads code, not prose.
 fn strip_comment_lines(source: &str) -> String {
+    strip_comment_lines_with(source, "//")
+}
+
+/// [`strip_comment_lines`] for a file whose comment marker is not `//`.
+fn strip_comment_lines_with(source: &str, marker: &str) -> String {
     source
         .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| !line.trim_start().starts_with(marker))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -977,4 +982,56 @@ fn workspace_root() -> PathBuf {
         assert!(dir.pop(), "workspace root not found");
     }
     dir
+}
+
+// ---------------------------------------------------------------------------
+// AC7 — the docs present the zero-setup path as the default
+// ---------------------------------------------------------------------------
+
+/// The getting-started chapter must lead with `cargo dev` and still keep the
+/// Docker route, and the command it prints must be the one the alias defines.
+///
+/// A doc guard rather than prose, following the repo's existing
+/// `*_docs.rs` convention: AC7 is the one criterion whose whole content is a
+/// document, so an untested claim about it is no claim at all.
+#[test]
+fn the_getting_started_chapter_leads_with_the_zero_setup_path() {
+    let root = workspace_root();
+    let chapter = std::fs::read_to_string(root.join("docs/getting-started/01-project-skeleton.md"))
+        .expect("chapter 1 should exist");
+
+    let zero_setup = chapter
+        .find("## The fastest path: `cargo dev`")
+        .expect("the zero-setup path must have its own section");
+    let bring_your_own = chapter
+        .find("## Bring your own Postgres")
+        .expect("the bring-your-own-Postgres path must be retained");
+    assert!(
+        zero_setup < bring_your_own,
+        "the zero-setup path must come first — it is the default"
+    );
+
+    // The Docker/Compose route is retained, not replaced.
+    assert!(chapter.contains("docker compose up -d"), "{chapter}");
+    assert!(chapter.contains("compose.yaml"), "{chapter}");
+
+    // And the alias the chapter tells people to run is the one that exists.
+    // Comment lines are stripped: the file *explains* why it is not
+    // `--release`, so reading the raw text matches the prose, not the alias.
+    let alias = strip_comment_lines_with(
+        &std::fs::read_to_string(root.join(".cargo/config.toml")).expect("cargo config"),
+        "#",
+    );
+    assert!(
+        alias.contains("\ndev = ["),
+        "the `cargo dev` alias must exist: {alias}"
+    );
+    assert!(
+        alias.contains("dev-runtime-managed"),
+        "the alias must enable the tier that needs no installed Postgres: {alias}"
+    );
+    assert!(
+        !alias.contains("--release"),
+        "deliberately not --release: on a fresh clone the compile dominates the metric"
+    );
 }

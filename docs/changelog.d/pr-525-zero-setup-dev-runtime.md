@@ -145,6 +145,18 @@ own `managed-pg` feature resolves to, so the two would unify if that feature
 were ever enabled here (it is not today, so that third reason is future-proofing
 rather than a present benefit).
 
+**One claim that is compiled but not proven here.** `dev_runtime_managed.rs`
+drives the download path end to end — acquire, verify the toolset, run a real
+cluster on the downloaded binaries, then prove a second call reuses the cache —
+but it is opt-in (`HARVEST_DEV_TEST_DOWNLOAD=1`, a ~30 MB fetch) and the
+environment this was authored in blocks `api.github.com` at its egress proxy, so
+the fetch itself returns `403` there. The target is compiled on every CI leg (a
+`compileonly` manifest row plus both clippy legs) and the failure it produces is
+the intended one — a named, actionable error rather than a hang — but the
+"clean machine downloads a PostgreSQL" half of AC2 is asserted by a test that
+has not yet been *run* green anywhere with network access. Recorded here rather
+than papered over.
+
 **Test evidence.** `dev_runtime_tests.rs` — 30 no-database, no-process tests over
 the pure halves: the whole safety table (loopback, sockets, both DSN forms, TLS
 modes, twenty managed providers, prefix-lookalike hosts, fail-closed parsing,
