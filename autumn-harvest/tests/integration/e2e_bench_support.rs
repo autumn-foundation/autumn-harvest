@@ -3017,7 +3017,26 @@ pub mod db {
         /// connection tasks with it — so no task can still be holding a pooled
         /// connection when the caller drops the pool and `teardown` drops the
         /// databases.
-        pub fn stop(self) {
+        pub fn stop(&self) {
+            self.handle.abort();
+        }
+    }
+
+    /// Abort the accept loop when a `SignalServer` is dropped without
+    /// [`SignalServer::stop`].
+    ///
+    /// The panic path, one layer further out than `Fleet`'s (Codex review
+    /// round 4, PR #1282): if `run_signal_roundtrip` panics after the server is
+    /// spawned, unwinding merely *drops* this handle, and dropping a
+    /// `JoinHandle` detaches its task. The accept loop would keep running --
+    /// holding its `ShardedDbPool` clone and its idle connections -- through
+    /// every later cell of the sweep, which is exactly the per-cell containment
+    /// this and `Fleet`'s `Drop` exist to make real.
+    ///
+    /// `stop` consumes `self`, so on the ordinary path this runs immediately
+    /// after and aborts an already-aborted task, which is a no-op.
+    impl Drop for SignalServer {
+        fn drop(&mut self) {
             self.handle.abort();
         }
     }
@@ -3162,17 +3181,26 @@ pub mod db {
     /// review round 3, PR #1282). `postgres:16` is a moving tag, and the doc
     /// treats the exact version as reproduction metadata, so "unknown" is not
     /// an acceptable answer for a run that had a server in front of it.
-    static PROVISIONED_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    /// Every DISTINCT server version this run provisioned against.
+    ///
+    /// A set rather than a single value (Codex review round 4, PR #1282): in
+    /// `HARVEST_BENCH_SHARD_URLS` mode the shards are independent servers and
+    /// nothing makes them the same build. Recording only the first would print
+    /// shard 0's version as though it described the whole sweep -- inaccurate
+    /// reproduction metadata on a page that treats the exact version as
+    /// load-bearing. A homogeneous topology still renders as one string.
+    static PROVISIONED_VERSIONS: Mutex<std::collections::BTreeSet<String>> =
+        Mutex::new(std::collections::BTreeSet::new());
 
     async fn record_server_version(conn: &mut AsyncPgConnection) {
-        if PROVISIONED_VERSION.get().is_some() {
-            return;
-        }
         if let Ok(row) = diesel::sql_query("SELECT version() AS version")
             .get_result::<VersionRow>(conn)
             .await
         {
-            let _ = PROVISIONED_VERSION.set(row.version);
+            PROVISIONED_VERSIONS
+                .lock()
+                .expect("poisoned")
+                .insert(row.version);
         }
     }
 
@@ -3180,7 +3208,14 @@ pub mod db {
     /// environment block. `None` only when no server was ever reached.
     #[must_use]
     pub fn provisioned_postgres_version() -> Option<String> {
-        PROVISIONED_VERSION.get().cloned()
+        let versions = PROVISIONED_VERSIONS.lock().expect("poisoned");
+        if versions.is_empty() {
+            return None;
+        }
+        // More than one means the shards were not the same build. Print them
+        // all rather than picking one: a sweep across mixed versions is a
+        // different experiment, and the reader needs to see that it happened.
+        Some(versions.iter().cloned().collect::<Vec<_>>().join(" | "))
     }
 
     // ── Scenario runners ──────────────────────────────────────────────────
