@@ -46,6 +46,7 @@
 # ordering correct by construction.
 #
 # osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
@@ -87,12 +88,14 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
+linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
+linux        autumn-harvest         integration                      -                          quota_history_bytes_perf_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests

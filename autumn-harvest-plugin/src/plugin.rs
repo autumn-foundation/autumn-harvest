@@ -52,7 +52,10 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
 /// already-migrated database. It also keeps the same dev/prod policy the plugin
 /// applied by hand before: auto-apply under the `dev` profile, warn-only
-/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas —
+/// and, for the dedicated Harvest database under `Split`/`External` that
+/// `autumn migrate` cannot reach, `harvest migrate run`; see
+/// [`ensure_runtime_migrations_blocking`]).
 ///
 /// Registering here rather than migrating ourselves is what lets Autumn resolve
 /// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
@@ -2511,6 +2514,7 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+        HARVEST_MIGRATE_REMEDY,
     )?;
 
     // Plugin-owned tables that live in the harvest database (issue #944's
@@ -2522,14 +2526,55 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         PLUGIN_HARVEST_MIGRATIONS,
         "Harvest plugin storage",
+        PLUGIN_HARVEST_MIGRATE_REMEDY,
     )
 }
+
+/// The command that applies [`HARVEST_MIGRATIONS`] to a dedicated Harvest
+/// database.
+///
+/// `autumn migrate` is deliberately NOT named: this path only ever runs for a
+/// dedicated Harvest database (`ensure_runtime_migrations_blocking` returns
+/// early under `Embedded`), which that command cannot reach — it applies the
+/// application database's sets and exits 0 having changed nothing (issue
+/// #1240).
+const HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run` ",
+    // The DSN usually carries a password, and a command line is readable by
+    // every process on the host (`ps`, /proc) for as long as the migration
+    // runs. `--database-url` still works and is right for a passwordless DSN.
+    "to apply them. Prefer the environment variable over `--database-url`: a ",
+    "command line is visible host-wide, and this DSN usually carries a password."
+);
+
+/// The command that applies [`PLUGIN_HARVEST_MIGRATIONS`].
+///
+/// **Not the same command.** The `harvest` binary embeds Harvest's own
+/// migrations, not the plugin's, so this set only applies when its directory is
+/// named explicitly. An operator given [`HARVEST_MIGRATE_REMEDY`] for *this*
+/// warning would see a successful exit and roll replicas with
+/// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
+/// added the table to prevent, since the first poison message then fails its
+/// dead-letter write and redelivers forever.
+const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run ",
+    "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
+    "Prefer the environment variable over `--database-url`: a command line is ",
+    "visible host-wide, and this DSN usually carries a password. ",
+    // Said out loud because the process logging this is usually a container
+    // with installed binaries and no checkout: unlike Harvest's own set, this
+    // one is NOT embedded in the `harvest` binary, so a workspace-relative
+    // path would send an operator at a directory that does not exist there.
+    "That directory ships in the autumn-harvest-plugin crate source, not in the ",
+    "`harvest` binary, so make it available wherever you run the command."
+);
 
 fn apply_migrations_for_profile(
     profile: &str,
     database_url: &str,
     migrations: EmbeddedMigrations,
     label: &str,
+    remedy: &str,
 ) -> autumn_web::AutumnResult<()> {
     if profile == "dev" {
         let result = autumn_web::migrate::run_pending(database_url, migrations)
@@ -2552,7 +2597,8 @@ fn apply_migrations_for_profile(
             tracing::warn!(
                 target = label,
                 count = pending.len(),
-                "Pending migrations detected. Run `autumn migrate` to apply them."
+                remedy,
+                "Pending migrations detected."
             );
             for migration in pending {
                 tracing::warn!(target = label, migration = %migration, "Pending migration");
@@ -2564,6 +2610,77 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_remedy_tests {
+    use super::{HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY};
+
+    #[test]
+    fn both_remedies_name_the_command_that_can_reach_a_dedicated_harvest_database() {
+        // `autumn migrate` reaches the application database only; naming it in
+        // either warning sends the operator to a command that exits 0 having
+        // changed nothing (issue #1240).
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("harvest migrate run"),
+                "remedy must name the dedicated-database command: {remedy}"
+            );
+            assert!(
+                !remedy.contains("autumn migrate"),
+                "remedy must not name a command that cannot apply these: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_remedy_puts_the_dsn_in_a_command_line() {
+        // These strings are copied verbatim by an operator mid-incident, and
+        // the DSN they substitute usually carries a password. A command line
+        // is readable by every process on the host (`ps`, /proc) for as long
+        // as the migration runs, so the remedy must demonstrate the
+        // environment form.
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("HARVEST_DATABASE_URL="),
+                "remedy must show the environment form: {remedy}"
+            );
+            assert!(
+                !remedy.contains("--database-url <"),
+                "remedy must not demonstrate passing the DSN as an argument: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_plugin_remedy_names_the_plugin_migration_directory() {
+        // The `harvest` binary embeds Harvest's own migrations, not the
+        // plugin's: without `--include-dir` the plugin set is silently not
+        // applied, and the operator rolls replicas with
+        // `harvest_connector_dead_letters` absent.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the plugin-storage warning must name its own migration directory: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("migrations/harvest"),
+            "{PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        // The process logging this is usually a container with no checkout, so
+        // the warning must say where that directory comes from rather than
+        // implying a path relative to the working directory.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("crate source"),
+            "the warning must say where the directory comes from: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            !HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the core-storage warning needs no extra directory -- the binary \
+             embeds that set: {HARVEST_MIGRATE_REMEDY}"
+        );
+    }
 }
 
 #[cfg(test)]

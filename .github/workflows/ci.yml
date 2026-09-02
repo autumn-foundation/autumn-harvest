@@ -278,6 +278,18 @@ jobs:
       - name: Compile claim/enqueue benchmark (issue #786)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
+      # Same bit-rot protection for the end-to-end suite (issue #941), and for
+      # the same reason: nothing else compiles a bench TARGET. The `--tests`
+      # steps above cover the shared harness module, but not `e2e_bench.rs`
+      # itself -- and not `replay_bench.rs`, which now pulls that harness in and
+      # so acquired a real build break under default features that no CI step
+      # would have caught. Two invocations because the two benches enable
+      # different feature sets.
+      - name: Compile end-to-end benchmark (issue #941)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          cargo bench -p autumn-harvest --features db,testing --bench e2e_bench --no-run
+          cargo bench -p autumn-harvest --features testing --bench replay_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib

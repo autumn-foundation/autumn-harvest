@@ -21,6 +21,7 @@ mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
+mod benchmarks_docs;
 #[cfg(feature = "db")]
 mod build_routing_tests;
 #[cfg(feature = "testing")]
@@ -84,6 +85,7 @@ mod debugger_tests;
 mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
+mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;
@@ -111,6 +113,8 @@ mod macros_workflow;
 mod metrics_coverage;
 mod metrics_integration;
 mod metrics_rs_adapter;
+#[cfg(feature = "db")]
+mod migrate_tests;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
 #[cfg(feature = "db")]
@@ -139,6 +143,7 @@ mod queue_fairness_tests;
 mod queue_pause_success_metric_tests;
 mod queue_pause_tests;
 mod quota_enforcement_tests;
+mod quota_history_bytes_perf_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]

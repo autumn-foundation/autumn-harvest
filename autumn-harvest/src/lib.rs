@@ -329,6 +329,9 @@ mod loom_sync;
 /// Enabled by the `metrics-rs` cargo feature.
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
+/// Migration applier for a dedicated Harvest database (issue #1240).
+#[cfg(feature = "db")]
+pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
 pub mod partition;
