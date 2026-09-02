@@ -1,0 +1,180 @@
+# Dependency ledger harness (Ballast). Run locally with `cargo deny check`;
+# CI runs the same command in .github/workflows/ci.yml's `dependency-audit`
+# job on every push/PR that touches Cargo.toml/Cargo.lock/this file.
+#
+# Every `ignore`/`exceptions` entry below is a documented pin: it carries the
+# reason it's deferred and the trigger that should bring it back for review.
+# An entry with neither is a bug in this file, not a policy.
+
+[graph]
+# Resolve metadata the same way CI builds it (`--all-features`), so a crate
+# that's only pulled in behind a feature flag (e.g. `kafka`, `mcp`) is still
+# audited.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories — RUSTSEC scan, reachability-joined by hand below.
+# ---------------------------------------------------------------------------
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0204 — crossbeam-epoch 0.9.18, invalid pointer deref in the
+    # `fmt::Pointer`/`fmt::Display` impls for `Atomic`/`Shared` when the
+    # pointer is null. We never format those types ourselves; reached via
+    # `moka` (autumn-web's cache, production) and `criterion` (dev-only
+    # benchmarks) — both transitive through `crossbeam-deque`/`rayon`, not a
+    # direct dependency. Fix is a patch bump (>=0.9.20) entirely inside
+    # `autumn-web`'s and `criterion`'s trees; not ours to force via
+    # `cargo update` without those crates re-resolving on their own.
+    # Verdict: unreachable. Revisit: next scheduled dependency batch.
+    { id = "RUSTSEC-2026-0204", reason = "unreachable: we never format Atomic/Shared; fix lives in autumn-web's/criterion's transitive tree, not our manifest. Revisit: next scheduled batch." },
+
+    # RUSTSEC-2026-0258 — h2 0.4.13, unbounded empty DATA frames (low
+    # severity DoS if a peer floods empty frames and streams aren't drained).
+    # Reached via hyper -> axum -> autumn-web, which IS our production HTTP
+    # server path (management API / Vantage dashboard). Not our fix to make:
+    # h2 is entirely inside autumn-web's tree (we don't depend on hyper/h2
+    # directly), so the bump has to come from an autumn-web release.
+    # Verdict: reachable, but the fix isn't in this repo's manifest.
+    # Revisit: track against the next autumn-web bump; re-run this audit
+    # after any autumn-web version change to confirm it picked up h2 >=0.4.16.
+    { id = "RUSTSEC-2026-0258", reason = "reachable via our HTTP server, but h2 is entirely inside autumn-web's tree — fix ships in an autumn-web release, not here. Revisit: next autumn-web bump." },
+
+    # RUSTSEC-2026-0253 — lru 0.16.4, use-after-free in LruCache::pop() when
+    # a stored key/value's Drop panics mid-pop. This IS a direct dependency
+    # (autumn-harvest/src/cache.rs's WorkflowCache::remove calls
+    # LruCache::pop()), so usage exists. But the key type is `Uuid` (Copy, no
+    # custom Drop — cannot panic on drop) and the value type
+    # `CachedWorkflowState` (a Vec<WorkflowEvent> of plain data, no custom
+    # Drop either). Neither stored type can panic during drop, so this call
+    # site cannot trigger the UB the advisory describes.
+    # Verdict: unreachable (usage confirmed, exploitability requires a
+    # panicking Drop our types don't have). The fix (>=0.18.2) is a manifest
+    # bump (0.16 -> 0.18); good candidate for the first scheduled batch once
+    # a changelog read confirms no breaking API surface we use.
+    # Revisit: next scheduled batch.
+    { id = "RUSTSEC-2026-0253", reason = "unreachable: LruCache::pop() is called (cache.rs), but our key (Uuid) and value (CachedWorkflowState) types have no custom Drop, so the panic-during-drop precondition can't occur. Candidate for next scheduled batch (0.16->0.18 manifest bump). Revisit: next scheduled batch." },
+
+    # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
+    # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
+    # no direct use in this repo. "No safe upgrade is available" per the
+    # advisory. Nothing to bump; the maintenance signal belongs to
+    # autumn-web's dependency on `validator`.
+    # Revisit: if autumn-web drops or replaces `validator`, or
+    # proc-macro-error2 gains a maintained release.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
+
+    # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
+    # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
+    # reachable depends on whether autumn-web ever performs RSA *signing*
+    # (private-key ops) rather than RS256 *verification* only, which is a
+    # question about autumn-web's own source, outside this repository.
+    # No patch exists upstream ("no patch is yet available") as of this
+    # writing regardless. Verdict: undetermined from this repo alone.
+    # Revisit: an upstream `rsa` fix ships, or autumn-web's JWT usage is
+    # confirmed verify-only (would lower urgency further).
+    { id = "RUSTSEC-2023-0071", reason = "undetermined from this repo: reachability depends on whether autumn-web does RSA signing vs. verify-only, which is outside this codebase. No upstream patch exists yet either way. Revisit: rsa fix ships upstream, or autumn-web's usage is confirmed verify-only." },
+
+    # Yanked, not advisory-listed. Both are transitive (chacha20 via
+    # rand 0.10.1 -> {ferroid, postgres-protocol/tokio-postgres}; spin via
+    # lazy_static/sharded-slab), pulled in by autumn-web's and our own
+    # diesel-async's trees. `cargo update -p <crate>` doesn't move either off
+    # the yanked version while upstream still requires it. Revisit: next
+    # scheduled batch (re-run `cargo update -p chacha20 -p spin` there to see
+    # if upstream has moved on).
+    { crate = "chacha20@0.10.0", reason = "yanked, entirely transitive (rand 0.10.1's tree); no non-yanked version satisfies upstream's constraint yet. Revisit: next scheduled batch." },
+    { crate = "spin@0.9.8", reason = "yanked, entirely transitive (lazy_static/sharded-slab); no non-yanked version satisfies upstream's constraint yet. Revisit: next scheduled batch." },
+
+    # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
+    # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
+    # reqwest-retry -> postgresql_archive, which is itself gated behind
+    # autumn-harvest-plugin's `dev-runtime-managed` feature: local-only
+    # ephemeral-Postgres tooling for `cargo dev`, off by default and never in
+    # a release build (see the feature's own doc comment in
+    # autumn-harvest-plugin/Cargo.toml). Revisit: postgresql_archive drops
+    # its parking_lot 0.11 dependency, or instant gains a maintained fork.
+    { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
+
+    # RUSTSEC-2026-0098 / -0099 / -0104 — rustls-webpki 0.101.7, three
+    # certificate-parsing bugs (name-constraint acceptance x2, a reachable
+    # panic in CRL parsing). Pulled via an old rustls 0.21 line
+    # (hyper-rustls 0.24.2 / tokio-rustls 0.24.1 / aws-smithy-http-client),
+    # itself behind autumn-harvest-plugin's `sqs` feature (AWS SQS broker
+    # connector), optional and off by default. Fixing requires bumping
+    # aws-config/aws-sdk-sqs to a release built on rustls 0.23 (a manifest
+    # change, not a lockfile-only update) — an Upgrade-class change, not a
+    # harness-scope fix. Revisit: next scheduled batch evaluates whether a
+    # current aws-config/aws-sdk-sqs release has moved off rustls 0.21.
+    { id = "RUSTSEC-2026-0098", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
+    { id = "RUSTSEC-2026-0099", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
+    { id = "RUSTSEC-2026-0104", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — inventory taken 2026-09-02 via `cargo deny list`.
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "0BSD",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "PostgreSQL",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # r-efi is LGPL-2.1-or-later, otherwise not in the `allow` list above
+    # (copyleft, deliberately not blanket-allowed). It's an optional
+    # dependency of `getrandom` active only under `target_os = "uefi"`; this
+    # workspace never builds for that target, so it's present in Cargo.lock
+    # but never actually compiled into anything we ship. Scoped to this one
+    # crate rather than added to `allow` so a *reachable* LGPL dependency
+    # would still fail the gate.
+    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+]
+
+[licenses.private]
+# The four examples/* crates are `publish = false` and carry no `license`
+# field — they're internal samples, never published. Don't fail the gate on
+# them; a real crate we intend to publish should still set `license`.
+ignore = true
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate-version and wildcard/feature policy.
+# ---------------------------------------------------------------------------
+[bans]
+# `warn`, not `deny`: as of this baseline there are 33 duplicated crate names
+# in the graph (see the harness PR's ledger report for the full list and
+# which party's version constraint causes each). The large majority are
+# driven by external hires (autumn-web, testcontainers, redis, diesel_migrations)
+# whose own transitive versions we don't control from this manifest; treating
+# every one as a hard failure would block CI on constraints this repo can't
+# resolve unilaterally. `croner` is the one duplicate where BOTH sides are in
+# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — a
+# candidate for a dedicated dedup PR, not bundled into this harness.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
