@@ -150,7 +150,7 @@ pub const BENCH_SIGNAL_WORKFLOW: &str = "harvest_e2e_bench_signal_wf";
 /// Signal name the round-trip scenario delivers.
 pub const BENCH_SIGNAL: &str = "bench_signal";
 
-/// The three activities of the canonical workflow (issue #941 AC1a).
+/// The three activities of the canonical workflow (issue #941, AC1 clause (a)).
 pub const BENCH_ACTIVITIES: [&str; 3] = [
     "harvest_e2e_bench_step_1",
     "harvest_e2e_bench_step_2",
@@ -761,7 +761,7 @@ impl ScenarioReport {
     }
 
     #[must_use]
-    pub fn is_sound(&self) -> bool {
+    pub const fn is_sound(&self) -> bool {
         self.unsound.is_empty()
     }
 }
@@ -783,14 +783,16 @@ pub fn render_matrix(reports: &[ScenarioReport]) -> String {
     out.push_str("|:--|--:|:--|--:|:--|\n");
     for report in reports {
         for metric in &report.metrics {
-            out.push_str(&format!(
-                "| `{}` | {} | `{}` | {} | {} |\n",
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | `{}` | {} | {} |",
                 report.scenario.as_str(),
                 report.shards,
                 metric.key,
                 render_value(metric.value),
                 if report.is_sound() { "yes" } else { "**no**" },
-            ));
+            );
         }
     }
     out
@@ -1454,6 +1456,10 @@ mod tests {
     #[test]
     fn sample_warmup_never_discards_every_sample() {
         for n in 0..SAMPLE_WARMUP_DIVISOR {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "loop bound is SAMPLE_WARMUP_DIVISOR, a single digit"
+            )]
             let samples: Vec<f64> = (0..n).map(|i| i as f64).collect();
             assert_eq!(
                 measured_samples(&samples).len(),
@@ -1616,6 +1622,10 @@ mod tests {
 
     #[test]
     fn steady_state_rate_refuses_a_thin_or_degenerate_population() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "loop bound is MIN_THROUGHPUT_COMPLETIONS, a few hundred"
+        )]
         let thin: Vec<f64> = (0..MIN_THROUGHPUT_COMPLETIONS - 1)
             .map(|i| i as f64 * 0.01)
             .collect();
@@ -2403,7 +2413,7 @@ pub mod db {
         /// cannot move an already-recorded observation.
         signal_observed: Mutex<BTreeMap<Uuid, Instant>>,
         /// Execution ids that reached the `wait_for_signal` call.
-        parked: Mutex<BTreeMap<Uuid, ()>>,
+        parked: Mutex<std::collections::BTreeSet<Uuid>>,
         /// Activity dispatches that produced no sample because the context
         /// carried no task id. Counted rather than ignored, so the published
         /// population can be reconciled against the population that ran.
@@ -2447,7 +2457,7 @@ pub mod db {
         }
 
         fn record_parked(&self, exec_id: Uuid) {
-            self.parked.lock().expect("poisoned").insert(exec_id, ());
+            self.parked.lock().expect("poisoned").insert(exec_id);
         }
 
         fn record_signal_observed(&self, exec_id: Uuid) {
@@ -2494,7 +2504,7 @@ pub mod db {
         })
     }
 
-    /// The canonical 3-activity workflow (issue #941 AC1a).
+    /// The canonical 3-activity workflow (issue #941, AC1 clause (a)).
     fn bench_workflow(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
         Box::pin(async move {
             for name in BENCH_ACTIVITIES {
@@ -2901,16 +2911,13 @@ pub mod db {
                     // for the life of the scenario.
                     Some(_) = connections.join_next(), if !connections.is_empty() => continue,
                 };
-                let (mut socket, _) = match accepted {
-                    Ok(pair) => pair,
-                    // A transient accept error (EMFILE under load) must not
-                    // retire the endpoint for the rest of the run: every
-                    // subsequent signal would then be counted as a failure and
-                    // the cell blamed on the engine.
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        continue;
-                    }
+                // A transient accept error (EMFILE under load) must not retire
+                // the endpoint for the rest of the run: every subsequent signal
+                // would then be counted as a failure and the cell blamed on the
+                // engine.
+                let Ok((mut socket, _)) = accepted else {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
                 };
                 let sharded = sharded.clone();
                 connections.spawn(async move {
@@ -2924,7 +2931,7 @@ pub mod db {
                         )
                         .await;
                         match read {
-                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                            Ok(Ok(0) | Err(_)) | Err(_) => return,
                             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
                         }
                         match super::parse_http_request(&buf) {
@@ -3132,6 +3139,13 @@ pub mod db {
     /// # Errors
     ///
     /// Returns [`SkipReason`] when no Postgres could be provisioned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one measurement protocol, read top to bottom: provision, warm up, measure, \
+                  collect, judge soundness, tear down. Splitting it into fragments would make \
+                  the ordering constraints between those phases -- which are the whole \
+                  correctness argument -- harder to audit, not easier."
+    )]
     pub async fn run_throughput(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = setup_shards(shard_count).await?;
@@ -3448,6 +3462,13 @@ pub mod db {
     /// # Errors
     ///
     /// Returns [`SkipReason`] when no Postgres could be provisioned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one measurement protocol, read top to bottom: provision, warm up, measure, \
+                  collect, judge soundness, tear down. Splitting it into fragments would make \
+                  the ordering constraints between those phases -- which are the whole \
+                  correctness argument -- harder to audit, not easier."
+    )]
     pub async fn run_dispatch_latency(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = setup_shards(shard_count).await?;
@@ -3548,9 +3569,9 @@ pub mod db {
         samples.sort_by(|a, b| a.0.cmp(&b.0));
         let ordered: Vec<f64> = samples.iter().map(|(_, ms)| *ms).collect();
         let kept = measured_samples(&ordered);
-        let stats = LatencyStats::from_samples(kept);
+        let dispatch = LatencyStats::from_samples(kept);
 
-        let mut unsound = latency_soundness(stats.count, negative, missing_created_at);
+        let mut unsound = latency_soundness(dispatch.count, negative, missing_created_at);
         unsound.extend(warmup_soundness(
             "dispatch",
             warm_per_shard * shards.len(),
@@ -3559,7 +3580,7 @@ pub mod db {
         unsound.extend(clock_offset_soundness(
             &offsets_before,
             &offsets,
-            stats.p50_ms,
+            dispatch.p50_ms,
         ));
         unsound.extend(dispatch_population_soundness(
             BENCH_ACTIVITIES.len() * requested,
@@ -3588,13 +3609,13 @@ pub mod db {
             clippy::cast_precision_loss,
             reason = "sample counts here are far below 2^53"
         )]
-        let samples_metric = stats.count as f64;
+        let samples_metric = dispatch.count as f64;
         Ok(ScenarioReport {
             scenario: BenchScenario::DispatchLatency,
             shards: shard_count,
             metrics: vec![
-                Metric::new("p50_ms", publish.then_some(stats.p50_ms)),
-                Metric::new("p99_ms", publish.then_some(stats.p99_ms)),
+                Metric::new("p50_ms", publish.then_some(dispatch.p50_ms)),
+                Metric::new("p99_ms", publish.then_some(dispatch.p99_ms)),
                 Metric::new("samples", Some(samples_metric)),
                 Metric::new("achieved_starts_per_sec", Some(achieved)),
             ],
@@ -3642,6 +3663,13 @@ pub mod db {
     /// # Errors
     ///
     /// Returns [`SkipReason`] when no Postgres could be provisioned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one measurement protocol, read top to bottom: provision, warm up, measure, \
+                  collect, judge soundness, tear down. Splitting it into fragments would make \
+                  the ordering constraints between those phases -- which are the whole \
+                  correctness argument -- harder to audit, not easier."
+    )]
     pub async fn run_signal_roundtrip(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = setup_shards(shard_count).await?;
@@ -3769,9 +3797,9 @@ pub mod db {
         }
         samples.sort_by_key(|(sent_at, _)| *sent_at);
         let ordered: Vec<f64> = samples.iter().map(|(_, ms)| *ms).collect();
-        let stats = LatencyStats::from_samples(&ordered);
+        let roundtrip = LatencyStats::from_samples(&ordered);
 
-        let mut unsound = latency_soundness(stats.count, 0, 0);
+        let mut unsound = latency_soundness(roundtrip.count, 0, 0);
         unsound.extend(warmup_soundness("signal", warm_ids.len(), &warm_drained));
         if parked < total {
             unsound.push(format!(
@@ -3814,13 +3842,13 @@ pub mod db {
             clippy::cast_precision_loss,
             reason = "sample counts here are far below 2^53"
         )]
-        let samples_metric = stats.count as f64;
+        let samples_metric = roundtrip.count as f64;
         Ok(ScenarioReport {
             scenario: BenchScenario::SignalRoundtrip,
             shards: shard_count,
             metrics: vec![
-                Metric::new("p50_ms", publish.then_some(stats.p50_ms)),
-                Metric::new("p99_ms", publish.then_some(stats.p99_ms)),
+                Metric::new("p50_ms", publish.then_some(roundtrip.p50_ms)),
+                Metric::new("p99_ms", publish.then_some(roundtrip.p99_ms)),
                 Metric::new("samples", Some(samples_metric)),
                 Metric::new("achieved_signals_per_sec", Some(achieved)),
             ],
