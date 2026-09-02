@@ -2263,8 +2263,7 @@ async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
         "external cancel",
     )
     .await
-    .err()
-    .expect("cancelling a forwarding seal must not succeed");
+    .expect_err("cancelling a forwarding seal must not succeed");
     assert!(
         matches!(err, HarvestError::ShardUnavailable { .. }),
         "expected a retryable ShardUnavailable so the delivery stays pending, got {err:?}"
