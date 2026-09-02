@@ -108,6 +108,17 @@ dialog and each writing an audit record with `source = ui` and the matching oper
 (`schedule.pause`, `schedule.resume`, `schedule.trigger`, `schedule.delete`). The UI
 adds no unaudited mutation path.
 
+A row is offered **Resume** when `is_paused` **or** `auto_paused_at` is set. The
+scheduler's auto-pause (#360) sets `auto_paused_at` *without* setting `is_paused`, so a
+row can be non-firing with `is_paused = false`; keying the action on `is_paused` alone
+would show an "Auto-paused" badge next to a Pause button and leave no way to restore
+firing. Resume — per row and in bulk — clears `auto_paused_at` and resets
+`consecutive_failure_count`, exactly as `POST /admin/schedules/{id}/resume` does, so the
+next tick does not immediately re-pause the schedule.
+
+The `paused` filter matches the `is_paused` column only; use `health=Unhealthy` to find
+auto-paused schedules alongside the other non-firing states.
+
 #### Fire-time preview — `/schedules/{id}/preview`
 
 Renders the next N fire times from the same computation as
@@ -168,6 +179,11 @@ A two-stage flow over `POST /admin/schedules/{id}/backfill` (#337):
    a flash summarising what was dispatched — including the failure count, which is
    reported nowhere else.
 
+The submitted window is normalised with `SecondsFormat::AutoSi`, preserving sub-second
+precision: an `interval:` backfill treats `from` as its first slot, so truncating
+`…00.900Z` to `…00Z` would shift every slot in the plan rather than merely respelling the
+window.
+
 `max_count` is capped at the engine's `DEFAULT_BACKFILL_MAX_COUNT` (1,000). The endpoint
 treats a supplied `max_count` as the planning limit that *replaces* its own default, so an
 uncapped value from a browser form could make one request enumerate millions of timestamps.
@@ -191,6 +207,11 @@ All three drill-downs resolve the schedule through the API's own
 `resolve_schedule_with_shard`, so an unparseable id is a `400`, "checked every expected
 shard and none had it" is a `404`, and "a shard could not be checked" is a `503` — never a
 `404` claiming a schedule was deleted when a shard was merely unreachable.
+
+The preview then passes the *resolved row* to `compute_schedule_preview_for` rather than
+handing the id back for a second lookup: `load_schedule_by_id` stops at the first
+unreachable shard, which would fail a preview for a schedule already found on a later
+healthy one.
 
 **Out of scope (tracked elsewhere):** creating or editing schedules from the UI (#771),
 overdue-schedule detection (#696), recent-runs enrichment (#762).

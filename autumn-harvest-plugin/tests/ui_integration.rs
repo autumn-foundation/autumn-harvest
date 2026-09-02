@@ -2415,6 +2415,15 @@ struct BoolValue {
     value: bool,
 }
 
+/// `auto_paused_at`-cleared + failure-counter probe for the #360 resume tests.
+#[derive(diesel::QueryableByName)]
+struct AutoPauseState {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    cleared: bool,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    failures: i32,
+}
+
 #[derive(diesel::QueryableByName)]
 struct CountValue {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -3271,6 +3280,172 @@ async fn ui_schedules_pause_redirect_resolves_to_the_list() {
     assert!(
         html.contains("redirect_wf"),
         "landed on the wrong page: {html}"
+    );
+}
+
+/// Codex round 1 #3: an auto-paused schedule (#360 sets `auto_paused_at`
+/// **without** `is_paused`) must be resumable from Vantage — per row and in
+/// bulk — and the resume must clear the auto-pause state the way the API's does,
+/// or the next tick immediately re-pauses it.
+#[tokio::test]
+async fn ui_schedules_auto_paused_row_can_be_resumed() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "auto_paused_wf",
+            auto_paused: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for auto-pause setup");
+    conn.batch_execute(&format!(
+        "UPDATE harvest_schedules SET consecutive_failure_count = 5 WHERE id = '{id}'"
+    ))
+    .await
+    .expect("seed a failure count");
+
+    let app = build_single_shard_ui_app(&database_url);
+
+    // The row offers Resume, not Pause, even though `is_paused` is false.
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Auto-paused"),
+        "auto-paused badge missing: {html}"
+    );
+    assert!(
+        html.contains(&format!("schedules/{id}/resume")),
+        "an auto-paused row must offer Resume: {html}"
+    );
+    assert!(
+        !html.contains(&format!("schedules/{id}/pause")),
+        "an auto-paused row must not offer Pause: {html}"
+    );
+
+    let (status, _headers, body) = post_form(&app, &format!("/schedules/{id}/resume"), "").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "resume must redirect: {body}"
+    );
+
+    let state: AutoPauseState = diesel::sql_query(format!(
+        "SELECT (auto_paused_at IS NULL) AS cleared, consecutive_failure_count AS failures \
+         FROM harvest_schedules WHERE id = '{id}'"
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("row still exists");
+    assert!(
+        state.cleared,
+        "resume must clear auto_paused_at, or the schedule stays held back"
+    );
+    assert_eq!(
+        state.failures, 0,
+        "resume must reset the failure counter, or the next tick re-pauses it"
+    );
+}
+
+/// The same for the bulk resume path, which selected solely on `is_paused`.
+#[tokio::test]
+async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "auto_paused_bulk",
+            auto_paused: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) =
+        post_form(&app, "/schedules/bulk-resume", "target=auto_paused_bulk").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "bulk resume must redirect: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for bulk resume assertion");
+    let cleared: bool = diesel::sql_query(format!(
+        "SELECT (auto_paused_at IS NULL) AS value FROM harvest_schedules WHERE id = '{id}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("row exists")
+    .value;
+    assert!(
+        cleared,
+        "a bulk resume must reach an auto-paused schedule, not just is_paused rows"
+    );
+}
+
+/// Codex round 1 #2: the preview drill-down must render for a schedule on a
+/// healthy shard even when an earlier shard is unreachable — the resilient
+/// resolver found the row, so a second fragile lookup must not undo that.
+#[tokio::test]
+async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &good_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "later_shard_wf",
+            schedule_expr: Some("0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Shard 0 is unreachable; the schedule lives on shard 1.
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), bad_pool);
+    pools.insert(ShardId::new(1), good_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(1),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a preview for a schedule on a healthy shard must render \
+         despite an unreachable earlier shard: {html}"
+    );
+    assert!(
+        html.contains("later_shard_wf"),
+        "the resolved schedule must be rendered: {html}"
     );
 }
 

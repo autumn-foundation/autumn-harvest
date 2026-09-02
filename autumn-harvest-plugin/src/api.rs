@@ -42371,11 +42371,31 @@ pub(crate) async fn compute_schedule_preview(
     count: usize,
     from: chrono::DateTime<chrono::Utc>,
 ) -> Result<SchedulePreview, AutumnError> {
-    use autumn_harvest::policy::SkipPolicy;
-    use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
-
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
     let schedule = load_schedule_by_id(api_state, id).await?;
+    compute_schedule_preview_for(api_state, schedule, count, from).await
+}
+
+/// [`compute_schedule_preview`] for a caller that has already resolved the row.
+///
+/// `load_schedule_by_id` stops at the first shard whose connection fails, so a
+/// caller that resolved the schedule through the resilient
+/// [`resolve_schedule_with_shard`] — the Vantage drill-downs (issue #951) — must
+/// not hand the id back for a second, fragile lookup: in a multi-shard
+/// deployment where an earlier shard is down and the schedule lives on a later
+/// healthy one, that second lookup fails on a row we already hold.
+///
+/// # Errors
+///
+/// Propagates storage errors from the calendar-exclusion read.
+pub(crate) async fn compute_schedule_preview_for(
+    api_state: &HarvestApiState,
+    schedule: HarvestSchedule,
+    count: usize,
+    from: chrono::DateTime<chrono::Utc>,
+) -> Result<SchedulePreview, AutumnError> {
+    use autumn_harvest::policy::SkipPolicy;
+    use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
 
     // Surfaced on every branch below so a caller can see why a schedule is
     // bounded even when it returns zero entries.

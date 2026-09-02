@@ -7600,6 +7600,20 @@ impl ScheduleHealth {
     }
 }
 
+/// Whether a schedule is currently held back from firing, and so is offered
+/// **Resume** rather than **Pause**.
+///
+/// The scheduler's auto-pause (#360) sets `auto_paused_at` and deliberately
+/// does **not** set `is_paused` — so a row can be non-firing with
+/// `is_paused = false`. Keying the row actions on `is_paused` alone would show
+/// an "Auto-paused" badge next to a Pause button and leave the operator with no
+/// way to restore firing from this page at all.
+/// `POST /admin/schedules/{id}/resume` treats
+/// `is_paused = true OR auto_paused_at IS NOT NULL` as resumable; this mirrors it.
+const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
+    row.is_paused || row.auto_paused_at.is_some()
+}
+
 /// Derive a row's health flags. Pure: every badge, sort and summary decision on
 /// the page goes through this one function, so they can never disagree.
 const fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
@@ -8085,16 +8099,24 @@ async fn schedule_resume_ui(
     let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
+        // Mirrors `set_schedule_paused(.., false, ..)`: the predicate matches an
+        // auto-paused row (`is_paused = false`, `auto_paused_at` set), and the
+        // update clears the auto-pause state and resets the failure counter so
+        // the next tick does not immediately re-trigger auto-pause (#360).
         let _ = diesel::update(
-            dsl::harvest_schedules
-                .find(row.id)
-                .filter(dsl::is_paused.ne(false)),
+            dsl::harvest_schedules.find(row.id).filter(
+                dsl::is_paused
+                    .ne(false)
+                    .or(dsl::auto_paused_at.is_not_null()),
+            ),
         )
         .set((
             dsl::is_paused.eq(false),
             dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
+            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now),
         ))
         .execute(&mut conn)
@@ -8628,8 +8650,15 @@ async fn schedule_bulk_resume_ui(
         };
         // Whole rows + the list's own matcher, so the health filter applies and
         // the acted-on set is exactly the set the confirmation counted (#951).
+        // `is_paused = true OR auto_paused_at IS NOT NULL`, matching the API's
+        // resume predicate — an auto-paused schedule has `is_paused = false`
+        // and would otherwise be unreachable from a bulk resume (#360).
         let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
-            .filter(dsl::is_paused.eq(true))
+            .filter(
+                dsl::is_paused
+                    .eq(true)
+                    .or(dsl::auto_paused_at.is_not_null()),
+            )
             .select(HarvestSchedule::as_select())
             .load(&mut conn)
             .await
@@ -8645,13 +8674,19 @@ async fn schedule_bulk_resume_ui(
         let updated_ids: Vec<uuid::Uuid> = diesel::update(
             dsl::harvest_schedules
                 .filter(dsl::id.eq_any(&matching_ids))
-                .filter(dsl::is_paused.eq(true)),
+                .filter(
+                    dsl::is_paused
+                        .eq(true)
+                        .or(dsl::auto_paused_at.is_not_null()),
+                ),
         )
         .set((
             dsl::is_paused.eq(false),
             dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
+            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now),
         ))
         .returning(dsl::id)
@@ -9020,18 +9055,17 @@ fn render_schedule_table(
                                 a.drilldown href={ (schedule_leaf_path(&id_str, "backfill")) } {
                                     "Backfill"
                                 }
-                                @if !row.is_paused {
-                                    form method="post"
-                                        action={ "schedules/" (id_str) "/pause" }
-                                        onsubmit="return confirm('Pause this schedule?')" {
-                                        button type="submit" { "Pause" }
-                                    }
-                                }
-                                @if row.is_paused {
+                                @if schedule_is_resumable(row) {
                                     form method="post"
                                         action={ "schedules/" (id_str) "/resume" }
                                         onsubmit="return confirm('Resume this schedule?')" {
                                         button type="submit" { "Resume" }
+                                    }
+                                } @else {
+                                    form method="post"
+                                        action={ "schedules/" (id_str) "/pause" }
+                                        onsubmit="return confirm('Pause this schedule?')" {
+                                        button type="submit" { "Pause" }
                                     }
                                 }
                                 form method="post"
@@ -9302,7 +9336,7 @@ fn build_schedule_query_string(
 // Every one of these is a *presentation* slice over an already-shipped,
 // already-audited API:
 //
-//   * preview      → `api::compute_schedule_preview`  (`GET /admin/schedules/{id}/preview`, #348/#543)
+//   * preview      → `api::compute_schedule_preview_for` (`GET /admin/schedules/{id}/preview`, #348/#543)
 //   * run history  → `api::load_schedule_runs`        (`GET /admin/schedules/{id}/runs`, #534/#762)
 //   * backfill     → `api::schedule_backfill`         (`POST /admin/schedules/{id}/backfill`, #337)
 //
@@ -9400,8 +9434,16 @@ async fn schedule_preview_ui(
         .count
         .unwrap_or(SCHEDULE_PREVIEW_DEFAULT_COUNT)
         .clamp(1, 100);
-    let preview =
-        crate::api::compute_schedule_preview(&api_state, row.id, count, chrono::Utc::now()).await?;
+    // Pass the row through rather than the id: `compute_schedule_preview`'s own
+    // lookup stops at the first unreachable shard, which would fail a preview
+    // for a schedule the resilient resolver above already found on a later one.
+    let preview = crate::api::compute_schedule_preview_for(
+        &api_state,
+        row.clone(),
+        count,
+        chrono::Utc::now(),
+    )
+    .await?;
     Ok(render_schedule_preview_page(
         &row, shard_id, &preview, count,
     ))
@@ -9887,9 +9929,14 @@ impl BackfillFormParams {
         if to_at < from_at {
             return Err("the backfill end must be at or after its start".to_string());
         }
+        // `AutoSi`, not `Secs`: truncating to whole seconds would change the
+        // *window*, not merely its spelling. An `interval:` backfill treats
+        // `from` as its first slot, so a submitted `…00.900Z` normalised to
+        // `…00Z` shifts every slot in the plan. `AutoSi` keeps a whole-second
+        // window spelled `…:00Z` and preserves fractional digits when present.
         Ok(Self {
-            from: from_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            to: to_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            from: from_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            to: to_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             max_count,
             include_paused,
         })
@@ -14948,6 +14995,102 @@ mod tests {
             !qs.contains("health="),
             "the shortcut supplies health itself; the suffix must not repeat it: {qs}"
         );
+    }
+
+    // -- Codex round 1 regressions --
+
+    /// Codex #1: a submitted window with sub-second precision must reach the API
+    /// unchanged. `SecondsFormat::Secs` truncated both bounds, and an `interval:`
+    /// backfill treats `from` as its first slot — so `…00.900Z` normalised to
+    /// `…00Z` shifts every slot in the plan rather than merely respelling it.
+    #[test]
+    fn backfill_window_preserves_sub_second_precision() {
+        let params = BackfillFormParams::parse(
+            "2026-08-01T00:00:00.900Z",
+            "2026-08-01T06:00:00.250Z",
+            None,
+            false,
+        )
+        .expect("a fractional-second window parses");
+        assert_eq!(
+            params.from, "2026-08-01T00:00:00.900Z",
+            "the start must not be truncated to whole seconds"
+        );
+        assert_eq!(params.to, "2026-08-01T06:00:00.250Z");
+
+        let request = params.to_request(true).expect("converts");
+        assert_eq!(
+            request.from.timestamp_subsec_millis(),
+            900,
+            "the request must carry the submitted precision"
+        );
+        assert_eq!(request.to.timestamp_subsec_millis(), 250);
+
+        // A whole-second window still normalises to the clean spelling.
+        let whole =
+            BackfillFormParams::parse("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z", None, false)
+                .expect("parses");
+        assert_eq!(whole.from, "2026-08-01T00:00:00Z");
+        assert_eq!(whole.to, "2026-08-02T00:00:00Z");
+    }
+
+    /// Codex #3: the scheduler's auto-pause (#360) sets `auto_paused_at` without
+    /// setting `is_paused`, so a row can be non-firing with `is_paused = false`.
+    /// Keying the row actions on `is_paused` alone showed an "Auto-paused" badge
+    /// next to a **Pause** button, leaving no way to restore firing.
+    #[test]
+    fn an_auto_paused_schedule_is_offered_resume_not_pause() {
+        let auto_paused = HarvestSchedule {
+            is_paused: false,
+            auto_paused_at: Some(chrono::Utc::now()),
+            consecutive_failure_count: 5,
+            ..make_schedule(Some("flaky_wf"), None, false)
+        };
+        assert!(
+            schedule_is_resumable(&auto_paused),
+            "an auto-paused schedule must be treated as resumable"
+        );
+
+        let id = auto_paused.id.to_string();
+        let html = render_schedule_table(
+            &[(ShardId::new(0), auto_paused)],
+            false,
+            &std::collections::HashMap::new(),
+        )
+        .into_string();
+        assert!(
+            html.contains(&format!("schedules/{id}/resume")),
+            "an auto-paused row must offer Resume: {html}"
+        );
+        assert!(
+            !html.contains(&format!("schedules/{id}/pause")),
+            "an auto-paused row must not offer Pause: {html}"
+        );
+        assert!(
+            html.contains("Auto-paused"),
+            "the badge must still say why: {html}"
+        );
+    }
+
+    /// A plainly active schedule is still offered Pause, and a hand-paused one
+    /// Resume — the fix must not invert the ordinary cases.
+    #[test]
+    fn resumability_is_unchanged_for_ordinary_schedules() {
+        let active = make_schedule(Some("active_wf"), None, false);
+        assert!(!schedule_is_resumable(&active));
+
+        let paused = make_schedule(Some("paused_wf"), None, true);
+        assert!(schedule_is_resumable(&paused));
+
+        let active_id = active.id.to_string();
+        let html = render_schedule_table(
+            &[(ShardId::new(0), active)],
+            false,
+            &std::collections::HashMap::new(),
+        )
+        .into_string();
+        assert!(html.contains(&format!("schedules/{active_id}/pause")));
+        assert!(!html.contains(&format!("schedules/{active_id}/resume")));
     }
 
     /// The backfill confirmation interpolates the schedule UUID into its

@@ -163,3 +163,35 @@ page could be made to submit `stage=commit`. This is a repo-wide property of eve
 mutation (cancel, terminate, signal, reset, DLQ replay, gate lift, schedule pause/delete/
 trigger), not something this page introduces, and a fix belongs at the router layer for
 all of them at once. Filed as a follow-up rather than bolted onto one form.
+
+**Codex round 1 (three P2s, all real, one of them a functional dead end).** The sharpest
+was auto-pause. The scheduler's #360 auto-pause sets `auto_paused_at` and deliberately
+does **not** set `is_paused`, so a row can be non-firing with `is_paused = false`. The
+health model read that correctly and rendered an "Auto-paused" badge — but the row
+actions, the bulk-resume candidate query and the resume UPDATE all keyed on `is_paused`
+alone, so the operator was shown a schedule that had stopped firing, offered a **Pause**
+button for it, and had no path in Vantage to restore it. Worse, even a resume that did
+land would not have cleared `auto_paused_at` or reset `consecutive_failure_count`, so the
+next tick would re-pause it. This page created the visibility and then dead-ended on it.
+Resumability is now `is_paused OR auto_paused_at IS NOT NULL`, and both resume paths clear
+the same fields as `set_schedule_paused(.., false, ..)`.
+
+The second: the preview drill-down resolved its row through the new resilient
+`resolve_schedule_with_shard` and then handed the *id* back to
+`compute_schedule_preview`, whose own `load_schedule_by_id` stops at the first shard whose
+connection fails. In a multi-shard deployment with an earlier shard down, the preview
+therefore failed for a schedule the resolver had just found on a later healthy one —
+undoing the very resilience the resolver was introduced for. `compute_schedule_preview`
+is now split so a caller holding a resolved row passes it through.
+
+The third: `SecondsFormat::Secs` truncated both window bounds when normalising a backfill
+submission. Judged a nit in the earlier internal review ("self-consistent, so the
+committed window equals the previewed one"), and that reasoning was too narrow — an
+`interval:` backfill treats `from` as its first slot, so `…00.900Z` normalised to `…00Z`
+shifts every slot in the plan. It changes the window, not its spelling. Now `AutoSi`,
+which keeps the clean `…:00Z` rendering for whole-second windows.
+
+Three pure regression tests (precision round-trip, auto-paused rows offering Resume,
+ordinary rows unchanged) and three integration tests (per-row and bulk resume clearing
+`auto_paused_at` and the failure counter, and a preview rendering across an unreachable
+earlier shard).
