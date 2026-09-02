@@ -36,6 +36,7 @@
 //! version branch inside a handler"). See the "Safe handler removal" runbook.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use autumn_harvest::WorkflowTypeNonTerminalCount;
 use autumn_harvest::execution::non_terminal_counts_by_workflow_name;
@@ -280,23 +281,30 @@ pub async fn build_workflow_reachability_report(
 }
 
 /// Build a reachability report against a single shard's pool **without** a
-/// started [`HarvestApiState`]/runtime — the boot-time gate core (issue #700
-/// AC4).
+/// started [`HarvestApiState`]/runtime — the single-shard convenience wrapper
+/// over [`build_reachability_report_for_shards`].
 ///
 /// [`build_workflow_reachability_report`] resolves `registered` from the
 /// installed handler registry and fans out across shards, so it can only run
 /// *after* `HarvestRunner::start` has spawned the worker poll loop. That is too
 /// late for the `fail` action: a worker could claim and terminally fail an
 /// orphaned-type execution during the boot window before the abort tears the
-/// runner down. This entry point takes `registered` (derived directly from the
-/// owned `BuiltHarvest`) and a single shard pool, so the gate can run *before*
-/// any worker spawns.
+/// runner down. This family of entry points takes `registered` (derived
+/// directly from the owned `BuiltHarvest`) and pools, so a caller can run the
+/// check *before* any worker spawns.
+///
+/// The boot gate itself no longer calls this: since issue #1128 it goes through
+/// the cross-shard [`build_reachability_report_for_shards`] (the standalone
+/// runner path supports multi-shard deployments, which a shard-0-only read
+/// would silently under-report). This wrapper is kept for single-shard callers
+/// that have exactly one pool in hand.
 ///
 /// The plugin is single-shard-only (multi-shard configs are rejected upstream),
 /// so a single-shard query reads the identical rows the started-runtime
 /// cross-shard fan-out would. It reuses the same [`observe_shard`] and
 /// [`build_report_from_observations`] helpers as
 /// [`build_workflow_reachability_report`], so the two cannot drift.
+///
 ///
 /// Infallible by construction: a DB read failure is encoded as an unreachable
 /// shard (`status == Unavailable`) inside the report rather than an `Err`, so
@@ -309,10 +317,94 @@ pub async fn build_reachability_report_single_shard(
     pool: &DbPool,
     filter: Option<String>,
 ) -> WorkflowReachabilityReport {
-    let observed_at = Utc::now();
-    let observation = observe_shard(0, Some(pool.clone()), filter.clone()).await;
-    build_report_from_observations(observed_at, filter, registered, vec![observation])
+    let shards = BTreeMap::from([(0, Some(pool.clone()))]);
+    build_reachability_report_for_shards(registered, &shards, filter).await
 }
+
+/// Build a reachability report across an explicit set of shard pools, **without**
+/// a started [`HarvestApiState`]/runtime — the multi-shard boot-time gate core
+/// (issue #1128).
+///
+/// The sibling of [`build_reachability_report_single_shard`], for the standalone
+/// [`HarvestRunner`](crate::runner::HarvestRunner) path, which — unlike the
+/// single-shard-only plugin — supports deployments spanning several databases
+/// (issue #522). A shard-0-only gate there would report a `complete`, clean
+/// fleet while shards 1..N host orphans.
+///
+/// `shards` maps a shard id to that shard's pool, or to `None` for a shard this
+/// process knows about (its router names it) but has no pool for. A `None` shard
+/// is reported `unavailable` rather than silently dropped — exactly the
+/// [`shard_fanout::expected_shards`] rule the started-runtime fan-out follows —
+/// so an uninspected shard degrades the report to `partial`/`unavailable`
+/// instead of letting it claim a `complete` inspection it never performed.
+///
+/// Shares [`observe_shard`] and [`build_report_from_observations`] with
+/// [`build_workflow_reachability_report`], so the boot gate and the management
+/// route cannot drift.
+///
+/// Infallible by construction: a DB read failure is encoded as an unreachable
+/// shard (`status == Unavailable`) inside the report rather than an `Err`, so
+/// the caller never blocks boot on the check's own failure — combined with
+/// [`startup_orphan_decision`]'s crash-loop rule (`Fail` + incomplete report →
+/// `Warn`, never `Abort`), a transient DB outage at boot can never hard-fail
+/// startup.
+pub async fn build_reachability_report_for_shards(
+    registered: &BTreeSet<String>,
+    shards: &BTreeMap<i32, Option<DbPool>>,
+    filter: Option<String>,
+) -> WorkflowReachabilityReport {
+    let observed_at = Utc::now();
+    let observations = join_all(shards.iter().map(|(shard_id, pool)| {
+        let filter = filter.clone();
+        let pool = pool.clone();
+        async move {
+            match tokio::time::timeout(
+                STARTUP_GATE_SHARD_TIMEOUT,
+                observe_shard(*shard_id, pool, filter),
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(_elapsed) => ShardObservation {
+                    shard_id: *shard_id,
+                    rows: Vec::new(),
+                    error: Some(format!(
+                        "shard {shard_id} did not answer the startup reachability query \
+                         within {STARTUP_GATE_SHARD_TIMEOUT:?}"
+                    )),
+                },
+            }
+        }
+    }))
+    .await;
+    build_report_from_observations(observed_at, filter, registered, observations)
+}
+
+/// Wall-clock bound on ONE shard's observation inside
+/// [`build_reachability_report_for_shards`].
+///
+/// Harvest configures no deadpool `Timeouts`, so a bare `pool.get().await` is an
+/// **unbounded** wait — the same hazard the claim path bounds with
+/// `worker::shard_acquire_bound`. That is tolerable for
+/// [`build_workflow_reachability_report`], which serves an HTTP request that
+/// carries its own deadline. It is not tolerable here: this core runs as the
+/// first act of [`HarvestRunner::start`](crate::runner::HarvestRunner::start),
+/// before anything exists that could time it out. A shard whose database is
+/// reachable-but-silent (a dropped security-group rule, a primary mid-failover,
+/// a wedged pooler) would park the boot **forever** — no error, no crash loop,
+/// just a process that never becomes ready, which is a worse outcome than the
+/// one the crash-loop rule exists to prevent. The multi-shard fan-out makes it
+/// worse still: one parked shard strands the whole gate.
+///
+/// An elapsed shard is reported `unavailable` exactly like any other unreadable
+/// shard, so it flows into the existing incomplete-report rule and
+/// [`startup_orphan_decision`] degrades it to `Warn`, never `Abort`.
+///
+/// Deliberately generous: the bound's job is to turn an *indefinite* park into a
+/// partial answer, not to police a merely-slow database — a gate that gave up on
+/// a healthy-but-loaded shard would report `partial` on every boot and train
+/// operators to ignore the warning.
+pub const STARTUP_GATE_SHARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn observe_shard(
     shard_id: i32,

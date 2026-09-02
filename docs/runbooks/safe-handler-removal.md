@@ -12,8 +12,9 @@ invisible failure into a one-call pre-flight gate.
 
 **When to use:** before any deploy that removes/renames a workflow type, and as
 a CI gate on the rollout. For where this sits in the full deploy sequence — and
-the optional boot-time `[harvest.startup] orphaned_workflows = warn|fail|off`
-gate — see the [Pre-cutover handler-coverage gate](safe-deploy.md#runbook-pre-cutover-handler-coverage-gate) in the safe-deploy runbook.
+the boot-time `[harvest.startup] orphaned_workflows = warn|fail|off` gate, which
+runs on **both** the `HarvestPlugin` and standalone `HarvestRunner::start` boot
+paths — see the [Pre-cutover handler-coverage gate](safe-deploy.md#runbook-pre-cutover-handler-coverage-gate) in the safe-deploy runbook.
 
 **When _not_ to use:** retiring a *worker build* (use `build_reachability`,
 below) or removing a *`ctx.version()` branch inside a handler* (use the
