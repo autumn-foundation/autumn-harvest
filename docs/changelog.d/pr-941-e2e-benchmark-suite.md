@@ -37,8 +37,9 @@
   claim-depth curve under an end-to-end label. The closed loop keeps depth
   shallow and constant; `inflight_soundness` refuses to publish a run in which
   the harness, not the engine, was the limiter (it fires at 384 in flight on the
-  reference box, and the published default of 128 is the deepest load level that
-  passes). The two latency scenarios are paced at ~30% of the measured saturated
+  reference box). The published default is **four times** the worker's workflow
+  slots: a deeper population buys a higher number by measuring further into the
+  claim-depth curve, which is #786's finding rather than this suite's. The two latency scenarios are paced at ~30% of the measured saturated
   rate, because a p99 taken under saturation measures the backlog rather than
   the dispatch path, and `pacing_verdict` marks a run that could not hold its
   pace. The signal round-trip is read from **one monotonic clock in one

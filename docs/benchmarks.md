@@ -39,22 +39,26 @@ full environment, the per-cell notes and the verbatim run output are in
 
 | scenario | metric | 1 shard | 2 shards | 4 shards |
 |:--|:--|--:|--:|--:|
-| `throughput` | workflows/sec | 22.65 | 34.97 | 33.53 |
-| `dispatch_latency` | p50 ms | 37.78 | 43.56 | 45.74 |
-| `dispatch_latency` | p99 ms | 55.60 | 62.23 | 100.03 |
-| `signal_roundtrip` | p50 ms | 55.79 | 59.66 | 45.60 |
-| `signal_roundtrip` | p99 ms | 65.44 | 69.02 | 80.24 |
-| `replay_throughput` | events/sec | 9 960 371.64 | 9 657 651.19 | 9 096 540.11 |
+| `throughput` | workflows/sec | 24.04 | 38.44 | 36.28 |
+| `dispatch_latency` | p50 ms | 39.83 | 43.19 | 55.77 |
+| `dispatch_latency` | p99 ms | 60.55 | 64.43 | 109.67 |
+| `signal_roundtrip` | p50 ms | 54.69 | 60.51 | 46.43 |
+| `signal_roundtrip` | p99 ms | 65.93 | 68.27 | 81.54 |
+| `replay_throughput` | events/sec | 9 564 120.54 | 9 387 692.65 | 9 239 806.28 |
 
-Three things a reader should take from that table before anything else:
+Four things a reader should take from that table before anything else:
 
-* **Sharding bought 1.54x at two shards and then stopped.** Four shards is
-  slower than two *on this machine*. See
-  [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show)
-  — the run's own replay control drifted -8.7% across the sweep, which is the
-  box getting busier, not the engine getting worse.
-* **The tail degrades faster than the median.** Dispatch p99 nearly doubles
-  across the sweep while p50 moves 21%.
+* **Sharding bought 1.60x at two shards and then gave some back.** Four shards
+  is slightly slower than two *on this machine*, which runs four Postgres
+  clusters, four workers and the harness on four cores. See
+  [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show).
+* **The tail degrades about three times faster than the median.** Dispatch p99
+  goes 60.55 → 109.67 ms across the sweep while p50 goes 39.83 → 55.77.
+* **The box was quiet for this run.** The replay control — in-memory, so it
+  cannot legitimately move with shard count — spread 3.4% across the sweep. An
+  earlier sweep on the same box drifted 8.7% and read 5–6% lower throughout.
+  That is the honest size of the run-to-run variation these numbers carry, and
+  most of the reason the tolerance is ±15% rather than tighter.
 * **p99 is the least reproducible number here.** It is published and checked
   because #941's success metric names it, but a tail measured on a box that is
   also running the harness is partly a measurement of that box's run queue —
