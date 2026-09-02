@@ -515,9 +515,13 @@ fn resolve_backlog_bucket_state(
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
-/// Mirrors the activity limiter's `register_rate_limit_buckets`
-/// (`INSERT … ON CONFLICT (key) DO NOTHING`, initial `tokens = burst`), so a
-/// rate change across a deploy does not silently reset a live bucket.
+/// Delegates to [`crate::queue::ensure_rate_limit_bucket`] rather than
+/// re-issuing the same `INSERT`: the two paths write the *same* table with the
+/// same "never reset a live bucket" contract, and since issue #1127 that
+/// statement also carries the stale-row touch that interlocks a registration
+/// against the idle-bucket GC. A second copy of it here would silently miss
+/// that interlock, and a deferred start whose bucket was collected mid-flight
+/// can never debit a token again.
 #[cfg(feature = "db")]
 async fn ensure_throttle_bucket(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -525,19 +529,7 @@ async fn ensure_throttle_bucket(
     refill_per_sec: f64,
     burst: f64,
 ) -> crate::error::HarvestResult<()> {
-    use diesel_async::RunQueryDsl;
-    diesel::sql_query(
-        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-         VALUES ($1, $2, $3, $3, NOW()) \
-         ON CONFLICT (key) DO NOTHING",
-    )
-    .bind::<diesel::sql_types::Text, _>(key)
-    .bind::<diesel::sql_types::Double, _>(refill_per_sec)
-    .bind::<diesel::sql_types::Double, _>(burst)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    Ok(())
+    crate::queue::ensure_rate_limit_bucket(conn, key, refill_per_sec, burst).await
 }
 
 /// Whether any pending-start row already exists for a bucket key.

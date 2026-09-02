@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_harvest_task_queue_rate_limit_key_live;
