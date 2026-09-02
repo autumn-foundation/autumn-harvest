@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+# Every doc (README.md, examples/quickstart/README.md) invokes this package
+# with plain `cargo run -p quickstart` — no `--bin`. Without default-run,
+# adding the retry-jitter-example [[bin]] below made that ambiguous and
+# broke all of them (see scripts/check-default-run.sh).
+default-run = "quickstart"
 
 [dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["db"] }
