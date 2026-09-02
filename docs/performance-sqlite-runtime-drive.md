@@ -408,7 +408,7 @@ at n=80) is **not** part of this recommendation. It is `activity_payload(i)`
 being rebuilt as a fresh `json!()` value every time the workflow function
 replays from the top and loops past an already-completed `i` — the
 deterministic-replay execution model's documented, load-bearing property
-(CLAUDE.md: "the workflow author's surrounding Rust code re-executes on
+(`docs/architecture.md`: "the workflow author's surrounding Rust code re-executes on
 every replay cycle even for already-completed calls; only the actual
 dispatch is skipped"). This is shared by the Postgres backend's identical
 execution model and by design — a workflow author's surrounding computation

@@ -309,7 +309,8 @@ request time) — that combination returns `400`.
 > double-run.
 
 For the full `reuse_policy` × `conflict_policy` matrix see the
-"Standalone Start — Conflict Policy" section in `CLAUDE.md`.
+"Standalone Start — Conflict Policy" section in
+[`docs/architecture.md`](../architecture.md#standalone-start--conflict-policy-issue-685).
 
 ---
 
