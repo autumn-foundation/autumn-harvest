@@ -67,6 +67,16 @@ async fn relation_exists(url: &str, relation: &str) -> bool {
     rows.into_iter().next().is_some_and(|row| row.present)
 }
 
+/// The names in a report's unserialized list, for tests that only care which
+/// migrations ran that way rather than why.
+fn unserialized_names(report: &migrate::MigrationReport) -> Vec<String> {
+    report
+        .applied_unserialized
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
 /// A synthetic migration far past every real timestamp, so it always sorts last
 /// and can never collide with a migration this repository adds later.
 fn probe_migration(version: &str, sql: &str) -> MigrationScript {
@@ -293,8 +303,12 @@ async fn a_nontransactional_migration_may_create_an_index_concurrently() {
     );
     assert_eq!(
         report.applied_unserialized,
-        vec!["29990102000000_harvest_migrate_probe_index".to_string()],
-        "only the run_in_transaction = false migration ran without the lock"
+        vec![migrate::UnserializedMigration {
+            name: "29990102000000_harvest_migrate_probe_index".to_string(),
+            reason: migrate::UnserializedReason::NoTransaction,
+        }],
+        "only the run_in_transaction = false migration ran without the lock, \
+         and for its own reason rather than a missing privilege"
     );
 }
 
@@ -580,26 +594,28 @@ async fn a_role_with_only_select_and_insert_on_the_ledger_can_still_migrate() {
 #[tokio::test]
 async fn a_nontransactional_body_that_loses_the_ledger_race_is_still_reported_unserialized() {
     // Without a transaction the body runs first and the ledger insert can lose
-    // afterwards, with nothing to roll the body back. The version is another
-    // migrator's, so the migration is `applied_concurrently` -- but this run
-    // really did execute unlocked DDL against the database, and the whole
-    // point of the unserialized list is to say so. Reporting only
-    // `applied_concurrently` would let the safety signal claim no unlocked
-    // body ran when one did.
+    // afterwards, with nothing to roll the body back. The version is then
+    // another migrator's, so the migration is `applied_concurrently` -- but
+    // this run really did execute unlocked DDL, and the unserialized list
+    // exists to say so. Reporting only `applied_concurrently` would let the
+    // safety signal claim no unlocked body ran when one did.
+    //
+    // The version must be absent when the run is *planned* and present when
+    // the ledger insert fires -- pre-recording it instead just classifies the
+    // migration `already_applied`, and the body never runs at all.
+    //
+    // The body itself records the version, which is a deterministic stand-in
+    // for the interleaving: `apply_without_transaction` cannot tell whether the
+    // row arrived from a concurrent migrator or from the body, because all it
+    // observes is its own insert losing to a row that is really there. Racing
+    // a second session against a `pg_sleep` body would exercise the same code
+    // path while depending on CI timing.
     let (_container, url) = empty_postgres().await;
-    migrate::apply(&url, &[]).await.expect("ledger created");
-
-    // Stand in for the migrator that wins the race: the version is already
-    // recorded when this run's insert lands.
-    let mut other = connect(&url).await;
-    diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ('29990106000000')")
-        .execute(&mut other)
-        .await
-        .expect("the winning migrator records the version");
 
     let nontransactional = MigrationScript::with_metadata(
         "29990106000000_harvest_migrate_probe_raced",
-        "CREATE TABLE IF NOT EXISTS harvest_migrate_raced (id INTEGER PRIMARY KEY);",
+        "CREATE TABLE harvest_migrate_raced (id INTEGER PRIMARY KEY); \
+         INSERT INTO __diesel_schema_migrations (version) VALUES ('29990106000000');",
         "run_in_transaction = false\n",
     )
     .expect("metadata parses");
@@ -610,22 +626,29 @@ async fn a_nontransactional_body_that_loses_the_ledger_race_is_still_reported_un
 
     assert!(
         report.applied.is_empty(),
-        "the version was not recorded by this run: {:?}",
+        "this run did not record the version: {:?}",
         report.applied
     );
     assert_eq!(
         report.applied_concurrently,
-        vec!["29990106000000_harvest_migrate_probe_raced".to_string()]
+        vec!["29990106000000_harvest_migrate_probe_raced".to_string()],
+        "the ledger row is not this run's"
     );
     assert_eq!(
-        report.applied_unserialized,
+        unserialized_names(&report),
         vec!["29990106000000_harvest_migrate_probe_raced".to_string()],
         "the body ran here, unlocked, before losing the insert -- the report \
          must not claim nothing ran unserialized"
     );
 
-    // Proof the body really did run: only this run creates that table.
+    // Proof the body really did execute rather than being skipped at planning:
+    // only the body creates this table, and it is not `IF NOT EXISTS`.
     assert!(relation_exists(&url, "harvest_migrate_raced").await);
+    assert!(
+        ledger_versions(&url)
+            .await
+            .contains(&"29990106000000".to_string())
+    );
 }
 
 /// The single count the ledger-visibility migration recorded.

@@ -10,7 +10,9 @@ use autumn_harvest::backup_verify::{
     Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
     dsn_targets_same_database, redact_dsn, verify_restore,
 };
-use autumn_harvest::migrate::{MigrationPlan, MigrationReport, MigrationScript};
+use autumn_harvest::migrate::{
+    MigrationPlan, MigrationReport, MigrationScript, UnserializedReason,
+};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
@@ -4967,12 +4969,15 @@ fn scan_keyword_dsn(
             i += 1;
         }
         let key = &dsn[key_start..i];
-        // A libpq keyword is `[A-Za-z0-9_]+`. Anything else means this is not
-        // keyword form at all -- a malformed URL
-        // (`postgres://alice:hunter2@db:notaport/db?sslmode=require`) otherwise
-        // scans as one giant "keyword" whose value needs no redaction, and the
-        // whole DSN, password included, comes back as if it had been examined.
-        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        // The key must be a keyword libpq actually recognizes, not merely
+        // keyword-SHAPED. Checking only the character set is not enough: a
+        // mistyped URL that keeps a credential but loses the `://`
+        // (`postgres=//alice:hunter2@db/harvest`) scans as the "keyword"
+        // `postgres`, needs no redaction because there is no `password=`, and
+        // comes back whole -- password included -- as if it had been examined.
+        // Rejecting here yields the caller's `<unparseable dsn>` label, which
+        // is what an input tokio-postgres will also reject should produce.
+        if !is_connection_keyword(key) {
             return None;
         }
         let spacing_start = i;
@@ -5091,6 +5096,68 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
     }
 
     redact_keyword_dsn(dsn).unwrap_or_else(|| format!("{UNPARSEABLE} #{ordinal}"))
+}
+
+/// Whether `key` is a libpq connection keyword.
+///
+/// Deliberately a superset of what tokio-postgres itself accepts. Erring wide
+/// only risks handing back a redacted label for a DSN the driver will reject
+/// anyway; erring narrow would downgrade a legitimate DSN's label to
+/// `<unparseable dsn>` and cost an operator the identity of the failing shard.
+/// What it must not admit is a token that is keyword-shaped but not a keyword,
+/// which is how a mistyped URL smuggles a password past redaction.
+fn is_connection_keyword(key: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "application_name",
+        "channel_binding",
+        "client_encoding",
+        "connect_timeout",
+        "dbname",
+        "fallback_application_name",
+        "gssdelegation",
+        "gssencmode",
+        "gsslib",
+        "host",
+        "hostaddr",
+        "keepalives",
+        "keepalives_count",
+        "keepalives_idle",
+        "keepalives_interval",
+        "krbsrvname",
+        "load_balance_hosts",
+        "options",
+        "passfile",
+        "password",
+        "port",
+        "replication",
+        "require_auth",
+        "requirepeer",
+        "requiressl",
+        "scram_client_key",
+        "scram_server_key",
+        "service",
+        "ssl_max_protocol_version",
+        "ssl_min_protocol_version",
+        "sslcert",
+        "sslcertmode",
+        "sslcompression",
+        "sslcrl",
+        "sslcrldir",
+        "sslkey",
+        "sslmode",
+        "sslnegotiation",
+        "sslpassword",
+        "sslrootcert",
+        "sslsni",
+        "target_session_attrs",
+        "tcp_user_timeout",
+        "user",
+    ];
+    // libpq keywords are lowercase; compare case-insensitively so a DSN
+    // written `Host=db` keeps its label rather than being called unparseable.
+    KEYWORDS
+        .iter()
+        .any(|keyword| key.eq_ignore_ascii_case(keyword))
 }
 
 /// Render a migration failure without leaking the DSN.
@@ -5230,26 +5297,26 @@ pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
                  concurrent migrator was not serialized against them:",
                 report.applied_unserialized.len()
             );
-            for name in &report.applied_unserialized {
-                let _ = writeln!(out, "      {name}");
+            // Per migration, not per run: a run can contain both reasons, and
+            // they take different remedies. Naming one cause for the whole
+            // list would send an operator to change a grant that cannot help
+            // the non-transactional entries.
+            for entry in &report.applied_unserialized {
+                let cause = match entry.reason {
+                    UnserializedReason::LedgerLockUnavailable => {
+                        "this role lacks UPDATE/DELETE/TRUNCATE on __diesel_schema_migrations"
+                    }
+                    UnserializedReason::NoTransaction => {
+                        "declares run_in_transaction = false, so there is no transaction \
+                         to hold the lock in -- no grant changes this"
+                    }
+                };
+                let _ = writeln!(out, "      {} -- {cause}", entry.name);
             }
-            // Two causes, two different remedies -- naming the wrong one sends
-            // an operator to change a grant that would not have helped.
-            if report.ledger_lock_available {
-                let _ = writeln!(
-                    out,
-                    "      cause: these declare run_in_transaction = false, so there is \
-                     no transaction for the lock to be held in. No grant changes this; \
-                     run migrators one at a time."
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "      cause: this role lacks UPDATE/DELETE/TRUNCATE on \
-                     __diesel_schema_migrations. Grant one of those, or run migrators \
-                     one at a time."
-                );
-            }
+            let _ = writeln!(
+                out,
+                "      Run migrators one at a time against this database."
+            );
         }
         if *setup_failed {
             let _ = writeln!(
@@ -17471,7 +17538,7 @@ mod migrate_cli_tests {
     //! `autumn-harvest/tests/integration/migrate_tests.rs`.
     use super::*;
     use autumn_harvest::migrate::{
-        FailedMigration, MigrationPlan, MigrationReport, MigrationScript,
+        FailedMigration, MigrationPlan, MigrationReport, MigrationScript, UnserializedMigration,
     };
 
     fn parse(args: &[&str]) -> Cli {
@@ -17745,7 +17812,10 @@ mod migrate_cli_tests {
                 unrecognized: Vec::new(),
                 failed: None,
                 ledger_lock_available: false,
-                applied_unserialized: vec!["20260801000000_x".to_string()],
+                applied_unserialized: vec![UnserializedMigration {
+                    name: "20260801000000_x".to_string(),
+                    reason: UnserializedReason::LedgerLockUnavailable,
+                }],
             },
         }];
 
@@ -17771,8 +17841,12 @@ mod migrate_cli_tests {
             serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
         assert_eq!(value["targets"][0]["ledger_lock_available"], false);
         assert_eq!(
-            value["targets"][0]["applied_unserialized"][0],
+            value["targets"][0]["applied_unserialized"][0]["name"],
             "20260801000000_x"
+        );
+        assert_eq!(
+            value["targets"][0]["applied_unserialized"][0]["reason"],
+            "ledger_lock_unavailable"
         );
     }
 
@@ -17795,7 +17869,10 @@ mod migrate_cli_tests {
                 unrecognized: Vec::new(),
                 failed: None,
                 ledger_lock_available: true,
-                applied_unserialized: vec!["20260802000000_concurrent_index".to_string()],
+                applied_unserialized: vec![UnserializedMigration {
+                    name: "20260802000000_concurrent_index".to_string(),
+                    reason: UnserializedReason::NoTransaction,
+                }],
             },
         }];
 
@@ -17842,6 +17919,70 @@ mod migrate_cli_tests {
         assert!(
             !text.contains("without the ledger lock"),
             "the normal path must not cry wolf: {text}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_run_gives_each_migration_its_own_cause() {
+        // A role without the privilege applies everything unserialized, and a
+        // `run_in_transaction = false` migration in the same run is
+        // unserialized for a reason no grant fixes. Attributing the whole list
+        // to the missing grant would tell an operator that granting it makes
+        // the run safe, which for the second entry is false.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec![
+                    "20260801000000_x".to_string(),
+                    "20260802000000_concurrent_index".to_string(),
+                ],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: false,
+                applied_unserialized: vec![
+                    UnserializedMigration {
+                        name: "20260801000000_x".to_string(),
+                        reason: UnserializedReason::LedgerLockUnavailable,
+                    },
+                    UnserializedMigration {
+                        name: "20260802000000_concurrent_index".to_string(),
+                        reason: UnserializedReason::NoTransaction,
+                    },
+                ],
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        let warning = text.split("WARNING:").nth(1).expect("a warning block");
+        assert!(
+            warning.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "the privilege cause must appear: {warning}"
+        );
+        assert!(
+            warning.contains("run_in_transaction = false"),
+            "the non-transactional cause must appear too, not be collapsed into \
+             the privilege one: {warning}"
+        );
+        assert!(
+            warning.contains("no grant changes this"),
+            "the operator must be told the grant will not fix that entry: {warning}"
+        );
+
+        // Each cause sits on its own migration's line.
+        let index_line = warning
+            .lines()
+            .find(|line| line.contains("20260802000000_concurrent_index"))
+            .expect("a line for the non-transactional migration");
+        assert!(
+            index_line.contains("run_in_transaction = false"),
+            "the cause must be attached to the migration it explains: {index_line}"
+        );
+        assert!(
+            !index_line.contains("lacks UPDATE"),
+            "and not to the other one's: {index_line}"
         );
     }
 
@@ -18230,6 +18371,48 @@ mod migrate_cli_tests {
             "credential leaked into: {label}"
         );
         assert_eq!(label, "<unparseable dsn> #1");
+    }
+
+    #[test]
+    fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
+        // A mistyped URL that loses the `://` but keeps the credential scans
+        // as the "keyword" `postgres`: character-set-valid, and with no
+        // `password=` key there is nothing for the scanner to redact, so the
+        // whole DSN came back as if it had been examined. Only requiring a
+        // keyword libpq actually recognizes catches it.
+        for dsn in [
+            "postgres=//alice:hunter2@db/harvest",
+            "postgresql=//alice:hunter2@db/harvest",
+            "notakeyword=alice:hunter2@db",
+        ] {
+            let label = migrate_target_label(dsn, 1);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label} (from {dsn})"
+            );
+            assert_eq!(label, "<unparseable dsn> #1", "from {dsn}");
+        }
+    }
+
+    #[test]
+    fn recognized_keywords_still_produce_a_usable_label() {
+        // The refusal above must not swallow legitimate keyword DSNs: an
+        // operator needs the shard's identity to know which one failed, and
+        // libpq keywords are case-insensitive.
+        let label = migrate_target_label("host=db.internal port=5432 dbname=harvest", 1);
+        assert!(label.contains("db.internal"), "{label}");
+        assert!(!label.starts_with("<unparseable"), "{label}");
+
+        let mixed_case = migrate_target_label("Host=db.internal DBName=harvest", 1);
+        assert!(!mixed_case.starts_with("<unparseable"), "{mixed_case}");
+
+        // And a password in a recognized keyword DSN is still redacted.
+        let with_password =
+            migrate_target_label("host=db.internal password=hunter2 dbname=harvest", 1);
+        assert!(
+            !with_password.contains("hunter2"),
+            "credential leaked into: {with_password}"
+        );
     }
 
     #[test]

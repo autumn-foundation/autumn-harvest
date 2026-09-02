@@ -493,23 +493,44 @@ pub struct MigrationReport {
     /// for what actually ran that way.
     pub ledger_lock_available: bool,
     /// Migrations this run applied **without** holding the ledger lock, in the
-    /// order applied.
+    /// order applied, each with the reason it ran that way.
     ///
-    /// Two causes, and they take different remedies, which is why this is a
-    /// list rather than a second flag:
-    ///
-    /// * the role cannot lock the ledger at all
-    ///   ([`ledger_lock_available`](Self::ledger_lock_available) is `false`) —
-    ///   fixable with a grant, or by running migrators one at a time;
-    /// * the migration declares `run_in_transaction = false`, so there is no
-    ///   transaction for a lock to be held in. Inherent, and no grant helps:
-    ///   run migrators one at a time.
+    /// Per migration rather than per run, because the two reasons take
+    /// different remedies and a single run can contain both: a role that
+    /// cannot lock the ledger applies *every* migration unserialized, and a
+    /// `run_in_transaction = false` migration in the same run is unserialized
+    /// for a reason no grant fixes. Attributing the whole list to one cause
+    /// would send an operator to change something that was never the cause for
+    /// half of it.
     ///
     /// Either way a concurrent migrator can run the same body, so this is
     /// reported rather than only logged — a caller may be a CLI with no
     /// tracing subscriber installed, and a degradation nobody sees is not one
     /// anyone can act on. See [`apply_to_connection`].
-    pub applied_unserialized: Vec<String>,
+    pub applied_unserialized: Vec<UnserializedMigration>,
+}
+
+/// One migration applied without the ledger lock, and why.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct UnserializedMigration {
+    /// The migration's directory name.
+    pub name: String,
+    /// Why the lock was not held for it.
+    pub reason: UnserializedReason,
+}
+
+/// Why a migration ran without the ledger lock.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnserializedReason {
+    /// This role may not lock the ledger at all — it lacks `UPDATE`, `DELETE`
+    /// and `TRUNCATE` on it. Every migration in the run is affected, and a
+    /// grant fixes it.
+    LedgerLockUnavailable,
+    /// The migration declares `run_in_transaction = false`, so there is no
+    /// transaction for a lock to be held in. Affects only that migration, and
+    /// no grant changes it.
+    NoTransaction,
 }
 
 /// Connect to `database_url`.
@@ -657,8 +678,11 @@ pub async fn apply_to_connection(
                 // Not `lock_ledger` alone: a `run_in_transaction = false`
                 // migration has no transaction to hold a lock in, so it runs
                 // unserialized however privileged the role is.
-                if !lock_ledger || !script.run_in_transaction {
-                    report.applied_unserialized.push(script.name.clone());
+                if let Some(reason) = unserialized_reason(lock_ledger, script) {
+                    report.applied_unserialized.push(UnserializedMigration {
+                        name: script.name.clone(),
+                        reason,
+                    });
                 }
             }
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
@@ -668,7 +692,12 @@ pub async fn apply_to_connection(
                 // body without the lock, which is the whole point of the
                 // unserialized list.
                 report.applied_concurrently.push(script.name.clone());
-                report.applied_unserialized.push(script.name.clone());
+                // Only the non-transactional path returns this variant, so the
+                // reason is that path's own.
+                report.applied_unserialized.push(UnserializedMigration {
+                    name: script.name.clone(),
+                    reason: UnserializedReason::NoTransaction,
+                });
             }
             Err(error) => {
                 // Say which it was: a rolled-back migration left nothing
@@ -838,6 +867,24 @@ async fn apply_without_transaction(
             }
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Why `script` would run without the ledger lock, or `None` if it holds it.
+///
+/// A migration with no transaction is unserialized whatever the privilege, so
+/// that reason is reported in preference to the privilege one: it is the reason
+/// a grant would not fix.
+const fn unserialized_reason(
+    lock_ledger: bool,
+    script: &MigrationScript,
+) -> Option<UnserializedReason> {
+    if !script.run_in_transaction {
+        Some(UnserializedReason::NoTransaction)
+    } else if lock_ledger {
+        None
+    } else {
+        Some(UnserializedReason::LedgerLockUnavailable)
     }
 }
 

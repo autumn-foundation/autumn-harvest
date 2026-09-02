@@ -356,18 +356,29 @@ harvest migrate run --dry-run   # print the plan, change nothing
 # or your application's own — ride along:
 harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
 
-# One flag per shard database in a multi-shard deployment:
-harvest migrate run --database-url "$SHARD_A" --database-url "$SHARD_B"
+# One invocation per shard database. Pass each DSN through the environment,
+# not `--database-url`: a command line is visible host-wide (`ps`, /proc) for
+# as long as the migration runs, and a shard DSN carries a password. `set -e`
+# keeps the repeated-flag behaviour of stopping before later shards on failure.
+set -e
+HARVEST_DATABASE_URL="$SHARD_A" harvest migrate run
+HARVEST_DATABASE_URL="$SHARD_B" harvest migrate run
 ```
 
 Harvest's own migrations are embedded in the binary, so this needs neither a
-source tree nor the `diesel` CLI. Each migration runs in one transaction
-together with its row in `__diesel_schema_migrations` — the same ledger Autumn
-and Diesel read — so a migration is applied exactly once whichever of them
-applies it, and a failure leaves neither the schema change nor the record of it.
+source tree nor the `diesel` CLI. A migration runs in one transaction together
+with its row in `__diesel_schema_migrations` — the same ledger Autumn and
+Diesel read — so it is applied exactly once whichever of them applies it, and a
+failure leaves neither the schema change nor the record of it.
+
 A migration whose `metadata.toml` says `run_in_transaction = false`, as a
 `CREATE INDEX CONCURRENTLY` migration must, is applied without one, exactly as
-Diesel applies it.
+Diesel applies it — and **the exactly-once guarantee above does not extend to
+it**. With no transaction there is nothing to hold a lock in and nothing to
+roll back, so two migrators racing can both execute its body; the loser reports
+it under `applied_unserialized` rather than pretending otherwise. Run migrators
+one at a time against a database, and write such migrations to be idempotent
+(`IF NOT EXISTS`), exactly as `diesel migration run` requires.
 
 TLS is supported and always *verified* — chain and hostname, against the
 platform trust store — so `sslmode=require`, `verify-ca` and `verify-full` all

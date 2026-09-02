@@ -96,19 +96,24 @@ Two details worth naming:
 
   | field | meaning |
   | --- | --- |
-  | `applied_unserialized` | the migrations this run applied without the lock held |
+  | `applied_unserialized` | `{name, reason}` per migration applied without the lock held |
   | `ledger_lock_available` | whether the role could have taken the lock at all |
 
-  Two causes land in that list and they take **different** remedies, which is
-  why the second field exists and why the warning names the cause. A role
-  without the privilege can be granted it (`ledger_lock_available: false`,
-  every applied migration listed). A `run_in_transaction = false` migration has
-  no transaction for a lock to be held in, so no grant changes anything
-  (`ledger_lock_available: true`, only that migration listed). A body that ran
-  unlocked and *then* lost the ledger insert to a concurrent migrator is listed
-  too — it appears in both `applied_concurrently` and `applied_unserialized`,
-  because the DDL really did execute here. Either way: run migrators one at a
-  time.
+  The reason is **per migration**, not per run, because one run can contain
+  both and they take different remedies:
+
+  | `reason` | cause | remedy |
+  | --- | --- | --- |
+  | `ledger_lock_unavailable` | the role lacks `UPDATE`/`DELETE`/`TRUNCATE` on the ledger | grant one of them, or run migrators one at a time |
+  | `no_transaction` | the migration declares `run_in_transaction = false` | no grant helps — run migrators one at a time |
+
+  A run by an unprivileged role that also contains a non-transactional
+  migration carries both reasons, and `harvest migrate run` prints each
+  migration with its own: attributing the whole list to the missing grant would
+  promise that granting it makes the run safe, which for the second kind is
+  false. A body that ran unlocked and *then* lost the ledger insert to a
+  concurrent migrator appears in both `applied_concurrently` and
+  `applied_unserialized`, because the DDL really did execute here.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
   ledger. It probes with `to_regclass` and reports a ledger-less database as
   "never migrated", so the gate is safe to point at a database you are only
