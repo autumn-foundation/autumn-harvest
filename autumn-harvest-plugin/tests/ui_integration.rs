@@ -2441,7 +2441,7 @@ async fn ui_schedules_preview_modal_renders_fire_times() {
             kind: "Workflow",
             name: "preview_wf",
             jitter_secs: 120,
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -2721,7 +2721,7 @@ async fn ui_schedules_backfill_form_previews_then_dispatches() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "echo",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -2817,7 +2817,7 @@ async fn ui_schedules_backfill_form_previews_then_dispatches() {
     let audits: i64 = diesel::sql_query(format!(
         "SELECT COUNT(*) AS value FROM harvest_audit_log \
          WHERE target_id = '{id}' AND source = 'ui' \
-           AND route_or_command = 'POST /admin/schedules/{{id}}/backfill'"
+           AND route_or_command = 'POST /ui/schedules/{{id}}/backfill'"
     ))
     .get_result::<CountValue>(&mut conn)
     .await
@@ -2892,7 +2892,7 @@ async fn ui_schedules_backfill_without_a_stage_defaults_to_the_dry_run() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "echo",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -3014,7 +3014,7 @@ async fn ui_schedules_backfill_flash_renders_on_the_run_history() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "echo",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -3067,7 +3067,7 @@ async fn ui_schedules_backfill_validates_and_caps_max_count() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "echo",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -3403,7 +3403,7 @@ async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "later_shard_wf",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
@@ -3461,7 +3461,7 @@ async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
         &ScheduleFixture {
             kind: "Workflow",
             name: "echo",
-            schedule_expr: Some("0 * * * *"),
+            schedule_expr: Some("cron:0 * * * *"),
             ..Default::default()
         },
     )
