@@ -19,6 +19,7 @@ pub mod driver;
 pub mod entry;
 pub mod mir;
 pub mod model;
+pub mod pipeline;
 pub mod report;
 pub mod resolve;
 pub mod verdict;
@@ -261,12 +262,5 @@ pub struct Options {
 /// # Errors
 /// On cargo/build failure, malformed model or allowlist, or unreadable inputs.
 pub fn verify(build: &driver::BuildRequest, opts: &Options) -> Result<Report> {
-    let _ = (build, opts);
-    // GREEN phase, stage 2: the resolver and the taint analysis land here. The
-    // driver, model, allowlist, report and CLI around this call are complete;
-    // this is deliberately an error rather than an empty report, so no caller
-    // can mistake "not implemented" for "nothing found".
-    Err(Error::Other(
-        "verify: the resolver/analysis stage is not implemented yet".to_string(),
-    ))
+    pipeline::run(build, opts)
 }

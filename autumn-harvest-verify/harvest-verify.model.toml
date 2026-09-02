@@ -287,11 +287,13 @@ reason = "Host identity. Which worker claimed the task is not recorded, so a rep
 # ── Process / thread identity ──────────────────────────────────────────────
 
 [[source]]
-path = "process::id"
+path = "id"
+dest_type = "u32"
 kind = "value"
-reason = "`std::process::id`. Differs on every worker restart."
+reason = "`std::process::id`. Differs on every worker restart. Measured: rustc trims this call to the bare segment `id`, so the row is pinned by its `u32` destination instead of by a path prefix."
 [[source]]
-path = "thread::current"
+path = "current"
+dest_type = "std::thread::Thread"
 kind = "value"
 reason = "`std::thread::current`. Which pool thread runs a decision cycle is not recorded; `.id()` and `.name()` off the result are therefore replay-varying."
 [[source]]
@@ -393,7 +395,17 @@ receiver = "Uuid"
 kind = "value"
 reason = "Random UUID. Prints as `Uuid::new_v4` and, via this crate's re-export, as `autumn_harvest::uuid::Uuid::new_v4`. `uuid` is a `[[trusted]]` propagator for parsing/formatting; this source row takes precedence. Sanctioned replacement: `ctx.new_uuid()` (AC4)."
 [[source]]
+path = "new_v4"
+receiver = "Uuid"
+kind = "value"
+reason = "Measured spelling of the row above: `uuid` builds the constructor in an inherent impl module, so rustc prints the call as `uuid::v4::<impl Uuid>::new_v4` — segments `uuid, v4, new_v4`, which the `Uuid::new_v4` suffix cannot match. The `receiver = \"Uuid\"` narrowing is what keeps this bare suffix honest. Sanctioned replacement: `ctx.new_uuid()` (AC4)."
+[[source]]
 path = "Uuid::now_v7"
+receiver = "Uuid"
+kind = "value"
+reason = "Time-ordered UUID: a wall-clock read plus randomness."
+[[source]]
+path = "now_v7"
 receiver = "Uuid"
 kind = "value"
 reason = "Time-ordered UUID: a wall-clock read plus randomness."
@@ -403,7 +415,17 @@ receiver = "Uuid"
 kind = "value"
 reason = "Time-ordered UUID; see `Uuid::now_v7`."
 [[source]]
+path = "now_v6"
+receiver = "Uuid"
+kind = "value"
+reason = "Time-ordered UUID; see `Uuid::now_v7`."
+[[source]]
 path = "Uuid::new_v1"
+receiver = "Uuid"
+kind = "value"
+reason = "Timestamp + node-id UUID; both components are host state."
+[[source]]
+path = "new_v1"
 receiver = "Uuid"
 kind = "value"
 reason = "Timestamp + node-id UUID; both components are host state."
@@ -1922,17 +1944,17 @@ clears = "order"
 reason = "See `sort_unstable` and `sort_by`."
 [[sanitizer]]
 path = "collect"
-dest_type = "std::collections::BTreeMap"
+dest_type = "BTreeMap"
 clears = "order"
 reason = "Collecting into a sorted map discards the source iteration order entirely. `collect` is generic in its destination, and MIR shows the chosen collection ONLY in the destination local's declared type — which is what `dest_type` reads. Without this key the row would have to clear `Order` for every `collect`, including `collect::<Vec<_>>`, which preserves it."
 [[sanitizer]]
 path = "collect"
-dest_type = "std::collections::BTreeSet"
+dest_type = "BTreeSet"
 clears = "order"
 reason = "See the `BTreeMap` row."
 [[sanitizer]]
 path = "collect"
-dest_type = "std::collections::BinaryHeap"
+dest_type = "BinaryHeap"
 clears = "order"
 reason = "A heap has no observable iteration order that author code can act on except through `into_sorted_vec` / `pop`, both of which are ordered by the element ordering."
 [[sanitizer]]

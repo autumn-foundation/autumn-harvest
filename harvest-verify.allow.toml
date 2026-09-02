@@ -27,5 +27,21 @@
 #   workflow = "my_crate::billing::reconcile_invoices"
 #   justification = "Why this is safe, what covers it, and the tracking issue."
 #
-# Intentionally empty: this repo's own examples corpus needs no entry at the
-# audited revision. See `docs/harvest-verify.md` for the worked example.
+# Measured at the audited revision over `-p autumn-harvest --all-examples
+# --no-default-features --features testing` — 57 workflow fns: 56 proven,
+# 0 unknown, 1 allowed = 1.8 % against the 10 % budget. See
+# `docs/harvest-verify.md` for how to read a verdict before writing an entry.
+
+[[allow]]
+workflow = "collect_approvals::collect_approvals"
+justification = """\
+`futures::future::select` is a reachability-only forbidden-effect rule: the \
+analyzer reports the combinator, it cannot inspect how the race is driven. \
+This one is replay-safe, and the example says why — the poll order is fixed \
+(the signal future first, the deadline second) and the losing future is kept \
+alive across loop iterations by `&mut timer_res`, so no already-started future \
+is ever dropped and restarted. The very same call already carries a reviewed \
+`harvest-suppress: DET011` in autumn-harvest/examples/collect_approvals.rs for \
+exactly that reason; this entry is the semantic layer recording that decision, \
+not a second opinion on it. Remove it if the example stops racing futures, or \
+when the model can verify a fixed-order select instead of reporting every one."""
