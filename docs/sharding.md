@@ -198,7 +198,7 @@ So pinning the **root** of a workflow tree confines the whole tree.
 
 ### Worked example — a two-region EU/US deployment
 
-1. **Provision two databases**, one per region, and run `harvest migrate run --database-url <dsn>` against each.
+1. **Provision two databases**, one per region, and run `harvest migrate run` against each (DSN via `HARVEST_DATABASE_URL`).
 
 2. **Declare the shards and the residency map** when building the router:
 
@@ -615,8 +615,13 @@ Follow this procedure to add a new shard to a live deployment. Each step is safe
 Provision a new Postgres database and run migrations against it:
 
 ```bash
-harvest migrate run --database-url postgres://user:pass@new-shard-host/harvest
+export HARVEST_DATABASE_URL=postgres://user:pass@new-shard-host/harvest
+harvest migrate run
 ```
+
+Pass the DSN through the environment, not `--database-url`: a command line is
+visible to every process on the host (`ps`, `/proc`) for as long as the
+migration runs, and a shard DSN carries a password.
 
 Harvest's migrations are embedded in the `harvest` binary, so this needs no
 source tree. Add `--include-dir` for any set that is not (the plugin's
@@ -643,7 +648,7 @@ Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reaso
 |---|---|---|
 | `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** covers this shard. | Widen a worker's coverage and redeploy — either add the shard to its `shard_assignments`, or remove the explicit `shard_assignments` narrowing entirely so "auto" coverage applies (issue #961). Verify with `GET /admin/config` → `worker.shard_assignments`. |
 | `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
-| `schema_migration_missing` | The shard is missing required migrations. | Re-run `harvest migrate run --database-url <shard-dsn>` against the shard. |
+| `schema_migration_missing` | The shard is missing required migrations. | Re-run `harvest migrate run` against the shard (DSN via `HARVEST_DATABASE_URL`). |
 
 The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522: until at least one `Healthy + Active` worker lists the new shard in its `shard_assignments`, the shard will not report `ready`. This prevents silently stranding work on the new shard.
 

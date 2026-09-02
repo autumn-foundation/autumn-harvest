@@ -5158,6 +5158,9 @@ const fn empty_migration_report() -> MigrationReport {
         already_applied: Vec::new(),
         applied_concurrently: Vec::new(),
         unrecognized: Vec::new(),
+        // Nothing ran, so nothing was locked. Never rendered as the warning
+        // below, because that is gated on the run having applied something.
+        ledger_locked: true,
         failed: None,
     }
 }
@@ -5215,6 +5218,18 @@ pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
                 "    unrecognized: {} ledger row(s) this binary does not know \
                  (is it older than the deployed schema?)",
                 report.unrecognized.len()
+            );
+        }
+        // The `harvest` binary installs no tracing subscriber, so the engine's
+        // own warning about this goes nowhere. An operator only learns that
+        // concurrent runs are unsafe here if the report says so.
+        if !report.ledger_locked {
+            let _ = writeln!(
+                out,
+                "    WARNING: applied without the ledger lock -- this role lacks \
+                 UPDATE/DELETE/TRUNCATE on __diesel_schema_migrations, so \
+                 concurrent migrators are NOT serialized (same as `diesel \
+                 migration run`). Run one at a time, or grant one of those."
             );
         }
         if *setup_failed {
@@ -5291,6 +5306,7 @@ pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError
                 "already_applied": target.report.already_applied,
                 "applied_concurrently": target.report.applied_concurrently,
                 "unrecognized": target.report.unrecognized,
+                "ledger_locked": target.report.ledger_locked,
                 // The run could not prepare this database at all. Without it an
                 // empty report reads as "finished with nothing to do".
                 "setup_failed": target.setup_failed,
@@ -17695,6 +17711,61 @@ mod migrate_cli_tests {
     }
 
     #[test]
+    fn an_unlocked_run_says_so_in_text_and_json() {
+        // The engine logs this through `tracing`, and the `harvest` binary
+        // installs no subscriber -- so if the report did not carry it, an
+        // operator would get no signal that concurrent runs are unsafe here.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_locked: false,
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            text.contains("without the ledger lock"),
+            "an unserialized apply must be visible to the operator: {text}"
+        );
+        assert!(
+            text.contains("one at a time"),
+            "the warning must say what to do about it: {text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["ledger_locked"], false);
+    }
+
+    #[test]
+    fn a_locked_run_carries_no_warning() {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_locked: true,
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            !text.contains("without the ledger lock"),
+            "the normal path must not cry wolf: {text}"
+        );
+    }
+
+    #[test]
     fn run_text_and_json_report_what_was_applied() {
         let targets = vec![MigrateRunTarget {
             database: "postgres://harvest/a".to_string(),
@@ -17705,6 +17776,7 @@ mod migrate_cli_tests {
                 applied_concurrently: vec!["20260802000000_y".to_string()],
                 unrecognized: Vec::new(),
                 failed: None,
+                ledger_locked: true,
             },
         }];
 
@@ -17747,6 +17819,7 @@ mod migrate_cli_tests {
                     name: "20260801000000_concurrent_index".to_string(),
                     rolled_back: false,
                 }),
+                ledger_locked: true,
             },
         }];
 
@@ -17783,6 +17856,7 @@ mod migrate_cli_tests {
                     name: "20260802000000_y".to_string(),
                     rolled_back: true,
                 }),
+                ledger_locked: true,
             },
         }];
         let text = format_migrate_run_text(&targets);
@@ -17811,6 +17885,7 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
+                ledger_locked: true,
             },
         }];
 
@@ -17834,6 +17909,7 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
+                ledger_locked: true,
             },
         }];
         assert!(!format_migrate_run_text(&targets).contains("FAILED"));

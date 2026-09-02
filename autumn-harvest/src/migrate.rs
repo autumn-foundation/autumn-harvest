@@ -437,6 +437,10 @@ impl From<HarvestError> for PartialMigration {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
+                // These failures happen before the privilege is probed, and
+                // nothing was applied, so there is no unserialized apply to
+                // warn about.
+                ledger_locked: true,
             },
             error,
         }
@@ -480,6 +484,16 @@ pub struct MigrationReport {
     /// The migration the run stopped on, when it stopped. `None` on a run that
     /// finished.
     pub failed: Option<FailedMigration>,
+    /// Whether this run held the ledger lock while applying.
+    ///
+    /// `false` means the role lacks `UPDATE`/`DELETE`/`TRUNCATE` on the ledger,
+    /// so migrations were applied *unserialized* — Diesel's behaviour, and no
+    /// worse than what that role has today, but two concurrent migrators can
+    /// then run the same body and one will fail on its own DDL. Reported here
+    /// rather than only logged, because a caller may be a CLI with no tracing
+    /// subscriber installed, and a degradation nobody sees is not a
+    /// degradation anyone can act on. See [`apply_to_connection`].
+    pub ledger_locked: bool,
 }
 
 /// Connect to `database_url`.
@@ -616,6 +630,7 @@ pub async fn apply_to_connection(
         applied_concurrently: Vec::new(),
         unrecognized: plan.unrecognized,
         failed: None,
+        ledger_locked: lock_ledger,
     };
 
     for script in &plan.pending {

@@ -86,9 +86,13 @@ Two details worth naming:
   granted exactly those two on a ledger it does not own would be denied the
   lock before any migration body ran. Refusing a migration set that
   `diesel migration run` applies for that role, mid-deploy, is the worse
-  outcome, so the run probes the privilege once, logs a warning naming what is
-  missing, and proceeds unlocked — Diesel's behaviour exactly. Run migrators one
-  at a time against such a database.
+  outcome, so the run probes the privilege once and proceeds unlocked —
+  Diesel's behaviour exactly. It is reported, not just logged: the report
+  carries `ledger_locked`, `harvest migrate run` prints a warning naming the
+  missing privilege and the remedy (run migrators one at a time, or grant one
+  of `UPDATE`/`DELETE`/`TRUNCATE`), and `--format json` carries the same field.
+  The `harvest` binary installs no tracing subscriber, so a warning logged
+  through `tracing` alone would reach nobody.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
   ledger. It probes with `to_regclass` and reports a ledger-less database as
   "never migrated", so the gate is safe to point at a database you are only
