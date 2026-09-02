@@ -545,6 +545,24 @@ pub async fn resolve_location_by_workflow_id_with(
     let expected = fanout_shards(&pool.shard_ids(), router);
     let mut candidates: Vec<(ShardId, ResolvedRun)> = Vec::new();
     let mut uninspected: Vec<UninspectedShard> = Vec::new();
+    // Underlying pools already probed by this fan-out. Several logical shards
+    // may be backed by clones of ONE physical pool — a supported topology (a
+    // pre-split staging deployment maps several shard ids onto one database),
+    // and the shape `ShardedDbPool::from_map` produces whenever the same
+    // `DbPool` is inserted under more than one id.
+    //
+    // Probing such an alias again is not merely wasteful, it is the bug Codex
+    // round 5 found: the resolver filters on `(workflow_name, workflow_id)` with
+    // no shard predicate, so an alias returns the rows its sibling already
+    // returned — while the acquisition it needs comes from the very pool that
+    // supplied `held`. On a one-connection pool that acquisition cannot succeed
+    // until this function returns, so the alias was reported uninspected on
+    // every sweep and a by-id cancel could never reach an authoritative answer:
+    // it cancelled the live run and then withheld its terminal forever.
+    //
+    // An alias is *inspected*, not uninspected — its database was read through
+    // its sibling — so it is skipped silently and contributes nothing new.
+    let mut probed: Vec<&DbPool> = Vec::new();
 
     for shard in expected {
         // 1. The caller's own shard: probe it on the connection already in hand.
@@ -553,6 +571,9 @@ pub async fn resolve_location_by_workflow_id_with(
             .as_ref()
             .is_some_and(|(held_shard, _)| *held_shard == shard);
         if held_here {
+            if let Some(shard_pool) = pool.exact_pool_for(shard) {
+                probed.push(shard_pool);
+            }
             let Some((_, conn)) = held.as_mut() else {
                 unreachable!("held_here implies held is Some")
             };
@@ -592,6 +613,18 @@ pub async fn resolve_location_by_workflow_id_with(
             continue;
         };
 
+        // An alias of a pool this fan-out already read — including the one that
+        // supplied `held`. Its database has been inspected; re-acquiring it
+        // would at best duplicate a row and at worst (a one-connection pool)
+        // deadlock against the connection the caller is still holding.
+        if probed
+            .iter()
+            .any(|probed_pool| same_underlying_pool(probed_pool, shard_pool))
+        {
+            continue;
+        }
+        probed.push(shard_pool);
+
         // 3. The peer probe, entirely inside its own budget.
         match probe_peer_shard(shard_pool, workflow_name, workflow_id).await {
             Ok(Some(run)) => candidates.push((shard, run)),
@@ -623,6 +656,20 @@ pub async fn resolve_location_by_workflow_id_with(
     }
 
     placement
+}
+
+/// Are these two handles the **same underlying pool** — clones sharing one
+/// connection set — rather than two pools that merely look alike?
+///
+/// `deadpool`'s `Pool` is a thin handle over an `Arc<PoolInner>`, and
+/// `Pool::manager()` borrows out of that shared allocation, so two clones return
+/// the same address and two independently built pools cannot. Comparing the
+/// handles themselves would not work: `ShardedDbPool` stores each shard's pool
+/// in its own map slot, so `std::ptr::eq` on `&DbPool` is really shard-id
+/// equality and reports two aliases of one pool as different (issue #1146,
+/// noted in review, load-bearing here).
+fn same_underlying_pool(a: &DbPool, b: &DbPool) -> bool {
+    std::ptr::eq(a.manager(), b.manager())
 }
 
 /// Probe one **peer** shard for `(workflow_name, workflow_id)`, entirely inside

@@ -1809,3 +1809,93 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
          — withholding must converge, not strand"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 10. Codex round 5 regression: colocated shard aliases
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Codex round 5 P1. Several logical shard ids backed by clones of ONE
+    // physical pool is a supported topology — it is what a pre-split staging
+    // deployment looks like, and what `ShardedDbPool::from_map` produces when
+    // the same `DbPool` is inserted under more than one id (the shape
+    // `workflow_id_targeted_tests` already uses).
+    //
+    // With one connection, the caller holds it as shard 0 and the fan-out then
+    // tried to acquire "shard 1" — which is the same pool. That acquisition
+    // cannot succeed until the sweep returns, so the alias was reported
+    // uninspected on every sweep, the answer was never authoritative, and a
+    // by-id cancel cancelled the live run and then withheld its terminal
+    // forever.
+    let one_conn = build_pool_with_max_size(&shards.urls[&ShardId::new(0)], 1);
+    let mut aliased: BTreeMap<ShardId, DbPool> = BTreeMap::new();
+    aliased.insert(ShardId::new(0), one_conn.clone());
+    aliased.insert(ShardId::new(1), one_conn.clone());
+    let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+    let workflow_id = key_hashing_to(&router, "aliased_shard_wf", "alias", ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut seed = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut seed, "aliased_shard_wf", &workflow_id, target).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut seed, "by_id_caller", "alias-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut seed,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "aliased_shard_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    // The sweep runs on the shared pool's ONLY connection, exactly as
+    // `spawn_timeout_checker_for_shard` does.
+    let mut pooled = one_conn
+        .get()
+        .await
+        .expect("the shared pool's single connection");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut pooled,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(sharded),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+
+    assert_eq!(
+        load_execution(&mut seed, target).await.state,
+        "CANCELLED",
+        "the target must be cancelled"
+    );
+    assert!(
+        history_event_types(&mut pooled, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "and the cancel must be REPORTED: the alias shares the database its \
+         sibling already read, so it is inspected — not an uninspectable shard \
+         that blocks an authoritative answer forever"
+    );
+}

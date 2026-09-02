@@ -242,6 +242,27 @@ shard's own scanner, one for a peer's read. That turns an invisible degradation
 into a visible misconfiguration, which is the most a library can do about a
 deployment's connection budget.
 
+**Codex round 5 (one P1).** Several logical shard ids backed by clones of one
+physical pool is a supported topology — a pre-split staging deployment, and what
+`ShardedDbPool::from_map` produces whenever the same `DbPool` is inserted under
+more than one id. The fan-out's "don't re-enter the held pool" check matched only
+the caller's *numeric* shard, so the alias was probed by re-acquiring the very
+pool that supplied the held connection. On a one-connection pool that cannot
+succeed until the sweep returns, so the alias was uninspected on every sweep, the
+answer was never authoritative, and a by-id cancel cancelled the live run and
+withheld its terminal **forever** — the round-2/3 withholding rule turned into a
+permanent stall by a topology neither round considered.
+
+The fan-out now dedupes by *underlying pool identity* rather than shard id.
+`deadpool`'s `Pool` is a handle over an `Arc<PoolInner>` and `Pool::manager()`
+borrows out of that shared allocation, so two clones return the same address and
+two independently built pools cannot; comparing the handles would not work, since
+each shard's pool sits in its own map slot and `std::ptr::eq` on `&DbPool` is
+really shard-id equality again. An alias is treated as **inspected** — its
+database was read through its sibling, and the resolver filters on
+`(workflow_name, workflow_id)` with no shard predicate, so it would return the
+same rows — rather than uninspected, which is what made the stall permanent.
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a
