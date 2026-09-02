@@ -32,17 +32,6 @@ ignore = [
     # Verdict: unreachable. Revisit: next scheduled dependency batch.
     { id = "RUSTSEC-2026-0204", reason = "unreachable: we never format Atomic/Shared; fix lives in autumn-web's/criterion's transitive tree, not our manifest. Revisit: next scheduled batch." },
 
-    # RUSTSEC-2026-0258 — h2 0.4.13, unbounded empty DATA frames (low
-    # severity DoS if a peer floods empty frames and streams aren't drained).
-    # Reached via hyper -> axum -> autumn-web, which IS our production HTTP
-    # server path (management API / Vantage dashboard). Not our fix to make:
-    # h2 is entirely inside autumn-web's tree (we don't depend on hyper/h2
-    # directly), so the bump has to come from an autumn-web release.
-    # Verdict: reachable, but the fix isn't in this repo's manifest.
-    # Revisit: track against the next autumn-web bump; re-run this audit
-    # after any autumn-web version change to confirm it picked up h2 >=0.4.16.
-    { id = "RUSTSEC-2026-0258", reason = "reachable via our HTTP server, but h2 is entirely inside autumn-web's tree — fix ships in an autumn-web release, not here. Revisit: next autumn-web bump." },
-
     # RUSTSEC-2026-0253 — lru 0.16.4, use-after-free in LruCache::pop() when
     # a stored key/value's Drop panics mid-pop. This IS a direct dependency
     # (autumn-harvest/src/cache.rs's WorkflowCache::remove calls
@@ -57,6 +46,29 @@ ignore = [
     # a changelog read confirms no breaking API surface we use.
     # Revisit: next scheduled batch.
     { id = "RUSTSEC-2026-0253", reason = "unreachable: LruCache::pop() is called (cache.rs), but our key (Uuid) and value (CachedWorkflowState) types have no custom Drop, so the panic-during-drop precondition can't occur. Candidate for next scheduled batch (0.16->0.18 manifest bump). Revisit: next scheduled batch." },
+
+    # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames (low severity DoS
+    # if a peer floods empty frames and streams aren't drained). This
+    # advisory matched TWO distinct h2 instances in the graph; a review
+    # comment on this PR correctly caught that the first one below does not
+    # need an ignore at all:
+    #   - h2 0.4.13, via hyper 1.x -> axum -> autumn-web (our production HTTP
+    #     server path): FIXED in the sibling commit, `cargo update -p
+    #     h2@0.4.13` -> 0.4.19, no manifest change, `cargo check
+    #     --workspace --all-features` green.
+    #   - h2 0.3.27, via the old hyper 0.14 line pulled by
+    #     aws-smithy-http-client/aws-config/aws-sdk-sqs (the `sqs` feature,
+    #     optional, off by default): `cargo update -p h2@0.3.27` resolves 0
+    #     packages — 0.3.27 is already the newest release its hyper-0.14
+    #     constraint allows, and the advisory's fix ("Patched in v0.4.16")
+    #     never landed on the 0.3.x branch. Same cluster and same fix path
+    #     as the rustls-webpki findings below: needs an aws-config/
+    #     aws-sdk-sqs manifest bump onto a release built on a newer
+    #     hyper/h2 line, not a lockfile update. This ignore entry now covers
+    #     only that surviving 0.3.27 instance.
+    # Revisit: next scheduled batch evaluates whether a current aws-config/
+    # aws-sdk-sqs release has moved off hyper 0.14/h2 0.3.
+    { id = "RUSTSEC-2026-0258", reason = "the hyper-1.x/axum/autumn-web instance is fixed (see sibling commit); the surviving h2@0.3.27 instance is reachable only via the optional `sqs` feature's AWS SDK cluster (old hyper 0.14 line) and has no patched 0.3.x release to update to — needs an aws-config/aws-sdk-sqs manifest bump. Revisit: next scheduled batch." },
 
     # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
     # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
