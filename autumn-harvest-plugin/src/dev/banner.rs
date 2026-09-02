@@ -228,13 +228,18 @@ fn redact_userinfo(base: &str) -> String {
 }
 
 /// Redact a `password=` parameter in a URI query string.
+///
+/// The key is percent-decoded before it is compared. `tokio_postgres`'s URI
+/// parser decodes query keys before matching them, so `?%70assword=` **is** the
+/// password parameter as far as the code that dials is concerned — and
+/// comparing the raw key printed the whole credential in the banner.
 fn redact_query_password(query: &str) -> String {
     query
         .split('&')
         .map(|pair| {
             if pair
                 .split_once('=')
-                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("password"))
+                .is_some_and(|(key, _)| percent_decoded(key).eq_ignore_ascii_case("password"))
             {
                 "password=***".to_owned()
             } else {
@@ -243,6 +248,34 @@ fn redact_query_password(query: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-decode a query key, for comparison only.
+///
+/// Deliberately not a general URI decoder and deliberately not applied to
+/// values: nothing in the DSN is re-encoded or reshaped by redaction, so a
+/// non-password parameter is emitted byte-for-byte as the developer typed it.
+/// A malformed escape is left alone, exactly as `percent_decode` leaves it.
+fn percent_decoded(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(high) = char::from(bytes[index + 1]).to_digit(16)
+            && let Some(low) = char::from(bytes[index + 2]).to_digit(16)
+        {
+            // Both digits are < 16, so the sum is < 256 and the cast is exact.
+            #[allow(clippy::cast_possible_truncation)]
+            out.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Redact `password=` from a keyword/value connection string.

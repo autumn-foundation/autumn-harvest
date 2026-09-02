@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 use autumn_harvest_plugin::dev::MAX_UNIX_SOCKET_PATH_LEN;
 use autumn_harvest_plugin::dev::{
     BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, ReapDecision,
-    RefusalReason, SessionRecord, StorageDescription, SuspicionReason, candidate_bin_dirs,
-    classify_database_url, decide_reap, effective_postmaster_pid, ephemeral_dsn, http_authority,
-    parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live, proc_stat_start_time,
-    record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir, unix_socket_path_len,
-    write_private_atomic,
+    RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
+    candidate_bin_dirs, classify_database_url, decide_reap, effective_postmaster_pid,
+    ephemeral_dsn, http_authority, parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live,
+    proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir,
+    unix_socket_path_len, write_private_atomic,
 };
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1287,100 @@ async fn provisioning_as_root_creates_no_session_root() {
         entries.is_empty(),
         "root must be refused before any session state exists, found: {entries:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Codex round 4
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redaction_decodes_a_percent_encoded_password_key() {
+    // Codex round 4 (P2). `tokio_postgres`'s URI parser percent-decodes query
+    // keys before matching them (`config.rs`, `parse_params`), so
+    // `?%70assword=` IS the password parameter to the code that dials — while
+    // a comparison against the raw key printed the whole credential.
+    for dsn in [
+        "postgres://u@localhost/app?%70assword=hunter2",
+        "postgres://u@localhost/app?%50ASSWORD=hunter2",
+        "postgres://u@localhost/app?sslmode=disable&pass%77ord=hunter2",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+    }
+}
+
+#[test]
+fn redaction_leaves_other_query_parameters_byte_for_byte() {
+    // Decoding is for the comparison only: nothing else in the DSN is
+    // re-encoded or reshaped, so what a developer pastes still round-trips.
+    let dsn = "postgres://u@localhost/app?application%5Fname=my%20app&connect_timeout=5";
+    assert_eq!(redact_dsn(dsn), dsn);
+}
+
+#[test]
+fn a_reused_owner_pid_does_not_strand_a_session_forever() {
+    // Codex round 4 (P2). `owner_alive` is an identity answer — the caller
+    // computes it from the recorded owner start token. Matching our own pid
+    // used to short-circuit ahead of it, so a run that received a dead
+    // predecessor's pid (ordinary under supervisors and pid namespaces) would
+    // skip that session, and so would every run after it.
+    let record = SessionRecord {
+        owner_pid: 4242,
+        owner_start_token: Some("111".to_owned()),
+        postmaster_pid: Some(4243),
+        postmaster_start_token: Some("222".to_owned()),
+        bin_dir: None,
+        data_dir: PathBuf::from("/tmp/harvest-dev-1/session-4242-0000000a/data"),
+        created_at: chrono::Utc::now(),
+    };
+
+    // Same pid as ours, but the owner is *not* the recorded one: reap it.
+    assert_eq!(
+        decide_reap(&record, false, true, 4242),
+        ReapDecision::StopThenRemove {
+            postmaster_pid: 4243
+        },
+        "a stale record must be reaped even when its owner pid matches ours"
+    );
+
+    // Genuinely ours: still skipped, and still says so.
+    assert_eq!(
+        decide_reap(&record, true, true, 4242),
+        ReapDecision::Skip(SkipReason::OwnedByThisProcess)
+    );
+
+    // Someone else's live session: skipped for the other reason.
+    assert_eq!(
+        decide_reap(&record, true, true, 99),
+        ReapDecision::Skip(SkipReason::OwnerAlive)
+    );
+}
+
+#[tokio::test]
+async fn a_non_loopback_http_host_is_refused() {
+    // Codex round 4 (P2). `http_host` is public and documented as
+    // loopback-only, but a doc comment is not an enforcement — and the
+    // management router is mounted with `.api(...)`, not `api_with_auth`,
+    // precisely because it is supposed to be unreachable.
+    for host in ["0.0.0.0", "::", "192.0.2.1"] {
+        let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+            http_host: (*host).to_owned(),
+            http_port: 0,
+            ..DevRuntimeConfig::default()
+        })
+        .await
+        .expect_err("a non-loopback bind address must be refused");
+        assert!(
+            matches!(
+                error,
+                autumn_harvest_plugin::dev::DevError::NonLoopbackHttpHost { .. }
+            ),
+            "{host}: {error}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

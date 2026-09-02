@@ -153,14 +153,21 @@ pub const fn decide_reap(
     postmaster_alive: bool,
     self_pid: u32,
 ) -> ReapDecision {
-    // Identity beats liveness. A session directory carrying our own pid is one
-    // we are about to use (or a same-pid predecessor's, which we would then be
-    // deleting out from under ourselves).
-    if record.owner_pid == self_pid {
-        return ReapDecision::Skip(SkipReason::OwnedByThisProcess);
-    }
+    // Liveness first, and `owner_alive` is an *identity* answer: the caller
+    // computes it from the recorded owner start token, not from the pid alone.
+    //
+    // Matching our own pid used to short-circuit ahead of it, which inverted
+    // the guarantee the token was added for. Receiving a dead predecessor's pid
+    // is not exotic — supervisors and pid namespaces hand out low, repeatable
+    // pids — and that session would then be skipped by *every* later run,
+    // leaking its postmaster and data directory forever. The pid now only
+    // chooses which reason to report.
     if owner_alive {
-        return ReapDecision::Skip(SkipReason::OwnerAlive);
+        return if record.owner_pid == self_pid {
+            ReapDecision::Skip(SkipReason::OwnedByThisProcess)
+        } else {
+            ReapDecision::Skip(SkipReason::OwnerAlive)
+        };
     }
     match record.postmaster_pid {
         Some(postmaster_pid) if postmaster_alive => ReapDecision::StopThenRemove { postmaster_pid },

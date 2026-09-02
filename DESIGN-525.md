@@ -164,7 +164,14 @@ autumn-harvest-plugin/src/dev/
    binaries, `initdb` into `<tmp>/harvest-dev-<uid>/session-<pid>-<rand>/data`,
    write the session record, start the postmaster on 127.0.0.1:0, wait for
    readiness, create the database and role.
-3a. **Re-prove the HTTP port** once storage exists. The reservation in step 1
+3a. **Refuse a non-loopback HTTP host.** `http_host` is a public config field
+   documented as loopback-only; that has to be enforced, not merely written
+   down, because `run_app` mounts the management router with `.api(...)` and
+   **not** `api_with_auth`. The dev runtime is unauthenticated precisely because
+   it is unreachable, so the two facts are kept true together: every address the
+   host resolves to must be loopback, and a host that will not resolve is
+   refused rather than assumed.
+3b. **Re-prove the HTTP port** once storage exists. The reservation in step 1
    cannot be *held* across provisioning — autumn-web binds the same port itself
    — so two runs that both found it free both get this far. autumn-web
    `process::exit(1)`s on a bind failure, skipping every destructor, so the

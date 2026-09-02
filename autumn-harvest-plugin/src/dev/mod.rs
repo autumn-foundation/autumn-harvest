@@ -217,6 +217,18 @@ pub enum DevError {
         reason: &'static str,
     },
 
+    /// The configured HTTP bind address is not loopback.
+    #[error(
+        "refusing to serve the dev runtime on {host}, which is not loopback. The management \
+         API is mounted without authentication because it is only ever reachable from this \
+         machine — binding it anywhere else would expose starting and mutating workflows to \
+         the network. Use 127.0.0.1 or ::1."
+    )]
+    NonLoopbackHttpHost {
+        /// The host as configured.
+        host: String,
+    },
+
     /// The requested HTTP port cannot be bound.
     #[error(
         "cannot bind http://127.0.0.1:{port} ({source}). Something else is already listening \
@@ -348,6 +360,10 @@ impl DevRuntime {
     /// [`DevError`] for a refused database, unavailable Postgres binaries, a
     /// cluster that will not start, or an HTTP server that never becomes ready.
     pub async fn start(config: DevRuntimeConfig) -> Result<Self, DevError> {
+        // Before anything binds: `http_host` is a public field documented as
+        // loopback-only, and until now nothing enforced it.
+        require_loopback_http_host(&config.http_host)?;
+
         // The port is settled FIRST, before any cluster exists. autumn-web
         // `process::exit(1)`s on a bind failure, which skips every destructor
         // and both teardown paths — so a busy port used to leak a postmaster
@@ -671,6 +687,38 @@ async fn abandon_cluster(
         postgres.shutdown().await.ok();
     }
     error
+}
+
+/// Refuse to serve anywhere but loopback.
+///
+/// `DevRuntimeConfig::http_host` is public and documented as loopback-only, but
+/// a doc comment is not an enforcement: a library caller could set `0.0.0.0`,
+/// `::` or a LAN interface. That matters more here than in most servers because
+/// `run_app` mounts the management router with `.api(...)`, **not**
+/// `api_with_auth` — the dev runtime is unauthenticated precisely because it is
+/// unreachable, so the two facts have to be kept true together.
+///
+/// Every address the host resolves to must be loopback, and a host that cannot
+/// be resolved is refused rather than assumed: proving loopback is the point,
+/// and an unprovable host is not a proof.
+fn require_loopback_http_host(host: &str) -> Result<(), DevError> {
+    use std::net::ToSocketAddrs as _;
+
+    let refuse = || DevError::NonLoopbackHttpHost {
+        host: host.to_owned(),
+    };
+    // Port 0 only to satisfy the resolver; nothing is bound here.
+    let mut resolved = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|_| refuse())?
+        .peekable();
+    if resolved.peek().is_none() {
+        return Err(refuse());
+    }
+    if resolved.any(|address| !address.ip().is_loopback()) {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
 /// The `host:port` authority for a URL, bracketing an IPv6 literal.
