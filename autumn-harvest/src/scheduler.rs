@@ -6830,6 +6830,43 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 mod tests {
     use super::*;
 
+    /// Documents (and pins) the exact hazard `load_schedule_overdue_aux_by_shard`
+    /// (in `autumn-harvest-plugin/src/api.rs`) must avoid when a batched
+    /// `calendar::load_exclusions_for_calendars` call fails: `exclude_weekends`
+    /// is a pure name check (`calendar_name == "weekends-off"`), independent of
+    /// whatever the exclusions query returned, so an EMPTY `excluded` slice is
+    /// **not** a safe stand-in for "the query failed" -- it still lets a
+    /// "weekends-off" calendar rebase a weekend slot away from its raw anchor,
+    /// which is exactly the wedge-hiding the caller's failure handling exists to
+    /// prevent (Codex review, PR #1314). The caller's fix is to treat a failed
+    /// batch as "skip calendar resolution for this shard" (`exclusions: None`),
+    /// never as "no exclusions" (`exclusions: Some(empty map)`) -- this test
+    /// pins why: with an empty `excluded` slice, the weekend flag alone is
+    /// sufficient to trigger a real rebase.
+    #[test]
+    fn resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions()
+     {
+        // 2026-06-13 is a fixed, independently-verified Saturday (not derived
+        // from `Utc::now()`, so this test's outcome never depends on what day
+        // it happens to run).
+        let saturday = Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap();
+
+        let rebased = resolve_effective_fire_at_pure(
+            &[],  // empty exclusions -- what an "unwrap_or_default() on failure" would produce
+            true, // exclude_weekends: true, i.e. calendar_name == "weekends-off"
+            "run_next_business_day",
+            Some("interval:3600"),
+            Some(saturday),
+        );
+
+        assert!(
+            rebased.is_some_and(|r| r.date_naive() != saturday.date_naive()),
+            "empty exclusions + exclude_weekends=true must still rebase a weekend slot -- \
+             proving a caller cannot treat a failed exclusions load as 'no exclusions' \
+             without risking exactly this silent rebase, got {rebased:?}"
+        );
+    }
+
     /// A representative workflow-schedule row for `merge_schedule_patch` unit
     /// tests (no database required).
     fn merge_base_row() -> HarvestSchedule {
