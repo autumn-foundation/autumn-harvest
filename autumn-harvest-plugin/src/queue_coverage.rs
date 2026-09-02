@@ -538,27 +538,9 @@ async fn observe_shard(
     filter: Option<String>,
     worker_stale_threshold: Duration,
 ) -> (ShardObservation<UncoveredQueueDemand>, BTreeSet<String>) {
-    let Some(pool) = pool else {
-        return (
-            ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: Some(format!("shard {shard_id} has no configured storage pool")),
-            },
-            BTreeSet::new(),
-        );
-    };
-    let Ok(mut conn) = pool.get().await else {
-        return (
-            ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: Some(format!(
-                    "database connection for shard {shard_id} could not be acquired"
-                )),
-            },
-            BTreeSet::new(),
-        );
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return (observation, BTreeSet::new()),
     };
 
     let pending: Vec<PendingQueueDemand> =
