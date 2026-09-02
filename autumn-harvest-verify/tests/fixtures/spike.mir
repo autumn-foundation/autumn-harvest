@@ -1,7 +1,7 @@
 // WARNING: This output format is intended for human consumers only
 // and is subject to change without notice. Knock yourself out.
 // HINT: See also -Z dump-mir for MIR at specific points during compilation.
-fn <impl at s.rs:5:1: 5:15>::next(_1: &A) -> u32 {
+fn <impl at spike.rs:5:1: 5:15>::next(_1: &A) -> u32 {
     debug self => _1;
     let mut _0: u32;
 
@@ -143,7 +143,7 @@ static TL::{constant#0}::{closure#1}::__RUST_STD_INTERNAL_VAL: LazyStorage<RefCe
     }
 }
 
-fn <impl at s.rs:9:1: 9:9>::emit(_1: &Ctx, _2: u32) -> u32 {
+fn <impl at spike.rs:9:1: 9:9>::emit(_1: &Ctx, _2: u32) -> u32 {
     debug self => _1;
     debug x => _2;
     let mut _0: u32;
@@ -208,7 +208,7 @@ fn sub(_1: &Ctx) -> {async fn body of sub()} {
     let mut _0: {async fn body of sub()};
 
     bb0: {
-        _0 = {coroutine@s.rs:12:36: 12:51 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@spike.rs:12:36: 12:51 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -267,7 +267,7 @@ fn wf(_1: &Ctx, _2: HashMap<String, u32>, _3: Box<dyn Src>) -> {async fn body of
     let mut _0: {async fn body of wf()};
 
     bb0: {
-        _0 = {coroutine@s.rs:13:76: 22:2 (#0)} { ctx: copy _1, m: move _2, s: move _3 };
+        _0 = {coroutine@spike.rs:13:76: 22:2 (#0)} { ctx: copy _1, m: move _2, s: move _3 };
         return;
     }
 }
@@ -282,7 +282,7 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
     let mut _7: &std::sync::atomic::AtomicU64;
     let mut _8: std::sync::atomic::Ordering;
     let mut _10: &std::thread::LocalKey<std::cell::RefCell<u64>>;
-    let mut _11: {closure@s.rs:16:21: 16:24};
+    let mut _11: {closure@spike.rs:16:21: 16:24};
     let mut _13: &u32;
     let mut _14: &std::cell::Ref<'_, u32>;
     let _15: std::cell::Ref<'_, u32>;
@@ -310,7 +310,7 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
     let mut _40: &dyn Src;
     let mut _41: (u32, bool);
     let mut _42: u32;
-    let mut _43: &{closure@s.rs:18:13: 18:21};
+    let mut _43: &{closure@spike.rs:18:13: 18:21};
     let mut _44: (u32,);
     let mut _45: u32;
     let mut _46: u64;
@@ -348,7 +348,7 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
                             scope 7 {
                                 debug r => _12;
                                 scope 8 {
-                                    debug f => (((*_61) as variant#3).1: {closure@s.rs:18:13: 18:21});
+                                    debug f => (((*_61) as variant#3).1: {closure@spike.rs:18:13: 18:21});
                                     let mut _17: u32;
                                     scope 9 {
                                         debug acc => _17;
@@ -400,8 +400,8 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
 
     bb3: {
         _10 = const wf::{closure#0}::promoted[0];
-        _11 = {closure@s.rs:16:21: 16:24};
-        _9 = LocalKey::<RefCell<u64>>::with::<{closure@s.rs:16:21: 16:24}, u64>(move _10, move _11) -> [return: bb4, unwind: bb42];
+        _11 = {closure@spike.rs:16:21: 16:24};
+        _9 = LocalKey::<RefCell<u64>>::with::<{closure@spike.rs:16:21: 16:24}, u64>(move _10, move _11) -> [return: bb4, unwind: bb42];
     }
 
     bb4: {
@@ -420,7 +420,7 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
     }
 
     bb7: {
-        (((*_61) as variant#3).1: {closure@s.rs:18:13: 18:21}) = {closure@s.rs:18:13: 18:21};
+        (((*_61) as variant#3).1: {closure@spike.rs:18:13: 18:21}) = {closure@spike.rs:18:13: 18:21};
         _17 = const 0_u32;
         (((*_61) as variant#3).4: bool) = const false;
         _19 = move _5;
@@ -511,14 +511,14 @@ fn wf::{closure#0}(_1: Pin<&mut {async fn body of wf()}>, _2: &mut Context<'_>) 
 
     bb24: {
         _27 = move (_41.0: u32);
-        _43 = &(((*_61) as variant#3).1: {closure@s.rs:18:13: 18:21});
+        _43 = &(((*_61) as variant#3).1: {closure@spike.rs:18:13: 18:21});
         _46 = deep() -> [return: bb25, unwind: bb42];
     }
 
     bb25: {
         _45 = move _46 as u32 (IntToInt);
         _44 = (move _45,);
-        _42 = <{closure@s.rs:18:13: 18:21} as Fn<(u32,)>>::call(move _43, move _44) -> [return: bb26, unwind: bb42];
+        _42 = <{closure@spike.rs:18:13: 18:21} as Fn<(u32,)>>::call(move _43, move _44) -> [return: bb26, unwind: bb42];
     }
 
     bb26: {
@@ -647,7 +647,7 @@ const wf::{closure#0}::promoted[0]: &LocalKey<RefCell<u64>> = {
     }
 }
 
-fn wf::{closure#0}::{closure#0}(_1: {closure@s.rs:16:21: 16:24}, _2: &RefCell<u64>) -> u64 {
+fn wf::{closure#0}::{closure#0}(_1: {closure@spike.rs:16:21: 16:24}, _2: &RefCell<u64>) -> u64 {
     debug v => _2;
     let mut _0: u64;
     let mut _3: &u64;
@@ -681,7 +681,7 @@ fn wf::{closure#0}::{closure#0}(_1: {closure@s.rs:16:21: 16:24}, _2: &RefCell<u6
     }
 }
 
-fn wf::{closure#0}::{closure#1}(_1: &{closure@s.rs:18:13: 18:21}, _2: u32) -> u32 {
+fn wf::{closure#0}::{closure#1}(_1: &{closure@spike.rs:18:13: 18:21}, _2: u32) -> u32 {
     debug x => _2;
     let mut _0: u32;
     let mut _3: (u32, bool);
