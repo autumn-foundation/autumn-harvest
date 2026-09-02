@@ -263,6 +263,20 @@ database was read through its sibling, and the resolver filters on
 `(workflow_name, workflow_id)` with no shard predicate, so it would return the
 same rows — rather than uninspected, which is what made the stall permanent.
 
+**Codex round 6 (one P1, on the round-5 fix).** That fix seeded the
+already-probed set *inside* the "this is the held shard" branch, but the fan-out
+visits shards in ascending order — so the seeding is too late whenever an alias
+sorts before the held shard. A checker holding shard 1 of an aliased {0, 1} pair
+still tried to acquire "shard 0", the pool it is itself holding, timed out, and
+marked it uninspected on every sweep: exactly the permanent withholding round 5
+set out to remove, reachable from the other side. The round-5 test pinned the
+caller to shard 0, the one ordering where seeding late happens to work, so it
+could not see this.
+
+The seed now happens once, before the loop, so iteration order cannot decide
+correctness. `outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard`
+is the round-5 test with the caller on the other side of the ordering.
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a

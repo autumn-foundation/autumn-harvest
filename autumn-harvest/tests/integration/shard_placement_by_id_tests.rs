@@ -1899,3 +1899,88 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
          that blocks an authoritative answer forever"
     );
 }
+
+#[tokio::test]
+async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Codex round 6, on the round-5 fix. The fan-out visits shards in ASCENDING
+    // order, and round 5 seeded the already-probed set inside the "this is the
+    // held shard" branch — too late whenever an alias sorts before the held
+    // shard. A checker holding shard 1 of an aliased {0, 1} pair therefore tried
+    // to acquire "shard 0", which is the pool it is itself holding, timed out,
+    // and marked it uninspected on every sweep — reinstating exactly the
+    // permanent withholding round 5 set out to fix.
+    //
+    // The round-5 test pinned the caller to shard 0, the one ordering where
+    // seeding late still works, so it could not see this. This is that test with
+    // the caller on the OTHER side of the ordering.
+    let one_conn = build_pool_with_max_size(&shards.urls[&ShardId::new(0)], 1);
+    let mut aliased: BTreeMap<ShardId, DbPool> = BTreeMap::new();
+    aliased.insert(ShardId::new(0), one_conn.clone());
+    aliased.insert(ShardId::new(1), one_conn.clone());
+    let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+    let workflow_id = key_hashing_to(&router, "alias_order_wf", "order", ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut seed = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut seed, "alias_order_wf", &workflow_id, target).await;
+
+    // The caller lives on shard 1 — the HIGHER of the two aliased ids, so the
+    // ascending fan-out reaches shard 0 first.
+    let caller = ExecutionId::new_for_shard(ShardId::new(1));
+    insert_running_row(&mut seed, "by_id_caller", "alias-order-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut seed,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "alias_order_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let mut pooled = one_conn
+        .get()
+        .await
+        .expect("the shared pool's single connection");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut pooled,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(sharded),
+        &[ShardId::new(1)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+
+    assert_eq!(
+        load_execution(&mut seed, target).await.state,
+        "CANCELLED",
+        "the target must be cancelled"
+    );
+    assert!(
+        history_event_types(&mut pooled, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "and reported: an alias that sorts BEFORE the held shard must be \
+         recognised as already-inspected too — otherwise the ordering alone \
+         decides whether the cancel ever completes"
+    );
+}

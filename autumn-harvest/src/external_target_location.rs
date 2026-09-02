@@ -564,6 +564,20 @@ pub async fn resolve_location_by_workflow_id_with(
     // its sibling — so it is skipped silently and contributes nothing new.
     let mut probed: Vec<&DbPool> = Vec::new();
 
+    // SEED with the held connection's own pool, before the loop. The fan-out
+    // visits shards in ascending order, so seeding inside the `held_here` branch
+    // is too late whenever an alias sorts BEFORE the held shard: a checker
+    // holding shard 1 of an aliased {0, 1} pair would try to acquire "shard 0" —
+    // the pool it is itself holding — and, on a one-connection pool, time out and
+    // mark it uninspected on every sweep, permanently withholding a by-id
+    // cancel's terminal. Order must not decide correctness here (issue #1146,
+    // Codex round 6, on the round-5 fix).
+    if let Some((held_shard, _)) = held.as_ref()
+        && let Some(held_pool) = pool.exact_pool_for(*held_shard)
+    {
+        probed.push(held_pool);
+    }
+
     for shard in expected {
         // 1. The caller's own shard: probe it on the connection already in hand.
         //    Never re-enter that pool — see this function's doc comment.
@@ -571,9 +585,6 @@ pub async fn resolve_location_by_workflow_id_with(
             .as_ref()
             .is_some_and(|(held_shard, _)| *held_shard == shard);
         if held_here {
-            if let Some(shard_pool) = pool.exact_pool_for(shard) {
-                probed.push(shard_pool);
-            }
             let Some((_, conn)) = held.as_mut() else {
                 unreachable!("held_here implies held is Some")
             };
