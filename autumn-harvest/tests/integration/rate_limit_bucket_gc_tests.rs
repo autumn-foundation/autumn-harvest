@@ -1159,6 +1159,122 @@ async fn the_throttle_path_registers_through_the_same_interlocked_statement() {
     );
 }
 
+#[tokio::test]
+async fn the_throttle_backlog_append_path_also_interlocks_the_bucket() {
+    // Codex review round 1, P1. `reserve_or_defer`'s FIFO fast path used to
+    // skip `ensure_throttle_bucket` whenever a backlog already existed, so the
+    // append path touched the bucket not at all: an observed backlog row that
+    // the scanner drops between the check and the insert leaves the sweep
+    // seeing an idle, full, dependent-free bucket — and the pending row that
+    // commits a moment later references a bucket that no longer exists.
+    // `fire_claimed_throttle_row` fails closed on a missing bucket, so that
+    // start sits deferred forever.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let key = autumn_harvest::throttle::bucket_key("onboarding", "acme");
+    insert_idle_bucket(&mut conn, &key, day_old()).await;
+    // A pre-existing backlog row puts the next admission on the append path...
+    insert_deferred_start(&mut conn, &key).await;
+    let registered_before = bucket_last_registered_at(&mut conn, &key).await;
+
+    let mut admitting = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut admitting)
+        .await
+        .expect("begin");
+    autumn_harvest::throttle::reserve_or_defer(
+        &mut admitting,
+        autumn_harvest::throttle::AdmitThrottleParams {
+            workflow_name: "onboarding",
+            throttle_key: "acme",
+            workflow_id: "wf-appended",
+            queue_name: "default",
+            input: serde_json::json!({}),
+            start_options: autumn_harvest::debounce::DebounceStartOptions::default(),
+            refill_per_sec: 1.0,
+            burst: 10.0,
+            schedule_to_start: None,
+            shard_id: 0,
+        },
+    )
+    .await
+    .expect("append to the backlog");
+
+    // ...and while that append is still uncommitted, a sweep that could not see
+    // its pending row must still leave the bucket alone. (The pre-existing
+    // backlog row is deleted first so the anti-join cannot be what saves it —
+    // the interlock has to.)
+    diesel::sql_query("DELETE FROM harvest_start_throttle WHERE workflow_id = 'wf-1'")
+        .execute(&mut conn)
+        .await
+        .expect("drop the old backlog row");
+    let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
+    assert_eq!(
+        collected(&result),
+        0,
+        "the append path must interlock the bucket it is about to depend on"
+    );
+
+    diesel::sql_query("COMMIT")
+        .execute(&mut admitting)
+        .await
+        .expect("commit");
+    assert!(
+        bucket_exists(&mut conn, &key).await,
+        "the appended start must still have a bucket to debit"
+    );
+    assert!(
+        bucket_last_registered_at(&mut conn, &key).await > registered_before,
+        "the append path registers the bucket like every other dependent"
+    );
+}
+
+#[tokio::test]
+async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
+    // Codex review round 1, P2. A preview deletes nothing, so without a keyset
+    // cursor it re-reads its first batch forever and can only ever forecast
+    // `batch_size` — against a real pass that spends the whole per-tick budget.
+    // An operator derisking a 50k-row tick by previewing 1k of it is being
+    // misled by exactly the tool meant to prevent that.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    for i in 0..5 {
+        insert_idle_bucket(&mut conn, &format!("dyn-rate:t:{i:04}"), day_old()).await;
+    }
+
+    let config = RetentionConfig {
+        dry_run: true,
+        batch_size: 2,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick(pool.clone(), config, Arc::new(CapturingMetrics::default())).await;
+    assert_eq!(
+        collected(&result),
+        5,
+        "the forecast must page past the first batch"
+    );
+    assert_eq!(
+        surviving_keys(&mut conn).await.len(),
+        5,
+        "and delete nothing"
+    );
+
+    // ...and the forecast matches what the real pass then collects.
+    let real = RetentionConfig {
+        batch_size: 2,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick(pool, real, Arc::new(CapturingMetrics::default())).await;
+    assert_eq!(collected(&result), 5);
+    assert!(surviving_keys(&mut conn).await.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // AC5 — shard-local
 // ---------------------------------------------------------------------------

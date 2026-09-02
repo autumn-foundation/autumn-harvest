@@ -9009,21 +9009,25 @@ fn build_activity_enqueue_plan(
             // here, mirroring the dynamic-no-rps guard above. The literal mirrors
             // `queue::DYNAMIC_RATE_PREFIX` (`"dyn-rate"`) + `":"`, matching the
             // builder's own static-key reject.
-            if let Some(key) = activity.rate_limit_key
+            // Checked on the EFFECTIVE static key — `rate_limit_key` when set,
+            // otherwise the activity NAME, which is what the bucket is
+            // registered under (issue #1127, Codex review round 1 P2).
+            let squatted = activity.rate_limit_key.unwrap_or(activity.name);
+            if activity.rate_limit_rps.is_some()
                 && let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
                     .into_iter()
-                    .find(|prefix| key.starts_with(prefix))
+                    .find(|prefix| squatted.starts_with(prefix))
             {
                 return Err(HarvestError::Config(format!(
-                    "activity '{}' sets a static rate_limit_key = \"{}\" beginning with the \
-                     reserved `{}` prefix (reserved for caller-keyed rate-limit/throttle \
-                     buckets); this collides with the generated bucket namespace, would \
-                     race first-writer-wins on the shared bucket's rate/burst, and would \
-                     make the bucket collectable by the idle-bucket GC (issue #1127) with \
-                     nothing to re-register it until a worker restart. \
-                     (HarvestBuilder::try_build rejects this; you likely built \
+                    "activity '{}' resolves to the static rate-limit bucket key \"{}\" \
+                     beginning with the reserved `{}` prefix (reserved for caller-keyed \
+                     rate-limit/throttle buckets); this collides with the generated bucket \
+                     namespace, would race first-writer-wins on the shared bucket's \
+                     rate/burst, and would make the bucket collectable by the idle-bucket \
+                     GC (issue #1127) with nothing to re-register it until a worker \
+                     restart. (HarvestBuilder::try_build rejects this; you likely built \
                      HandlerRegistry directly.)",
-                    activity.name, key, prefix
+                    activity.name, squatted, prefix
                 )));
             }
             let effective_rate_limit_key = activity
@@ -24973,19 +24977,23 @@ impl Worker {
                     // dynamic-no-rps guard above (issue #699 review, Codex P2).
                     // The enqueue path also fails the schedule transaction (see
                     // `persist_scheduled_activities`).
-                    if let Some(static_key) = activity.rate_limit_key
-                        && let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
-                            .into_iter()
-                            .find(|prefix| static_key.starts_with(prefix))
+                    // The EFFECTIVE key, since `rate_limit_key` falls back to
+                    // the activity name below and that is what gets registered
+                    // (issue #1127, Codex review round 1 P2).
+                    let static_key = activity.rate_limit_key.unwrap_or(activity.name);
+                    if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
+                        .into_iter()
+                        .find(|prefix| static_key.starts_with(prefix))
                     {
                         tracing::error!(
                             worker_id = %self.config.worker_id,
                             activity = %activity.name,
                             key = %static_key,
                             prefix = %prefix,
-                            "activity sets a static rate_limit_key beginning with a reserved \
-                             caller-keyed prefix; not registering this colliding bucket -- rename \
-                             the key or use rate_limit(key = ...) for dynamic per-key buckets"
+                            "activity resolves to a static rate-limit bucket key beginning with \
+                             a reserved caller-keyed prefix; not registering this colliding \
+                             bucket -- rename the activity or its key, or use \
+                             rate_limit(key = ...) for dynamic per-key buckets"
                         );
                         continue;
                     }

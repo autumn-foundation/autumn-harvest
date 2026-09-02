@@ -4659,12 +4659,20 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
 /// `DELETE`, so an operator can preview exactly what the pass would collect
 /// before letting it run. That affordance matters more here than for the
 /// sibling passes: this one is on by default and only destroys.
+///
+/// Takes a keyset cursor (`$3`, an exclusive lower bound on `key`) that the
+/// sweep does not need. A real pass pages by *deleting* what it counted; a
+/// preview removes nothing, so without a cursor it would re-read the same first
+/// batch forever and could only ever forecast `batch_size` — under-reporting by
+/// up to [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]× against the pass it is
+/// supposed to predict (issue #1127, Codex review round 1 P2).
 #[must_use]
 fn idle_rate_limit_bucket_preview_sql() -> String {
     let predicates = idle_rate_limit_bucket_predicates();
     format!(
         "SELECT b.key FROM harvest_rate_limit_buckets b \
           WHERE {predicates} \
+            AND b.key > $3 \
           ORDER BY b.key \
           LIMIT $2"
     )
@@ -4679,8 +4687,9 @@ fn idle_rate_limit_bucket_preview_sql() -> String {
 /// which are bounded names safe to use as a metric label.
 ///
 /// With `preview` set, nothing is deleted: the identical predicates are run as
-/// a read-only `SELECT` and the counts describe what a real pass *would*
-/// collect. That is what `dry_run` uses.
+/// a read-only `SELECT`, paged by a keyset cursor over `key`, and the counts
+/// describe what a real pass *would* collect under the same per-tick budget.
+/// That is what `dry_run` uses.
 ///
 /// Shard-local by construction: it takes one shard's connection and every
 /// dependent it consults (`harvest_task_queue`, `harvest_start_throttle`) lives
@@ -4688,8 +4697,8 @@ fn idle_rate_limit_bucket_preview_sql() -> String {
 ///
 /// Drains in `batch_size` batches up to
 /// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`], then leaves the remainder for the
-/// next tick. A preview stops after the first batch — it deletes nothing, so a
-/// second query would return the same rows forever.
+/// next tick. A preview pages over the same budget so its forecast matches what
+/// a real tick would do.
 ///
 /// # Errors
 ///
@@ -4715,16 +4724,29 @@ pub async fn sweep_idle_rate_limit_buckets(
         idle_rate_limit_bucket_sweep_sql()
     };
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    // Keyset cursor, used by the preview only. The sweep pages by deleting what
+    // it counted, so it always re-reads from the start of the eligible set.
+    let mut cursor = String::new();
 
     for _ in 0..MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK {
-        let rows: Vec<SweptKey> = diesel::sql_query(&sql)
+        let mut query = diesel::sql_query(&sql)
             .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
             .bind::<diesel::sql_types::BigInt, _>(batch)
+            .into_boxed();
+        if preview {
+            query = query.bind::<diesel::sql_types::Text, _>(cursor.clone());
+        }
+        let rows: Vec<SweptKey> = query
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
         let swept = rows.len();
         for row in rows {
+            // Keys come back in `key` order, so the last one is the next page's
+            // exclusive lower bound.
+            if preview {
+                cursor.clone_from(&row.key);
+            }
             // A key that no longer classifies cannot happen (the SQL filters on
             // the same prefix list), but counting it under a synthesised label
             // would be worse than not counting it.
@@ -4734,9 +4756,8 @@ pub async fn sweep_idle_rate_limit_buckets(
         }
         // A short batch means the eligible set is exhausted. Compare against
         // the EFFECTIVE limit, not the raw `batch_size`, or a clamped 0 would
-        // never terminate. A preview never loops: it removes nothing, so the
-        // next batch would return the same rows.
-        if preview || swept == 0 || i64::try_from(swept).unwrap_or(i64::MAX) < batch {
+        // never terminate.
+        if swept == 0 || i64::try_from(swept).unwrap_or(i64::MAX) < batch {
             break;
         }
     }
@@ -5981,6 +6002,15 @@ mod tests {
                 "the dry-run preview must not contain `{mutating}`"
             );
         }
+        // It must page by keyset, or — deleting nothing — it would re-read the
+        // first batch forever and forecast at most one batch against a pass
+        // that spends the whole per-tick budget.
+        assert!(preview.contains("AND b.key > $3"));
+        assert!(preview.contains("ORDER BY b.key"));
+        assert!(
+            !idle_rate_limit_bucket_sweep_sql().contains("$3"),
+            "the sweep pages by deleting what it counted and takes no cursor"
+        );
     }
 
     // -----------------------------------------------------------------------

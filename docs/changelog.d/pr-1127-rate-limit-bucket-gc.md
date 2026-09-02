@@ -53,9 +53,12 @@ and predicates resolved by an earlier `SELECT` would already be stale:
   The task predicate is `NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')` so a
   future task state fails safe toward *retaining*.
 
-**Both collectable namespaces are now reserved** against a static
-`rate_limit_key` (`builder::RESERVED_RATE_LIMIT_KEY_PREFIXES`, the macro's
-compile-time reject, and both worker-side guards). #699 reserved `dyn-rate:` and
+**Both collectable namespaces are now reserved** against a static bucket key
+(`builder::RESERVED_RATE_LIMIT_KEY_PREFIXES`, the macro's compile-time reject,
+and both worker-side guards), checked on the **effective** key — `rate_limit_key`
+when set, otherwise the activity *name*, which is what a static bucket is
+registered under, so a hand-built `ActivityInfo` named like a generated bucket
+cannot squat one either. #699 reserved `dyn-rate:` and
 left `start-throttle:` as a follow-up, which was fine while a squat was a
 namespace nit; #1127 makes it a stranding bug, because the GC collects that
 namespace on the guarantee that everything in it re-registers with the work that
@@ -86,7 +89,13 @@ handed over sorted by key, so the rare stale-path locks are always taken in one
 deterministic order (the precaution the quota advisory locks already take,
 #946). `throttle::ensure_throttle_bucket` delegates to that one function instead
 of carrying a second copy of the statement, which would have silently missed the
-interlock.
+interlock — and `reserve_or_defer` now ensures the bucket **before** its FIFO
+backlog guard rather than inside the no-backlog branch. The append path
+previously touched the bucket not at all, so an observed backlog row that the
+scanner drops between the check and the insert (a `schedule_to_start` stale-out
+debits no token) left the sweep seeing an idle, full, dependent-free bucket
+while the pending row committing a moment later referenced a bucket that no
+longer existed — deferred forever behind a fail-closed debit.
 
 The touch writes a dedicated `last_registered_at` rather than reusing
 `updated_at`: `updated_at` means "an operator or config write changed this
@@ -113,7 +122,10 @@ GC is switched off, which is deliberately distinct from "it ran and everything
 was live" and from "it could not run": a bare counter collapses all three into
 one indistinguishable zero, and a permanently-failing shard would then look
 exactly like an idle one. And `dry_run` runs the pass as a **read-only preview**
-built from the sweep's own predicates rather than skipping it — for a collector
+built from the sweep's own predicates, paged by a keyset cursor so its forecast
+covers the same per-tick budget a real pass spends (deleting nothing, it would
+otherwise re-read its first batch and under-report by up to 50×), rather than
+skipping it — for a collector
 that is on by default, "preview it first" is the standard derisking move, and it
 was precisely what a skip made unavailable.
 

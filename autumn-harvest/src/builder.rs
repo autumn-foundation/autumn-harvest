@@ -3049,38 +3049,6 @@ pub(crate) fn validate_activity_rate_limits<'a>(
             continue;
         }
 
-        // A static `rate_limit_key` must not squat either caller-keyed bucket
-        // namespace: `dyn-rate:` (per-key/dynamic buckets, issue #699) or
-        // `start-throttle:` (workflow-start throttles, issue #607). Both static
-        // and generated keys register `ON CONFLICT DO NOTHING` against the
-        // shared `harvest_rate_limit_buckets` table, so a static key colliding
-        // with a generated string would race first-writer-wins on the bucket's
-        // rate/burst.
-        //
-        // `start-throttle:` was left as a follow-up when #699 reserved
-        // `dyn-rate:`, because a squat was then merely a namespace nit. Issue
-        // #1127 made it a stranding bug: the idle-bucket GC collects exactly
-        // these two namespaces, on the guarantee that everything in them
-        // re-registers in the same transaction as the work that needs it — true
-        // for a generated key, false for a static one, which is re-registered
-        // only at worker startup. So the follow-up is done here.
-        //
-        // The literals mirror `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`
-        // (the `queue` module is `db`-gated, but this validation runs in every
-        // build) and the macro's own compile-time reject in
-        // `autumn-harvest-macros`.
-        if let Some(key) = activity.rate_limit_key
-            && let Some(prefix) = RESERVED_RATE_LIMIT_KEY_PREFIXES
-                .into_iter()
-                .find(|prefix| key.starts_with(prefix))
-        {
-            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                activity: activity.name.to_string(),
-                key: key.to_string(),
-                prefix,
-            });
-        }
-
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
         if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
             return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
@@ -3103,6 +3071,49 @@ pub(crate) fn validate_activity_rate_limits<'a>(
 
         let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
         let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
+
+        // A static bucket key must not squat either caller-keyed namespace:
+        // `dyn-rate:` (per-key/dynamic buckets, issue #699) or
+        // `start-throttle:` (workflow-start throttles, issue #607). Both static
+        // and generated keys register `ON CONFLICT DO NOTHING` against the
+        // shared `harvest_rate_limit_buckets` table, so a static key colliding
+        // with a generated string would race first-writer-wins on the bucket's
+        // rate/burst.
+        //
+        // Checked on the EFFECTIVE key, not on `rate_limit_key` alone (issue
+        // #1127, Codex review round 1 P2): the static bucket a worker registers
+        // falls back to the activity NAME when no key is given, so a hand-built
+        // `ActivityInfo` named `start-throttle:reports` would otherwise pass
+        // validation and register a squatting bucket. (The `#[activity]` macro
+        // cannot produce such a name — a Rust identifier holds neither `-` nor
+        // `:` — so this reaches only a directly-constructed `ActivityInfo`.)
+        //
+        // Scoped to activities that actually declare a limit, since that is
+        // exactly when a bucket is registered; an activity merely NAMED like
+        // one, with no rate limit, registers nothing and is left alone.
+        //
+        // `start-throttle:` was left as a follow-up when #699 reserved
+        // `dyn-rate:`, because a squat was then merely a namespace nit. Issue
+        // #1127 made it a stranding bug: the idle-bucket GC collects exactly
+        // these two namespaces, on the guarantee that everything in them
+        // re-registers in the same transaction as the work that needs it — true
+        // for a generated key, false for a static one, which is re-registered
+        // only at worker startup. So the follow-up is done here.
+        //
+        // The literals mirror `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`
+        // (the `queue` module is `db`-gated, but this validation runs in every
+        // build) and the macro's own compile-time reject in
+        // `autumn-harvest-macros`.
+        if let Some(prefix) = RESERVED_RATE_LIMIT_KEY_PREFIXES
+            .into_iter()
+            .find(|prefix| effective_key.starts_with(prefix))
+        {
+            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                activity: activity.name.to_string(),
+                key: effective_key.to_string(),
+                prefix,
+            });
+        }
         let entry = seen
             .entry(effective_key)
             .or_insert_with(|| RateLimitKeyEntry {
@@ -6456,6 +6467,87 @@ mod tests {
                     && prefix == "dyn-rate:"
             ),
             "expected RateLimitKeyReservedPrefix, got: {result:?}"
+        );
+    }
+
+    /// The reserved-prefix check runs on the EFFECTIVE static key, which falls
+    /// back to the activity NAME when no `rate_limit_key` is given (issue
+    /// #1127, Codex review round 1 P2). A hand-built `ActivityInfo` named like
+    /// a generated bucket would otherwise register a squatting static bucket
+    /// that the idle-bucket GC then collects, stranding its tasks until a
+    /// worker restart.
+    #[test]
+    fn build_rejects_an_activity_whose_name_squats_a_reserved_prefix() {
+        let act = ActivityInfo {
+            name: "start-throttle:reports",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(5.0),
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                    ref activity,
+                    ref key,
+                    prefix,
+                }) if activity == "start-throttle:reports"
+                    && key == "start-throttle:reports"
+                    && prefix == "start-throttle:"
+            ),
+            "expected RateLimitKeyReservedPrefix, got: {result:?}"
+        );
+    }
+
+    /// ...but an activity merely NAMED like one, declaring no rate limit at
+    /// all, registers no bucket and must build fine.
+    #[test]
+    fn build_accepts_a_reserved_looking_name_that_declares_no_rate_limit() {
+        let act = ActivityInfo {
+            name: "dyn-rate:not-a-bucket",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        assert!(
+            HarvestBuilder::new()
+                .activities(vec![act])
+                .try_build()
+                .is_ok(),
+            "an activity that registers no bucket squats nothing"
         );
     }
 
