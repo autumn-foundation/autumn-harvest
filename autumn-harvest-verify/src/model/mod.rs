@@ -20,6 +20,17 @@ pub struct SourceRule {
     /// Receiver / self type name (last segment, generics stripped) for trait/inherent methods.
     #[serde(default)]
     pub receiver: Option<String>,
+    /// Optional disambiguator: a `::`-segment **suffix** of the fully-qualified declared
+    /// type of the call's destination local, as printed by the `let _N: T;` declarations.
+    ///
+    /// MIR prints callee paths *trimmed* (`std::env::var` is printed as bare `var`) but
+    /// `let` declarations *fully qualified*, so a bare-suffix rule such as `var` would
+    /// otherwise match any user function of that name. Requiring
+    /// `dest_type = "std::result::Result<std::string::String, std::env::VarError>"`
+    /// pins the row to the real `std::env::var` without keying on an unstable path prefix.
+    /// `None` = the destination type is not consulted.
+    #[serde(default)]
+    pub dest_type: Option<String>,
     pub kind: TaintKind,
     pub reason: String,
 }
@@ -56,6 +67,11 @@ pub struct ForbiddenRule {
     pub path: String,
     #[serde(default)]
     pub receiver: Option<String>,
+    /// Same disambiguator as [`SourceRule::dest_type`]: a suffix of the destination
+    /// local's fully-qualified declared type (e.g. `tokio::time::Sleep` pins the bare
+    /// `sleep` suffix to `tokio::time::sleep`).
+    #[serde(default)]
+    pub dest_type: Option<String>,
     pub reason: String,
 }
 
@@ -64,8 +80,33 @@ pub struct SanitizerRule {
     pub path: String,
     #[serde(default)]
     pub receiver: Option<String>,
+    /// Same disambiguator as [`SourceRule::dest_type`]. It is what makes
+    /// `collect` expressible as a sanitizer: only
+    /// `collect` *into* a `BTreeMap`/`BTreeSet` kills `Order`, and the
+    /// collection chosen is visible only in the destination local's declared type.
+    #[serde(default)]
+    pub dest_type: Option<String>,
     /// Which taint kind the sanitizer clears on its receiver/result.
     pub clears: TaintKind,
+    pub reason: String,
+}
+
+/// A rule keyed on a *type* name rather than a call path.
+///
+/// Used by [`Model::ambient_type`]: the interior-mutability rows in `[[source]]`
+/// (`Mutex::lock`, `AtomicU64::load`, `RefCell::borrow`, `LazyLock`'s `Deref::deref`, ...)
+/// are only non-deterministic **sources** when their receiver is *ambient* — a `static`,
+/// a `static mut`, a `thread_local!`, or a value reachable from one. Applied to a
+/// non-ambient local (a `Mutex` created inside the workflow body) the same call merely
+/// propagates the receiver's taint.
+///
+/// The analyzer therefore reads these two tables together: a `[[source]]` row on such a
+/// receiver means "propagate the receiver's taint through this call, **and** treat a
+/// `static` whose declared type appears in `[[ambient_type]]` as an ambient root".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeRule {
+    /// Type name (last `::` segment, generic arguments stripped), e.g. `AtomicU64`.
+    pub name: String,
     pub reason: String,
 }
 
@@ -102,6 +143,10 @@ pub struct Model {
     pub reduction: Vec<SanitizerRule>,
     #[serde(default)]
     pub trusted: Vec<TrustedCrate>,
+    /// Interior-mutable / lazily-initialised types whose `static` instances are ambient
+    /// taint roots (see [`TypeRule`]).
+    #[serde(default)]
+    pub ambient_type: Vec<TypeRule>,
 }
 
 impl Model {

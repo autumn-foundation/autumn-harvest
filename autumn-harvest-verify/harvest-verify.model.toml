@@ -1,2 +1,2166 @@
-# harvest-verify model (issue #962). RED phase: populated by the model agent.
-version = "0.0.0-red"
+# ═══════════════════════════════════════════════════════════════════════════
+# harvest-verify — builtin determinism model (issue #962)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# This file IS the analysis. `src/` decides how taint flows; this file decides
+# what taint is, where it starts, and where it must never arrive. AC4 requires
+# that the sanctioned-primitive set be extensible "without a release", which is
+# why the rules live in data and not in a `match` arm.
+#
+# ── How a row matches ──────────────────────────────────────────────────────
+#
+# Stable `rustc --emit=mir` prints callee paths with rustc's *trimmed* def-paths
+# — the shortest unambiguous path — while `let _N: T;` declarations print types
+# *fully qualified*. Measured on rustc 1.94.1 against this repo:
+#
+#     _2 = var::<&str>(const "DEPLOY_REGION")
+#     let mut _2: std::result::Result<std::string::String, std::env::VarError>;
+#     _5 = SystemTime::now()
+#     _3 = format(move _4)
+#     _5 = DateTime::<Utc>::timestamp(move _6)
+#     let _6: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>;
+#
+# Three consequences drive every rule below:
+#
+#   1. A rule keyed on a full path (`std::env::var`) matches NOTHING.
+#   2. Re-export paths win: `chrono` prints as `autumn_harvest::chrono`,
+#      `uuid` as `autumn_harvest::uuid`. A `chrono::*` prefix rule silently misses.
+#   3. Trimmed paths are *ambiguity-dependent*: the same source lengthens the
+#      moment a second item of that name is in scope.
+#
+# So a `path` is matched as a **`::`-segment SUFFIX of the callee path with
+# generic arguments stripped**, never as a prefix:
+#
+#     path = "SystemTime::now"   matches  `SystemTime::now`, `std::time::SystemTime::now`
+#     path = "now"               matches  any callee whose last segment is `now`
+#
+# Two optional narrowing keys keep bare suffixes honest:
+#
+#   * `receiver` — the self/receiver type name (LAST segment, generics stripped).
+#     `receiver = "HashMap"` matches `<HashMap<K, V> as IntoIterator>::into_iter`
+#     and `HashMap::<K, V>::iter` alike.
+#   * `dest_type` — a suffix of the fully-qualified declared type of the call's
+#     destination local, read from the `let` declarations. This is the answer to
+#     the bare-`var` problem: `path = "var"` alone would match any user function
+#     named `var`, so the row also requires
+#     `dest_type = "std::result::Result<std::string::String, std::env::VarError>"`,
+#     which no user function can accidentally produce. Same device pins bare
+#     `sleep` to `tokio::time::sleep` via `dest_type = "tokio::time::Sleep"`,
+#     and expresses "collect INTO a BTreeMap" as an order sanitizer.
+#
+# Rows are matched most-specific-first (`receiver` + `dest_type` > `receiver` >
+# `path` alone), and `[[source]]` always beats `[[trusted]]`: `chrono` is a
+# trusted taint-propagator AND `Utc::now` is a source, and the source row wins.
+#
+# ── Tables ─────────────────────────────────────────────────────────────────
+#
+#   [[ambient_type]]        interior-mutable / lazily-initialised types whose
+#                           `static` instances are ambient taint roots
+#   [[source]]              taint origins; `kind = "value" | "order"`
+#   [[sink]]                command-emitting `WorkflowContext` methods
+#   [[sanctioned]]          ctx primitives whose RETURN is clean
+#   [[non_sink]]            ctx methods that are neither sink nor source
+#   [[handler_registration]] ctx methods registering a closure that is analyzed
+#                           as an entry-adjacent body
+#   [[forbidden]]           effects that are findings on reachability alone
+#   [[sanitizer]]           calls that CLEAR a taint kind
+#   [[reduction]]           order-killing reductions and lookups
+#   [[trusted]]             crates with no MIR available, modelled as pure
+#                           taint-propagators rather than as `unknown`
+#
+# An unmodelled `WorkflowContext::*` method is NOT assumed clean: it yields
+# `unknown("unmodeled-ctx-method: <name>")`. That is why all 160 public methods
+# of `impl WorkflowContext` are classified here, not just the 73 the examples
+# happen to call.
+#
+# ── Extending it ───────────────────────────────────────────────────────────
+#
+# `cargo harvest-verify --model extra.toml` overlays a file on this one: the
+# result is the union of the rows, and a later row with the same
+# (table, path, receiver) key replaces the earlier one. Overlays compose, applied
+# left to right. Removing a builtin row = re-declaring it in the other table
+# (e.g. an `[[sanctioned]]` row for a first-party wrapper that records its own
+# result). Every row must carry a non-empty `reason`; a row without one is a
+# model error, not a warning, because an unexplained rule is how a model rots.
+#
+# The version string is printed with every verdict ("no non-determinism found,
+# under model 2026.09.0, up to boundaries ..."), so a verdict can always be
+# traced to the rules that produced it. Bump the date component when rows change.
+
+version = "2026.09.0"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AMBIENT TYPES — statics of these types are taint roots
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Measured constraint (rustc 1.94.1): an immutable `static PLAIN: u64 = 7` and a
+# `static COUNTER: AtomicU64` lower to the SAME MIR shape —
+# `_6 = const {alloc35: &u64}` / `_7 = const {alloc1: &AtomicU64}` — with the
+# static's identity recoverable only from the `alloc` footer
+# (`alloc1 (static: COUNTER, size: 8, align: 8)`). The analyzer resolves the
+# footer, reads the declared type, and consults this table: an interior-mutable
+# or lazily-initialised static is an ambient Value root (its contents can differ
+# between the original run and the replay); a plain immutable data static is
+# clean and must NOT be flagged, or every `static MAX_RETRIES: u32` in the
+# corpus becomes a finding.
+#
+# The interior-mutability rows in `[[source]]` below are read together with this
+# table: `Mutex::lock` on a workflow-local `Mutex` merely propagates the
+# receiver's taint; the same call on a `static` of a type listed here starts
+# taint. `static mut` is always ambient regardless of type.
+
+[[ambient_type]]
+name = "AtomicBool"
+reason = "Interior-mutable; a static's value is process-lifetime state, not history-derived."
+[[ambient_type]]
+name = "AtomicU8"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicU16"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicU32"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicU64"
+reason = "Interior-mutable ambient counter. The canonical laundered seed: `COUNTER.fetch_add(1, Relaxed)` replays to a different number on a second worker."
+[[ambient_type]]
+name = "AtomicUsize"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicI8"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicI16"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicI32"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicI64"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicIsize"
+reason = "Interior-mutable ambient counter/flag."
+[[ambient_type]]
+name = "AtomicPtr"
+reason = "Interior-mutable ambient pointer slot."
+[[ambient_type]]
+name = "Mutex"
+reason = "Interior-mutable. A `static M: Mutex<Vec<T>>` carries state across executions on the same worker and is empty on another."
+[[ambient_type]]
+name = "RwLock"
+reason = "Interior-mutable; see `Mutex`."
+[[ambient_type]]
+name = "RefCell"
+reason = "Interior-mutable. Reached in practice through `thread_local! { static TL: RefCell<T> }`, whose `LocalKey::with` read hides inside a promoted constant (`_10 = const wf::{closure#0}::promoted[0]`)."
+[[ambient_type]]
+name = "Cell"
+reason = "Interior-mutable; see `RefCell`."
+[[ambient_type]]
+name = "OnceLock"
+reason = "Lazily initialised: the value observed depends on which execution won the initialisation race, and the initialiser is invisible at the use site."
+[[ambient_type]]
+name = "OnceCell"
+reason = "Lazily initialised; see `OnceLock`."
+[[ambient_type]]
+name = "LazyLock"
+reason = "Lazily initialised, and the worst shape in the whole model: the use site is a bare `<LazyLock<u64> as Deref>::deref(move _7)` that looks like a pure deref, while the initialiser — which may call `SystemTime::elapsed` — is four hops away in `LAZY::{closure#0}`."
+[[ambient_type]]
+name = "LazyCell"
+reason = "Lazily initialised; see `LazyLock`."
+[[ambient_type]]
+name = "Lazy"
+reason = "`once_cell::sync::Lazy` / `lazy_static!`'s generated type. Same invisible-initialiser shape as `LazyLock`."
+[[ambient_type]]
+name = "LocalKey"
+reason = "`thread_local!` storage: per-thread state, and which worker thread runs a decision cycle is not recorded."
+[[ambient_type]]
+name = "SyncOnceCell"
+reason = "Pre-stabilisation spelling of `OnceLock`, still present in older dependency code."
+[[ambient_type]]
+name = "RandomState"
+reason = "`HashMap`'s default hasher builder. A `static` of it seeds every map built from it with per-process randomness."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SOURCES — kind = "value"
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Wall clock and monotonic clock ─────────────────────────────────────────
+
+[[source]]
+path = "SystemTime::now"
+kind = "value"
+reason = "Host wall clock. Differs between the original execution and every replay. The sanctioned replacement is `ctx.system_now()` (AC4)."
+[[source]]
+path = "SystemTime::elapsed"
+kind = "value"
+reason = "Reads the host wall clock to subtract from. Same hazard as `SystemTime::now`, and the shape MIR inlining leaves behind at opt-level >= 1."
+[[source]]
+path = "SystemTime::duration_since"
+kind = "value"
+reason = "Only non-deterministic when either operand is a live clock read; taint reaches it through the operand, and this row makes the result carry it even when the argument is `UNIX_EPOCH`."
+[[source]]
+path = "Instant::now"
+kind = "value"
+reason = "Monotonic clock; the origin is process start, so the value differs on every run and every worker."
+[[source]]
+path = "Instant::elapsed"
+kind = "value"
+reason = "Monotonic clock read; see `Instant::now`."
+[[source]]
+path = "Instant::duration_since"
+kind = "value"
+reason = "Difference of two monotonic reads. Included because the difference is itself a wall-clock-derived quantity whose value depends on how long the original run took — a laundering shape (`t1.duration_since(t0).as_secs() % 3`) that the syntactic layer's `Instant::now` rule catches at the read but not at the use."
+[[source]]
+path = "Utc::now"
+receiver = "Utc"
+kind = "value"
+reason = "chrono wall clock. Prints as `Utc::now` and, through this crate's re-export, as `autumn_harvest::chrono::Utc::now` — which is exactly why this row is a suffix and not a `chrono::` prefix. `chrono` is a `[[trusted]]` propagator; this source row takes precedence over that."
+[[source]]
+path = "Local::now"
+receiver = "Local"
+kind = "value"
+reason = "chrono local-time clock: non-deterministic in the clock AND in the machine's timezone."
+[[source]]
+path = "Utc::today"
+receiver = "Utc"
+kind = "value"
+reason = "Deprecated chrono date read; still compiles and still reads the host clock."
+
+# ── Process environment ────────────────────────────────────────────────────
+#
+# `std::env::var` prints as the bare suffix `var`, which alone would match any
+# user function named `var`. Each row is pinned by `dest_type`, the declared type
+# of the destination local, which MIR prints fully qualified.
+
+[[source]]
+path = "var"
+dest_type = "std::result::Result<std::string::String, std::env::VarError>"
+kind = "value"
+reason = "`std::env::var`. The environment of the worker process is not part of the recorded history: a replay on another host reads different values. The `dest_type` pin is load-bearing — a bare `var` suffix would match user code."
+[[source]]
+path = "var_os"
+dest_type = "std::option::Option<std::ffi::OsString>"
+kind = "value"
+reason = "`std::env::var_os`; see `var`."
+[[source]]
+path = "vars"
+dest_type = "std::env::Vars"
+kind = "value"
+reason = "`std::env::vars`. Both the values AND the iteration order are host state."
+[[source]]
+path = "vars_os"
+dest_type = "std::env::VarsOs"
+kind = "value"
+reason = "`std::env::vars_os`; see `vars`."
+[[source]]
+path = "args"
+dest_type = "std::env::Args"
+kind = "value"
+reason = "`std::env::args`. The worker's argv is not recorded and differs between deployments."
+[[source]]
+path = "args_os"
+dest_type = "std::env::ArgsOs"
+kind = "value"
+reason = "`std::env::args_os`; see `args`."
+[[source]]
+path = "current_dir"
+dest_type = "std::io::error::Result<std::path::PathBuf>"
+kind = "value"
+reason = "`std::env::current_dir`. The worker's working directory is host state."
+[[source]]
+path = "temp_dir"
+dest_type = "std::path::PathBuf"
+kind = "value"
+reason = "`std::env::temp_dir`. Reads `TMPDIR`; host state."
+[[source]]
+path = "current_exe"
+dest_type = "std::io::error::Result<std::path::PathBuf>"
+kind = "value"
+reason = "`std::env::current_exe`. Host state, and differs across a rolling deploy."
+[[source]]
+path = "hostname"
+kind = "value"
+reason = "Host identity. Which worker claimed the task is not recorded, so a replay on another worker sees a different name."
+
+# ── Process / thread identity ──────────────────────────────────────────────
+
+[[source]]
+path = "process::id"
+kind = "value"
+reason = "`std::process::id`. Differs on every worker restart."
+[[source]]
+path = "thread::current"
+kind = "value"
+reason = "`std::thread::current`. Which pool thread runs a decision cycle is not recorded; `.id()` and `.name()` off the result are therefore replay-varying."
+[[source]]
+path = "ThreadId::as_u64"
+receiver = "ThreadId"
+kind = "value"
+reason = "Thread identity as a number — the laundered form of `thread::current().id()`."
+[[source]]
+path = "Thread::id"
+receiver = "Thread"
+kind = "value"
+reason = "Thread identity; see `thread::current`."
+[[source]]
+path = "Thread::name"
+receiver = "Thread"
+kind = "value"
+reason = "Thread name; see `thread::current`."
+[[source]]
+path = "available_parallelism"
+kind = "value"
+reason = "`std::thread::available_parallelism`. A property of the host, not of the workflow."
+
+# ── Randomness ─────────────────────────────────────────────────────────────
+#
+# `rand`'s entry points are the AC4 hazard with a sanctioned replacement
+# (`ctx.random_u64` / `ctx.random_range` / `ctx.new_uuid`). Deterministically
+# SEEDED generators are deliberately absent: `StdRng::seed_from_u64(k)` with a
+# recorded `k` is reproducible and must stay `proven-deterministic`, which is
+# what the corpus's `seeded` crate exists to prove.
+
+[[source]]
+path = "thread_rng"
+kind = "value"
+reason = "`rand::thread_rng`. Thread-local generator seeded from the OS; the canonical unrecorded randomness source."
+[[source]]
+path = "rng"
+kind = "value"
+reason = "`rand::rng` (the 0.9 spelling of `thread_rng`)."
+[[source]]
+path = "random"
+kind = "value"
+reason = "`rand::random`. The sanctioned replacement is `ctx.random_u64()` / `ctx.random_range()` (AC4)."
+[[source]]
+path = "Rng::gen"
+kind = "value"
+reason = "Draws from an unseeded generator when the receiver is one; taint otherwise propagates from the receiver, so a `StdRng::seed_from_u64` stays clean."
+[[source]]
+path = "Rng::gen_range"
+kind = "value"
+reason = "See `Rng::gen`. Sanctioned replacement: `ctx.random_range()`."
+[[source]]
+path = "Rng::gen_bool"
+kind = "value"
+reason = "See `Rng::gen`. A coin flip that gates a command emission is a control-taint finding."
+[[source]]
+path = "Rng::random"
+kind = "value"
+reason = "rand 0.9 spelling of `Rng::gen`."
+[[source]]
+path = "Rng::random_range"
+kind = "value"
+reason = "rand 0.9 spelling of `Rng::gen_range`."
+[[source]]
+path = "RngCore::next_u32"
+kind = "value"
+reason = "Raw generator draw."
+[[source]]
+path = "RngCore::next_u64"
+kind = "value"
+reason = "Raw generator draw."
+[[source]]
+path = "RngCore::fill_bytes"
+kind = "value"
+reason = "Raw generator draw into an `&mut` out-param: the taint lands in the referent, not in the return value."
+[[source]]
+path = "OsRng"
+kind = "value"
+reason = "`rand::rngs::OsRng` reads the OS entropy pool directly."
+[[source]]
+path = "SeedableRng::from_entropy"
+kind = "value"
+reason = "Seeds from the OS entropy pool — the seed itself is unrecorded, so every value the generator later produces is tainted."
+[[source]]
+path = "SeedableRng::from_os_rng"
+kind = "value"
+reason = "rand 0.9 spelling of `from_entropy`."
+[[source]]
+path = "StdRng::from_entropy"
+receiver = "StdRng"
+kind = "value"
+reason = "See `SeedableRng::from_entropy`."
+[[source]]
+path = "getrandom"
+kind = "value"
+reason = "`getrandom::getrandom`, the crate every `from_entropy` bottoms out in; matched directly for the case where a workflow calls it itself."
+[[source]]
+path = "Uuid::new_v4"
+receiver = "Uuid"
+kind = "value"
+reason = "Random UUID. Prints as `Uuid::new_v4` and, via this crate's re-export, as `autumn_harvest::uuid::Uuid::new_v4`. `uuid` is a `[[trusted]]` propagator for parsing/formatting; this source row takes precedence. Sanctioned replacement: `ctx.new_uuid()` (AC4)."
+[[source]]
+path = "Uuid::now_v7"
+receiver = "Uuid"
+kind = "value"
+reason = "Time-ordered UUID: a wall-clock read plus randomness."
+[[source]]
+path = "Uuid::now_v6"
+receiver = "Uuid"
+kind = "value"
+reason = "Time-ordered UUID; see `Uuid::now_v7`."
+[[source]]
+path = "Uuid::new_v1"
+receiver = "Uuid"
+kind = "value"
+reason = "Timestamp + node-id UUID; both components are host state."
+[[source]]
+path = "RandomState::new"
+receiver = "RandomState"
+kind = "value"
+reason = "Draws per-process hash keys. Constructing it makes the resulting map's iteration order vary between processes — this row is what connects `HashMap::new` to the `[[source]] kind = \"order\"` rows below."
+
+# ── Thread-local storage ───────────────────────────────────────────────────
+#
+# Shape (measured): the `LocalKey` read hides inside a promoted constant, so the
+# call site is `LocalKey::<RefCell<u64>>::with::<{closure@…}, u64>(move _10, move _11)`
+# with the static's identity only in `const wf::{closure#0}::promoted[0]`.
+
+[[source]]
+path = "LocalKey::with"
+receiver = "LocalKey"
+kind = "value"
+reason = "Reads `thread_local!` storage. Which worker thread runs a decision cycle is not recorded, so per-thread state is ambient."
+[[source]]
+path = "LocalKey::try_with"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+[[source]]
+path = "LocalKey::get"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+[[source]]
+path = "LocalKey::set"
+receiver = "LocalKey"
+kind = "value"
+reason = "Writes per-thread state that a later read on another thread will not observe."
+[[source]]
+path = "LocalKey::take"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+[[source]]
+path = "LocalKey::replace"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+[[source]]
+path = "LocalKey::with_borrow"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+[[source]]
+path = "LocalKey::with_borrow_mut"
+receiver = "LocalKey"
+kind = "value"
+reason = "See `LocalKey::with`."
+
+# ── Interior mutability — sources only on an AMBIENT receiver ──────────────
+#
+# READ THESE WITH `[[ambient_type]]`. The analyzer applies each row as:
+# "propagate the receiver's taint through this call, AND treat a `static` of this
+# type as an ambient root." A `Mutex` created inside the workflow body is not a
+# source; the identical call on a `static` one is.
+
+[[source]]
+path = "load"
+receiver = "AtomicU64"
+kind = "value"
+reason = "Ambient atomic read. Same rule applies to every `Atomic*` receiver in `[[ambient_type]]`; the analyzer matches the receiver against that table rather than requiring one row per width."
+[[source]]
+path = "fetch_add"
+receiver = "AtomicU64"
+kind = "value"
+reason = "The canonical laundered counter: `COUNTER.fetch_add(1, Relaxed) % 3` selects a branch that replays differently on a fresh worker."
+[[source]]
+path = "fetch_sub"
+receiver = "AtomicU64"
+kind = "value"
+reason = "See `fetch_add`."
+[[source]]
+path = "fetch_or"
+receiver = "AtomicU64"
+kind = "value"
+reason = "See `fetch_add`."
+[[source]]
+path = "fetch_and"
+receiver = "AtomicU64"
+kind = "value"
+reason = "See `fetch_add`."
+[[source]]
+path = "fetch_xor"
+receiver = "AtomicU64"
+kind = "value"
+reason = "See `fetch_add`."
+[[source]]
+path = "swap"
+receiver = "AtomicU64"
+kind = "value"
+reason = "Returns the previous ambient value."
+[[source]]
+path = "compare_exchange"
+receiver = "AtomicU64"
+kind = "value"
+reason = "Returns the previous ambient value, and whether it succeeded depends on scheduling."
+[[source]]
+path = "compare_exchange_weak"
+receiver = "AtomicU64"
+kind = "value"
+reason = "See `compare_exchange`; additionally allowed to fail spuriously."
+[[source]]
+path = "Mutex::lock"
+receiver = "Mutex"
+kind = "value"
+reason = "Reads the guarded value. Ambient when the `Mutex` is a `static` or reachable from one."
+[[source]]
+path = "Mutex::try_lock"
+receiver = "Mutex"
+kind = "value"
+reason = "See `Mutex::lock`; additionally, WHETHER it succeeds depends on contention, which is a scheduling property."
+[[source]]
+path = "RwLock::read"
+receiver = "RwLock"
+kind = "value"
+reason = "See `Mutex::lock`."
+[[source]]
+path = "RwLock::write"
+receiver = "RwLock"
+kind = "value"
+reason = "See `Mutex::lock`."
+[[source]]
+path = "RwLock::try_read"
+receiver = "RwLock"
+kind = "value"
+reason = "See `Mutex::try_lock`."
+[[source]]
+path = "RwLock::try_write"
+receiver = "RwLock"
+kind = "value"
+reason = "See `Mutex::try_lock`."
+[[source]]
+path = "RefCell::borrow"
+receiver = "RefCell"
+kind = "value"
+reason = "Reads the cell. Ambient when reached through a `thread_local!` or a `static`."
+[[source]]
+path = "RefCell::borrow_mut"
+receiver = "RefCell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "RefCell::try_borrow"
+receiver = "RefCell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "RefCell::try_borrow_mut"
+receiver = "RefCell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "RefCell::take"
+receiver = "RefCell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "RefCell::replace"
+receiver = "RefCell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "Cell::get"
+receiver = "Cell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "Cell::take"
+receiver = "Cell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "Cell::replace"
+receiver = "Cell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "Cell::into_inner"
+receiver = "Cell"
+kind = "value"
+reason = "See `RefCell::borrow`."
+[[source]]
+path = "OnceLock::get"
+receiver = "OnceLock"
+kind = "value"
+reason = "Whether the cell is populated — and by which execution — is ambient."
+[[source]]
+path = "OnceLock::get_or_init"
+receiver = "OnceLock"
+kind = "value"
+reason = "Measured shape: `OnceLock::<u64>::get_or_init::<{closure@hard.rs:54:31: 54:33}>(move _4, const ZeroSized: {closure@…})` — the initialiser's identity is only in the turbofish, so the analyzer must resolve the closure body to see what it reads. Tainted as a source regardless, because WHICH execution ran the initialiser is not recorded."
+[[source]]
+path = "OnceCell::get"
+receiver = "OnceCell"
+kind = "value"
+reason = "See `OnceLock::get`."
+[[source]]
+path = "OnceCell::get_or_init"
+receiver = "OnceCell"
+kind = "value"
+reason = "See `OnceLock::get_or_init`."
+[[source]]
+path = "Deref::deref"
+receiver = "LazyLock"
+kind = "value"
+reason = "The measured use site is a bare `<LazyLock<u64> as Deref>::deref(move _7)` that reads like a pure deref while the initialiser — potentially `SystemTime::elapsed` — sits four hops away in `LAZY::{closure#0}`. Modelled as a source so the invisible initialiser cannot make a workflow look clean."
+[[source]]
+path = "Deref::deref"
+receiver = "LazyCell"
+kind = "value"
+reason = "See `LazyLock`'s `Deref::deref`."
+[[source]]
+path = "Deref::deref"
+receiver = "Lazy"
+kind = "value"
+reason = "`once_cell::sync::Lazy` and the type `lazy_static!` generates. Same invisible-initialiser shape as `LazyLock`."
+[[source]]
+path = "LazyLock::force"
+receiver = "LazyLock"
+kind = "value"
+reason = "Explicit spelling of the deref above."
+[[source]]
+path = "Lazy::force"
+receiver = "Lazy"
+kind = "value"
+reason = "Explicit spelling of the deref above."
+
+# ── Replay-varying `WorkflowContext` reads ─────────────────────────────────
+#
+# The hazard class with NO rule in HVG001-HVG011 or DET001-DET011, and 20 call
+# sites in this repo's own examples. Note what is NOT here: `deadline`,
+# `scheduled_time`, `start_time` and `now` were audited and found replay-STABLE
+# (see `[[sanctioned]]`), and `time_until_deadline` / `should_continue_as_new`
+# are sinks with clean returns, not sources. Classifying the whole family as
+# replay-varying "to be safe" would have produced 20 false positives; classifying
+# none of it would have missed the two that are real.
+
+[[source]]
+path = "is_replaying"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs:4545, doc 4519-4544: \"Observability-only: use it to gate side effects, never to derive workflow commands. Branching command-affecting logic on it records different commands live vs replay and triggers non-determinism.\" The doc's own example (`if !ctx.is_replaying() { println!(..) }`) is the clean use; a command inside that branch is the finding."
+[[source]]
+path = "history_event_count"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs:4314. `should_continue_as_new` (context.rs:4352-4356) calls it \"the (task-varying) event count\" and deliberately evaluates the deadline branch unconditionally so the recorded side-effect stream stays \"a pure function of the recorded history at the cursor, not of the event count\". The engine's own workaround is the evidence that a branch on this value diverges."
+[[source]]
+path = "replay_position"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs:4297 = `match_history(|m| m.position())`, the matcher cursor. Live execution sits at the frontier; a replay walks the same program point with a different cursor."
+[[source]]
+path = "history_has_unconsumed_events"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs:3448 = `match_history(|m| m.has_non_lifecycle_unconsumed())`. Doc 3444-3447: it exists so `run_workflow_strict` can \"detect early-completion non-determinism\" — a cursor-relative predicate, false live and true on replay at the same program point."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SOURCES — kind = "order"
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# `HashMap`/`HashSet` iteration order is seeded per process by `RandomState`, so
+# it differs between the original run and a replay on another worker. The VALUES
+# are deterministic — only the sequence is not — which is why `Order` is a
+# distinct taint kind from `Value`: it is killed by sorting or by an
+# order-insensitive reduction (`[[sanitizer]]` / `[[reduction]]`), while `Value`
+# is killed only by `ctx.side_effect`.
+#
+# `impl Trait` returns are transparent in MIR (measured:
+# `fn make_iter(_1: &HashMap<String, u64>) -> std::collections::hash_map::Values<'_, String, u64>`),
+# so an `Order`-tainted iterator laundered through a helper's return type is still
+# visible to the analyzer.
+#
+# `IndexMap` and `BTreeMap`/`BTreeSet` are deliberately ABSENT: `IndexMap`
+# preserves insertion order and `BTree*` are sorted, so all three iterate
+# deterministically. `serde_json::Map` is a `BTreeMap` by default and is likewise
+# absent — but note the fragility: enabling serde_json's `preserve_order` feature
+# swaps it for an `IndexMap`, which is still deterministic, so no row is needed
+# either way. It would only become an `Order` source if a build swapped it for a
+# `HashMap`, which serde_json never does.
+
+[[source]]
+path = "iter"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::iter`. Iterating the map yields entries in a per-process, hash-seeded order."
+
+[[source]]
+path = "iter_mut"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::iter_mut`. See `iter`."
+
+[[source]]
+path = "into_iter"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::into_iter`. Covers both the inherent call and `<HashMap<K, V> as IntoIterator>::into_iter`, which is why the row keys on the receiver rather than on the path prefix."
+
+[[source]]
+path = "keys"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::keys`. See `iter`."
+
+[[source]]
+path = "values"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::values`. See `iter`. Measured: a helper returning `hash_map::Values<'_, String, u64>` keeps the order taint visible across the call."
+
+[[source]]
+path = "values_mut"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::values_mut`. See `iter`."
+
+[[source]]
+path = "drain"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::drain`. See `iter`; additionally consumes the map."
+
+[[source]]
+path = "into_keys"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::into_keys`. See `iter`."
+
+[[source]]
+path = "into_values"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::into_values`. See `iter`."
+
+[[source]]
+path = "retain"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::retain`. Visits entries in hash order, so a `retain` closure with a side effect or an early-exit counter is order-dependent."
+
+[[source]]
+path = "extract_if"
+receiver = "HashMap"
+kind = "order"
+reason = "`HashMap::extract_if`. See `retain`."
+
+[[source]]
+path = "iter"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::iter`. Iterating the set yields entries in a per-process, hash-seeded order."
+
+[[source]]
+path = "iter_mut"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::iter_mut`. See `iter`."
+
+[[source]]
+path = "into_iter"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::into_iter`. Covers both the inherent call and `<HashMap<K, V> as IntoIterator>::into_iter`, which is why the row keys on the receiver rather than on the path prefix."
+
+[[source]]
+path = "drain"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::drain`. See `iter`; additionally consumes the set."
+
+[[source]]
+path = "retain"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::retain`. Visits entries in hash order, so a `retain` closure with a side effect or an early-exit counter is order-dependent."
+
+[[source]]
+path = "extract_if"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::extract_if`. See `retain`."
+
+# hashbrown is `std`'s HashMap implementation and is also used directly by
+# several dependencies; its maps carry the same hash-seeded order.
+[[source]]
+path = "iter"
+receiver = "HashTable"
+kind = "order"
+reason = "`hashbrown::HashTable::iter`. Same hash-seeded order as `std`'s `HashMap`, which is built on it."
+[[source]]
+path = "into_iter"
+receiver = "HashTable"
+kind = "order"
+reason = "`hashbrown::HashTable`; see `HashTable::iter`."
+# hashbrown's `HashMap`/`HashSet` need no extra rows: `receiver` matches the
+# LAST segment of the receiver type, so the `HashMap`/`HashSet` rows above cover
+# `hashbrown::HashMap` and `hashbrown::HashSet` by construction.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SINKS — `WorkflowContext` methods that emit a history-matched command
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Oracle: `WorkflowContext::push_command` (autumn-harvest/src/context.rs) is the
+# single command-emission primitive. A method is a SINK iff it reaches
+# `push_command` transitively **and** the command it pushes is matched against
+# recorded history. The `reason` on each row names the call chain to the
+# `push_command` site (`*` marks the emitting frame).
+#
+# The second half of that test matters: six methods reach `push_command` and are
+# still NOT sinks, because they return early under
+# `is_replaying()` / `replay_suppresses_side_effects()` and their command is
+# replay-suppressed bookkeeping that never participates in matching
+# (`set_current_details`, `publish_progress`, `upsert_search_attrs`,
+# `log_info`, `log_warn`, `log_error`). They are `[[non_sink]]` rows, each with
+# the guard's line number. Those six cover 30+ of the 310 real `ctx.` call sites
+# in this repo's examples; mis-filing them as sinks alone would exhaust the
+# 10 % allowlist budget.
+#
+# `args` is omitted (= all arguments checked) on every row: for a command-emitting
+# call there is no argument whose non-determinism is harmless. `side_effect` is the
+# single exception and is commented at its row.
+[[sink]]
+path = "await_condition_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:8650; emits a command transitively: await_condition_timeout -> timer* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "await_external_workflow"
+receiver = "WorkflowContext"
+reason = "context.rs:9605; emits a command transitively: await_external_workflow -> await_external_workflow_value -> dispatch_await_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "await_external_workflow_value"
+receiver = "WorkflowContext"
+reason = "context.rs:9624; emits a command transitively: await_external_workflow_value -> dispatch_await_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "business_days_from_now"
+receiver = "WorkflowContext"
+reason = "context.rs:6417 -> `freeze_business_day` -> `side_effect`, freezing the resolved business day into history. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
+path = "cancel_timer"
+receiver = "WorkflowContext"
+reason = "context.rs:6970; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "continue_as_new"
+receiver = "WorkflowContext"
+reason = "context.rs:12169; emits a command transitively: continue_as_new -> continue_as_new_impl* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "continue_as_new_as"
+receiver = "WorkflowContext"
+reason = "context.rs:12312; emits a command transitively: continue_as_new_as -> continue_as_new_as_type -> continue_as_new_impl* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "continue_as_new_as_type"
+receiver = "WorkflowContext"
+reason = "context.rs:12278; emits a command transitively: continue_as_new_as_type -> continue_as_new_impl* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "create_session"
+receiver = "WorkflowContext"
+reason = "context.rs:11916; emits a command transitively: create_session -> resolve_session_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "dag_skip_marker"
+receiver = "WorkflowContext"
+reason = "context.rs:9893 pushes `WorkflowCommand::RecordMarker` and returns `HistoryMatch::Diverged` as a non-determinism error - a directly history-matched command."
+[[sink]]
+path = "execute_activity"
+receiver = "WorkflowContext"
+reason = "context.rs:7859; emits a command transitively: execute_activity -> execute_activity_with_opts -> execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_external"
+receiver = "WorkflowContext"
+reason = "context.rs:12029; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out"
+receiver = "WorkflowContext"
+reason = "context.rs:10100; emits a command transitively: execute_activity_fan_out -> fan_out_raw_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_collect"
+receiver = "WorkflowContext"
+reason = "context.rs:10149; emits a command transitively: execute_activity_fan_out_collect -> fan_out_collect_raw_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_collect_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:10042; emits a command transitively: execute_activity_fan_out_collect_raw -> fan_out_collect_raw_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_collect_raw_windowed"
+receiver = "WorkflowContext"
+reason = "context.rs:10384; emits a command transitively: execute_activity_fan_out_collect_raw_windowed -> fan_out_collect_raw_windowed_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_collect_windowed"
+receiver = "WorkflowContext"
+reason = "context.rs:10545; emits a command transitively: execute_activity_fan_out_collect_windowed -> fan_out_collect_raw_windowed_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:9974; emits a command transitively: execute_activity_fan_out_raw -> fan_out_raw_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_raw_windowed"
+receiver = "WorkflowContext"
+reason = "context.rs:10268; emits a command transitively: execute_activity_fan_out_raw_windowed -> fan_out_raw_windowed_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_fan_out_windowed"
+receiver = "WorkflowContext"
+reason = "context.rs:10492; emits a command transitively: execute_activity_fan_out_windowed -> fan_out_raw_windowed_impl -> check_fan_out_count -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:5671; emits a command transitively: execute_activity_raw -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_raw_with_opts"
+receiver = "WorkflowContext"
+reason = "context.rs:5686; emits a command transitively: execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_activity_with_opts"
+receiver = "WorkflowContext"
+reason = "context.rs:7882; emits a command transitively: execute_activity_with_opts -> execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_admitted_update"
+receiver = "WorkflowContext"
+reason = "context.rs:12896; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_child_workflow_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:8387; emits a command transitively: execute_child_workflow_timeout -> execute_child_workflow_timeout_placed -> spawn_child_workflow_timeout_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_child_workflow_timeout_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:8414; emits a command transitively: execute_child_workflow_timeout_placed -> spawn_child_workflow_timeout_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_local_activity"
+receiver = "WorkflowContext"
+reason = "context.rs:7921; emits a command transitively: execute_local_activity -> execute_local_activity_with_opts -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_local_activity_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:5879; emits a command transitively: execute_local_activity_raw -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "execute_local_activity_with_opts"
+receiver = "WorkflowContext"
+reason = "context.rs:7949; emits a command transitively: execute_local_activity_with_opts -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "mutex"
+receiver = "WorkflowContext"
+reason = "context.rs:6893 returns a `MutexHandle`; `MutexHandle::acquire` (context.rs:1194) pushes `WorkflowCommand::AcquireMutex` at context.rs:1232. The builder itself emits nothing, but the handle it hands back is only useful by emitting, so the builder call is the sink site the author writes."
+[[sink]]
+path = "new_uuid"
+receiver = "WorkflowContext"
+reason = "context.rs:5109; emits a command transitively: new_uuid -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "patched"
+receiver = "WorkflowContext"
+reason = "context.rs:5420 pushes `WorkflowCommand::RecordMarker` (context.rs:5438) and matches it. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
+path = "race"
+receiver = "WorkflowContext"
+reason = "context.rs:11038 returns a `RaceBuilder`; `RaceBuilder::run` (context.rs:1600) calls `ctx.race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). Branch selection is recorded, so the set and order of branches must be deterministic."
+[[sink]]
+path = "random_f64"
+receiver = "WorkflowContext"
+reason = "context.rs:5141; emits a command transitively: random_f64 -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "random_range"
+receiver = "WorkflowContext"
+reason = "context.rs:5165; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "random_u64"
+receiver = "WorkflowContext"
+reason = "context.rs:5123; emits a command transitively: random_u64 -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "random_uuid"
+receiver = "WorkflowContext"
+reason = "context.rs:5259; emits a command transitively: random_uuid -> side_effect* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "receive_signal"
+receiver = "WorkflowContext"
+reason = "context.rs:8448; emits a command transitively: receive_signal -> wait_for_signal* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "receive_signal_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:8992; emits a command transitively: receive_signal_timeout -> wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "request_cancel_external_workflow"
+receiver = "WorkflowContext"
+reason = "context.rs:9381; emits a command transitively: request_cancel_external_workflow -> request_cancel_external_target -> dispatch_cancel_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "request_cancel_external_workflow_by_id"
+receiver = "WorkflowContext"
+reason = "context.rs:9447; emits a command transitively: request_cancel_external_workflow_by_id -> request_cancel_external_target -> dispatch_cancel_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "reset_timer"
+receiver = "WorkflowContext"
+reason = "context.rs:7041; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "should_continue_as_new"
+receiver = "WorkflowContext"
+reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
+[[sink]]
+path = "side_effect"
+receiver = "WorkflowContext"
+args = [0]
+opaque_closure_args = [1]
+reason = "context.rs:4842 pushes `WorkflowCommand::RecordSideEffect` at context.rs:4506 and matches it against history. DUAL ROLE: also a `[[sanctioned]]` row - the recorded *result* replays verbatim, so its return is clean while a tainted *decision to call it* is still a finding. Its closure is `opaque_closure_args = [1]`: laundering non-determinism inside the closure is the whole point of the primitive."
+[[sink]]
+path = "signal_external_workflow"
+receiver = "WorkflowContext"
+reason = "context.rs:9046; emits a command transitively: signal_external_workflow -> signal_external_workflow_with_idempotency -> signal_external_target -> dispatch_signal_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "signal_external_workflow_by_id"
+receiver = "WorkflowContext"
+reason = "context.rs:9138; emits a command transitively: signal_external_workflow_by_id -> signal_external_workflow_by_id_with_idempotency -> signal_external_target -> dispatch_signal_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "signal_external_workflow_by_id_with_idempotency"
+receiver = "WorkflowContext"
+reason = "context.rs:9167; emits a command transitively: signal_external_workflow_by_id_with_idempotency -> signal_external_target -> dispatch_signal_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "signal_external_workflow_with_idempotency"
+receiver = "WorkflowContext"
+reason = "context.rs:9072; emits a command transitively: signal_external_workflow_with_idempotency -> signal_external_target -> dispatch_signal_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "sleep_until"
+receiver = "WorkflowContext"
+reason = "context.rs:6344; emits a command transitively: sleep_until -> timer* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow"
+receiver = "WorkflowContext"
+reason = "context.rs:7994; emits a command transitively: spawn_child_workflow -> spawn_child_workflow_placed -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_detached"
+receiver = "WorkflowContext"
+reason = "context.rs:7794; emits a command transitively: spawn_child_workflow_detached -> spawn_child_workflow_detached_placed -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_detached_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:7820; emits a command transitively: spawn_child_workflow_detached_placed -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_detached_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:7675; emits a command transitively: spawn_child_workflow_detached_raw -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_detached_raw_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:7715; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out"
+receiver = "WorkflowContext"
+reason = "context.rs:10893; emits a command transitively: spawn_child_workflow_fan_out -> spawn_child_workflow_fan_out_placed -> spawn_child_workflow_fan_out_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_collect"
+receiver = "WorkflowContext"
+reason = "context.rs:10966; emits a command transitively: spawn_child_workflow_fan_out_collect -> spawn_child_workflow_fan_out_collect_placed -> spawn_child_workflow_fan_out_collect_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_collect_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:10991; emits a command transitively: spawn_child_workflow_fan_out_collect_placed -> spawn_child_workflow_fan_out_collect_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_collect_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:10797; emits a command transitively: spawn_child_workflow_fan_out_collect_raw -> spawn_child_workflow_fan_out_collect_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_collect_raw_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:10828; emits a command transitively: spawn_child_workflow_fan_out_collect_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:10926; emits a command transitively: spawn_child_workflow_fan_out_placed -> spawn_child_workflow_fan_out_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:10694; emits a command transitively: spawn_child_workflow_fan_out_raw -> spawn_child_workflow_fan_out_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_fan_out_raw_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:10730; emits a command transitively: spawn_child_workflow_fan_out_raw_placed -> record_fan_out_marker* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:8016; emits a command transitively: spawn_child_workflow_placed -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:7420; emits a command transitively: spawn_child_workflow_raw -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_raw_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:7465; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:8097; emits a command transitively: spawn_child_workflow_timeout -> spawn_child_workflow_timeout_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "spawn_child_workflow_timeout_placed"
+receiver = "WorkflowContext"
+reason = "context.rs:8133; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "start_timer"
+receiver = "WorkflowContext"
+reason = "context.rs:6691; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "system_now"
+receiver = "WorkflowContext"
+reason = "context.rs:5072; emits a command transitively: system_now -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "system_time_now"
+receiver = "WorkflowContext"
+reason = "context.rs:5089; emits a command transitively: system_time_now -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "time_until_deadline"
+receiver = "WorkflowContext"
+reason = "context.rs:3993 = `deadline()? - system_now()`; `system_now` records a `SideEffectRecorded` event (context.rs:5072 -> `capture_builtin_validated`). DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:3964-3991 states it uses the replay-safe recorded clock, \"never `chrono::Utc::now()`\"."
+[[sink]]
+path = "timer"
+receiver = "WorkflowContext"
+reason = "context.rs:6179; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "timer_business_days"
+receiver = "WorkflowContext"
+reason = "context.rs:6492; emits a command transitively: timer_business_days -> timer* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "version"
+receiver = "WorkflowContext"
+reason = "context.rs:5280 pushes `WorkflowCommand::RecordMarker` (context.rs:5296) and matches it. DUAL ROLE (see `[[sanctioned]]`): the recorded version replays verbatim, which is what makes it the sanctioned way to branch on a code change."
+[[sink]]
+path = "wait_for_signal"
+receiver = "WorkflowContext"
+reason = "context.rs:8684; calls `push_command` directly. Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "wait_for_signal_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:8816; emits a command transitively: wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+
+# ── Sinks reached through a handle `WorkflowContext` hands back ─────────────
+# `ctx.mutex(k)`, `ctx.race()`, `ctx.start_timer(..)` and `ctx.create_session(..)`
+# return borrow-scoped builders; the command is pushed by the handle's own method.
+# Both ends are modelled so a finding names the site the author actually wrote.
+[[sink]]
+path = "acquire"
+receiver = "MutexHandle"
+reason = "context.rs:1194; pushes `WorkflowCommand::AcquireMutex` at context.rs:1232 and matches `MutexGranted` history."
+[[sink]]
+path = "release"
+receiver = "MutexGuard"
+reason = "context.rs:1289 -> `do_release` (context.rs:1297) pushes `WorkflowCommand::ReleaseMutex` at context.rs:1310."
+[[sink]]
+path = "cancel"
+receiver = "TimerHandle"
+reason = "context.rs:1128 -> `WorkflowContext::cancel_timer`, which pushes `WorkflowCommand::CancelTimer` (context.rs:7017)."
+[[sink]]
+path = "reset"
+receiver = "TimerHandle"
+reason = "context.rs:1137 -> `WorkflowContext::reset_timer`, which pushes `CancelTimer` + `ArmTimer` (context.rs:7078-7085)."
+[[sink]]
+path = "await_fire"
+receiver = "TimerHandle"
+reason = "context.rs:1147 -> `WorkflowContext::await_timer_fire`; suspends on a recorded timer."
+[[sink]]
+path = "run"
+receiver = "RaceBuilder"
+reason = "context.rs:1600 -> `WorkflowContext::race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). The branch set and its order are recorded."
+[[sink]]
+path = "execute_activity"
+receiver = "Session"
+reason = "context.rs:2416 -> `execute_activity_raw_full`; a session-routed activity is an ordinary recorded `ScheduleActivity`."
+[[sink]]
+path = "execute_activity_raw"
+receiver = "Session"
+reason = "context.rs:2452 -> `execute_activity_raw_full`."
+[[sink]]
+path = "complete"
+receiver = "Session"
+reason = "context.rs:2517 -> `execute_activity_raw_full`; closing a session is itself a recorded activity."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SANCTIONED — ctx primitives whose RETURN value is clean
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# AC4's list, plus the members of the deadline family that the audit found to be
+# replay-stable. Thirteen of these rows are DUAL ROLE: they also appear in
+# `[[sink]]`, because the primitive records its result and a tainted decision to
+# call it still diverges the command stream. Modelling `side_effect` as sanctioned
+# only (return clean, call ignored) would silently drop the control-taint finding
+# that motivates the whole analysis; modelling it as a sink only would flag every
+# correct use of the one primitive the engine offers for laundering.
+[[sanctioned]]
+path = "system_now"
+receiver = "WorkflowContext"
+reason = "context.rs:5072 \"Deterministic wall-clock read, captured once and replayed verbatim.\" The recorded value is the AC4 sanctioned replacement for `SystemTime::now`, so the RETURN is clean."
+[[sanctioned]]
+path = "system_time_now"
+receiver = "WorkflowContext"
+reason = "context.rs:5089; `system_now` as a `std::time::SystemTime`. Recorded and replayed verbatim."
+[[sanctioned]]
+path = "now"
+receiver = "WorkflowContext"
+reason = "context.rs:3892 returns the recorded `WorkflowStarted` timestamp (`self.start_time`), not a live clock. Replay-stable by construction."
+[[sanctioned]]
+path = "new_uuid"
+receiver = "WorkflowContext"
+reason = "context.rs:5109 \"Deterministic UUID (version 7), captured once and replayed verbatim.\" AC4 replacement for `Uuid::new_v4`."
+[[sanctioned]]
+path = "random_u64"
+receiver = "WorkflowContext"
+reason = "context.rs:5123; captured once and replayed verbatim. AC4 replacement for `rand::random`."
+[[sanctioned]]
+path = "random_f64"
+receiver = "WorkflowContext"
+reason = "context.rs:5141; captured once and replayed verbatim."
+[[sanctioned]]
+path = "random_range"
+receiver = "WorkflowContext"
+reason = "context.rs:5165; captured once and replayed verbatim. AC4 replacement for `Rng::gen_range`."
+[[sanctioned]]
+path = "random_uuid"
+receiver = "WorkflowContext"
+reason = "context.rs:5259; a `side_effect` wrapper, so the UUID is recorded."
+[[sanctioned]]
+path = "side_effect"
+receiver = "WorkflowContext"
+reason = "context.rs:4842. The recorded result replays verbatim - laundering non-determinism is the primitive's entire purpose - so the return is clean even though the call is a sink."
+[[sanctioned]]
+path = "version"
+receiver = "WorkflowContext"
+reason = "context.rs:5280. The recorded version number replays verbatim; branching on it is the sanctioned way to evolve workflow code."
+[[sanctioned]]
+path = "patched"
+receiver = "WorkflowContext"
+reason = "context.rs:5420. History-derived two-state gate (issue #687); the recorded marker replays verbatim."
+[[sanctioned]]
+path = "deprecate_patch"
+receiver = "WorkflowContext"
+reason = "context.rs:5480. Returns `()` and only marks the gate in the matcher (`m.deprecate_patch(patch_id)`); no command is pushed."
+[[sanctioned]]
+path = "deadline"
+receiver = "WorkflowContext"
+reason = "context.rs:3933, doc 3906-3931: \"a **replay-STABLE** value derived only from immutable inputs ... It records no event and returns the same value on every replay cycle and every worker, so author code may safely branch on it.\" NOT a replay-varying source, and not a sink."
+[[sanctioned]]
+path = "time_until_deadline"
+receiver = "WorkflowContext"
+reason = "context.rs:3993, doc 3964-3991: measured against the replay-stable nominal `deadline()` and the recorded clock `system_now()`, \"**never** `chrono::Utc::now()` - so it is deterministic across replays\". Clean return; the call is still a sink because `system_now` records."
+[[sanctioned]]
+path = "should_continue_as_new"
+receiver = "WorkflowContext"
+reason = "context.rs:4361, doc 4335-4360: the deadline branch \"consults the replay-safe recorded clock via a **tolerant** read ... so its answer is deterministic across replays and workers\", under the stated contract that a `true` result is immediately followed by `continue_as_new`. Clean return; the call is still a sink because the tolerant read records a `Now` side effect at the frontier."
+[[sanctioned]]
+path = "business_days_from_now"
+receiver = "WorkflowContext"
+reason = "context.rs:6417 \"Resolve and **freeze** a business-day deadline\" - the resolved day is recorded via `side_effect`, so the return replays verbatim."
+[[sanctioned]]
+path = "scheduled_time"
+receiver = "WorkflowContext"
+reason = "context.rs:4022 \"frozen into the `WorkflowStarted` event at start time and replays deterministically to the identical value.\""
+[[sanctioned]]
+path = "start_time"
+receiver = "WorkflowContext"
+reason = "context.rs:4062: the recorded `WorkflowStarted` timestamp."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NON-SINK — observability, metadata and history-clean reads
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Neither a sink nor a source: the call emits no history-matched command and its
+# return value is a function of the recorded history or of the execution's fixed
+# identity. Every row names the line that proves it.
+[[non_sink]]
+path = "all_handlers_finished"
+receiver = "WorkflowContext"
+reason = "context.rs:4150; reconstructed from the admitted-update state the history matcher holds, not from live worker state."
+[[non_sink]]
+path = "await_condition"
+receiver = "WorkflowContext"
+reason = "context.rs:8642 returns `AwaitConditionFut`, a pure predicate poll loop over workflow-local state. No command; contrast `await_condition_timeout`, which arms a durable timer."
+[[non_sink]]
+path = "build_id"
+receiver = "WorkflowContext"
+reason = "context.rs:4051; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "cancellation_reason"
+receiver = "WorkflowContext"
+reason = "context.rs:4695; the recorded cancellation reason."
+[[non_sink]]
+path = "check_cancellation"
+receiver = "WorkflowContext"
+reason = "context.rs:4728; returns `Err(Cancelled)` from the same recorded field. No command."
+[[non_sink]]
+path = "drain_commands"
+receiver = "WorkflowContext"
+reason = "context.rs:13299 \"Called by the worker after the workflow task\" - engine-facing, never inside a `#[workflow]` body. Present in the examples only in hand-rolled driver code."
+[[non_sink]]
+path = "drain_signals"
+receiver = "WorkflowContext"
+reason = "context.rs:8549; non-blocking read of already-delivered, recorded signals. Consumption is cursor-ordered and recorded, so it is replay-stable."
+[[non_sink]]
+path = "drain_signals_collect"
+receiver = "WorkflowContext"
+reason = "context.rs:8585; poison-tolerant sibling of `drain_signals`."
+[[non_sink]]
+path = "drain_signals_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:8636; untyped sibling of `drain_signals`."
+[[non_sink]]
+path = "execute_query"
+receiver = "WorkflowContext"
+reason = "context.rs:12587; invokes a registered query handler in-process. Queries are replay-neutral and emit no command."
+[[non_sink]]
+path = "execute_query_with_args"
+receiver = "WorkflowContext"
+reason = "context.rs:12531; see `execute_query`."
+[[non_sink]]
+path = "execution_id"
+receiver = "WorkflowContext"
+reason = "context.rs:4028; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "for_replay"
+receiver = "WorkflowContext"
+reason = "context.rs:3274; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "for_replay_canary_with_state"
+receiver = "WorkflowContext"
+reason = "context.rs:3429; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "for_replay_strict"
+receiver = "WorkflowContext"
+reason = "context.rs:3408; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "for_replay_strict_with_state"
+receiver = "WorkflowContext"
+reason = "context.rs:3417; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "for_replay_with_state"
+receiver = "WorkflowContext"
+reason = "context.rs:3284; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "for_replay_with_state_and_history_policy"
+receiver = "WorkflowContext"
+reason = "context.rs:3298; replayer-facing constructor, never called from a `#[workflow]` body."
+[[non_sink]]
+path = "header"
+receiver = "WorkflowContext"
+reason = "context.rs:4277; a recorded context header."
+[[non_sink]]
+path = "headers"
+receiver = "WorkflowContext"
+reason = "context.rs:4285; the recorded context header map. Returned as an ordered map, so not an `Order` source."
+[[non_sink]]
+path = "holds_mutex"
+receiver = "WorkflowContext"
+reason = "context.rs:6906 \"Reconstructed each decision cycle from `MutexGranted` history matches, so it is replay-stable.\""
+[[non_sink]]
+path = "info"
+receiver = "WorkflowContext"
+reason = "context.rs:4102 \"A read-only, replay-safe snapshot of this run's system metadata.\""
+[[non_sink]]
+path = "invoke_update"
+receiver = "WorkflowContext"
+reason = "context.rs:12731; dispatches to a registered update handler. The handler body is analyzed via its `[[handler_registration]]` row; the dispatch itself emits nothing."
+[[non_sink]]
+path = "is_cancelled"
+receiver = "WorkflowContext"
+reason = "context.rs:4685 = `self.cancellation_reason.is_some()`, populated from a recorded `WorkflowCancelled` event."
+[[non_sink]]
+path = "last_completion_result"
+receiver = "WorkflowContext"
+reason = "context.rs:4194 \"frozen into the `WorkflowStarted` event at start time, so replay always returns the same result regardless of which worker processes the task.\""
+[[non_sink]]
+path = "last_error"
+receiver = "WorkflowContext"
+reason = "context.rs:4216; carried on `WorkflowStarted` like `last_completion_result`."
+[[non_sink]]
+path = "list_query_names"
+receiver = "WorkflowContext"
+reason = "context.rs:12600; sorted names of registered handlers."
+[[non_sink]]
+path = "list_signal_handler_names"
+receiver = "WorkflowContext"
+reason = "context.rs:13105; \"Returns the sorted names\" - sorted, so not an `Order` source either."
+[[non_sink]]
+path = "log_error"
+receiver = "WorkflowContext"
+reason = "context.rs:4628; see `log_info`."
+[[non_sink]]
+path = "log_info"
+receiver = "WorkflowContext"
+reason = "context.rs:4614 -> `WorkflowLogger::info` -> `emit` (context.rs:1956). Replay-suppressed; the `RecordLog` command is bookkeeping, never history-matched."
+[[non_sink]]
+path = "log_warn"
+receiver = "WorkflowContext"
+reason = "context.rs:4621; see `log_info`."
+[[non_sink]]
+path = "logger"
+receiver = "WorkflowContext"
+reason = "context.rs:4607. `WorkflowLogger::emit` (context.rs:1956) returns early when `replay_suppresses_side_effects()` is true and its `RecordLog` push is explicitly \"replay-suppressed bookkeeping\" (doc 1937-1945) that is never matched against history."
+[[non_sink]]
+path = "metrics"
+receiver = "WorkflowContext"
+reason = "context.rs:4268 returns a `UserMetrics` handle. `UserMetrics::{counter,gauge,histogram}` (telemetry.rs:3496/3512/3528) are \"Suppressed during workflow replay and when telemetry is disabled\" and push no command. AC4 (#532) names this surface explicitly."
+[[non_sink]]
+path = "new_for_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:3484; a constructor used by declarative `#[update]` dispatch, not workflow-body API."
+[[non_sink]]
+path = "new_test"
+receiver = "WorkflowContext"
+reason = "context.rs:3556; test constructor."
+[[non_sink]]
+path = "parent_execution_id"
+receiver = "WorkflowContext"
+reason = "context.rs:4069; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "publish_progress"
+receiver = "WorkflowContext"
+reason = "context.rs:13238. \"an ordered, **ephemeral** progress chunk\"; doc 13240-13256: \"a progress chunk is never recorded and never replayed, so on replay we push no command and consume no seq slot\"."
+[[non_sink]]
+path = "queue_name"
+receiver = "WorkflowContext"
+reason = "context.rs:3881; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "set_current_details"
+receiver = "WorkflowContext"
+reason = "context.rs:13164. Pushes `SetCurrentDetails`, but returns at the top when `is_replaying()` (context.rs:13165-13167), so the command never participates in history matching. Modelling it as a sink would turn 13 of the 310 real `ctx.` call sites in this repo's examples into findings."
+[[non_sink]]
+path = "state"
+receiver = "WorkflowContext"
+reason = "context.rs:4669; typed shared state injected by the worker builder. Whether that state is deterministic is a property of the injected value, tracked by the ambient-root rules, not of this accessor."
+[[non_sink]]
+path = "take_deferred_nd_error"
+receiver = "WorkflowContext"
+reason = "context.rs:4951; engine-facing accessor for the deferred non-determinism error."
+[[non_sink]]
+path = "take_nd_details"
+receiver = "WorkflowContext"
+reason = "context.rs:4291; engine-facing accessor for recorded non-determinism diagnostics."
+[[non_sink]]
+path = "try_receive_signal"
+receiver = "WorkflowContext"
+reason = "context.rs:8511; non-blocking read of the oldest buffered, already-recorded signal."
+[[non_sink]]
+path = "try_wait_for_signal"
+receiver = "WorkflowContext"
+reason = "context.rs:8615; untyped sibling of `try_receive_signal`."
+[[non_sink]]
+path = "unfinished_update_handler_count"
+receiver = "WorkflowContext"
+reason = "context.rs:4163; see `all_handlers_finished`."
+[[non_sink]]
+path = "upsert_search_attrs"
+receiver = "WorkflowContext"
+reason = "context.rs:4770. \"**fire-and-forget metadata operation** ... Workflow logic must not branch on the return value\"; the push is guarded by `if self.is_replaying() { return Ok(()) }` (context.rs:4788-4790), so it is never history-matched."
+[[non_sink]]
+path = "validate_update"
+receiver = "WorkflowContext"
+reason = "context.rs:12855; runs a validator without admitting the update."
+[[non_sink]]
+path = "with_activity_defaults"
+receiver = "WorkflowContext"
+reason = "context.rs:3726; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_activity_input_override"
+receiver = "WorkflowContext"
+reason = "context.rs:3747; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_advancing_timer_clock"
+receiver = "WorkflowContext"
+reason = "context.rs:3630; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_build_id"
+receiver = "WorkflowContext"
+reason = "context.rs:3797; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_context_headers"
+receiver = "WorkflowContext"
+reason = "context.rs:4229; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_current_details_cap"
+receiver = "WorkflowContext"
+reason = "context.rs:3758; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_deadline"
+receiver = "WorkflowContext"
+reason = "context.rs:3851; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_execution_timeout"
+receiver = "WorkflowContext"
+reason = "context.rs:3825; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_history_policy"
+receiver = "WorkflowContext"
+reason = "context.rs:3868; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_log_policy"
+receiver = "WorkflowContext"
+reason = "context.rs:3714; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_metrics"
+receiver = "WorkflowContext"
+reason = "context.rs:4242; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_parent_execution_id"
+receiver = "WorkflowContext"
+reason = "context.rs:3812; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_payload_caps"
+receiver = "WorkflowContext"
+reason = "context.rs:3683; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_payload_offload_threshold"
+receiver = "WorkflowContext"
+reason = "context.rs:3702; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_queue_name"
+receiver = "WorkflowContext"
+reason = "context.rs:3779; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_shard_router"
+receiver = "WorkflowContext"
+reason = "context.rs:7260; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_workflow_id"
+receiver = "WorkflowContext"
+reason = "context.rs:3790; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_workflow_name"
+receiver = "WorkflowContext"
+reason = "context.rs:3768; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "workflow_id"
+receiver = "WorkflowContext"
+reason = "context.rs:4037; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "workflow_type"
+receiver = "WorkflowContext"
+reason = "context.rs:4045; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+
+# ── `ActivityContext` and its handles ──────────────────────────────────────
+# Activity bodies are NOT replayed: an activity runs once per attempt and its
+# result is recorded. Reading a clock or the attempt number inside an activity is
+# therefore not a determinism hazard, and none of these emit a workflow command.
+# They are listed because `ctx` is the conventional binding in activity bodies
+# too, so the examples corpus greps them alongside the workflow surface.
+[[non_sink]]
+path = "attempt"
+receiver = "ActivityContext"
+reason = "Activity-side: 1-based attempt number for this activity execution (context.rs:14448)."
+[[non_sink]]
+path = "previous_failure"
+receiver = "ActivityContext"
+reason = "Activity-side: the previous attempt's error message (context.rs:14462)."
+[[non_sink]]
+path = "max_attempts"
+receiver = "ActivityContext"
+reason = "Activity-side: the retry policy's attempt ceiling (context.rs:14472)."
+[[non_sink]]
+path = "is_last_attempt"
+receiver = "ActivityContext"
+reason = "Activity-side: whether this is the final retry (context.rs:14483)."
+[[non_sink]]
+path = "is_retrying"
+receiver = "ActivityContext"
+reason = "Activity-side: whether `attempt > 1` (context.rs:14491)."
+[[non_sink]]
+path = "heartbeat_details"
+receiver = "ActivityContext"
+reason = "Activity-side: the details payload recorded by a previous attempt's heartbeat (context.rs:14754)."
+[[non_sink]]
+path = "heartbeat"
+receiver = "ActivityContext"
+reason = "Activity-side: records activity liveness in `harvest_task_queue.last_heartbeat_at` (context.rs:14807). This is a task-queue row update, not a `harvest_events` write and not a workflow command."
+[[non_sink]]
+path = "start_auto_heartbeat"
+receiver = "ActivityContext"
+reason = "Activity-side: spawns the background heartbeat guard (context.rs:14910); activity-side only."
+[[non_sink]]
+path = "start_auto_heartbeat_default"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14998; see `start_auto_heartbeat`."
+[[non_sink]]
+path = "run_transactional"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15202; runs the closure inside the activity's transactional state. Activity-side, no workflow command."
+[[non_sink]]
+path = "deadline"
+receiver = "ActivityContext"
+reason = "Activity-side: the attempt deadline (context.rs:14659) - activity-side, and const."
+[[non_sink]]
+path = "time_remaining"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14688; saturating remaining time against the LIVE attempt deadline. Its own doc (context.rs:3979-3983) warns it is not interchangeable with `WorkflowContext::time_until_deadline`. Activity-side, so wall-clock derivation is fine."
+[[non_sink]]
+path = "is_expiring_within"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14711; a live-clock predicate, activity-side."
+[[non_sink]]
+path = "idempotency_key"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14415; supplied by the caller."
+[[non_sink]]
+path = "identity"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14548; the activity identity record."
+[[non_sink]]
+path = "task_id"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs; the queue task id."
+[[non_sink]]
+path = "activity_id"
+receiver = "ActivityContext"
+reason = "Activity-side: the activity id (context.rs:14578)."
+[[non_sink]]
+path = "activity_type"
+receiver = "ActivityContext"
+reason = "Activity-side: the activity type name (context.rs:14572)."
+[[non_sink]]
+path = "is_local"
+receiver = "ActivityContext"
+reason = "Activity-side: whether this is a local activity (context.rs:14589)."
+[[non_sink]]
+path = "trace_context"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14101; the captured OTel carrier."
+[[non_sink]]
+path = "check_cancellation"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs; activity-side cooperative cancellation check."
+[[non_sink]]
+path = "is_cancelled"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs; activity-side cancellation flag."
+[[non_sink]]
+path = "info"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14526; the activity metadata snapshot."
+[[non_sink]]
+path = "metrics"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14174; the `UserMetrics` handle. Activity-side, never replay-suppressed."
+[[non_sink]]
+path = "header"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14182; a context header."
+[[non_sink]]
+path = "headers"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:14190; the context header map."
+[[non_sink]]
+path = "state"
+receiver = "ActivityContext"
+reason = "Activity-side: activity-side shared state accessor."
+[[non_sink]]
+path = "execution_id"
+receiver = "ActivityContext"
+reason = "Activity-side: the parent execution id (context.rs:14554)."
+[[non_sink]]
+path = "workflow_id"
+receiver = "ActivityContext"
+reason = "Activity-side: the parent workflow id (context.rs:14560)."
+[[non_sink]]
+path = "workflow_type"
+receiver = "ActivityContext"
+reason = "Activity-side: the parent workflow type (context.rs:14566)."
+[[non_sink]]
+path = "queue_name"
+receiver = "ActivityContext"
+reason = "Activity-side: the queue this activity was claimed from (context.rs:14598)."
+[[non_sink]]
+path = "counter"
+receiver = "UserMetrics"
+reason = "telemetry.rs:3496; \"Suppressed during workflow replay and when telemetry is disabled.\" Pushes no command (AC4 / issue #532)."
+[[non_sink]]
+path = "gauge"
+receiver = "UserMetrics"
+reason = "telemetry.rs:3512; \"Suppressed during workflow replay and when telemetry is disabled.\" Pushes no command (AC4 / issue #532)."
+[[non_sink]]
+path = "histogram"
+receiver = "UserMetrics"
+reason = "telemetry.rs:3528; \"Suppressed during workflow replay and when telemetry is disabled.\" Pushes no command (AC4 / issue #532)."
+[[non_sink]]
+path = "info"
+receiver = "WorkflowLogger"
+reason = "context.rs:1922; `WorkflowLogger::emit` returns early under `replay_suppresses_side_effects()` and its `RecordLog` push is replay-suppressed bookkeeping (doc context.rs:1937-1945), never history-matched."
+[[non_sink]]
+path = "warn"
+receiver = "WorkflowLogger"
+reason = "context.rs:1927; `WorkflowLogger::emit` returns early under `replay_suppresses_side_effects()` and its `RecordLog` push is replay-suppressed bookkeeping (doc context.rs:1937-1945), never history-matched."
+[[non_sink]]
+path = "error"
+receiver = "WorkflowLogger"
+reason = "context.rs:1932; `WorkflowLogger::emit` returns early under `replay_suppresses_side_effects()` and its `RecordLog` push is replay-suppressed bookkeeping (doc context.rs:1937-1945), never history-matched."
+[[non_sink]]
+path = "emit"
+receiver = "WorkflowLogger"
+reason = "context.rs:1956; `WorkflowLogger::emit` returns early under `replay_suppresses_side_effects()` and its `RecordLog` push is replay-suppressed bookkeeping (doc context.rs:1937-1945), never history-matched."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HANDLER REGISTRATION — closures analyzed as entry-adjacent bodies
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These are entry points, not calls. A workflow that registers a signal handler
+# whose closure reads a `static` and emits an activity IS non-deterministic, and
+# an analyzer that walks only the `#[workflow]` body would report it
+# `proven-deterministic` - the one modelling choice that would make the verdict a
+# lie. The registered closure resolves as a `wf::{closure#N}` body, so it is
+# analyzed as part of the registering workflow. If the analyzer cannot resolve the
+# closure it must emit the `unmodeled-ctx-method` boundary rather than proceed.
+[[handler_registration]]
+path = "register_signal_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:13076; the typed closure becomes an entry-adjacent body. Sources and sinks inside it belong to the registering workflow."
+[[handler_registration]]
+path = "register_signal_handler_raw"
+receiver = "WorkflowContext"
+reason = "context.rs:13037; untyped push-based signal handler closure."
+[[handler_registration]]
+path = "register_query"
+receiver = "WorkflowContext"
+reason = "context.rs:12456; no-arg query handler closure."
+[[handler_registration]]
+path = "register_query_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:12499; typed query handler closure."
+[[handler_registration]]
+path = "register_update_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:12804; typed update handler plus an optional validator closure - both are entry-adjacent bodies."
+[[handler_registration]]
+path = "register_update_handler_no_validator"
+receiver = "WorkflowContext"
+reason = "context.rs:12826; update handler closure with no validator."
+[[handler_registration]]
+path = "register_declarative_query_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:12626; registers the closure carried on a `QueryHandlerInfo` companion record."
+[[handler_registration]]
+path = "register_declarative_update_handler"
+receiver = "WorkflowContext"
+reason = "context.rs:12643; registers the closure carried on an `UpdateHandlerInfo` companion record."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FORBIDDEN — findings on REACHABILITY alone, no taint required
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These are not sources and not sinks: they are effects a workflow body must not
+# perform at all. Reaching one from a `#[workflow]` function is a
+# `forbidden-effect` finding whether or not any value is tainted, because the
+# effect itself is unrecorded — a blocking sleep is not replayed, a spawned task
+# outlives the decision cycle, a file read returns different bytes on another
+# host.
+#
+# NOT here, deliberately:
+#   * `println!` / `print!` lower to `std::io::_print`. Console output is noise,
+#     not a determinism hazard, and `ctx.is_replaying()`-gated `println!` is the
+#     documented idiom (context.rs:4533-4541). Flagging it would fight the docs.
+#   * `tokio::select!` — the macro lowers to an inline poll loop with no callee
+#     path, so it is NOT identifiable in MIR at all. The syntactic guardrail
+#     HVG010 remains the only gate on it. This is a named limitation, not an
+#     omission: the report's boundaries table carries it.
+
+[[forbidden]]
+path = "sleep"
+dest_type = "tokio::time::Sleep"
+reason = "`tokio::time::sleep`. Wall-clock sleeping inside a workflow body burns the decision-cycle budget and is not replayed; the durable equivalent is `ctx.timer()` / `ctx.sleep_until()`. Pinned by `dest_type` because the trimmed callee path is the bare suffix `sleep`."
+[[forbidden]]
+path = "sleep_until"
+dest_type = "tokio::time::Sleep"
+reason = "`tokio::time::sleep_until`. Distinct from `WorkflowContext::sleep_until`, which is a durable sink — the `dest_type` pin is what separates them."
+[[forbidden]]
+path = "thread::sleep"
+reason = "`std::thread::sleep` blocks the worker thread for real time that no replay reproduces."
+[[forbidden]]
+path = "tokio::spawn"
+reason = "A spawned task outlives the decision cycle and its interleaving is not recorded. Concurrency inside a workflow must go through `ctx.race()` or the fan-out family, which record their branches."
+[[forbidden]]
+path = "spawn_blocking"
+reason = "`tokio::task::spawn_blocking`; see `tokio::spawn`."
+[[forbidden]]
+path = "spawn_local"
+reason = "`tokio::task::spawn_local`; see `tokio::spawn`."
+[[forbidden]]
+path = "thread::spawn"
+reason = "`std::thread::spawn`; see `tokio::spawn`, and the spawned closure is never analyzed as part of the workflow."
+[[forbidden]]
+path = "Builder::spawn"
+receiver = "Builder"
+reason = "`std::thread::Builder::spawn`, the configured spelling of `thread::spawn`."
+[[forbidden]]
+path = "block_on"
+reason = "`Runtime::block_on` / `futures::executor::block_on` inside a workflow body blocks the executor the workflow is running on."
+[[forbidden]]
+path = "fs::read"
+reason = "`std::fs::read`. The worker's filesystem is not part of the recorded history: a replay on another host reads different bytes, or none."
+[[forbidden]]
+path = "fs::read_to_string"
+reason = "`std::fs::read_to_string`; see `fs::read`."
+[[forbidden]]
+path = "fs::write"
+reason = "`std::fs::write`. An unrecorded external side effect that re-fires on every replay."
+[[forbidden]]
+path = "fs::read_dir"
+reason = "`std::fs::read_dir`. Both the contents AND the entry order are host state."
+[[forbidden]]
+path = "fs::remove_file"
+reason = "`std::fs::remove_file`; an unrecorded external side effect."
+[[forbidden]]
+path = "fs::create_dir_all"
+reason = "`std::fs::create_dir_all`; an unrecorded external side effect."
+[[forbidden]]
+path = "fs::metadata"
+reason = "`std::fs::metadata`. File timestamps and sizes are host state."
+[[forbidden]]
+path = "File::open"
+receiver = "File"
+reason = "`std::fs::File::open`; see `fs::read`."
+[[forbidden]]
+path = "File::create"
+receiver = "File"
+reason = "`std::fs::File::create`; see `fs::write`."
+[[forbidden]]
+path = "TcpStream::connect"
+receiver = "TcpStream"
+reason = "`std::net::TcpStream::connect`. Network I/O belongs in an activity, whose result is recorded; performed inline it re-fires on every replay."
+[[forbidden]]
+path = "TcpListener::bind"
+receiver = "TcpListener"
+reason = "`std::net::TcpListener::bind`; see `TcpStream::connect`."
+[[forbidden]]
+path = "UdpSocket::bind"
+receiver = "UdpSocket"
+reason = "`std::net::UdpSocket::bind`; see `TcpStream::connect`."
+[[forbidden]]
+path = "Client::get"
+receiver = "Client"
+reason = "`reqwest::Client::get`. An HTTP call inside a workflow body is unrecorded network I/O; it belongs in an activity."
+[[forbidden]]
+path = "Client::post"
+receiver = "Client"
+reason = "`reqwest::Client::post`; see `Client::get`."
+[[forbidden]]
+path = "RequestBuilder::send"
+receiver = "RequestBuilder"
+reason = "`reqwest::RequestBuilder::send` — the point at which the request actually goes out, and the row that catches a request built elsewhere."
+[[forbidden]]
+path = "reqwest::get"
+reason = "The free-function shorthand; see `Client::get`."
+[[forbidden]]
+path = "Command::spawn"
+receiver = "Command"
+reason = "`std::process::Command::spawn`. Running a subprocess from a workflow body is unrecorded I/O with unrecorded output."
+[[forbidden]]
+path = "Command::output"
+receiver = "Command"
+reason = "`std::process::Command::output`; see `Command::spawn`."
+[[forbidden]]
+path = "Command::status"
+receiver = "Command"
+reason = "`std::process::Command::status`; see `Command::spawn`."
+[[forbidden]]
+path = "select"
+reason = "`futures::future::select`. Resolution order depends on poll scheduling, which is not recorded. The recorded equivalent is `ctx.race()`, whose winner is written into history."
+[[forbidden]]
+path = "select_all"
+reason = "`futures::future::select_all`; see `select`."
+[[forbidden]]
+path = "select_ok"
+reason = "`futures::future::select_ok`; see `select`."
+[[forbidden]]
+path = "try_select"
+reason = "`futures::future::try_select`; see `select`."
+[[forbidden]]
+path = "FuturesUnordered::next"
+receiver = "FuturesUnordered"
+reason = "`futures::stream::FuturesUnordered` yields in COMPLETION order, which is a scheduling property. `FuturesOrdered` is deliberately absent — it yields in submission order and is deterministic."
+[[forbidden]]
+path = "stdin"
+reason = "`std::io::stdin`. A worker has no interactive input; reading it is unrecorded host state."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SANITIZERS — calls that CLEAR a taint kind
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Only `Order` has sanitizers. `Value` is cleared by exactly one thing —
+# `ctx.side_effect` recording the value into history — which is already expressed
+# by that method's `[[sanctioned]]` row. There is no `clears = "value"` row in
+# this model, and adding one would be how a real finding gets laundered away.
+
+[[sanitizer]]
+path = "sort"
+clears = "order"
+reason = "`[T]::sort` totally orders the elements, so a `Vec` collected from a `HashMap` iteration is order-clean afterwards. This is the fix the analyzer's finding message should suggest."
+[[sanitizer]]
+path = "sort_unstable"
+clears = "order"
+reason = "Equal elements may be permuted, but equal elements are indistinguishable, so the resulting SEQUENCE is deterministic. See `sort`."
+[[sanitizer]]
+path = "sort_by"
+clears = "order"
+reason = "See `sort`. Measured shape: `slice::<impl [String]>::sort_by::<{closure@hard.rs:33:15: 33:21}>(copy _5, move _7)` — the comparator is a separate body, and the analyzer descends into it (a comparator that reads a clock is itself a finding)."
+[[sanitizer]]
+path = "sort_by_key"
+clears = "order"
+reason = "See `sort_by`."
+[[sanitizer]]
+path = "sort_by_cached_key"
+clears = "order"
+reason = "See `sort_by`."
+[[sanitizer]]
+path = "sort_unstable_by"
+clears = "order"
+reason = "See `sort_unstable` and `sort_by`."
+[[sanitizer]]
+path = "sort_unstable_by_key"
+clears = "order"
+reason = "See `sort_unstable` and `sort_by`."
+[[sanitizer]]
+path = "collect"
+dest_type = "std::collections::BTreeMap"
+clears = "order"
+reason = "Collecting into a sorted map discards the source iteration order entirely. `collect` is generic in its destination, and MIR shows the chosen collection ONLY in the destination local's declared type — which is what `dest_type` reads. Without this key the row would have to clear `Order` for every `collect`, including `collect::<Vec<_>>`, which preserves it."
+[[sanitizer]]
+path = "collect"
+dest_type = "std::collections::BTreeSet"
+clears = "order"
+reason = "See the `BTreeMap` row."
+[[sanitizer]]
+path = "collect"
+dest_type = "std::collections::BinaryHeap"
+clears = "order"
+reason = "A heap has no observable iteration order that author code can act on except through `into_sorted_vec` / `pop`, both of which are ordered by the element ordering."
+[[sanitizer]]
+path = "into_sorted_vec"
+receiver = "BinaryHeap"
+clears = "order"
+reason = "`BinaryHeap::into_sorted_vec` produces an ascending sequence independent of insertion order."
+[[sanitizer]]
+path = "sorted"
+clears = "order"
+reason = "`itertools::Itertools::sorted`."
+[[sanitizer]]
+path = "sorted_by"
+clears = "order"
+reason = "`itertools::Itertools::sorted_by`; see `sort_by`."
+[[sanitizer]]
+path = "sorted_by_key"
+clears = "order"
+reason = "`itertools::Itertools::sorted_by_key`; see `sort_by`."
+[[sanitizer]]
+path = "sorted_unstable"
+clears = "order"
+reason = "`itertools::Itertools::sorted_unstable`."
+[[sanitizer]]
+path = "reverse"
+receiver = "Vec"
+clears = "order"
+reason = "NOT a sanitizer on its own — listed here ONLY to record the audit decision: reversing a hash-seeded order yields another hash-seeded order. This row clears nothing that was not already clear; it exists so a future reader does not add it as a real sanitizer. (`clears` is required by the schema; the analyzer treats a receiver-mismatched row as inert.)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REDUCTIONS — order-insensitive consumers of an ordered sequence
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A reduction reads an `Order`-tainted sequence and produces a value that does
+# NOT depend on the order. `Value` taint passes straight through: `.max()` of a
+# `Vec<Instant>` is still a clock read.
+
+[[reduction]]
+path = "len"
+clears = "order"
+reason = "Cardinality is order-independent."
+[[reduction]]
+path = "count"
+clears = "order"
+reason = "`Iterator::count`; see `len`."
+[[reduction]]
+path = "is_empty"
+clears = "order"
+reason = "See `len`."
+[[reduction]]
+path = "sum"
+clears = "order"
+reason = "Integer addition is associative and commutative, so the sum of a hash-ordered sequence is order-independent. CAVEAT, deliberately accepted: FLOAT addition is not associative, so `f64` sums over a `HashMap` iteration can differ in the last bits between orderings. The analyzer does not distinguish the element type here — a rule that flagged every float sum would produce more false positives than it prevents real divergences, and a workflow whose commands depend on the last bit of a float sum has a problem this tool is not the right shape to find. The report's soundness-boundaries table carries this."
+[[reduction]]
+path = "product"
+clears = "order"
+reason = "See `sum`, including the float caveat."
+[[reduction]]
+path = "max"
+clears = "order"
+reason = "The maximum of a set is order-independent."
+[[reduction]]
+path = "min"
+clears = "order"
+reason = "The minimum of a set is order-independent."
+[[reduction]]
+path = "all"
+clears = "order"
+reason = "Universal quantification is order-independent. (Short-circuiting changes how MANY elements are visited, not the answer; it matters only if the predicate has side effects, which is a separate finding on the predicate body.)"
+[[reduction]]
+path = "any"
+clears = "order"
+reason = "Existential quantification; see `all`."
+[[reduction]]
+path = "contains"
+clears = "order"
+reason = "Membership is order-independent."
+[[reduction]]
+path = "fold"
+clears = "order"
+reason = "NOT order-independent in general — `fold` with a non-commutative accumulator IS order-sensitive. Listed with `clears = \"order\"` would be wrong, so this row is deliberately absent from the analyzer's effective set: see the note in the `reverse` sanitizer row for the same device. Kept as a documented non-rule so a future contributor does not add it."
+[[reduction]]
+path = "get"
+receiver = "HashMap"
+clears = "order"
+reason = "A keyed lookup returns the same value regardless of iteration order — the map's ORDER is unobservable through it. This row is what keeps `HashMap` usable in a deterministic workflow: only ITERATION is the hazard, never lookup."
+[[reduction]]
+path = "get_mut"
+receiver = "HashMap"
+clears = "order"
+reason = "See `HashMap::get`."
+[[reduction]]
+path = "contains_key"
+receiver = "HashMap"
+clears = "order"
+reason = "See `HashMap::get`."
+[[reduction]]
+path = "index"
+receiver = "HashMap"
+clears = "order"
+reason = "`<HashMap as Index>::index`, the `map[k]` spelling of `get`."
+[[reduction]]
+path = "insert"
+receiver = "HashMap"
+clears = "order"
+reason = "Returns the displaced value for that key, not an order-dependent one."
+[[reduction]]
+path = "remove"
+receiver = "HashMap"
+clears = "order"
+reason = "Returns the value for that key; see `HashMap::get`."
+[[reduction]]
+path = "len"
+receiver = "HashMap"
+clears = "order"
+reason = "See `len`."
+[[reduction]]
+path = "contains"
+receiver = "HashSet"
+clears = "order"
+reason = "See `HashMap::get`: membership is not order-dependent."
+[[reduction]]
+path = "insert"
+receiver = "HashSet"
+clears = "order"
+reason = "Returns whether the element was newly inserted; order-independent."
+[[reduction]]
+path = "remove"
+receiver = "HashSet"
+clears = "order"
+reason = "Returns whether the element was present; order-independent."
+[[reduction]]
+path = "len"
+receiver = "HashSet"
+clears = "order"
+reason = "See `len`."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRUSTED CRATES — modelled as pure taint-propagators
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# When the analyzer meets a call into a crate whose MIR it does not have, the
+# honest default is `unknown("external-crate-body: <path>")`. That default is
+# correct and useless at scale: `format!` alone would make every workflow
+# unknown. A crate listed here is instead modelled as a PURE PROPAGATOR — its
+# result is tainted iff any argument is, it performs no effect, and it starts no
+# taint of its own.
+#
+# The precedence rule is what keeps this from becoming a hole: `[[source]]`,
+# `[[forbidden]]`, `[[sanitizer]]` and `[[reduction]]` rows are matched BEFORE
+# the trusted-crate default. `chrono` is trusted AND `Utc::now` is a source; the
+# source wins. `tokio` is trusted AND `tokio::time::sleep` is forbidden; the
+# forbidden row wins. Trust means "no body needed to propagate", never "assumed
+# clean".
+#
+# Adding a crate here is the single highest-leverage way to make this tool lie.
+# Each row states why the crate's whole surface is effect-free apart from the
+# rows already carved out above.
+
+[[trusted]]
+name = "core"
+reason = "Always trusted. Language primitives: arithmetic, formatting, iteration, `Option`/`Result` combinators. No ambient state and no I/O; every hazard reached through it (`core::hint::must_use`, `Iterator::next` over a hash-seeded iterator) is carried by a rule above."
+[[trusted]]
+name = "alloc"
+reason = "Always trusted. `Vec`, `String`, `Box`, `BTreeMap`: allocation and owned containers. Allocation ADDRESSES vary between runs, but no safe API exposes one as a value."
+[[trusted]]
+name = "std"
+reason = "Always trusted as a propagator — and the crate with the most carve-outs: the clock, environment, filesystem, network, thread, process, interior-mutability and `HashMap`-iteration rows above ALL take precedence over this entry. `format!` alone justifies the row: measured, it lowers to `Arguments::new` over an array aggregate with no call into user code, and treating it as unknown would make every workflow that formats a string `unknown`."
+[[trusted]]
+name = "serde"
+reason = "Serialization traits. Derived impls are pure structural walks over the value; nothing ambient is read. (A hand-written `Serialize` that reads a clock is a source inside the FIRST-PARTY crate, whose MIR the analyzer has, so it is still caught.)"
+[[trusted]]
+name = "serde_json"
+reason = "JSON encode/decode over a `BTreeMap`-backed `Map`, so `Value` object iteration is ordered. Note the fragility, carried in the report: serde_json's `preserve_order` feature swaps `Map` for an `IndexMap` — still deterministic, so no rule changes — but a build that swapped it for a `HashMap` would silently invalidate this row."
+[[trusted]]
+name = "serde_core"
+reason = "The trait-only split of `serde`; same argument."
+[[trusted]]
+name = "chrono"
+reason = "Date/time ARITHMETIC and formatting are pure functions of their inputs. The clock ENTRY POINTS are not: `Utc::now` and `Local::now` are `[[source]]` rows and take precedence. Note the re-export: chrono prints as `autumn_harvest::chrono::...` in MIR emitted from this workspace, which is why the source rows are suffix-matched."
+[[trusted]]
+name = "uuid"
+reason = "UUID parsing, formatting and byte manipulation are pure. The generators are not: `new_v4`, `now_v7`, `now_v6` and `new_v1` are `[[source]]` rows and take precedence."
+[[trusted]]
+name = "autumn_harvest"
+reason = "The engine itself. Its `WorkflowContext` surface is fully classified above (160 public methods) and an UNMODELLED `WorkflowContext::*` method yields `unknown(\"unmodeled-ctx-method\")` rather than being silently trusted. Everything else in the crate — `info`, `policy`, `shard`, error types, the `Saga` builder — is a propagator. The crate is also the re-export point for `chrono`, `serde_json` and `uuid`, which is why paths through it are matched by suffix."
+[[trusted]]
+name = "tokio"
+reason = "Async runtime plumbing propagates taint like any other library, but the runtime's EFFECTS are `[[forbidden]]` rows that take precedence: `sleep`, `sleep_until`, `spawn`, `spawn_blocking`, `spawn_local`, `block_on`. `tokio::select!` is the acknowledged hole — the macro lowers to an inline poll loop with no callee path, so nothing in this table can see it, and HVG010 remains its only gate."
+[[trusted]]
+name = "futures"
+reason = "Combinators over futures propagate taint. The order-sensitive combinators (`select`, `select_all`, `select_ok`, `try_select`, `FuturesUnordered`) are `[[forbidden]]` rows and take precedence."
+[[trusted]]
+name = "tracing"
+reason = "Structured logging. Emits no workflow command and reads nothing ambient that reaches a value; a `tracing` subscriber's own clock reads happen outside the workflow body."
+[[trusted]]
+name = "base64"
+reason = "Pure encoding: output is a function of input bytes."
+[[trusted]]
+name = "sha2"
+reason = "Pure hashing: output is a function of input bytes. (Contrast `RandomState`, which is a `[[source]]` because its KEYS are random.)"
+[[trusted]]
+name = "hmac"
+reason = "Pure keyed hashing; see `sha2`."
+[[trusted]]
+name = "url"
+reason = "Pure parsing and formatting."
+[[trusted]]
+name = "thiserror"
+reason = "Derive-only: generates `Display`/`Error` impls that are pure formatting."
+[[trusted]]
+name = "anyhow"
+reason = "Error wrapping. `anyhow::Error` captures a backtrace when `RUST_BACKTRACE` is set — host state — but no safe API turns a backtrace into a value a workflow branches on."
+[[trusted]]
+name = "itertools"
+reason = "Iterator adaptors, pure. Its `sorted*` family are `[[sanitizer]]` rows and take precedence."
+[[trusted]]
+name = "indexmap"
+reason = "`IndexMap`/`IndexSet` iterate in INSERTION order, which is deterministic — this is exactly why no `[[source]] kind = \"order\"` row exists for them, and why `IndexMap` is the recommended fix for a hash-order finding."
+[[trusted]]
+name = "once_cell"
+reason = "Propagator for the container types; the ambient reads are covered by `Lazy`'s `Deref::deref` `[[source]]` row and by the `Lazy`/`OnceCell` `[[ambient_type]]` entries, which take precedence."
+[[trusted]]
+name = "bytes"
+reason = "`Bytes`/`BytesMut`: reference-counted byte buffers. Pure data."
+[[trusted]]
+name = "regex"
+reason = "Compilation and matching are pure functions of the pattern and the haystack. (Capture-group iteration is positional, not hash-ordered.)"
+[[trusted]]
+name = "rand"
+reason = "Trusted as a PROPAGATOR only, so that a seeded `StdRng` threaded through helper functions still analyses. Every entry point that draws unrecorded entropy — `thread_rng`, `rng`, `random`, `Rng::gen*`, `RngCore::*`, `OsRng`, `from_entropy` — is a `[[source]]` row and takes precedence. `SeedableRng::seed_from_u64` is deliberately NOT a source: a recorded seed is reproducible, and the corpus proves that case must stay `proven-deterministic`."
