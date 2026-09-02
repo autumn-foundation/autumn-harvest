@@ -396,7 +396,9 @@ cd docs/assays/apparatus/0001-redis-throughput-bench
 BENCH_SECS=10 cargo run --release
 # prints one "concurrency,ops_completed_per_sec" line per swept steady-state
 # cell, then one "backlog_drain,backlog=1000,claimers=8,claims_per_sec=...,
-# drained_before_ceiling=..." line for the matched-workload comparison
+# drained_before_ceiling=..." line for the exploratory backlog-drain number
+# (NOT a matched reproduction of docs/performance.md's harness -- see
+# post-review correction #2)
 ```
 
 The Postgres control is reproduced via the existing, already-documented
