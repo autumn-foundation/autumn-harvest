@@ -2,3 +2,6 @@
 Cargo.lock
 .env*
 .claude/
+
+# Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
+**/target/

@@ -108,7 +108,10 @@ pub struct Rvalue {
 /// A statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
-    Assign { dest: Place, rvalue: Rvalue },
+    Assign {
+        dest: Place,
+        rvalue: Rvalue,
+    },
     /// `StorageLive`, `StorageDead`, `FakeRead`, `PlaceMention`, `nop`, ... — ignored.
     Other(String),
 }
@@ -128,15 +131,33 @@ pub enum Terminator {
         /// Unwind successor (`unwind: bbN`), if any.
         unwind: Option<String>,
     },
-    SwitchInt { operand: Operand, targets: Vec<String> },
-    Goto { target: String },
+    SwitchInt {
+        operand: Operand,
+        targets: Vec<String>,
+    },
+    Goto {
+        target: String,
+    },
     Return,
     Unreachable,
-    Drop { place: Place, target: String, unwind: Option<String> },
-    Assert { operand: Operand, target: String, unwind: Option<String> },
-    InlineAsm { targets: Vec<String> },
+    Drop {
+        place: Place,
+        target: String,
+        unwind: Option<String>,
+    },
+    Assert {
+        operand: Operand,
+        target: String,
+        unwind: Option<String>,
+    },
+    InlineAsm {
+        targets: Vec<String>,
+    },
     /// Anything else, with its successors (best effort) so the CFG stays connected.
-    Other { text: String, targets: Vec<String> },
+    Other {
+        text: String,
+        targets: Vec<String>,
+    },
 }
 
 /// A basic block `bbN: { statements; terminator }`.
@@ -154,10 +175,12 @@ impl Terminator {
     pub fn successors(&self) -> Vec<&str> {
         match self {
             Self::Call { target, .. } => target.iter().map(String::as_str).collect(),
-            Self::SwitchInt { targets, .. } | Self::InlineAsm { targets } | Self::Other { targets, .. } => {
-                targets.iter().map(String::as_str).collect()
+            Self::SwitchInt { targets, .. }
+            | Self::InlineAsm { targets }
+            | Self::Other { targets, .. } => targets.iter().map(String::as_str).collect(),
+            Self::Goto { target } | Self::Drop { target, .. } | Self::Assert { target, .. } => {
+                vec![target.as_str()]
             }
-            Self::Goto { target } | Self::Drop { target, .. } | Self::Assert { target, .. } => vec![target.as_str()],
             Self::Return | Self::Unreachable => Vec::new(),
         }
     }

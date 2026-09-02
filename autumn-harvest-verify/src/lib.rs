@@ -26,7 +26,9 @@ pub mod verdict;
 pub use allowlist::Allowlist;
 pub use model::Model;
 pub use report::Report;
-pub use verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind, Verdict, WorkflowVerdict};
+pub use verdict::{
+    Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind, Verdict, WorkflowVerdict,
+};
 
 /// Errors surfaced by the tool (exit code 2 at the CLI).
 #[derive(Debug, thiserror::Error)]
