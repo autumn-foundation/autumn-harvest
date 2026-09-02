@@ -297,6 +297,19 @@ pub struct EraseOutcome {
     /// deployment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_residences: Vec<ErasedResidence>,
+    /// Shards on this execution's residence chain that have been **retired**
+    /// (issue #964) — decommissioned, their pools removed from every node, and
+    /// their ids forwarded to a successor — and so were not visited.
+    ///
+    /// This is reported rather than silently skipped because it is the one case
+    /// where the erasure is complete only if the decommission was done properly:
+    /// `docs/runbooks/shard-decommission.md` requires the retired shard's
+    /// database to be destroyed (or its payloads erased) before its pool is
+    /// dropped, and declaring the forward is the operator's assertion that it
+    /// was. A merely *unreachable* residence is a different thing entirely and
+    /// fails the whole call instead of appearing here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_residences: Vec<i32>,
 }
 
 /// One previously-hosting shard's contribution to a cross-residence erase
@@ -475,6 +488,19 @@ mod db {
         drop(conn);
 
         for shard in priors {
+            // A RETIRED shard is not an unreachable one. `with_shard_forwards`
+            // refuses to declare a forward for a shard that is still readable,
+            // so the declaration is the operator's assertion that the shard is
+            // decommissioned and its database gone — which the decommission
+            // runbook requires before the pool is dropped. Failing closed on it
+            // would make every run that ever lived on a retired shard
+            // permanently un-erasable, which is a worse answer than none. It is
+            // reported rather than skipped silently, so the response never
+            // implies a copy was scrubbed that this node could not see.
+            if crate::shard::ShardedDbPool::shard_is_retired(*shard) {
+                outcome.retired_residences.push(shard.as_i32());
+                continue;
+            }
             let mut conn = crate::shard_rebalance::conn_for_shard(pool, *shard).await?;
             match erase_workflow_payloads(&mut conn, exec_id, reason).await {
                 Ok(prior) => outcome.prior_residences.push(ErasedResidence {
@@ -609,6 +635,7 @@ mod db {
                 skipped_children,
                 failures,
                 prior_residences: Vec::new(),
+                retired_residences: Vec::new(),
             }))
         })
     }
@@ -933,6 +960,7 @@ mod db {
             skipped_children,
             failures,
             prior_residences: Vec::new(),
+            retired_residences: Vec::new(),
         })
     }
 }
@@ -1145,6 +1173,7 @@ mod tests {
             skipped_children: vec![],
             failures: vec![],
             prior_residences: vec![],
+            retired_residences: vec![],
         };
         let v = serde_json::to_value(&outcome).unwrap();
         // empty vecs are omitted
@@ -1186,6 +1215,7 @@ mod tests {
             skipped_children: vec![],
             failures: vec![],
             prior_residences: vec![],
+            retired_residences: vec![],
         };
         let v = serde_json::to_value(&outcome).unwrap();
         assert_eq!(v["summary_scrubbed"], true);

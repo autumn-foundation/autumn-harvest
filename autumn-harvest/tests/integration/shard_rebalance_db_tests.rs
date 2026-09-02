@@ -1844,3 +1844,109 @@ async fn erasing_a_twice_migrated_run_scrubs_the_intermediate_shard_too() {
         "both prior residences must be named, oldest first"
     );
 }
+
+// ── Codex round 3: the residence history outliving the row it lived on ───────
+
+#[tokio::test]
+async fn erasure_still_reaches_the_source_after_target_retention_summarised_the_run() {
+    // The live shard's retention janitor eventually deletes a terminal run's
+    // execution row and keeps only a compact `harvest_execution_summaries` row.
+    // The sealed source copies are NOT collected with it — retention
+    // deliberately never purges a `MIGRATED` row, because that would destroy
+    // the forwarding pointer — so their payloads are still sitting there. A
+    // residence lookup that read "never migrated" from the execution row's
+    // absence would report a clean erasure over exactly those copies.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "gdpr-summarised").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // Demote the live copy exactly as retention does: a summary row carrying
+    // the residence history, and no execution row.
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'COMPLETED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, e.input, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the execution row");
+
+    let mut source = shards.source().await;
+    assert!(
+        payload_bearing_events(&mut source, exec_id).await > 0,
+        "precondition: the sealed source still holds the subject's payloads"
+    );
+
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_all_residences(
+        &shards.pool,
+        exec_id,
+        "gdpr subject request",
+    )
+    .await
+    .expect("erase across every residence");
+
+    let mut source = shards.source().await;
+    assert_eq!(
+        payload_bearing_events(&mut source, exec_id).await,
+        0,
+        "the residence history must survive the execution row's collection"
+    );
+    assert_eq!(outcome.prior_residences.len(), 1);
+    assert_eq!(outcome.prior_residences[0].shard_id, SOURCE.as_i32());
+}
+
+#[tokio::test]
+async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id() {
+    // The outbox sweeps decide whether a delivery target resolves to the same
+    // POOL they are already transacting on. `ExecutionId` encodes where a run
+    // originated, so a caller that has itself been rebalanced would compare its
+    // origin against the target's residence and call two connections to the
+    // same database "cross-pool" — taking the branch that checks out a second
+    // connection from the pool already driving the transaction, and
+    // self-deadlocking a pool of the supported minimum size one.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-caller").await;
+
+    let mut source = shards.source().await;
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut source, exec_id).await,
+        Some(SOURCE)
+    );
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // The id still encodes SOURCE — the identity is never re-minted — but the
+    // run now lives on TARGET, and the connection that holds it says so.
+    assert_eq!(exec_id.shard(), SOURCE);
+    let mut target = shards.target().await;
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut target, exec_id).await,
+        Some(TARGET),
+        "the held row's shard_id follows the run across a migration"
+    );
+
+    // A connection that does not hold the row at all answers None, so the
+    // caller falls back to the id's encoded shard (the pre-#964 behaviour)
+    // rather than to a wrong shard.
+    let mut other = shards.source().await;
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut other, ExecutionId::new()).await,
+        None
+    );
+}

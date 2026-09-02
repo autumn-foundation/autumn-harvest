@@ -992,6 +992,11 @@ diesel::table! {
         /// parent's execution rows are gone.
         parent_id     -> Nullable<Uuid>,
         summarized_at -> Timestamptz,
+        /// The demoted execution's residence history (issue #964), carried over
+        /// verbatim so a cross-residence payload erasure can still reach the
+        /// sealed source copies after the execution row itself is collected.
+        /// NULL for a run that never moved.
+        migrated_from_shards -> Nullable<Jsonb>,
     }
 }
 

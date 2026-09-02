@@ -575,8 +575,8 @@ pub use db::{
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
     conn_for_execution_forwarded, conn_for_shard, list_migration_candidates, load_migration,
     migrate_execution, migrate_quiescent_executions, observe_quiescence, residence_chain,
-    resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations, stage_copy,
-    verify_target_copy,
+    resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations, shard_of_held_row,
+    stage_copy, verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -2508,9 +2508,21 @@ mod db {
     ) -> HarvestResult<Vec<ShardId>> {
         let live = resolve_execution_shard(pool, exec_id).await?;
         let mut conn = checkout(pool, live).await?;
+        // The execution row first, and the SUMMARY as the fallback. After a
+        // migrated run terminates, the live shard's retention janitor deletes
+        // the execution row and keeps only a compact
+        // `harvest_execution_summaries` row — while the sealed source copies
+        // survive, because retention deliberately never purges a `MIGRATED` row
+        // (that would destroy the forwarding pointer). Reading "never migrated"
+        // from the execution row's absence would therefore report a clean
+        // erasure over exactly the copies that still hold the data, so the
+        // array is carried onto the summary at demotion time and read back here.
         let row: Option<PriorShardsRow> = diesel::sql_query(
-            "SELECT migrated_from_shards AS shards FROM harvest_workflow_executions \
-              WHERE id = $1",
+            "SELECT COALESCE(e.migrated_from_shards, s.migrated_from_shards) AS shards \
+               FROM (SELECT $1::uuid AS id) k \
+               LEFT JOIN harvest_workflow_executions e ON e.id = k.id \
+               LEFT JOIN harvest_execution_summaries s ON s.execution_id = k.id \
+              WHERE e.id IS NOT NULL OR s.execution_id IS NOT NULL",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .get_result(&mut *conn)
@@ -2551,6 +2563,49 @@ mod db {
     struct PriorShardsRow {
         #[diesel(sql_type = Nullable<Jsonb>)]
         shards: Option<Value>,
+    }
+
+    /// The shard an execution **currently** lives on, read from a connection
+    /// that already holds it — no pool checkout of any kind.
+    ///
+    /// This is the caller-side companion to [`resolve_execution_shard`], and it
+    /// exists because that function cannot be used here. The engine's outbox
+    /// sweeps run inside a transaction on the caller's own shard and then decide
+    /// whether the delivery target resolves to that *same pool*; getting that
+    /// comparison wrong sends them down the cross-pool branch, which checks out
+    /// a second connection from the pool already driving the transaction and
+    /// self-deadlocks a pool of the supported minimum size one. `ExecutionId`
+    /// encodes where a run *originated*, so a caller that has itself been
+    /// rebalanced compares its origin against the target's residence and the
+    /// two disagree even when both are the same database.
+    ///
+    /// Resolving the caller's residence the usual way would need a checkout of
+    /// its own — the same deadlock, one level down. Its `shard_id` column
+    /// follows the run across a migration (the copy carries every column and the
+    /// cutover updates it), so the connection in hand already knows the answer.
+    ///
+    /// Returns `None` when the row is not on this connection at all, leaving the
+    /// caller to fall back to the id's encoded shard, which is the pre-#964
+    /// behaviour.
+    pub async fn shard_of_held_row(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> Option<ShardId> {
+        let row: Option<ShardIdRow> =
+            diesel::sql_query("SELECT shard_id FROM harvest_workflow_executions WHERE id = $1")
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .get_result(conn)
+                .await
+                .optional_row()
+                .ok()
+                .flatten();
+        row.map(|r| ShardId::new(r.shard_id))
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ShardIdRow {
+        #[diesel(sql_type = Integer)]
+        shard_id: i32,
     }
 
     /// Check out a connection to one specific shard, failing closed when this

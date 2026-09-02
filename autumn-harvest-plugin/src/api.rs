@@ -7114,6 +7114,7 @@ pub const fn management_api_response_fields()
                 "skipped_children",
                 "failures",
                 "prior_residences",
+                "retired_residences",
             ]),
         ),
         (
@@ -22915,13 +22916,22 @@ async fn erase_workflow_payloads_handler(
         .unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
     // Cross-residence (issue #964): a rebalanced execution's payloads exist on
     // the sealed source shard as well as the live target, and an erasure that
     // scrubbed only the shard the id routes to would leave a complete readable
     // copy of the subject's data behind on another database.
+    //
+    // NOTE the deliberate absence of a held connection around this call. The
+    // helper checks out its own connection PER RESIDENCE, starting with the
+    // live one — so holding the audit connection across it would have this
+    // request waiting on a pool slot it is itself holding whenever the live
+    // shard's pool is the supported minimum size of one. That would wedge every
+    // erasure, migrated or not, until checkout timed out. The audit connection
+    // is therefore acquired AFTER the erase returns, which is the same
+    // one-connection-at-a-time discipline the cross-shard cancel path keeps for
+    // issue #688's precedent.
     let result = match api_state.storage_pool() {
         Ok(pool) => {
             autumn_harvest::erase::erase_workflow_payloads_all_residences(
@@ -22933,6 +22943,7 @@ async fn erase_workflow_payloads_handler(
         }
         Err(e) => Err(e),
     };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -38468,7 +38479,24 @@ pub(crate) async fn load_workflows(
         };
     }
 
-    if !filters.states.is_empty() {
+    if filters.states.is_empty() {
+        // Issue #964: a completed migration leaves TWO rows carrying the same
+        // `id` and the same copied `created_at` — `MIGRATED` on the source and
+        // the live `RUNNING` copy on the target — and this listing fans out
+        // across every shard. Returning both would show one logical execution
+        // twice, and worse: the keyset cursor is derived from `(created_at, id)`,
+        // which is byte-identical for the two copies, so a page boundary landing
+        // between them makes the strict next-page predicate skip the other one
+        // permanently — possibly leaving only the stale `MIGRATED` state visible.
+        //
+        // The sealed source is a forwarding tombstone, not a workflow, so the
+        // DEFAULT listing collapses residences to the live row by excluding it.
+        // An explicit `state=MIGRATED` filter still returns it: the diagnostic
+        // view an operator needs mid-decommission is deliberately preserved,
+        // and that branch cannot double-count because it excludes the live copy
+        // by the same predicate.
+        query = query.filter(harvest_workflow_executions::state.ne("MIGRATED"));
+    } else {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
     if let Some(name) = &filters.workflow_name {

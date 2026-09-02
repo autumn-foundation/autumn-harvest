@@ -1027,6 +1027,34 @@ impl ShardedDbPool {
         shard
     }
 
+    /// Whether `shard` has been declared **retired** — decommissioned, its pool
+    /// removed from every node, and its ids forwarded to a successor.
+    ///
+    /// A retired shard is not "a shard I happen to have no pool for right now".
+    /// The two look identical from the pool map and must not be treated alike:
+    /// a missing pool mid a shard-add rollout is a transient gap where the data
+    /// is very much still there, while a retired shard is one an operator has
+    /// asserted is gone. `ShardRouter::with_shard_forwards` refuses to declare a
+    /// forward for a shard that is still readable, which is what makes the
+    /// declaration mean something.
+    ///
+    /// The distinction matters wherever code must reach data on a shard rather
+    /// than merely route to it — cross-residence payload erasure above all,
+    /// which fails closed on an unreachable residence and would otherwise be
+    /// permanently unable to erase any run that ever lived on a retired shard.
+    #[must_use]
+    pub fn shard_is_retired(shard: ShardId) -> bool {
+        GLOBAL_SHARD_ROUTER
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|r| r.shard_forwards.contains_key(&shard))
+            })
+            .unwrap_or(false)
+    }
+
     /// Build a multi-shard pool from `(shard, DSN)` pairs.
     ///
     /// The paved path for operator tooling that must reach several shard

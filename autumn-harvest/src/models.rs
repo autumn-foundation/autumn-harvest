@@ -1610,6 +1610,11 @@ pub struct ExecutionSummary {
     /// cascade.
     pub parent_id: Option<Uuid>,
     pub summarized_at: DateTime<Utc>,
+    /// The residence history carried over from the demoted execution row
+    /// (issue #964), so a cross-residence erasure can still reach the sealed
+    /// source copies after that row is collected. `None` for a run that never
+    /// moved.
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 /// Insert struct for a newly written execution summary (issue #752).
@@ -1632,6 +1637,10 @@ pub struct NewExecutionSummary {
     /// Parent execution UUID when demoting a child workflow, else `None`
     /// (issue #752).
     pub parent_id: Option<Uuid>,
+    /// The demoted execution's residence history (issue #964), carried over so
+    /// a cross-residence erasure can still reach the sealed source copies after
+    /// the execution row is gone. `None` for a run that never moved.
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 // ── WASM activity module storage (issue #965) ───────────────────────────────

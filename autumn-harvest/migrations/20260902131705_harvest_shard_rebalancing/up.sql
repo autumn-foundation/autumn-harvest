@@ -100,6 +100,22 @@ ALTER TABLE harvest_workflow_executions
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;
 
+-- The residence history has to outlive the execution row it lives on.
+--
+-- After a migrated run terminates, the TARGET shard's retention janitor
+-- eventually deletes its execution row and keeps only a compact
+-- `harvest_execution_summaries` row. The sealed source copies are not collected
+-- with it — retention deliberately never purges a `MIGRATED` row, because that
+-- would destroy the pointer every pre-migration id resolves through — so their
+-- payloads are still sitting there. A residence lookup that found only the
+-- summary and read "never migrated" from its absence would report a clean
+-- erasure over exactly those copies.
+--
+-- Carrying the array onto the summary keeps the erasure's traversal complete
+-- for the whole life of the data, not just the life of the execution row.
+ALTER TABLE harvest_execution_summaries
+    ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;
+
 -- ## The active-uniqueness index is deliberately LEFT ALONE
 --
 -- Issue #964's AC3 points at the reset path's `TERMINATED` sealing as the

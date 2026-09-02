@@ -26,7 +26,8 @@ Companion documents:
 2. DRAIN                rebalance its quiescent residents onto the successor
 3. CONVERGE             repeat until zero residents remain; resolve the stragglers
 4. FORWARD              declare the retired-shard forward, then drop it from `readable_shards`
-5. RETIRE               keep or archive the database — never before step 4 is deployed fleet-wide
+5. RETIRE               settle erasure obligations, then destroy or archive the database
+                        — never before step 4 is deployed fleet-wide
 ```
 
 Each step is reversible until step 5. Steps 1–3 leave the shard fully
@@ -183,6 +184,24 @@ Only after step 4 is deployed everywhere:
   `shard.rebalance.migrate` rows to *this* shard's `harvest_audit_log`, so
   retiring the database retires the record of the drill. Ship them off-box with
   the audit exporter (issue #953) before going further.
+- **Settle your erasure obligations on this shard before it leaves reach.** The
+  sealed `MIGRATED` copies here still hold every payload they had — that is the
+  whole reason they are not retention-collected. Once step 4's forward is
+  declared and this pool is dropped, a later
+  `POST /workflows/{id}/erase-payloads` for a run that lived here **cannot
+  scrub this copy**; it reports the shard under `retired_residences` rather
+  than pretending it did. Declaring the forward is therefore an assertion that
+  this shard's payloads are no longer your problem, and it must be true before
+  you make it. Two ways to make it true, and you need exactly one:
+  - *Destroy* the database rather than archiving it live (the ordinary case:
+    the payloads cease to exist, so nothing can be owed against them); or
+  - if you are keeping it — even as a cold backup — run the erasures you owe
+    against it **now**, while its pool is still configured, and keep it out of
+    any restore path that could bring the plaintext back.
+
+  A shard that is still readable cannot be declared retired at all:
+  `ShardRouter::with_shard_forwards` refuses the declaration, which is what
+  makes it mean something.
 - **Do not drop the database until you are sure.** Take a final backup. The
   sealed `MIGRATED` rows are the audit record of where each run used to live.
 - Remove the shard's pool from every node's configuration.

@@ -2434,7 +2434,17 @@ pub async fn enforce_external_signals_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                let caller_shard = caller_exec_id.shard();
+                // The caller's CURRENT residence, read off the connection this
+                // transaction already holds (issue #964). `ExecutionId` encodes
+                // where a run originated, so a caller that has itself been
+                // rebalanced would otherwise compare its origin against the
+                // target's residence below and call two connections to the same
+                // database "cross-pool" — taking the branch that checks out a
+                // second connection from the pool already driving this
+                // transaction, and self-deadlocking a pool of size one.
+                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
+                    .await
+                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 // Issue #964: follow the forwarding pointer a shard rebalance
                 // leaves behind. Without this the delivery routes to the shard
@@ -2450,14 +2460,15 @@ pub async fn enforce_external_signals_outbox(
                 };
 
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for(routed_shard),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        std::ptr::eq(t_pool, c_pool)
-                    } else {
-                        false
-                    }
+                    // The caller side keeps `pool_for`'s default-shard fallback
+                    // (matching the `exact_pool_for_execution` it replaces), so a
+                    // legacy caller carrying `ShardId::UNENCODED` still resolves
+                    // to the pool that actually serves it rather than to `None`
+                    // and a spurious cross-pool verdict. The target side stays
+                    // exact: there, an unknown shard must fail rather than
+                    // silently deliver to the default database.
+                    pool.exact_pool_for(routed_shard)
+                        .is_some_and(|t_pool| std::ptr::eq(t_pool, pool.pool_for(caller_shard)))
                 });
 
                 let terminal_opt = if same_pool {
@@ -2770,7 +2781,17 @@ pub async fn enforce_external_cancels_outbox(
                 // the deferred unfinished-handler-check routing after this
                 // step commits) can tell a same-shard check apart from a
                 // cross-shard one without re-deriving it (issue #751 review).
-                let caller_shard = caller_exec_id.shard();
+                //
+                // The caller's CURRENT residence, not its id's encoded origin
+                // (issue #964): a caller that has itself been rebalanced would
+                // otherwise be compared against the target's residence and
+                // judged cross-pool against its own database, sending the
+                // delivery down the branch that checks out a second connection
+                // from the pool already driving this transaction. Read off the
+                // held connection, so resolving it cannot deadlock in turn.
+                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
+                    .await
+                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
@@ -2826,14 +2847,15 @@ pub async fn enforce_external_cancels_outbox(
                 };
 
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for(routed_shard),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        std::ptr::eq(t_pool, c_pool)
-                    } else {
-                        false
-                    }
+                    // The caller side keeps `pool_for`'s default-shard fallback
+                    // (matching the `exact_pool_for_execution` it replaces), so a
+                    // legacy caller carrying `ShardId::UNENCODED` still resolves
+                    // to the pool that actually serves it rather than to `None`
+                    // and a spurious cross-pool verdict. The target side stays
+                    // exact: there, an unknown shard must fail rather than
+                    // silently deliver to the default database.
+                    pool.exact_pool_for(routed_shard)
+                        .is_some_and(|t_pool| std::ptr::eq(t_pool, pool.pool_for(caller_shard)))
                 });
 
                 // Completion-trigger / cascade follow-up starts + terminal
@@ -3013,19 +3035,20 @@ pub async fn enforce_external_cancels_outbox(
                 // "Same shard" here means "resolves to the same *pool*", not
                 // a raw `ShardId` equality check (issue #751 review, round
                 // 5): a legacy/pre-sharding caller execution carries
-                // `ShardId::UNENCODED`, which `exact_pool_for_execution`
-                // correctly resolves to the default shard's pool via its own
-                // fallback -- but a raw `exec_id.shard() == caller_shard`
-                // comparison would treat that as cross-shard even against an
-                // *encoded* default-shard execution physically served by the
-                // identical pool, taking the `pool.get()` branch below and
+                // `ShardId::UNENCODED`, which `pool_for`'s default-shard
+                // fallback correctly resolves to the default shard's pool --
+                // but a raw `exec_id.shard() == caller_shard` comparison would
+                // treat that as cross-shard even against an *encoded*
+                // default-shard execution physically served by the identical
+                // pool, taking the `pool.get()` branch below and
                 // self-deadlocking under the same pool-size-1 configuration
-                // this whole routing exists to protect. `pool_for(shard)`
-                // (with its own default-shard fallback) applied to
-                // `caller_shard` is a faithful, `ShardId`-only stand-in for
-                // `exact_pool_for_execution(caller_exec_id)` -- both consult
-                // only `.shard()` internally, so the two are provably
-                // equivalent without needing `caller_exec_id` itself here.
+                // this whole routing exists to protect.
+                //
+                // `caller_shard` is now the caller's CURRENT residence (issue
+                // #964), read off the held connection rather than decoded from
+                // its id, because a caller that has itself been rebalanced
+                // would otherwise be judged cross-pool against its own
+                // database -- the same self-deadlock by a different route.
                 for (exec_id, workflow_name) in deferred_checks {
                     // Forwarding-aware (issue #964). These ids come back from a
                     // cancel that already ran on the target's CURRENT residence,
@@ -3203,6 +3226,12 @@ pub async fn enforce_external_awaits_outbox(
                 };
 
                 let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                // The caller's CURRENT residence (issue #964), read off the held
+                // connection — see the signal outbox above for why the id's
+                // encoded origin is the wrong thing to compare pools with.
+                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
+                    .await
+                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
@@ -3249,14 +3278,15 @@ pub async fn enforce_external_awaits_outbox(
                 };
 
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for(routed_shard),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        std::ptr::eq(t_pool, c_pool)
-                    } else {
-                        false
-                    }
+                    // The caller side keeps `pool_for`'s default-shard fallback
+                    // (matching the `exact_pool_for_execution` it replaces), so a
+                    // legacy caller carrying `ShardId::UNENCODED` still resolves
+                    // to the pool that actually serves it rather than to `None`
+                    // and a spurious cross-pool verdict. The target side stays
+                    // exact: there, an unknown shard must fail rather than
+                    // silently deliver to the default database.
+                    pool.exact_pool_for(routed_shard)
+                        .is_some_and(|t_pool| std::ptr::eq(t_pool, pool.pool_for(caller_shard)))
                 });
 
                 // Map the reader's 3-state result to the awaiter's terminal
