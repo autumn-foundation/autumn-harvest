@@ -3827,7 +3827,12 @@ pub mod db {
         drop(sharded);
         let teardown_failures = cluster.teardown().await;
 
-        offsets.sort_by(f64::total_cmp);
+        // NOT sorted. `offsets_before` is in shard order and both lists are
+        // rendered as per-shard in the notes, so sorting this one silently
+        // decouples the two -- and can contradict the shard-specific drift
+        // reason `clock_offset_soundness` produced from the same pair (Codex
+        // review, PR #1282). The sort was a leftover from when this was
+        // summarised as a single worst-case value.
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
         let publish = unsound.is_empty();
         #[allow(
