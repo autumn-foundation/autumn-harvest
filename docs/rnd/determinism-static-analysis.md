@@ -532,9 +532,11 @@ approximate, and a reader who quotes a verdict needs them.
   `now_ish() -> std::string::String` from a dependency compiled without
   `--emit=mir` has exactly that shape. A body-less callee is trusted as a pure
   taint-propagator iff one of four things holds: a `std`/`core`/`alloc` or
-  `[[trusted]]` crate root appears in the callee path text itself (the qualifying
-  trait of a `<T as std::future::IntoFuture>::into_future` included, turbofish
-  arguments excluded); the call is a **method** and the declared type of its
+  `[[trusted]]` crate root appears in the callee's **owner** path — the qualified
+  self type of `<Ty as Trait>::m` and of `Ty::m`, the module-and-self prefix of an
+  inherent impl (`core::slice::<impl [LineItem]>::iter`), or, for a free function,
+  its own path; never the qualifying TRAIT, whose std-ness says nothing about
+  whose impl runs, and never generic arguments; the call is a **method** and the declared type of its
   receiver argument — which MIR prints fully qualified even where the callee path
   is trimmed, as `_17: &tracing::__macro_support::MacroCallsite` — is rooted
   entirely in trusted crates, or, for an associated function with no receiver
@@ -602,14 +604,14 @@ audited revision, each one a place where a determined counterexample gets a
 reader who has to decide whether to trust a verdict needs the list that was not
 fixed, not only the list that was.
 
-1. **`<T as std::Trait>::m` on an unemitted dependency's type is trusted.** The
-   trusted-root test scans the callee path text, so the qualifying trait name
-   alone is enough — a third-party type's `impl std::fmt::Display` body is
-   treated as std and never becomes a boundary. The narrower relative, a
-   dependency's *extension trait* on a std type (`impl DepExt for String`),
-   survives the receiver rule for the same reason: rustc trims both the self type
-   and the trait, so the receiver argument's `&std::string::String` is the only
-   thing printed and it is genuinely std.
+1. **A dependency's *extension trait* on a std type is trusted.** `impl DepExt
+   for String` in an unemitted dependency prints with both the self type and the
+   trait trimmed, so the receiver argument's `&std::string::String` is the only
+   fully-qualified text at the site — and it is genuinely std, while the body
+   that runs is the dependency's. The mirror case is closed: a std TRAIT over a
+   dependency's type (`<Clock as std::convert::Into<String>>::into`) is no longer
+   trusted, because the trusted-root test now reads the callee's owner and not
+   the trait (fixture `tests/fixtures/trait_path_trust.rs`).
 2. **Single-fn-name aliasing.** Bodies are indexed by their trimmed printed path.
    Two crates exporting the same bare name collapse onto one key, and
    `real_path_near` breaks the tie by proximity, falling back to the first

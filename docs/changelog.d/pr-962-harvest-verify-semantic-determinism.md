@@ -100,8 +100,10 @@ everything it calls.
   and a non-UTF-8 dump, now raise `mir-parse` where they used to be dropped, and
   *any* boundary now downgrades `proven-deterministic` to `unknown` rather than
   being appended after the verdict was assembled); **body-less callees** (trusted
-  only when a std/`[[trusted]]` root appears in the callee text or a declared
-  type at the call site, or the receiver is a primitive — otherwise
+  only when a std/`[[trusted]]` root appears in the path of the callee's OWNER
+  (its self type or, for a free function, its own path — never the qualifying
+  trait) or in a declared receiver type at the call site, or the receiver is a
+  primitive — otherwise
   `external-crate-body`); **`std::thread::sleep` and `thread`/`tokio::spawn`**
   (pinned by `dest_type` now that rustc prints them as one segment); **`HashSet`
   set operations** as `Order` sources; **fn items passed to higher-order

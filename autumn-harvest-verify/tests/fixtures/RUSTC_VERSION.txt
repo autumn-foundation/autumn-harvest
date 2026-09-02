@@ -67,6 +67,30 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 # `bodyless_dep_stub.rs` and the emitted `.mir` are. rustc trims the callee to a
 # bare `now_ish()` in the dump, which is the whole point of the fixture.
 #
+# `trait_path_trust.mir` (review round 5) needs the same TWO steps, and for the
+# same reason: the impl whose trust is at stake must have no body in the
+# analyzed set. From this directory:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name trait_path_dep_stub \
+#         -o libtrait_path_dep_stub.rlib trait_path_dep_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern trait_path_dep_stub=libtrait_path_dep_stub.rlib \
+#         -o trait_path_trust.mir trait_path_trust.rs
+#   rm libtrait_path_dep_stub.rlib
+#
+# The property it pins is a PRINTING one, so check it after re-emitting: the
+# dump must still spell the trait out and leave the self type a dependency's.
+#
+#   grep -n 'convert::Into\|convert::From' trait_path_trust.mir
+#
+# must show `<Clock as std::convert::Into<std::string::String>>::into` (the
+# finding: std in the trait only) and
+# `<std::string::String as std::convert::From<&str>>::from` (the control: std in
+# the self type). The full spelling comes from the fixture's `shadow` module,
+# whose `String`, `Into` and `From` names stop rustc trimming those paths; if a
+# future rustc trims them anyway, re-shape the shadow until the two forms above
+# appear rather than weakening the test.
+#
 # `parse_drift_garbled.mir` is NOT compiled: it is a byte-for-byte copy of
 # `parse_drift.mir` with exactly one call terminator rewritten from
 # `_4 = wall_clock_secs() -> [..]` to `_4 <== wall_clock_secs() -> [..]`,

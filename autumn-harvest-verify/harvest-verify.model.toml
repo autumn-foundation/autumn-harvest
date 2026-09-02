@@ -2230,8 +2230,11 @@ reason = "See `len`."
 #
 # A trusted crate is the exception, because it is modelled by the tables above
 # instead. The analyzer recognises one from evidence about the CALLEE: either
-# the callee path names a trusted crate root itself (including the qualifying
-# trait of a `<T as std::future::IntoFuture>::into_future`), or the call is a
+# the callee's OWNER path names a trusted crate root — the qualified self type
+# of `<Ty as Trait>::m`, an inherent impl's module prefix
+# (`core::slice::<impl [LineItem]>::iter`) or a free function's own path, but
+# NEVER the qualifying trait, since `<Clock as std::convert::Into<String>>::into`
+# runs a dependency's impl — or the call is a
 # METHOD whose receiver type is a primitive (`<u64 as From<u32>>::from`) or is
 # declared at the call site with a trusted root — MIR prints `let` declarations
 # fully qualified even where it trims the callee path, so `String::clone`'s

@@ -1111,11 +1111,20 @@ impl<'a> Analyzer<'a> {
     ///
     /// The discriminator has to be evidence about the **callee**. A declared
     /// type at the call site is not: `now_ish() -> std::string::String` names
-    /// std in its result and is still a dependency's body. Three things count:
+    /// std in its result and is still a dependency's body. Neither is the
+    /// qualifying TRAIT of a `<Ty as Trait>::m` call: rustc prints
+    /// `<Clock as std::convert::Into<String>>::into` for a dependency's own
+    /// `From<Clock> for String` wherever it cannot trim the trait, and that
+    /// impl is as free to read the wall clock as any other dependency body.
+    /// Trust is a property of the **owner** of the executed item. Three things
+    /// count:
     ///
-    ///  1. the callee path text itself is rooted at std/core/alloc or at a
-    ///     `[[trusted]]` crate — including the qualifying trait of a
-    ///     `<T as std::future::IntoFuture>::into_future`;
+    ///  1. the callee's OWNER path is rooted at std/core/alloc or at a
+    ///     `[[trusted]]` crate — the qualified self type of `<Ty as Trait>::m`
+    ///     and of `Ty::m` (`<std::string::String as std::convert::From<&str>>::from`),
+    ///     or, for a free function, its own path (`std::env::var`). A trusted
+    ///     root that appears only in the trait, in generic arguments or in an
+    ///     argument or result type is not evidence;
     ///  2. the call is a **method**, and its receiver type is std — either a
     ///     primitive (the language reserves inherent impls on those, and rustc
     ///     prints them trimmed: `<u64 as From<u32>>::from`), or the declared type
@@ -1138,8 +1147,8 @@ impl<'a> Analyzer<'a> {
         if self.model.is_std_free_fn(&parsed) {
             return true;
         }
-        // (1) A crate root spelled in the callee PATH itself.
-        if path_roots(&callee_path_text(printed)).any(|root| self.is_trusted_root(root)) {
+        // (1) A trusted crate root at the head of the callee's OWNER path.
+        if path_roots(&callee_owner_text(printed, &parsed)).any(|root| self.is_trusted_root(root)) {
             return true;
         }
         let Some(receiver) = parsed.receiver.as_deref() else {
@@ -2178,21 +2187,39 @@ fn receiver_roots<'t>(ty: &'t str, receiver: &'t str) -> impl Iterator<Item = &'
         .filter_map(crate::util::crate_root)
 }
 
-/// The part of a callee path that names the callee, for a crate-root scan.
+/// The part of a callee path that names the item's **owner**, for a crate-root
+/// scan: the qualified self type of `<Ty as Trait>::m` and of `Ty::m`, and the
+/// function's own path for a free function.
 ///
-/// A qualified header is kept whole, because its self type and its trait are
-/// both statements about the callee (`<T as std::future::IntoFuture>::into_future`
-/// is std's). Turbofish arguments are dropped, because they are statements
-/// about the *caller's* type arguments: `helper::<std::string::String>` from a
-/// dependency compiled without `--emit=mir` names std without being std.
-fn callee_path_text(printed: &str) -> String {
+/// Everything else a callee path spells is about something other than the body
+/// that runs. The TRAIT is the sharpest case: an external type implementing a
+/// standard trait prints as `<Clock as std::convert::Into<String>>::into`
+/// wherever rustc cannot trim the trait, and the body that runs is the
+/// dependency's `From<Clock> for String`, free to read the wall clock. Generic
+/// arguments are the caller's type arguments (`helper::<std::string::String>`
+/// from a dependency compiled without `--emit=mir` names std without being
+/// std), and [`CalleePath::receiver_path`] has already dropped them from the
+/// self type.
+///
+/// A qualified header the parser could not decompose — `<impl at FILE:l:c>`,
+/// which names no type at all — yields nothing rather than its span text: an
+/// owner that cannot be read is not an owner that is trusted.
+///
+/// An unqualified path carries its owner's MODULE prefix, and that prefix is
+/// part of the owner: core's inherent slice impl prints as
+/// `core::slice::<impl [LineItem]>::iter`, whose self type (`[LineItem]`) names
+/// a first-party type while the impl block is core's own. So everything up to
+/// the method segment is the owner there, and a free function — which owns
+/// nothing — is judged on the root of its own path (`std::env::var`,
+/// `serde_json::to_value`).
+fn callee_owner_text(printed: &str, parsed: &CalleePath) -> String {
     let text = printed.trim();
-    if text.starts_with('<')
-        && let Some(close) = crate::util::matching_angle(text)
-        && let (Some(header), Some(rest)) =
-            (text.get(..=close), text.get(close.saturating_add(1)..))
-    {
-        return format!("{header}{}", strip_generics_everywhere(rest));
+    if text.starts_with('<') {
+        return parsed.receiver_path.clone().unwrap_or_default();
+    }
+    if parsed.receiver.is_some() {
+        let owner = parsed.segments.len().saturating_sub(1);
+        return parsed.segments.get(..owner).unwrap_or_default().join("::");
     }
     strip_generics_everywhere(text)
 }

@@ -1135,3 +1135,55 @@ fn drop_glue_with_no_readable_impl_header_is_unknown_never_proven() {
         );
     }
 }
+
+/// Round 5: a body-less impl from a dependency, reached through a std trait
+/// that rustc prints fully qualified. `std::` in the TRAIT says nothing about
+/// whose body runs — this one is `Clock`'s, and it reads the wall clock.
+#[test]
+fn a_std_trait_does_not_trust_a_dependencys_impl() {
+    let verdicts = run(
+        "trait_path_trust.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_dep_impl_through_std_trait");
+    assert_ne!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "`<Clock as std::convert::Into<String>>::into` runs a dependency's body; \
+         boundaries = {:?}",
+        boundary_kinds(v)
+    );
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::ExternalCrateBody),
+        "got {:?}",
+        boundary_kinds(v)
+    );
+}
+
+/// The other half: trust read off the qualified SELF type
+/// (`<std::string::String as std::convert::From<&str>>::from`), off a trimmed
+/// receiver's declared type (`Vec::<u32>::push` with `_7: &mut std::vec::Vec<u32>`)
+/// and off a `[[std_free_fn]]` row (`format`) all survive the stricter rule.
+#[test]
+fn std_self_types_stay_trusted_under_the_stricter_rule() {
+    let verdicts = run(
+        "trait_path_trust.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_std_receivers_stay_trusted");
+    assert_eq!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "boundaries = {:?}",
+        boundaries(v)
+            .iter()
+            .map(|b| (b.kind, b.detail.as_str()))
+            .collect::<Vec<_>>()
+    );
+}

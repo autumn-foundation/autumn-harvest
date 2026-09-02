@@ -466,8 +466,10 @@ The ones you are most likely to meet:
   is deliberately narrow, because a std-rooted argument or result type is not
   evidence — `now_ish() -> std::string::String` from an unemitted dependency has
   exactly that shape. A body-less callee propagates taint silently only when a
-  `std`/`core`/`alloc` or `[[trusted]]` root appears in the **callee path text**
-  (turbofish excluded), when it is a **method** whose receiver argument's declared
+  `std`/`core`/`alloc` or `[[trusted]]` root appears in the path of the callee's
+  **owner** — its qualified self type, an inherent impl's module prefix, or a free
+  function's own path, never the qualifying trait and never generic arguments —
+  when it is a **method** whose receiver argument's declared
   type is rooted entirely in trusted crates (or, for an associated function,
   whose receiver type is spelled with a trusted root in some declared type at the
   site), when the receiver is a primitive, or when a `[[std_free_fn]]` row names
@@ -475,8 +477,9 @@ The ones you are most likely to meet:
   `[[std_free_fn]]` therefore holds the **free** functions of std and of trusted
   crates that rustc trims to one segment — seven rows here (`format`,
   `must_use`, `to_value`, `from_value`, `display`, `debug`, `task_duration`). The
-  residual cost: `<T as std::Trait>::m` on a third-party type is trusted on the
-  strength of the trait name alone.
+  residual cost: a dependency's *extension trait* on a std type
+  (`impl DepExt for String`) is trusted, because rustc trims both the trait and
+  the self type, leaving a genuinely std receiver as the only qualified text.
 - **Two names that print the same are kept apart, and unified when they cannot
   be.** Statics are indexed by their full printed path (`a::COUNTER: u64` and
   `b::COUNTER: AtomicU64` are two entries, not one) and impl methods by
