@@ -856,6 +856,11 @@ pub struct RateLimitBucketGcOutcome {
     pub error: Option<String>,
 }
 
+/// Constructors used only by the janitor loop, which is itself `db`-gated —
+/// without this the no-`db` build (linted through `autumn-harvest-sqlite`) sees
+/// them as dead code. The struct stays ungated: it is a field of
+/// [`RetentionTickResult`], which every build can serialize.
+#[cfg(feature = "db")]
 impl RateLimitBucketGcOutcome {
     /// A completed pass (real, or a `dry_run` preview).
     #[must_use]
