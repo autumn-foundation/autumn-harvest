@@ -38,11 +38,17 @@
 //!   failed to drain, or left a shard idle reports `n/a` and a named reason
 //!   rather than a confident-looking number ([`latency_soundness`],
 //!   [`throughput_soundness`]).
-//! * **Saturation is per scenario, on purpose.** `throughput` saturates the
-//!   engine — that is the number. `dispatch_latency` and `signal_roundtrip` are
-//!   paced *below* saturation, and [`pacing_verdict`] marks a run that could not
-//!   hold its pace, so a queueing measurement can never be published as a
-//!   dispatch measurement.
+//! * **Load is bounded, per scenario, on purpose.** `throughput` runs a
+//!   *bounded closed loop*: a fixed population is held in flight and topped up
+//!   as runs complete, so queue depth stays shallow and the rate is sustained
+//!   rather than a slice of a draining backlog. (A pre-loaded backlog measures
+//!   the claim-depth curve, which is issue #786's finding, not this suite's —
+//!   see §5 of `docs/plans/2026-09-01-e2e-benchmark-suite.md` for the
+//!   measurement that forced the change.) [`inflight_soundness`] refuses to
+//!   publish a run in which the harness, not the engine, was the limiter.
+//!   `dispatch_latency` and `signal_roundtrip` are paced *below* saturation, and
+//!   [`pacing_verdict`] marks a run that could not hold its pace, so a queueing
+//!   measurement can never be published as a dispatch measurement.
 //! * **Clocks.** The signal round-trip is measured end to end on one monotonic
 //!   `Instant` clock inside a single process. Activity dispatch spans a DB clock
 //!   (`harvest_task_queue.created_at`) and the host clock, so the harness
@@ -71,7 +77,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchScenario {
     /// Sustained workflows completed per second for the canonical 3-activity
-    /// workflow, measured as a saturated backlog drain.
+    /// workflow, measured under a bounded closed loop.
     Throughput,
     /// Activity dispatch latency (schedule -> handler start), p50/p99, measured
     /// under a deliberately unsaturated paced load.
@@ -86,6 +92,18 @@ pub enum BenchScenario {
 
 /// Shard counts every scenario is run at (issue #941 AC2).
 pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
+
+/// The release whose numbers [`PUBLISHED_BASELINES`] holds, and therefore the
+/// `docs/benchmarks/results-v<version>.md` the docs guard checks.
+///
+/// Deliberately **not** `CARGO_PKG_VERSION`. Issue #941 AC4 asks that each
+/// release's numbers be *kept*, not that every release have fresh ones — and a
+/// benchmark sweep is a 20-40 minute run on a reference box, not something a
+/// version bump can conjure. Tying the guard to the crate version would fail CI
+/// on every bump until somebody re-measured. Bump this constant in the same
+/// commit that adds a new results file and updates the baselines below; see
+/// "Publishing a new release's numbers" in `docs/benchmarks.md`.
+pub const PUBLISHED_RESULTS_VERSION: &str = "0.6.0";
 
 /// Published reproduction tolerance (issue #941 AC3): a fresh clone on the
 /// documented hardware should land within this percentage of the published
@@ -193,7 +211,11 @@ pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
         return BenchScenario::all().to_vec();
     };
-    let wanted: Vec<&str> = filter.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let wanted: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     BenchScenario::all()
         .into_iter()
         .filter(|s| wanted.contains(&s.as_str()))
@@ -265,11 +287,12 @@ impl BenchScenario {
         !matches!(self, Self::ReplayThroughput)
     }
 
-    /// Whether the scenario is paced below saturation. `Throughput` is not —
-    /// saturation is its measurement, and `ReplayThroughput` drives no queue at
-    /// all. Pacing the two latency scenarios is what keeps their p99 a
-    /// statement about the dispatch and signal paths rather than about how deep
-    /// the queue happened to be.
+    /// Whether the scenario is paced at a fixed *rate*. `Throughput` is not:
+    /// its load is bounded by population (a closed loop) rather than by rate,
+    /// because the rate is the thing being measured. `ReplayThroughput` drives
+    /// no queue at all. Pacing the two latency scenarios is what keeps their
+    /// p99 a statement about the dispatch and signal paths rather than about
+    /// how deep the queue happened to be.
     #[must_use]
     pub const fn is_paced(self) -> bool {
         matches!(self, Self::DispatchLatency | Self::SignalRoundtrip)
@@ -395,6 +418,146 @@ pub fn throughput_soundness(
     reasons
 }
 
+/// Largest host-to-database clock offset, as a fraction of the measured p50,
+/// that a dispatch cell may publish through.
+///
+/// The dispatch measurement is the one number here that spans two clocks. On a
+/// single host the offset is tens of microseconds against tens of milliseconds
+/// and this never binds; point the harness at a database on another machine and
+/// it is the whole ballgame. Refusing above 2% is what stops a 30 ms skew from
+/// being published as 30 ms of engine latency, with the offset printed
+/// helpfully in the notes beside it.
+pub const MAX_CLOCK_OFFSET_FRACTION_OF_P50: f64 = 0.02;
+
+/// Reasons a dispatch cell's two-clock measurement must not be published.
+///
+/// Takes the offset probed *before* the measured window and the one probed
+/// after: a single probe cannot distinguish a steady offset (correctable in
+/// principle, and small enough to ignore in practice) from a drifting one
+/// (which contaminates the samples unevenly).
+#[must_use]
+pub fn clock_offset_soundness(before: &[f64], after: &[f64], p50_ms: f64) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !p50_ms.is_finite() || p50_ms <= 0.0 {
+        return reasons;
+    }
+    let ceiling = p50_ms * MAX_CLOCK_OFFSET_FRACTION_OF_P50;
+    let worst = before
+        .iter()
+        .chain(after)
+        .copied()
+        .fold(0.0_f64, |acc, o| acc.max(o.abs()));
+    if worst > ceiling {
+        reasons.push(format!(
+            "the host-to-database clock offset reached {worst:.3} ms, more than \
+             {:.0}% of the {p50_ms:.2} ms p50 this cell would publish; a dispatch latency \
+             measured across two clocks that far apart is mostly skew",
+            MAX_CLOCK_OFFSET_FRACTION_OF_P50 * 100.0,
+        ));
+    }
+    // Drift between the two probes contaminates samples unevenly across the
+    // window, so it is worth naming separately from the absolute size.
+    for (idx, (b, a)) in before.iter().zip(after).enumerate() {
+        let drift = (a - b).abs();
+        if drift > ceiling {
+            reasons.push(format!(
+                "shard {idx}'s host-to-database offset drifted {drift:.3} ms across the \
+                 measured window ({b:+.3} -> {a:+.3} ms)"
+            ));
+        }
+    }
+    reasons
+}
+
+/// Smallest fraction of the dispatches that ran which must have produced a
+/// sample.
+pub const MIN_DISPATCH_SAMPLE_COVERAGE: f64 = 0.90;
+
+/// Reasons a dispatch cell's sample population is too far below the population
+/// that actually ran.
+///
+/// [`latency_soundness`]'s floor is an absolute minimum (200); it cannot notice
+/// that 250 samples came out of 4 800 dispatches. This does.
+#[must_use]
+pub fn dispatch_population_soundness(
+    expected: usize,
+    collected: usize,
+    redispatched: usize,
+    unrecorded: usize,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if expected > 0 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "dispatch counts are thousands, far below 2^53"
+        )]
+        let coverage = collected as f64 / expected as f64;
+        if coverage < MIN_DISPATCH_SAMPLE_COVERAGE {
+            reasons.push(format!(
+                "only {collected} of {expected} activity dispatches produced a sample \
+                 ({:.1}%); the published percentiles would describe a population this run \
+                 cannot account for",
+                coverage * 100.0,
+            ));
+        }
+    }
+    if redispatched > 0 {
+        reasons.push(format!(
+            "{redispatched} activity task row(s) were dispatched more than once, so a \
+             re-delivery delay would be indistinguishable from dispatch latency"
+        ));
+    }
+    if unrecorded > 0 {
+        reasons.push(format!(
+            "{unrecorded} activity dispatch(es) carried no task id and produced no sample"
+        ));
+    }
+    reasons
+}
+
+/// Reasons a scenario's discarded warmup population did not actually drain.
+///
+/// A warmup that did not finish is not warmup — it is background load inside
+/// the measured window, competing for the same worker slots.
+#[must_use]
+pub fn warmup_soundness(scenario: &str, requested: usize, per_shard: &[u64]) -> Vec<String> {
+    let drained = per_shard.iter().sum::<u64>();
+    let drained = usize::try_from(drained).unwrap_or(usize::MAX);
+    if drained < requested {
+        return vec![format!(
+            "the {scenario} warmup population did not drain ({drained} of {requested}); the \
+             remainder was still running inside the measured window"
+        )];
+    }
+    Vec::new()
+}
+
+/// Largest spread between the replay control's readings across a sweep before
+/// the sweep is called out as noisy.
+///
+/// Replay is in-memory and shard-invariant, so any spread across the shard
+/// counts is the reference box, not the engine.
+pub const REPLAY_CONTROL_DRIFT_PCT: f64 = 10.0;
+
+/// Peak-to-peak spread of the replay control across a sweep, in percent of the
+/// largest reading, or `None` when there is nothing to compare.
+///
+/// This is the comparison that makes the control do its job: nothing else in
+/// the report looks at the three replay cells *against each other*, and each on
+/// its own always looks fine.
+#[must_use]
+pub fn replay_control_drift_pct(readings: &[f64]) -> Option<f64> {
+    if readings.len() < 2 {
+        return None;
+    }
+    let max = readings.iter().copied().fold(f64::MIN, f64::max);
+    let min = readings.iter().copied().fold(f64::MAX, f64::min);
+    if !max.is_finite() || !min.is_finite() || max <= 0.0 {
+        return None;
+    }
+    Some((max - min) / max * 100.0)
+}
+
 /// Whether a paced scenario held its target start rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pacing {
@@ -514,6 +677,22 @@ pub fn mean_inflight(samples: &[usize]) -> Option<f64> {
     Some(total / samples.len() as f64)
 }
 
+/// The middle half of an ordered observation series.
+///
+/// The in-flight evidence must describe the same window the headline rate is
+/// computed over ([`steady_state_window`]). Averaging the whole loop instead
+/// includes the drain-down tail, where the population decays to zero by
+/// construction — which both flatters nothing and, on a short run, fires
+/// [`inflight_soundness`] against a perfectly sound measurement.
+#[must_use]
+pub fn steady_state_slice<T>(samples: &[T]) -> &[T] {
+    let n = samples.len();
+    if n < 4 {
+        return samples;
+    }
+    &samples[n / 4..n * 3 / 4]
+}
+
 /// Reasons a closed-loop throughput figure is *feeder*-bound rather than
 /// engine-bound, empty when it is engine-bound.
 ///
@@ -617,6 +796,109 @@ pub fn render_matrix(reports: &[ScenarioReport]) -> String {
     out
 }
 
+// ── Deployment configuration (published in `docs/benchmarks.md`) ──────────
+//
+// These live in the pure section rather than beside the code that uses them so
+// the docs-drift guard -- which runs on every OS with no `db` feature -- can pin
+// them into the published page. Issue #941 AC2 asks for "a documented
+// worker/concurrency configuration"; documented means a reader can see it on the
+// page, not only in the output of a run they have not done yet.
+
+/// Worker tasks per shard. One worker per shard is the deployment shape the
+/// shard-count sweep is a statement about: adding a shard adds its worker.
+pub const WORKERS_PER_SHARD: usize = 1;
+/// Concurrent workflow tasks per worker.
+pub const MAX_CONCURRENT_WORKFLOWS: usize = 8;
+/// Concurrent activity tasks per worker.
+pub const MAX_CONCURRENT_ACTIVITIES: usize = 16;
+/// Fallback poll interval. The reference run also wires LISTEN/NOTIFY per
+/// shard, so this bounds how long a *missed* notification can cost.
+pub const POLL_INTERVAL_MS: u64 = 25;
+/// Connections per shard pool. At or above the worker's total concurrency
+/// so a measurement never includes pool-checkout queueing.
+pub const POOL_SIZE_PER_SHARD: usize = 32;
+/// Workflows completed per shard in the throughput scenario's measured
+/// population.
+pub const THROUGHPUT_WORKFLOWS_PER_SHARD: usize = 1_200;
+/// Workflows held in flight per shard by the closed-loop feeder: **four times**
+/// [`MAX_CONCURRENT_WORKFLOWS`], so the worker is never starved and the queue
+/// never becomes the measurement.
+///
+/// Deliberately shallow. A pre-loaded backlog would instead measure the
+/// **claim-depth** curve — claim cost grows superlinearly with pending backlog
+/// depth, which is issue #786's published finding, not this suite's — and the
+/// resulting figure would depend on where in the drain you looked rather than
+/// on the engine's sustained capacity.
+///
+/// Worth being exact about why this is not larger, because the larger number is
+/// more flattering. Calibration on the reference box measured ~23 workflows/s
+/// at 32 in flight and ~28/s at 128 — but 128 is *sixteen* times the worker's
+/// eight workflow slots, so it holds ~120 workflows **pending** per shard for
+/// the whole measured window. That extra ~20% is bought by measuring deeper
+/// into the very claim-depth curve this scenario was redesigned to stop
+/// re-publishing under an end-to-end label. The slower number is the honest
+/// one. (384 is refused outright: the feeder can no longer hold the
+/// population — see [`inflight_soundness`].)
+///
+/// A reader who wants the deeper figure can have it —
+/// `HARVEST_BENCH_INFLIGHT=128` — and the report prints the population actually
+/// held beside the rate, so the two can never be confused.
+pub const THROUGHPUT_INFLIGHT_PER_SHARD: usize = 4 * MAX_CONCURRENT_WORKFLOWS;
+/// Connections the feeder starts workflows over, per shard. One connection
+/// caps the feeder at roughly 285 starts/s, which is inside the range the
+/// engine can complete — so the harness would silently become the limiter.
+pub const FEEDER_CONNECTIONS_PER_SHARD: usize = 4;
+/// Target start rate for the paced scenarios, per shard.
+///
+/// Roughly **30%** of the saturated rate the throughput scenario measures on
+/// the reference box, so the queue these latencies are measured against
+/// stays shallow. Pacing at 70% of capacity would publish a p99 that is
+/// mostly queueing; [`Pacing`] reports when the box could not hold the pace,
+/// but keeping the target well clear of saturation is what stops the
+/// question arising.
+pub const PACED_STARTS_PER_SEC_PER_SHARD: f64 = 8.0;
+/// Workflows started per shard in the dispatch-latency scenario.
+pub const DISPATCH_WORKFLOWS_PER_SHARD: usize = 400;
+/// Workflows parked on a signal per shard in the round-trip scenario.
+pub const SIGNAL_WORKFLOWS_PER_SHARD: usize = 400;
+/// Queue every bench workflow and activity is dispatched on.
+pub const BENCH_QUEUE: &str = "default";
+
+/// Resolved in-flight population per shard for this run.
+#[must_use]
+pub fn inflight_target() -> usize {
+    positive_override(
+        std::env::var(INFLIGHT_ENV_VAR).ok().as_deref(),
+        THROUGHPUT_INFLIGHT_PER_SHARD,
+    )
+}
+
+/// Resolved measured completions per shard for this run.
+#[must_use]
+pub fn measured_workflows_per_shard() -> usize {
+    positive_override(
+        std::env::var(WORKFLOWS_ENV_VAR).ok().as_deref(),
+        THROUGHPUT_WORKFLOWS_PER_SHARD,
+    )
+}
+
+/// Wall-clock ceiling for one scenario at one shard count. A scenario that
+/// hits it reports what it collected and is marked unsound rather than
+/// parking the whole suite.
+pub const SCENARIO_BUDGET_SECS: u64 = 900;
+
+/// How long to wait after every signal workflow's handler has reached
+/// `wait_for_signal` before the first signal is sent, so the suspension has
+/// committed.
+pub const SIGNAL_PARK_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ceiling on any single read of the signal endpoint's socket, both ends.
+///
+/// Generous relative to a loopback round trip measured in tens of
+/// milliseconds; its job is to turn "this will never answer" into a failed
+/// sample the report can name, instead of a parked scenario.
+pub const SIGNAL_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ── HTTP framing (pure) ────────────────────────────────────────────────────
 
 /// The signal route, mirroring the plugin's
@@ -662,39 +944,94 @@ pub struct ParsedRequest {
     pub body: String,
 }
 
-/// Parse a complete HTTP/1.1 request out of `buf`.
+/// Outcome of parsing bytes read from a socket.
 ///
-/// Returns `None` while the buffer holds only a partial request, so a caller
-/// reading from a socket knows to read more rather than treating a short read
-/// as a malformed request. Deliberately minimal: this parser serves exactly one
-/// route with a fixed request shape (see the module docs on why the harness
-/// does not pull in an HTTP stack), so it understands `Content-Length` bodies
-/// and nothing else — no chunked encoding, no keep-alive pipelining.
-#[must_use]
-pub fn parse_http_request(buf: &[u8]) -> Option<ParsedRequest> {
-    let text = std::str::from_utf8(buf).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next()?.split(' ');
-    let method = request_line.next()?;
-    let path = request_line.next()?;
-    // A request line with no HTTP version is not a request we serve.
-    request_line.next()?;
+/// The distinction is load-bearing, not cosmetic. A server that cannot tell
+/// "keep reading" from "this will never be valid" waits forever for bytes the
+/// peer will never send — and because the benchmark's client blocks in
+/// `read_to_end` with the request already written, that is a deadlock on both
+/// sides, not a slow request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpParse {
+    /// A complete request.
+    Complete(ParsedRequest),
+    /// A prefix of a request: read more.
+    Incomplete,
+    /// Not a request this endpoint can ever serve: answer, do not wait.
+    Malformed,
+}
 
-    let mut content_length = 0usize;
+/// Largest request this endpoint will buffer before giving up.
+///
+/// The signal route's requests are a few hundred bytes. Any cap is arbitrary;
+/// the point is that an unbounded `Vec` fed by a socket is not a thing a
+/// benchmark harness should own.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Parse an HTTP/1.1 request out of `buf`.
+///
+/// Deliberately minimal: this endpoint serves exactly one route with a fixed
+/// request shape (see the module docs on why the harness does not pull in an
+/// HTTP stack), so it understands `Content-Length` bodies and nothing else — no
+/// chunked encoding, no keep-alive pipelining.
+#[must_use]
+pub fn parse_http_request(buf: &[u8]) -> HttpParse {
+    if buf.len() > MAX_REQUEST_BYTES {
+        return HttpParse::Malformed;
+    }
+    // Find the header terminator on the BYTES, so a non-UTF8 body cannot make a
+    // perfectly good header block unparseable.
+    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        // No terminator yet. Only "more bytes might arrive" if the prefix is
+        // still a plausible header block.
+        return match std::str::from_utf8(buf) {
+            Ok(_) => HttpParse::Incomplete,
+            Err(e) if e.error_len().is_none() => HttpParse::Incomplete,
+            Err(_) => HttpParse::Malformed,
+        };
+    };
+    let Ok(head) = std::str::from_utf8(&buf[..split]) else {
+        return HttpParse::Malformed;
+    };
+    let body_bytes = &buf[split + 4..];
+
+    let mut lines = head.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return HttpParse::Malformed;
+    };
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(path), Some(_version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return HttpParse::Malformed;
+    };
+
+    let mut content_length = 0_usize;
     for line in lines {
-        let (name, value) = line.split_once(':')?;
+        let Some((name, value)) = line.split_once(':') else {
+            return HttpParse::Malformed;
+        };
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse().ok()?;
+            let Ok(parsed) = value.trim().parse::<usize>() else {
+                return HttpParse::Malformed;
+            };
+            if parsed > MAX_REQUEST_BYTES {
+                return HttpParse::Malformed;
+            }
+            content_length = parsed;
         }
     }
-    if body.len() < content_length {
-        return None;
+    if body_bytes.len() < content_length {
+        return HttpParse::Incomplete;
     }
-    Some(ParsedRequest {
+    // Slice the BYTES and then validate, so a Content-Length that disagrees
+    // with the body's UTF-8 boundaries is a 400 rather than a panic.
+    let Ok(body) = std::str::from_utf8(&body_bytes[..content_length]) else {
+        return HttpParse::Malformed;
+    };
+    HttpParse::Complete(ParsedRequest {
         method: method.to_owned(),
         path: path.to_owned(),
-        body: body[..content_length].to_owned(),
+        body: body.to_owned(),
     })
 }
 
@@ -743,24 +1080,114 @@ pub struct Baseline {
 /// tolerance on a busy machine is the expected outcome, not a regression.
 /// `docs/benchmarks.md` says so where the numbers appear.
 pub const PUBLISHED_BASELINES: &[Baseline] = &[
-    Baseline { scenario: BenchScenario::Throughput, shards: 1, metric: "workflows_per_sec", value: 22.65 },
-    Baseline { scenario: BenchScenario::Throughput, shards: 2, metric: "workflows_per_sec", value: 34.97 },
-    Baseline { scenario: BenchScenario::Throughput, shards: 4, metric: "workflows_per_sec", value: 33.53 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 1, metric: "p50_ms", value: 37.78 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 1, metric: "p99_ms", value: 55.60 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 2, metric: "p50_ms", value: 43.56 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 2, metric: "p99_ms", value: 62.23 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 4, metric: "p50_ms", value: 45.74 },
-    Baseline { scenario: BenchScenario::DispatchLatency, shards: 4, metric: "p99_ms", value: 100.03 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 1, metric: "p50_ms", value: 55.79 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 1, metric: "p99_ms", value: 65.44 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 2, metric: "p50_ms", value: 59.66 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 2, metric: "p99_ms", value: 69.02 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 4, metric: "p50_ms", value: 45.60 },
-    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 4, metric: "p99_ms", value: 80.24 },
-    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 1, metric: "events_per_sec", value: 9_960_371.64 },
-    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 2, metric: "events_per_sec", value: 9_657_651.19 },
-    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 4, metric: "events_per_sec", value: 9_096_540.11 },
+    Baseline {
+        scenario: BenchScenario::Throughput,
+        shards: 1,
+        metric: "workflows_per_sec",
+        value: 22.65,
+    },
+    Baseline {
+        scenario: BenchScenario::Throughput,
+        shards: 2,
+        metric: "workflows_per_sec",
+        value: 34.97,
+    },
+    Baseline {
+        scenario: BenchScenario::Throughput,
+        shards: 4,
+        metric: "workflows_per_sec",
+        value: 33.53,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 1,
+        metric: "p50_ms",
+        value: 37.78,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 1,
+        metric: "p99_ms",
+        value: 55.60,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 2,
+        metric: "p50_ms",
+        value: 43.56,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 2,
+        metric: "p99_ms",
+        value: 62.23,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 4,
+        metric: "p50_ms",
+        value: 45.74,
+    },
+    Baseline {
+        scenario: BenchScenario::DispatchLatency,
+        shards: 4,
+        metric: "p99_ms",
+        value: 100.03,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 1,
+        metric: "p50_ms",
+        value: 55.79,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 1,
+        metric: "p99_ms",
+        value: 65.44,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 2,
+        metric: "p50_ms",
+        value: 59.66,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 2,
+        metric: "p99_ms",
+        value: 69.02,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 4,
+        metric: "p50_ms",
+        value: 45.60,
+    },
+    Baseline {
+        scenario: BenchScenario::SignalRoundtrip,
+        shards: 4,
+        metric: "p99_ms",
+        value: 80.24,
+    },
+    Baseline {
+        scenario: BenchScenario::ReplayThroughput,
+        shards: 1,
+        metric: "events_per_sec",
+        value: 9_960_371.64,
+    },
+    Baseline {
+        scenario: BenchScenario::ReplayThroughput,
+        shards: 2,
+        metric: "events_per_sec",
+        value: 9_657_651.19,
+    },
+    Baseline {
+        scenario: BenchScenario::ReplayThroughput,
+        shards: 4,
+        metric: "events_per_sec",
+        value: 9_096_540.11,
+    },
 ];
 
 /// Look up a published baseline.
@@ -846,7 +1273,7 @@ pub const REPLAY_WARMUP_ITERATIONS: usize = 5;
 /// starting a second, unrelated replay series.
 #[cfg(feature = "testing")]
 pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
-    use autumn_harvest::testing::WorkflowReplayer;
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 
     let replayer = WorkflowReplayer::new().register_fn("sequential", sequential_workflow);
     for _ in 0..REPLAY_WARMUP_ITERATIONS {
@@ -855,32 +1282,62 @@ pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
     }
 
     let mut per_iteration_ms = Vec::with_capacity(REPLAY_MEASURED_ITERATIONS);
+    let mut replayed_events = Vec::with_capacity(REPLAY_MEASURED_ITERATIONS);
+    let mut failed_iterations = 0_usize;
     for _ in 0..REPLAY_MEASURED_ITERATIONS {
         // Build outside the timed region: the published number is replay cost,
         // not history-construction cost.
         let (_exec, events) = build_history(REPLAY_ACTIVITY_COUNT);
         let started = std::time::Instant::now();
-        let _ = replayer.replay_from_events(events).await;
+        let report = replayer.replay_from_events(events).await;
         per_iteration_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        // The report's own count, not the constant. A replay that ended early
+        // returns in nanoseconds; dividing the assumed full history by that
+        // time would publish a spectacular throughput for work never done.
+        replayed_events.push(report.events_replayed);
+        if !matches!(report.status, ReplayStatus::ReplaySucceeded) {
+            failed_iterations += 1;
+        }
     }
     per_iteration_ms.sort_by(f64::total_cmp);
-    let median_ms = per_iteration_ms[per_iteration_ms.len() / 2];
+    // `percentile_ms`'s convention, so the suite has one definition of "median".
+    let median_ms = super::claim_bench_support::percentile_ms(&per_iteration_ms, 50.0);
+    let min_replayed = replayed_events.iter().copied().min().unwrap_or(0);
     #[allow(
         clippy::cast_precision_loss,
         reason = "the event count is 10 001, far below 2^53"
     )]
-    let events_per_sec = (REPLAY_EVENT_COUNT as f64) / (median_ms / 1000.0);
+    let events = min_replayed as f64;
+    let events_per_sec = (median_ms > 0.0).then(|| events / (median_ms / 1000.0));
 
+    let mut unsound = Vec::new();
+    if failed_iterations > 0 {
+        unsound.push(format!(
+            "{failed_iterations} of {REPLAY_MEASURED_ITERATIONS} replay iterations did not \
+             report ReplaySucceeded"
+        ));
+    }
+    if min_replayed != REPLAY_EVENT_COUNT {
+        unsound.push(format!(
+            "an iteration replayed {min_replayed} events, not the {REPLAY_EVENT_COUNT} the \
+             issue #135 history contains"
+        ));
+    }
+
+    let publish = unsound.is_empty();
     ScenarioReport {
         scenario: BenchScenario::ReplayThroughput,
         shards,
         metrics: vec![
-            Metric::new("events_per_sec", Some(events_per_sec)),
+            Metric::new(
+                "events_per_sec",
+                if publish { events_per_sec } else { None },
+            ),
             Metric::new("ms_per_history", Some(median_ms)),
         ],
         notes: vec![
             format!(
-                "{REPLAY_EVENT_COUNT} events ({REPLAY_ACTIVITY_COUNT} activities), median of \
+                "{min_replayed} events replayed ({REPLAY_ACTIVITY_COUNT} activities), median of \
                  {REPLAY_MEASURED_ITERATIONS} iterations after {REPLAY_WARMUP_ITERATIONS} warmup \
                  iterations"
             ),
@@ -889,7 +1346,7 @@ pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
                 .to_owned(),
             "the same history `benches/replay_bench.rs` budgets at 200 ms (issue #135)".to_owned(),
         ],
-        unsound: Vec::new(),
+        unsound,
     }
 }
 
@@ -942,10 +1399,16 @@ mod tests {
 
     #[test]
     fn only_the_latency_scenarios_are_paced() {
-        assert!(!BenchScenario::Throughput.is_paced(), "saturation is the throughput measurement");
+        assert!(
+            !BenchScenario::Throughput.is_paced(),
+            "saturation is the throughput measurement"
+        );
         assert!(BenchScenario::DispatchLatency.is_paced());
         assert!(BenchScenario::SignalRoundtrip.is_paced());
-        assert!(!BenchScenario::ReplayThroughput.is_paced(), "replay drives no queue");
+        assert!(
+            !BenchScenario::ReplayThroughput.is_paced(),
+            "replay drives no queue"
+        );
     }
 
     #[test]
@@ -967,7 +1430,10 @@ mod tests {
         // startup would inflate nothing and deflate everything.
         let measured = 1000;
         let warmup = warmup_batch_for(measured);
-        assert!(warmup > 0, "a measured batch must be preceded by a warmup batch");
+        assert!(
+            warmup > 0,
+            "a measured batch must be preceded by a warmup batch"
+        );
         assert!(
             warmup < measured,
             "the warmup batch must be smaller than the batch it warms up for"
@@ -1012,9 +1478,14 @@ mod tests {
     #[test]
     fn stats_below_the_minimum_sample_count_are_unsound() {
         let reasons = latency_soundness(MIN_LATENCY_SAMPLES - 1, 0, 0);
-        assert!(!reasons.is_empty(), "a thin sample set must not be published");
         assert!(
-            reasons.iter().any(|r| r.contains(&MIN_LATENCY_SAMPLES.to_string())),
+            !reasons.is_empty(),
+            "a thin sample set must not be published"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains(&MIN_LATENCY_SAMPLES.to_string())),
             "the reason must name the bar it missed: {reasons:?}"
         );
         assert!(latency_soundness(MIN_LATENCY_SAMPLES, 0, 0).is_empty());
@@ -1044,7 +1515,9 @@ mod tests {
     fn an_incomplete_drain_is_reported_as_truncated() {
         let reasons = throughput_soundness(1000, 900, &[900]);
         assert!(
-            reasons.iter().any(|r| r.contains("900") && r.contains("1000")),
+            reasons
+                .iter()
+                .any(|r| r.contains("900") && r.contains("1000")),
             "the shortfall must be printed, not averaged away: {reasons:?}"
         );
     }
@@ -1069,7 +1542,11 @@ mod tests {
     #[test]
     fn pacing_shortfall_marks_the_scenario_saturated() {
         assert_eq!(pacing_verdict(100.0, 100.0), Pacing::Held);
-        assert_eq!(pacing_verdict(100.0, 90.0), Pacing::Held, "exactly at the ratio holds");
+        assert_eq!(
+            pacing_verdict(100.0, 90.0),
+            Pacing::Held,
+            "exactly at the ratio holds"
+        );
         assert_eq!(pacing_verdict(100.0, 89.0), Pacing::Saturated);
         assert_eq!(
             pacing_verdict(0.0, 0.0),
@@ -1080,11 +1557,26 @@ mod tests {
 
     #[test]
     fn reproduction_verdict_uses_the_published_tolerance() {
-        assert_eq!(repro_verdict(100.0, 100.0, REPRO_TOLERANCE_PCT), ReproVerdict::Within);
-        assert_eq!(repro_verdict(115.0, 100.0, REPRO_TOLERANCE_PCT), ReproVerdict::Within);
-        assert_eq!(repro_verdict(85.0, 100.0, REPRO_TOLERANCE_PCT), ReproVerdict::Within);
-        assert_eq!(repro_verdict(115.1, 100.0, REPRO_TOLERANCE_PCT), ReproVerdict::Outside);
-        assert_eq!(repro_verdict(84.9, 100.0, REPRO_TOLERANCE_PCT), ReproVerdict::Outside);
+        assert_eq!(
+            repro_verdict(100.0, 100.0, REPRO_TOLERANCE_PCT),
+            ReproVerdict::Within
+        );
+        assert_eq!(
+            repro_verdict(115.0, 100.0, REPRO_TOLERANCE_PCT),
+            ReproVerdict::Within
+        );
+        assert_eq!(
+            repro_verdict(85.0, 100.0, REPRO_TOLERANCE_PCT),
+            ReproVerdict::Within
+        );
+        assert_eq!(
+            repro_verdict(115.1, 100.0, REPRO_TOLERANCE_PCT),
+            ReproVerdict::Outside
+        );
+        assert_eq!(
+            repro_verdict(84.9, 100.0, REPRO_TOLERANCE_PCT),
+            ReproVerdict::Outside
+        );
     }
 
     #[test]
@@ -1141,8 +1633,14 @@ mod tests {
     fn the_steady_state_window_is_the_middle_half() {
         let completions: Vec<f64> = (0..400).map(|i| f64::from(i) * 0.01).collect();
         let (lo, hi) = steady_state_window(&completions).expect("sound population");
-        assert!((lo - 1.0).abs() < 1e-9, "25th percentile completion, got {lo}");
-        assert!((hi - 3.0).abs() < 1e-9, "75th percentile completion, got {hi}");
+        assert!(
+            (lo - 1.0).abs() < 1e-9,
+            "25th percentile completion, got {lo}"
+        );
+        assert!(
+            (hi - 3.0).abs() < 1e-9,
+            "75th percentile completion, got {hi}"
+        );
     }
 
     #[test]
@@ -1157,7 +1655,9 @@ mod tests {
         );
         let reasons = inflight_soundness(32, Some(12.0));
         assert!(
-            reasons.iter().any(|r| r.contains("12.0") && r.contains("32")),
+            reasons
+                .iter()
+                .any(|r| r.contains("12.0") && r.contains("32")),
             "a feeder-bound run must name both the achieved and the target population: \
              {reasons:?}"
         );
@@ -1177,7 +1677,10 @@ mod tests {
     #[test]
     fn an_absent_filter_selects_the_whole_published_matrix() {
         assert_eq!(selected_scenarios(None), BenchScenario::all().to_vec());
-        assert_eq!(selected_scenarios(Some("  ")), BenchScenario::all().to_vec());
+        assert_eq!(
+            selected_scenarios(Some("  ")),
+            BenchScenario::all().to_vec()
+        );
         assert_eq!(selected_shard_counts(None), SHARD_COUNTS.to_vec());
     }
 
@@ -1194,7 +1697,10 @@ mod tests {
 
     #[test]
     fn an_unknown_filter_entry_is_named_rather_than_silently_dropped() {
-        assert_eq!(unknown_scenario_ids(Some("throughput,typo")), vec!["typo".to_owned()]);
+        assert_eq!(
+            unknown_scenario_ids(Some("throughput,typo")),
+            vec!["typo".to_owned()]
+        );
         assert!(unknown_scenario_ids(Some("throughput")).is_empty());
         assert!(unknown_scenario_ids(None).is_empty());
         assert_eq!(
@@ -1209,9 +1715,119 @@ mod tests {
         assert_eq!(positive_override(None, 32), 32);
         assert_eq!(positive_override(Some("128"), 32), 128);
         assert_eq!(positive_override(Some(" 64 "), 32), 64);
-        assert_eq!(positive_override(Some("0"), 32), 32, "zero in flight is not a load level");
+        assert_eq!(
+            positive_override(Some("0"), 32),
+            32,
+            "zero in flight is not a load level"
+        );
         assert_eq!(positive_override(Some("-8"), 32), 32);
         assert_eq!(positive_override(Some("lots"), 32), 32);
+    }
+
+    #[test]
+    fn a_drifting_or_large_clock_offset_voids_a_dispatch_cell() {
+        // Tens of microseconds against a ~38 ms p50: the single-host case.
+        assert!(
+            clock_offset_soundness(&[0.033], &[0.041], 37.78).is_empty(),
+            "a sub-millisecond offset must not void a tens-of-milliseconds measurement"
+        );
+        // A 30 ms skew against a 37.78 ms p50 is most of the number.
+        let reasons = clock_offset_soundness(&[30.0], &[30.0], 37.78);
+        assert!(
+            reasons.iter().any(|r| r.contains("30.000")),
+            "a large offset must be named, not printed helpfully beside a published number: \
+             {reasons:?}"
+        );
+        // Same magnitude either way: a database clock that runs ahead
+        // understates the latency just as badly.
+        assert!(!clock_offset_soundness(&[-30.0], &[-30.0], 37.78).is_empty());
+        // Small at both ends but drifting across the window.
+        let reasons = clock_offset_soundness(&[0.0], &[5.0], 37.78);
+        assert!(
+            reasons.iter().any(|r| r.contains("drifted")),
+            "drift across the window contaminates samples unevenly: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_population_far_below_what_ran_is_unsound() {
+        assert!(dispatch_population_soundness(1200, 1200, 0, 0).is_empty());
+        assert!(
+            dispatch_population_soundness(1200, 1080, 0, 0).is_empty(),
+            "the leading-tenth warmup discard must not itself trip the coverage floor"
+        );
+        let reasons = dispatch_population_soundness(4800, 250, 0, 0);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("250") && r.contains("4800")),
+            "250 samples out of 4800 dispatches must not publish a percentile: {reasons:?}"
+        );
+        assert!(
+            !dispatch_population_soundness(1200, 1200, 1, 0).is_empty(),
+            "a re-dispatched row makes a re-delivery delay look like dispatch latency"
+        );
+        assert!(!dispatch_population_soundness(1200, 1200, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn a_warmup_that_did_not_drain_is_unsound() {
+        assert!(warmup_soundness("throughput", 240, &[240]).is_empty());
+        assert!(warmup_soundness("throughput", 240, &[120, 120]).is_empty());
+        let reasons = warmup_soundness("throughput", 240, &[100]);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("100") && r.contains("240")),
+            "an undrained warmup is background load inside the measured window: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn the_replay_control_reports_its_spread_across_a_sweep() {
+        // Nothing else in the report compares the replay cells against each
+        // other, and each on its own always looks fine.
+        assert_eq!(replay_control_drift_pct(&[]), None);
+        assert_eq!(replay_control_drift_pct(&[1.0]), None);
+        let drift = replay_control_drift_pct(&[9_960_371.64, 9_657_651.19, 9_096_540.11])
+            .expect("three readings");
+        assert!(
+            (drift - 8.67).abs() < 0.05,
+            "the reference sweep drifted ~8.7%, got {drift}"
+        );
+        assert!(replay_control_drift_pct(&[100.0, 100.0]).expect("two readings") < 1e-9);
+    }
+
+    #[test]
+    fn the_steady_state_slice_is_the_same_window_the_rate_uses() {
+        let samples: Vec<usize> = (0..400).collect();
+        let slice = steady_state_slice(&samples);
+        assert_eq!(slice.len(), 200);
+        assert_eq!(slice[0], 100, "starts at the 25th percentile observation");
+        assert_eq!(slice[slice.len() - 1], 299);
+        // A short series survives intact rather than becoming empty.
+        assert_eq!(steady_state_slice(&[1_usize, 2, 3]).len(), 3);
+        assert_eq!(steady_state_slice::<usize>(&[]).len(), 0);
+    }
+
+    #[test]
+    fn a_drain_down_tail_no_longer_voids_a_sound_short_run() {
+        // The regression this slice exists to prevent: a 400-completion run at
+        // 128 in flight spends ~32% of its loop draining down, so a whole-loop
+        // mean falls under the 90% floor while the measured window was fully
+        // populated throughout.
+        let mut whole_loop: Vec<usize> = vec![128; 68];
+        whole_loop.extend((0..32).rev().map(|i| i * 4));
+        let whole_mean = mean_inflight(&whole_loop).expect("non-empty");
+        assert!(
+            !inflight_soundness(128, Some(whole_mean)).is_empty(),
+            "the whole-loop mean is what used to fire the gate ({whole_mean:.1})"
+        );
+        let windowed = mean_inflight(steady_state_slice(&whole_loop)).expect("non-empty");
+        assert!(
+            inflight_soundness(128, Some(windowed)).is_empty(),
+            "the measured window was fully populated; it must publish ({windowed:.1})"
+        );
     }
 
     #[test]
@@ -1260,9 +1876,14 @@ mod tests {
     #[test]
     fn a_signal_request_round_trips_through_the_framing() {
         let bytes = signal_request_bytes("127.0.0.1:9000", "abc-123", "bench_signal", "{\"n\":1}");
-        let parsed = parse_http_request(&bytes).expect("a complete request must parse");
+        let HttpParse::Complete(parsed) = parse_http_request(&bytes) else {
+            panic!("a complete request must parse");
+        };
         assert_eq!(parsed.method, "POST");
-        assert_eq!(parsed.path, "/api/harvest/workflows/abc-123/signal/bench_signal");
+        assert_eq!(
+            parsed.path,
+            "/api/harvest/workflows/abc-123/signal/bench_signal"
+        );
         assert_eq!(parsed.body, "{\"n\":1}");
     }
 
@@ -1272,17 +1893,73 @@ mod tests {
         for cut in [1, bytes.len() / 2, bytes.len() - 1] {
             assert_eq!(
                 parse_http_request(&bytes[..cut]),
-                None,
-                "a short read must be reported as incomplete, not parsed"
+                HttpParse::Incomplete,
+                "a short read must be reported as incomplete, not parsed and not rejected"
             );
         }
-        assert!(parse_http_request(&bytes).is_some());
+        assert!(matches!(parse_http_request(&bytes), HttpParse::Complete(_)));
+    }
+
+    #[test]
+    fn a_permanently_malformed_request_is_rejected_rather_than_waited_on() {
+        // Each of these can never become valid by reading more bytes. Reporting
+        // them as `Incomplete` would park the server until the peer gave up --
+        // and the benchmark's own client never gives up, so it would deadlock
+        // both ends and burn the scenario budget.
+        for (label, raw) in [
+            (
+                "a header line with no colon",
+                b"POST / HTTP/1.1\r\nbroken\r\n\r\n".to_vec(),
+            ),
+            (
+                "a non-numeric Content-Length",
+                b"POST / HTTP/1.1\r\nContent-Length: lots\r\n\r\n".to_vec(),
+            ),
+            (
+                "a Content-Length past the cap",
+                format!(
+                    "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                    MAX_REQUEST_BYTES + 1
+                )
+                .into_bytes(),
+            ),
+            ("a request line with no version", b"POST /\r\n\r\n".to_vec()),
+            (
+                "invalid UTF-8 in the header block",
+                b"POST /\xff\xfe HTTP/1.1\r\n\r\n".to_vec(),
+            ),
+        ] {
+            assert_eq!(
+                parse_http_request(&raw),
+                HttpParse::Malformed,
+                "{label} must be rejected, not waited on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_length_that_splits_a_character_is_rejected_not_panicked_on() {
+        // The body is one 2-byte character; the declared length cuts it in half.
+        // Slicing a `&str` there would panic inside the server's connection task.
+        let raw = "POST /p HTTP/1.1\r\nContent-Length: 1\r\n\r\n\u{e9}"
+            .as_bytes()
+            .to_vec();
+        assert_eq!(parse_http_request(&raw), HttpParse::Malformed);
+    }
+
+    #[test]
+    fn an_oversized_buffer_is_rejected_rather_than_accumulated() {
+        let raw = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        assert_eq!(parse_http_request(&raw), HttpParse::Malformed);
     }
 
     #[test]
     fn response_status_is_parsed_from_the_status_line() {
         assert_eq!(parse_status_code(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
-        assert_eq!(parse_status_code(b"HTTP/1.1 404 Not Found\r\n\r\n"), Some(404));
+        assert_eq!(
+            parse_status_code(b"HTTP/1.1 404 Not Found\r\n\r\n"),
+            Some(404)
+        );
         assert_eq!(parse_status_code(b"garbage"), None);
     }
 
@@ -1341,7 +2018,10 @@ mod tests {
                 "lookup must find every table entry"
             );
         }
-        assert_eq!(baseline_for(BenchScenario::Throughput, 3, "workflows_per_sec"), None);
+        assert_eq!(
+            baseline_for(BenchScenario::Throughput, 3, "workflows_per_sec"),
+            None
+        );
     }
 
     #[test]
@@ -1398,92 +2078,16 @@ pub mod db {
 
     use super::super::claim_bench_support::LatencyStats;
     use super::{
-        BENCH_ACTIVITIES, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW, BenchScenario,
-        Metric, Pacing, SHARD_URLS_ENV_VAR, ScenarioReport, latency_soundness, measured_samples,
-        inflight_soundness, mean_inflight, pacing_verdict, steady_state_throughput,
-        steady_state_window, throughput_soundness, warmup_batch_for,
+        BENCH_ACTIVITIES, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW,
+        BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
+        MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
+        PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
+        SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
+        SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
+        dispatch_population_soundness, inflight_soundness, latency_soundness, mean_inflight,
+        measured_samples, pacing_verdict, steady_state_slice, steady_state_throughput,
+        steady_state_window, throughput_soundness, warmup_batch_for, warmup_soundness,
     };
-
-    // ── Deployment configuration (published in `docs/benchmarks.md`) ───────
-
-    /// Worker tasks per shard. One worker per shard is the deployment shape the
-    /// shard-count sweep is a statement about: adding a shard adds its worker.
-    pub const WORKERS_PER_SHARD: usize = 1;
-    /// Concurrent workflow tasks per worker.
-    pub const MAX_CONCURRENT_WORKFLOWS: usize = 8;
-    /// Concurrent activity tasks per worker.
-    pub const MAX_CONCURRENT_ACTIVITIES: usize = 16;
-    /// Fallback poll interval. The reference run also wires LISTEN/NOTIFY per
-    /// shard, so this bounds how long a *missed* notification can cost.
-    pub const POLL_INTERVAL_MS: u64 = 25;
-    /// Connections per shard pool. At or above the worker's total concurrency
-    /// so a measurement never includes pool-checkout queueing.
-    pub const POOL_SIZE_PER_SHARD: usize = 32;
-    /// Workflows completed per shard in the throughput scenario's measured
-    /// population.
-    pub const THROUGHPUT_WORKFLOWS_PER_SHARD: usize = 1_200;
-    /// Workflows held in flight per shard by the closed-loop feeder.
-    ///
-    /// Deliberately shallow. A pre-loaded backlog would instead measure the
-    /// **claim-depth** curve — claim cost grows superlinearly with pending
-    /// backlog depth, which is issue #786's published finding, not this
-    /// suite's — and the resulting figure would depend on where in the drain
-    /// you looked rather than on the engine's sustained capacity. Four times
-    /// the worker's concurrent-workflow slots, so the worker is never starved
-    /// and the queue never becomes the measurement.
-    /// Calibrated on the reference box: 32 in flight yields ~23 workflows/s,
-    /// 128 yields ~28/s, and 384 is refused because the feeder can no longer
-    /// hold the population (see `inflight_soundness`). 128 is therefore the
-    /// deepest load level at which the published number is still a statement
-    /// about the engine.
-    pub const THROUGHPUT_INFLIGHT_PER_SHARD: usize = 128;
-    /// Connections the feeder starts workflows over, per shard. One connection
-    /// caps the feeder at roughly 285 starts/s, which is inside the range the
-    /// engine can complete — so the harness would silently become the limiter.
-    pub const FEEDER_CONNECTIONS_PER_SHARD: usize = 4;
-    /// Target start rate for the paced scenarios, per shard.
-    ///
-    /// Roughly **30%** of the saturated rate the throughput scenario measures on
-    /// the reference box, so the queue these latencies are measured against
-    /// stays shallow. Pacing at 70% of capacity would publish a p99 that is
-    /// mostly queueing; [`Pacing`] reports when the box could not hold the pace,
-    /// but keeping the target well clear of saturation is what stops the
-    /// question arising.
-    pub const PACED_STARTS_PER_SEC_PER_SHARD: f64 = 8.0;
-    /// Workflows started per shard in the dispatch-latency scenario.
-    pub const DISPATCH_WORKFLOWS_PER_SHARD: usize = 400;
-    /// Workflows parked on a signal per shard in the round-trip scenario.
-    pub const SIGNAL_WORKFLOWS_PER_SHARD: usize = 400;
-    /// Queue every bench workflow and activity is dispatched on.
-    pub const BENCH_QUEUE: &str = "default";
-
-    /// Resolved in-flight population per shard for this run.
-    #[must_use]
-    pub fn inflight_target() -> usize {
-        super::positive_override(
-            std::env::var(super::INFLIGHT_ENV_VAR).ok().as_deref(),
-            THROUGHPUT_INFLIGHT_PER_SHARD,
-        )
-    }
-
-    /// Resolved measured completions per shard for this run.
-    #[must_use]
-    pub fn measured_workflows_per_shard() -> usize {
-        super::positive_override(
-            std::env::var(super::WORKFLOWS_ENV_VAR).ok().as_deref(),
-            THROUGHPUT_WORKFLOWS_PER_SHARD,
-        )
-    }
-
-    /// Wall-clock ceiling for one scenario at one shard count. A scenario that
-    /// hits it reports what it collected and is marked unsound rather than
-    /// parking the whole suite.
-    pub const SCENARIO_BUDGET_SECS: u64 = 900;
-
-    /// How long to wait after every signal workflow's handler has reached
-    /// `wait_for_signal` before the first signal is sent, so the suspension has
-    /// committed.
-    pub const SIGNAL_PARK_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
     // ── Skip / provisioning ───────────────────────────────────────────────
 
@@ -1542,19 +2146,46 @@ pub mod db {
         super::super::claim_bench_support::db::run_token()
     }
 
-    fn replace_database(url: &str, db_name: &str) -> String {
-        let (base, query) = url
-            .split_once('?')
-            .map_or((url, None), |(b, q)| (b, Some(q)));
-        let cut = base
-            .rfind('/')
-            .expect("a Postgres URL must contain a database path");
-        let mut out = format!("{}/{db_name}", &base[..cut]);
-        if let Some(q) = query {
-            out.push('?');
-            out.push_str(q);
+    /// Swap the database component of a Postgres URL.
+    ///
+    /// Delegates to the sibling harness's helper rather than a local
+    /// `rfind('/')`: that shortcut panics on a libpq keyword/value DSN
+    /// (`host=h port=5432 dbname=postgres`, a legal value for
+    /// `HARVEST_TEST_DATABASE_URL`) and silently corrupts a URL with no path
+    /// (`postgres://host:5432` becomes `postgres://<db_name>` — the host
+    /// replaced by the database). One definition of this across the two
+    /// benchmark harnesses.
+    fn replace_database(url: &str, db_name: &str) -> Result<String, SkipReason> {
+        super::super::claim_bench_support::with_db_name(url, db_name).map_err(|e| {
+            SkipReason(format!(
+                "cannot address a fresh database on {}: {e}",
+                super::super::claim_bench_support::redact_url(url)
+            ))
+        })
+    }
+
+    /// Drop a set of `(admin URL, database name)` pairs, ignoring failures.
+    ///
+    /// Used both by [`ShardCluster::teardown`] and by the provisioning error
+    /// paths, so "the databases this run created get dropped" has one
+    /// implementation rather than three.
+    async fn drop_created(created: &[(String, String)]) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (admin_url, name) in created {
+            let Ok(mut admin) = <AsyncPgConnection as AsyncConnection>::establish(admin_url).await
+            else {
+                failures.push(format!("{name}: could not reconnect to drop it"));
+                continue;
+            };
+            if let Err(e) =
+                diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&mut admin)
+                    .await
+            {
+                failures.push(format!("{name}: {e}"));
+            }
         }
-        out
+        failures
     }
 
     async fn create_shard_database(
@@ -1575,13 +2206,22 @@ pub mod db {
             .execute(&mut admin)
             .await
             .map_err(|e| SkipReason(format!("create database {name}: {e}")))?;
-        let url = replace_database(admin_url, &name);
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
-            .await
-            .map_err(|e| SkipReason(format!("connect to fresh shard database: {e}")))?;
-        conn.batch_execute(&autumn_harvest::test_init_sql())
-            .await
-            .map_err(|e| SkipReason(format!("migrate shard database: {e}")))?;
+        let url = replace_database(admin_url, &name)?;
+        // Every failure from here on must drop the database this function just
+        // created, or a connect/migrate error orphans it.
+        let created = [(admin_url.to_owned(), name.clone())];
+        let mut conn = match <AsyncPgConnection as AsyncConnection>::establish(&url).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                drop_created(&created).await;
+                return Err(SkipReason(format!("connect to fresh shard database: {e}")));
+            }
+        };
+        if let Err(e) = conn.batch_execute(&autumn_harvest::test_init_sql()).await {
+            drop(conn);
+            drop_created(&created).await;
+            return Err(SkipReason(format!("migrate shard database: {e}")));
+        }
         Ok((url, name, conn))
     }
 
@@ -1603,7 +2243,11 @@ pub mod db {
     pub async fn setup_shards(shard_count: u32) -> Result<ShardCluster, SkipReason> {
         let count = shard_count as usize;
         if let Ok(raw) = std::env::var(SHARD_URLS_ENV_VAR) {
-            let admin_urls: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            let admin_urls: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
             if admin_urls.len() < count {
                 return Err(SkipReason(format!(
                     "{SHARD_URLS_ENV_VAR} lists {} URL(s) but this scenario needs {count}; \
@@ -1616,10 +2260,21 @@ pub mod db {
             let mut created = Vec::new();
             for (idx, admin) in admin_urls.iter().take(count).enumerate() {
                 let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-                let (url, name, lease) = create_shard_database(admin, shard).await?;
-                urls.insert(shard, url);
-                created.push(((*admin).to_owned(), name));
-                leases.push(lease);
+                match create_shard_database(admin, shard).await {
+                    Ok((url, name, lease)) => {
+                        urls.insert(shard, url);
+                        created.push(((*admin).to_owned(), name));
+                        leases.push(lease);
+                    }
+                    // Shard 3 of 4 failing is the common case (one server slower
+                    // to accept connections). Without this, shards 0-2 are
+                    // already created and migrated and nothing ever drops them.
+                    Err(e) => {
+                        drop(leases);
+                        drop_created(&created).await;
+                        return Err(e);
+                    }
+                }
             }
             return Ok(ShardCluster {
                 urls,
@@ -1662,10 +2317,18 @@ pub mod db {
         let mut created = Vec::new();
         for idx in 0..count {
             let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-            let (url, name, lease) = create_shard_database(&admin_url, shard).await?;
-            urls.insert(shard, url);
-            created.push((admin_url.clone(), name));
-            leases.push(lease);
+            match create_shard_database(&admin_url, shard).await {
+                Ok((url, name, lease)) => {
+                    urls.insert(shard, url);
+                    created.push((admin_url.clone(), name));
+                    leases.push(lease);
+                }
+                Err(e) => {
+                    drop(leases);
+                    drop_created(&created).await;
+                    return Err(e);
+                }
+            }
         }
         Ok(ShardCluster {
             urls,
@@ -1716,22 +2379,7 @@ pub mod db {
         pub async fn teardown(mut self) -> Vec<String> {
             // Release our own backends first, or `DROP DATABASE` blocks on them.
             self.leases.clear();
-            let mut failures = Vec::new();
-            for (admin_url, name) in &self.created {
-                let Ok(mut admin) = <AsyncPgConnection as AsyncConnection>::establish(admin_url)
-                    .await
-                else {
-                    failures.push(format!("{name}: could not reconnect to drop it"));
-                    continue;
-                };
-                if let Err(e) = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                    .execute(&mut admin)
-                    .await
-                {
-                    failures.push(format!("{name}: {e}"));
-                }
-            }
-            failures
+            drop_created(&self.created).await
         }
 
         pub async fn connect(&self, shard: ShardId) -> AsyncPgConnection {
@@ -1756,6 +2404,10 @@ pub mod db {
         signal_observed: Mutex<BTreeMap<Uuid, Instant>>,
         /// Execution ids that reached the `wait_for_signal` call.
         parked: Mutex<BTreeMap<Uuid, ()>>,
+        /// Activity dispatches that produced no sample because the context
+        /// carried no task id. Counted rather than ignored, so the published
+        /// population can be reconciled against the population that ran.
+        unrecorded_dispatches: Mutex<usize>,
     }
 
     impl BenchObservations {
@@ -1776,6 +2428,15 @@ pub mod db {
                 .expect("poisoned")
                 .get(&exec_id)
                 .copied()
+        }
+
+        #[must_use]
+        pub fn unrecorded_dispatches(&self) -> usize {
+            *self.unrecorded_dispatches.lock().expect("poisoned")
+        }
+
+        fn record_unrecorded_dispatch(&self) {
+            *self.unrecorded_dispatches.lock().expect("poisoned") += 1;
         }
 
         fn record_activity_start(&self, task_id: Uuid) {
@@ -1821,8 +2482,13 @@ pub mod db {
     /// engine's, not the handler's.
     fn bench_activity(ctx: &ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
         Box::pin(async move {
-            if let Some(task_id) = ctx.info().task_id {
-                observations_of_activity(ctx).record_activity_start(task_id);
+            let observations = observations_of_activity(ctx);
+            match ctx.info().task_id {
+                Some(task_id) => observations.record_activity_start(task_id),
+                // A queue-dispatched activity always has a task row; recording
+                // the absence rather than ignoring it keeps the sample
+                // population auditable (see `unrecorded_dispatches`).
+                None => observations.record_unrecorded_dispatch(),
             }
             Ok(serde_json::json!({ "ok": true }))
         })
@@ -1860,7 +2526,10 @@ pub mod db {
         })
     }
 
-    fn workflow_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    fn workflow_info(
+        name: &'static str,
+        handler: autumn_harvest::info::WorkflowHandlerFn,
+    ) -> WorkflowInfo {
         WorkflowInfo {
             quota: None,
             declared_activities: None,
@@ -1946,12 +2615,26 @@ pub mod db {
     }
 
     impl Fleet {
+        /// Shut every worker down, and **abort** any that does not stop in time.
+        ///
+        /// `timeout(_, handle)` consumes the `JoinHandle` and dropping it
+        /// *detaches* the task rather than stopping it. A detached worker keeps
+        /// claiming from a pool whose database the next line drops, and keeps
+        /// burning CPU through the remaining cells of a twelve-cell sweep --
+        /// perturbing the measurements those cells publish. So the handle is
+        /// kept and aborted.
         pub async fn stop(self) {
             for worker in &self.workers {
                 worker.shutdown();
             }
             for handle in self.handles {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(15), handle).await;
+                let abort = handle.abort_handle();
+                if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+                    .await
+                    .is_err()
+                {
+                    abort.abort();
+                }
             }
         }
     }
@@ -2187,6 +2870,12 @@ pub mod db {
     }
 
     impl SignalServer {
+        /// Stop accepting and abort every in-flight connection task.
+        ///
+        /// Aborting the accept loop drops its `JoinSet`, which aborts the
+        /// connection tasks with it — so no task can still be holding a pooled
+        /// connection when the caller drops the pool and `teardown` drops the
+        /// databases.
         pub fn stop(self) {
             self.handle.abort();
         }
@@ -2201,25 +2890,54 @@ pub mod db {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
+            // Connection tasks are tracked rather than detached: `stop` must be
+            // able to guarantee no task is still holding a pooled connection
+            // when the caller drops the pool and drops the databases.
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    // Reap finished connection tasks so the set does not grow
+                    // for the life of the scenario.
+                    Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let (mut socket, _) = match accepted {
+                    Ok(pair) => pair,
+                    // A transient accept error (EMFILE under load) must not
+                    // retire the endpoint for the rest of the run: every
+                    // subsequent signal would then be counted as a failure and
+                    // the cell blamed on the engine.
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
                 };
                 let sharded = sharded.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _ = socket.set_nodelay(true);
                     let mut buf = Vec::with_capacity(512);
                     let request = loop {
                         let mut chunk = [0_u8; 512];
-                        match socket.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        let read = tokio::time::timeout(
+                            SIGNAL_SOCKET_TIMEOUT,
+                            socket.read(&mut chunk),
+                        )
+                        .await;
+                        match read {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
                         }
-                        if let Some(request) = super::parse_http_request(&buf) {
-                            break request;
+                        match super::parse_http_request(&buf) {
+                            super::HttpParse::Complete(request) => break Some(request),
+                            super::HttpParse::Incomplete => (),
+                            // Answer rather than wait: see `HttpParse`.
+                            super::HttpParse::Malformed => break None,
                         }
                     };
-                    let status = serve_signal(&sharded, &request).await;
+                    let status = match request {
+                        Some(request) => serve_signal(&sharded, &request).await,
+                        None => 400,
+                    };
                     let body = if status == 200 { "{\"ok\":true}" } else { "{}" };
                     let response = format!(
                         "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2268,12 +2986,8 @@ pub mod db {
         exec_id: ExecutionId,
         signal_name: &str,
     ) -> (Instant, Option<u16>) {
-        let request = super::signal_request_bytes(
-            &addr.to_string(),
-            &exec_id.to_string(),
-            signal_name,
-            "{}",
-        );
+        let request =
+            super::signal_request_bytes(&addr.to_string(), &exec_id.to_string(), signal_name, "{}");
         let sent_at = Instant::now();
         let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
             return (sent_at, None);
@@ -2283,7 +2997,15 @@ pub mod db {
             return (sent_at, None);
         }
         let mut response = Vec::with_capacity(128);
-        let _ = stream.read_to_end(&mut response).await;
+        // Bounded: an unbounded `read_to_end` against a peer that never answers
+        // parks the whole scenario past its budget, and the signalling loop only
+        // checks the deadline between sends.
+        if tokio::time::timeout(SIGNAL_SOCKET_TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .is_err()
+        {
+            return (sent_at, None);
+        }
         (sent_at, super::parse_status_code(&response))
     }
 
@@ -2302,7 +3024,12 @@ pub mod db {
     pub async fn probe_postgres_version() -> Option<String> {
         let url = std::env::var(SHARD_URLS_ENV_VAR)
             .ok()
-            .and_then(|raw| raw.split(',').map(str::trim).find(|s| !s.is_empty()).map(str::to_owned))
+            .and_then(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .find(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
             .or_else(|| std::env::var("HARVEST_TEST_DATABASE_URL").ok())?;
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
@@ -2323,9 +3050,12 @@ pub mod db {
     /// Note the wall clock one cell took, and complain when it exhausted its
     /// budget — a cell that ran out of time reported whatever it had collected,
     /// which is not a published number.
-    fn budget_note(started: Instant, unsound: &mut Vec<String>) -> String {
+    fn budget_note(started: Instant, deadline: Instant, unsound: &mut Vec<String>) -> String {
         let elapsed = started.elapsed();
-        if elapsed >= std::time::Duration::from_secs(SCENARIO_BUDGET_SECS) {
+        // Against the deadline itself, not against elapsed-since-the-cell-began:
+        // the deadline starts after provisioning, so a cell whose provisioning
+        // was slow but whose collection finished cleanly must not be refused.
+        if Instant::now() >= deadline {
             unsound.push(format!(
                 "the {SCENARIO_BUDGET_SECS}s scenario budget was exhausted; this cell reports \
                  only what it had collected when the clock ran out"
@@ -2357,7 +3087,8 @@ pub mod db {
                 per_shard.push(u64::try_from(completed_count(conn, cohort).await).unwrap_or(0));
             }
             let total: u64 = per_shard.iter().sum();
-            if usize::try_from(total).unwrap_or(usize::MAX) >= expected || Instant::now() >= deadline
+            if usize::try_from(total).unwrap_or(usize::MAX) >= expected
+                || Instant::now() >= deadline
             {
                 return per_shard;
             }
@@ -2389,14 +3120,14 @@ pub mod db {
     }
 
     /// **Scenario (a).** Sustained workflows completed per second for the
-    /// canonical 3-activity workflow, as a saturated backlog drain.
+    /// canonical 3-activity workflow, under a bounded closed loop.
     ///
-    /// A warmup cohort is drained first so pools, prepared statements and the
-    /// planner's statistics are warm; the headline is then the middle-half rate
-    /// over the measured cohort, which excludes both the ramp-up and the
-    /// drain-down tail. Seeding is checked against the measured window: a rate
-    /// bounded by how fast the harness could insert is reported as unsound
-    /// rather than published.
+    /// A warmup population runs through the identical loop first and is
+    /// discarded, so pools are full and the planner has statistics on a
+    /// populated table; the headline is then the middle-half rate over the
+    /// measured population, which excludes both the ramp-up and the drain-down
+    /// tail. [`inflight_soundness`] is what stops a run the *harness* bounded
+    /// from being published as a fact about the engine.
     ///
     /// # Errors
     ///
@@ -2413,10 +3144,15 @@ pub mod db {
         // Warmup: the same closed loop, at a fraction of the population, with
         // every completion discarded. Pools fill, statements are planned, the
         // planner sees real statistics.
-        let inflight = inflight_target();
-        let per_shard_total = measured_workflows_per_shard();
+        let inflight = super::inflight_target();
+        let per_shard_total = super::measured_workflows_per_shard();
         let warm_per_shard = warmup_batch_for(per_shard_total);
-        run_closed_loop(&cluster, "warm", warm_per_shard, inflight, deadline).await;
+        let warm_loops =
+            run_closed_loop(&cluster, "warm", warm_per_shard, inflight, deadline).await;
+        let warm_drained: Vec<u64> = warm_loops
+            .iter()
+            .map(|l| u64::try_from(l.completed).unwrap_or(0))
+            .collect();
 
         let loops = run_closed_loop(&cluster, "meas", per_shard_total, inflight, deadline).await;
         let requested = per_shard_total * shards.len();
@@ -2459,10 +3195,22 @@ pub mod db {
         let sustained = steady_state_throughput(&secs);
         let window_secs = steady_state_window(&secs).map(|(lo, hi)| hi - lo);
 
-        let inflight_samples: Vec<usize> =
-            loops.iter().flat_map(|l| l.inflight_samples.clone()).collect();
+        // Only the samples from the window the headline is computed over. The
+        // loop's drain-down tail decays 128 -> 0 by construction, so averaging
+        // over the whole loop measures the tail rather than the population the
+        // rate was produced under -- and on a short run it fires the gate
+        // against a perfectly good measurement.
+        let inflight_samples: Vec<usize> = loops
+            .into_iter()
+            .flat_map(|l| steady_state_slice(&l.inflight_samples).to_vec())
+            .collect();
         let mean_flight = mean_inflight(&inflight_samples);
         let mut unsound = throughput_soundness(requested, completed, &per_shard);
+        unsound.extend(warmup_soundness(
+            "throughput",
+            warm_per_shard * shards.len(),
+            &warm_drained,
+        ));
         // Per shard on both sides: `inflight_samples` is the concatenation of
         // every shard's observations, so its mean is already a per-shard
         // population.
@@ -2472,7 +3220,7 @@ pub mod db {
         let topology = cluster.topology;
         drop(sharded);
         let teardown_failures = cluster.teardown().await;
-        let wall_clock_note = budget_note(scenario_started, &mut unsound);
+        let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
 
         #[allow(
             clippy::cast_precision_loss,
@@ -2524,6 +3272,8 @@ pub mod db {
     struct LoopOutcome {
         /// How many workflows the feeder actually started on this shard.
         started: usize,
+        /// How many of them the engine completed before the loop ended.
+        completed: usize,
         /// The in-flight population sampled once per feeder cycle.
         inflight_samples: Vec<usize>,
     }
@@ -2575,12 +3325,14 @@ pub mod db {
 
         let mut started = 0_usize;
         let mut inflight_samples = Vec::new();
+        // Reported so the caller can verify a warmup population actually
+        // drained rather than merely timing out (see `warmup_soundness`).
+        let mut completed;
         started += start_batch(&mut feeders, shard, cohort, started, total.min(inflight)).await;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            let completed =
-                usize::try_from(completed_count(&mut observer, cohort).await).unwrap_or(0);
+            completed = usize::try_from(completed_count(&mut observer, cohort).await).unwrap_or(0);
             inflight_samples.push(started.saturating_sub(completed));
             if completed >= total || Instant::now() >= deadline {
                 break;
@@ -2592,6 +3344,7 @@ pub mod db {
         }
         LoopOutcome {
             started,
+            completed,
             inflight_samples,
         }
     }
@@ -2640,6 +3393,7 @@ pub mod db {
         cohort: &str,
         count: usize,
         per_shard_rate: f64,
+        deadline: Instant,
     ) -> (Vec<ExecutionId>, std::time::Duration) {
         let period = std::time::Duration::from_secs_f64(1.0 / per_shard_rate);
         let started = Instant::now();
@@ -2658,6 +3412,10 @@ pub mod db {
                 // exactly the saturation `pacing_verdict` exists to detect.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 for i in 0..count {
+                    // The only measurement loop that used to run unbounded.
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     ticker.tick().await;
                     let exec_id = ExecutionId::new_for_shard(shard);
                     let workflow_id = format!("{cohort}-s{}-{i}", shard.as_i32());
@@ -2699,29 +3457,59 @@ pub mod db {
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
+        // Probe the host-to-database offset BEFORE the window as well as after
+        // it: an offset measured only afterwards is not the offset that was in
+        // effect while the samples were taken.
+        let mut offsets_before = Vec::new();
+        for shard in &shards {
+            let mut conn = cluster.connect(*shard).await;
+            offsets_before.push(clock_offset_ms(&mut conn).await);
+        }
+
         let warm_per_shard = warmup_batch_for(DISPATCH_WORKFLOWS_PER_SHARD);
         for shard in &shards {
             seed_workflows(&cluster, *shard, BENCH_WORKFLOW, "warm", warm_per_shard).await;
         }
-        wait_for_completions(&cluster, "warm", warm_per_shard * shards.len(), deadline).await;
+        let warm_drained =
+            wait_for_completions(&cluster, "warm", warm_per_shard * shards.len(), deadline).await;
 
-        let (_ids, elapsed) = paced_seed(
+        let (paced_ids, elapsed) = paced_seed(
             &cluster,
             BENCH_WORKFLOW,
             "meas",
             DISPATCH_WORKFLOWS_PER_SHARD,
             PACED_STARTS_PER_SEC_PER_SHARD,
+            deadline,
         )
         .await;
-        let requested = DISPATCH_WORKFLOWS_PER_SHARD * shards.len();
+        let requested = paced_ids.len();
         let per_shard = wait_for_completions(&cluster, "meas", requested, deadline).await;
 
         #[allow(clippy::cast_precision_loss, reason = "start counts are small")]
-        let achieved = requested as f64 / elapsed.as_secs_f64();
+        // `interval`'s first tick fires immediately, so n starts span n-1
+        // periods. Dividing by n would overstate the achieved rate and bias the
+        // one gate that protects this scenario in the optimistic direction.
+        let achieved = (requested.saturating_sub(1)) as f64 / elapsed.as_secs_f64();
         let target = PACED_STARTS_PER_SEC_PER_SHARD * f64::from(shard_count);
 
-        let starts: BTreeMap<Uuid, DateTime<Utc>> =
-            observations.activity_starts().into_iter().collect();
+        // FIRST-wins, matching the signal path's discipline. `collect()` into a
+        // map is last-wins, which would turn a re-delivered task row (a
+        // heartbeat-lease reclaim, a capability release) into a sample of the
+        // whole re-delivery delay -- a silently inflated tail with nothing to
+        // mark it. Duplicates are counted instead, and reported.
+        let mut starts: BTreeMap<Uuid, DateTime<Utc>> = BTreeMap::new();
+        let mut redispatched = 0_usize;
+        for (task_id, started) in observations.activity_starts() {
+            if starts.insert(task_id, started).is_some() {
+                redispatched += 1;
+                // Keep the earliest.
+                let earliest = starts
+                    .get(&task_id)
+                    .copied()
+                    .map_or(started, |existing| existing.min(started));
+                starts.insert(task_id, earliest);
+            }
+        }
 
         let mut samples: Vec<(DateTime<Utc>, f64)> = Vec::new();
         let mut negative = 0_usize;
@@ -2748,7 +3536,8 @@ pub mod db {
                         clippy::cast_precision_loss,
                         reason = "dispatch latencies are milliseconds, far below 2^53 microseconds"
                     )]
-                    let ms = (*started - created_at).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+                    let ms =
+                        (*started - created_at).num_microseconds().unwrap_or(0) as f64 / 1000.0;
                     if ms < 0.0 {
                         negative += 1;
                     }
@@ -2762,6 +3551,22 @@ pub mod db {
         let stats = LatencyStats::from_samples(kept);
 
         let mut unsound = latency_soundness(stats.count, negative, missing_created_at);
+        unsound.extend(warmup_soundness(
+            "dispatch",
+            warm_per_shard * shards.len(),
+            &warm_drained,
+        ));
+        unsound.extend(clock_offset_soundness(
+            &offsets_before,
+            &offsets,
+            stats.p50_ms,
+        ));
+        unsound.extend(dispatch_population_soundness(
+            BENCH_ACTIVITIES.len() * requested,
+            samples.len(),
+            redispatched,
+            observations.unrecorded_dispatches(),
+        ));
         let completed = usize::try_from(per_shard.iter().sum::<u64>()).unwrap_or(0);
         unsound.extend(throughput_soundness(requested, completed, &per_shard));
         if pacing_verdict(target, achieved) == Pacing::Saturated {
@@ -2777,7 +3582,7 @@ pub mod db {
         let teardown_failures = cluster.teardown().await;
 
         offsets.sort_by(f64::total_cmp);
-        let wall_clock_note = budget_note(scenario_started, &mut unsound);
+        let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
         let publish = unsound.is_empty();
         #[allow(
             clippy::cast_precision_loss,
@@ -2799,12 +3604,26 @@ pub mod db {
                     format!("topology: {}", topology.as_str()),
                     format!("target pace: {target:.1} workflow starts/s"),
                     format!(
-                        "host-to-database clock offset: {} ms (per shard, median of 7 probes)",
+                        "host-to-database clock offset before the window: {} ms (per shard, \
+                         median of 7 probes)",
+                        offsets_before
+                            .iter()
+                            .map(|o| format!("{o:+.3}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(
+                        "host-to-database clock offset after the window: {} ms",
                         offsets
                             .iter()
                             .map(|o| format!("{o:+.3}"))
                             .collect::<Vec<_>>()
                             .join(", ")
+                    ),
+                    format!(
+                        "{redispatched} re-dispatched task row(s); \
+                         {} dispatch(es) recorded no task id",
+                        observations.unrecorded_dispatches()
                     ),
                     wall_clock_note,
                 ],
@@ -2835,7 +3654,13 @@ pub mod db {
         let server = match spawn_signal_server(sharded.clone()).await {
             Ok(server) => server,
             Err(e) => {
+                // Tear down before returning: `ShardCluster` has no `Drop`
+                // (dropping databases is async), so an early return that skips
+                // this leaves freshly migrated databases on the operator's
+                // server -- exactly what `teardown` exists to prevent.
                 fleet.stop().await;
+                drop(sharded);
+                let _ = cluster.teardown().await;
                 return Err(SkipReason(format!("bind the signal endpoint: {e}")));
             }
         };
@@ -2845,8 +3670,14 @@ pub mod db {
         let mut measured_ids = Vec::new();
         for shard in &shards {
             warm_ids.extend(
-                seed_workflows(&cluster, *shard, BENCH_SIGNAL_WORKFLOW, "warm", warm_per_shard)
-                    .await,
+                seed_workflows(
+                    &cluster,
+                    *shard,
+                    BENCH_SIGNAL_WORKFLOW,
+                    "warm",
+                    warm_per_shard,
+                )
+                .await,
             );
             measured_ids.extend(
                 seed_workflows(
@@ -2897,7 +3728,7 @@ pub mod db {
             warm_ticker.tick().await;
             let _ = send_signal_over_http(server.addr, *exec_id, BENCH_SIGNAL).await;
         }
-        wait_for_completions(&cluster, "warm", warm_ids.len(), deadline).await;
+        let warm_drained = wait_for_completions(&cluster, "warm", warm_ids.len(), deadline).await;
 
         let mut ticker = tokio::time::interval(period);
         // `Delay`, not `Burst`: see `paced_seed`.
@@ -2910,7 +3741,8 @@ pub mod db {
                 break;
             }
             ticker.tick().await;
-            let (sent_at, status) = send_signal_over_http(server.addr, *exec_id, BENCH_SIGNAL).await;
+            let (sent_at, status) =
+                send_signal_over_http(server.addr, *exec_id, BENCH_SIGNAL).await;
             if status != Some(200) {
                 failures += 1;
             }
@@ -2940,6 +3772,7 @@ pub mod db {
         let stats = LatencyStats::from_samples(&ordered);
 
         let mut unsound = latency_soundness(stats.count, 0, 0);
+        unsound.extend(warmup_soundness("signal", warm_ids.len(), &warm_drained));
         if parked < total {
             unsound.push(format!(
                 "only {parked} of {total} workflows had parked on the signal before signalling \
@@ -2974,7 +3807,7 @@ pub mod db {
         let topology = cluster.topology;
         drop(sharded);
         let teardown_failures = cluster.teardown().await;
-        let wall_clock_note = budget_note(scenario_started, &mut unsound);
+        let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
 
         let publish = unsound.is_empty();
         #[allow(
@@ -3008,5 +3841,4 @@ pub mod db {
             unsound,
         })
     }
-
 }

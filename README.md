@@ -372,8 +372,14 @@ in [`docs/alerts/README.md`](docs/alerts/README.md).
 
 ### Measured performance baselines
 
-[`docs/performance.md`](docs/performance.md) publishes measured task-claim and
-enqueue baselines: how claim latency scales with pending-backlog depth (the
+[`docs/benchmarks.md`](docs/benchmarks.md) publishes **end-to-end** numbers —
+sustained workflows/sec for a canonical 3-activity workflow, activity dispatch
+and signal round-trip percentiles, and replay throughput, each at 1, 2 and 4
+shards — with a committed `docker-compose.yml` and a one-command runner so you
+can reproduce any of them on your own hardware.
+
+[`docs/performance.md`](docs/performance.md) is the component-level complement:
+it publishes measured task-claim and enqueue baselines: how claim latency scales with pending-backlog depth (the
 number that answers *"when do I add a shard?"*), what five representative
 claim-path predicates cost (five more are in the query on every claim but are
 left on their cheapest null/empty path, so they are evaluated rather than

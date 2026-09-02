@@ -4,11 +4,18 @@
 # rather than four databases on one server is not decoration: a Harvest shard is
 # a database with its own pool, and four "shards" sharing one server's buffer
 # cache, WAL writer and CPU would make a shard-count sweep a measurement of that
-# one server contending with itself. `benchmarks/run.sh` starts as many of these
-# as the sweep needs (1, then 2, then 4).
+# one server contending with itself. `benchmarks/run.sh` starts all four and hands
+# the harness all four URLs; each cell of the sweep then uses the first 1, 2 or
+# 4 of them.
 #
 # Ports are in the 55432+ range so this never collides with a Postgres already
 # listening on 5432.
+#
+# Storage is deliberately left as the container's own filesystem rather than a
+# tmpfs: a RAM-backed data directory would make these containers *faster* than
+# the native clusters the published numbers came from, which is the opposite of
+# the conservative direction for a reproduction path (and it puts four Postgres
+# data directories in the reader's RAM).
 #
 # The settings below are deliberately close to stock. This suite publishes
 # reference numbers for an untuned Postgres, because that is what a reader
@@ -41,9 +48,6 @@ x-shard: &shard
     interval: 1s
     timeout: 3s
     retries: 30
-  tmpfs:
-    - /var/lib/postgresql/data
-
 services:
   shard-0:
     <<: *shard

@@ -22,6 +22,13 @@
 // publishes and the CPU budget this bench guards are measured over
 // byte-identical histories. Moving the builder — not copying it — is what makes
 // drift between the two impossible rather than merely unlikely.
+// The shared harness's `db` section reaches the percentile/redaction helpers in
+// `claim_bench_support` through the crate root, and `db` is a DEFAULT feature --
+// so this module must be declared here too, or a plain
+// `cargo bench --bench replay_bench` fails to resolve it. It carries
+// `#![allow(dead_code)]`, so the only cost is compile time.
+#[path = "../tests/integration/claim_bench_support.rs"]
+mod claim_bench_support;
 #[path = "../tests/integration/e2e_bench_support.rs"]
 mod e2e_bench_support;
 

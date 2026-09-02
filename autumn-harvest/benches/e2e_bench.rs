@@ -68,10 +68,11 @@ mod claim_bench_support;
 mod e2e_bench_support;
 
 use e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, Metric, PUBLISHED_BASELINES, REPRO_TOLERANCE_PCT,
-    SCENARIO_FILTER_ENV_VAR, SHARD_FILTER_ENV_VAR, ReproVerdict, ScenarioReport, baseline_for,
-    relative_error_pct, render_matrix, render_value, repro_verdict, selected_scenarios,
-    selected_shard_counts, unknown_scenario_ids,
+    BenchScenario, CHECK_ENV_VAR, Metric, PUBLISHED_BASELINES, REPLAY_CONTROL_DRIFT_PCT,
+    REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR, SHARD_FILTER_ENV_VAR,
+    ScenarioReport, baseline_for, relative_error_pct, render_matrix, render_value,
+    replay_control_drift_pct, repro_verdict, selected_scenarios, selected_shard_counts,
+    unknown_scenario_ids,
 };
 
 fn main() {
@@ -107,13 +108,27 @@ async fn run() {
     for shards in shard_counts {
         for scenario in scenarios.iter().copied() {
             eprintln!("==> {} at {shards} shard(s)", scenario.as_str());
-            match run_scenario(scenario, shards).await {
-                Ok(report) => reports.push(report),
-                Err(reason) => {
+            // Each cell runs in its own task, so a panic in one becomes a
+            // `JoinError` rather than unwinding out of `main`. Without this a
+            // single unlucky database error aborts the whole sweep, discards
+            // every cell already measured, and skips teardown for the databases
+            // the remaining cells would have created.
+            let outcome = tokio::spawn(run_scenario(scenario, shards)).await;
+            match outcome {
+                Ok(Ok(report)) => reports.push(report),
+                Ok(Err(reason)) => {
                     println!(
                         "\n> **Skipped** `{}` at {shards} shard(s): {}\n",
                         scenario.as_str(),
                         reason
+                    );
+                }
+                Err(join) => {
+                    println!(
+                        "\n> **Failed** `{}` at {shards} shard(s): the scenario panicked \
+                         ({join}). Later cells still ran; databases this cell created may \
+                         need dropping by hand.\n",
+                        scenario.as_str(),
                     );
                 }
             }
@@ -134,7 +149,11 @@ async fn run() {
 
     println!("\n## Notes\n");
     for report in &reports {
-        println!("### `{}` at {} shard(s)\n", report.scenario.as_str(), report.shards);
+        println!(
+            "### `{}` at {} shard(s)\n",
+            report.scenario.as_str(),
+            report.shards
+        );
         for note in &report.notes {
             println!("* {note}");
         }
@@ -152,6 +171,8 @@ async fn run() {
         print_reproduction_check(&reports);
     }
 
+    print_replay_control(&reports);
+
     let unsound: Vec<String> = reports
         .iter()
         .filter(|r| !r.is_sound())
@@ -160,7 +181,10 @@ async fn run() {
     if unsound.is_empty() {
         println!("\nEvery scenario reported sound.\n");
     } else {
-        println!("\n**Unsound scenarios (not publishable): {}**\n", unsound.join(", "));
+        println!(
+            "\n**Unsound scenarios (not publishable): {}**\n",
+            unsound.join(", ")
+        );
     }
 }
 
@@ -172,7 +196,9 @@ async fn run_scenario(
         BenchScenario::Throughput => e2e_bench_support::db::run_throughput(shards).await,
         BenchScenario::DispatchLatency => e2e_bench_support::db::run_dispatch_latency(shards).await,
         BenchScenario::SignalRoundtrip => e2e_bench_support::db::run_signal_roundtrip(shards).await,
-        BenchScenario::ReplayThroughput => Ok(e2e_bench_support::run_replay_throughput(shards).await),
+        BenchScenario::ReplayThroughput => {
+            Ok(e2e_bench_support::run_replay_throughput(shards).await)
+        }
     }
 }
 
@@ -180,23 +206,71 @@ async fn print_environment() {
     println!("## Environment\n");
     println!("| | |");
     println!("|:--|:--|");
-    println!("| Logical CPUs | {} |", std::thread::available_parallelism().map_or_else(|_| "unknown".to_owned(), |n| n.to_string()));
-    println!("| OS | {} / {} |", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "| Logical CPUs | {} |",
+        std::thread::available_parallelism()
+            .map_or_else(|_| "unknown".to_owned(), |n| n.to_string())
+    );
+    println!(
+        "| OS | {} / {} |",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!("| Profile | `bench` (release) |");
     println!("| Harness | `autumn-harvest/tests/integration/e2e_bench_support.rs` |");
     println!(
         "| Workers | {} per shard, {} concurrent workflows, {} concurrent activities |",
-        e2e_bench_support::db::WORKERS_PER_SHARD,
-        e2e_bench_support::db::MAX_CONCURRENT_WORKFLOWS,
-        e2e_bench_support::db::MAX_CONCURRENT_ACTIVITIES,
+        e2e_bench_support::WORKERS_PER_SHARD,
+        e2e_bench_support::MAX_CONCURRENT_WORKFLOWS,
+        e2e_bench_support::MAX_CONCURRENT_ACTIVITIES,
     );
     println!(
         "| Poll interval | {} ms (LISTEN/NOTIFY wired per shard) |",
-        e2e_bench_support::db::POLL_INTERVAL_MS
+        e2e_bench_support::POLL_INTERVAL_MS
     );
-    println!("| Pool size | {} per shard |", e2e_bench_support::db::POOL_SIZE_PER_SHARD);
+    println!(
+        "| Pool size | {} per shard |",
+        e2e_bench_support::POOL_SIZE_PER_SHARD
+    );
     if let Some(version) = e2e_bench_support::db::probe_postgres_version().await {
         println!("| Postgres | {version} |");
+    }
+    println!();
+}
+
+/// Report the replay control's spread across the sweep.
+///
+/// Replay is in-memory and cannot legitimately move with shard count, so any
+/// spread across the three cells is the reference box, not the engine. Nothing
+/// else in the report compares those cells *against each other* — and each one
+/// on its own always looks fine — so without this the control cannot actually
+/// signal anything.
+fn print_replay_control(reports: &[ScenarioReport]) {
+    let readings: Vec<f64> = reports
+        .iter()
+        .filter(|r| r.scenario == BenchScenario::ReplayThroughput)
+        .filter_map(|r| r.metric("events_per_sec"))
+        .collect();
+    let Some(drift) = replay_control_drift_pct(&readings) else {
+        return;
+    };
+    println!("\n## Noise control\n");
+    println!(
+        "The replay scenario is in-memory and shard-invariant, so its spread across the sweep \
+         bounds how much the reference box's own load moved while the other cells were measured."
+    );
+    println!("\n* replay spread across the sweep: **{drift:.1}%**");
+    if drift > REPLAY_CONTROL_DRIFT_PCT {
+        println!(
+            "* **above the {REPLAY_CONTROL_DRIFT_PCT:.0}% bar**: the box was not quiet during \
+             this run. Treat every other number here as carrying at least this much noise, and \
+             re-run on an idle machine before publishing."
+        );
+    } else {
+        println!(
+            "* within the {REPLAY_CONTROL_DRIFT_PCT:.0}% bar: the box stayed quiet enough for \
+             the other cells to be comparable with each other."
+        );
     }
     println!();
 }

@@ -20,7 +20,10 @@
 use std::path::{Path, PathBuf};
 
 use super::e2e_bench_support::{
-    BenchScenario, PUBLISHED_BASELINES, REPRO_TOLERANCE_PCT, SHARD_COUNTS,
+    BenchScenario, CHECK_ENV_VAR, INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES,
+    MAX_CONCURRENT_WORKFLOWS, POOL_SIZE_PER_SHARD, PUBLISHED_BASELINES, PUBLISHED_RESULTS_VERSION,
+    REPRO_TOLERANCE_PCT, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR,
+    SHARD_URLS_ENV_VAR, THROUGHPUT_INFLIGHT_PER_SHARD, WORKERS_PER_SHARD, WORKFLOWS_ENV_VAR,
 };
 
 fn repo_root() -> PathBuf {
@@ -42,7 +45,7 @@ fn benchmarks_doc() -> String {
 }
 
 fn results_doc_path() -> String {
-    format!("docs/benchmarks/results-v{}.md", env!("CARGO_PKG_VERSION"))
+    format!("docs/benchmarks/results-v{PUBLISHED_RESULTS_VERSION}.md")
 }
 
 #[test]
@@ -104,11 +107,56 @@ fn the_committed_topology_has_a_service_per_shard() {
 #[test]
 fn the_doc_states_the_reproduction_tolerance_the_harness_uses() {
     let doc = benchmarks_doc();
-    let stated = format!("{REPRO_TOLERANCE_PCT:.0}%");
+    // The signed form, not a bare `15%`: a doc that said "115%" would satisfy a
+    // substring check for "15%" while telling the reader something false.
+    let stated = format!("\u{b1}{REPRO_TOLERANCE_PCT:.0}%");
     assert!(
         doc.contains(&stated),
-        "docs/benchmarks.md must state the +/-{stated} tolerance the harness compares against"
+        "docs/benchmarks.md must state the {stated} tolerance the harness compares against"
     );
+}
+
+#[test]
+fn every_documented_environment_variable_is_one_the_harness_reads() {
+    // The knob table is the reader's whole interface to a partial run. Renaming
+    // a constant without editing the table silently orphans it.
+    let doc = benchmarks_doc();
+    for var in [
+        SHARD_URLS_ENV_VAR,
+        CHECK_ENV_VAR,
+        SCENARIO_FILTER_ENV_VAR,
+        SHARD_FILTER_ENV_VAR,
+        INFLIGHT_ENV_VAR,
+        WORKFLOWS_ENV_VAR,
+    ] {
+        assert!(
+            doc.contains(var),
+            "`{var}` is read by the harness but never documented in docs/benchmarks.md"
+        );
+    }
+}
+
+#[test]
+fn the_doc_publishes_the_worker_configuration_the_numbers_were_taken_at() {
+    // Issue #941 AC2 asks for "a documented worker/concurrency configuration".
+    // Documented means on the published page, not only in the run's own output.
+    let doc = benchmarks_doc();
+    for (label, value) in [
+        ("workers per shard", WORKERS_PER_SHARD),
+        ("concurrent workflow tasks", MAX_CONCURRENT_WORKFLOWS),
+        ("concurrent activity tasks", MAX_CONCURRENT_ACTIVITIES),
+        ("connections per shard pool", POOL_SIZE_PER_SHARD),
+        (
+            "workflows in flight per shard",
+            THROUGHPUT_INFLIGHT_PER_SHARD,
+        ),
+    ] {
+        assert!(
+            doc.contains(&value.to_string()),
+            "docs/benchmarks.md must state the {label} ({value}) the published numbers were \
+             taken at"
+        );
+    }
 }
 
 #[test]
@@ -184,18 +232,52 @@ fn the_docs_drift_guard_itself_runs_in_ci() {
 }
 
 #[test]
-fn every_published_baseline_appears_in_the_versioned_results_file() {
+fn every_published_baseline_appears_on_its_own_row_in_the_versioned_results_file() {
     let results = read(&results_doc_path());
     for baseline in PUBLISHED_BASELINES {
-        let rendered = format!("{:.2}", baseline.value);
-        assert!(
-            results.contains(&rendered),
-            "{} is a published baseline for `{}` at {} shards but does not appear in {} — \
-             the harness's constants and the results file must be the same numbers",
-            rendered,
+        // The harness renders the results table itself, so match the whole row
+        // rather than the number alone: a bare-number check passes when the
+        // right value sits on the wrong scenario or the wrong shard count, which
+        // is exactly the drift worth catching.
+        let row = format!(
+            "| `{}` | {} | `{}` | {:.2} |",
             baseline.scenario.as_str(),
             baseline.shards,
+            baseline.metric,
+            baseline.value,
+        );
+        assert!(
+            results.contains(&row),
+            "the published baseline for `{}` at {} shards ({} = {:.2}) has no matching row in \
+             {} — the harness's constants and the results file must be the same numbers, on \
+             the same rows.\nExpected row: {row}",
+            baseline.scenario.as_str(),
+            baseline.shards,
+            baseline.metric,
+            baseline.value,
             results_doc_path(),
+        );
+    }
+}
+
+#[test]
+fn every_headline_number_is_also_on_the_index_page() {
+    // The changelog and the planning record both claim the doc must contain the
+    // published baselines. It does -- docs/benchmarks.md carries a headline
+    // table -- and this is what keeps that claim true.
+    let doc = benchmarks_doc();
+    for baseline in PUBLISHED_BASELINES {
+        let rendered = format!("{:.2}", baseline.value);
+        // Large counts are rendered with thin spaces for readability on the
+        // index page, so compare on the digits alone.
+        let digits: String = rendered.chars().filter(char::is_ascii_digit).collect();
+        let doc_digits: String = doc.chars().filter(char::is_ascii_digit).collect();
+        assert!(
+            doc_digits.contains(&digits),
+            "the published baseline {rendered} for `{}` at {} shards does not appear in \
+             docs/benchmarks.md",
+            baseline.scenario.as_str(),
+            baseline.shards,
         );
     }
 }
@@ -203,11 +285,10 @@ fn every_published_baseline_appears_in_the_versioned_results_file() {
 #[test]
 fn the_results_file_for_this_version_is_linked_from_the_index() {
     let doc = benchmarks_doc();
-    let version = env!("CARGO_PKG_VERSION");
     assert!(
-        doc.contains(&format!("results-v{version}.md")),
-        "docs/benchmarks.md must link this release's results file (issue #941 AC4 keeps each \
-         release's numbers rather than overwriting them)"
+        doc.contains(&format!("results-v{PUBLISHED_RESULTS_VERSION}.md")),
+        "docs/benchmarks.md must link the published release's results file (issue #941 AC4 \
+         keeps each release's numbers rather than overwriting them)"
     );
 }
 

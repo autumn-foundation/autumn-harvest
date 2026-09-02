@@ -1,7 +1,8 @@
 # Harvest end-to-end benchmarks
 
 Harvest publishes two performance artifacts besides this page: the replay CPU
-budget (a 10 001-event history replays in under 200 ms, issue #135) and the
+budget (issue #135: a 10 000-event history replays in under 200 ms; the bench's
+history is 10 001 events) and the
 task-claim microbenchmark with its CI-gated p50 budget (issue #786,
 [`performance.md`](performance.md)). Both are *component* numbers. Neither
 answers the question an evaluating architect asks first:
@@ -28,7 +29,7 @@ Four scenarios, each run at **1 shard**, **2 shards** and **4 shards**.
 | `throughput` | sustained workflows completed/sec | a canonical **3-activity** workflow, run under a bounded closed loop |
 | `dispatch_latency` | activity dispatch p50/p99 | `harvest_task_queue.created_at` (the activity was scheduled) → the activity handler's first line |
 | `signal_roundtrip` | signal round-trip p50/p99 | an HTTP signal request leaving the client → the workflow's own code resuming past `wait_for_signal` |
-| `replay_throughput` | replay events/sec | the issue #135 10 001-event history, in memory |
+| `replay_throughput` | replay events/sec | the issue #135 history (10 001 events), in memory |
 
 ### Headline numbers, v0.6.0
 
@@ -66,6 +67,23 @@ Each release's numbers are kept, not overwritten:
 
 * **0.6.0** — [`benchmarks/results-v0.6.0.md`](benchmarks/results-v0.6.0.md)
 
+## The configuration these numbers were taken at
+
+Issue #941 asks for a documented worker/concurrency configuration, so it lives
+here rather than only in the output of a run you have not done yet.
+`benchmarks_docs.rs` pins these values to the harness constants.
+
+| | | why |
+|:--|--:|:--|
+| workers per shard | 1 | adding a shard adds its worker — the deployment shape the shard sweep is a statement about |
+| concurrent workflow tasks per worker | 8 | raising this to 24 on the four-core reference box *reduced* throughput; 72 concurrent tasks oversubscribe four cores |
+| concurrent activity tasks per worker | 16 | two per workflow slot |
+| connections per shard pool | 32 | at or above total worker concurrency, so no measurement includes pool-checkout queueing |
+| workflows in flight per shard | 32 | four times the workflow slots — see [bounded load](#methodology) |
+| paced start rate per shard | 8/sec | roughly 30% of the saturated rate, so the latency scenarios measure the path and not the queue |
+| poll interval | 25 ms | with LISTEN/NOTIFY wired per shard, so this bounds a *missed* notification rather than every wake |
+| durability | `fsync=off`, `synchronous_commit=off` | see [known limitations](#known-limitations) |
+
 ## Reproducing
 
 One command, against the committed four-shard Postgres topology in
@@ -100,12 +118,16 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 ./benchmarks/run
 |:--|:--|
 | `HARVEST_BENCH_SCENARIOS` | comma-separated scenario ids; unset runs all four |
 | `HARVEST_BENCH_SHARDS` | comma-separated shard counts; unset runs 1, 2 and 4 |
-| `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard (the load level) |
-| `HARVEST_BENCH_WORKFLOWS` | measured completions per shard |
+| `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard — the load level. `throughput` only |
+| `HARVEST_BENCH_WORKFLOWS` | measured completions per shard. `throughput` only |
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
+| `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
 
-### Without Docker
+The two latency scenarios have no size knob; their populations are fixed so the
+published percentiles always rest on the same sample count.
+
+### Without docker compose
 
 The harness resolves its shards in this order:
 
@@ -135,10 +157,14 @@ Two honest caveats about that band:
 * It is a band on *this* hardware class. On a different CPU count, or against a
   Postgres with durability enabled, expect to be outside it — that is the
   measurement working, not failing.
-* The published numbers were taken on **native Postgres clusters**, not
-  containers. The compose path adds container networking and storage overhead
-  that was not separately quantified, so a compose run is the more pessimistic
-  of the two.
+* The published numbers were taken on **native Postgres clusters**, provisioned
+  with the same settings as the compose services but not through Docker (the
+  machine they were measured on had no Docker daemon). The compose path adds
+  container networking and a container filesystem; **that delta has not been
+  measured**, and this page does not claim to know its sign. Treat the ±15% band
+  as applying to the native path, and treat a compose run's difference from it
+  as unquantified rather than as a regression. Closing this needs one sweep on a
+  Docker-capable machine of the same class.
 
 ## Methodology
 
@@ -178,9 +204,17 @@ the number rather than assuming it away, and a negative sample — which only sk
 can produce — is counted and reported, never clamped to zero.
 
 **Nothing unsound is published.** Each cell reports `n/a` and a named reason,
-rather than a confident-looking number, when it collected too few samples,
-failed to drain what it started, left a shard idle, could not hold its pace or
-its in-flight target, or saw a signal request fail.
+rather than a confident-looking number, when it: collected too few samples;
+failed to drain what it started; left a shard idle; could not hold its pace or
+its in-flight target; saw a signal request fail; ran its warmup population into
+the measured window instead of draining it first; produced far fewer dispatch
+samples than dispatches that ran; re-dispatched a task row (which would make a
+re-delivery delay indistinguishable from dispatch latency); saw a
+host-to-database clock offset worth more than 2% of the p50 it would publish, or
+one that drifted across the window; saw any workflow fail to observe its signal;
+replayed a partial history; or ran out of its wall-clock budget. A negative
+dispatch sample — which only clock skew can produce — voids the cell rather than
+being clamped to zero.
 
 **Replay is the noise control.** Replay is in-memory and cannot legitimately
 move with shard count. It is run at all three counts anyway: drift across those
@@ -219,6 +253,24 @@ happened.
   payload of consequence.
 * **A single reference machine.** Four logical CPUs. Nothing here says how the
   engine behaves on 32 cores.
+* **The signal round-trip includes connection setup.** The stopwatch starts
+  before `TcpStream::connect`, not after, so each sample carries a fresh
+  loopback TCP handshake. That is pessimistic against a keep-alive client and it
+  keeps the measured path identical for every sample — but it is not "the
+  instant the request left the process".
+* **The signal scenario has a residual pre-park window.** A workflow is
+  considered ready when its handler reaches `wait_for_signal`; the suspension
+  itself commits a moment later. The harness waits a further two seconds before
+  the first signal, which is four orders of magnitude more than that window — but
+  the window is not *closed*, and a signal that beat a suspension would be
+  recorded as a shorter round trip than it was.
+* **Nothing sweeps up after a crash.** Databases are named uniquely per run and
+  dropped on every ordinary exit, including the error paths. A panic or a Ctrl-C
+  can still leave a handful behind on a server you supplied; they are all named
+  `harvest_e2e_*` and safe to drop.
+* **A supplied URL must be able to `CREATE DATABASE`.** `HARVEST_BENCH_SHARD_URLS`
+  and `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. A role without
+  that right produces a skip notice, not an error.
 
 ## Relationship to the other performance pages
 
@@ -247,6 +299,28 @@ Issue #941 measures and publishes; it does not tune, and it gates nothing.
   migration, and no behaviour or public-API change. Every number is taken from
   columns and events that already existed.
 * **No tuning.** Anything these numbers reveal is a separate issue.
+
+## Publishing a new release's numbers
+
+The published baselines live as constants in the harness
+(`PUBLISHED_BASELINES`), not only in Markdown, so the two cannot drift. Nothing
+about a version bump forces a re-measurement: `PUBLISHED_RESULTS_VERSION` is
+deliberately independent of the crate version, so a release that does not
+re-measure keeps pointing at the last release that did.
+
+To publish a fresh set:
+
+1. Run the suite on an idle reference machine: `./benchmarks/run.sh`. It writes
+   to `benchmarks/results/<timestamp>.md` (gitignored working output — not to be
+   confused with `docs/benchmarks/`, which is the published, permanent copy).
+2. Check the run's **noise control** section first. If the replay spread across
+   the sweep is above 10%, the box was not quiet; re-run rather than publish.
+3. Copy the report to `docs/benchmarks/results-v<version>.md`, adding the
+   hardware block and the reading of the shard sweep.
+4. Update `PUBLISHED_BASELINES` and `PUBLISHED_RESULTS_VERSION` in the harness,
+   and the headline table above.
+5. `cargo test -p autumn-harvest --test integration -- benchmarks_docs` will fail
+   until all four agree.
 
 ## Where the code is
 

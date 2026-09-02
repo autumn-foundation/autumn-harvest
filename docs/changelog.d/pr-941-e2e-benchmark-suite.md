@@ -61,9 +61,13 @@
   as the component-level complement, and `benchmarks_docs.rs` fails the build if
   a CI manifest row ever runs an end-to-end scenario (issue #941 puts CI-gated
   end-to-end budgets out of scope until baselines stabilise). The same guard
-  pins the doc to the harness: the published baselines are constants, the doc
-  must contain them, the documented command must be the committed runner, and
-  the compose file must define a service per shard.
+  pins the doc to the harness: the published baselines are constants, the index
+  page and the versioned results file must both carry them (the results file on
+  a matching scenario/shard row, not merely somewhere in the text), every
+  documented environment variable must be one the harness actually reads, the
+  documented command must be the committed runner, the published worker and
+  concurrency configuration must be the constants the run used, and the compose
+  file must define a service per shard.
 
   **Zero engine impact.** No new `WorkflowEvent` variant, no migration, no
   behaviour or public-API change; nothing under `autumn-harvest/src/` is touched.
