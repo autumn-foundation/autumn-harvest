@@ -18374,6 +18374,28 @@ mod migrate_cli_tests {
     }
 
     #[test]
+    fn a_url_password_option_other_than_password_is_withheld_too() {
+        // The URL branch delegates to `redact_dsn`, which matched the exact
+        // key `password` while the keyword branch matched any key *containing*
+        // it. So the same secret was redacted or not depending purely on how
+        // the DSN was spelled, and `?sslpassword=` -- a real libpq option --
+        // reached the migration report.
+        for dsn in [
+            "postgres://db.prod/harvest?sslpassword=hunter2",
+            "postgresql://db.prod/harvest?sslmode=require&sslpassword=hunter2",
+        ] {
+            let label = migrate_target_label(dsn, 2);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label} (from {dsn})"
+            );
+            // Withholding the whole DSN costs the label its identity, so the
+            // ordinal is what keeps two targets apart.
+            assert_eq!(label, "<redacted dsn> #2", "from {dsn}");
+        }
+    }
+
+    #[test]
     fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
         // A mistyped URL that loses the `://` but keeps the credential scans
         // as the "keyword" `postgres`: character-set-valid, and with no
