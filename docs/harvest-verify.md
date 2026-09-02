@@ -12,7 +12,7 @@ the always-on syntactic layer: the `#[workflow]` compile-time guardrails
 (HVG001–HVG011) and `harvest det-check` (DET001–DET011), both documented in the
 [workflow determinism guide](workflow-determinism-guide.md). Those are
 sub-second, unconditional and body-or-one-hop scoped. `harvest-verify` is
-opt-in, minutes-long, and follows values across crate boundaries.
+opt-in, needs its own MIR build, and follows values across crate boundaries.
 
 It is a **prototype** (issue #962). Read
 [`docs/rnd/determinism-static-analysis.md`](rnd/determinism-static-analysis.md)
@@ -82,7 +82,7 @@ $ cargo harvest-verify --list-boundaries
 | `-p, --package <NAME>` | Package to analyze. Repeatable. |
 | `--lib` | Analyze the package's library target. |
 | `--example <NAME>` | Analyze one example target. Repeatable. |
-| `--all-examples` | Analyze every example target of the selected packages. |
+| `--all-examples` | Analyze every example target of the selected packages **whose `required-features` are enabled**. Each skipped example prints a `warning: skipping example <name>: required feature(s) not enabled: <list>` line, so the analyzed set is always visible in the output. |
 | `--bin <NAME>` | Analyze one binary target. Repeatable. |
 | `--features <LIST>` | Comma-separated features to enable, as for `cargo build`. |
 | `--no-default-features` | Disable default features. |
@@ -93,12 +93,18 @@ $ cargo harvest-verify --list-boundaries
 | `--allowlist <FILE>` | Load an allowlist (conventionally `harvest-verify.allow.toml`). |
 | `--strict` | `unknown` verdicts and unused allowlist entries fail the run. |
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` emits the full report. |
-| `--report` | Print the summary footer: analyzed/proven/unknown/found/allowed counts, the boundary tally, and any warnings. |
+| `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
 
-**`--release` and any `-C opt-level` above 0 are refused.** MIR inlining is on at
-`opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the analysis
-would silently lose the very hops its traces exist to name.
+**There is no `--release` flag, and optimized builds are refused.** MIR inlining
+is on at `opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the
+analysis would silently lose the very hops its traces exist to name. So:
+`--release` is not accepted as an argument at all (unknown flag, exit `2`), and
+the driver additionally refuses an optimization requested through the
+environment — `CARGO_PROFILE=release`, a non-zero `CARGO_PROFILE_DEV_OPT_LEVEL`,
+or a `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` carrying `-O` or a non-zero
+`-C opt-level` — with a tool error (exit `2`) naming the variable. The build it
+runs always ends in `-- --emit=mir -C opt-level=0`.
 
 ### Exit codes
 
@@ -126,35 +132,89 @@ self-explanatory. This mirrors `harvest det-check`'s contract.
 `unknown` **never** counts as a detection and never counts as a pass. It is a
 third answer, and the reason the tool does not offer a binary verdict.
 
-Every run also prints the model version and the boundary set, e.g.:
+Every run opens with the model version and the rustc it read, and closes with the
+counts and the boundary set. Verbatim, from a real run over this repo's examples:
 
+```console
+$ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
+    -p autumn-harvest --all-examples --no-default-features --features testing \
+    --allowlist harvest-verify.allow.toml --report
+harvest-verify: model 2026.09.0, rustc rustc 1.98.0 (88d9e12ae 2026-08-18)
+
+proven-deterministic  workflow_logs::import_batch
+... one line per workflow ...
+
+warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
+warning: the MIR parser is validated on rustc 1.94.x; this run used `rustc 1.98.0 (88d9e12ae 2026-08-18)`. A format change surfaces as a `mir-parse` boundary, never as a wrong verdict
+
+analyzed 57: proven 56, unknown 0, found 0, allowed 1
+verdicts hold under model 2026.09.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
-under model 2026.09.0 (rustc 1.94.1); boundaries: dyn-dispatch, external-crate-body
-```
+
+Three things about that footer are worth knowing before you quote it:
+
+- **The boundary list is the tool's whole vocabulary, not this run's hits.** It
+  is `BoundaryKind::ALL` — the same twelve names `--list-boundaries` prints, in
+  the same order. It says what the analyzer *cannot* see in general; the
+  boundaries actually hit in a run appear on the individual workflows, as
+  `unknown:` lines.
+- **`rustc rustc 1.98.0 …` really does print the word twice.** The recorded
+  version string already begins with `rustc`, and the header prefixes it again.
+  Cosmetic, and left described rather than quietly tidied so the page matches the
+  binary.
+- **The version-mismatch warning overstates its guarantee.** A change to the MIR
+  *grammar* does surface as a `mir-parse` boundary. A change to how rustc
+  *spells a type* does not: the parser reads it fine and a model row silently
+  stops matching. That has already happened once —
+  [see the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
+  — so treat a toolchain bump as a reason to re-run the corpus, not as something
+  the warning has handled for you.
 
 ### The shape of a finding
 
 A finding names the **source**, the **sink**, and every hop between them —
 including the generic substitution that made the hop possible:
 
+Below is a real finding, copied from a run over the corpus case
+`wf_hashmap_generic_dispatch` (line-wrapped here; the tool prints each field on
+one line):
+
 ```
-nondeterminism-found: my_workflows::dispatch::dispatch_pending
-  kind: tainted-sink-argument   taint: Order
-  source: <HashMap<String, u32> as IntoIterator>::into_iter
-          in helpers::pairs  [T := HashMap<String, u32>]
-  trace:  my_workflows::dispatch::dispatch_pending::{closure#0}
-       -> calls helpers::pairs::<HashMap<String, u32>>  [T := HashMap<String, u32>]
-       -> iterates HashMap (Order taint on the returned Vec)
-       -> returns to `items`
-       -> loop element -> `entry`
-       -> emits WorkflowContext::execute_activity_raw  (argument 2)
-  sink:   WorkflowContext::execute_activity_raw
+nondeterminism-found  harvest_verify_corpus_seeded::wf_hashmap_generic_dispatch::wf_hashmap_generic_dispatch
+  tainted-sink-argument [order] Order taint from <HashMap<std::string::String, u32> as IntoIterator>::into_iter
+      in pairs reaches autumn_harvest::WorkflowContext::execute_activity_raw
+      in wf_hashmap_generic_dispatch::{closure#0}
+    trace: wf_hashmap_generic_dispatch::{closure#0}: calls pairs::<HashMap<std::string::String, u32>>
+        -> harvest_verify_corpus_helpers::pairs [T := HashMap<std::string::String, u32>]
+        -> pairs: calls <HashMap<std::string::String, u32> as IntoIterator>::into_iter (`HashMap::into_iter`)
+        -> pairs: calls <... as Iterator>::collect::<Vec<(String, u32)>>
+        -> wf_hashmap_generic_dispatch::{closure#0}: calls <Vec<(std::string::String, u32)> as IntoIterator>::into_iter
+        -> wf_hashmap_generic_dispatch::{closure#0}: calls <std::vec::IntoIter<(std::string::String, u32)> as Iterator>::next
+        -> wf_hashmap_generic_dispatch::{closure#0}: emits autumn_harvest::WorkflowContext::execute_activity_raw
+    source: pairs bb0 <HashMap<std::string::String, u32> as IntoIterator>::into_iter
+    sink: wf_hashmap_generic_dispatch::{closure#0} bb18 autumn_harvest::WorkflowContext::execute_activity_raw
 ```
+
+The layout is fixed: a verdict line, then one block per finding whose first line
+is `<kind> [<taint>] <message>`, then a `trace:` chain of `->`-separated hops, a
+`source:` and a `sink:`, each given as `<function> <block> <what>`. A workflow
+can carry several findings — this one also reports a `control-dependent-sink
+[control]` for the same flow, because the loop over the hash-ordered pairs is
+itself a tainted branch.
 
 Read it bottom-up if you are fixing it: the sink is where the divergence becomes
 visible in history, the source is what to change, and the hops tell you which
-function to look at. In this example the fix is either `sort` the pairs before
-dispatch or use a `BTreeMap` — the same remedy DET010/HVG011 recommend.
+function to look at. Note `[T := HashMap<std::string::String, u32>]` on the
+second hop — that is the generic substitution that made the hop visible; `pairs`
+is a generic helper in another crate and its MIR is dumped in generic form. In
+this example the fix is either to `sort` the pairs before dispatch or to use a
+`BTreeMap` — the same remedy DET010/HVG011 recommend.
+
+Boundaries print in the same block, one per line, as
+`  unknown: <boundary>: <detail> at <function> <block>` — for example
+`unknown: dyn-dispatch: <dyn Fetcher as Fetcher>::get at wf_dyn_unknown_impl::{closure#0} bb4`.
+They are printed even when the verdict is `nondeterminism-found`, so nothing the
+analyzer could not see is hidden behind a finding.
 
 MIR carries almost no source spans (only impl and closure headers), so hops are
 named by function and, where the tool can match a call expression uniquely,
@@ -277,9 +337,19 @@ and is a non-sink.
 
 The job below mirrors this repository's own (`.github/workflows/ci.yml`, job
 `harvest-verify`). Note the cache: a cold `--target-dir` rebuilds the whole
-dependency graph before the first `.mir` file exists, which alone exceeds a
-five-minute budget. **The performance target for this job is a warm-cache
-number.**
+dependency graph before the first `.mir` file exists. **The performance target
+for this job is a warm-cache number.**
+
+For scale, the gate over this repository's 43 buildable example targets — 57
+`#[workflow]` fns — was measured at **25.1 s** warm, **18.6 s** on an immediate
+repeat, and **1 min 41 s** cold into a fresh `--target-dir` that ended up 4.0 GB.
+Cold is therefore not automatically fatal, but that measurement was taken with
+cargo's registry already populated; a CI runner also pays the crate downloads,
+which is why the cache stays load-bearing and the published target stays a
+warm-cache number. The authoritative figure for this repo is the `harvest-verify`
+job log, which wraps the gate in `time`. Note that this is one `time` around the
+whole command, so it reports emit **plus** analysis — there is no phase split
+published anywhere today, and `--report` does not produce one.
 
 ```yaml
 name: determinism (semantic)
@@ -325,15 +395,39 @@ The ones you are most likely to meet:
 - **`unknown` is common in real code and is not a failure.** `dyn` dispatch with
   more than one implementing type, fn pointers, `extern "C"`, raw pointers, and
   callees in crates whose MIR was not emitted all produce it.
-- **The MIR text format is not a stable API.** The parser is validated against a
-  recorded rustc version, printed in every report header. On another version the
-  tool warns and any shape it cannot parse becomes `unknown("mir-parse: …")` —
-  never a wrong answer, but possibly a less useful one.
+- **The MIR text format is not a stable API, and the model is more fragile than
+  the parser.** The parser is validated against a recorded rustc version, printed
+  in every report header, and a shape it cannot parse becomes
+  `unknown("mir-parse: …")` rather than a wrong answer. But the parser is not the
+  weak point. Model rows are keyed on the *trimmed* paths and type names rustc
+  prints, so a release that renames a type in its output — not the grammar, just
+  the spelling — leaves the parser happy and a row silently unmatched. On the
+  `1.94 → 1.98` bump exactly that happened: `AtomicU64` began printing as
+  `Atomic<u64>`, and five known-bad corpus workflows started reporting
+  `proven-deterministic` — no warning, no boundary raised, `unknown` count still
+  zero. It was caught by the seeded corpus and fixed, but nothing in the tool's
+  own output would have told you. **Re-run the corpus after any toolchain
+  change**; see
+  [the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot).
+- **A callee with no body and no crate-rooted path is assumed pure.** rustc's
+  trimmed paths make `format` or `String::clone` indistinguishable from a
+  first-party function whose MIR was not emitted, so both are treated as
+  taint-propagators rather than as boundaries. Anything stricter would make
+  nearly every workflow `unknown`. The cost: a non-deterministic source inside an
+  unemitted body is invisible, and you get `proven-deterministic` instead of
+  `unknown`.
 - **`tokio::select!` is invisible to it.** The macro leaves no residual token in
   MIR. HVG010/DET011 remain the gate for select-style racing.
-- **Sanitizers are flow-insensitive.** A `sort()` anywhere in a body clears
-  `Order` taint on that place for the whole body, including at points that run
-  before the sort. This under-reports; it never over-reports.
+- **Sanitizer kills are per-place and monotone.** A `sort()` anywhere in a body
+  clears `Order` taint on that place for the whole body — including at points
+  that run before the sort, and including on branches where the sort never runs.
+  A value sorted on one path counts as sorted on all of them. This under-reports;
+  it never over-reports.
+- **Recursion is cut, not solved.** A callee already on the call stack is not
+  re-entered: the analyzer records a `recursion` boundary and returns a
+  pass-through summary that reports **no sinks**. The verdict degrades to
+  `unknown`, so you are told — but a command emitted only from inside a recursive
+  cycle produces no finding and no trace.
 - **Single-impl devirtualization assumes a closed world.** Correct for the
   analyzed crate set; wrong the moment a downstream crate adds a second impl.
 - **Not analyzed at all:** activity bodies (activities are allowed to be
@@ -355,7 +449,7 @@ The ones you are most likely to meet:
 | Reach | The workflow body; plus one hop to a bare free-function call in the *same module* | Transitive across helpers, closures, trait impls, generic instantiations and first-party crates |
 | Sees data flow? | No | Yes — `Value`, `Order` and `Control` taint |
 | Sees interior mutability, statics, thread-locals? | Only as literal token patterns in the body | Yes, by resolving statics and classifying their types |
-| Cost | Sub-second, compile-time, always on | Minutes; requires a MIR build; opt-in |
+| Cost | Sub-second, compile-time, always on | Requires a MIR build; opt-in. Measured on this repo: ~19–25 s warm, ~1 min 41 s cold over 43 example targets |
 | Verdict | Findings or nothing | Three-valued, with named boundaries |
 | Failure mode | False **negatives** (documented, deliberate) | False positives *and* `unknown`s (allowlisted, measured) |
 
@@ -364,7 +458,7 @@ retired.** The reasoning is a rule-by-rule matrix in
 [the R&D report](rnd/determinism-static-analysis.md#relationship-to-the-syntactic-baseline);
 the short version is that two hazard classes (`select!` macros, bare logging)
 have no semantic coverage at all, and that trading an always-on compile-time hard
-blocker for an opt-in minutes-long check would be a net safety regression.
+blocker for an opt-in check that needs its own MIR build would be a net safety regression.
 
 Both are static analysis, and neither is the last line. The backstops after a
 history exists are unchanged: `WorkflowReplayer` / `harvest-replay` against

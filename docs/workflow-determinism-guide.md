@@ -681,6 +681,27 @@ Each `#[workflow]` fn gets one of three verdicts — `proven-deterministic`,
 or `unknown` (with the analysis boundary named). It is an R&D prototype, opt-in,
 and a build-time tool with no engine footprint.
 
+**What it costs and what it catches, measured on this repository.** Over the 43
+example targets that build under `--no-default-features --features testing` — 57
+`#[workflow]` fns — the tool reports 56 proven, 0 unknown, 0 found and 1
+allowlisted entry: a 1.8% flag rate against its own 10% budget, in 15–25 seconds
+warm (1 min 41 s cold). Against the seeded corpus of 29 non-deterministic
+workflows that the *entire* syntactic layer passes cleanly, it detects **29 of
+29**, each with a fully named cross-crate trace.
+
+> **Before you trust a clean verdict, check the toolchain.** During this issue a
+> rustc upgrade (`1.94.1 → 1.98.0`) changed how one family of types is *spelled*
+> in MIR output, and five known-bad workflows quietly started reporting
+> `proven-deterministic` — no warning, no boundary raised, `unknown` count still
+> zero. The MIR parser handled the upgrade perfectly; the analyzer's model did
+> not, and nothing in the tool's output said so. It was caught only because the
+> seeded corpus is asserted in CI, and it is fixed.
+> **Re-run the corpus after any toolchain change**, and read
+> [§A measured instance of coverage rot](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
+> before treating this layer as a defence rather than an experiment. The
+> guardrails and `det-check` above are unaffected — they are compile-time and
+> token-based, which is exactly the tradeoff the two layers exist to make.
+
 - **[`harvest-verify.md`](harvest-verify.md)** — the user guide: how to run it,
   every flag, the exit-code contract, how to read a trace, the allowlist format,
   extending the model without a tool release, and a GitHub Actions recipe.
@@ -696,7 +717,7 @@ and a build-time tool with no engine footprint.
 22 HVG and DET rules, and the answer is that the syntactic layer stays exactly as
 it is. Two reasons: `tokio::select!` leaves no residual token in MIR, so
 HVG010/DET011 remain the *only* defence against select-style racing; and trading
-an always-on, sub-second, compile-time hard blocker for an opt-in, minutes-long
+an always-on, sub-second, compile-time hard blocker for an opt-in, build-heavy
 check would be a net safety regression. The layers compose — fast first line, deep
 second line — and both are still static analysis, with `WorkflowReplayer` and the
 live `HistoryMatcher` as the backstops once a history exists.

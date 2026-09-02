@@ -33,9 +33,9 @@ everything it calls.
   a clean result reads as *"no non-determinism found, under model M, up to
   boundaries B"*.
 - **The model is data, not code** (AC4). `harvest-verify.model.toml` classifies all
-  **160** public `WorkflowContext` methods across ten tables — 111 sources, 85
+  **160** public `WorkflowContext` methods across ten tables — 124 sources, 85
   sinks, 18 sanctioned primitives, 105 non-sinks, 8 handler registrations, 34
-  forbidden effects, 16 sanitizers, 22 reductions, 24 trusted crates, 24 ambient
+  forbidden effects, 16 sanitizers, 22 reductions, 24 trusted crates, 25 ambient
   types — each row carrying a `context.rs` line citation. `ctx.system_now`,
   `ctx.new_uuid`, `ctx.random_*`, `ctx.side_effect` (#384), `ctx.version` and
   `UserMetrics` emission (#532) are modelled as determinism-preserving, and
@@ -66,12 +66,51 @@ everything it calls.
   report states that conflict and its resolution explicitly.
 - **CI gating** (AC6): a new Linux `harvest-verify` job runs the corpus and engine
   tests, the false-positive metric over this repo's own examples, and a non-strict
-  gate run, with both phases wrapped in `time` so the emit/analyze split lands in
-  the log. Exit `1` on any finding, exit `2` on a tool error so "the tool broke"
-  never reads as "your workflow is broken". `unknown` warns by default.
+  gate run wrapped in `time` so its wall clock lands in the log. Exit `1` on any
+  finding, exit `2` on a tool error so "the tool broke" never reads as "your
+  workflow is broken". `unknown` warns by default.
 - **`docs/harvest-verify.md`** — the user guide: flags, exit codes, how to read a
   trace, the allowlist format, a worked example of extending the model without a
   release, a GitHub Actions recipe, and the limitations.
+
+**Every metric is met, measured on `rustc 1.98.0`.** Detection is **29/29 =
+100%** against a ≥ 90% metric, every seeded case carrying a fully named
+cross-crate source→sink trace; the oracle agrees on all **46** rows (29 seeded,
+13 clean, 4 boundary); each of the 4 boundary cases returns `unknown` with the
+expected kind. The false-positive budget is met with room to spare: over this
+repo's own examples the tool analyzes **57** `#[workflow]` fns (inside the 43 of
+53 example targets that build under `--no-default-features --features testing`;
+the other 10 are skipped by `required-features`, and each skip is printed) and
+reports **56 proven, 0 unknown, 0 found, 1 allowlisted — 1.8% against a 10%
+limit**. The whole gate runs in **15–25 s warm** and 1 min 41 s cold into a fresh
+4.0 GB target directory, so the `< 5 min` budget holds comfortably; it is still
+published as a warm-cache number because a CI runner also pays the crate
+downloads. The crate's own suite is **242 tests, 0 failures**.
+
+**The most instructive result in the issue was a regression this PR caught and
+fixed.** The prototype was validated on `rustc 1.94.1`; the toolchain then moved
+to `1.98.0`, which prints the atomic integer types through the generic
+`Atomic<T>` instead of their width aliases. The MIR **parser** absorbed that
+four-release gap with **zero** `mir-parse` boundaries — but the **model**'s
+`[[ambient_type]]` table named `AtomicU64` and not `Atomic`, so atomic statics
+stopped being recognised as ambient roots and **five seeded corpus bugs silently
+became `proven-deterministic`**: `wf_static_counter_in_helper`,
+`wf_atomic_shard_pick`, `wf_tainted_child_workflow_input`,
+`wf_order_dependence_which_first` and `wf_closure_captures_ambient`. Detection
+fell to 24/29 (82.8%) and the oracle to 41/46, **with the `unknown` count pinned
+at zero throughout and no warning of any kind**. The neighbouring ambient
+families (`static Mutex`, `static RwLock`, `thread_local!` `RefCell`, `Cell`)
+were unaffected, which pinned the cause to the type-name change; the fix is an
+`Atomic` ambient-type row plus generic-spelling `[[source]]` rows for the atomic
+operations, keeping the alias rows for MIR emitted by older toolchains. The
+lesson is recorded in the report as **§A measured instance of coverage rot**,
+because it falsifies two things the design had assumed: the planned
+`unknown`-count ratchet would *not* have caught this (the `unknown` count never
+moved, so the format-drift condition on the go is restated to cover the corpus
+detection rate), and the tool's own warning that "a format change surfaces as a
+`mir-parse` boundary, never as a wrong verdict" is stronger than the design
+supports. The seeded corpus paid for itself here: it is the only thing in the
+repository that noticed.
 
 **Zero engine footprint (AC7), by construction.** This is a build-time tool. **No
 new `WorkflowEvent` variant, no database migration, no `#[workflow]` macro-path
@@ -86,7 +125,7 @@ each rule catches, what launders past it, and whether the semantic pass subsumes
 it. Most rules are subsumed and several are materially extended — but HVG010/DET011
 (`select!`) have **no** semantic coverage, because the macro leaves no residual
 token in MIR, and trading an always-on sub-second compile-time hard blocker for an
-opt-in minutes-long check would be a net safety regression. The syntactic layer
+opt-in check that needs its own MIR build would be a net safety regression. The syntactic layer
 stays the fast first line; this is the deep second line.
 
 **Test evidence.** `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`
