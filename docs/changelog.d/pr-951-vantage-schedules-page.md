@@ -229,3 +229,36 @@ stopped. No budget is rendered for a zero cap now, and it never counts as bounde
 Three pure regression tests and three integration tests, including the backfill path
 across an unreachable earlier shard and a live-bounded-out row's badge, filter and sort
 position.
+
+**Codex round 3 (three P2s — all three the *same* mistake as round 2, in the places round
+2 didn't reach).** Round 2 taught the `max_runs > 0` convention and the "derive terminal
+state from live fields" rule; round 3 found both applied in one place and not the other,
+plus a third instance of the same class.
+
+The `end_at` bound was compared against the wall clock. The scheduler judges it on the
+**pending slot** — `schedule_overdue` tests `next_run_at >= end_at`, and the tick refuses
+a fire whose `effective_fire_time >= end_at` — and `now` is wrong in both directions: a
+schedule whose next slot already sits past the cutoff will never fire again while the
+clock is still short of it (rendered healthy), and after downtime an overdue slot from
+*before* the cutoff is still legal and will be processed once the clock passes it
+(rendered exhausted). Now `next_run_at >= end_at`, falling back to the wall clock only
+when there is no pending slot to judge.
+
+`max_runs = 0` was corrected in the list cell in round 2 but not in the shared preview
+computation, which mapped the raw cap through `remaining_runs_budget`, got `Some(0)`, and
+short-circuited to zero entries — so the preview told an operator an *unlimited* schedule
+had spent its budget. The convention now lives in one place,
+`api::schedule_remaining_runs`, used by both the preview and the `GET /admin/schedules`
+entry; a legacy zero-cap row reports `remaining_runs: null` rather than `0`.
+
+And the preview short-circuited on `is_paused` only. The scheduler's due-list filters on
+`auto_paused_at IS NULL` (#360), so an auto-paused schedule — `is_paused = false` —
+projected future fire times for a schedule that will never fire, on the same page whose
+header correctly badged it Auto-paused. The preview now treats auto-pause as terminal and
+carries the reason (`auto-paused after N consecutive failures; resume to restore firing`)
+so an API caller sees why the list is empty, while `is_paused` keeps mirroring the column.
+
+All three were defects in the *shared* computation, so fixing them repaired
+`GET /admin/schedules/{id}/preview` and `GET /admin/schedules` as well as the page.
+
+Three pure regression tests, including both directions of the `end_at`/pending-slot error.

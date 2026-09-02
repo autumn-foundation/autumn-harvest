@@ -90,7 +90,7 @@ condition:
 |---|---|
 | `Paused` | `is_paused` |
 | `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
-| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds — `runs_started >= max_runs` (for `max_runs > 0`) or `now >= end_at` — before a tick has stamped the column. An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
+| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
 | `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
 
 Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing
@@ -131,7 +131,9 @@ Renders the next N fire times from the same computation as
 - The jitter window (`[scheduled_at, scheduled_at + jitter_secs]`) per entry.
 - An advisory **Overlap risk** flag when `skip`/`buffer_one` could drop the firing.
 - Bounded-run truncation (#478/#543) is applied, and a preview that comes back empty
-  says *why*: paused (with the pause reason), exhausted (with `exhausted_reason`), the
+  says *why*: paused (with the pause reason), **auto-paused** (#360 — the scheduler's
+  due-list filters on `auto_paused_at IS NULL`, so such a schedule will not fire even
+  though its `is_paused` column is false), exhausted (with `exhausted_reason`), the
   `end_at` cutoff, or an expression with no future firings.
 
 `?count=N` (1–100, default 10) controls how many entries are projected.

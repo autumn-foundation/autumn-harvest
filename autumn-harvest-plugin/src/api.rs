@@ -25282,6 +25282,23 @@ pub(crate) fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
     (max_runs - runs_started).max(0)
 }
 
+/// The remaining run budget for a schedule row, encoding the engine's
+/// **`max_runs > 0`** convention: a non-positive cap means *unlimited*, not a
+/// spent budget.
+///
+/// That convention is applied at every bound check in the engine
+/// (`schedule_backfill_inner`, `trigger_schedule_now`, the scheduler's
+/// reservation predicate and `schedule_overdue`) and is pinned by
+/// `backfill_max_runs_zero_is_treated_as_unlimited`. Mapping
+/// [`remaining_runs_budget`] over the raw `Option<i32>` instead yields `Some(0)`
+/// for a legacy `max_runs = 0` row, which reads as "exhausted" everywhere it is
+/// consumed — including the preview's zero-entry short-circuit.
+pub(crate) fn schedule_remaining_runs(max_runs: Option<i32>, runs_started: i32) -> Option<i32> {
+    max_runs
+        .filter(|max| *max > 0)
+        .map(|max| remaining_runs_budget(max, runs_started))
+}
+
 async fn list_schedules(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Value>, AutumnError> {
@@ -26415,9 +26432,7 @@ fn schedule_entry_from_row(
         (ScheduleKind::Dag, String::new())
     };
     let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-    let remaining_runs = s
-        .max_runs
-        .map(|max| remaining_runs_budget(max, s.runs_started));
+    let remaining_runs = schedule_remaining_runs(s.max_runs, s.runs_started);
     let (execution_timeout_secs, sla_secs) = resolve_schedule_deadline_secs(registry, &name);
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         s.catchup_policy.as_deref(),
@@ -30547,7 +30562,6 @@ async fn load_schedule_by_id(
 
 /// Like [`load_schedule_by_id`] but also returns the [`ShardId`] of the shard
 /// the schedule was found on, so callers can route subsequent writes correctly.
-/// Resolve a schedule by id across shards.
 ///
 /// Delegates to [`resolve_schedule_with_shard`] so every schedule lookup in the
 /// plugin obeys one rule. The previous implementation `?`-propagated the first
@@ -42319,11 +42333,24 @@ fn empty_preview_response(
     from: chrono::DateTime<chrono::Utc>,
     count: usize,
 ) -> SchedulePreview {
-    let pause_reason = schedule.is_paused.then(|| schedule.pause_reason.clone());
+    // `is_paused` keeps mirroring the column. An auto-paused row has it `false`
+    // yet still previews empty, so the reason carries the explanation rather
+    // than leaving a caller to guess why a healthy-looking schedule projects
+    // nothing (#360).
+    let pause_reason = if schedule.is_paused {
+        schedule.pause_reason.clone()
+    } else if schedule.auto_paused_at.is_some() {
+        Some(format!(
+            "auto-paused after {} consecutive failures; resume to restore firing",
+            schedule.consecutive_failure_count
+        ))
+    } else {
+        None
+    };
     SchedulePreview {
         entries: vec![],
         is_paused: schedule.is_paused,
-        pause_reason: pause_reason.flatten(),
+        pause_reason,
         from,
         count_requested: count,
         end_at: schedule.end_at,
@@ -42390,10 +42417,10 @@ pub(crate) async fn compute_schedule_preview_for(
     use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
 
     // Surfaced on every branch below so a caller can see why a schedule is
-    // bounded even when it returns zero entries.
-    let remaining_runs = schedule
-        .max_runs
-        .map(|max| remaining_runs_budget(max, schedule.runs_started));
+    // bounded even when it returns zero entries. Uses the `max > 0` convention,
+    // so a legacy `max_runs = 0` row is unlimited rather than reporting a spent
+    // budget and truncating the preview to nothing.
+    let remaining_runs = schedule_remaining_runs(schedule.max_runs, schedule.runs_started);
 
     // Paused schedules return zero entries with a paused reason summary.
     //
@@ -42406,7 +42433,16 @@ pub(crate) async fn compute_schedule_preview_for(
     // harmless belt-and-suspenders match — `truncate_preview_entries_by_bounds`
     // would produce an empty list for `Some(0)` regardless, so this only skips
     // the unnecessary schedule-parsing and calendar-exclusion work).
-    if schedule.is_paused || schedule.exhausted_at.is_some() || remaining_runs == Some(0) {
+    // `auto_paused_at` is as terminal as `is_paused` for firing: the scheduler's
+    // due-list filters on `auto_paused_at IS NULL` (#360), so an auto-paused
+    // schedule will not fire even though its `is_paused` column is false.
+    // Projecting fire times for it would tell an operator a stopped schedule has
+    // upcoming firings.
+    if schedule.is_paused
+        || schedule.auto_paused_at.is_some()
+        || schedule.exhausted_at.is_some()
+        || remaining_runs == Some(0)
+    {
         return Ok(empty_preview_response(
             &schedule,
             remaining_runs,

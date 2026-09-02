@@ -7633,11 +7633,28 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// engine's convention at every bound check (and is pinned by
 /// `backfill_max_runs_zero_is_treated_as_unlimited`).
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
-    row.exhausted_at.is_some()
-        || row.end_at.is_some_and(|end_at| now >= end_at)
-        || row
-            .max_runs
-            .is_some_and(|max| max > 0 && row.runs_started >= max)
+    if row.exhausted_at.is_some() {
+        return true;
+    }
+    if row
+        .max_runs
+        .is_some_and(|max| max > 0 && row.runs_started >= max)
+    {
+        return true;
+    }
+    // The `end_at` bound is about the **pending slot**, not the wall clock —
+    // `schedule_overdue` tests `next_run_at >= end_at`, and the tick refuses a
+    // fire whose `effective_fire_time >= end_at`. Comparing `now` instead is
+    // wrong in both directions: a schedule whose next slot is already past the
+    // cutoff will never fire again while the clock is still short of it (we
+    // would call it healthy), and after downtime an overdue slot from *before*
+    // the cutoff is still legal and will be processed once the clock has passed
+    // it (we would call it exhausted). Fall back to the wall clock only when
+    // there is no pending slot to judge.
+    row.end_at.is_some_and(|end_at| {
+        row.next_run_at
+            .map_or(now >= end_at, |next_run_at| next_run_at >= end_at)
+    })
 }
 
 /// Derive a row's health flags. Pure: every badge, sort and summary decision on
@@ -9512,10 +9529,16 @@ fn render_schedule_preview_page(
         h2 { "Fire-time preview — " code { (schedule_target_name(row)) } }
         (render_schedule_drilldown_header(row, shard_id, "preview"))
 
-        @if preview.is_paused {
+        @if preview.is_paused || row.auto_paused_at.is_some() {
             div.degraded-banner role="status" {
-                strong { "Schedule is paused. " }
-                "No fire times are projected while a schedule is paused."
+                @if row.auto_paused_at.is_some() && !preview.is_paused {
+                    strong { "Schedule is auto-paused. " }
+                    "The scheduler excludes auto-paused schedules from firing (#360), "
+                    "so no fire times are projected until it is resumed."
+                } @else {
+                    strong { "Schedule is paused. " }
+                    "No fire times are projected while a schedule is paused."
+                }
                 @if let Some(ref reason) = preview.pause_reason {
                     " Reason: " (reason)
                 }
@@ -9532,6 +9555,8 @@ fn render_schedule_preview_page(
                 "No upcoming fire times."
                 @if preview.remaining_runs == Some(0) {
                     " The run budget is spent."
+                } @else if row.auto_paused_at.is_some() {
+                    " The schedule is auto-paused."
                 } @else if let Some(end_at) = preview.end_at {
                     " The window ends " (format_timestamp(Some(end_at))) "."
                 } @else if !preview.is_paused && preview.exhausted_reason.is_none() {
@@ -15244,6 +15269,121 @@ mod tests {
         assert_eq!(
             rows[0].1.id, bounded_out.id,
             "a live-bounded-out row must sort above a healthy one despite firing later"
+        );
+    }
+
+    // -- Codex round 3 regressions --
+
+    /// Codex r3 #1: the `end_at` bound is about the pending slot, not the wall
+    /// clock. `schedule_overdue` tests `next_run_at >= end_at`; comparing `now`
+    /// is wrong in both directions.
+    #[test]
+    fn end_at_exhaustion_is_judged_on_the_pending_slot() {
+        let now = chrono::Utc::now();
+        let cutoff = now + chrono::Duration::hours(2);
+
+        // Next slot is already past the cutoff, but the clock is not: the
+        // scheduler will never fire this again, so it is bounded out.
+        let slot_past_cutoff = HarvestSchedule {
+            end_at: Some(cutoff),
+            next_run_at: Some(cutoff + chrono::Duration::minutes(1)),
+            ..make_schedule(Some("slot_past"), None, false)
+        };
+        assert!(
+            schedule_is_bounded_out(&slot_past_cutoff, now),
+            "a next slot at/past end_at means no legal slot remains"
+        );
+
+        // The clock has passed the cutoff, but an overdue slot from before it is
+        // still legal and the tick will process it: NOT bounded out.
+        let overdue_legal_slot = HarvestSchedule {
+            end_at: Some(now - chrono::Duration::hours(1)),
+            next_run_at: Some(now - chrono::Duration::hours(2)),
+            ..make_schedule(Some("overdue_legal"), None, false)
+        };
+        assert!(
+            !schedule_is_bounded_out(&overdue_legal_slot, now),
+            "an overdue slot from before the cutoff is still fireable"
+        );
+
+        // A slot comfortably before the cutoff is fine.
+        let healthy = HarvestSchedule {
+            end_at: Some(cutoff),
+            next_run_at: Some(now + chrono::Duration::minutes(5)),
+            ..make_schedule(Some("healthy"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&healthy, now));
+
+        // No pending slot at all: fall back to the wall clock.
+        let no_slot_past_cutoff = HarvestSchedule {
+            end_at: Some(now - chrono::Duration::hours(1)),
+            next_run_at: None,
+            ..make_schedule(Some("no_slot"), None, false)
+        };
+        assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
+
+        let no_slot_before_cutoff = HarvestSchedule {
+            end_at: Some(cutoff),
+            next_run_at: None,
+            ..make_schedule(Some("no_slot_ok"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
+    }
+
+    /// Codex r3 #2: `max_runs = 0` is unlimited, so the *preview* must not report
+    /// a spent budget either. The list cell was corrected in round 2 while the
+    /// shared computation still mapped the raw cap.
+    #[test]
+    fn a_zero_run_cap_is_unlimited_in_the_shared_budget_helper() {
+        assert_eq!(
+            crate::api::schedule_remaining_runs(Some(0), 12),
+            None,
+            "max_runs = 0 is unlimited, not a spent budget"
+        );
+        assert_eq!(crate::api::schedule_remaining_runs(Some(-1), 3), None);
+        assert_eq!(crate::api::schedule_remaining_runs(None, 3), None);
+        assert_eq!(crate::api::schedule_remaining_runs(Some(10), 4), Some(6));
+        assert_eq!(
+            crate::api::schedule_remaining_runs(Some(3), 9),
+            Some(0),
+            "a genuinely spent positive cap still reports zero"
+        );
+    }
+
+    /// Codex r3 #3: an auto-paused schedule previews empty, and the page says
+    /// why rather than blaming the expression.
+    #[test]
+    fn preview_page_explains_an_auto_paused_schedule() {
+        let row = HarvestSchedule {
+            is_paused: false,
+            auto_paused_at: Some(chrono::Utc::now()),
+            consecutive_failure_count: 4,
+            ..make_schedule(Some("flaky_wf"), None, false)
+        };
+        let preview = crate::api::SchedulePreview {
+            entries: vec![],
+            is_paused: false,
+            pause_reason: Some(
+                "auto-paused after 4 consecutive failures; resume to restore firing".to_string(),
+            ),
+            from: chrono::Utc::now(),
+            count_requested: 10,
+            end_at: None,
+            remaining_runs: None,
+            exhausted_reason: None,
+        };
+        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        assert!(
+            html.contains("auto-paused"),
+            "the banner must name auto-pause: {html}"
+        );
+        assert!(
+            html.contains("4 consecutive failures"),
+            "the reason must be surfaced: {html}"
+        );
+        assert!(
+            !html.contains("produces no future firings"),
+            "must not blame the expression for an auto-pause: {html}"
         );
     }
 
