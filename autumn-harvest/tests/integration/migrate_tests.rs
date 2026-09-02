@@ -589,17 +589,24 @@ async fn a_nontransactional_body_that_loses_the_ledger_race_is_still_reported_un
     let (_container, url) = empty_postgres().await;
     migrate::apply(&url, &[]).await.expect("ledger created");
 
-    // Stand in for the migrator that wins the race: the version is already
-    // recorded when this run's insert lands.
-    let mut other = connect(&url).await;
-    diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ('29990106000000')")
-        .execute(&mut other)
-        .await
-        .expect("the winning migrator records the version");
-
+    // Stand in for the migrator that wins the race, from *inside* the body.
+    //
+    // The timing this test is about is narrow and load-bearing: the competing
+    // row has to land after this run reads the ledger to build its plan and
+    // before this run's own insert. Recording it up front instead -- the
+    // obvious way to write this -- misses the path entirely: `build_plan`
+    // reads the ledger first, sees the version, and files the migration under
+    // `already_applied`, so the body never runs and the report comes back
+    // empty on all three lists.
+    //
+    // Putting the insert in the body hits the window exactly, and
+    // deterministically: `run_in_transaction = false` means each statement
+    // commits as it executes, so the row is visible to this run's insert the
+    // moment the body finishes -- no second connection, no thread, no sleep.
     let nontransactional = MigrationScript::with_metadata(
         "29990106000000_harvest_migrate_probe_raced",
-        "CREATE TABLE IF NOT EXISTS harvest_migrate_raced (id INTEGER PRIMARY KEY);",
+        "CREATE TABLE IF NOT EXISTS harvest_migrate_raced (id INTEGER PRIMARY KEY); \
+         INSERT INTO __diesel_schema_migrations (version) VALUES ('29990106000000');",
         "run_in_transaction = false\n",
     )
     .expect("metadata parses");
