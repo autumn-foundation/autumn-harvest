@@ -39,33 +39,35 @@ full environment, the per-cell notes and the verbatim run output are in
 
 | scenario | metric | 1 shard | 2 shards | 4 shards |
 |:--|:--|--:|--:|--:|
-| `throughput` | workflows/sec | 24.26 | 35.30 | 31.21 |
-| `dispatch_latency` | p50 ms | 41.13 | 35.63 | 54.23 |
-| `dispatch_latency` | p99 ms | 59.15 | 85.20 | 104.42 |
-| `signal_roundtrip` | p50 ms | 54.13 | 46.17 | 52.96 |
-| `signal_roundtrip` | p99 ms | 67.00 | 76.50 | 89.94 |
-| `replay_throughput` | events/sec | 9 164 358.24 | 9 293 754.57 | 8 485 196.09 |
+| `throughput` | workflows/sec | 23.73 | 35.70 | 33.58 |
+| `dispatch_latency` | p50 ms | 40.98 | 47.22 | 58.02 |
+| `dispatch_latency` | p99 ms | 58.63 | 65.49 | 111.75 |
+| `signal_roundtrip` | p50 ms | 53.59 | 44.74 | 54.23 |
+| `signal_roundtrip` | p99 ms | 65.96 | 71.16 | 92.90 |
+| `replay_throughput` | events/sec | 9 204 142.19 | 9 282 928.36 | 9 240 557.56 |
 
 Four things a reader should take from that table before anything else:
 
-* **Sharding bought 1.45x at two shards and then gave some back.** Four shards
+* **The box was idle, and that is a precondition rather than a formality.** The
+  replay control — in-memory, so it cannot legitimately move with shard count —
+  spread **0.8%** across this sweep. An earlier sweep of the same code on the
+  same machine, taken while the machine was also compiling, read **8.7%** and
+  deformed its latency cells badly enough to invert the dispatch p50 ordering;
+  another read 602 ms in a cell that reads 58 ms here. On four cores a
+  concurrent build is enough to move a published latency by more than 10x, so
+  check your own run's noise-control section before comparing anything.
+* **Sharding bought 1.50x at two shards and then gave some back.** Four shards
   is slower than two *on this machine*, which runs four Postgres clusters, four
-  workers and the harness on four cores. This has reproduced across every sweep
-  taken here. See
+  workers and the harness on four cores. This reproduces on every sweep taken
+  here. See
   [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show).
-* **The tail degrades much faster than the median.** Dispatch p99 goes 59.15 →
-  104.42 ms across the sweep while p50 stays within about 30% of where it
-  started.
-* **Two rows are not monotonic, and that is noise, not a finding.** Dispatch and
-  signal p50 both read lower at 2 shards than at 1. Both gaps are smaller than
-  the run's own 8.7% noise floor (measured by the replay control), and the 1-
-  and 2-shard latency cells have traded places across sweeps. Read the latency
-  columns as "roughly flat from 1 to 2, clearly worse at 4", not as an ordering.
-* **p99 is the least reproducible number here.** It is published and checked
-  because #941's success metric names it, but a tail measured on a box that is
-  also running the harness is partly a measurement of that box's run queue —
-  the reason issue #786 gates p50 rather than p99. A p99 outside tolerance on a
-  busy machine is expected, not a regression.
+* **The tail degrades about twice as fast as the median.** Dispatch p50 rises
+  42% across the sweep while its p99 rises 91%.
+* **One row is genuinely non-monotonic.** Signal p50 dips at two shards (44.74)
+  below one shard (53.59) and recovers at four. On a sweep whose control read
+  0.8% that is not noise — but this suite has no instrumentation to attribute
+  it, so the results file records it as an observation and declines to guess at
+  a mechanism.
 
 ### Results by release
 
