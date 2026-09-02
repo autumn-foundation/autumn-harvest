@@ -1275,6 +1275,48 @@ async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
     assert!(surviving_keys(&mut conn).await.is_empty());
 }
 
+#[tokio::test]
+async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() {
+    // Codex review round 4, P2. The sweep now pages by a keyset cursor instead
+    // of restarting its ordered scan every batch, so a retained prefix is walked
+    // once per tick rather than once per batch. The risk that buys is a paging
+    // bug: a cursor that advances wrongly would skip collectable rows entirely,
+    // and the rows most exposed are the ones sorting AFTER a retained block.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // Retained (pinned by a live task) — and sorting FIRST, so every batch would
+    // have to walk past them without a cursor.
+    for i in 0..6 {
+        let key = format!("dyn-rate:aaa:{i:04}");
+        insert_idle_bucket(&mut conn, &key, day_old()).await;
+        insert_task(&mut conn, &key, "PENDING").await;
+    }
+    // Collectable, sorting after every retained row.
+    for i in 0..7 {
+        insert_idle_bucket(&mut conn, &format!("dyn-rate:zzz:{i:04}"), day_old()).await;
+    }
+
+    // batch_size 2 => four batches, each of which must resume past the retained
+    // block rather than re-deciding it.
+    let config = RetentionConfig {
+        batch_size: 2,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(
+        collected(&result),
+        7,
+        "every collectable bucket behind the retained prefix must still be swept"
+    );
+    let survivors = surviving_keys(&mut conn).await;
+    assert_eq!(survivors.len(), 6, "and every pinned bucket must survive");
+    assert!(survivors.iter().all(|key| key.starts_with("dyn-rate:aaa:")));
+}
+
 // ---------------------------------------------------------------------------
 // Upgrade safety — the migration's two backfills (Codex review round 2, P1s)
 // ---------------------------------------------------------------------------

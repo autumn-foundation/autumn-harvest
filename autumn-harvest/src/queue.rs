@@ -4633,6 +4633,23 @@ fn idle_rate_limit_bucket_predicates() -> String {
 ///   across sizes. The `USING` join is a deterministic primary-key lookup per
 ///   victim, which also shortens how long the batch holds row locks that a
 ///   concurrent debit must block on.
+///
+/// Takes a keyset cursor (`$3`, an exclusive lower bound on `key`) for the same
+/// reason the preview does, though not for the same failure.
+///
+/// Deleting what it counted does let the sweep make progress without one — but
+/// only past the rows it *removed*. Rows the predicates RETAIN stay where they
+/// are, so every batch re-walks the whole retained prefix ahead of its victims,
+/// re-evaluating the fullness arithmetic and both anti-joins over it, up to
+/// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`] times a tick (issue #1127, Codex
+/// review round 4). Measured with 200k retained buckets sorting ahead of 50k
+/// collectable ones: 6,737 ms for a 50-batch tick without the cursor, 2,622 ms
+/// with it, for the same 50,000 deletions — and the gap widens with the
+/// retained prefix, on exactly the large tables this pass exists to serve.
+///
+/// The cost is that a row skipped by `SKIP LOCKED` below the cursor waits for
+/// the next tick rather than the next batch, which is the right trade for a
+/// periodic best-effort pass.
 #[must_use]
 fn idle_rate_limit_bucket_sweep_sql() -> String {
     let predicates = idle_rate_limit_bucket_predicates();
@@ -4640,6 +4657,7 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
         "WITH victims AS ( \
              SELECT b.key FROM harvest_rate_limit_buckets b \
               WHERE {predicates} \
+                AND b.key > $3 \
               ORDER BY b.key \
               LIMIT $2 \
               FOR UPDATE SKIP LOCKED \
@@ -4724,29 +4742,27 @@ pub async fn sweep_idle_rate_limit_buckets(
         idle_rate_limit_bucket_sweep_sql()
     };
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    // Keyset cursor, used by the preview only. The sweep pages by deleting what
-    // it counted, so it always re-reads from the start of the eligible set.
+    // Keyset cursor over `key`, used by BOTH shapes: the preview would otherwise
+    // re-read its first batch forever, and the sweep would re-walk the retained
+    // prefix ahead of its victims once per batch.
     let mut cursor = String::new();
 
     for _ in 0..MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK {
-        let mut query = diesel::sql_query(&sql)
+        let rows: Vec<SweptKey> = diesel::sql_query(&sql)
             .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
             .bind::<diesel::sql_types::BigInt, _>(batch)
-            .into_boxed();
-        if preview {
-            query = query.bind::<diesel::sql_types::Text, _>(cursor.clone());
-        }
-        let rows: Vec<SweptKey> = query
+            .bind::<diesel::sql_types::Text, _>(cursor.clone())
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
         let swept = rows.len();
+        // The MAXIMUM key, not the last row: the preview's `SELECT` is ordered,
+        // but a `DELETE ... RETURNING` is not, so "the last row" would be an
+        // arbitrary one and could rewind the cursor into rows already handled.
+        if let Some(highest) = rows.iter().map(|row| &row.key).max() {
+            cursor.clone_from(highest);
+        }
         for row in rows {
-            // Keys come back in `key` order, so the last one is the next page's
-            // exclusive lower bound.
-            if preview {
-                cursor.clone_from(&row.key);
-            }
             // A key that no longer classifies cannot happen (the SQL filters on
             // the same prefix list), but counting it under a synthesised label
             // would be worse than not counting it.
@@ -5992,8 +6008,9 @@ mod tests {
         // preview: an operator would derisk against the wrong answer.
         let predicates = idle_rate_limit_bucket_predicates();
         let preview = idle_rate_limit_bucket_preview_sql();
+        let sweep = idle_rate_limit_bucket_sweep_sql();
         assert!(preview.contains(&predicates));
-        assert!(idle_rate_limit_bucket_sweep_sql().contains(&predicates));
+        assert!(sweep.contains(&predicates));
         // ...and it must not be able to modify anything.
         assert!(preview.starts_with("SELECT b.key FROM harvest_rate_limit_buckets b"));
         for mutating in ["DELETE", "UPDATE", "FOR UPDATE"] {
@@ -6002,15 +6019,20 @@ mod tests {
                 "the dry-run preview must not contain `{mutating}`"
             );
         }
-        // It must page by keyset, or — deleting nothing — it would re-read the
-        // first batch forever and forecast at most one batch against a pass
-        // that spends the whole per-tick budget.
-        assert!(preview.contains("AND b.key > $3"));
-        assert!(preview.contains("ORDER BY b.key"));
-        assert!(
-            !idle_rate_limit_bucket_sweep_sql().contains("$3"),
-            "the sweep pages by deleting what it counted and takes no cursor"
-        );
+        // BOTH shapes page by keyset over the same ordering. The preview would
+        // otherwise re-read its first batch forever (it deletes nothing) and the
+        // sweep would re-walk its retained prefix once per batch, re-running the
+        // anti-joins over rows it has already decided to keep.
+        for (label, sql) in [("preview", preview.as_str()), ("sweep", sweep.as_str())] {
+            assert!(
+                sql.contains("AND b.key > $3"),
+                "the {label} must page by keyset cursor"
+            );
+            assert!(
+                sql.contains("ORDER BY b.key"),
+                "the {label}'s cursor is only sound over that ordering"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
