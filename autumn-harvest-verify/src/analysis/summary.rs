@@ -25,11 +25,13 @@
 //! `unknown` rather than silently `proven`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use crate::mir::ast::{BasicBlock, Body, Local, Operand, Place, Projection, Statement, Terminator};
 use crate::model::callee::CalleePath;
-use crate::model::{CallClass, Model, SinkRule};
+use crate::model::{CallClass, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule};
 use crate::resolve::{Program, Resolution, Substitution};
+use crate::util::{last_segment, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
 use super::control::ControlGraph;
@@ -44,11 +46,6 @@ fn read_operand(operand: &Operand, state: &TaintState, discriminant: bool) -> Ta
         Operand::Copy(place) | Operand::Move(place) => state.read(place, discriminant),
         Operand::Const { .. } => TaintSet::new(),
     }
-}
-
-/// Parse a printed callee path (a thin wrapper for readability at call sites).
-fn parsed_of(printed: &str) -> CalleePath {
-    CalleePath::parse(printed)
 }
 
 /// Body analyses per workflow entry.
@@ -96,6 +93,133 @@ struct SinkRecord {
     site: Site,
 }
 
+/// Where the analyzer currently is: the body being walked, the block inside it,
+/// and the context the body was entered with.
+///
+/// These five values are threaded verbatim through every transfer function and
+/// never change inside one, so they travel as one `Copy` value rather than as
+/// five parameters repeated down the call chain.
+#[derive(Clone, Copy)]
+struct Frame<'f> {
+    /// MIR path of the body being analyzed.
+    path: &'f str,
+    body: &'f Body,
+    block: &'f BasicBlock,
+    /// The generic substitution this body is being analyzed under.
+    subst: &'f Substitution,
+    /// The hop chain from the workflow entry to this body.
+    hops: &'f [Hop],
+}
+
+impl<'f> Frame<'f> {
+    /// The same frame, moved to another block of the same body.
+    const fn at(self, block: &'f BasicBlock) -> Self {
+        Self { block, ..self }
+    }
+}
+
+/// The parts of a `Call` terminator the transfer functions read.
+#[derive(Clone, Copy)]
+struct CallOperands<'c> {
+    dest: &'c Place,
+    /// `None` for an indirect call (`_8 = copy _5(..)`), which has no path.
+    callee: Option<&'c str>,
+    /// The callee operand of an indirect call, for the boundary's detail text.
+    indirect: Option<&'c Operand>,
+    args: &'c [Operand],
+}
+
+/// Everything about one call site that is fixed once `(body, substitution)` is:
+/// the substituted callee text, its decomposition, and the model rows it matches.
+///
+/// The fixpoint visits every block up to `3 * MAX_ROUNDS + 1` times, and each
+/// visit used to re-run `Substitution::apply`, `CalleePath::parse` and
+/// `Model::classify` over the same text — all three of which scan the path
+/// character by character. Caching them turns the analyzer's one accidental
+/// quadratic (rounds x call sites) back into a linear pass.
+struct CallClasses<'m> {
+    printed: String,
+    parsed: CalleePath,
+    classes: Vec<CallClass<'m>>,
+}
+
+impl<'m> CallClasses<'m> {
+    /// The `[[forbidden]]` row, if the model attached one.
+    fn forbidden(&self) -> Option<&'m ForbiddenRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Forbidden(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// The `[[sink]]` row, if the model attached one.
+    fn sink(&self) -> Option<&'m SinkRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Sink(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// The `[[source]]` row, if the model attached one.
+    fn source(&self) -> Option<&'m SourceRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Source(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// The `[[sanitizer]]` row, if the model attached one.
+    fn sanitizer(&self) -> Option<&'m SanitizerRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Sanitizer(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// The `[[reduction]]` row, if the model attached one.
+    fn reduction(&self) -> Option<&'m SanitizerRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Reduction(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// The name of an unmodelled `WorkflowContext` method — an honest boundary.
+    fn unmodeled_ctx_method(&self) -> Option<&str> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::UnmodeledCtxMethod(name) => Some(name.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The call registers a handler closure, which is analyzed entry-adjacent.
+    fn registers_handler(&self) -> bool {
+        self.classes
+            .iter()
+            .any(|c| matches!(c, CallClass::HandlerRegistration(_)))
+    }
+
+    /// The call is a ctx primitive whose return value is recorded in history
+    /// (`[[sanctioned]]`) or is pure observability (`[[non_sink]]`) — either
+    /// way it starts nothing and propagates nothing.
+    fn is_clean_ctx_call(&self) -> bool {
+        self.classes
+            .iter()
+            .any(|c| matches!(c, CallClass::Sanctioned(_) | CallClass::NonSink(_)))
+    }
+}
+
+/// Where a call site goes, and under which substitution.
+///
+/// Split from [`CallClasses`] because resolution is only asked for on the calls
+/// the model does *not* decide, and [`Program::call_substitution_in`] scans
+/// every block of the caller to find the call site — an O(blocks) answer that
+/// must be computed once per site, never once per round.
+struct CallTarget {
+    resolution: Resolution,
+    subst: Substitution,
+}
+
 /// One `switchInt` whose operand is tainted.
 #[derive(Debug, Clone)]
 struct BranchRecord {
@@ -109,6 +233,10 @@ pub struct Analyzer<'a> {
     program: &'a Program,
     model: &'a Model,
     memo: HashMap<String, BodyOutcome>,
+    /// Per-call-site classification, keyed on `body|block|substitution`.
+    classes: HashMap<String, Rc<CallClasses<'a>>>,
+    /// Per-call-site resolution, keyed the same way.
+    targets: HashMap<String, Rc<CallTarget>>,
     stack: Vec<String>,
     budget: u32,
     /// Findings collected across every body reached from this entry.
@@ -124,6 +252,8 @@ impl<'a> Analyzer<'a> {
             program,
             model,
             memo: HashMap::new(),
+            classes: HashMap::new(),
+            targets: HashMap::new(),
             stack: Vec::new(),
             budget: BUDGET,
             findings: Vec::new(),
@@ -181,6 +311,19 @@ impl<'a> Analyzer<'a> {
         // the taint the earlier blocks already pushed downstream. Re-running the
         // whole body with the kills already in hand is the cheapest correct
         // answer, and the kill set only grows, so it terminates.
+        // A body with no blocks (a truncated dump) has nothing to walk and no
+        // block to anchor a frame on; it is clean, not conservative, because
+        // nothing in it could have connected a source to a sink.
+        let Some(first) = body.blocks.first() else {
+            return BodyOutcome::default();
+        };
+        let frame = Frame {
+            path,
+            body,
+            block: first,
+            subst,
+            hops,
+        };
         let mut state = TaintState::new();
         let mut kills: Vec<(Place, TaintKind)> = Vec::new();
         for _attempt in 0..3 {
@@ -200,7 +343,7 @@ impl<'a> Analyzer<'a> {
             for _round in 0..MAX_ROUNDS {
                 let mut changed = false;
                 for block in &body.blocks {
-                    changed |= self.run_block(path, body, block, subst, hops, &mut state, None);
+                    changed |= self.run_block(frame.at(block), &mut state, None);
                 }
                 changed |= state.apply_kills();
                 if !changed {
@@ -223,15 +366,7 @@ impl<'a> Analyzer<'a> {
             branches: &mut branches,
         };
         for block in &body.blocks {
-            self.run_block(
-                path,
-                body,
-                block,
-                subst,
-                hops,
-                &mut state,
-                Some(&mut report),
-            );
+            self.run_block(frame.at(block), &mut state, Some(&mut report));
         }
         self.control_dependent_sinks(path, body, &sinks, &branches);
 
@@ -259,27 +394,25 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Transfer functions for one block. `report` is `Some` on the final pass only.
-    #[allow(clippy::too_many_arguments)]
     fn run_block(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        subst: &Substitution,
-        hops: &[Hop],
+        frame: Frame<'_>,
         state: &mut TaintState,
         mut report: Option<&mut Report<'_>>,
     ) -> bool {
         let mut changed = false;
-        for statement in &block.statements {
+        for statement in &frame.block.statements {
             let Statement::Assign { dest, rvalue } = statement else {
                 continue;
             };
-            if let Some((place, is_mut)) = &rvalue.ref_of {
-                let _ = is_mut;
-                if dest.projections.is_empty() {
-                    state.alias(dest.local, place);
-                }
+            // `&x` and `&mut x` alias the referent identically for taint: a
+            // shared borrow of a tainted place reads it, a unique one also
+            // writes it back, and `TaintState` models both as one canonical
+            // place — so the mutability flag is deliberately not consulted.
+            if let Some((place, _)) = &rvalue.ref_of
+                && dest.projections.is_empty()
+            {
+                state.alias(dest.local, place);
             }
             let mut set = TaintSet::new();
             for operand in &rvalue.reads {
@@ -295,17 +428,17 @@ impl<'a> Analyzer<'a> {
                 // and the `unsafe-raw-pointer` boundary below is the honest
                 // answer rather than an ambient-source verdict (U04).
                 if !rvalue.text.contains(": *mut ") && !rvalue.text.contains(": *const ") {
-                    set.absorb(&self.static_taint_of_alloc(path, alloc, block, hops));
+                    set.absorb(&self.static_taint_of_alloc(frame, alloc));
                 }
             }
-            set.absorb(&self.const_taint(path, body, &rvalue.text, block, subst, hops));
+            set.absorb(&self.const_taint(frame, &rvalue.text));
             if report.is_some() {
-                self.raw_pointer_check(path, body, &rvalue.reads, block);
+                self.raw_pointer_check(frame, &rvalue.reads);
             }
             changed |= state.add(dest, &set);
         }
 
-        match &block.terminator {
+        match &frame.block.terminator {
             Terminator::Call {
                 dest,
                 callee,
@@ -313,19 +446,13 @@ impl<'a> Analyzer<'a> {
                 args,
                 ..
             } => {
-                changed |= self.transfer_call(
-                    path,
-                    body,
-                    block,
+                let call = CallOperands {
                     dest,
-                    callee.as_deref(),
-                    indirect.as_ref(),
+                    callee: callee.as_deref(),
+                    indirect: indirect.as_ref(),
                     args,
-                    subst,
-                    hops,
-                    state,
-                    report.as_deref_mut(),
-                );
+                };
+                changed |= self.transfer_call(frame, call, state, report.as_deref_mut());
             }
             Terminator::SwitchInt { operand, targets } => {
                 if targets.len() >= 2
@@ -334,7 +461,7 @@ impl<'a> Analyzer<'a> {
                     let facts = read_operand(operand, state, false);
                     if !facts.is_empty() {
                         report.branches.push(BranchRecord {
-                            block: block.label.clone(),
+                            block: frame.block.label.clone(),
                             facts,
                             what: operand_text(operand),
                         });
@@ -349,7 +476,12 @@ impl<'a> Analyzer<'a> {
             | Terminator::Other { .. } => {}
             Terminator::InlineAsm { .. } => {
                 if report.is_some() {
-                    self.push_boundary(BoundaryKind::InlineAsm, "asm!", path, &block.label);
+                    self.push_boundary(
+                        BoundaryKind::InlineAsm,
+                        "asm!",
+                        frame.path,
+                        &frame.block.label,
+                    );
                 }
             }
         }
@@ -358,90 +490,71 @@ impl<'a> Analyzer<'a> {
 
     // ── calls ───────────────────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// One call terminator: classify it against the model, and let the first
+    /// class that applies decide it.
+    ///
+    /// The order of the arms is the model's documented decision order
+    /// ([`crate::model::matcher`]), and each arm is total — it returns without
+    /// falling through — because a call that is a sink *and* a source must be
+    /// treated as exactly one of them, never as both in sequence.
     fn transfer_call(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        dest: &Place,
-        callee: Option<&str>,
-        indirect: Option<&Operand>,
-        args: &[Operand],
-        subst: &Substitution,
-        hops: &[Hop],
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
         state: &mut TaintState,
         mut report: Option<&mut Report<'_>>,
     ) -> bool {
         let emit = report.is_some();
-        let arg_taints: Vec<TaintSet> = args
+        let arg_taints: Vec<TaintSet> = call
+            .args
             .iter()
             .map(|operand| read_operand(operand, state, false))
             .collect();
         let union = union_of(&arg_taints);
 
-        let Some(callee) = callee else {
+        let Some(callee) = call.callee else {
             if emit {
-                let detail = indirect.map_or_else(|| block.label.clone(), operand_text);
-                self.push_boundary(BoundaryKind::IndirectCall, &detail, path, &block.label);
+                let detail = call
+                    .indirect
+                    .map_or_else(|| frame.block.label.clone(), operand_text);
+                self.push_boundary(
+                    BoundaryKind::IndirectCall,
+                    &detail,
+                    frame.path,
+                    &frame.block.label,
+                );
             }
-            return state.add(dest, &union);
+            return state.add(call.dest, &union);
         };
 
-        let printed = subst.apply(callee);
-        let parsed = CalleePath::parse(&printed);
+        let site = self.call_classes(frame, call.dest, callee);
         // A reborrow hands back the *same* place under a new name. Without this
         // edge `xs.sort()` lowers to `sort(deref_mut(&mut xs))` and the sanitizer
         // would clear the taint of a temporary instead of the vector's.
-        if dest.projections.is_empty()
-            && REBORROWS.contains(&parsed.last_segment())
-            && let Some(place) = args.first().and_then(operand_place)
+        if call.dest.projections.is_empty()
+            && REBORROWS.contains(&site.parsed.last_segment())
+            && let Some(place) = call.args.first().and_then(operand_place)
         {
-            state.alias(dest.local, place);
+            state.alias(call.dest.local, place);
         }
-        let declared = Self::dest_type(body, dest, subst, &parsed);
-        let classes = self.model.classify(&parsed, declared.as_deref());
 
         // Every class the model can attach to a call, in decision order.
-        if let Some(rule) = classes.iter().find_map(|c| match c {
-            CallClass::Forbidden(rule) => Some(*rule),
-            _ => None,
-        }) {
+        if let Some(rule) = site.forbidden() {
             if emit {
-                let site = Self::site(path, &block.label, &printed);
-                self.findings.push(Finding {
-                    kind: FindingKind::ForbiddenEffect,
-                    taint: TaintKind::Value,
-                    source: site.clone(),
-                    sink: site.clone(),
-                    trace: with_hops(hops, &site, &format!("calls {printed}")),
-                    message: format!(
-                        "forbidden effect {printed} reachable from {path} ({})",
-                        first_sentence(&rule.reason)
-                    ),
-                });
-                if let Some(report) = report.as_deref_mut() {
-                    report.sinks.push(SinkRecord {
-                        block: block.label.clone(),
-                        site,
-                    });
-                }
+                self.record_forbidden(frame, &site.printed, rule, report.as_deref_mut());
             }
             return false;
         }
 
-        if let Some(rule) = classes.iter().find_map(|c| match c {
-            CallClass::Sink(rule) => Some(*rule),
-            _ => None,
-        }) {
-            let offset = usize::from(parsed.receiver.is_some());
+        if let Some(rule) = site.sink() {
+            let offset = usize::from(site.parsed.receiver.is_some());
             if emit {
-                let site = Self::site(path, &block.label, &printed);
-                self.record_sink(rule, offset, args, &arg_taints, &site);
+                let at = Self::site(frame.path, &frame.block.label, &site.printed);
+                self.record_sink(rule, offset, call.args, &arg_taints, &at);
                 if let Some(report) = report {
                     report.sinks.push(SinkRecord {
-                        block: block.label.clone(),
-                        site,
+                        block: frame.block.label.clone(),
+                        site: at,
                     });
                 }
             }
@@ -450,154 +563,213 @@ impl<'a> Analyzer<'a> {
                 .iter()
                 .map(|index| index.saturating_add(offset))
                 .collect();
-            self.descend_closures(
-                path,
-                body,
-                block,
-                args,
-                &arg_taints,
-                subst,
-                hops,
-                state,
-                dest,
-                &opaque,
-            );
+            self.descend_closures(frame, call, &arg_taints, state, &opaque);
             // A command's result is recorded in history and replayed verbatim.
             return false;
         }
 
-        if classes
-            .iter()
-            .any(|c| matches!(c, CallClass::HandlerRegistration(_)))
-        {
-            self.descend_closures(
-                path,
-                body,
-                block,
-                args,
-                &arg_taints,
-                subst,
-                hops,
-                state,
-                dest,
-                &BTreeSet::new(),
-            );
+        if site.registers_handler() {
+            self.descend_closures(frame, call, &arg_taints, state, &BTreeSet::new());
             return false;
         }
 
-        if classes
-            .iter()
-            .any(|c| matches!(c, CallClass::Sanctioned(_) | CallClass::NonSink(_)))
-        {
+        if site.is_clean_ctx_call() {
             return false;
         }
 
-        if let Some(rule) = classes.iter().find_map(|c| match c {
-            CallClass::Source(rule) => Some(*rule),
-            _ => None,
-        }) {
-            let ambient = rule
-                .receiver
-                .as_deref()
-                .is_some_and(|receiver| self.model.is_ambient_type(receiver));
-            let receiver_tainted = arg_taints.first().is_some_and(|set| !set.is_empty());
-            let mut set = union.clone();
-            if !ambient || receiver_tainted {
-                let site = Self::site(path, &block.label, &printed);
-                let mut hop_chain = hops.to_vec();
-                hop_chain.push(Hop {
-                    function: path.to_string(),
-                    step: format!("calls {printed} ({})", first_sentence(&rule.reason)),
-                });
-                set.insert(Fact {
-                    kind: rule.kind,
-                    source: site,
-                    hops: hop_chain,
-                });
-            }
-            self.descend_closures(
-                path,
-                body,
-                block,
-                args,
-                &arg_taints,
-                subst,
-                hops,
-                state,
-                dest,
-                &BTreeSet::new(),
-            );
-            let mut changed = state.add(dest, &set);
-            changed |= Self::write_back_refs(body, args, &set, state, None);
-            return changed;
+        if let Some(rule) = site.source() {
+            return self.transfer_source(frame, call, rule, &site.printed, &arg_taints, state);
         }
 
-        if let Some(rule) = classes.iter().find_map(|c| match c {
-            CallClass::Sanitizer(rule) => Some(*rule),
-            _ => None,
-        }) {
-            // A comparator that reads ambient state does not *clear* the order —
-            // it decides it. `sort_by(|a, b| ..COUNTER..)` is an Order source.
-            let closure_taint = self.closure_argument_taint(
-                path,
-                body,
-                block,
-                args,
-                &arg_taints,
-                subst,
-                hops,
-                state,
-            );
-            if closure_taint.is_empty() {
-                if let Some(receiver) = args.first().and_then(operand_place) {
-                    state.kill(receiver, rule.clears);
-                }
-                state.kill(dest, rule.clears);
-                let mut cleared = BTreeSet::new();
-                cleared.insert(rule.clears);
-                return state.add(dest, &union.without(&cleared));
-            }
-            let ordered = closure_taint.as_kind(rule.clears);
-            let mut changed = state.add(dest, &union);
-            changed |= state.add(dest, &ordered);
-            changed |= Self::write_back_refs(body, args, &ordered, state, None);
-            return changed;
+        if let Some(rule) = site.sanitizer() {
+            return self.transfer_sanitizer(frame, call, rule, &arg_taints, state);
         }
 
-        if let Some(rule) = classes.iter().find_map(|c| match c {
-            CallClass::Reduction(rule) => Some(*rule),
-            _ => None,
-        }) {
+        if let Some(rule) = site.reduction() {
             let mut cleared = BTreeSet::new();
             cleared.insert(rule.clears);
-            return state.add(dest, &union.without(&cleared));
+            return state.add(call.dest, &union.without(&cleared));
         }
 
-        if let Some(name) = classes.iter().find_map(|c| match c {
-            CallClass::UnmodeledCtxMethod(name) => Some(name.clone()),
-            _ => None,
-        }) {
+        if let Some(name) = site.unmodeled_ctx_method() {
             if emit {
-                self.push_boundary(BoundaryKind::UnmodeledCtxMethod, &name, path, &block.label);
+                let detail = name.to_string();
+                self.push_boundary(
+                    BoundaryKind::UnmodeledCtxMethod,
+                    &detail,
+                    frame.path,
+                    &frame.block.label,
+                );
             }
-            return state.add(dest, &union);
+            return state.add(call.dest, &union);
         }
 
         // Nothing in the model decides this call: follow it.
-        self.follow_call(
-            path,
-            body,
-            block,
-            dest,
-            &printed,
-            callee,
-            args,
-            &arg_taints,
-            subst,
-            hops,
-            state,
-            report,
-        )
+        self.follow_call(frame, call, &site.printed, &arg_taints, state, report)
+    }
+
+    /// A `[[forbidden]]` effect is a finding on reachability alone, and it also
+    /// counts as a sink so that reaching it only on a tainted branch is one too.
+    fn record_forbidden(
+        &mut self,
+        frame: Frame<'_>,
+        printed: &str,
+        rule: &ForbiddenRule,
+        report: Option<&mut Report<'_>>,
+    ) {
+        let at = Self::site(frame.path, &frame.block.label, printed);
+        self.findings.push(Finding {
+            kind: FindingKind::ForbiddenEffect,
+            taint: TaintKind::Value,
+            source: at.clone(),
+            sink: at.clone(),
+            trace: with_hops(frame.hops, &at, &format!("calls {printed}")),
+            message: format!(
+                "forbidden effect {printed} reachable from {} ({})",
+                frame.path,
+                first_sentence(&rule.reason)
+            ),
+        });
+        if let Some(report) = report {
+            report.sinks.push(SinkRecord {
+                block: frame.block.label.clone(),
+                site: at,
+            });
+        }
+    }
+
+    /// A `[[source]]` call: start a fact, unless the row is keyed on an ambient
+    /// receiver type and *this* receiver carries no taint.
+    ///
+    /// That guard is the whole reason `[[ambient_type]]` exists: a `Mutex`
+    /// created inside the workflow body reaching `lock()` is not a source, while
+    /// the identical call on a `static` one — whose read already tainted the
+    /// receiver — is.
+    fn transfer_source(
+        &mut self,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
+        rule: &SourceRule,
+        printed: &str,
+        arg_taints: &[TaintSet],
+        state: &mut TaintState,
+    ) -> bool {
+        let ambient = rule
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| self.model.is_ambient_type(receiver));
+        let receiver_tainted = arg_taints.first().is_some_and(|set| !set.is_empty());
+        let mut set = union_of(arg_taints);
+        if !ambient || receiver_tainted {
+            let at = Self::site(frame.path, &frame.block.label, printed);
+            let mut hop_chain = frame.hops.to_vec();
+            hop_chain.push(Hop {
+                function: frame.path.to_string(),
+                step: format!("calls {printed} ({})", first_sentence(&rule.reason)),
+            });
+            set.insert(Fact {
+                kind: rule.kind,
+                source: at,
+                hops: hop_chain,
+            });
+        }
+        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+        let mut changed = state.add(call.dest, &set);
+        changed |= Self::write_back_refs(frame.body, call.args, &set, state, None);
+        changed
+    }
+
+    /// A `[[sanitizer]]` call: clear the row's kind on the receiver and the
+    /// result — unless a closure argument is itself tainted.
+    ///
+    /// A comparator that reads ambient state does not *clear* the order, it
+    /// decides it: `sort_by(|a, b| ..COUNTER..)` is an `Order` source, not a
+    /// sanitizer.
+    fn transfer_sanitizer(
+        &mut self,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
+        rule: &SanitizerRule,
+        arg_taints: &[TaintSet],
+        state: &mut TaintState,
+    ) -> bool {
+        let union = union_of(arg_taints);
+        let closure_taint = self.closure_argument_taint(frame, call, arg_taints);
+        if closure_taint.is_empty() {
+            if let Some(receiver) = call.args.first().and_then(operand_place) {
+                state.kill(receiver, rule.clears);
+            }
+            state.kill(call.dest, rule.clears);
+            let mut cleared = BTreeSet::new();
+            cleared.insert(rule.clears);
+            return state.add(call.dest, &union.without(&cleared));
+        }
+        let ordered = closure_taint.as_kind(rule.clears);
+        let mut changed = state.add(call.dest, &union);
+        changed |= state.add(call.dest, &ordered);
+        changed |= Self::write_back_refs(frame.body, call.args, &ordered, state, None);
+        changed
+    }
+
+    // ── per-call-site caches ────────────────────────────────────────────────
+
+    /// The key both caches use: a call site is identified by its body, its
+    /// block and the substitution the body is being analyzed under.
+    fn site_key(frame: Frame<'_>) -> String {
+        let mut key = String::with_capacity(frame.path.len().saturating_add(24));
+        key.push_str(frame.path);
+        key.push('|');
+        key.push_str(&frame.block.label);
+        key.push('|');
+        key.push_str(&frame.subst.key());
+        key
+    }
+
+    /// The substituted callee text, its decomposition and its model rows.
+    fn call_classes(
+        &mut self,
+        frame: Frame<'_>,
+        dest: &Place,
+        callee: &str,
+    ) -> Rc<CallClasses<'a>> {
+        let key = Self::site_key(frame);
+        if let Some(hit) = self.classes.get(&key) {
+            return Rc::clone(hit);
+        }
+        let printed = frame.subst.apply(callee);
+        let parsed = CalleePath::parse(&printed);
+        let declared = Self::dest_type(frame.body, dest, frame.subst, &parsed);
+        let classes = self.model.classify(&parsed, declared.as_deref());
+        let facts = Rc::new(CallClasses {
+            printed,
+            parsed,
+            classes,
+        });
+        self.classes.insert(key, Rc::clone(&facts));
+        facts
+    }
+
+    /// Where the call goes, and the substitution it induces on the callee.
+    fn call_target(&mut self, frame: Frame<'_>, printed: &str, callee: &str) -> Rc<CallTarget> {
+        let key = Self::site_key(frame);
+        if let Some(hit) = self.targets.get(&key) {
+            return Rc::clone(hit);
+        }
+        let resolution = self.program.resolve_call(frame.path, printed);
+        // Only a call that lands in an analyzed body needs a substitution, and
+        // computing one costs a scan of the caller's blocks.
+        let inner = if matches!(resolution, Resolution::Body(_)) {
+            self.program
+                .call_substitution_in(frame.path, callee, frame.subst)
+        } else {
+            Substitution::new()
+        };
+        let target = Rc::new(CallTarget {
+            resolution,
+            subst: inner,
+        });
+        self.targets.insert(key, Rc::clone(&target));
+        target
     }
 
     /// `[dyn Tr devirtualized to Concrete, built in f]` for an RTA-resolved call.
@@ -619,61 +791,48 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolve and descend into an unmodelled call.
-    #[allow(clippy::too_many_arguments)]
     fn follow_call(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        dest: &Place,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
         printed: &str,
-        callee: &str,
-        args: &[Operand],
         arg_taints: &[TaintSet],
-        subst: &Substitution,
-        hops: &[Hop],
         state: &mut TaintState,
         report: Option<&mut Report<'_>>,
     ) -> bool {
         let emit = report.is_some();
         let union = union_of(arg_taints);
-        match self.program.resolve_call(path, printed) {
+        let site = self.call_target(frame, printed, call.callee.unwrap_or_default());
+        match &site.resolution {
             Resolution::Body(target) => {
-                let inner_subst = self.program.call_substitution_in(path, callee, subst);
-                let qualified = self.program.qualified_name(&target);
+                let qualified = self.program.qualified_name(target);
                 let resolved = if qualified == printed {
                     String::new()
                 } else {
                     format!(" -> {qualified}")
                 };
                 let hop = Hop {
-                    function: path.to_string(),
+                    function: frame.path.to_string(),
                     step: format!(
                         "calls {printed}{resolved}{}{}",
-                        self.devirtualized(&parsed_of(printed)),
-                        subst_note(&inner_subst)
+                        self.devirtualized(&CalleePath::parse(printed)),
+                        subst_note(&site.subst)
                     ),
                 };
-                let mut inner_hops = hops.to_vec();
+                let mut inner_hops = frame.hops.to_vec();
                 inner_hops.push(hop.clone());
                 let seeded: Vec<TaintSet> =
                     arg_taints.iter().map(|set| set.with_hop(&hop)).collect();
-                let outcome = self.analyze_body(&target, &inner_subst, &seeded, &inner_hops);
-                let mut changed = state.add(dest, &outcome.ret);
-                changed |=
-                    Self::write_back_refs(body, args, &TaintSet::new(), state, Some(&outcome));
-                self.descend_closures(
-                    path,
-                    body,
-                    block,
-                    args,
-                    arg_taints,
-                    subst,
-                    hops,
+                let outcome = self.analyze_body(target, &site.subst, &seeded, &inner_hops);
+                let mut changed = state.add(call.dest, &outcome.ret);
+                changed |= Self::write_back_refs(
+                    frame.body,
+                    call.args,
+                    &TaintSet::new(),
                     state,
-                    dest,
-                    &BTreeSet::new(),
+                    Some(&outcome),
                 );
+                self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
                 if outcome.has_sink
                     && let Some(report) = report
                 {
@@ -681,10 +840,10 @@ impl<'a> Analyzer<'a> {
                     // for control dependence: `if tainted { dispatch(ctx) }` is
                     // the same finding as an inline `ctx.execute_activity_raw`.
                     report.sinks.push(SinkRecord {
-                        block: block.label.clone(),
+                        block: frame.block.label.clone(),
                         site: Self::site(
-                            path,
-                            &block.label,
+                            frame.path,
+                            &frame.block.label,
                             &format!("commands emitted by {qualified}"),
                         ),
                     });
@@ -693,112 +852,75 @@ impl<'a> Analyzer<'a> {
             }
             Resolution::External(_) => {
                 let hop = Hop {
-                    function: path.to_string(),
+                    function: frame.path.to_string(),
                     step: format!("calls {printed}"),
                 };
-                self.descend_closures(
-                    path,
-                    body,
-                    block,
-                    args,
-                    arg_taints,
-                    subst,
-                    hops,
-                    state,
-                    dest,
-                    &BTreeSet::new(),
-                );
-                let mut changed = state.add(dest, &union.with_hop(&hop));
-                changed |= Self::write_back_refs(body, args, &union, state, None);
+                self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+                let mut changed = state.add(call.dest, &union.with_hop(&hop));
+                changed |= Self::write_back_refs(frame.body, call.args, &union, state, None);
                 changed
             }
             Resolution::Boundary(kind, detail) => {
                 if emit {
-                    self.push_boundary(kind, &detail, path, &block.label);
+                    self.push_boundary(*kind, detail, frame.path, &frame.block.label);
                 }
-                state.add(dest, &union)
+                state.add(call.dest, &union)
             }
         }
     }
 
-    /// Analyze every closure passed as an argument, assuming it is invoked.
-    #[allow(clippy::too_many_arguments)]
+    /// Analyze every closure passed as an argument, assuming it is invoked, and
+    /// fold what it returns into the call's destination.
     fn descend_closures(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        args: &[Operand],
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
         arg_taints: &[TaintSet],
-        subst: &Substitution,
-        hops: &[Hop],
         state: &mut TaintState,
-        dest: &Place,
         opaque: &BTreeSet<usize>,
     ) {
-        let taint = self.closure_argument_taint_inner(
-            path, body, block, args, arg_taints, subst, hops, state, opaque,
-        );
+        let taint = self.closure_argument_taint_inner(frame, call, arg_taints, opaque);
         if !taint.is_empty() {
-            state.add(dest, &taint);
+            state.add(call.dest, &taint);
         }
     }
 
     /// The taint a call's closure arguments contribute to its result.
-    #[allow(clippy::too_many_arguments)]
     fn closure_argument_taint(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        args: &[Operand],
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
         arg_taints: &[TaintSet],
-        subst: &Substitution,
-        hops: &[Hop],
-        state: &mut TaintState,
     ) -> TaintSet {
-        self.closure_argument_taint_inner(
-            path,
-            body,
-            block,
-            args,
-            arg_taints,
-            subst,
-            hops,
-            state,
-            &BTreeSet::new(),
-        )
+        self.closure_argument_taint_inner(frame, call, arg_taints, &BTreeSet::new())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Every closure argument outside `opaque`, analyzed as if it were invoked
+    /// here, with its environment seeded from that argument's own taint and its
+    /// remaining parameters from everything else the call was given.
     fn closure_argument_taint_inner(
         &mut self,
-        path: &str,
-        body: &Body,
-        block: &BasicBlock,
-        args: &[Operand],
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
         arg_taints: &[TaintSet],
-        subst: &Substitution,
-        hops: &[Hop],
-        state: &mut TaintState,
         opaque: &BTreeSet<usize>,
     ) -> TaintSet {
         let mut out = TaintSet::new();
-        for (index, operand) in args.iter().enumerate() {
+        for (index, operand) in call.args.iter().enumerate() {
             if opaque.contains(&index) {
                 continue;
             }
-            let Some(span) = Self::closure_span_of(body, operand, subst) else {
+            let Some(span) = Self::closure_span_of(frame.body, operand, frame.subst) else {
                 continue;
             };
             let Some(target) = self.program.closure_body(&span).map(str::to_string) else {
                 continue;
             };
             let hop = Hop {
-                function: path.to_string(),
+                function: frame.path.to_string(),
                 step: format!("invokes closure {span}"),
             };
-            let mut inner_hops = hops.to_vec();
+            let mut inner_hops = frame.hops.to_vec();
             inner_hops.push(hop.clone());
             // `_1` is the closure environment; the remaining parameters are
             // whatever the callee hands it, which is at most everything else
@@ -825,7 +947,6 @@ impl<'a> Analyzer<'a> {
             let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
         }
-        let _ = (block, state);
         out
     }
 
@@ -1014,14 +1135,8 @@ impl<'a> Analyzer<'a> {
     // ── reads ───────────────────────────────────────────────────────────────
 
     /// Taint of a `const {allocN: &T}` read: ambient statics only.
-    fn static_taint_of_alloc(
-        &self,
-        path: &str,
-        alloc: &str,
-        block: &BasicBlock,
-        hops: &[Hop],
-    ) -> TaintSet {
-        let doc = self.program.doc_of(path);
+    fn static_taint_of_alloc(&self, frame: Frame<'_>, alloc: &str) -> TaintSet {
+        let doc = self.program.doc_of(frame.path);
         let Some(item) = self.program.static_of_alloc(doc, alloc) else {
             return TaintSet::new();
         };
@@ -1029,26 +1144,12 @@ impl<'a> Analyzer<'a> {
         if !ambient {
             return TaintSet::new();
         }
-        let name = item
-            .path
-            .rsplit("::")
-            .next()
-            .unwrap_or(&item.path)
-            .to_string();
-        Self::ambient_fact(path, &name, &item.ty, &block.label, hops)
+        let name = last_segment(&item.path).to_string();
+        Self::ambient_fact(frame, &name, &item.ty)
     }
 
     /// Taint of a `const NAME` / `const f::promoted[0]` / `&/*tls*/ NAME` rvalue.
-    fn const_taint(
-        &mut self,
-        path: &str,
-        body: &Body,
-        text: &str,
-        block: &BasicBlock,
-        subst: &Substitution,
-        hops: &[Hop],
-    ) -> TaintSet {
-        let _ = body;
+    fn const_taint(&mut self, frame: Frame<'_>, text: &str) -> TaintSet {
         let candidate = if let Some(rest) = text.trim().strip_prefix("const ") {
             rest.trim()
         } else if let Some(at) = text.find("/*tls*/") {
@@ -1066,16 +1167,16 @@ impl<'a> Analyzer<'a> {
         {
             return TaintSet::new();
         }
-        let bare = crate::resolve::strip_generics_everywhere(candidate);
+        let bare = strip_generics_everywhere(candidate);
         if bare.contains("promoted[") {
             if self.program.body(&bare).is_some() {
                 let hop = Hop {
-                    function: path.to_string(),
+                    function: frame.path.to_string(),
                     step: format!("reads {bare}"),
                 };
-                let mut inner = hops.to_vec();
+                let mut inner = frame.hops.to_vec();
                 inner.push(hop);
-                let outcome = self.analyze_body(&bare, subst, &[], &inner);
+                let outcome = self.analyze_body(&bare, frame.subst, &[], &inner);
                 return outcome.ret;
             }
             return TaintSet::new();
@@ -1086,16 +1187,16 @@ impl<'a> Analyzer<'a> {
         if !(item.is_mut || self.model.is_ambient_type(&item.ty)) {
             return TaintSet::new();
         }
-        let name = bare.rsplit("::").next().unwrap_or(&bare).to_string();
+        let name = last_segment(&bare).to_string();
         let ty = item.ty.clone();
-        Self::ambient_fact(path, &name, &ty, &block.label, hops)
+        Self::ambient_fact(frame, &name, &ty)
     }
 
-    fn ambient_fact(path: &str, name: &str, ty: &str, block: &str, hops: &[Hop]) -> TaintSet {
-        let site = Self::site(path, block, &format!("static {name}"));
-        let mut chain = hops.to_vec();
+    fn ambient_fact(frame: Frame<'_>, name: &str, ty: &str) -> TaintSet {
+        let site = Self::site(frame.path, &frame.block.label, &format!("static {name}"));
+        let mut chain = frame.hops.to_vec();
         chain.push(Hop {
-            function: path.to_string(),
+            function: frame.path.to_string(),
             step: format!("reads ambient static {name}: {ty}"),
         });
         TaintSet::of(Fact {
@@ -1106,13 +1207,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// An arbitrary raw-pointer dereference is outside the memory model (D7).
-    fn raw_pointer_check(
-        &mut self,
-        path: &str,
-        body: &Body,
-        reads: &[Operand],
-        block: &BasicBlock,
-    ) {
+    fn raw_pointer_check(&mut self, frame: Frame<'_>, reads: &[Operand]) {
         for operand in reads {
             let Some(place) = operand_place(operand) else {
                 continue;
@@ -1124,7 +1219,7 @@ impl<'a> Analyzer<'a> {
             {
                 continue;
             }
-            let Some(ty) = body.locals.get(&place.local) else {
+            let Some(ty) = frame.body.locals.get(&place.local) else {
                 continue;
             };
             let ty = ty.trim_start();
@@ -1134,8 +1229,8 @@ impl<'a> Analyzer<'a> {
                 self.push_boundary(
                     BoundaryKind::UnsafeRawPointer,
                     &format!("(*_{}): {ty}", place.local.0),
-                    path,
-                    &block.label,
+                    frame.path,
+                    &frame.block.label,
                 );
             }
         }

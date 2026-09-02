@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::subst::split_top;
+use crate::util::{matching_angle, split_top, split_top_trim};
 
 /// One `impl` block header, as written in the source.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -222,7 +222,7 @@ fn parse_impl_header(header: &str) -> Option<ImplHeader> {
         let close = matching_angle(rest)?;
         let inner = rest.get(1..close)?;
         (
-            split_top(inner, ',')
+            split_top_trim(inner, ",")
                 .into_iter()
                 .filter_map(generic_param_name)
                 .collect(),
@@ -232,7 +232,7 @@ fn parse_impl_header(header: &str) -> Option<ImplHeader> {
         (Vec::new(), rest)
     };
     let body = rest.split(" where ").next().unwrap_or(rest).trim();
-    let halves = split_top_str(body, " for ");
+    let halves = split_top(body, " for ");
     let (trait_, self_ty) = if halves.len() >= 2 {
         (
             halves.first().map(|s| (*s).trim().to_string()),
@@ -260,57 +260,6 @@ fn generic_param_name(param: &str) -> Option<String> {
         .next()
         .unwrap_or_default();
     (!name.is_empty()).then(|| name.to_string())
-}
-
-fn matching_angle(text: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    for (at, c) in text.char_indices() {
-        match c {
-            '<' => depth = depth.saturating_add(1),
-            '>' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(at);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split on a top-level multi-character separator (`" for "`).
-fn split_top_str<'a>(text: &'a str, separator: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut at = 0usize;
-    let mut previous = ' ';
-    while at < text.len() {
-        let Some(rest) = text.get(at..) else { break };
-        let Some(c) = rest.chars().next() else { break };
-        match c {
-            '<' | '(' | '[' => depth = depth.saturating_add(1),
-            '>' if previous == '-' => {}
-            '>' | ')' | ']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if depth == 0 && rest.starts_with(separator) {
-            if let Some(piece) = text.get(start..at) {
-                out.push(piece);
-            }
-            at = at.saturating_add(separator.len());
-            start = at;
-            previous = c;
-            continue;
-        }
-        previous = c;
-        at = at.saturating_add(c.len_utf8());
-    }
-    if let Some(piece) = text.get(start..) {
-        out.push(piece);
-    }
-    out
 }
 
 #[cfg(test)]

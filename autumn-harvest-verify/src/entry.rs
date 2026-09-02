@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use crate::mir::MirDoc;
+use crate::util::split_last;
 
 /// Prefix of the companion fn the `#[workflow]` macro emits next to every
 /// workflow. `__autumn_activity_info_*` is deliberately *not* matched.
@@ -29,7 +30,7 @@ pub fn discover(docs: &[MirDoc]) -> Vec<Entry> {
     for doc in docs {
         let paths: BTreeSet<&str> = doc.bodies.iter().map(|b| b.path.as_str()).collect();
         for body in &doc.bodies {
-            let (prefix, last) = split_last_segment(&body.path);
+            let (prefix, last) = split_last(&body.path).unwrap_or(("", body.path.as_str()));
             let Some(name) = last.strip_prefix(MARKER) else {
                 continue;
             };
@@ -59,13 +60,6 @@ pub fn discover(docs: &[MirDoc]) -> Vec<Entry> {
     });
     entries.dedup();
     entries
-}
-
-/// Splits `a::b::c` into `("a::b", "c")`; `("", "c")` for a bare path.
-fn split_last_segment(path: &str) -> (&str, &str) {
-    path.rfind("::")
-        .and_then(|at| Some((path.get(..at)?, path.get(at + 2..)?)))
-        .unwrap_or(("", path))
 }
 
 #[cfg(test)]
@@ -124,12 +118,5 @@ mod tests {
              \n    bb0: {\n        return;\n    }\n}\n",
         );
         assert!(discover(&[d]).is_empty());
-    }
-
-    #[test]
-    fn splitting_paths() {
-        assert_eq!(split_last_segment("a::b::c"), ("a::b", "c"));
-        assert_eq!(split_last_segment("c"), ("", "c"));
-        assert_eq!(split_last_segment(""), ("", ""));
     }
 }

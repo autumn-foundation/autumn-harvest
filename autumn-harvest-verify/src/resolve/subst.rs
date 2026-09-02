@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::util::{is_bare_ident, split_generic, split_top_trim};
+
 /// A generic substitution: type-parameter name → concrete type text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Substitution(pub BTreeMap<String, String>);
@@ -179,75 +181,16 @@ fn is_placeholder(ty: &str) -> bool {
     is_bare_ident(ty) && ty.len() <= 2 && ty.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
+/// A leading lifetime, stripped without touching the `&` it qualifies.
+///
+/// [`crate::util::peel_refs`] would take the reference off too, which
+/// [`unify`] must not do before it has matched the two sides' reference
+/// prefixes against each other.
 fn strip_lifetimes(ty: &str) -> &str {
     let ty = ty.trim();
-    ty.strip_prefix("'")
+    ty.strip_prefix('\'')
         .and_then(|rest| rest.split_once(' '))
         .map_or(ty, |(_, rest)| rest.trim())
-}
-
-fn is_bare_ident(text: &str) -> bool {
-    !text.is_empty()
-        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-}
-
-/// `Wrapper<A, B>` → (`Wrapper`, [`A`, `B`]); a non-generic type → (itself, []).
-fn split_generic(ty: &str) -> (&str, Vec<&str>) {
-    let ty = ty.trim();
-    let Some(open) = top_angle(ty) else {
-        return (ty, Vec::new());
-    };
-    if !ty.ends_with('>') {
-        return (ty, Vec::new());
-    }
-    let base = ty.get(..open).unwrap_or(ty).trim();
-    let inner = ty
-        .get(open.saturating_add(1)..ty.len().saturating_sub(1))
-        .unwrap_or("");
-    (base, split_top(inner, ','))
-}
-
-fn top_angle(ty: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    for (at, c) in ty.char_indices() {
-        match c {
-            '<' if depth == 0 => return Some(at),
-            '(' | '[' | '{' => depth = depth.saturating_add(1),
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split on a top-level separator, honouring `<>`, `()`, `[]` and `{}` nesting.
-#[must_use]
-pub fn split_top(text: &str, separator: char) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut previous = ' ';
-    for (at, c) in text.char_indices() {
-        match c {
-            '<' | '(' | '[' | '{' => depth = depth.saturating_add(1),
-            '>' if previous != '-' => depth = depth.saturating_sub(1),
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ if c == separator && depth == 0 => {
-                if let Some(piece) = text.get(start..at) {
-                    out.push(piece.trim());
-                }
-                start = at.saturating_add(c.len_utf8());
-            }
-            _ => {}
-        }
-        previous = c;
-    }
-    if let Some(piece) = text.get(start..) {
-        out.push(piece.trim());
-    }
-    out.retain(|piece| !piece.is_empty());
-    out
 }
 
 /// The turbofish arguments written on the last segment of `path`, verbatim.
@@ -255,8 +198,6 @@ pub fn split_top(text: &str, separator: char) -> Vec<&str> {
 pub fn turbofish(path: &str) -> Vec<String> {
     let path = path.trim();
     // The item's own generic arguments are the last top-level `::<...>` group.
-    let segments = split_top(path, ':');
-    let _ = segments;
     let mut best: Option<(usize, usize)> = None;
     let mut depth = 0i32;
     let bytes = path.as_bytes();
@@ -292,7 +233,7 @@ pub fn turbofish(path: &str) -> Vec<String> {
         return Vec::new();
     }
     let inner = path.get(open.saturating_add(1)..close).unwrap_or("");
-    split_top(inner, ',')
+    split_top_trim(inner, ",")
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -380,11 +321,9 @@ mod tests {
     }
 
     #[test]
-    fn splitting_honours_nesting() {
-        assert_eq!(split_top("A<B, C>, D", ','), vec!["A<B, C>", "D"]);
-        assert_eq!(
-            split_top("fn(&u32) -> u32, T", ','),
-            vec!["fn(&u32) -> u32", "T"]
-        );
+    fn a_lifetime_is_stripped_but_its_reference_is_kept() {
+        assert_eq!(strip_lifetimes("&'a mut T"), "&'a mut T");
+        assert_eq!(strip_lifetimes("'a mut T"), "mut T");
+        assert_eq!(strip_lifetimes("T"), "T");
     }
 }

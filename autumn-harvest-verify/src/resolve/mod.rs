@@ -40,10 +40,14 @@ use std::path::PathBuf;
 
 use crate::mir::ast::{Body, Local, MirDoc, Operand, Statement, StaticItem, Terminator};
 use crate::model::callee::{CalleePath, TypeName};
+use crate::util::{
+    crate_root, last_segment, looks_like_type_param, peel_containers, peel_refs, split_last,
+    split_top_trim, strip_generics_everywhere,
+};
 use crate::verdict::BoundaryKind;
 
 pub use impls::ImplHeader;
-pub use subst::{Substitution, split_top};
+pub use subst::Substitution;
 
 /// Index of source files needed to resolve `<impl at file:line:col>` headers.
 #[derive(Debug, Clone, Default)]
@@ -404,7 +408,7 @@ impl Program {
         let path = CalleePath::parse(callee);
         let near = self.crate_of.get(caller_body).map(String::as_str);
         // 1. An async coroutine reached through its shim, `poll` or `into_future`.
-        if let Some(inner) = async_receiver(callee)
+        if let Some(inner) = async_body_of(callee)
             && let Some(body) = near
                 .and_then(|krate| self.async_bodies.get(&format!("{krate}::{inner}")))
                 .or_else(|| self.async_bodies.get(&inner))
@@ -737,11 +741,6 @@ fn async_body_of(ty: &str) -> Option<String> {
     Some(rest.get(..end)?.trim().to_string())
 }
 
-/// The `{async fn body of X()}` a callee path mentions (its receiver or its own type).
-fn async_receiver(callee: &str) -> Option<String> {
-    async_body_of(callee)
-}
-
 /// `{closure@FILE:l:c: l:c}` → (FILE, l, c); also matches `{async block@..}`.
 fn brace_span(text: &str) -> Option<(String, usize, usize)> {
     let at = text.find('@')?;
@@ -773,7 +772,7 @@ fn parse_file_line_col(text: &str) -> Option<(String, usize, usize)> {
 /// The closure/coroutine span a body's first parameter carries, if any.
 fn closure_param_span(body: &Body) -> Option<String> {
     let (_, ty) = body.params.first()?;
-    let ty = crate::model::callee::peel_refs(ty).trim();
+    let ty = peel_refs(ty).trim();
     let ty = ty.trim_start_matches("mut ").trim();
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
 }
@@ -781,36 +780,9 @@ fn closure_param_span(body: &Body) -> Option<String> {
 /// `Box<dyn Jitter>` / `&dyn Jitter + Send` → `Jitter`.
 fn dyn_trait_of(ty: &str) -> Option<String> {
     let inner = peel_containers(ty);
-    let rest = crate::model::callee::peel_refs(inner).strip_prefix("dyn ")?;
-    let name = TypeName::parse(split_top(rest, '+').first().copied().unwrap_or(rest)).name;
+    let rest = peel_refs(inner).strip_prefix("dyn ")?;
+    let name = TypeName::parse(split_top_trim(rest, "+").first().copied().unwrap_or(rest)).name;
     (!name.is_empty()).then_some(name)
-}
-
-/// Peel `Box`/`Arc`/`Rc`/`Pin` wrappers and references off a type.
-fn peel_containers(ty: &str) -> &str {
-    const TRANSPARENT: [&str; 4] = ["Box", "Arc", "Rc", "Pin"];
-    let mut current = crate::model::callee::peel_refs(ty).trim();
-    for _ in 0..8 {
-        let Some(open) = current.find('<') else {
-            return current;
-        };
-        let base = current.get(..open).unwrap_or("").trim();
-        let base_name = last_segment(base);
-        if !TRANSPARENT.contains(&base_name) {
-            return current;
-        }
-        let Some(inner) = current
-            .get(open.saturating_add(1)..current.len().saturating_sub(1))
-            .map(str::trim)
-        else {
-            return current;
-        };
-        current = crate::model::callee::peel_refs(
-            split_top(inner, ',').first().copied().unwrap_or(inner),
-        )
-        .trim();
-    }
-    current
 }
 
 /// The declared type of an operand, as the caller's `let` declarations print it.
@@ -839,33 +811,6 @@ fn operand_text(operand: &Operand) -> String {
         Operand::Move(place) => format!("move _{}", place.local.0),
         Operand::Const { text, .. } => text.clone(),
     }
-}
-
-/// Remove every `::<..>` turbofish group from a path, keeping the segments.
-#[must_use]
-pub fn strip_generics_everywhere(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut depth = 0i32;
-    let mut previous = ' ';
-    for c in path.chars() {
-        match c {
-            '<' => depth = depth.saturating_add(1),
-            '>' if previous != '-' => {
-                depth = depth.saturating_sub(1);
-                previous = c;
-                continue;
-            }
-            _ => {}
-        }
-        if depth == 0 && c != '<' {
-            out.push(c);
-        }
-        previous = c;
-    }
-    out.trim()
-        .replace("::::", "::")
-        .trim_end_matches("::")
-        .to_string()
 }
 
 /// Top-level `std`/`core`/`alloc` modules, which rustc's trimmed paths print
@@ -921,46 +866,6 @@ fn is_std_module(root: &str) -> bool {
     MODULES.contains(&root)
 }
 
-/// The leading crate identifier of an explicitly rooted path.
-fn crate_root(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let end = text
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(text.len());
-    let ident = text.get(..end)?;
-    if ident.is_empty() || !ident.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return None;
-    }
-    text.get(end..)?.starts_with("::").then_some(ident)
-}
-
-/// `T`, `U`, `K`, `F`, `T1`, `__S` — the spellings a type parameter takes.
-#[must_use]
-pub fn looks_like_type_param(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    if let Some(rest) = name.strip_prefix("__") {
-        return rest.starts_with(|c: char| c.is_ascii_uppercase());
-    }
-    let mut chars = name.chars();
-    let first = chars.next().unwrap_or(' ');
-    if !first.is_ascii_uppercase() {
-        return false;
-    }
-    let rest: String = chars.collect();
-    rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
-}
-
-fn last_segment(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
-}
-
-fn split_last(path: &str) -> Option<(&str, &str)> {
-    let at = path.rfind("::")?;
-    Some((path.get(..at)?, path.get(at.saturating_add(2)..)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,26 +899,5 @@ mod tests {
         );
         assert_eq!(dyn_trait_of("&dyn Fetcher").as_deref(), Some("Fetcher"));
         assert_eq!(dyn_trait_of("Vec<u8>"), None);
-    }
-
-    #[test]
-    fn turbofish_groups_are_stripped_from_a_path() {
-        assert_eq!(
-            strip_generics_everywhere("pairs::<HashMap<String, u32>>"),
-            "pairs"
-        );
-        assert_eq!(
-            strip_generics_everywhere("with_page_cursor::<R, F>::promoted[0]"),
-            "with_page_cursor::promoted[0]"
-        );
-    }
-
-    #[test]
-    fn type_parameter_spellings() {
-        assert!(looks_like_type_param("T"));
-        assert!(looks_like_type_param("T1"));
-        assert!(looks_like_type_param("__S"));
-        assert!(!looks_like_type_param("HashMap"));
-        assert!(!looks_like_type_param("Live"));
     }
 }

@@ -54,6 +54,10 @@ use super::callee::{self, CalleePath};
 use super::{
     CtxMethodRule, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule, TrustedCrate,
 };
+use crate::util::{
+    crate_root, is_segment_suffix, normalize_ws, peel_containers, peel_path_head, peel_refs,
+    segments, split_generic,
+};
 
 /// One way a call site is classified by the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +204,7 @@ impl Model {
     /// `std::…`) has a crate root; rustc's trimmed `Ty::method` prints do not.
     #[must_use]
     pub fn trusted_crate(&self, callee: &CalleePath) -> Option<&TrustedCrate> {
-        let root = crate_root(&callee.text)?;
+        let root = crate_root(peel_path_head(&callee.text))?;
         self.trusted.iter().find(|c| c.name == root)
     }
 
@@ -213,22 +217,16 @@ impl Model {
     /// else is matched on the type's last `::` segment with generics stripped.
     #[must_use]
     pub fn is_ambient_type(&self, ty: &str) -> bool {
-        const TRANSPARENT: [&str; 4] = ["Box", "Arc", "Rc", "Pin"];
-        let mut current = ty.to_string();
-        for _ in 0..8 {
-            let name = callee::TypeName::parse(&current);
-            if self.ambient_type.iter().any(|t| t.name == name.name) {
-                return true;
-            }
-            if !TRANSPARENT.contains(&name.name.as_str()) {
-                return false;
-            }
-            let Some(inner) = name.generic_args.first() else {
-                return false;
-            };
-            current.clone_from(inner);
+        let name = callee::TypeName::parse(ty).name;
+        if self.ambient_type.iter().any(|t| t.name == name) {
+            return true;
         }
-        false
+        let inner = peel_containers(ty);
+        if inner == ty.trim() {
+            return false;
+        }
+        let name = callee::TypeName::parse(inner).name;
+        self.ambient_type.iter().any(|t| t.name == name)
     }
 }
 
@@ -265,7 +263,7 @@ fn push_matches<'m, R, C>(
             hits.push((score, rule));
         }
     }
-    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     out.extend(hits.into_iter().map(|(_, rule)| wrap(rule)));
 }
 
@@ -294,99 +292,18 @@ fn rule_matches(callee: &CalleePath, dest_type: Option<&str>, key: RuleKey<'_>) 
 #[must_use]
 pub fn dest_type_matches(rule: &str, declared: &str) -> bool {
     let rule = normalize_ws(rule);
-    let declared = normalize_ws(callee::peel_refs(declared));
+    let declared = normalize_ws(peel_refs(declared));
     if rule == declared {
         return true;
     }
-    let (rule_base, rule_args) = split_base_args(&rule);
-    let (decl_base, decl_args) = split_base_args(&declared);
-    if !segments_suffix(rule_base, decl_base) {
+    let (rule_base, rule_args) = split_generic(&rule);
+    let (decl_base, decl_args) = split_generic(&declared);
+    if !is_segment_suffix(rule_base, &segments(decl_base)) {
         return false;
     }
-    rule_args.is_none_or(|want| decl_args.is_some_and(|have| want == have))
-}
-
-/// `a::B<C, D>` → (`a::B`, `Some("C, D")`); `a::B` → (`a::B`, `None`).
-fn split_base_args(ty: &str) -> (&str, Option<&str>) {
-    let mut depth = 0i32;
-    let bytes = ty.as_bytes();
-    let mut start: Option<usize> = None;
-    for (idx, c) in ty.char_indices() {
-        match c {
-            '<' => {
-                if depth == 0 && start.is_none() {
-                    start = Some(idx);
-                }
-                depth = depth.saturating_add(1);
-            }
-            '>' => {
-                if !(idx > 0 && bytes.get(idx.saturating_sub(1)) == Some(&b'-')) {
-                    depth = depth.saturating_sub(1);
-                }
-            }
-            _ => {}
-        }
-    }
-    start.map_or((ty, None), |idx| {
-        let base = ty.get(..idx).unwrap_or(ty).trim_end();
-        let args = ty
-            .get(idx.saturating_add(1)..ty.len().saturating_sub(1))
-            .map(str::trim);
-        (base, args)
-    })
-}
-
-/// True when `needle`'s `::` segments are a suffix of `haystack`'s.
-fn segments_suffix(needle: &str, haystack: &str) -> bool {
-    let want: Vec<&str> = callee::split_top_level(needle, "::")
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let have: Vec<&str> = callee::split_top_level(haystack, "::")
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if want.is_empty() || want.len() > have.len() {
-        return false;
-    }
-    let start = have.len().saturating_sub(want.len());
-    have.get(start..)
-        .is_some_and(|tail| tail.iter().zip(&want).all(|(a, b)| a == b))
-}
-
-/// Collapse whitespace runs to a single space and trim.
-fn normalize_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// The crate a path is explicitly rooted at, if any. See the module docs.
-fn crate_root(text: &str) -> Option<&str> {
-    let mut t = text.trim();
-    for _ in 0..8 {
-        t = callee::peel_refs(t.trim_start());
-        if let Some(rest) = t.strip_prefix('<') {
-            t = rest;
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("dyn ") {
-            t = rest;
-            continue;
-        }
-        break;
-    }
-    let end = t
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(t.len());
-    let ident = t.get(..end)?;
-    if ident.is_empty() || !ident.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return None;
-    }
-    if !t.get(end..)?.starts_with("::") {
-        return None;
-    }
-    Some(ident)
+    // A rule that writes no generic arguments does not constrain them; one that
+    // writes any must match the declared type's argument list exactly.
+    rule_args.is_empty() || rule_args == decl_args
 }
 
 #[cfg(test)]
@@ -437,6 +354,32 @@ mod tests {
         // ... the same method on a Vec is not.
         let vec = classify(&m, "<Vec<u64> as IntoIterator>::into_iter", None);
         assert!(source_of(&vec).is_none(), "{vec:?}");
+    }
+
+    #[test]
+    fn a_dest_type_row_must_spell_out_the_type_rustc_prints_not_its_alias() {
+        let m = model();
+        // Measured with `rustc --emit=mir` (1.98.0): `std::env::current_dir()`
+        // declares its destination as the RESOLVED type, never as the
+        // `std::io::Result<T>` alias the function signature is written with.
+        let printed = "std::result::Result<std::path::PathBuf, std::io::Error>";
+        assert!(
+            source_of(&classify(&m, "current_dir", Some(printed))).is_some(),
+            "the `current_dir` row must fire on the type MIR actually prints"
+        );
+        assert!(
+            source_of(&classify(&m, "current_exe", Some(printed))).is_some(),
+            "so must `current_exe`, which shares the destination type"
+        );
+        assert!(
+            !dest_type_matches("std::io::error::Result<std::path::PathBuf>", printed),
+            "the alias spelling is exactly what could never match — a row \
+             written that way is dead, not merely imprecise"
+        );
+        assert!(
+            source_of(&classify(&m, "current_dir", None)).is_none(),
+            "a row carrying a `dest_type` never matches an unknown destination"
+        );
     }
 
     #[test]

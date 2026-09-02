@@ -22,6 +22,7 @@ pub mod model;
 pub mod pipeline;
 pub mod report;
 pub mod resolve;
+mod util;
 pub mod verdict;
 
 pub use allowlist::Allowlist;

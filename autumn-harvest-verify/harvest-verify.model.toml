@@ -110,6 +110,9 @@ version = "2026.09.0"
 # taint. `static mut` is always ambient regardless of type.
 
 [[ambient_type]]
+name = "Atomic"
+reason = "The generic `core::sync::atomic::Atomic<T>` that rustc >= 1.98 prints for every atomic; `AtomicU64` and friends are aliases of it and MIR resolves an alias to the type it names (`static SEQ: Atomic<u64>`, `_1 = const {alloc6: &Atomic<u64>}`). The width-named rows below stay for MIR emitted by older toolchains, which printed the alias."
+[[ambient_type]]
 name = "AtomicBool"
 reason = "Interior-mutable; a static's value is process-lifetime state, not history-derived."
 [[ambient_type]]
@@ -266,9 +269,9 @@ kind = "value"
 reason = "`std::env::args_os`; see `args`."
 [[source]]
 path = "current_dir"
-dest_type = "std::io::error::Result<std::path::PathBuf>"
+dest_type = "std::result::Result<std::path::PathBuf, std::io::Error>"
 kind = "value"
-reason = "`std::env::current_dir`. The worker's working directory is host state."
+reason = "`std::env::current_dir`. The worker's working directory is host state. The `dest_type` spells `Result` out rather than using the `std::io::Result<T>` alias: MIR prints the *resolved* type of the destination local, so a row keyed on the alias could never match."
 [[source]]
 path = "temp_dir"
 dest_type = "std::path::PathBuf"
@@ -276,9 +279,9 @@ kind = "value"
 reason = "`std::env::temp_dir`. Reads `TMPDIR`; host state."
 [[source]]
 path = "current_exe"
-dest_type = "std::io::error::Result<std::path::PathBuf>"
+dest_type = "std::result::Result<std::path::PathBuf, std::io::Error>"
 kind = "value"
-reason = "`std::env::current_exe`. Host state, and differs across a rolling deploy."
+reason = "`std::env::current_exe`. Host state, and differs across a rolling deploy. See `current_dir` for why the alias `std::io::Result` is spelled out."
 [[source]]
 path = "hostname"
 kind = "value"
@@ -489,6 +492,55 @@ reason = "See `LocalKey::with`."
 # type as an ambient root." A `Mutex` created inside the workflow body is not a
 # source; the identical call on a `static` one is.
 
+# rustc >= 1.98 prints every atomic as the generic `Atomic<T>` rather than as
+# the width alias, so each operation needs the row twice: once per spelling. The
+# `AtomicU64` rows below are what MIR from older toolchains (and the checked-in
+# 1.94 fixtures) match.
+[[source]]
+path = "load"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `load`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "fetch_add"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `fetch_add`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "fetch_sub"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `fetch_sub`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "fetch_or"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `fetch_or`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "fetch_and"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `fetch_and`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "fetch_xor"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `fetch_xor`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "swap"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `swap`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "compare_exchange"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `compare_exchange`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
+[[source]]
+path = "compare_exchange_weak"
+receiver = "Atomic"
+kind = "value"
+reason = "See the `AtomicU64` row for `compare_exchange_weak`; this is the generic `Atomic<T>` spelling rustc >= 1.98 prints."
 [[source]]
 path = "load"
 receiver = "AtomicU64"

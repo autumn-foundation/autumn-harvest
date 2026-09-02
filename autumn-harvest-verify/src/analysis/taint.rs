@@ -334,8 +334,7 @@ impl TaintState {
     #[must_use]
     pub fn read_root(&self, local: Local) -> TaintSet {
         let mut out = TaintSet::new();
-        for (projections, set) in self.places.get(&local).into_iter().flatten() {
-            let _ = projections;
+        for (_, set) in self.places.get(&local).into_iter().flatten() {
             out.absorb(set);
         }
         out

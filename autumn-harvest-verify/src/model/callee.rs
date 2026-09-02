@@ -20,6 +20,11 @@
 //! one whose `segments` is the whole text), because a callee the analyzer
 //! cannot decompose must become a boundary, never a panic.
 
+use crate::util::{
+    generic_args_of, is_segment_suffix, is_type_shaped, matching_angle, peel_refs, split_top,
+    split_top_trim, strip_generics,
+};
+
 /// A callee path as printed at a MIR call site, decomposed for rule matching.
 ///
 /// See the module docs for the shapes this handles.
@@ -100,18 +105,7 @@ impl CalleePath {
     /// rule keyed on a full path would match nothing (see the model TOML header).
     #[must_use]
     pub fn ends_with_path(&self, rule: &str) -> bool {
-        let wanted: Vec<&str> = split_top_level(rule, "::")
-            .into_iter()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if wanted.is_empty() || wanted.len() > self.segments.len() {
-            return false;
-        }
-        let start = self.segments.len().saturating_sub(wanted.len());
-        self.segments
-            .get(start..)
-            .is_some_and(|tail| tail.iter().zip(&wanted).all(|(have, want)| have == want))
+        is_segment_suffix(rule, &self.segments)
     }
 }
 
@@ -128,7 +122,7 @@ fn parse_qualified(text: &str, out: &mut CalleePath) {
         .trim_start_matches("::");
 
     if !inner.starts_with("impl at ") {
-        let halves = split_top_level(inner, " as ");
+        let halves = split_top(inner, " as ");
         let self_ty = halves.first().copied().unwrap_or(inner).trim();
         let self_ty = strip_impl_header(self_ty);
         let ty = TypeName::parse(self_ty);
@@ -159,7 +153,7 @@ fn parse_unqualified(text: &str, out: &mut CalleePath) {
     let mut generics: Vec<Vec<String>> = Vec::new();
     let mut impl_receiver: Option<TypeName> = None;
 
-    for token in split_top_level(text, "::") {
+    for token in split_top(text, "::") {
         let token = token.trim();
         if token.is_empty() {
             continue;
@@ -176,15 +170,14 @@ fn parse_unqualified(text: &str, out: &mut CalleePath) {
                     impl_receiver = Some(TypeName::parse(strip_impl_header(inner)));
                 }
             } else if let Some(slot) = generics.last_mut() {
-                *slot = split_top_level(inner, ",")
+                *slot = split_top_trim(inner, ",")
                     .into_iter()
-                    .map(|a| a.trim().to_string())
-                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
                     .collect();
             }
             continue;
         }
-        names.push(strip_generics(token));
+        names.push(strip_generics(token).to_string());
         generics.push(Vec::new());
     }
 
@@ -214,22 +207,13 @@ fn parse_unqualified(text: &str, out: &mut CalleePath) {
     out.segments = names;
 }
 
-/// A type name is "type-shaped" when it starts with an uppercase ASCII letter
-/// (`HashMap`, `WorkflowContext`) or is a brace form (`{closure}`); module
-/// segments (`env`, `time`, `collections`) are lowercase and are not receivers.
-fn is_type_shaped(name: &str) -> bool {
-    name.starts_with('{') || name.chars().next().is_some_and(char::is_uppercase)
-}
-
 /// `impl Trait for Ty` / `impl Ty` → the self type; anything else unchanged.
 fn strip_impl_header(text: &str) -> &str {
     let text = text.trim();
     let Some(after) = text.strip_prefix("impl ") else {
         return text;
     };
-    split_top_level(after, " for ")
-        .last()
-        .map_or(after, |s| s.trim())
+    split_top(after, " for ").last().map_or(after, |s| s.trim())
 }
 
 /// A type's name plus the pieces the model narrows on.
@@ -260,9 +244,7 @@ impl TypeName {
         let mut t = peel_refs(ty);
         if let Some(rest) = t.strip_prefix("dyn ") {
             out.is_dyn = true;
-            t = split_top_level(rest, "+")
-                .first()
-                .map_or(rest, |s| s.trim());
+            t = split_top(rest, "+").first().map_or(rest, |s| s.trim());
         }
         let t = peel_refs(t);
         if t.is_empty() {
@@ -288,9 +270,7 @@ impl TypeName {
                 .trim_start_matches("::");
             if rest.is_empty() {
                 let inner = t.get(1..close).unwrap_or("").trim();
-                let head = split_top_level(inner, " as ")
-                    .first()
-                    .map_or(inner, |s| s.trim());
+                let head = split_top(inner, " as ").first().map_or(inner, |s| s.trim());
                 if head == t {
                     out.name = t.to_string();
                     return out;
@@ -304,7 +284,7 @@ impl TypeName {
             out.name = t.to_string();
             return out;
         }
-        let tokens = split_top_level(t, "::");
+        let tokens = split_top(t, "::");
         let mut name = String::new();
         let mut args: Vec<String> = Vec::new();
         for token in tokens {
@@ -317,15 +297,17 @@ impl TypeName {
                     .get(1..token.len().saturating_sub(1))
                     .unwrap_or("")
                     .trim();
-                args = split_top_level(inner, ",")
+                args = split_top_trim(inner, ",")
                     .into_iter()
-                    .map(|a| a.trim().to_string())
-                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
                     .collect();
                 continue;
             }
-            name = strip_generics(token);
-            args = generic_args_of(token);
+            name = strip_generics(token).to_string();
+            args = generic_args_of(token)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         }
         out.name = name;
         out.generic_args = args;
@@ -350,160 +332,6 @@ fn normalize_brace(t: &str) -> String {
     format!("{{{kind}}}")
 }
 
-/// Peel `&`, `&mut`, `*const`, `*mut`, `mut` and lifetimes off a type.
-pub(crate) fn peel_refs(ty: &str) -> &str {
-    let mut t = ty.trim();
-    for _ in 0..16 {
-        let next = if let Some(r) = t.strip_prefix("&mut ") {
-            r
-        } else if let Some(r) = t.strip_prefix("*const ") {
-            r
-        } else if let Some(r) = t.strip_prefix("*mut ") {
-            r
-        } else if let Some(r) = t.strip_prefix("mut ") {
-            r
-        } else if let Some(r) = t.strip_prefix('&') {
-            r
-        } else if t.starts_with('\'') {
-            match t.split_once(' ') {
-                Some((_, rest)) => rest,
-                None => return t,
-            }
-        } else {
-            return t;
-        };
-        t = next.trim_start();
-    }
-    t
-}
-
-/// The segment name with any trailing generic-argument group removed.
-fn strip_generics(token: &str) -> String {
-    let token = token.trim();
-    let end = top_level_angle_start(token).unwrap_or(token.len());
-    token
-        .get(..end)
-        .unwrap_or(token)
-        .trim()
-        .trim_end_matches("::")
-        .to_string()
-}
-
-/// The generic arguments written directly on `token` (`Foo<A, B>` → `["A", "B"]`).
-fn generic_args_of(token: &str) -> Vec<String> {
-    let token = token.trim();
-    let Some(start) = top_level_angle_start(token) else {
-        return Vec::new();
-    };
-    let inner = token
-        .get(start.saturating_add(1)..token.len().saturating_sub(1))
-        .unwrap_or("");
-    split_top_level(inner, ",")
-        .into_iter()
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
-        .collect()
-}
-
-/// Byte index of the first depth-0 `<` in `token`, if any.
-fn top_level_angle_start(token: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    for (idx, c) in token.char_indices() {
-        match c {
-            '<' => {
-                if depth == 0 {
-                    return Some(idx);
-                }
-                depth = depth.saturating_add(1);
-            }
-            '(' | '[' | '{' => depth = depth.saturating_add(1),
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Byte index of the `>` that closes the `<` at the start of `text`.
-///
-/// `->` is skipped: `<{closure@f.rs:1:1: 1:2} as FnOnce<()>>::call_once` and
-/// `Box<dyn Fn() -> String>` must both scan correctly.
-#[must_use]
-pub fn matching_angle(text: &str) -> Option<usize> {
-    if !text.starts_with('<') {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    for (idx, c) in text.char_indices() {
-        match c {
-            '<' => depth = depth.saturating_add(1),
-            '>' => {
-                if idx > 0 && bytes.get(idx.saturating_sub(1)) == Some(&b'-') {
-                    continue;
-                }
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split `text` on every occurrence of `sep` that is not nested inside
-/// `<>`, `()`, `[]` or `{}`.
-///
-/// The workhorse of this module: `<<T as IntoIterator>::IntoIter as Iterator>`
-/// has an ` as ` at depth 1 that must not split, and
-/// `collect::<Vec<(String, u32)>>` has commas at depth 2 that must not split
-/// the argument list. `->` never closes an angle bracket.
-#[must_use]
-pub fn split_top_level<'a>(text: &'a str, sep: &str) -> Vec<&'a str> {
-    if sep.is_empty() {
-        return vec![text];
-    }
-    let bytes = text.as_bytes();
-    let mut parts: Vec<&'a str> = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut chars = text.char_indices();
-    while let Some((idx, c)) = chars.next() {
-        match c {
-            '<' | '(' | '[' | '{' => depth = depth.saturating_add(1),
-            '>' => {
-                if !(idx > 0 && bytes.get(idx.saturating_sub(1)) == Some(&b'-')) {
-                    depth = depth.saturating_sub(1);
-                }
-            }
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if depth != 0 {
-            continue;
-        }
-        let Some(rest) = text.get(idx..) else {
-            continue;
-        };
-        if rest.starts_with(sep) {
-            parts.push(text.get(start..idx).unwrap_or(""));
-            start = idx.saturating_add(sep.len());
-            // Skip the separator's remaining characters.
-            let mut consumed = c.len_utf8();
-            while consumed < sep.len() {
-                match chars.next() {
-                    Some((_, skipped)) => consumed = consumed.saturating_add(skipped.len_utf8()),
-                    None => break,
-                }
-            }
-        }
-    }
-    parts.push(text.get(start..).unwrap_or(""));
-    parts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,25 +342,6 @@ mod tests {
 
     fn segs(text: &str) -> Vec<String> {
         p(text).segments
-    }
-
-    #[test]
-    fn splits_only_at_depth_zero() {
-        assert_eq!(
-            split_top_level("a::b::c", "::"),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-        assert_eq!(
-            split_top_level("Vec<(String, u32)>, u64", ","),
-            vec!["Vec<(String, u32)>".to_string(), " u64".to_string()]
-        );
-        assert_eq!(
-            split_top_level("<T as IntoIterator>::IntoIter as Iterator", " as "),
-            vec![
-                "<T as IntoIterator>::IntoIter".to_string(),
-                "Iterator".to_string()
-            ]
-        );
     }
 
     #[test]

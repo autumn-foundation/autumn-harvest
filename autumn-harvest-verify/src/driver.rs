@@ -831,7 +831,7 @@ mod tests {
         let (mirs, warnings) = emit_mir_with_warnings(&req).expect("emit_mir");
         assert!(!mirs.is_empty(), "warnings: {warnings:?}");
         for mir in &mirs {
-            let size = std::fs::metadata(&mir.path).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&mir.path).map_or(0, |m| m.len());
             println!(
                 "{} {} {} ({size} bytes)",
                 mir.crate_name,
