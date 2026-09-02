@@ -6,4 +6,4 @@ entry for its pre-registration commit, apparatus, and verdict.
 
 | # | question | verdict | report |
 |--:|:--|:--|:--|
-| 1 | Does the built `autumn-harvest-redis` adapter clear its own spec's >10,000 ops/sec bar, on a machine where nothing else can slow it down? | **kill** on the registered claim (8,828 mean vs 10,000 ops/sec @ 8 workers, shared queue) — but 13.8x the measured Postgres control at matched concurrency, and unintegrated with the worker regardless | [0001-redis-adapter-throughput-ceiling.md](0001-redis-adapter-throughput-ceiling.md) |
+| 1 | Does the built `autumn-harvest-redis` adapter clear its own spec's >10,000 ops/sec bar, on a machine where nothing else can slow it down? | **kill**, narrowly: an 8-worker/steady-state sub-question this assay added on its own (8,828 mean vs 10,000 ops/sec). The founding spec's actual, unconstrained claim looks achievable, not refuted — a matched-workload backlog-drain check (post-hoc, not pre-registered) hit 12,271 mean, 19.2x the Postgres control. Unintegrated with the worker regardless of either number. | [0001-redis-adapter-throughput-ceiling.md](0001-redis-adapter-throughput-ceiling.md) |

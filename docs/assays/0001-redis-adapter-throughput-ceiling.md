@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,828 vs 10,000 ops/sec @ matched concurrency, ledger #1)
+# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,828 vs 10,000 ops/sec — but only for this assay's own 8-worker steady-state sub-question, ledger #1)
 
 > Status: **measured.** The Pre-registration section below was committed
 > (`3a0e3b9`) before the apparatus was built or run; nothing in it has been
@@ -147,18 +147,35 @@ verdict). 10s measured window per cell. Machine: this session's 4-logical-CPU
 container, local `redis-server` 7.0.15 on loopback, `save ""` / `appendonly
 no`.
 
-> **Post-review correction.** The first version of this apparatus (commit
-> `368abec`) gave each worker its own dedicated stream rather than the single
-> shared queue the pre-registration committed to, counted a round trip before
-> checking whether `complete` succeeded, and started its measured window
-> before every worker had a live connection. All three were flagged by
-> automated review on the PR and are fixed in the version described above and
-> archived here; the numbers in this report are from the corrected apparatus.
-> The corrected, contention-bearing shared-queue numbers landed within noise
-> of the original dedicated-stream numbers (registered cell: 8,586-9,092
-> ops/sec across three shared-queue runs vs. 8,578-8,643 ops/sec across the
-> original dedicated-stream runs) — the fix changed what was actually being
-> tested, not the verdict.
+> **Post-review correction #1** (commit `505a176`). The first version of this
+> apparatus (commit `368abec`) gave each worker its own dedicated stream
+> rather than the single shared queue the pre-registration committed to,
+> counted a round trip before checking whether `complete` succeeded, and
+> started its measured window before every worker had a live connection. All
+> three were flagged by automated review on the PR and are fixed in the
+> version described above and archived here; the numbers in this report are
+> from the corrected apparatus. The corrected, contention-bearing
+> shared-queue numbers landed within noise of the original dedicated-stream
+> numbers (registered cell: 8,586-9,092 ops/sec across three shared-queue
+> runs vs. 8,578-8,643 ops/sec across the original dedicated-stream runs) —
+> the fix changed what was actually being tested, not the verdict.
+>
+> **Post-review correction #2 — a second, more consequential methodology gap.**
+> Automated review also pointed out that the steady-state
+> enqueue→claim→complete loop above keeps the queue near-empty by
+> construction (each worker enqueues one item and immediately tries to claim
+> it back), which is *not* the workload `docs/performance.md`'s Postgres
+> number measures: that number is "N real `claim_task()` calls draining the
+> full backlog" — claimers only, against a **static, pre-seeded** 1,000-row
+> backlog, no concurrent producer. Comparing the two as a controlled,
+> matched-workload result (as the original version of this report did, under
+> a "13.8x" headline) was not sound. A `backlog_drain_scenario` was added
+> to the apparatus afterward — seed 1,000 entries, then 8 claim-only workers
+> drain them with no further enqueues, mirroring the Postgres methodology
+> exactly — and is reported below as a **separate, explicitly post-hoc**
+> measurement: it was run after the registered result was already known, so
+> it is evidence for a follow-up charter, not a replacement for the
+> registered verdict. See Verdict for how the two are kept apart.
 
 **Stubs list (what was faked/skipped, and why it matters for reading the number):**
 
@@ -216,64 +233,113 @@ logical CPUs, not re-measured here): Postgres claim path sustains **640
 claims/sec** at an 8-concurrent-claimer / 1,000-row-backlog scenario, falling
 to **29/sec** at a 10,000-row backlog.
 
-At the concurrency shape the control was measured under (8 concurrent
-workers/claimers), the adapter beats the Postgres number by **13.8x**
-(8,827.90 mean vs 640 claims/sec) — a large, real margin, even though it
-misses the crate's own flat 10,000/sec bar at that same concurrency. The
-adapter does cross 10,000/sec, but only once concurrency roughly doubles past
-the registered/control-matched shape, then plateaus near 14.5-14.7k ops/sec by
-32 workers — consistent with a single Redis instance's serialized command
-throughput becoming the limit, not this box's 4 cores (workers 8→64 is an
-8x concurrency increase for only a 1.7x throughput increase).
+The steady-state number above (8,827.90 mean at 8 workers) and the Postgres
+640 claims/sec figure are **not a matched-workload comparison** — see
+post-review correction #2 — because the Redis loop keeps the queue near-empty
+while the Postgres number specifically measures draining a static 1,000-row
+backlog. The earlier version of this report divided one by the other and
+called it "13.8x"; that comparison is withdrawn.
+
+**Matched-workload comparison (post-hoc, not pre-registered):** seed a static
+1,000-row backlog, drain it with 8 claim-only workers, no further enqueues —
+the same shape as the Postgres cell. Three runs, each racing to drain the
+full 1,000 rows (wall-clock ceiling 60s, never approached):
+
+| run | claims/sec | drained before ceiling |
+|--:|--:|:--|
+| 1 | 12,358.76 | yes |
+| 2 | 11,738.81 | yes |
+| 3 | 12,716.71 | yes |
+
+Mean **12,271.43 claims/sec** — **above the 10,000/sec line**, and **19.2x**
+the Postgres control (640 claims/sec) at the same backlog depth and
+concurrency. This is the more faithful reproduction of what
+`docs/performance.md` and the founding spec both actually describe
+("dispatch and claim operations" against a real backlog), and it does not
+agree with the registered steady-state result: at the same 8-worker
+concurrency, claim-only draining is ~40% faster than enqueue-claim-complete
+under steady load, which makes sense (one fewer Redis round trip per op with
+no enqueue in the timed path, and no empty-poll backoff since the backlog
+never runs dry before the ceiling).
+
+Separately, the steady-state sweep does show the adapter crossing 10,000/sec
+once concurrency roughly doubles past the registered 8-worker shape,
+plateauing near 14.5-14.7k ops/sec by 32 workers — consistent with a single
+Redis instance's serialized command throughput becoming the limit, not this
+box's 4 cores (workers 8→64 is an 8x concurrency increase for only a 1.7x
+throughput increase).
 
 ## 🏁 Verdict
 
-**KILL** — on the pre-registered claim, at the pre-registered condition. The
-adapter measured 8,586.70-9,091.80 ops/sec (mean 8,827.90) across three runs
-at 8 concurrent workers on the pre-registered shared queue, against the
-committed **≥10,000 ops/sec** line. That is a miss on every one of the three
-runs, under the single most favorable conditions this adapter will ever run
-in (no Postgres, no worker, no network hop, nothing else on the box). Per the
-pre-registration, this is a no, not a rounding call — 400 vs a 200ms line was
-never the test here, and neither is 8,800-ish vs 10,000.
+**KILL — but scoped narrowly, and automated review correctly caught this
+report initially overstating that scope.** The pre-registered claim was:
+"`RedisTaskQueue` sustains ≥10,000 ops/sec, one op = one enqueue→claim→complete
+round trip, at **8 concurrent worker tasks**." That 8-worker figure was *this
+assay's own choice*, made for comparability with the Postgres control's
+shape — it is not a constraint the founding spec itself imposes.
+`docs/plans/vantage-spec-redis-adapter.md:10` sets no worker-count condition
+at all: "Success = Engine can reliably sustain > 10,000 tasks/second queue
+dispatch and claim operations."
 
-Two things sit alongside that kill and change what it means for the decision,
-rather than reversing it:
+On the **registered, 8-worker, steady-state sub-question**: the adapter
+measured 8,586.70-9,091.80 ops/sec (mean 8,827.90) across three runs, against
+the committed **≥10,000 ops/sec** line. That is a miss on every one of the
+three runs, under the single most favorable conditions this adapter will
+ever run in (no Postgres, no worker, no network hop, nothing else on the
+box). Per the pre-registration, this is a no for that specific sub-question —
+not a rounding call.
 
-1. **The adapter is not dead technology.** Against the actual measured control
-   (not the vendor-style "~10k ceiling" narrative the spec and architecture
-   doc assert but never measured), it wins by 13.8x at matched concurrency,
-   and does clear 10,000/sec at roughly double the worker count. The founding
-   claim is wrong as a flat, concurrency-independent number, but the
-   underlying approach clearly outperforms Postgres by a wide margin on this
-   hardware.
-2. **None of this is reachable today.** `autumn-harvest-redis/src/lib.rs`'s
-   own module doc states the crate has never been wired into `worker.rs` —
-   the transactional-boundary split it describes as a prerequisite is
-   unbuilt. Whatever this adapter can sustain in isolation, no operator can
-   turn it on as the "escape hatch" `docs/autumn-workflow-architecture.md`
-   describes. This was true before this assay and is unaffected by the
-   throughput number either way.
+**This does not establish that the founding spec's own, unconstrained claim
+is false, and the first version of this report was wrong to imply it did.**
+Two pieces of evidence, both gathered honestly but neither pre-registered
+(so neither overrides the registered kill above — they inform the next
+charter instead):
+
+1. The steady-state sweep itself crosses 10,000/sec once concurrency doubles
+   past 8 workers: 11,840-12,058 ops/sec at 16 workers, plateauing near
+   14.5-14.7k by 32.
+2. The post-hoc, matched-workload backlog-drain measurement (see Assay) —
+   the one that actually mirrors how `docs/performance.md`'s Postgres number
+   was taken — clears 10,000/sec even at 8 workers: mean 12,271.43
+   claims/sec, 19.2x the Postgres control at the same backlog depth and
+   concurrency.
+
+Read together: **the founding, unconstrained ">10,000 ops/sec, reliably
+sustained" claim looks achievable, not refuted**, once the workload shape
+matches what either the spec or the Postgres control actually describes. What
+*is* genuinely established is narrower and still worth having: an
+enqueue-heavy, always-near-empty-queue workload at exactly 8 concurrent
+workers does not clear 10,000/sec on this hardware — a real, if
+narrower, finding, not a verdict on the crate as a whole.
+
+Separately, and unaffected by any of the above either way:
+`autumn-harvest-redis/src/lib.rs`'s own module doc states the crate has never
+been wired into `worker.rs` — the transactional-boundary split it describes
+as a prerequisite is unbuilt. Whatever this adapter can sustain in isolation,
+no operator can turn it on as the "escape hatch"
+`docs/autumn-workflow-architecture.md` describes. This was true before this
+assay and no measurement here changes it.
 
 **For the named decision** (is `docs/autumn-workflow-architecture.md`'s
-Phase-4 claim safe to keep documenting as-is): **no.** It currently describes
-a working, verified >10,000/sec escape hatch. It should instead say the
-adapter exists, is unintegrated, and its standalone throughput has now been
-measured (crosses 10k/sec only above ~16 concurrent workers on a 4-core
-reference box; beats the measured Postgres path by an order of magnitude at
-matched concurrency). That correction does not require deciding whether to
-prioritize the integration follow-up — it is owed regardless, immediately,
-because the current docs assert a measurement that did not exist until this
-report.
+Phase-4 claim safe to keep documenting as-is): **no, but not because the
+number is false** — because it was never measured at all, and "never
+measured" is not the same finding as "measured and wrong." The doc should
+say: the founding >10,000/sec claim has now been measured and looks
+achievable (12,271 claims/sec mean, matched-workload, exploratory), an
+artificially narrow 8-worker/steady-state sub-question was separately killed
+(8,828 mean), and — the part that actually gates usability — the adapter is
+unintegrated with the worker regardless of any of these numbers.
 
-**Re-charter, not close:** the underlying "is this worth finishing"
-question is genuinely open and worth a properly scoped follow-up assay once
-someone is ready to spend on it — not this one, whose registered line was
-answered. A sharper next charter: pick the concurrency shape a real
-`autumn-harvest` deployment would actually run (worker pool size, not an
-arbitrary sweep), and gate the worker-integration decision on that number,
-post-refactor, against a control that includes the transactional-boundary
-cost this assay explicitly stubbed out.
+**Re-charter, not close:** two follow-ups are now worth pre-registering
+properly, since the exploratory data above was gathered after this assay's
+own registered result and should not be laundered into a second verdict
+without its own commitment: (1) a backlog-drain-methodology assay, matching
+the Postgres control's actual shape from the start rather than discovering
+the mismatch mid-assay, across a range of concurrency and backlog depths; (2)
+once the worker-integration refactor lands, a deployment-shaped assay (real
+worker pool size, real transactional-boundary cost included) that is the one
+that should actually gate the "ship this as the documented escape hatch"
+decision.
 
 ## 🔬 Reproduce
 
@@ -285,7 +351,9 @@ redis-server --daemonize yes --port 6379 --save "" --appendonly no
 # never add this to the workspace Cargo.toml).
 cd docs/assays/apparatus/0001-redis-throughput-bench
 BENCH_SECS=10 cargo run --release
-# prints one "concurrency,ops_completed_per_sec" line per swept cell
+# prints one "concurrency,ops_completed_per_sec" line per swept steady-state
+# cell, then one "backlog_drain,backlog=1000,claimers=8,claims_per_sec=...,
+# drained_before_ceiling=..." line for the matched-workload comparison
 ```
 
 The Postgres control is reproduced via the existing, already-documented
