@@ -98,12 +98,17 @@ async fn sweep_one(concurrency: usize, duration: Duration, redis_url: &str) -> f
 }
 
 /// Drain a pre-seeded, static backlog with claim-only workers -- no worker
-/// enqueues anything once the seed is in place. This mirrors
-/// `docs/performance.md`'s own methodology ("N real claim_task() calls
-/// draining the full backlog") instead of the steady-state loop above, which
-/// keeps the queue near-empty by construction and is therefore not a fair
-/// comparison against a Postgres number that is specifically about draining
-/// a seeded backlog.
+/// enqueues anything once the seed is in place. This is closer to
+/// `docs/performance.md`'s methodology than the steady-state loop above (which
+/// keeps the queue near-empty by construction), but it is still NOT a matched
+/// reproduction of that harness: `claim_bench_support.rs` spreads its backlog
+/// across 4 queues and caps claims at `backlog / MAX_DRAIN_FRACTION` (= 5) so
+/// the backlog stays at 80-100% of its seeded depth throughout the run, while
+/// this function uses one queue and drains it to zero. See assay #1's report,
+/// "post-review correction #2", for why that gap is not patched here: getting
+/// a true match means reusing or porting that harness's scenario shape, not
+/// another one-off reimplementation. Numbers from this function are reported
+/// as exploratory and are never compared to the Postgres control by a ratio.
 async fn run_drain_worker(
     queue: RedisTaskQueue,
     worker_id: String,

@@ -160,22 +160,39 @@ no`.
 > runs vs. 8,578-8,643 ops/sec across the original dedicated-stream runs) —
 > the fix changed what was actually being tested, not the verdict.
 >
-> **Post-review correction #2 — a second, more consequential methodology gap.**
-> Automated review also pointed out that the steady-state
+> **Post-review correction #2 — a methodology gap, then a second one found
+> underneath it.** Automated review pointed out that the steady-state
 > enqueue→claim→complete loop above keeps the queue near-empty by
-> construction (each worker enqueues one item and immediately tries to claim
-> it back), which is *not* the workload `docs/performance.md`'s Postgres
-> number measures: that number is "N real `claim_task()` calls draining the
-> full backlog" — claimers only, against a **static, pre-seeded** 1,000-row
-> backlog, no concurrent producer. Comparing the two as a controlled,
-> matched-workload result (as the original version of this report did, under
-> a "13.8x" headline) was not sound. A `backlog_drain_scenario` was added
-> to the apparatus afterward — seed 1,000 entries, then 8 claim-only workers
-> drain them with no further enqueues, mirroring the Postgres methodology
-> exactly — and is reported below as a **separate, explicitly post-hoc**
-> measurement: it was run after the registered result was already known, so
-> it is evidence for a follow-up charter, not a replacement for the
-> registered verdict. See Verdict for how the two are kept apart.
+> construction, which is not the workload `docs/performance.md`'s Postgres
+> number measures. A `backlog_drain_scenario` was added — seed 1,000
+> entries, 8 claim-only workers drain them, no further enqueues — and
+> reported as a closer, though explicitly post-hoc, approximation.
+>
+> Automated review then checked that approximation against the actual
+> Postgres harness source
+> (`autumn-harvest/tests/integration/claim_bench_support.rs`) and found it
+> still wasn't matched: that harness spreads a scenario's backlog across
+> **4 queues** (`headline_scenario` and the backlog-depth sweep both use
+> `queues: 4`), and deliberately claims only a bounded fraction of it —
+> `measured_claims_for` caps claims at `backlog / MAX_DRAIN_FRACTION`
+> (`MAX_DRAIN_FRACTION = 5`), so the published 640 claims/sec at a 1,000-row
+> backlog is **~200 claims while the backlog stays at 80-100% of its seeded
+> depth** — not a full drain to zero. This repo's own apparatus drained the
+> full 1,000 rows on a single queue: a different backlog-depth profile and a
+> different queue topology from what it was being compared against, verified
+> directly against the harness source rather than taken on the reviewer's
+> word.
+>
+> At this point the apparatus has been corrected three times chasing this one
+> comparison, each round surfacing a new mismatch. That pattern is itself the
+> finding: **reproducing `claim_bench_support.rs`'s exact scenario shape
+> (bounded-fraction draws, multi-queue spread, wall-clock-bounded sampling)
+> is a real engineering lift, not something a quick, cheap assay's apparatus
+> converges on by iterating a few more times.** Rather than build a fourth,
+> more elaborate version, the ratio claim is withdrawn outright — see Assay
+> and Verdict for what's kept (the two real, honestly-labeled numbers this
+> apparatus did measure) versus what's cut (any specific "Nx" figure against
+> the Postgres control).
 
 **Stubs list (what was faked/skipped, and why it matters for reading the number):**
 
@@ -233,17 +250,19 @@ logical CPUs, not re-measured here): Postgres claim path sustains **640
 claims/sec** at an 8-concurrent-claimer / 1,000-row-backlog scenario, falling
 to **29/sec** at a 10,000-row backlog.
 
-The steady-state number above (8,827.90 mean at 8 workers) and the Postgres
-640 claims/sec figure are **not a matched-workload comparison** — see
-post-review correction #2 — because the Redis loop keeps the queue near-empty
-while the Postgres number specifically measures draining a static 1,000-row
-backlog. The earlier version of this report divided one by the other and
-called it "13.8x"; that comparison is withdrawn.
+**No ratio against the Postgres control is reported.** Two rounds of review
+found two independent ways the workloads weren't matched (near-empty queue
+vs. a seeded backlog; then full single-queue drain vs. Postgres's
+bounded-fraction claim across 4 queues at 80-100% depth) — see post-review
+correction #2. Building an apparatus that actually reproduces
+`claim_bench_support.rs`'s scenario shape is a real, separate piece of work,
+not a quick fix to this one's loop. Both this report's own multiplier claims
+("13.8x", then "19.2x") are withdrawn; neither survives.
 
-**Matched-workload comparison (post-hoc, not pre-registered):** seed a static
-1,000-row backlog, drain it with 8 claim-only workers, no further enqueues —
-the same shape as the Postgres cell. Three runs, each racing to drain the
-full 1,000 rows (wall-clock ceiling 60s, never approached):
+What *is* kept, honestly labeled as exploratory and not compared to Postgres
+by a specific factor: seeding a static 1,000-entry backlog on one shared
+queue and draining it fully with 8 claim-only workers (no further enqueues)
+measured, across three runs (wall-clock ceiling 60s, never approached):
 
 | run | claims/sec | drained before ceiling |
 |--:|--:|:--|
@@ -251,16 +270,12 @@ full 1,000 rows (wall-clock ceiling 60s, never approached):
 | 2 | 11,738.81 | yes |
 | 3 | 12,716.71 | yes |
 
-Mean **12,271.43 claims/sec** — **above the 10,000/sec line**, and **19.2x**
-the Postgres control (640 claims/sec) at the same backlog depth and
-concurrency. This is the more faithful reproduction of what
-`docs/performance.md` and the founding spec both actually describe
-("dispatch and claim operations" against a real backlog), and it does not
-agree with the registered steady-state result: at the same 8-worker
-concurrency, claim-only draining is ~40% faster than enqueue-claim-complete
-under steady load, which makes sense (one fewer Redis round trip per op with
-no enqueue in the timed path, and no empty-poll backoff since the backlog
-never runs dry before the ceiling).
+Mean **12,271.43 claims/sec** — above the 10,000/sec line, and, taken on its
+own (not as a ratio against a differently-shaped Postgres number), faster
+than the registered steady-state cell at the same 8-worker concurrency
+(~8,828 mean), consistent with claim-only draining having one fewer Redis
+round trip per op than enqueue-claim-complete and no empty-poll backoff while
+backlog remains.
 
 Separately, the steady-state sweep does show the adapter crossing 10,000/sec
 once concurrency roughly doubles past the registered 8-worker shape,
@@ -298,15 +313,14 @@ charter instead):
 1. The steady-state sweep itself crosses 10,000/sec once concurrency doubles
    past 8 workers: 11,840-12,058 ops/sec at 16 workers, plateauing near
    14.5-14.7k by 32.
-2. The post-hoc, matched-workload backlog-drain measurement (see Assay) —
-   the one that actually mirrors how `docs/performance.md`'s Postgres number
-   was taken — clears 10,000/sec even at 8 workers: mean 12,271.43
-   claims/sec, 19.2x the Postgres control at the same backlog depth and
-   concurrency.
+2. The exploratory backlog-drain measurement (see Assay — not a matched
+   comparison against Postgres, see post-review correction #2, but still a
+   real number for this adapter alone) also clears 10,000/sec at 8 workers:
+   mean 12,271.43 claims/sec.
 
 Read together: **the founding, unconstrained ">10,000 ops/sec, reliably
-sustained" claim looks achievable, not refuted**, once the workload shape
-matches what either the spec or the Postgres control actually describes. What
+sustained" claim looks achievable, not refuted**, under more than one
+workload shape this assay tried. What
 *is* genuinely established is narrower and still worth having: an
 enqueue-heavy, always-near-empty-queue workload at exactly 8 concurrent
 workers does not clear 10,000/sec on this hardware — a real, if
@@ -325,20 +339,25 @@ Phase-4 claim safe to keep documenting as-is): **no, but not because the
 number is false** — because it was never measured at all, and "never
 measured" is not the same finding as "measured and wrong." The doc should
 say: the founding >10,000/sec claim has now been measured and looks
-achievable (12,271 claims/sec mean, matched-workload, exploratory), an
-artificially narrow 8-worker/steady-state sub-question was separately killed
-(8,828 mean), and — the part that actually gates usability — the adapter is
+achievable (12,271 claims/sec mean under an exploratory, not
+Postgres-matched, backlog-drain condition), an artificially narrow
+8-worker/steady-state sub-question was separately killed (8,828 mean), no
+verified multiplier against the Postgres control exists (two were tried and
+both withdrawn), and — the part that actually gates usability — the adapter is
 unintegrated with the worker regardless of any of these numbers.
 
 **Re-charter, not close:** two follow-ups are now worth pre-registering
 properly, since the exploratory data above was gathered after this assay's
 own registered result and should not be laundered into a second verdict
-without its own commitment: (1) a backlog-drain-methodology assay, matching
-the Postgres control's actual shape from the start rather than discovering
-the mismatch mid-assay, across a range of concurrency and backlog depths; (2)
-once the worker-integration refactor lands, a deployment-shaped assay (real
-worker pool size, real transactional-boundary cost included) that is the one
-that should actually gate the "ship this as the documented escape hatch"
+without its own commitment: (1) a genuinely matched-workload assay against
+Postgres — this one tried twice to approximate `claim_bench_support.rs`'s
+scenario shape (4-queue spread, bounded-fraction claims at 80-100% backlog
+depth) and missed both times, so the honest scope for that follow-up is
+porting or directly reusing that harness's scenario definitions against a
+Redis backend, not another one-off reimplementation; (2) once the
+worker-integration refactor lands, a deployment-shaped assay (real worker
+pool size, real transactional-boundary cost included) that is the one that
+should actually gate the "ship this as the documented escape hatch"
 decision.
 
 ## 🔬 Reproduce
