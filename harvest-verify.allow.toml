@@ -1,0 +1,31 @@
+# harvest-verify allowlist (issue #962, AC5)
+# ============================================================================
+#
+# Suppresses a `harvest-verify` verdict for one workflow, with a REQUIRED
+# justification. A file rather than a `#[workflow(allow_unverified)]` attribute
+# because AC7 forbids any macro-path change — see
+# `docs/rnd/determinism-static-analysis.md` §Escape hatch.
+#
+# Rules (each enforced by a test in `autumn-harvest-verify/tests/allowlist.rs`):
+#
+#   * `workflow` is the fully-qualified path (`crate::module::fn`), matched
+#     EXACTLY. No globs: a pattern that silently widens is how an allowlist
+#     becomes a bypass.
+#   * `justification` is required and must be non-blank. An escape hatch without
+#     a justification is an off switch.
+#   * A duplicate `workflow` is a hard error — two justifications for one
+#     workflow means one of them is stale.
+#   * An UNUSED entry (its workflow no longer exists, or no longer needs it) is
+#     reported as a warning, and is an error under `--strict`.
+#
+# The size of this file IS the success metric: `≤ 10%` of the analyzed workflow
+# fns may need an entry. If it grows past that, the tool is wrong, not the code.
+#
+# Format:
+#
+#   [[allow]]
+#   workflow = "my_crate::billing::reconcile_invoices"
+#   justification = "Why this is safe, what covers it, and the tracking issue."
+#
+# Intentionally empty: this repo's own examples corpus needs no entry at the
+# audited revision. See `docs/harvest-verify.md` for the worked example.

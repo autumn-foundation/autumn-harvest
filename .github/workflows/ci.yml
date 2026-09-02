@@ -138,6 +138,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #962: a new workspace member gets NO clippy coverage unless a step
+      # is added here — there is no `--workspace` clippy invocation in this job,
+      # only per-crate ones. The verify crate opts into the workspace's pedantic
+      # + nursery lints, which `-D warnings` makes effectively deny.
+      - name: Clippy autumn-harvest-verify
+        run: cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings
       # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
       # DOCS-ONLY pull requests — which is the change class most likely to break
       # them, and the one the `test` matrix below skips entirely (every step
@@ -205,6 +211,23 @@ jobs:
       # same trailing-`::` YAML reason as above.
       - name: Run docs/migrating-from-temporal.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migrating_from_temporal_docs::"
+
+      # Issue #962: same reasoning as the four steps above, for the R&D report's
+      # boundary-table, rule-subsumption and metric-citation guards.
+      # `docs/rnd/determinism-static-analysis.md` matches BOTH clauses of the
+      # docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits only the
+      # report — dropping a boundary row, staling the 22-rule matrix, citing a
+      # test that does not exist — sets `code=false` and skips the entire `test`
+      # matrix. That is precisely the change class these guards exist to catch,
+      # so they run here in the ungated `lint` job.
+      #
+      # Guarded by `determinism_static_analysis_docs::guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted for
+      # the same trailing-`::` YAML reason as above: a trailing colon in an
+      # unquoted scalar is a mapping indicator, and unquoted this line makes the
+      # whole workflow unparseable.
+      - name: Run docs/rnd/determinism-static-analysis.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration determinism_static_analysis_docs::"
 
   test:
     name: Test (${{ matrix.os }})
@@ -605,6 +628,60 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # Issue #962: the semantic (MIR-level) determinism analyzer, `harvest-verify`.
+  # This is the SECOND line behind the syntactic HVG/DET guardrails — opt-in, and
+  # deliberately NON-STRICT here: `unknown` verdicts warn, only a
+  # `nondeterminism-found` fails the job (exit 1). A tool/build error is exit 2,
+  # so "the tool broke" never reads as "your workflow is broken".
+  #
+  # Linux-only, like the other single-OS steps: the analysis is
+  # platform-independent and a three-OS matrix would triple the cost for no
+  # coverage. Gated on the `changes` filter exactly like `test`, plus the usual
+  # draft-skip.
+  #
+  # PERFORMANCE NOTE: the `< 5 min` success metric in
+  # docs/rnd/determinism-static-analysis.md is a WARM-CACHE number. A cold
+  # `--target-dir` rebuilds the whole dependency graph before the first `.mir`
+  # file exists (measured at minutes on its own), so `Swatinem/rust-cache` is
+  # load-bearing here, not a nicety, and `target/harvest-verify` — the analyzer's
+  # own emit directory — is cached alongside the normal workspace target dir.
+  # The gate run is wrapped in `time` so the wall clock of both phases (MIR emit
+  # and analysis) lands in the job log rather than in a claim; the tool itself
+  # prints the split under `--report`.
+  harvest-verify:
+    name: Semantic determinism analysis (harvest-verify)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-directories: target/harvest-verify
+      # Corpus + engine tests. The corpus test builds MIR into
+      # `target/harvest-verify`, which the cache above preserves between runs.
+      - name: Analyzer, corpus and boundary tests
+        run: cargo test -p autumn-harvest-verify
+      # The false-positive metric, over this repo's own examples — the only
+      # number in issue #962 produced by code the analyzer's author did not
+      # write, and the one the go/no-go hinges on. Env-gated because it needs a
+      # full example build; `--nocapture` so the proven/unknown/found triple and
+      # the per-workflow table land in the log.
+      - name: False-positive metric over the examples corpus
+        run: HARVEST_VERIFY_EXAMPLES=1 cargo test -p autumn-harvest-verify --test examples_metrics -- --nocapture
+      # The gate itself. Non-strict: exit 1 only on a finding.
+      - name: harvest-verify gate over autumn-harvest examples (non-strict)
+        run: |
+          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
+            harvest-verify -p autumn-harvest --all-examples \
+            --no-default-features --features testing \
+            --allowlist harvest-verify.allow.toml --report
 
   # Opt-in fuzz smoke. NEVER runs on push/PR — GitHub Actions minutes are tight
   # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab

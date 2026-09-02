@@ -648,6 +648,61 @@ for the full ruleset, the generator, the escape hatch, and CI/pre-commit recipes
 
 ---
 
+## The semantic second line: `harvest-verify`
+
+Everything above this section is **syntactic**. The `#[workflow]` guardrails scan
+the annotated body for token patterns; `det-check` extends the same tables across
+exactly **one hop**, to a bare free-function call declared in the caller's own
+module. That is deliberate — it is what keeps the layer sub-second, always-on and
+free of false positives — and the "Known limitations" section above is an honest
+catalogue of what it costs: every limitation listed there is a false **negative**.
+
+Three of those false negatives are structural rather than incidental:
+
+- **Reach.** `Uuid::new_v4()` is listed verbatim by *both* HVG002 and DET003 — and
+  moving it one crate away turns two fully-covered rules into a miss. Rule coverage
+  is not protection.
+- **Values.** Neither layer tracks data, so a `static AtomicU64` read three helpers
+  deep, a `RefCell` cursor captured in a closure, or a `HashMap` arriving as a
+  *function parameter* (HVG011/DET010 track only local bindings) is invisible —
+  the last one even when written inline.
+- **A class with no rule at all.** `ctx.is_replaying()` and
+  `ctx.history_event_count()` return different values live and on replay. Branching
+  command-affecting logic on either diverges by construction, and no HVG or DET
+  rule mentions them.
+
+`cargo harvest-verify` ([issue #962](https://github.com/autumn-foundation/autumn-harvest/issues/962))
+is the **second line** that attacks the false-negative side. It asks stable rustc
+for the textual MIR of your workflow targets, resolves the call graph through
+helpers, closures, trait impls, generic instantiations and first-party crates, and
+runs a taint analysis from non-deterministic sources to command-emitting sinks.
+Each `#[workflow]` fn gets one of three verdicts — `proven-deterministic`,
+`nondeterminism-found` (with a source→sink trace naming every helper on the path),
+or `unknown` (with the analysis boundary named). It is an R&D prototype, opt-in,
+and a build-time tool with no engine footprint.
+
+- **[`harvest-verify.md`](harvest-verify.md)** — the user guide: how to run it,
+  every flag, the exit-code contract, how to read a trace, the allowlist format,
+  extending the model without a tool release, and a GitHub Actions recipe.
+- **[`rnd/determinism-static-analysis.md`](rnd/determinism-static-analysis.md)** —
+  the feasibility report: the substrates that were weighed, the taint model, the
+  **twelve named soundness boundaries**, the success metrics with the test that
+  asserts each, and the go/no-go. Read the boundaries section before quoting a
+  verdict: `proven-deterministic` means *"no non-determinism found, under model M,
+  up to boundaries B"*, and the tool prints the model and the boundary set with
+  every run for exactly that reason.
+
+**Nothing here retires.** The report answers that question rule by rule across all
+22 HVG and DET rules, and the answer is that the syntactic layer stays exactly as
+it is. Two reasons: `tokio::select!` leaves no residual token in MIR, so
+HVG010/DET011 remain the *only* defence against select-style racing; and trading
+an always-on, sub-second, compile-time hard blocker for an opt-in, minutes-long
+check would be a net safety regression. The layers compose — fast first line, deep
+second line — and both are still static analysis, with `WorkflowReplayer` and the
+live `HistoryMatcher` as the backstops once a history exists.
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:
