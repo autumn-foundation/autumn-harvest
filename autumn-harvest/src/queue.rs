@@ -4405,7 +4405,9 @@ pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) ->
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
 /// `INSERT … ON CONFLICT (key) DO NOTHING` with the initial `tokens = burst`, so
-/// a rate change across a deploy never silently resets a live bucket. Shared by
+/// a rate change across a deploy never silently resets a live bucket, preceded by
+/// the conditional `last_registered_at` touch described on
+/// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]. Shared by
 /// the static activity-limiter startup registration and the dynamic per-key
 /// enqueue path (issue #699) so the fail-closed `EXISTS` gate in [`claim_task`]
 /// (and the dispatch-time [`try_consume_rate_limit_token`]) always has a bucket
@@ -4430,42 +4432,68 @@ pub async fn ensure_rate_limit_bucket(
     Ok(())
 }
 
-/// How stale a bucket's `updated_at` must be before [`ensure_rate_limit_bucket`]
-/// refreshes it (issue #1127).
+/// How stale a bucket's `last_registered_at` must be before
+/// [`ensure_rate_limit_bucket`] refreshes it (issue #1127).
 ///
 /// This is a *concurrency interlock*, not a heartbeat. The idle-bucket GC picks
 /// its victims with `SELECT ... FOR UPDATE SKIP LOCKED`, so it skips any bucket
-/// row locked by an in-flight transaction. `ON CONFLICT (key) DO NOTHING` takes
-/// **no** lock on the conflicting row, which leaves a real (if narrow) race: an
-/// enqueue that had not yet committed when the sweep took its snapshot is
-/// invisible to the sweep's dependent anti-joins, so its bucket could be
-/// collected out from under it — and both the claim-time gate and
+/// row locked by an in-flight transaction — but `INSERT ... ON CONFLICT (key)
+/// DO NOTHING` takes **no** lock on the conflicting row. That leaves a real (if
+/// narrow) race: an enqueue whose transaction had not committed when the sweep
+/// took its snapshot is invisible to the sweep's dependent anti-joins, so its
+/// bucket can be collected out from under it — and both the claim-time gate and
 /// [`try_consume_rate_limit_token`] fail *closed* on a missing row, with nothing
 /// to re-register it. Stranded forever.
 ///
-/// `ON CONFLICT DO UPDATE` does lock the row, so the ensure and the sweep
-/// serialise: whichever runs second sees the other's outcome (the sweep skips a
-/// locked row; an ensure blocked behind a delete re-inserts the bucket). The
-/// `WHERE` keeps that cost off the hot path — a bucket touched within this
-/// interval is written **zero** times, and a bucket stale enough for the GC to
-/// consider it is by definition older than this, since
-/// [`crate::retention::MIN_RATE_LIMIT_BUCKET_RETENTION`] is longer.
+/// The fix is a **conditional** `UPDATE ... WHERE key = $1 AND <row is stale>`
+/// run ahead of the insert in the same statement. A plain `UPDATE` locks only
+/// the rows its qualification matches, so:
+///
+/// - a bucket registered within this interval — the hot path, every enqueue of
+///   a rate-limited activity — matches nothing, and is neither written **nor
+///   locked**. `ON CONFLICT DO UPDATE` would have been wrong here: Postgres
+///   locks the conflicting row *before* evaluating the `DO UPDATE`'s `WHERE`,
+///   so even a no-op touch would hold an exclusive row lock for the whole
+///   (long) decision transaction, stalling any concurrent `claim_task` debit of
+///   the same bucket and making two enqueues that touch the same two buckets in
+///   opposite order deadlock;
+/// - a bucket stale enough for the GC to consider — which it always is, since
+///   this interval is far shorter than
+///   [`crate::retention::MIN_RATE_LIMIT_BUCKET_RETENTION`] — is locked and
+///   refreshed, so the ensure and the sweep serialise: the sweep skips a locked
+///   row, and an ensure that lost the race re-inserts the bucket behind the
+///   delete.
+///
+/// Even so, the ensure loop in `worker.rs` sorts its bucket keys before
+/// registering them, so the rare stale-path locks are always taken in one
+/// deterministic order (the same precaution the quota advisory locks take,
+/// issue #946).
 pub const RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS: u32 = 300;
 
-/// The `INSERT ... ON CONFLICT` statement behind [`ensure_rate_limit_bucket`].
+/// The statement behind [`ensure_rate_limit_bucket`].
 ///
 /// Split out so the touch semantics (see
 /// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]) are unit-assertable without a
-/// database: the `DO UPDATE` writes **only** `updated_at`, never a live
-/// bucket's `tokens`, declared `refill_rate`/`burst`, or operator override.
+/// database: the touch writes **only** `last_registered_at`, never a live
+/// bucket's `tokens`, declared `refill_rate`/`burst`, or operator override —
+/// and deliberately not `updated_at` either, which stays what it was before
+/// issue #1127, the "an operator or config write changed this bucket" stamp
+/// that `GET /admin/rate-limits` reports.
 #[must_use]
 fn ensure_rate_limit_bucket_sql() -> String {
     format!(
-        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-         VALUES ($1, $2, $3, $3, NOW()) \
-         ON CONFLICT (key) DO UPDATE \
-            SET updated_at = NOW() \
-          WHERE harvest_rate_limit_buckets.updated_at < NOW() - INTERVAL '{RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS} seconds'"
+        "WITH touched AS ( \
+             UPDATE harvest_rate_limit_buckets \
+                SET last_registered_at = NOW() \
+              WHERE key = $1 \
+                AND (last_registered_at IS NULL \
+                     OR last_registered_at < NOW() - INTERVAL '{RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS} seconds') \
+             RETURNING key \
+         ) \
+         INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, last_registered_at) \
+         VALUES ($1, $2, $3, $3, NOW(), NOW()) \
+         ON CONFLICT (key) DO NOTHING"
     )
 }
 
@@ -4478,15 +4506,25 @@ fn ensure_rate_limit_bucket_sql() -> String {
 /// activity name, an author-supplied static `rate_limit_key` — is bounded by
 /// the registry: one bucket per declared activity, forever.
 ///
-/// This one list drives **both** cardinality decisions in the subsystem, which
-/// are the same judgement seen from two sides: these families may never become
-/// a metric label ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`], one series per tenant
-/// forever) and these families are the only ones the idle-bucket GC collects
-/// (one row per tenant forever). A bounded static key is deliberately NOT
-/// collectable: it is re-registered only at worker startup, so collecting one
-/// would stall the next enqueue behind the fail-closed claim gate until a
-/// restart — whereas both families here re-register in the same transaction as
-/// the work that needs them.
+/// This one list is checked against **both** cardinality decisions in the
+/// subsystem, which are the same judgement seen from two sides: these families
+/// may never become a metric label ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`], one
+/// series per tenant forever) and these families are the only ones the
+/// idle-bucket GC collects (one row per tenant forever). A bounded static key
+/// is deliberately NOT collectable: it is re-registered only at worker startup,
+/// so collecting one would stall the next enqueue behind the fail-closed claim
+/// gate until a restart — whereas both families here re-register in the same
+/// transaction as the work that needs them. That is also why both prefixes are
+/// *reserved* against static `rate_limit_key` squatting
+/// ([`crate::builder::validate_activity_rate_limits`]): a static key inside one
+/// of these namespaces would be collectable but not re-registerable.
+///
+/// The entries are the separator-terminated forms of [`DYNAMIC_RATE_PREFIX`]
+/// and [`crate::throttle::THROTTLE_BUCKET_PREFIX`] — the constants the two key
+/// builders actually format with — pinned to them by
+/// `unbounded_prefixes_track_the_real_key_builders`, so renaming either
+/// constant fails the build's tests rather than silently making this sweep
+/// match nothing in production.
 pub const UNBOUNDED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "start-throttle:"];
 
 /// Classify a bucket key into its unbounded family, or `None` when the key is
@@ -4514,20 +4552,29 @@ pub fn unbounded_rate_limit_key_family(key: &str) -> Option<&'static str> {
 /// per tick.
 pub const MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK: usize = 50;
 
-/// The batched `DELETE` behind [`sweep_idle_rate_limit_buckets`] (issue #1127).
+/// The shared candidate predicates behind the idle-bucket sweep and its
+/// dry-run preview (issue #1127), against the bucket table aliased `b`.
 ///
-/// Every safety guard lives in this one statement, and the reason each is here
-/// rather than resolved by an earlier `SELECT` is that a bucket can be debited
-/// concurrently: predicates evaluated in a separate statement would be stale by
-/// the time the delete ran.
+/// Every safety guard lives here, and the reason each is evaluated inside the
+/// sweep's own statement rather than resolved by an earlier `SELECT` is that a
+/// bucket can be debited concurrently: predicates evaluated in a separate
+/// statement would already be stale by the time the delete ran.
 ///
 /// - **Family scope** — only the unbounded families
-///   ([`UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`]).
-/// - **Idleness** — `GREATEST(last_refilled_at, updated_at, created_at)` past
-///   the caller's cutoff. `last_refilled_at` moves on every debit/refund,
-///   `updated_at` on every operator override write and every stale-bucket touch
+///   ([`UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`]). A bounded static key is not
+///   collectable, and both prefixes are reserved against static-key squatting
+///   so that stays true.
+/// - **Idleness** — `GREATEST(last_refilled_at, updated_at, created_at,
+///   last_registered_at)` past the caller's cutoff. `last_refilled_at` moves on
+///   every debit/refund, `updated_at` on every operator/config write,
+///   `last_registered_at` on every (throttled) re-registration
 ///   ([`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]), and `created_at` covers a
-///   bucket registered but never used.
+///   bucket registered but never used. `GREATEST` ignores NULLs, so a
+///   pre-#1127 row with no `last_registered_at` simply ages out on the others.
+/// - **No operator baseline** — a bucket whose permanent baseline an operator
+///   wrote through `POST /admin/rate-limits/{key}` (issue #332) carries
+///   `baseline_set_at` and is exempt: collecting it would revert a deliberate
+///   clamp to the code-declared rate the next time that key was used.
 /// - **Fullness** — effective available tokens at or above the effective burst,
 ///   derived from the *same* [`effective_available_tokens_expr`] /
 ///   [`effective_burst_expr`] the debit path uses, so the test can never drift
@@ -4540,42 +4587,86 @@ pub const MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK: usize = 50;
 ///   `harvest_start_throttle` deferred start would be stranded forever behind
 ///   the fail-closed gate. The task-state test is written as `NOT IN
 ///   ('COMPLETED', 'FAILED', 'CANCELLED')` so a future non-terminal state fails
-///   safe toward
-///   *retaining*.
-/// - **`FOR UPDATE SKIP LOCKED`** — never block a concurrent claim, and never
-///   collect a bucket an in-flight enqueue has touched (the interlock described
-///   on [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]).
+///   safe toward *retaining*.
 #[must_use]
-fn idle_rate_limit_bucket_sweep_sql() -> String {
-    let effective_tokens = effective_available_tokens_expr("harvest_rate_limit_buckets");
-    let effective_burst = effective_burst_expr("harvest_rate_limit_buckets");
+fn idle_rate_limit_bucket_predicates() -> String {
+    let effective_tokens = effective_available_tokens_expr("b");
+    let effective_burst = effective_burst_expr("b");
     let families = UNBOUNDED_RATE_LIMIT_KEY_PREFIXES
         .iter()
-        .map(|prefix| format!("key LIKE '{prefix}%'"))
+        .map(|prefix| format!("b.key LIKE '{prefix}%'"))
         .collect::<Vec<_>>()
         .join(" OR ");
     format!(
-        "DELETE FROM harvest_rate_limit_buckets \
-         WHERE key IN ( \
-             SELECT key FROM harvest_rate_limit_buckets \
-              WHERE ({families}) \
-                AND GREATEST(last_refilled_at, updated_at, created_at) < $1 \
-                AND (override_expires_at IS NULL OR override_expires_at <= NOW()) \
-                AND {effective_tokens} >= {effective_burst} \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM harvest_task_queue q \
-                     WHERE q.rate_limit_key = harvest_rate_limit_buckets.key \
-                       AND q.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') \
-                ) \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM harvest_start_throttle s \
-                     WHERE s.bucket_key = harvest_rate_limit_buckets.key \
-                ) \
-              ORDER BY key \
+        "({families}) \
+           AND GREATEST(b.last_refilled_at, b.updated_at, b.created_at, b.last_registered_at) < $1 \
+           AND b.baseline_set_at IS NULL \
+           AND (b.override_expires_at IS NULL OR b.override_expires_at <= NOW()) \
+           AND {effective_tokens} >= {effective_burst} \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM harvest_task_queue q \
+                WHERE q.rate_limit_key = b.key \
+                  AND q.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM harvest_start_throttle s \
+                WHERE s.bucket_key = b.key \
+           )"
+    )
+}
+
+/// The batched `DELETE` behind [`sweep_idle_rate_limit_buckets`] (issue #1127).
+///
+/// [`idle_rate_limit_bucket_predicates`] decides *what* is collectable; this
+/// adds the two concurrency properties:
+///
+/// - **`FOR UPDATE SKIP LOCKED`** — never block a concurrent claim's debit, and
+///   never collect a bucket an in-flight enqueue has touched (the interlock
+///   described on [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]). Postgres
+///   re-evaluates the row-local predicates against any version committed
+///   between the scan and the lock, so a bucket debited in that window is
+///   dropped from the batch rather than collected.
+/// - **`DELETE ... USING victims`** rather than `WHERE key IN (SELECT ...)`:
+///   the `LIMIT` blocks sublink pull-up, so the `IN` form lets the planner hash
+///   the subplan and sequentially scan the whole bucket table to apply it —
+///   measured at ~60% of a batch's cost on a 200k-row table, and unstable
+///   across sizes. The `USING` join is a deterministic primary-key lookup per
+///   victim, which also shortens how long the batch holds row locks that a
+///   concurrent debit must block on.
+#[must_use]
+fn idle_rate_limit_bucket_sweep_sql() -> String {
+    let predicates = idle_rate_limit_bucket_predicates();
+    format!(
+        "WITH victims AS ( \
+             SELECT b.key FROM harvest_rate_limit_buckets b \
+              WHERE {predicates} \
+              ORDER BY b.key \
               LIMIT $2 \
               FOR UPDATE SKIP LOCKED \
          ) \
-         RETURNING key"
+         DELETE FROM harvest_rate_limit_buckets d \
+          USING victims v \
+          WHERE d.key = v.key \
+         RETURNING d.key"
+    )
+}
+
+/// The read-only twin of [`idle_rate_limit_bucket_sweep_sql`], used under
+/// `dry_run` (issue #1127).
+///
+/// The same predicates by construction — both are rendered from
+/// [`idle_rate_limit_bucket_predicates`] — with no `FOR UPDATE` and no
+/// `DELETE`, so an operator can preview exactly what the pass would collect
+/// before letting it run. That affordance matters more here than for the
+/// sibling passes: this one is on by default and only destroys.
+#[must_use]
+fn idle_rate_limit_bucket_preview_sql() -> String {
+    let predicates = idle_rate_limit_bucket_predicates();
+    format!(
+        "SELECT b.key FROM harvest_rate_limit_buckets b \
+          WHERE {predicates} \
+          ORDER BY b.key \
+          LIMIT $2"
     )
 }
 
@@ -4583,9 +4674,13 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
 ///
 /// Deletes buckets in the unbounded key families that have been idle since
 /// `cutoff` and are provably safe to remove — see
-/// [`idle_rate_limit_bucket_sweep_sql`] for each guard and why it is there.
+/// [`idle_rate_limit_bucket_predicates`] for each guard and why it is there.
 /// Returns the number collected per family (`"dyn-rate"` / `"start-throttle"`),
 /// which are bounded names safe to use as a metric label.
+///
+/// With `preview` set, nothing is deleted: the identical predicates are run as
+/// a read-only `SELECT` and the counts describe what a real pass *would*
+/// collect. That is what `dry_run` uses.
 ///
 /// Shard-local by construction: it takes one shard's connection and every
 /// dependent it consults (`harvest_task_queue`, `harvest_start_throttle`) lives
@@ -4593,7 +4688,8 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
 ///
 /// Drains in `batch_size` batches up to
 /// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`], then leaves the remainder for the
-/// next tick.
+/// next tick. A preview stops after the first batch — it deletes nothing, so a
+/// second query would return the same rows forever.
 ///
 /// # Errors
 ///
@@ -4602,6 +4698,7 @@ pub async fn sweep_idle_rate_limit_buckets(
     conn: &mut AsyncPgConnection,
     cutoff: DateTime<Utc>,
     batch_size: usize,
+    preview: bool,
 ) -> HarvestResult<std::collections::BTreeMap<String, u64>> {
     #[derive(diesel::QueryableByName)]
     struct SweptKey {
@@ -4610,9 +4707,13 @@ pub async fn sweep_idle_rate_limit_buckets(
     }
 
     // Clamp exactly as the sibling retention passes do: a `batch_size` of 0
-    // would otherwise make `LIMIT 0` delete nothing forever.
+    // would otherwise make `LIMIT 0` collect nothing forever.
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
-    let sql = idle_rate_limit_bucket_sweep_sql();
+    let sql = if preview {
+        idle_rate_limit_bucket_preview_sql()
+    } else {
+        idle_rate_limit_bucket_sweep_sql()
+    };
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
 
     for _ in 0..MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK {
@@ -4633,8 +4734,9 @@ pub async fn sweep_idle_rate_limit_buckets(
         }
         // A short batch means the eligible set is exhausted. Compare against
         // the EFFECTIVE limit, not the raw `batch_size`, or a clamped 0 would
-        // never terminate.
-        if swept == 0 || i64::try_from(swept).unwrap_or(i64::MAX) < batch {
+        // never terminate. A preview never loops: it removes nothing, so the
+        // next batch would return the same rows.
+        if preview || swept == 0 || i64::try_from(swept).unwrap_or(i64::MAX) < batch {
             break;
         }
     }
@@ -4648,11 +4750,14 @@ pub async fn sweep_idle_rate_limit_buckets(
 /// emitted with the bucket `key` as a metric LABEL. A caller-controlled /
 /// per-execution-resolved key family — dynamic per-key limits
 /// (`dyn-rate:{expr}:{tenant}`, #699) and start throttles
-/// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant input
-/// and buckets are never GC'd, so labelling by it would create one time-series
-/// per tenant forever. Those families are excluded here; their per-tenant bucket
-/// state is observable via `GET /admin/rate-limits`, not metrics. Bounded static
-/// keys (bare activity names / author strings) keep their per-key gauges.
+/// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant
+/// input, so labelling by it would create one time-series per tenant. The
+/// idle-bucket GC (issue #1127) bounds the *table*, not this: a bucket still
+/// outlives its traffic by the GC's idle window, and a Prometheus series
+/// outlives the bucket that created it, so the cardinality argument is
+/// unchanged. Those families are excluded here; their per-tenant bucket state
+/// is observable via `GET /admin/rate-limits`, not metrics. Bounded static keys
+/// (bare activity names / author strings) keep their per-key gauges.
 pub const RATE_LIMIT_GAUGE_SAMPLER_FILTER: &str =
     "WHERE key NOT LIKE 'dyn-rate:%' AND key NOT LIKE 'start-throttle:%'";
 
@@ -5601,25 +5706,89 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn unbounded_rate_limit_key_families_are_the_two_caller_driven_ones() {
+    fn unbounded_prefixes_track_the_real_key_builders() {
+        // The GC matches on these prefixes; the key BUILDERS format with
+        // `DYNAMIC_RATE_PREFIX` / `THROTTLE_BUCKET_PREFIX`. Without this pin, a
+        // rename of either constant would leave the sweep matching nothing in
+        // production while every test still passed.
         assert_eq!(
             UNBOUNDED_RATE_LIMIT_KEY_PREFIXES,
-            ["dyn-rate:", "start-throttle:"]
+            [
+                format!("{DYNAMIC_RATE_PREFIX}:").as_str(),
+                format!("{}:", crate::throttle::THROTTLE_BUCKET_PREFIX).as_str(),
+            ]
         );
+    }
+
+    #[test]
+    fn real_generated_keys_classify_into_their_families() {
+        // Not hand-written literals: the actual output of the two key builders,
+        // whose shapes (length-prefixed segments, empty resolved keys) are not
+        // obvious from the prefix alone.
+        let dynamic = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
+        assert_eq!(unbounded_rate_limit_key_family(&dynamic), Some("dyn-rate"));
+        let dynamic_unresolved = dynamic_rate_bucket_key("input.tenant_id", None);
+        assert_eq!(
+            unbounded_rate_limit_key_family(&dynamic_unresolved),
+            Some("dyn-rate")
+        );
+
+        let keyed = crate::throttle::bucket_key("onboarding", "acme");
+        assert_eq!(
+            unbounded_rate_limit_key_family(&keyed),
+            Some("start-throttle")
+        );
+        // An unkeyed (global-per-workflow) throttle, whose resolved key is "".
+        let unkeyed = crate::throttle::bucket_key("onboarding", "");
+        assert_eq!(
+            unbounded_rate_limit_key_family(&unkeyed),
+            Some("start-throttle")
+        );
+    }
+
+    #[test]
+    fn reserved_prefixes_match_the_collectable_families() {
+        // The GC may only collect namespaces that are RESERVED against static
+        // `rate_limit_key` squatting: a static key inside one would be
+        // collectable but re-registered only at worker startup, stranding every
+        // task enqueued in between behind the fail-closed claim gate.
+        assert_eq!(
+            UNBOUNDED_RATE_LIMIT_KEY_PREFIXES,
+            crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
+        );
+    }
+
+    #[test]
+    fn unbounded_prefixes_carry_no_like_metacharacters() {
+        // The sweep matches families with `LIKE '{prefix}%'`. A prefix
+        // containing `_` or `%` would silently over-match — and over-matching
+        // here means collecting a bucket family that does not re-register.
+        for prefix in UNBOUNDED_RATE_LIMIT_KEY_PREFIXES {
+            assert!(
+                !prefix.contains('_') && !prefix.contains('%'),
+                "`{prefix}` contains a LIKE metacharacter"
+            );
+        }
     }
 
     #[test]
     fn gauge_sampler_filter_excludes_exactly_the_collectable_families() {
         // The gauge sampler's exclusion list and the GC's inclusion list are
         // the SAME cardinality judgement (issue #699 review #1, issue #1127):
-        // a family added to one and not the other would either grow a metric
-        // series per tenant forever or grow the table per tenant forever.
+        // a family in one and not the other would either grow a metric series
+        // per tenant forever or grow the table per tenant forever. Checked in
+        // BOTH directions, so "exactly" is what is actually asserted.
         for prefix in UNBOUNDED_RATE_LIMIT_KEY_PREFIXES {
             assert!(
                 RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains(&format!("NOT LIKE '{prefix}%'")),
                 "gauge sampler filter must exclude the `{prefix}` family"
             );
         }
+        assert_eq!(
+            RATE_LIMIT_GAUGE_SAMPLER_FILTER.matches("NOT LIKE").count(),
+            UNBOUNDED_RATE_LIMIT_KEY_PREFIXES.len(),
+            "the gauge filter must exclude no family the GC does not collect"
+        );
     }
 
     #[test]
@@ -5651,39 +5820,49 @@ mod tests {
         let sql = idle_rate_limit_bucket_sweep_sql();
         for prefix in UNBOUNDED_RATE_LIMIT_KEY_PREFIXES {
             assert!(
-                sql.contains(&format!("LIKE '{prefix}%'")),
+                sql.contains(&format!("b.key LIKE '{prefix}%'")),
                 "sweep must be scoped to the `{prefix}` family"
             );
         }
+        // Disjunction, not conjunction: `AND`-ing the families matches nothing.
+        assert!(sql.contains("' OR b.key LIKE '"));
     }
 
     #[test]
     fn idle_bucket_sweep_sql_guards_every_live_dependent() {
         let sql = idle_rate_limit_bucket_sweep_sql();
-        // A PENDING/RUNNING/PAUSED task referencing the bucket: both the
-        // claim-time gate and `try_consume_rate_limit_token` fail CLOSED on a
-        // missing row, so deleting one would strand the task with nothing to
-        // re-register it.
-        assert!(sql.contains("harvest_task_queue"));
+        // A PENDING/RUNNING task referencing the bucket: both the claim-time
+        // gate and `try_consume_rate_limit_token` fail CLOSED on a missing row,
+        // so deleting one would strand the task with nothing to re-register it.
+        // The whole fragment, not just the table name — an `EXISTS` in place of
+        // `NOT EXISTS` inverts the guard while still mentioning the table.
+        assert!(sql.contains(
+            "AND NOT EXISTS ( SELECT 1 FROM harvest_task_queue q WHERE q.rate_limit_key = b.key"
+        ));
         assert!(
-            sql.contains("state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')"),
+            sql.contains("q.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')"),
             "the task anti-join must fail safe toward retaining for any \
              non-terminal (including future) task state"
         );
         // A deferred throttled start whose bucket vanished can never debit a
         // token, so it would sit deferred forever.
-        assert!(sql.contains("harvest_start_throttle"));
-        assert!(sql.contains("bucket_key"));
+        assert!(sql.contains(
+            "AND NOT EXISTS ( SELECT 1 FROM harvest_start_throttle s WHERE s.bucket_key = b.key"
+        ));
     }
 
     #[test]
-    fn idle_bucket_sweep_sql_retains_buckets_under_a_live_override() {
+    fn idle_bucket_sweep_sql_retains_operator_written_buckets() {
         let sql = idle_rate_limit_bucket_sweep_sql();
         assert!(
-            sql.contains("override_expires_at IS NULL OR")
-                && sql.contains("override_expires_at <= NOW()"),
+            sql.contains("(b.override_expires_at IS NULL OR b.override_expires_at <= NOW())"),
             "a live TTL'd pacing override (issue #945) must not be silently \
              destroyed by the GC"
+        );
+        assert!(
+            sql.contains("b.baseline_set_at IS NULL"),
+            "a permanent operator baseline (issue #332) must not be silently \
+             reverted by the GC"
         );
     }
 
@@ -5694,39 +5873,61 @@ mod tests {
         // re-registration (`tokens = burst`). The fullness test must reuse the
         // SHARED override-aware expressions so it can never drift from the
         // debit math it is protecting.
-        assert!(sql.contains(&effective_available_tokens_expr(
-            "harvest_rate_limit_buckets"
+        assert!(sql.contains(&format!(
+            "{} >= {}",
+            effective_available_tokens_expr("b"),
+            effective_burst_expr("b")
         )));
-        assert!(sql.contains(&effective_burst_expr("harvest_rate_limit_buckets")));
     }
 
     #[test]
     fn idle_bucket_sweep_sql_keys_idleness_off_the_activity_columns() {
         let sql = idle_rate_limit_bucket_sweep_sql();
         assert!(
-            sql.contains("GREATEST(last_refilled_at, updated_at, created_at) < $1"),
-            "idleness must be keyed off last_refilled_at/updated_at (and \
-             created_at, so a never-used bucket ages out too)"
+            sql.contains(
+                "GREATEST(b.last_refilled_at, b.updated_at, b.created_at, b.last_registered_at) < $1"
+            ),
+            "idleness must be keyed off every column that records activity: a \
+             debit/refund, an operator write, a re-registration, and creation"
         );
     }
 
     #[test]
-    fn ensure_rate_limit_bucket_touches_a_stale_row_so_the_gc_cannot_race_it() {
-        // The GC (issue #1127) skips buckets locked by a concurrent ensure.
-        // `ON CONFLICT DO NOTHING` takes no lock on the existing row, so an
-        // enqueue whose transaction had not yet committed when the sweep took
-        // its snapshot could be stranded behind the fail-closed claim gate.
-        // Touching a STALE row (and only a stale one) takes that lock exactly
-        // when the row is GC-eligible, and costs nothing on the hot path.
+    fn ensure_rate_limit_bucket_touches_only_a_stale_row() {
+        // The GC skips buckets locked by a concurrent ensure. `ON CONFLICT DO
+        // NOTHING` takes no lock on the existing row, so an enqueue whose
+        // transaction had not yet committed when the sweep took its snapshot
+        // could be stranded behind the fail-closed claim gate.
+        //
+        // The touch must be a CONDITIONAL `UPDATE`, never `ON CONFLICT DO
+        // UPDATE`: Postgres locks the conflicting row BEFORE evaluating a
+        // `DO UPDATE`'s `WHERE`, so even a no-op touch would hold an exclusive
+        // row lock for the whole decision transaction — stalling a concurrent
+        // claim's debit of the same bucket. A plain `UPDATE` locks only rows
+        // its qualification matches, so a fresh bucket is neither written nor
+        // locked.
         let sql = ensure_rate_limit_bucket_sql();
-        assert!(sql.contains("ON CONFLICT (key) DO UPDATE"));
-        assert!(sql.contains("SET updated_at = NOW()"));
+        assert!(
+            !sql.contains("ON CONFLICT (key) DO UPDATE"),
+            "`DO UPDATE` locks the conflicting row unconditionally"
+        );
+        assert!(sql.contains("ON CONFLICT (key) DO NOTHING"));
+        assert!(sql.contains("UPDATE harvest_rate_limit_buckets SET last_registered_at = NOW()"));
+        assert!(sql.contains("WHERE key = $1"));
         assert!(sql.contains(&format!(
-            "harvest_rate_limit_buckets.updated_at < NOW() - INTERVAL '{RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS} seconds'"
+            "last_registered_at < NOW() - INTERVAL '{RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS} seconds'"
         )));
-        // Pacing state is never clobbered by the touch: a live bucket's
-        // tokens/rates/override must survive re-registration untouched.
-        for clobbered in ["tokens =", "refill_rate =", "burst =", "override_"] {
+        // A pre-#1127 row has no `last_registered_at` at all and must still be
+        // touchable, or it is permanently unprotected.
+        assert!(sql.contains("last_registered_at IS NULL"));
+        // Pacing state and the operator-facing `updated_at` are never written.
+        for clobbered in [
+            "tokens =",
+            "refill_rate =",
+            "burst =",
+            "override_",
+            "updated_at =",
+        ] {
             assert!(
                 !sql.contains(clobbered),
                 "the ensure/touch must not write `{clobbered}`"
@@ -5745,22 +5946,41 @@ mod tests {
     }
 
     #[test]
-    fn idle_bucket_sweep_sql_is_batched_and_recheck_safe() {
+    fn idle_bucket_sweep_sql_is_batched_and_lock_safe() {
         let sql = idle_rate_limit_bucket_sweep_sql();
         assert!(sql.contains("LIMIT $2"), "the sweep must be batched");
         assert!(
             sql.contains("FOR UPDATE SKIP LOCKED"),
-            "the candidate selection must not block a concurrent debit"
+            "the candidate selection must neither block a concurrent debit nor \
+             collect a bucket an in-flight enqueue holds"
         );
+        // `DELETE ... USING`, not `WHERE key IN (SELECT ...)`: the LIMIT blocks
+        // sublink pull-up, so the IN form lets the planner hash the subplan and
+        // sequentially scan the whole bucket table per batch.
+        assert!(sql.contains("DELETE FROM harvest_rate_limit_buckets d USING victims v"));
+        assert!(!sql.contains("WHERE key IN ("));
         assert!(
-            sql.starts_with("DELETE FROM harvest_rate_limit_buckets"),
-            "the predicate must live in the DELETE itself so a bucket debited \
-             between selection and deletion is not collected"
-        );
-        assert!(
-            sql.contains("RETURNING"),
+            sql.contains("RETURNING d.key"),
             "swept keys are classified in Rust"
         );
+    }
+
+    #[test]
+    fn the_dry_run_preview_shares_the_sweeps_predicates_exactly() {
+        // A preview that could disagree with the sweep is worse than no
+        // preview: an operator would derisk against the wrong answer.
+        let predicates = idle_rate_limit_bucket_predicates();
+        let preview = idle_rate_limit_bucket_preview_sql();
+        assert!(preview.contains(&predicates));
+        assert!(idle_rate_limit_bucket_sweep_sql().contains(&predicates));
+        // ...and it must not be able to modify anything.
+        assert!(preview.starts_with("SELECT b.key FROM harvest_rate_limit_buckets b"));
+        for mutating in ["DELETE", "UPDATE", "FOR UPDATE"] {
+            assert!(
+                !preview.contains(mutating),
+                "the dry-run preview must not contain `{mutating}`"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

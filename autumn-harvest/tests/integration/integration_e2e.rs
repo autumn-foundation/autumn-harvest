@@ -245,7 +245,16 @@ const INIT_SQL: &str = concat!(
     // issue #946: quota_key column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite (and in
     // every suite that borrows `setup_test_database_url_or_env` from here).
-    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql")
+    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql"),
+    "\n",
+    // issue #1127: last_registered_at/baseline_set_at columns on
+    // harvest_rate_limit_buckets. REQUIRED for the same reason as the #945
+    // columns above -- `queue::ensure_rate_limit_bucket` references
+    // `last_registered_at` unconditionally, and it runs inside the SAME
+    // transaction as every dynamic-per-key activity enqueue, so without these
+    // columns that decision transaction rolls back and the workflow never
+    // progresses (a silent timeout, not an obvious error).
+    include_str!("../../migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

@@ -728,14 +728,23 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
-    /// A static `rate_limit_key` begins with the reserved `dyn-rate:` prefix
-    /// (issue #699). That prefix namespaces per-key/dynamic rate-limit buckets;
-    /// a static key beginning with it could collide with a generated dynamic
-    /// bucket, so it is rejected to keep the static and dynamic bucket
-    /// namespaces provably disjoint.
+    /// A static `rate_limit_key` begins with a reserved bucket-namespace prefix
+    /// — `dyn-rate:` (issue #699) or `start-throttle:` (issue #607).
+    ///
+    /// Those prefixes namespace the *caller-keyed* bucket families: per-key
+    /// dynamic rate limits and workflow-start throttles. A static key beginning
+    /// with one could collide with a generated bucket, so it is rejected to
+    /// keep the static and generated namespaces provably disjoint.
+    ///
+    /// Since issue #1127 this is load-bearing beyond collision avoidance: the
+    /// idle-bucket GC collects exactly those two namespaces, on the guarantee
+    /// that both re-register in the same transaction as the work that needs
+    /// them. A *static* key inside one would be collected and then re-registered
+    /// only at the next worker startup, leaving every task enqueued in between
+    /// stalled behind the fail-closed claim gate.
     #[error(
         "activity '{activity}' sets rate_limit_key = \"{key}\", which begins with the reserved \
-         `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets); \
+         `{prefix}` prefix (reserved for caller-keyed rate-limit/throttle buckets); \
          choose a different rate_limit_key"
     )]
     RateLimitKeyReservedPrefix {
@@ -743,6 +752,8 @@ pub enum HarvestBuilderError {
         activity: String,
         /// The offending static key.
         key: String,
+        /// The reserved prefix it squats.
+        prefix: &'static str,
     },
 
     /// A local activity declares a dynamic per-key rate limit
@@ -2922,6 +2933,14 @@ fn check_rate_limit_positive(
 }
 
 /// Verify that rate limiting attributes on activities are consistent and valid.
+/// Bucket-key namespaces reserved against a static `rate_limit_key`.
+///
+/// Mirrors `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES` — the `queue`
+/// module is `db`-gated while this validation runs in every build, so the two
+/// are kept in step by `reserved_prefixes_match_the_collectable_families` in
+/// `queue.rs` rather than by a shared constant.
+pub(crate) const RESERVED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "start-throttle:"];
+
 /// Validate every activity's rate-limit configuration (issue #699).
 ///
 /// This is the single, comprehensive rate-limit gate. It is called from
@@ -3030,24 +3049,35 @@ pub(crate) fn validate_activity_rate_limits<'a>(
             continue;
         }
 
-        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
-        // reserved for per-key/dynamic buckets (issue #699). Both static and
-        // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
-        // `harvest_rate_limit_buckets` table, so a static key colliding with a
-        // generated `dyn-rate:{expr}:{tenant}` string would race
-        // first-writer-wins on the bucket's rate/burst. Reject it up front.
-        // (The `start-throttle:` prefix from #607 is a separate pre-existing
-        // namespace; this validation reserves `dyn-rate:` — the one this PR
-        // generates — and leaves `start-throttle:` as a follow-up.)
-        // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
-        // module is `db`-gated, but this validation runs in every build) and the
-        // macro's own compile-time reject in `autumn-harvest-macros`.
+        // A static `rate_limit_key` must not squat either caller-keyed bucket
+        // namespace: `dyn-rate:` (per-key/dynamic buckets, issue #699) or
+        // `start-throttle:` (workflow-start throttles, issue #607). Both static
+        // and generated keys register `ON CONFLICT DO NOTHING` against the
+        // shared `harvest_rate_limit_buckets` table, so a static key colliding
+        // with a generated string would race first-writer-wins on the bucket's
+        // rate/burst.
+        //
+        // `start-throttle:` was left as a follow-up when #699 reserved
+        // `dyn-rate:`, because a squat was then merely a namespace nit. Issue
+        // #1127 made it a stranding bug: the idle-bucket GC collects exactly
+        // these two namespaces, on the guarantee that everything in them
+        // re-registers in the same transaction as the work that needs it — true
+        // for a generated key, false for a static one, which is re-registered
+        // only at worker startup. So the follow-up is done here.
+        //
+        // The literals mirror `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`
+        // (the `queue` module is `db`-gated, but this validation runs in every
+        // build) and the macro's own compile-time reject in
+        // `autumn-harvest-macros`.
         if let Some(key) = activity.rate_limit_key
-            && key.starts_with("dyn-rate:")
+            && let Some(prefix) = RESERVED_RATE_LIMIT_KEY_PREFIXES
+                .into_iter()
+                .find(|prefix| key.starts_with(prefix))
         {
             return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
                 activity: activity.name.to_string(),
                 key: key.to_string(),
+                prefix,
             });
         }
 
@@ -6417,8 +6447,60 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(HarvestBuilderError::RateLimitKeyReservedPrefix { ref activity, ref key })
-                    if activity == "act1" && key == "dyn-rate:9:tenant_id:acme"
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                    ref activity,
+                    ref key,
+                    prefix,
+                }) if activity == "act1"
+                    && key == "dyn-rate:9:tenant_id:acme"
+                    && prefix == "dyn-rate:"
+            ),
+            "expected RateLimitKeyReservedPrefix, got: {result:?}"
+        );
+    }
+
+    /// A static `rate_limit_key` in the `start-throttle:` namespace (issue #607)
+    /// is rejected for the same reason as `dyn-rate:` — and since issue #1127
+    /// the reason is stronger than namespace hygiene. The idle-bucket GC
+    /// collects that namespace on the guarantee that everything in it
+    /// re-registers with the work that needs it; a static key does not, so a
+    /// collected one would strand every task enqueued before the next worker
+    /// startup behind the fail-closed claim gate.
+    #[test]
+    fn build_rejects_static_rate_limit_key_squatting_the_start_throttle_prefix() {
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(50.0),
+            rate_limit_burst: None,
+            rate_limit_key: Some("start-throttle:onboarding:acme"),
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                    ref activity,
+                    ref key,
+                    prefix,
+                }) if activity == "act1"
+                    && key == "start-throttle:onboarding:acme"
+                    && prefix == "start-throttle:"
             ),
             "expected RateLimitKeyReservedPrefix, got: {result:?}"
         );

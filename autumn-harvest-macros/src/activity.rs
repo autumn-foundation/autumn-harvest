@@ -156,13 +156,18 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         } else if meta.path.is_ident("rate_limit_key") {
             let value: LitStr = meta.value()?.parse()?;
             let key = value.value();
-            // The `dyn-rate:` prefix is reserved for per-key/dynamic rate-limit
-            // buckets (issue #699); a static key beginning with it could collide
-            // with a generated dynamic bucket, so reject it at compile time.
-            if key.starts_with("dyn-rate:") {
+            // The `dyn-rate:` (issue #699) and `start-throttle:` (issue #607)
+            // prefixes namespace the caller-keyed bucket families; a static key
+            // beginning with either could collide with a generated bucket, and
+            // since issue #1127 would additionally be collectable by the
+            // idle-bucket GC with nothing to re-register it before the next
+            // worker startup. Reject at compile time. Mirrors
+            // `autumn_harvest::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES`.
+            if key.starts_with("dyn-rate:") || key.starts_with("start-throttle:") {
                 return Err(meta.error(
-                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` prefix \
-                     (reserved for per-key/dynamic rate-limit buckets)",
+                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` or \
+                     `start-throttle:` prefix (reserved for caller-keyed rate-limit and \
+                     workflow-start-throttle buckets)",
                 ));
             }
             result.rate_limit_key = Some(key);

@@ -739,8 +739,10 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history, per-type
-    /// history overrides, audit log, or schedule decision purging) are enabled.
+    /// Returns `true` if any retention feature is enabled: workflow-history
+    /// retention (global or per-type), audit-log purging, schedule-decision
+    /// purging, bounded summary GC (issue #752), partition maintenance (issue
+    /// #958), or the idle rate-limit-bucket GC (issue #1127).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
@@ -821,14 +823,59 @@ pub struct RetentionTickResult {
     /// each cohort that was considered and the reason it was left alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_maintenance: Option<crate::partition::MaintenanceOutcome>,
-    /// Inert per-tenant rate-limit buckets collected on this shard this tick
-    /// (issue #1127).
+    /// Idle rate-limit-bucket GC outcome for this shard this tick (issue
+    /// #1127).
     ///
-    /// Reported through `GET /admin/retention`, so "is the table still
-    /// growing?" has an answer that does not require a metrics pipeline. Real
-    /// deletes only — a `dry_run` tick collects nothing.
-    #[serde(default)]
-    pub rate_limit_buckets_deleted: usize,
+    /// `None` when the GC is disabled — deliberately distinct from
+    /// `Some(collected: 0)` ("it ran and everything was live or pinned") and
+    /// from `Some(error: ...)` ("it could not run"), which a bare counter
+    /// collapses into one indistinguishable zero. Same shape and same reason as
+    /// `partition_maintenance`. Reported through `GET /admin/retention`, so "is
+    /// the table still growing, and why?" has an answer that needs no metrics
+    /// pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_gc: Option<RateLimitBucketGcOutcome>,
+}
+
+/// One shard's idle rate-limit-bucket GC result for one tick (issue #1127).
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct RateLimitBucketGcOutcome {
+    /// Buckets collected, per bounded key family (`dyn-rate` /
+    /// `start-throttle`). Under `dry_run` these are would-collect counts.
+    pub collected_by_family: BTreeMap<String, u64>,
+    /// Total across families — the number an operator watches.
+    pub collected: u64,
+    /// Whether this was a read-only `dry_run` preview rather than a real pass.
+    /// A preview reports what a real pass *would* collect and deletes nothing,
+    /// so a non-zero `collected` here is a forecast, not work done.
+    pub dry_run: bool,
+    /// Why this shard's pass did not run, when it did not. A shard that keeps
+    /// reporting an error is exactly what an operator needs to see, and without
+    /// this it would be indistinguishable from a shard with nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl RateLimitBucketGcOutcome {
+    /// A completed pass (real, or a `dry_run` preview).
+    #[must_use]
+    fn collected(collected_by_family: BTreeMap<String, u64>, dry_run: bool) -> Self {
+        Self {
+            collected: collected_by_family.values().sum(),
+            collected_by_family,
+            dry_run,
+            error: None,
+        }
+    }
+
+    /// A pass that could not run on this shard.
+    #[must_use]
+    fn failed(error: String) -> Self {
+        Self {
+            error: Some(error),
+            ..Self::default()
+        }
+    }
 }
 
 /// The current overall status of the retention subsystem.
@@ -908,14 +955,14 @@ impl RetentionMonitor {
     /// still collect buckets), so it cannot ride along in that phase's
     /// `update`.
     #[cfg(feature = "db")]
-    fn update_rate_limit_buckets(&self, shard: ShardId, deleted: usize) {
+    fn update_rate_limit_buckets(&self, shard: ShardId, outcome: RateLimitBucketGcOutcome) {
         let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
-            existing.rate_limit_buckets_deleted = deleted;
+            existing.rate_limit_bucket_gc = Some(outcome);
         }
     }
 
@@ -948,10 +995,13 @@ pub struct RetentionRuntime {
 
 #[cfg(feature = "db")]
 impl RetentionRuntime {
-    /// # Panics
+    /// Returns `None` when nothing in `config` is enabled.
     ///
-    /// Panics inside the spawned task if the enabled config is missing `max_age`
-    /// (which cannot happen when `config.enabled()` is `true`).
+    /// A config can be enabled for a reason other than a history horizon —
+    /// partition maintenance (issue #958) or the idle rate-limit-bucket GC
+    /// (issue #1127) each spawn the runtime on their own — so `max_age` being
+    /// unset is an ordinary, fully-supported state here: the history-retention
+    /// phase is gated on `loosest_cutoff_age()` and is simply skipped.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn spawn(
@@ -1299,50 +1349,70 @@ impl RetentionRuntime {
                 // history forever still has to collect buckets.
                 //
                 // Shard-local and best-effort, exactly like the audit/schedule/
-                // summary purges above: a shard that fails logs and is retried
-                // next tick rather than failing the whole tick, because
+                // summary purges above: a shard that fails is reported and
+                // retried next tick rather than failing the whole tick, because
                 // reclamation here is independent of everything else the
-                // janitor just did.
+                // janitor just did. Reported, not merely logged — otherwise
+                // `GET /admin/retention` would keep serving the last successful
+                // tick's count and a permanently-failing shard would look
+                // exactly like an idle one.
                 //
-                // `dry_run` suppresses it entirely — unlike partition
-                // *creation*, this pass only destroys.
+                // Under `dry_run` the pass still runs, as a read-only PREVIEW:
+                // it deletes nothing and reports what it *would* collect (the
+                // same affordance `purge_expired_summaries` offers). A
+                // collector that is on by default is precisely the kind an
+                // operator wants to preview first.
                 if config.rate_limit_bucket_gc_active()
-                    && !config.dry_run
                     && let Some(window) = config.rate_limit_bucket_retention()
                     && let Ok(window) = chrono::Duration::from_std(window)
                 {
                     let cutoff = Utc::now() - window;
                     for (shard, pool) in pools.iter_shards() {
-                        let Ok(mut conn) = pool.get().await else {
-                            tracing::warn!(
-                                shard = %shard,
-                                "harvest rate-limit bucket GC could not acquire a connection"
-                            );
-                            continue;
+                        let mut conn = match pool.get().await {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %error,
+                                    "harvest rate-limit bucket GC could not acquire a connection"
+                                );
+                                monitor_task.update_rate_limit_buckets(
+                                    shard,
+                                    RateLimitBucketGcOutcome::failed(error.to_string()),
+                                );
+                                continue;
+                            }
                         };
                         match crate::queue::sweep_idle_rate_limit_buckets(
                             &mut conn,
                             cutoff,
                             config.batch_size,
+                            config.dry_run,
                         )
                         .await
                         {
                             Ok(by_family) => {
                                 let total: u64 = by_family.values().sum();
-                                for (family, count) in &by_family {
-                                    metrics.record_rate_limit_buckets_deleted(family, *count);
+                                // Real deletes only: a preview's would-collect
+                                // counts must never move a counter an operator
+                                // reads as work actually done.
+                                if !config.dry_run {
+                                    for (family, count) in &by_family {
+                                        metrics.record_rate_limit_buckets_deleted(family, *count);
+                                    }
                                 }
                                 if total > 0 {
                                     tracing::info!(
                                         shard = %shard,
                                         deleted = total,
+                                        dry_run = config.dry_run,
                                         window_secs = window.num_seconds(),
                                         "harvest idle rate-limit buckets collected"
                                     );
                                 }
                                 monitor_task.update_rate_limit_buckets(
                                     shard,
-                                    usize::try_from(total).unwrap_or(usize::MAX),
+                                    RateLimitBucketGcOutcome::collected(by_family, config.dry_run),
                                 );
                             }
                             Err(err) => {
@@ -1350,6 +1420,10 @@ impl RetentionRuntime {
                                     shard = %shard,
                                     error = %err,
                                     "harvest idle rate-limit bucket GC failed"
+                                );
+                                monitor_task.update_rate_limit_buckets(
+                                    shard,
+                                    RateLimitBucketGcOutcome::failed(err.to_string()),
                                 );
                             }
                         }
@@ -3417,6 +3491,17 @@ mod tests {
         let off = RetentionConfig::default().without_rate_limit_bucket_gc();
         assert_eq!(off.rate_limit_bucket_retention(), None);
         assert!(!off.rate_limit_bucket_gc_active());
+    }
+
+    #[test]
+    fn a_zero_window_is_rejected_rather_than_collecting_everything_now() {
+        // `Some(0)` would leave the GC ACTIVE with a cutoff of "now", i.e.
+        // collect every full, unpinned bucket immediately — reopening the
+        // stranding race the touch interval closes. It must fail the build, not
+        // be treated as "disabled".
+        let zero = RetentionConfig::default().with_rate_limit_bucket_retention(Duration::ZERO);
+        assert!(zero.rate_limit_bucket_gc_active(), "zero is not 'disabled'");
+        assert!(zero.validate().is_err());
     }
 
     #[test]

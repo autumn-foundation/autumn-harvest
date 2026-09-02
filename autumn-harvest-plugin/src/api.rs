@@ -33568,15 +33568,25 @@ async fn set_rate_limit(
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // `baseline_set_at` marks this bucket as carrying a PERMANENT operator
+    // baseline, which exempts it from the idle-bucket GC (issue #1127). This
+    // route validates nothing against the registry, so an operator can (and, to
+    // clamp a noisy tenant, would) target a per-tenant `dyn-rate:`/
+    // `start-throttle:` key — and collecting such a row would silently revert
+    // the clamp to the code-declared rate the next time that tenant appeared.
+    // Same principle as the sweep's refusal to collect a bucket under a live
+    // TTL'd pacing override (issue #945): deliberate operator intent is never
+    // destroyed by a background pass.
     let upsert_sql = "INSERT INTO harvest_rate_limit_buckets \
-         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW()) \
+         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, baseline_set_at) \
+         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW(), NOW()) \
          ON CONFLICT (key) DO UPDATE \
          SET refill_rate = EXCLUDED.refill_rate, \
              burst = EXCLUDED.burst, \
              tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
              last_refilled_at = NOW(), \
-             updated_at = NOW()";
+             updated_at = NOW(), \
+             baseline_set_at = NOW()";
 
     // Fail fast on any shard error: an emergency throttle must be applied to the
     // entire fleet.  A partial write would leave some shards with the old bucket
@@ -33784,6 +33794,15 @@ struct RateLimitBucketView {
     /// shard (preferring an active override), but an operator should not
     /// treat them as authoritative for every shard.
     shard_disagreement: bool,
+    /// When an operator last wrote this bucket's permanent baseline through
+    /// `POST /admin/rate-limits/{key}`. Non-`null` also means the row is
+    /// **exempt** from the idle rate-limit-bucket GC (issue #1127) — the
+    /// answer to "why has this bucket never been collected?".
+    baseline_set_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the engine last (re-)registered this bucket (issue #1127). With
+    /// `last_refilled_at` and `updated_at` this is the GC's idleness clock, so
+    /// it is also the answer to "why has this bucket not been collected yet?".
+    last_registered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<RateLimitBucket> for RateLimitBucketView {
@@ -33811,6 +33830,8 @@ impl From<RateLimitBucket> for RateLimitBucketView {
             effective_refill_rate: effective.refill_rate,
             effective_burst: effective.burst,
             shard_disagreement: false,
+            baseline_set_at: b.baseline_set_at,
+            last_registered_at: b.last_registered_at,
         }
     }
 }
@@ -33837,6 +33858,8 @@ mod rate_limit_bucket_view_tests {
             override_refill_rate,
             override_burst,
             override_expires_at,
+            last_registered_at: Some(ts),
+            baseline_set_at: None,
         }
     }
 
