@@ -21,17 +21,6 @@ feature-depth = 1
 [advisories]
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2026-0204 — crossbeam-epoch 0.9.18, invalid pointer deref in the
-    # `fmt::Pointer`/`fmt::Display` impls for `Atomic`/`Shared` when the
-    # pointer is null. We never format those types ourselves; reached via
-    # `moka` (autumn-web's cache, production) and `criterion` (dev-only
-    # benchmarks) — both transitive through `crossbeam-deque`/`rayon`, not a
-    # direct dependency. Fix is a patch bump (>=0.9.20) entirely inside
-    # `autumn-web`'s and `criterion`'s trees; not ours to force via
-    # `cargo update` without those crates re-resolving on their own.
-    # Verdict: unreachable. Revisit: next scheduled dependency batch.
-    { id = "RUSTSEC-2026-0204", reason = "unreachable: we never format Atomic/Shared; fix lives in autumn-web's/criterion's transitive tree, not our manifest. Revisit: next scheduled batch." },
-
     # RUSTSEC-2026-0253 — lru 0.16.4, use-after-free in LruCache::pop() when
     # a stored key/value's Drop panics mid-pop. This IS a direct dependency
     # (autumn-harvest/src/cache.rs's WorkflowCache::remove calls
@@ -89,16 +78,6 @@ ignore = [
     # Revisit: an upstream `rsa` fix ships, or autumn-web's JWT usage is
     # confirmed verify-only (would lower urgency further).
     { id = "RUSTSEC-2023-0071", reason = "undetermined from this repo: reachability depends on whether autumn-web does RSA signing vs. verify-only, which is outside this codebase. No upstream patch exists yet either way. Revisit: rsa fix ships upstream, or autumn-web's usage is confirmed verify-only." },
-
-    # Yanked, not advisory-listed. Both are transitive (chacha20 via
-    # rand 0.10.1 -> {ferroid, postgres-protocol/tokio-postgres}; spin via
-    # lazy_static/sharded-slab), pulled in by autumn-web's and our own
-    # diesel-async's trees. `cargo update -p <crate>` doesn't move either off
-    # the yanked version while upstream still requires it. Revisit: next
-    # scheduled batch (re-run `cargo update -p chacha20 -p spin` there to see
-    # if upstream has moved on).
-    { crate = "chacha20@0.10.0", reason = "yanked, entirely transitive (rand 0.10.1's tree); no non-yanked version satisfies upstream's constraint yet. Revisit: next scheduled batch." },
-    { crate = "spin@0.9.8", reason = "yanked, entirely transitive (lazy_static/sharded-slab); no non-yanked version satisfies upstream's constraint yet. Revisit: next scheduled batch." },
 
     # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
     # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
