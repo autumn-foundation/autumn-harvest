@@ -85,7 +85,6 @@ fn main() {
 
 async fn run() {
     println!("# Harvest end-to-end benchmark run (issue #941)\n");
-    print_environment().await;
 
     let scenario_filter = std::env::var(SCENARIO_FILTER_ENV_VAR).ok();
     let shard_filter = std::env::var(SHARD_FILTER_ENV_VAR).ok();
@@ -143,6 +142,11 @@ async fn run() {
         );
         return;
     }
+
+    // After the sweep, not before: the Postgres version is only known once
+    // something has been provisioned, and on the testcontainer path there is no
+    // environment variable to read it from ahead of time.
+    print_environment();
 
     println!("\n## Results\n");
     println!("{}", render_matrix(&reports));
@@ -202,7 +206,7 @@ async fn run_scenario(
     }
 }
 
-async fn print_environment() {
+fn print_environment() {
     println!("## Environment\n");
     println!("| | |");
     println!("|:--|:--|");
@@ -232,9 +236,11 @@ async fn print_environment() {
         "| Pool size | {} per shard |",
         e2e_bench_support::POOL_SIZE_PER_SHARD
     );
-    if let Some(version) = e2e_bench_support::db::probe_postgres_version().await {
-        println!("| Postgres | {version} |");
-    }
+    println!(
+        "| Postgres | {} |",
+        e2e_bench_support::db::provisioned_postgres_version()
+            .unwrap_or_else(|| "unknown (no server was reached)".to_owned())
+    );
     println!();
 }
 

@@ -699,6 +699,28 @@ pub fn mean_inflight(samples: &[usize]) -> Option<f64> {
     Some(total / samples.len() as f64)
 }
 
+/// Reasons a closed-loop throughput figure is feeder-bound on **any** shard.
+///
+/// The per-shard form of [`inflight_soundness`], and the same lesson the
+/// pacing gate learned one review round earlier (Codex, PR #1282): a mean over
+/// every shard's samples lets well-fed shards hide a starved one. Four shards
+/// at 32, 32, 32 and 28 average 31 against a floor of 28.8 and pass — while the
+/// shard that missed its target is the one bounding the aggregate rate the cell
+/// publishes. Each shard is judged against the target it was actually given.
+#[must_use]
+pub fn per_shard_inflight_soundness(target: usize, per_shard_means: &[Option<f64>]) -> Vec<String> {
+    if per_shard_means.is_empty() {
+        return vec!["no in-flight observations were collected".to_owned()];
+    }
+    let mut reasons = Vec::new();
+    for (shard, mean) in per_shard_means.iter().enumerate() {
+        for reason in inflight_soundness(target, *mean) {
+            reasons.push(format!("shard {shard}: {reason}"));
+        }
+    }
+    reasons
+}
+
 /// The middle half of an ordered observation series.
 ///
 /// The in-flight evidence must describe the same window the headline rate is
@@ -1854,6 +1876,34 @@ mod tests {
     }
 
     #[test]
+    fn a_single_feeder_bound_shard_cannot_hide_behind_its_peers() {
+        // The regression this exists to catch (Codex review round 3, PR #1282):
+        // 32/32/32/28 averages 31 against a floor of 28.8, so a flattened mean
+        // passes while the starved shard is the one bounding the aggregate rate
+        // the cell publishes.
+        let flattened = mean_inflight(&[32, 32, 32, 28]).expect("non-empty");
+        assert!(
+            inflight_soundness(32, Some(flattened)).is_empty(),
+            "the aggregate mean is what used to pass ({flattened:.1})"
+        );
+        let reasons =
+            per_shard_inflight_soundness(32, &[Some(32.0), Some(32.0), Some(32.0), Some(28.0)]);
+        assert!(
+            reasons.iter().any(|r| r.starts_with("shard 3:")),
+            "the starved shard must be named: {reasons:?}"
+        );
+        assert!(
+            per_shard_inflight_soundness(32, &[Some(32.0), Some(31.0)]).is_empty(),
+            "every shard within the hold ratio publishes"
+        );
+        assert!(!per_shard_inflight_soundness(32, &[]).is_empty());
+        assert!(
+            !per_shard_inflight_soundness(32, &[Some(32.0), None]).is_empty(),
+            "a shard that collected nothing is not evidence of an engine-bound run"
+        );
+    }
+
+    #[test]
     fn the_steady_state_slice_is_the_same_window_the_rate_uses() {
         let samples: Vec<usize> = (0..400).collect();
         let slice = steady_state_slice(&samples);
@@ -2139,8 +2189,8 @@ pub mod db {
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
         SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
-        dispatch_population_soundness, inflight_soundness, latency_soundness, mean_inflight,
-        measured_samples, pacing_verdict, per_shard_pacing_verdict, steady_state_slice,
+        dispatch_population_soundness, latency_soundness, mean_inflight, measured_samples,
+        pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict, steady_state_slice,
         steady_state_throughput, steady_state_window, throughput_soundness, warmup_batch_for,
         warmup_soundness,
     };
@@ -2283,6 +2333,7 @@ pub mod db {
                 return Err(SkipReason(format!("connect to fresh shard database: {e}")));
             }
         };
+        record_server_version(&mut conn).await;
         if let Err(e) = conn.batch_execute(&autumn_harvest::test_init_sql()).await {
             drop(conn);
             drop_created(&created).await;
@@ -3102,30 +3153,34 @@ pub mod db {
         version: String,
     }
 
-    /// `SELECT version()` from the first reachable shard, for the environment
-    /// block of the published report.
+    /// The `version()` of the server this run actually provisioned against.
     ///
-    /// Reported from the live server rather than typed into the doc by hand:
-    /// the Postgres version is one of the few things that most changes these
-    /// numbers, and a hand-typed one is the kind that goes stale silently.
-    pub async fn probe_postgres_version() -> Option<String> {
-        let url = std::env::var(SHARD_URLS_ENV_VAR)
-            .ok()
-            .and_then(|raw| {
-                raw.split(',')
-                    .map(str::trim)
-                    .find(|s| !s.is_empty())
-                    .map(str::to_owned)
-            })
-            .or_else(|| std::env::var("HARVEST_TEST_DATABASE_URL").ok())?;
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+    /// Recorded during provisioning rather than probed from an environment
+    /// variable, because on the testcontainer path there is no such variable:
+    /// the probe returned `None` and the published environment block simply
+    /// omitted the Postgres version for an otherwise perfectly good run (Codex
+    /// review round 3, PR #1282). `postgres:16` is a moving tag, and the doc
+    /// treats the exact version as reproduction metadata, so "unknown" is not
+    /// an acceptable answer for a run that had a server in front of it.
+    static PROVISIONED_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    async fn record_server_version(conn: &mut AsyncPgConnection) {
+        if PROVISIONED_VERSION.get().is_some() {
+            return;
+        }
+        if let Ok(row) = diesel::sql_query("SELECT version() AS version")
+            .get_result::<VersionRow>(conn)
             .await
-            .ok()?;
-        diesel::sql_query("SELECT version() AS version")
-            .get_result::<VersionRow>(&mut conn)
-            .await
-            .ok()
-            .map(|r| r.version)
+        {
+            let _ = PROVISIONED_VERSION.set(row.version);
+        }
+    }
+
+    /// The Postgres version this run measured against, for the report's
+    /// environment block. `None` only when no server was ever reached.
+    #[must_use]
+    pub fn provisioned_postgres_version() -> Option<String> {
+        PROVISIONED_VERSION.get().cloned()
     }
 
     // ── Scenario runners ──────────────────────────────────────────────────
@@ -3289,16 +3344,20 @@ pub mod db {
         let sustained = steady_state_throughput(&secs);
         let window_secs = steady_state_window(&secs).map(|(lo, hi)| hi - lo);
 
-        // Only the samples from the window the headline is computed over. The
-        // loop's drain-down tail decays 128 -> 0 by construction, so averaging
-        // over the whole loop measures the tail rather than the population the
-        // rate was produced under -- and on a short run it fires the gate
-        // against a perfectly good measurement.
-        let inflight_samples: Vec<usize> = loops
-            .into_iter()
-            .flat_map(|l| steady_state_slice(&l.inflight_samples).to_vec())
+        // Per shard, and only over the window the headline is computed over.
+        //
+        // Two separate corrections live in this one expression. The
+        // `steady_state_slice` keeps the evidence to the same middle-half window
+        // the rate uses -- the loop's drain-down tail decays to zero by
+        // construction, so a whole-loop mean measures the tail. And the
+        // per-shard grouping is retained rather than flattened, because a mean
+        // over every shard's samples lets three well-fed shards hide a fourth
+        // that the feeder could not keep up with.
+        let per_shard_flight: Vec<Option<f64>> = loops
+            .iter()
+            .map(|l| mean_inflight(steady_state_slice(&l.inflight_samples)))
             .collect();
-        let mean_flight = mean_inflight(&inflight_samples);
+
         let mut unsound = throughput_soundness(requested, completed, &per_shard);
         unsound.extend(warmup_soundness(
             "throughput",
@@ -3308,7 +3367,7 @@ pub mod db {
         // Per shard on both sides: `inflight_samples` is the concatenation of
         // every shard's observations, so its mean is already a per-shard
         // population.
-        unsound.extend(inflight_soundness(inflight, mean_flight));
+        unsound.extend(per_shard_inflight_soundness(inflight, &per_shard_flight));
 
         fleet.stop().await;
         let topology = cluster.topology;
@@ -3341,14 +3400,16 @@ pub mod db {
                          measured completions, warmup population {}",
                         warm_per_shard * shards.len()
                     ),
-                    mean_flight.map_or_else(
-                        || "mean in-flight population: n/a".to_owned(),
-                        |m| {
-                            format!(
-                                "mean in-flight population: {m:.1} per shard against a target of \
-                                 {inflight}"
-                            )
-                        },
+                    format!(
+                        "mean in-flight population per shard against a target of {inflight}: {}",
+                        per_shard_flight
+                            .iter()
+                            .map(|m| m.map_or_else(
+                                || "n/a".to_owned(),
+                                |mean| format!("{mean:.1}")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     ),
                     "the headline is the middle-half rate: the ramp-up and the drain-down tails \
                      are excluded, so it is a sustained rate rather than an average over a \
@@ -3382,19 +3443,33 @@ pub mod db {
         inflight: usize,
         deadline: Instant,
     ) -> Vec<LoopOutcome> {
-        let mut tasks = Vec::new();
-        for shard in cluster.shard_ids() {
+        // A `JoinSet`, not loose `JoinHandle`s: if one shard's loop panics, the
+        // `expect` below unwinds and dropping loose handles would DETACH the
+        // siblings, leaving them inserting rows and holding connections until
+        // the 900s deadline while later cells of the sweep are being measured
+        // (Codex review round 3, PR #1282). Dropping a `JoinSet` aborts what it
+        // owns, so the containment in `benches/e2e_bench.rs` actually contains.
+        //
+        // Results come back in completion order, so each task carries its shard
+        // index and the outcomes are restored to shard order before returning --
+        // every per-shard verdict downstream is reported against a shard number.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (idx, shard) in cluster.shard_ids().into_iter().enumerate() {
             let url = cluster.urls[&shard].clone();
             let cohort = cohort.to_owned();
-            tasks.push(tokio::spawn(async move {
-                closed_loop_on_shard(&url, shard, &cohort, per_shard, inflight, deadline).await
-            }));
+            tasks.spawn(async move {
+                (
+                    idx,
+                    closed_loop_on_shard(&url, shard, &cohort, per_shard, inflight, deadline).await,
+                )
+            });
         }
-        let mut outcomes = Vec::new();
-        for task in tasks {
-            outcomes.push(task.await.expect("closed-loop shard task"));
+        let mut indexed = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            indexed.push(joined.expect("closed-loop shard task"));
         }
-        outcomes
+        indexed.sort_by_key(|(idx, _)| *idx);
+        indexed.into_iter().map(|(_, outcome)| outcome).collect()
     }
 
     async fn closed_loop_on_shard(
@@ -3491,12 +3566,14 @@ pub mod db {
     ) -> (Vec<ExecutionId>, std::time::Duration) {
         let period = std::time::Duration::from_secs_f64(1.0 / per_shard_rate);
         let started = Instant::now();
-        let mut tasks = Vec::new();
+        // `JoinSet` for the same reason as `run_closed_loop`: a panic in one
+        // shard's seeder must not detach its siblings onto the rest of the sweep.
+        let mut tasks = tokio::task::JoinSet::new();
         for shard in cluster.shard_ids() {
             let url = cluster.urls[&shard].clone();
             let workflow_name = workflow_name.to_owned();
             let cohort = cohort.to_owned();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
                     .await
                     .expect("connect for paced seeding");
@@ -3523,11 +3600,11 @@ pub mod db {
                     ids.push(exec_id);
                 }
                 ids
-            }));
+            });
         }
         let mut all = Vec::new();
-        for task in tasks {
-            all.extend(task.await.expect("paced seed task"));
+        while let Some(joined) = tasks.join_next().await {
+            all.extend(joined.expect("paced seed task"));
         }
         (all, started.elapsed())
     }
@@ -3754,10 +3831,13 @@ pub mod db {
         deadline: Instant,
     ) -> (Vec<(ExecutionId, Instant)>, Vec<f64>, usize) {
         let period = std::time::Duration::from_secs_f64(1.0 / PACED_STARTS_PER_SEC_PER_SHARD);
-        let mut tasks = Vec::with_capacity(by_shard.len());
-        for ids in by_shard {
+        // `JoinSet` for the same reason as `run_closed_loop`, and indexed for the
+        // same reason: `achieved_per_shard` is reported and gated per shard, so
+        // completion order would mislabel which shard missed its pace.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (idx, ids) in by_shard.iter().enumerate() {
             let ids = ids.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut ticker = tokio::time::interval(period);
                 // `Delay`, not `Burst`: a catch-up burst after a slow send
                 // would hide the saturation the verdict exists to detect.
@@ -3786,14 +3866,18 @@ pub mod db {
                 )]
                 let achieved = (sent.len().saturating_sub(1)) as f64
                     / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
-                (sent, achieved, failures)
-            }));
+                (idx, sent, achieved, failures)
+            });
         }
+        let mut indexed = Vec::with_capacity(by_shard.len());
+        while let Some(joined) = tasks.join_next().await {
+            indexed.push(joined.expect("paced signal task"));
+        }
+        indexed.sort_by_key(|(idx, _, _, _)| *idx);
         let mut all_sent = Vec::new();
         let mut achieved_per_shard = Vec::with_capacity(by_shard.len());
         let mut failures = 0_usize;
-        for task in tasks {
-            let (sent, achieved, shard_failures) = task.await.expect("paced signal task");
+        for (_, sent, achieved, shard_failures) in indexed {
             all_sent.extend(sent);
             achieved_per_shard.push(achieved);
             failures += shard_failures;
