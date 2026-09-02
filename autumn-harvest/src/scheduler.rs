@@ -5335,10 +5335,19 @@ pub async fn schedule_running_basis_batch(
 /// `resolve_effective_fire_at` so this addition cannot change behavior for
 /// that function's existing (single-schedule) callers.
 ///
-/// `excluded` should be the calendar's exclusion dates (an empty slice when
-/// the calendar has none, or when its exclusions failed to load and the
-/// caller chooses to degrade to "no rebasing" rather than propagate the
-/// error).
+/// `excluded` should be the calendar's exclusion dates -- an empty slice is
+/// only correct when the calendar genuinely has no exclusion rows, **never**
+/// as a stand-in for "the load failed." `exclude_weekends` is a pure name
+/// check (`calendar_name == "weekends-off"`) independent of `excluded`, so
+/// an empty slice does **not** reliably degrade to "no rebasing": a
+/// `weekends-off` calendar still rebases a weekend slot on an empty slice
+/// (see `resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions`
+/// below), which can hide a genuinely overdue wedge. A caller whose
+/// exclusions load failed must skip calling this function entirely (fall
+/// back to the raw anchor) rather than pass `&[]` in its place -- see
+/// `load_schedule_overdue_aux_by_shard` in `autumn-harvest-plugin/src/api.rs`
+/// for the pattern (`Option<HashMap<..>>`, `None` on failure, short-circuits
+/// before this function is ever called).
 #[must_use]
 pub fn resolve_effective_fire_at_pure(
     excluded: &[NaiveDate],
