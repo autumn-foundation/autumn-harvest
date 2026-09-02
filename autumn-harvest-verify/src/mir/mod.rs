@@ -5,6 +5,7 @@
 //! [`crate::BoundaryKind::MirParse`] boundary by the analysis — never a panic.
 
 pub mod ast;
+mod lexer;
 pub mod parse;
 
 pub use ast::*;
