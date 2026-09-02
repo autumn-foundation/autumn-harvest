@@ -480,19 +480,95 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   quickstart:
-    name: Quickstart example builds
+    name: Quickstart example builds and runs (clean-room, README steps)
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Matches examples/quickstart/compose.yaml so AUTUMN_MANIFEST_DIR's autumn.toml
+    # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quickstart
+          POSTGRES_PASSWORD: quickstart
+          POSTGRES_DB: quickstart
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quickstart"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build quickstart
         run: cargo build -p quickstart
+      - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
+        # `cargo build -p quickstart` alone never exercises this: the crate has
+        # two [[bin]] targets (quickstart, retry-jitter-example), and `cargo
+        # build` compiles both regardless of which one `cargo run` would pick.
+        # Only invoking the bare README command — the literal 5-minute-quickstart
+        # front door in README.md and examples/quickstart/README.md step 2 —
+        # catches an ambiguous-binary regression here. This step reproduces
+        # examples/quickstart/README.md steps 2 and 4 verbatim.
+        env:
+          AUTUMN_PROFILE: dev
+          AUTUMN_MANIFEST_DIR: examples/quickstart
+        run: |
+          set -uo pipefail
+          cargo run -p quickstart &
+          APP_PID=$!
+          trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
+
+          # 1. Wait for the app to become healthy (fail fast if it exits early).
+          healthy=false
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3000/api/harvest/health; then
+              echo "app healthy after ${i}s"; healthy=true; break
+            fi
+            if ! kill -0 "${APP_PID}" 2>/dev/null; then
+              echo "::error::quickstart app exited before becoming healthy"; exit 1
+            fi
+            sleep 1
+          done
+          if [ "${healthy}" != "true" ]; then
+            echo "::error::quickstart app never became healthy"; exit 1
+          fi
+
+          # 2. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
+          resp="$(curl -sf -X POST \
+            http://localhost:3000/api/harvest/workflows/greeting/start \
+            -H 'Content-Type: application/json' \
+            -d '{"workflow_id":"ci-1","input":"World"}')" || {
+              echo "::error::start request failed"; exit 1; }
+          echo "start response: ${resp}"
+          eid="$(echo "${resp}" | jq -r '.execution_id // empty')"
+          if [ -z "${eid}" ]; then
+            echo "::error::no execution_id in start response"; exit 1
+          fi
+
+          # 3. Poll until COMPLETED. The workflow has a 30s durable timer between
+          # its two activities, so this needs headroom well past 30s.
+          for i in $(seq 1 90); do
+            state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
+              | jq -r '.execution.state // empty' 2>/dev/null || true)"
+            echo "t=${i}s state=${state:-<none>}"
+            case "${state}" in
+              COMPLETED)
+                echo "workflow reached COMPLETED — quickstart runs end to end"; exit 0 ;;
+              FAILED|TIMED_OUT|TERMINATED|CANCELLED)
+                echo "::error::workflow reached terminal-but-not-completed state: ${state}"
+                exit 1 ;;
+            esac
+            sleep 1
+          done
+          echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
 
   scaffold-smoke:
     name: Scaffold builds and runs (harvest new)
