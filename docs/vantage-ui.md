@@ -77,7 +77,7 @@ endpoint, no new `WorkflowEvent` variant, and no migration**.
 | Health | derived | See badges below |
 | Overlap | `overlap_policy` (#241) | Buffering policies also show `buffered <n>` (and `/<cap>` under `buffer_all`) |
 | Catchup | `catchup_policy` (#484) | Effective policy, the `window` duration, and `dropped <n>` from the most recent recovery tick |
-| Bounded runs | `max_runs` / `runs_started` / `end_at` / `exhausted_reason` (#478) | `<remaining> of <max> left · ends <ts> · exhausted: <reason>` |
+| Bounded runs | `max_runs` / `runs_started` / `end_at` / `exhausted_reason` (#478) | `<remaining> of <max> left · ends <ts> · exhausted: <reason>`. `max_runs = 0` is the engine's *unlimited* (every bound check guards on `max > 0`), so no budget is rendered for it. |
 | Created | `created_at` | |
 | Shard | fan-out | Multi-shard deployments only |
 
@@ -90,7 +90,7 @@ condition:
 |---|---|
 | `Paused` | `is_paused` |
 | `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
-| `Exhausted: <reason>` | `exhausted_at` set (#478) |
+| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds — `runs_started >= max_runs` (for `max_runs > 0`) or `now >= end_at` — before a tick has stamped the column. An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
 | `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
 
 Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing
@@ -208,10 +208,11 @@ All three drill-downs resolve the schedule through the API's own
 shard and none had it" is a `404`, and "a shard could not be checked" is a `503` — never a
 `404` claiming a schedule was deleted when a shard was merely unreachable.
 
-The preview then passes the *resolved row* to `compute_schedule_preview_for` rather than
-handing the id back for a second lookup: `load_schedule_by_id` stops at the first
-unreachable shard, which would fail a preview for a schedule already found on a later
-healthy one.
+`load_schedule_by_id_with_shard` — the lookup behind the preview and backfill endpoints —
+delegates to the same resolver, so a schedule on a healthy shard is found even while an
+earlier shard is down, and a not-found result during an outage is a `503` rather than a
+`404`. The preview additionally passes its already-resolved row to
+`compute_schedule_preview_for`, avoiding a second lookup entirely.
 
 **Out of scope (tracked elsewhere):** creating or editing schedules from the UI (#771),
 overdue-schedule detection (#696), recent-runs enrichment (#762).

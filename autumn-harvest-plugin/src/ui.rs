@@ -7614,15 +7614,49 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
     row.is_paused || row.auto_paused_at.is_some()
 }
 
+/// Whether a schedule has run out of budget or passed its cutoff, whether or
+/// not a scheduler tick has got round to stamping `exhausted_at`.
+///
+/// `exhausted_at` is written *asynchronously* by the tick that observes the
+/// bound. A tick that dies first leaves a row that is already terminal —
+/// `runs_started >= max_runs`, or `now >= end_at` — with the column still NULL.
+/// The engine never trusts the column alone: `schedule_backfill_inner` and
+/// `trigger_schedule_now` both reject on `exhausted_at.is_some() ||
+/// live_end_at_exceeded || live_budget_exhausted`, and the scheduler's own
+/// `schedule_overdue` derives the same thing from the raw fields for exactly
+/// this reason. Reading the column alone here would render such a row as a calm
+/// `Active` schedule, exclude it from `health=Unhealthy`, and sort it *below*
+/// the unhealthy rows — while this page's own preview for it correctly reports
+/// no upcoming fire times.
+///
+/// `max_runs = 0` is **unlimited**, not "spent": the `max > 0` guard is the
+/// engine's convention at every bound check (and is pinned by
+/// `backfill_max_runs_zero_is_treated_as_unlimited`).
+fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
+    row.exhausted_at.is_some()
+        || row.end_at.is_some_and(|end_at| now >= end_at)
+        || row
+            .max_runs
+            .is_some_and(|max| max > 0 && row.runs_started >= max)
+}
+
 /// Derive a row's health flags. Pure: every badge, sort and summary decision on
 /// the page goes through this one function, so they can never disagree.
-const fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
+///
+/// `now` is a parameter rather than read inside so the bounded-out branch is
+/// testable without sleeping.
+fn schedule_health_at(row: &HarvestSchedule, now: DateTime<Utc>) -> ScheduleHealth {
     ScheduleHealth {
         paused: row.is_paused,
         auto_paused: row.auto_paused_at.is_some(),
-        exhausted: row.exhausted_at.is_some(),
+        exhausted: schedule_is_bounded_out(row, now),
         catchup_dropped: row.last_catchup_dropped > 0,
     }
+}
+
+/// [`schedule_health_at`] anchored to the current instant.
+fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
+    schedule_health_at(row, Utc::now())
 }
 
 /// Filter the list by health (issue #951 AC3): "show me only what is wrong".
@@ -7654,7 +7688,7 @@ impl ScheduleHealthFilter {
         }
     }
 
-    const fn matches(self, row: &HarvestSchedule) -> bool {
+    fn matches(self, row: &HarvestSchedule) -> bool {
         match self {
             Self::All => true,
             Self::Unhealthy => !schedule_health(row).is_healthy(),
@@ -9117,7 +9151,18 @@ fn render_schedule_health_badges(row: &HarvestSchedule) -> Markup {
             // a superset of its text; here it would be a subset.
             span.badge.TERMINATED role="status" {
                 "Exhausted"
-                @if let Some(ref reason) = row.exhausted_reason { ": " (reason) }
+                @match row.exhausted_reason {
+                    Some(ref reason) => { ": " (reason) }
+                    // Bounded out on the live fields, before a tick stamped
+                    // `exhausted_at`/`exhausted_reason` — say which bound.
+                    None => {
+                        @if row.max_runs.is_some_and(|max| max > 0 && row.runs_started >= max) {
+                            ": run budget spent"
+                        } @else if row.end_at.is_some() {
+                            ": past end_at"
+                        }
+                    }
+                }
             }
         }
         @if health.catchup_dropped {
@@ -9151,7 +9196,10 @@ fn schedule_catchup_label(row: &HarvestSchedule) -> String {
 /// machine-readable exhaustion reason once it has fired for the last time.
 fn schedule_bounded_runs_label(row: &HarvestSchedule) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(max) = row.max_runs {
+    // `max_runs = 0` is the engine's "unlimited", not a spent budget — every
+    // bound check guards on `max > 0`. Rendering it as "0 of 0 left" would tell
+    // an operator a schedule that fires forever has stopped.
+    if let Some(max) = row.max_runs.filter(|max| *max > 0) {
         let remaining = crate::api::remaining_runs_budget(max, row.runs_started);
         parts.push(format!("{remaining} of {max} left"));
     }
@@ -15091,6 +15139,112 @@ mod tests {
         .into_string();
         assert!(html.contains(&format!("schedules/{active_id}/pause")));
         assert!(!html.contains(&format!("schedules/{active_id}/resume")));
+    }
+
+    // -- Codex round 2 regressions --
+
+    /// Codex #1: `max_runs = 0` is the engine's "unlimited" (every bound check
+    /// guards on `max > 0`, pinned by `backfill_max_runs_zero_is_treated_as_unlimited`),
+    /// so it must not render as a spent budget.
+    #[test]
+    fn a_zero_run_cap_reads_as_unlimited_not_spent() {
+        let unlimited_by_zero = HarvestSchedule {
+            max_runs: Some(0),
+            runs_started: 12,
+            ..make_schedule(Some("legacy_wf"), None, false)
+        };
+        assert_eq!(
+            schedule_bounded_runs_label(&unlimited_by_zero),
+            "—",
+            "max_runs = 0 must not render a budget at all"
+        );
+        assert!(
+            !schedule_is_bounded_out(&unlimited_by_zero, chrono::Utc::now()),
+            "max_runs = 0 must never count as bounded out"
+        );
+        assert!(
+            schedule_health(&unlimited_by_zero).is_healthy(),
+            "a zero-cap schedule is unlimited, so it reads healthy"
+        );
+    }
+
+    /// Codex #3: `exhausted_at` is stamped asynchronously, so a row can be
+    /// terminal on its live bounds while the column is still NULL. Reading the
+    /// column alone rendered such a row as a calm Active schedule that the
+    /// health filter excluded and the sort put below the unhealthy rows.
+    #[test]
+    fn a_row_bounded_out_before_its_tick_stamped_it_reads_exhausted() {
+        let now = chrono::Utc::now();
+
+        let budget_spent = HarvestSchedule {
+            max_runs: Some(5),
+            runs_started: 5,
+            exhausted_at: None,
+            ..make_schedule(Some("spent_wf"), None, false)
+        };
+        assert!(schedule_is_bounded_out(&budget_spent, now));
+        assert!(schedule_health_at(&budget_spent, now).exhausted);
+        let html = render_schedule_health_badges(&budget_spent).into_string();
+        assert!(html.contains("Exhausted"), "badge missing: {html}");
+        assert!(
+            html.contains("run budget spent"),
+            "an unstamped exhaustion must still name its bound: {html}"
+        );
+
+        let past_cutoff = HarvestSchedule {
+            end_at: Some(now - chrono::Duration::hours(1)),
+            exhausted_at: None,
+            ..make_schedule(Some("cutoff_wf"), None, false)
+        };
+        assert!(schedule_is_bounded_out(&past_cutoff, now));
+        let html = render_schedule_health_badges(&past_cutoff).into_string();
+        assert!(html.contains("past end_at"), "cutoff bound missing: {html}");
+
+        // A cutoff still in the future is not bounded out.
+        let future_cutoff = HarvestSchedule {
+            end_at: Some(now + chrono::Duration::hours(1)),
+            ..make_schedule(Some("future_wf"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&future_cutoff, now));
+        assert!(schedule_health_at(&future_cutoff, now).is_healthy());
+    }
+
+    /// The live-bounds derivation must also drive the filter and the sort, not
+    /// just the badge — that was the substance of the finding.
+    #[test]
+    fn a_live_bounded_out_row_is_filtered_and_sorted_as_unhealthy() {
+        let now = chrono::Utc::now();
+        let bounded_out = HarvestSchedule {
+            max_runs: Some(3),
+            runs_started: 3,
+            exhausted_at: None,
+            next_run_at: Some(now + chrono::Duration::hours(10)),
+            ..make_schedule(Some("z_bounded"), None, false)
+        };
+        let healthy = HarvestSchedule {
+            next_run_at: Some(now + chrono::Duration::minutes(1)),
+            ..make_schedule(Some("a_healthy"), None, false)
+        };
+
+        let filters = ScheduleUiFilters {
+            health: ScheduleHealthFilter::Unhealthy,
+            ..Default::default()
+        };
+        assert!(
+            filters.matches(ShardId::new(0), &bounded_out),
+            "health=Unhealthy must include a row bounded out on live fields"
+        );
+        assert!(!filters.matches(ShardId::new(0), &healthy));
+
+        let mut rows = vec![
+            (ShardId::new(0), healthy),
+            (ShardId::new(0), bounded_out.clone()),
+        ];
+        sort_schedule_rows(&mut rows);
+        assert_eq!(
+            rows[0].1.id, bounded_out.id,
+            "a live-bounded-out row must sort above a healthy one despite firing later"
+        );
     }
 
     /// The backfill confirmation interpolates the schedule UUID into its

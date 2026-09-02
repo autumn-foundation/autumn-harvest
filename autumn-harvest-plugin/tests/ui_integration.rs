@@ -3449,6 +3449,166 @@ async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
     );
 }
 
+/// Codex round 2 #2: the backfill launcher must work for a schedule on a
+/// healthy shard while an earlier shard is unreachable. Round 1 fixed the
+/// preview instance; the shared lookup underneath is now resilient, so the
+/// backfill path is covered by the same rule.
+#[tokio::test]
+async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &good_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Shard 0 is unreachable; the schedule lives on shard 1.
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), bad_pool);
+    pools.insert(ShardId::new(1), good_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(1),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the backfill form must render despite an unreachable earlier shard: {html}"
+    );
+
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=preview",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the dry run must reach the schedule on the healthy shard: {html}"
+    );
+    assert!(
+        html.contains("Confirm backfill"),
+        "the dry run must produce a confirmation, not a resolution failure: {html}"
+    );
+}
+
+/// Codex round 2 #3: a schedule that is terminal on its live bounds but whose
+/// tick never stamped `exhausted_at` must still read as unhealthy on the list.
+#[tokio::test]
+async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() {
+    let (database_url, _container) = setup_test_database_url().await;
+    // `runs_started == max_runs`, `exhausted_at` still NULL.
+    let bounded = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "unstamped_bounded",
+            max_runs: Some(4),
+            runs_started: 4,
+            next_run_at_sql: Some("NOW() + INTERVAL '10 hours'"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let healthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "still_healthy",
+            next_run_at_sql: Some("NOW() + INTERVAL '1 minute'"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("run budget spent"),
+        "an unstamped exhaustion must be badged with its bound: {html}"
+    );
+
+    // It sorts above the healthy row despite firing much later.
+    let pos = |id: uuid::Uuid| {
+        html.find(&id.to_string())
+            .unwrap_or_else(|| panic!("schedule {id} missing: {html}"))
+    };
+    assert!(
+        pos(bounded) < pos(healthy),
+        "a live-bounded-out row must sort to the top: {html}"
+    );
+
+    // And the health filter finds it.
+    let (status, html) = fetch_html(&app, "/schedules?health=Unhealthy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("unstamped_bounded"),
+        "health=Unhealthy must include it: {html}"
+    );
+    assert!(
+        !html.contains("still_healthy"),
+        "the healthy row must be filtered out: {html}"
+    );
+}
+
+/// Codex round 2 #1: a legacy `max_runs = 0` row is unlimited, and must not be
+/// rendered as a spent budget or flagged unhealthy.
+#[tokio::test]
+async fn ui_schedules_zero_run_cap_renders_as_unlimited() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "zero_cap_wf",
+            max_runs: Some(0),
+            runs_started: 9,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("zero_cap_wf"), "row missing: {html}");
+    assert!(
+        !html.contains("of 0 left"),
+        "max_runs = 0 is unlimited and must not render a budget: {html}"
+    );
+    assert!(
+        !html.contains("Needs attention"),
+        "an unlimited schedule must not be counted unhealthy: {html}"
+    );
+}
+
 /// Timezone column renders and differentiates UTC (subdued) from other timezones (prominent badge).
 #[tokio::test]
 async fn ui_schedules_displays_timezone() {

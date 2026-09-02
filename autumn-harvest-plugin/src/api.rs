@@ -30547,30 +30547,22 @@ async fn load_schedule_by_id(
 
 /// Like [`load_schedule_by_id`] but also returns the [`ShardId`] of the shard
 /// the schedule was found on, so callers can route subsequent writes correctly.
+/// Resolve a schedule by id across shards.
+///
+/// Delegates to [`resolve_schedule_with_shard`] so every schedule lookup in the
+/// plugin obeys one rule. The previous implementation `?`-propagated the first
+/// shard's `acquire_conn` failure, so a schedule living on a *later* healthy
+/// shard could not be found at all while an earlier shard was down — which took
+/// down `GET /admin/schedules/{id}/preview` and `POST /admin/schedules/{id}/backfill`
+/// (and, through them, the Vantage drill-downs) for rows that were perfectly
+/// readable. The shared resolver keeps scanning, returns the row when any shard
+/// has it, and distinguishes an authoritative `404` from a `503` when a shard
+/// could not be checked — never an unqualified "not found" during an outage.
 async fn load_schedule_by_id_with_shard(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<(HarvestSchedule, ShardId), AutumnError> {
-    use autumn_harvest::schema::harvest_schedules::dsl;
-
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    for (shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let row = dsl::harvest_schedules
-            .find(schedule_id)
-            .select(HarvestSchedule::as_select())
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(database_error)
-            .map_err(map_error)?;
-        if let Some(r) = row {
-            return Ok((r, shard));
-        }
-    }
-    Err(AutumnError::not_found_msg(format!(
-        "schedule {schedule_id}"
-    )))
+    resolve_schedule_with_shard(api_state, schedule_id).await
 }
 
 fn parse_schedule_expr_with_tz(

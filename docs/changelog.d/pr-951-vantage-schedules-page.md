@@ -195,3 +195,37 @@ Three pure regression tests (precision round-trip, auto-paused rows offering Res
 ordinary rows unchanged) and three integration tests (per-row and bulk resume clearing
 `auto_paused_at` and the failure counter, and a preview rendering across an unreachable
 earlier shard).
+
+**Codex round 2 (three more P2s, and one of them the root cause round 1 only patched).**
+
+The instructive one: round 1 fixed the *preview* passing its id back to a lookup that
+stops at the first unreachable shard. Round 2 pointed out the backfill path still did
+exactly the same thing — the fix had been applied to the instance, not the cause.
+`load_schedule_by_id_with_shard` now delegates to `resolve_schedule_with_shard`, so every
+schedule lookup in the plugin obeys one rule: keep scanning past an unreachable shard,
+return the row when any shard has it, and distinguish an authoritative `404` from a `503`
+when a shard could not be checked. That also repairs `GET /admin/schedules/{id}/preview`
+and `POST /admin/schedules/{id}/backfill` themselves, which had the same defect
+independently of the UI.
+
+Second: the health model read `exhausted_at` alone. That column is stamped
+*asynchronously* by the tick that observes the bound, so a tick that dies first leaves a
+row already terminal — `runs_started >= max_runs`, or `now >= end_at` — with the column
+still NULL. The engine never trusts it alone (`schedule_backfill_inner` and
+`trigger_schedule_now` both check the live fields, and the scheduler's `schedule_overdue`
+derives the same thing from raw columns for precisely this reason), so a bounded-out row
+rendered here as a calm `Active` schedule that `health=Unhealthy` excluded and the sort
+put *below* the unhealthy rows — while this page's own preview for it correctly reported
+no upcoming fire times. `schedule_is_bounded_out` now mirrors the engine's predicate, and
+an unstamped exhaustion names its bound (`run budget spent` / `past end_at`) since there
+is no `exhausted_reason` yet.
+
+Third, and the reason the second fix has a `max > 0` guard: `max_runs = 0` is the engine's
+*unlimited*, not a spent budget — the guard appears at five bound-check sites and is
+pinned by `backfill_max_runs_zero_is_treated_as_unlimited`. The cell rendered a legacy
+zero-cap row as `0 of 0 left`, telling an operator a schedule that fires forever had
+stopped. No budget is rendered for a zero cap now, and it never counts as bounded out.
+
+Three pure regression tests and three integration tests, including the backfill path
+across an unreachable earlier shard and a live-bounded-out row's badge, filter and sort
+position.
