@@ -64,6 +64,25 @@ deployment and get nothing at all for it.
   failing, in the same spirit as the gate's own crash-loop rule), which is the
   wiring a standalone embedder needs to copy. The runbook says so explicitly.
 
+**Post-review hardening (Codex round 1).**
+
+- **P2 — report every incomplete gate through the incomplete-warning path.** The
+  split above keyed its branch on whether any orphan happened to be *seen*
+  (`orphaned_types.is_empty()`), which routed the mixed case — `fail`, an orphan
+  found on a reachable shard, another shard unavailable — to the plain
+  "orphaned workflow types detected" message. That is the case an operator most
+  needs explained, and that message says nothing about the configured `fail`
+  having been downgraded to a warning, nor that boot is continuing. The branch
+  now keys on the report STATUS, which is precisely what
+  `startup_orphan_decision` keys on, so the branch and the decision cannot
+  disagree; the orphan details ride along in the incomplete message, so nothing
+  is lost when some were found. Pinned by extending
+  `standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable` — which
+  already constructs exactly this mixed case — with a scoped `tracing`
+  subscriber asserting the operator-visible text names the incomplete check, the
+  downgraded `fail`, and the orphan that was found. Confirmed falsifiable: with
+  the old `is_empty()` guard restored, that test fails.
+
 **Behaviour notes.** `off` still skips the check entirely and is still the only
 zero-cost setting; `warn` (the default) never blocks a boot, so this is not a
 breaking change for any existing standalone deployment. Crash-loop safety is

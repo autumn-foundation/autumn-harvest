@@ -29,8 +29,8 @@ use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
 use crate::config::{HarvestRuntimeConfig, OrphanStartupAction};
 use crate::state::{AppDbPool, HarvestDbPool};
 use crate::workflow_reachability::{
-    ReachabilityVerdict, StartupOrphanDecision, build_reachability_report_for_shards,
-    startup_orphan_decision,
+    ReachabilityReportStatus, ReachabilityVerdict, StartupOrphanDecision,
+    build_reachability_report_for_shards, startup_orphan_decision,
 };
 
 /// Resource bundle used to start a Harvest runtime outside `HarvestExt`.
@@ -434,7 +434,17 @@ pub async fn run_startup_orphan_gate(
         // shard. Logging "orphaned workflow types detected" with an EMPTY list
         // would either page an operator alerting on that string, or teach them to
         // filter away the real detection.
-        StartupOrphanDecision::Warn if orphaned_types.is_empty() => {
+        //
+        // Codex round 1 (P2): key this on the report STATUS, not on whether any
+        // orphan happened to be seen. The mixed case — `fail`, an orphan found on
+        // a reachable shard, another shard unavailable — is exactly the one an
+        // operator most needs explained, and keying on `orphaned_types.is_empty()`
+        // sent it to the message below, which says nothing about the configured
+        // `fail` having been downgraded to a warning or about boot continuing.
+        // Status is also precisely what `startup_orphan_decision` keys on, so the
+        // branch and the decision cannot disagree. The orphan details ride along,
+        // so nothing is lost when some were found.
+        StartupOrphanDecision::Warn if report.status != ReachabilityReportStatus::Complete => {
             let unavailable_shards: Vec<i32> = report
                 .shards
                 .iter()
@@ -442,14 +452,18 @@ pub async fn run_startup_orphan_gate(
                 .map(|shard| shard.shard_id)
                 .collect();
             tracing::warn!(
+                action = ?action,
                 status = ?report.status,
                 unavailable_shards = ?unavailable_shards,
+                orphaned_types = ?orphaned_types,
+                total_orphaned_executions = report.total_orphaned_executions,
                 "the boot-time orphaned-workflow check did not complete: at least one \
-                 shard could not be inspected, so an unreachable shard could still host \
-                 in-flight runs whose #[workflow] handler is gone. Boot continues — an \
-                 incomplete check never refuses startup, even under \
-                 orphaned_workflows = fail. See docs/runbooks/safe-deploy.md \
-                 (Pre-cutover handler-coverage gate)."
+                 shard could not be inspected, so orphan detection did not run for the \
+                 whole fleet. Boot continues — an incomplete check never refuses \
+                 startup, even under orphaned_workflows = fail, because a boot loop has \
+                 no human in it. Any orphaned types listed here are what the REACHABLE \
+                 shards showed and may not be all of them. See \
+                 docs/runbooks/safe-deploy.md (Pre-cutover handler-coverage gate)."
             );
             Ok(())
         }

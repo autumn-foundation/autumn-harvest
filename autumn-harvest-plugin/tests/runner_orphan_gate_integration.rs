@@ -44,6 +44,7 @@ use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tracing::instrument::WithSubscriber as _;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -107,6 +108,42 @@ fn unified_dag_info_named(name: &'static str) -> DagInfo {
         mcp: false,
         execution_timeout: None,
         sla: None,
+    }
+}
+
+/// Collects `tracing` output so a test can assert on what an operator would
+/// actually read in the boot log.
+///
+/// Scoped to one future via `WithSubscriber` rather than installed globally, so
+/// sibling tests in this binary are unaffected.
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("captured logs lock")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("captured logs lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }
 
@@ -653,15 +690,45 @@ async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable()
     let resources =
         HarvestRunnerResources::new(build_test_pool(&database_url)).with_shard_router(router);
 
+    // Capture what an operator would read in the boot log. This is the MIXED
+    // case — `fail`, an orphan found on a reachable shard, and another shard
+    // uninspectable — and it is the one that most needs explaining (Codex round
+    // 1, P2): the operator configured `fail`, and it was downgraded to a warning
+    // because detection did not run everywhere.
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+
     autumn_harvest_plugin::runner::run_startup_orphan_gate(
         OrphanStartupAction::Fail,
         &built,
         &resources,
     )
+    .with_subscriber(subscriber)
     .await
     .expect(
         "an incomplete report must warn, never abort: a boot loop has no human in it, so a \
          shard that could not be inspected must not hard-fail startup",
+    );
+
+    let logged = logs.text();
+    assert!(
+        logged.contains("did not complete"),
+        "the operator must be told detection did not run for the whole fleet, not just \
+         that orphans were detected; got: {logged}"
+    );
+    assert!(
+        logged.contains("even under orphaned_workflows = fail"),
+        "the operator configured `fail` and it was downgraded — the log must say so; \
+         got: {logged}"
+    );
+    assert!(
+        logged.contains(&orphan_type),
+        "the orphan actually found must still be named, not dropped by routing this case \
+         to the incomplete-report message; got: {logged}"
     );
 }
 
