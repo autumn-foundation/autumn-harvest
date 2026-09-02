@@ -1,6 +1,6 @@
 -- before: every statement pg_stat_statements recorded for this database during one real GET /admin/schedules request, 500 schedules --
-REQUEST TOTAL: calls=1559 buffers=2223
-aux-lookup shapes' share: calls=1550/1559 (99.4%), buffers=2185/2223 (98.3%)
+REQUEST TOTAL: calls=1557 buffers=2218
+aux-lookup shapes' share: calls=1550/1557 (99.6%), buffers=2185/2218 (98.5%)
 
 calls=500 shared_blks_hit=1130 shared_blks_read=0 total_buffers=1130
 query=SELECT COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."workflow_name" = $1) AND ("harvest_workflow_executions"."state" = ANY($2)))
@@ -23,17 +23,11 @@ query=SELECT "harvest_backfill_log"."id", "harvest_backfill_log"."schedule_id", 
 calls=500 shared_blks_hit=5 shared_blks_read=0 total_buffers=5
 query=SELECT to_regclass($1) IS NOT NULL AS present
 
-calls=1 shared_blks_hit=4 shared_blks_read=0 total_buffers=4
-query=SELECT query, calls, shared_blks_hit, shared_blks_read, (shared_blks_hit + shared_blks_read) AS total_buffers FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = $1) AND ( (query ILIKE $2 AND query ILIKE $3) OR query ILIKE $4 OR query ILIKE $5 OR query ILIKE $6 ) ORDER BY total_buffers DESC LIMIT $7
-
-calls=1 shared_blks_hit=1 shared_blks_read=0 total_buffers=1
-query=SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = 'schedule_overdue_aux_perf_1b232b11f1ea489fb5a295ded46eab24'), 0)
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET CLIENT_ENCODING TO 'UTF8'
 
 calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
 query=SELECT $1
-
-calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
-query=SET CLIENT_ENCODING TO 'UTF8'
 
 calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
 query=SET TIME ZONE 'UTC'

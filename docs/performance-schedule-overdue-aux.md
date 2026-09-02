@@ -33,8 +33,8 @@ shipped recently enough that it had not yet been profiled.
   4th schedule's workflow; pending-throttle rows for every 7th), one
   `GET /admin/schedules` request issued **1,550 SQL calls** touching
   **2,185 buffers** in the aux-lookup statement shapes alone —
-  **99.4% of the whole request's calls and 98.3% of its buffers**
-  (1,559 calls / 2,223 buffers total).
+  **99.55% of the whole request's calls and 98.51% of its buffers**
+  (1,557 calls / 2,218 buffers total).
 * **The fix batches all three lookups per shard**: one grouped
   `RUNNING`/`PAUSED` count query (`scheduler::schedule_running_basis_batch`),
   one grouped pending-throttle count query
@@ -45,7 +45,7 @@ shipped recently enough that it had not yet been profiled.
   row on the shard at once. Measured on the identical fixture: **4 SQL
   calls**, **16 buffers** — a **99.74% reduction in calls** (387.5x fewer)
   and a **99.27% reduction in buffers** (136.6x fewer). The whole request's
-  totals fall from 1,559 calls / 2,223 buffers to 13 calls / 54 buffers.
+  totals fall from 1,557 calls / 2,218 buffers to 11 calls / 49 buffers.
 * **No new index, no schema change, no migration.** The per-schedule decision
   logic (`scheduler::resolve_effective_fire_at_pure`) is unchanged, pure,
   DB-free code, extracted verbatim from the existing
@@ -106,10 +106,10 @@ whole request:
 | `to_regclass($1) IS NOT NULL` | 500 | 5 |
 | `SELECT excluded_date FROM harvest_calendar_exclusions WHERE calendar_name = $1` | 50 | 50 |
 | **aux-lookup total** | **1,550** | **2,185** |
-| **whole-request total** | 1,559 | 2,223 |
-| **aux-lookup share** | **99.4%** | **98.3%** |
+| **whole-request total** | 1,557 | 2,218 |
+| **aux-lookup share** | **99.55%** | **98.51%** |
 
-The remaining ~0.6%/1.7% is the single `SELECT * FROM harvest_schedules`
+The remaining ~0.45%/1.49% is the single `SELECT * FROM harvest_schedules`
 list query and the best-effort recent-backfill batch load
 (`load_recent_backfills`, already batched via `schedule_id = ANY($1)` — not
 touched by this change). The aux lookups are not a fraction of this
@@ -188,19 +188,27 @@ of scope for this change; see "Known limitations" below).
 |:--|--:|--:|--:|
 | aux-lookup calls | 1,550 | 4 | **-99.74%** (387.5x fewer) |
 | aux-lookup buffers | 2,185 | 16 | **-99.27%** (136.6x fewer) |
-| whole-request calls | 1,559 | 13 | -99.17% |
-| whole-request buffers | 2,223 | 54 | -97.57% |
+| whole-request calls | 1,557 | 11 | -99.29% |
+| whole-request buffers | 2,218 | 49 | -97.79% |
 | statement shapes (aux) | 4 | 4 | same shapes, O(1) instead of O(n) calls each |
 
-Tool: `pg_stat_statements`, reset and snapshotted around one real
+Tool: `pg_stat_statements`, reset and snapshotted **once** around one real
 `GET /admin/schedules` request against the identical 500-schedule fixture in
 the identical test run (before/after captured as separate runs of the same
 harness, with only `autumn-harvest-plugin/src/api.rs` toggled between the
-pre-fix and post-fix version — see "Reproduce" below). Clears the impact
-floor several times over: this is an N+1 elimination (statement count per
-request drops from O(schedules) to O(1) per shard), which alone clears the
-floor, and the buffer reduction separately clears the ≥20% threshold by more
-than two orders of magnitude.
+pre-fix and post-fix version — see "Reproduce" below). The aux-lookup and
+whole-request views are both derived from that single snapshot in-process,
+not from two separate `pg_stat_statements` queries: `pg_stat_statements`
+tracks queries against itself like any other statement, so a first snapshot
+query would appear as a new row a second snapshot query could then pick up,
+inflating the total (caught in review — an earlier version of this harness
+queried it twice and over-counted the whole-request total by the first
+query's own footprint, a few calls/buffers out of the small "after" totals).
+Clears the impact floor several times over: this is an N+1 elimination
+(statement count per request drops from O(schedules) to O(1) per shard),
+which alone clears the floor, and the buffer reduction separately clears the
+≥20% threshold by more than two orders of magnitude (136.6x fewer aux-lookup
+buffers).
 
 Full artifacts: `docs/perf-artifacts/schedule-overdue-aux/`
 (`{before,after}-pg_stat_statements.txt` for the filtered aux-lookup shapes,

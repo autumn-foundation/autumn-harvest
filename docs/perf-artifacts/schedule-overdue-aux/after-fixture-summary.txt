@@ -5,5 +5,5 @@ returned_rows=500
 aux_statement_shapes=4
 total_calls=4
 total_buffers=16
-request_total_calls=13
-request_total_buffers=54
+request_total_calls=11
+request_total_buffers=49

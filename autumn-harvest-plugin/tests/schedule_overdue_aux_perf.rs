@@ -300,10 +300,39 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
     );
 }
 
-/// Every statement shape this investigation targets: the running-basis count
-/// on `harvest_workflow_executions`, the throttle existence-check
-/// (`to_regclass`) and count on `harvest_start_throttle`, and the
-/// calendar-exclusions lookup on `harvest_calendar_exclusions` -- each
+/// Every statement recorded for this database since the last reset, in ONE
+/// query -- deliberately not split into a filtered "aux" query followed by a
+/// separate unfiltered "everything" query. `pg_stat_statements` tracks
+/// queries *against itself* like any other statement, so a first snapshot
+/// query would become a new row a second snapshot query could then pick up,
+/// inflating whatever total is computed from the later one (Codex review, PR
+/// #1314). Querying exactly once per label and deriving both the aux-lookup
+/// subset and the whole-request total from that single result set in Rust
+/// (see [`is_aux_lookup_statement`]) avoids that self-pollution entirely.
+/// `pg_stat_statements` itself is excluded from the snapshot for the same
+/// reason -- a row for this very `SELECT` would otherwise appear in its own
+/// results.
+async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
+    diesel::sql_query(format!(
+        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                (shared_blks_hit + shared_blks_read) AS total_buffers \
+         FROM pg_stat_statements \
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}') \
+           AND query NOT ILIKE '%pg_stat_statements%' \
+         ORDER BY total_buffers DESC"
+    ))
+    .load(conn)
+    .await
+    .expect(
+        "pg_stat_statements query failed -- it must be preloaded via shared_preload_libraries \
+         for this capture to produce real evidence rather than fail outright",
+    )
+}
+
+/// Whether `row` is one of the statement shapes this investigation targets:
+/// the running-basis count on `harvest_workflow_executions`, the throttle
+/// existence-check (`to_regclass`) and count on `harvest_start_throttle`, and
+/// the calendar-exclusions lookup on `harvest_calendar_exclusions` -- each
 /// identified by a distinctive table/function + column substring so this
 /// can't accidentally match an unrelated statement shape (e.g. the
 /// schedule-list's own `SELECT * FROM harvest_schedules`).
@@ -314,42 +343,12 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 /// placeholder in the stored query text (constant-jumbling), so the table
 /// name itself is not present in that row's `query` column even though the
 /// row belongs to this investigation.
-async fn aux_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
-    diesel::sql_query(format!(
-        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
-                (shared_blks_hit + shared_blks_read) AS total_buffers \
-         FROM pg_stat_statements \
-         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}') \
-           AND ( \
-             (query ILIKE '%harvest_workflow_executions%' AND query ILIKE '%workflow_name%') \
-             OR query ILIKE '%harvest_start_throttle%' \
-             OR query ILIKE '%harvest_calendar_exclusions%' \
-             OR query ILIKE '%to_regclass%' \
-           ) \
-         ORDER BY total_buffers DESC LIMIT 20"
-    ))
-    .load(conn)
-    .await
-    .expect(
-        "pg_stat_statements query failed -- it must be preloaded via shared_preload_libraries \
-         for this capture to produce real evidence rather than fail outright",
-    )
-}
-
-/// Every statement the whole `GET /admin/schedules` request issued on this
-/// database, unfiltered -- gives the aux-lookup shapes' share of the total
-/// request cost (profiling step 2 of the playbook: "state the percentage").
-async fn all_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
-    diesel::sql_query(format!(
-        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
-                (shared_blks_hit + shared_blks_read) AS total_buffers \
-         FROM pg_stat_statements \
-         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}') \
-         ORDER BY total_buffers DESC"
-    ))
-    .load(conn)
-    .await
-    .expect("pg_stat_statements query failed")
+fn is_aux_lookup_statement(row: &StatRow) -> bool {
+    let q = row.query.to_ascii_lowercase();
+    (q.contains("harvest_workflow_executions") && q.contains("workflow_name"))
+        || q.contains("harvest_start_throttle")
+        || q.contains("harvest_calendar_exclusions")
+        || q.contains("to_regclass")
 }
 
 // ── Evidence capture (not a CI assertion) ───────────────────────────────────
@@ -400,7 +399,14 @@ async fn zz_capture_schedule_overdue_aux_perf_evidence() {
         "every seeded schedule must appear in the list"
     );
 
-    let stats_rows = aux_statements(&mut stats_conn, &db_name).await;
+    // ONE snapshot query for both views below -- see `snapshot_statements`'s
+    // doc comment for why a second query against `pg_stat_statements` here
+    // would pollute whatever total is computed from it.
+    let all_rows = snapshot_statements(&mut stats_conn, &db_name).await;
+    let stats_rows: Vec<&StatRow> = all_rows
+        .iter()
+        .filter(|r| is_aux_lookup_statement(r))
+        .collect();
     assert!(
         !stats_rows.is_empty(),
         "pg_stat_statements returned zero rows matching the aux-lookup shapes after one real \
@@ -432,11 +438,9 @@ async fn zz_capture_schedule_overdue_aux_perf_evidence() {
     .expect("write pg_stat_statements artifact");
     eprintln!("total_calls={total_calls} total_buffers={total_buffers}");
 
-    // Unfiltered ranking of the whole request's statement cost, so the PR
-    // write-up can state the aux-lookup shapes' share of the total (profiling
-    // step 2: "state the percentage. If under 5% of buffers *and* under 5% of
-    // calls, stop").
-    let all_rows = all_statements(&mut stats_conn, &db_name).await;
+    // The same snapshot's unfiltered total, so the PR write-up can state the
+    // aux-lookup shapes' share of the whole request (profiling step 2: "state
+    // the percentage. If under 5% of buffers *and* under 5% of calls, stop").
     let request_total_calls: i64 = all_rows.iter().map(|r| r.calls).sum();
     let request_total_buffers: i64 = all_rows.iter().map(|r| r.total_buffers).sum();
     let all_text = all_rows
