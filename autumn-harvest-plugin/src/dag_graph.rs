@@ -487,7 +487,7 @@ pub fn build_run_graph(
                 return DagRunNode {
                     node_name,
                     kind: DagNodeKind::Gate,
-                    status: gate_status(&events, task_index, task, tasks, exec_state),
+                    status: gate_status(&events, task_index, task, tasks, exec_state, &dispatched),
                     depends_on,
                     started_at: None,
                     finished_at: None,
@@ -497,7 +497,7 @@ pub fn build_run_graph(
                 };
             }
 
-            let base = node_outcome(&events, &node_name);
+            let base = node_outcome(&events, &node_name, &dispatched);
 
             // `classify` is the single source of truth for status, timing,
             // attempts, and error: all four describe the node's authoritative
@@ -582,6 +582,7 @@ fn gate_status(
     task: &DagTask,
     tasks: &[DagTask],
     exec_state: &str,
+    dispatched: &BTreeSet<&str>,
 ) -> DagNodeStatus {
     let Some(gate) = &task.signal else {
         // Defensive: only called for gate tasks.
@@ -602,7 +603,7 @@ fn gate_status(
     // gate by its recorded resolution ONLY once its upstreams' outcomes show the
     // walker would have reached it; an unreached (or trigger-rule-skipped) gate
     // is `pending`, never `succeeded`/`timed_out` from a stray event.
-    match task_reach(events, task, tasks, tasks.len()) {
+    match task_reach(events, task, tasks, tasks.len(), dispatched) {
         TaskReach::NotReached | TaskReach::SkippedByTrigger => return DagNodeStatus::Pending,
         TaskReach::Reached => {}
     }
@@ -701,10 +702,11 @@ fn task_reach(
     task: &DagTask,
     tasks: &[DagTask],
     depth: usize,
+    dispatched: &BTreeSet<&str>,
 ) -> TaskReach {
     let mut statuses: Vec<TaskStatus> = Vec::with_capacity(task.upstreams.len());
     for &up in &task.upstreams {
-        match resolved_upstream_status(events, up, tasks, depth) {
+        match resolved_upstream_status(events, up, tasks, depth, dispatched) {
             Some(status) => statuses.push(status),
             None => return TaskReach::NotReached,
         }
@@ -733,6 +735,7 @@ fn resolved_upstream_status(
     idx: usize,
     tasks: &[DagTask],
     depth: usize,
+    dispatched: &BTreeSet<&str>,
 ) -> Option<TaskStatus> {
     // Defensive: recursion deeper than the DAG size ⇒ a malformed cyclic
     // definition. Treat as not-yet-resolved rather than looping forever.
@@ -756,7 +759,7 @@ fn resolved_upstream_status(
         // for it may exist; an unreached gate (an upstream still in flight) is not
         // "done" → None. Only a gate the walker actually reached is classified from
         // its recorded signal/timer resolution.
-        return match task_reach(events, up, tasks, depth) {
+        return match task_reach(events, up, tasks, depth, dispatched) {
             TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
             TaskReach::NotReached => None,
             TaskReach::Reached => match gate_resolution(events, &gate.signal_name) {
@@ -771,7 +774,7 @@ fn resolved_upstream_status(
             },
         };
     }
-    match node_outcome(events, &up.activity_name) {
+    match node_outcome(events, &up.activity_name, dispatched) {
         NodeOutcome::Succeeded => Some(TaskStatus::Succeeded),
         NodeOutcome::Failed | NodeOutcome::TimedOut => Some(TaskStatus::Failed),
         // Scheduled-no-terminal: in flight (or the run died while it ran). The
@@ -786,7 +789,7 @@ fn resolved_upstream_status(
             // marker — infer it from this upstream's own upstream outcomes) or
             // genuinely not-yet-run. A trigger-rule skip is a "done" outcome
             // (Skipped); a not-yet-reached / still-runnable node is not resolved.
-            match task_reach(events, up, tasks, depth) {
+            match task_reach(events, up, tasks, depth, dispatched) {
                 TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
                 TaskReach::Reached | TaskReach::NotReached => None,
             }
@@ -1469,9 +1472,10 @@ mod tests {
             (ts(7), sched("d", id)),
         ];
         let events_only: Vec<WorkflowEvent> = events.iter().map(|(_, e)| e.clone()).collect();
+        let dispatched = crate::dag_retry::dispatched_activity_names(&events_only);
         let nodes = build_run_graph(&def, &events, "FAILED");
         for n in &nodes {
-            let outcome = node_outcome(&events_only, &n.node_name);
+            let outcome = node_outcome(&events_only, &n.node_name, &dispatched);
             let consistent = match outcome {
                 NodeOutcome::Succeeded => n.status == DagNodeStatus::Succeeded,
                 NodeOutcome::Failed => n.status == DagNodeStatus::Failed,
@@ -1671,7 +1675,11 @@ mod tests {
         // AC5: this exactly matches the #366 retry resolver for the same
         // history — both collapse to the latest-scheduled instance's outcome.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
-        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::Succeeded);
+        let dispatched = crate::dag_retry::dispatched_activity_names(&plain);
+        assert_eq!(
+            node_outcome(&plain, "a", &dispatched),
+            NodeOutcome::Succeeded
+        );
     }
 
     #[test]
@@ -1714,7 +1722,11 @@ mod tests {
         // AC5: node_outcome returns NotAttempted for the same zero-event history,
         // so the graph and the #366 retry path agree.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
-        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::NotAttempted);
+        let dispatched = crate::dag_retry::dispatched_activity_names(&plain);
+        assert_eq!(
+            node_outcome(&plain, "a", &dispatched),
+            NodeOutcome::NotAttempted
+        );
     }
 
     // ── Issue #746 — signal/timer gate nodes (Phase 1 RED) ───────────────────
