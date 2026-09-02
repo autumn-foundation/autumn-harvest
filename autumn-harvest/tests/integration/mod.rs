@@ -84,6 +84,7 @@ mod debounce_tests;
 mod debugger_tests;
 mod delayed_start_tests;
 mod det_check_tests;
+mod determinism_static_analysis_docs;
 mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;
@@ -95,6 +96,7 @@ mod force_fail_tests;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
+mod history_ceiling_claim_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;

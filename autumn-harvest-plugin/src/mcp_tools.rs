@@ -628,7 +628,8 @@ fn register_harvest_mcp_schemas(registry: &mut autumn_web::openapi::SchemaRegist
 
 /// Permissive schema used when a workflow (or update) publishes no
 /// `input_schema`. Deliberately carries **no** `"type"` constraint: per
-/// CLAUDE.md's "Multi-param dispatch packs into JSON array" convention, an
+/// `docs/architecture.md`'s "Multi-param dispatch packs into JSON array"
+/// convention, an
 /// unpublished workflow's actual expected input can be a JSON object
 /// (single struct param), an array (multi-param, positional), or a bare
 /// scalar (single non-object param) — asserting `"type": "object"` here

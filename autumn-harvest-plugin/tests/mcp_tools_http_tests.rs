@@ -349,7 +349,8 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
     // NOTE: start_tool no longer duplicates issue #373 schema validation
     // itself (removed as a redundant, closure-captured-schema copy of the
     // check start_workflow already performs against the live registry --
-    // see the code-review hardening notes in CLAUDE.md); that validation is
+    // see the code-review hardening notes in docs/shipped-work.md); that
+    // validation is
     // gated behind a successful `api_state.runtime()` lookup inside
     // start_workflow, which this no-DB harness can never reach, so a
     // schema-violation rejection cannot be exercised here. That guarantee is

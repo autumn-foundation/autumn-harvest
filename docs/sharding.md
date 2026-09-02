@@ -4,7 +4,7 @@
 
 Harvest can spread workflow state across N independent Postgres databases (shards). A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions.
 
-For the full sharding architecture, see `CLAUDE.md` §Sharding and `autumn-harvest/src/shard.rs`.
+For the full sharding architecture, see [`docs/architecture.md`](architecture.md#sharding) §Sharding and `autumn-harvest/src/shard.rs`.
 
 **When should you shard?** [`performance.md`](performance.md) publishes measured
 task-claim latency against pending-backlog depth. Claim cost grows superlinearly
@@ -466,7 +466,7 @@ Renders a table by default; pass `--json` for piping.
 
 ### Adding a shard to a deployment that uses per-key concurrency
 
-Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
+Follow the standard add-a-shard procedure in [`docs/architecture.md`](architecture.md#sharding). The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
 
 ---
 

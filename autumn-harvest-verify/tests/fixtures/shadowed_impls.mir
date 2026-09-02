@@ -1,0 +1,290 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at shadowed_impls.rs:21:1: 21:21>::execute_activity_raw(_1: &WorkflowContext, _2: String, _3: u64) -> Result<u64, String> {
+    debug self => _1;
+    debug name => _2;
+    debug arg => _3;
+    let mut _0: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _0 = Result::<u64, String>::Ok(copy _3);
+        drop(_2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn a::<impl at shadowed_impls.rs:30:5: 30:16>::run(_1: &a::Worker) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 1_u64;
+        return;
+    }
+}
+
+fn b::<impl at shadowed_impls.rs:41:5: 41:16>::run(_1: &b::Worker) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+    let mut _2: &std::time::Duration;
+    let _3: std::time::Duration;
+    let mut _4: std::result::Result<std::time::Duration, std::time::SystemTimeError>;
+    let mut _5: &std::time::SystemTime;
+    let _6: std::time::SystemTime;
+
+    bb0: {
+        _6 = SystemTime::now() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _5 = &_6;
+        _4 = SystemTime::duration_since(move _5, const std::time::UNIX_EPOCH) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _3 = Result::<Duration, SystemTimeError>::unwrap_or_default(move _4) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _2 = &_3;
+        _0 = Duration::as_secs(move _2) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_calls_ambient_worker() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_calls_ambient_worker(_1: &WorkflowContext) -> {async fn body of wf_calls_ambient_worker()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_calls_ambient_worker()};
+
+    bb0: {
+        _0 = {coroutine@shadowed_impls.rs:56:84: 59:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_calls_ambient_worker::{closure#0}(_1: Pin<&mut {async fn body of wf_calls_ambient_worker()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _13;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: std::string::String;
+    let mut _6: &str;
+    let mut _7: u64;
+    let mut _8: &b::Worker;
+    let mut _9: bool;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_calls_ambient_worker()};
+    let mut _13: std::future::ResumeTy;
+    let mut _14: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        let _4: b::Worker;
+        scope 2 {
+            debug w => _4;
+        }
+    }
+
+    bb0: {
+        _14 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _13 = std::future::ResumeTy(move _14);
+        _12 = copy (_1.0: &mut {async fn body of wf_calls_ambient_worker()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb10, 1: bb8, 2: bb7, otherwise: bb9];
+    }
+
+    bb1: {
+        _9 = const true;
+        _8 = &_4;
+        _7 = b::Worker::run(move _8) -> [return: bb2, unwind: bb4];
+    }
+
+    bb2: {
+        _9 = const false;
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _5, move _7) -> [return: bb3, unwind: bb4];
+    }
+
+    bb3: {
+        _9 = const false;
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb4 (cleanup): {
+        switchInt(copy _9) -> [0: bb5, otherwise: bb6];
+    }
+
+    bb5 (cleanup): {
+        _9 = const false;
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6 (cleanup): {
+        drop(_5) -> [return: bb5, unwind terminate(cleanup)];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        unreachable;
+    }
+
+    bb10: {
+        _9 = const false;
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = b::Worker;
+        _6 = const "charge";
+        _5 = <str as ToString>::to_string(move _6) -> [return: bb1, unwind: bb5];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_calls_clean_worker() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_calls_clean_worker(_1: &WorkflowContext) -> {async fn body of wf_calls_clean_worker()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_calls_clean_worker()};
+
+    bb0: {
+        _0 = {coroutine@shadowed_impls.rs:66:82: 69:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_calls_clean_worker::{closure#0}(_1: Pin<&mut {async fn body of wf_calls_clean_worker()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _13;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: std::string::String;
+    let mut _6: &str;
+    let mut _7: u64;
+    let mut _8: &a::Worker;
+    let mut _9: bool;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_calls_clean_worker()};
+    let mut _13: std::future::ResumeTy;
+    let mut _14: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        let _4: a::Worker;
+        scope 2 {
+            debug w => _4;
+        }
+    }
+
+    bb0: {
+        _14 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _13 = std::future::ResumeTy(move _14);
+        _12 = copy (_1.0: &mut {async fn body of wf_calls_clean_worker()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb10, 1: bb8, 2: bb7, otherwise: bb9];
+    }
+
+    bb1: {
+        _9 = const true;
+        _8 = &_4;
+        _7 = a::Worker::run(move _8) -> [return: bb2, unwind: bb4];
+    }
+
+    bb2: {
+        _9 = const false;
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _5, move _7) -> [return: bb3, unwind: bb4];
+    }
+
+    bb3: {
+        _9 = const false;
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb4 (cleanup): {
+        switchInt(copy _9) -> [0: bb5, otherwise: bb6];
+    }
+
+    bb5 (cleanup): {
+        _9 = const false;
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6 (cleanup): {
+        drop(_5) -> [return: bb5, unwind terminate(cleanup)];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        unreachable;
+    }
+
+    bb10: {
+        _9 = const false;
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = a::Worker;
+        _6 = const "charge";
+        _5 = <str as ToString>::to_string(move _6) -> [return: bb1, unwind: bb5];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
