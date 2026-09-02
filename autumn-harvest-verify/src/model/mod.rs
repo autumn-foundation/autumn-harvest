@@ -1,19 +1,35 @@
-//! Table-driven model of sources, sinks, sanctioned primitives, forbidden effects,
-//! sanitizers, reductions and trusted crates. The builtin model is
+//! The determinism model, in data rather than in `match` arms.
+//!
+//! Table-driven model of sources, sinks, sanctioned primitives, forbidden
+//! effects, sanitizers, reductions and trusted crates. The builtin model is
 //! `harvest-verify.model.toml`, embedded with `include_str!` and overlayable via
-//! `--model <file>` (union of rows; later rows for the same `path` override).
+//! `--model <file>` (union of rows; later rows for the same key override).
+//! [`matcher`] implements how a row is matched against a call site.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::TaintKind;
 
+pub mod callee;
+pub mod matcher;
+
+pub use callee::CalleePath;
+pub use matcher::CallClass;
+
 /// The builtin model text.
 pub const BUILTIN_MODEL_TOML: &str = include_str!("../../harvest-verify.model.toml");
 
-/// A path pattern: matched as a `::`-segment suffix of the callee path with generic
-/// arguments stripped (so `SystemTime::now` matches `std::time::SystemTime::now` and
-/// `<HashMap<K, V> as IntoIterator>::into_iter` is matched via `receiver = "HashMap"`,
-/// `path = "into_iter"`).
+/// A taint origin.
+///
+/// The `path` is matched as a `::`-segment suffix of the callee path with
+/// generic arguments stripped, so `SystemTime::now` matches
+/// `std::time::SystemTime::now`, and
+/// `<HashMap<K, V> as IntoIterator>::into_iter` is matched via
+/// `receiver = "HashMap"`, `path = "into_iter"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRule {
     pub path: String,
@@ -152,10 +168,26 @@ pub struct Model {
 impl Model {
     /// The builtin model.
     ///
+    /// The embedded TOML is parsed once per process (`OnceLock`) and cloned, so
+    /// calling this in a loop is cheap.
+    ///
     /// # Errors
     /// If the embedded TOML fails to parse (a build-time defect, surfaced as an error, not a panic).
     pub fn builtin() -> crate::Result<Self> {
-        Self::from_toml(BUILTIN_MODEL_TOML)
+        Self::builtin_ref().cloned()
+    }
+
+    /// The builtin model, parsed once and borrowed.
+    ///
+    /// # Errors
+    /// If the embedded TOML fails to parse.
+    pub fn builtin_ref() -> crate::Result<&'static Self> {
+        static BUILTIN: OnceLock<std::result::Result<Model, String>> = OnceLock::new();
+        match BUILTIN.get_or_init(|| Self::from_toml(BUILTIN_MODEL_TOML).map_err(|e| e.to_string()))
+        {
+            Ok(model) => Ok(model),
+            Err(message) => Err(crate::Error::Model(message.clone())),
+        }
     }
 
     /// Parse a model from TOML text.
@@ -166,10 +198,198 @@ impl Model {
         toml::from_str(text).map_err(|e| crate::Error::Model(e.to_string()))
     }
 
-    /// Overlay another model: union of rows; a later row with the same `path` (+ receiver) replaces the earlier one.
+    /// Read a model from a TOML file.
+    ///
+    /// # Errors
+    /// On i/o failure or malformed TOML (the path is named in either case).
+    pub fn load(path: &Path) -> crate::Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|e| crate::Error::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Self::from_toml(&text).map_err(|e| crate::Error::Model(format!("{}: {e}", path.display())))
+    }
+
+    /// The builtin model with `paths` overlaid on it, left to right (D8).
+    ///
+    /// # Errors
+    /// If the builtin or any overlay fails to load or parse.
+    pub fn load_with_overlays(paths: &[std::path::PathBuf]) -> crate::Result<Self> {
+        let mut model = Self::builtin()?;
+        for path in paths {
+            model = model.merged_with(Self::load(path)?);
+        }
+        Ok(model)
+    }
+
+    /// Overlay another model on this one (D8).
+    ///
+    /// The result is the **union** of the rows: an overlay row whose
+    /// `(path, receiver, dest_type)` key is already present *replaces* the
+    /// earlier row in place (keeping its position, so the model stays readable
+    /// as "builtin, then additions"), and any other overlay row is appended.
+    /// `[[trusted]]` and `[[ambient_type]]` rows are keyed on `name`.
+    /// The `version` string is taken from the overlay when it sets a non-empty
+    /// one, so a verdict can always be traced to the rules that produced it.
     #[must_use]
     pub fn merged_with(self, overlay: Self) -> Self {
-        let _ = overlay;
-        todo!("RED phase: implemented in GREEN")
+        Self {
+            version: if overlay.version.is_empty() {
+                self.version
+            } else {
+                overlay.version
+            },
+            source: merge_rows(self.source, overlay.source, |r| {
+                (r.path.clone(), r.receiver.clone(), r.dest_type.clone())
+            }),
+            sink: merge_rows(self.sink, overlay.sink, |r| {
+                (r.path.clone(), Some(r.receiver.clone()), None)
+            }),
+            sanctioned: merge_rows(self.sanctioned, overlay.sanctioned, ctx_key),
+            non_sink: merge_rows(self.non_sink, overlay.non_sink, ctx_key),
+            handler_registration: merge_rows(
+                self.handler_registration,
+                overlay.handler_registration,
+                ctx_key,
+            ),
+            forbidden: merge_rows(self.forbidden, overlay.forbidden, |r| {
+                (r.path.clone(), r.receiver.clone(), r.dest_type.clone())
+            }),
+            sanitizer: merge_rows(self.sanitizer, overlay.sanitizer, sanitizer_key),
+            reduction: merge_rows(self.reduction, overlay.reduction, sanitizer_key),
+            trusted: merge_rows(self.trusted, overlay.trusted, |r| {
+                (r.name.clone(), None, None)
+            }),
+            ambient_type: merge_rows(self.ambient_type, overlay.ambient_type, |r| {
+                (r.name.clone(), None, None)
+            }),
+        }
+    }
+}
+
+/// The key a row is deduplicated on: `(path, receiver, dest_type)`.
+type RowKey = (String, Option<String>, Option<String>);
+
+fn ctx_key(rule: &CtxMethodRule) -> RowKey {
+    (rule.path.clone(), Some(rule.receiver.clone()), None)
+}
+
+fn sanitizer_key(rule: &SanitizerRule) -> RowKey {
+    (
+        rule.path.clone(),
+        rule.receiver.clone(),
+        rule.dest_type.clone(),
+    )
+}
+
+/// Union of two row lists: a later row with an existing key replaces it in place.
+fn merge_rows<T>(base: Vec<T>, overlay: Vec<T>, key: impl Fn(&T) -> RowKey) -> Vec<T> {
+    let mut rows: Vec<T> = Vec::with_capacity(base.len().saturating_add(overlay.len()));
+    let mut index: HashMap<RowKey, usize> = HashMap::new();
+    for row in base.into_iter().chain(overlay) {
+        let k = key(&row);
+        if let Some(&at) = index.get(&k) {
+            if let Some(slot) = rows.get_mut(at) {
+                *slot = row;
+            }
+        } else {
+            index.insert(k, rows.len());
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overlay(text: &str) -> Model {
+        Model::from_toml(text).expect("overlay fixture must parse")
+    }
+
+    #[test]
+    fn the_builtin_model_is_parsed_once_and_is_non_empty() {
+        let a = Model::builtin_ref().expect("builtin");
+        let b = Model::builtin_ref().expect("builtin");
+        assert!(std::ptr::eq(a, b), "the builtin model must be cached");
+        assert!(!a.version.is_empty());
+        assert!(!a.source.is_empty() && !a.sink.is_empty());
+    }
+
+    #[test]
+    fn merging_is_a_union_with_in_place_replacement() {
+        let base = overlay(
+            r#"
+version = "base"
+[[source]]
+path = "SystemTime::now"
+kind = "value"
+reason = "base"
+[[source]]
+path = "iter"
+receiver = "HashMap"
+kind = "order"
+reason = "base order"
+"#,
+        );
+        let merged = base.merged_with(overlay(
+            r#"
+version = "over"
+[[source]]
+path = "SystemTime::now"
+kind = "value"
+reason = "overridden"
+[[source]]
+path = "new_v4"
+receiver = "Uuid"
+kind = "value"
+reason = "added"
+"#,
+        ));
+        assert_eq!(merged.version, "over");
+        assert_eq!(merged.source.len(), 3, "{:?}", merged.source);
+        assert_eq!(
+            merged.source.first().map(|r| r.reason.as_str()),
+            Some("overridden")
+        );
+        assert_eq!(
+            merged.source.get(1).map(|r| r.path.as_str()),
+            Some("iter"),
+            "an untouched row keeps its position"
+        );
+        assert_eq!(
+            merged.source.get(2).map(|r| r.path.as_str()),
+            Some("new_v4")
+        );
+    }
+
+    #[test]
+    fn the_receiver_and_dest_type_are_part_of_the_key() {
+        let base = overlay(
+            r#"
+[[sanitizer]]
+path = "collect"
+dest_type = "std::collections::BTreeMap"
+clears = "order"
+reason = "base"
+"#,
+        );
+        let merged = base.merged_with(overlay(
+            r#"
+[[sanitizer]]
+path = "collect"
+dest_type = "std::collections::BTreeSet"
+clears = "order"
+reason = "different destination, different row"
+"#,
+        ));
+        assert_eq!(merged.sanitizer.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_overlay_version_keeps_the_base_version() {
+        let base = overlay("version = \"base\"\n");
+        assert_eq!(base.merged_with(Model::default()).version, "base");
     }
 }

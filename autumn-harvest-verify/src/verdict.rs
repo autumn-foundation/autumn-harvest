@@ -100,7 +100,7 @@ impl BoundaryKind {
 
     /// Kebab-case name as printed in reports (`dyn-dispatch`, `ffi`, ...).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::DynDispatch => "dyn-dispatch",
             Self::IndirectCall => "indirect-call",
@@ -139,7 +139,7 @@ pub enum Verdict {
 impl Verdict {
     /// Kebab-case verdict name as printed in reports.
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::ProvenDeterministic => "proven-deterministic",
             Self::NondeterminismFound { .. } => "nondeterminism-found",
