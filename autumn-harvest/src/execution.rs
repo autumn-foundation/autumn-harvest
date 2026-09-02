@@ -2574,6 +2574,29 @@ pub async fn cancel_workflow_execution_collect(
                         Vec::new(),
                     ));
                 }
+                // A rebalanced seal is NOT a terminal prior (issue #964). The
+                // run is alive on another shard, so answering `Config("already
+                // terminal")` here would be a lie with teeth: the cancel
+                // outbox maps that error to `ExternalCancelDelivered` and
+                // records a delivered cancellation in the sender's history for
+                // a workflow that goes on running, never retrying.
+                //
+                // Every caller is supposed to have resolved the residence
+                // before reaching this shard, so landing here means the
+                // resolution failed or was skipped. A retryable
+                // `ShardUnavailable` leaves the delivery pending, which is the
+                // only safe answer for a cancel that has not happened.
+                state @ ("MIGRATED" | "MIGRATING") => {
+                    return Err(HarvestError::ShardUnavailable {
+                        shard_id: execution.migrated_to_shard.unwrap_or(execution.shard_id),
+                        reason: format!(
+                            "workflow execution {exec_id} was rebalanced onto another \
+                             shard (state {state}); this row is a forwarding seal, not \
+                             the live run, so the cancellation is left pending rather \
+                             than reported as delivered"
+                        ),
+                    });
+                }
                 state => {
                     return Err(HarvestError::Config(format!(
                         "workflow execution {exec_id} is already terminal ({state})"

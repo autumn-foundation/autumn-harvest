@@ -20379,6 +20379,7 @@ pub(crate) async fn signal_with_start_workflow(
     // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
     // where start_input is never written (mirrors the payload-cap deferral from issue #252).
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
+    let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -20406,6 +20407,21 @@ pub(crate) async fn signal_with_start_workflow(
             }
         };
         if let Some((existing_uuid, existing_state)) = hit {
+            // A rebalanced SEAL is not the run (issue #964). It matches this
+            // query — `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED —
+            // and shards iterate in id order, so the seal on the origin shard is
+            // found before the live copy on the target. Selecting it sends the
+            // whole operation to a row that will never run again: the resolver
+            // sees a non-RUNNING prior, upgrades to `TerminateIfRunning`, and
+            // the start path refuses a rebalanced prior, so the request 503s
+            // forever while the live run sits available on the next shard.
+            //
+            // Keep scanning instead, remembering the seal only so a live copy
+            // this node cannot see is refused rather than silently duplicated.
+            if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                seal_only = Some(candidate_shard);
+                continue;
+            }
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
@@ -20427,6 +20443,22 @@ pub(crate) async fn signal_with_start_workflow(
             found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
             break;
         }
+    }
+
+    // A seal but no live copy anywhere this node can reach: the run is alive on
+    // a shard with no pool here. Falling through would start a FRESH run for a
+    // business key that is already held, which is the duplicate the seal exists
+    // to prevent — so refuse retryably instead.
+    if found_shard.is_none()
+        && let Some(seal_shard) = seal_only
+    {
+        return AutumnError::service_unavailable_msg(format!(
+            "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+             off shard {}; its live copy is not reachable from this node, so the \
+             signal-with-start is refused rather than starting a duplicate run",
+            seal_shard.as_i32()
+        ))
+        .into_response();
     }
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
@@ -21037,6 +21069,7 @@ async fn update_with_start_workflow(
         (hit_exec_id.shard(), conn, hit_exec_id)
     } else {
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
@@ -21066,6 +21099,13 @@ async fn update_with_start_workflow(
                 }
             };
             if let Some((existing_uuid, existing_state)) = hit {
+                // A rebalanced seal is not the run (issue #964) — see the
+                // matching scan in the signal-with-start handler. Skip it and
+                // keep looking for the live copy.
+                if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                    seal_only = Some(candidate_shard);
+                    continue;
+                }
                 // Reuse the execution UUID only when attaching to a live RUNNING or
                 // SUSPENDED run under a non-rejecting policy. All other paths
                 // (terminal prior, PAUSED, TerminateIfRunning) go through
@@ -21089,6 +21129,16 @@ async fn update_with_start_workflow(
 
         if let Some(tuple) = found_shard {
             tuple
+        } else if let Some(seal_shard) = seal_only {
+            // Held by a run rebalanced onto a shard this node cannot reach.
+            // Starting fresh would duplicate the business key.
+            return AutumnError::service_unavailable_msg(format!(
+                "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+                 off shard {}; its live copy is not reachable from this node, so the \
+                 update-with-start is refused rather than starting a duplicate run",
+                seal_shard.as_i32()
+            ))
+            .into_response();
         } else {
             let shard = runtime
                 .router

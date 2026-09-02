@@ -162,8 +162,13 @@ migrate: a child's terminal appends to its parent's history in a shard-local
 transaction, so moving a child would break that edge, and `PAUSED` is a state the
 copy and cutover would have to carry through activation for a case an operator
 resolves with one resume. In-flight activity work, held or queued durable
-mutexes, and executions carrying dead-letter rows are all out of scope by design
-— each with a named blocker, so a dry run says which. Migration is
+mutexes, executions carrying dead-letter rows, and **schedule-attributed runs**
+are all out of scope by design — each with a named blocker, so a dry run says
+which. The schedule case is the least obvious: a schedule row does not move with
+its runs, and its overlap enforcement is shard-local, so a migrated run stops
+being counted against `max_active_runs` and stops being cancelled by
+`CancelOther`/`TerminateOther`. Making that safe is a change to the scheduler,
+not to this feature. Migration is
 operator-initiated; an auto-balancer can compose on top.
 
 Migration `20260902131705_harvest_shard_rebalancing`. See `docs/sharding.md`

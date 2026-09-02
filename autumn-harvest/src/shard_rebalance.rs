@@ -78,6 +78,11 @@ pub struct QuiescenceObservation {
     /// parent's history in a shard-local transaction, so a child may not move
     /// away from its parent.
     pub parent_id: Option<crate::types::ExecutionId>,
+    /// Whether the execution was started by a schedule
+    /// (`harvest_workflow_executions.schedule_id IS NOT NULL`). A schedule's
+    /// overlap enforcement is shard-local, so its runs may not move away from
+    /// it — see [`QuiescenceBlocker::ScheduleAttributed`].
+    pub schedule_attributed: bool,
     /// Workflow task rows a worker currently holds
     /// (`state = 'RUNNING' AND worker_id IS NOT NULL`).
     pub claimed_workflow_tasks: i64,
@@ -165,6 +170,23 @@ pub enum QuiescenceBlocker {
     HasDeadLetterRow,
     /// The run is parked by the replay non-determinism block.
     NonDeterminismBlocked,
+    /// The execution was started by a **schedule**, whose overlap policy is
+    /// enforced shard-locally.
+    ///
+    /// A schedule row does not move with its runs. Its tick counts
+    /// `RUNNING`/`PAUSED` executions on **its own** shard to honour
+    /// `max_active_runs`, and its `CancelOther`/`TerminateOther` overlap
+    /// policies cancel priors with the same shard-local query. After a
+    /// migration the local row reads `MIGRATED`, so the scheduler stops
+    /// counting the still-running copy and stops cancelling it: the schedule
+    /// silently exceeds its own cap, or starts a run without terminating the
+    /// prior it was told to replace.
+    ///
+    /// Out of scope by design, like in-flight activity work and held mutexes.
+    /// Making it safe means teaching schedule overlap enforcement to see
+    /// forwarded residences, which is a change to the scheduler rather than to
+    /// this feature.
+    ScheduleAttributed,
 }
 
 impl QuiescenceBlocker {
@@ -182,6 +204,9 @@ impl QuiescenceBlocker {
             Self::UnconsumedSignal => "a staged signal has not been folded into history",
             Self::InflightCompletionDelivery => "a completion-callback delivery is in flight",
             Self::ActiveSession => "a worker session is open",
+            Self::ScheduleAttributed => {
+                "the execution belongs to a schedule, whose overlap enforcement is shard-local"
+            }
             Self::LiveExternalTask => "an external task is outstanding",
             Self::LiveChild => "a non-terminal child workflow lives on this shard",
             Self::CrossShardChildRow => "an in-flight cross-shard child is parented here",
@@ -236,6 +261,9 @@ pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     }
     if obs.parent_id.is_some() {
         blockers.push(QuiescenceBlocker::NotARoot);
+    }
+    if obs.schedule_attributed {
+        blockers.push(QuiescenceBlocker::ScheduleAttributed);
     }
     if obs.claimed_workflow_tasks > 0 {
         blockers.push(QuiescenceBlocker::ClaimedWorkflowTask);
@@ -612,6 +640,7 @@ mod db {
     const QUIESCENCE_SQL: &str = "\
         e.state = 'RUNNING' \
         AND e.parent_id IS NULL \
+        AND e.schedule_id IS NULL \
         AND e.nd_blocked_at IS NULL \
         AND NOT EXISTS (SELECT 1 FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
             AND t.task_type = 'workflow' AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL) \
@@ -679,6 +708,8 @@ mod db {
         #[diesel(sql_type = Nullable<SqlUuid>)]
         parent_id: Option<Uuid>,
         #[diesel(sql_type = Bool)]
+        schedule_attributed: bool,
+        #[diesel(sql_type = Bool)]
         nd_blocked: bool,
         #[diesel(sql_type = BigInt)]
         claimed_workflow_tasks: i64,
@@ -713,6 +744,7 @@ mod db {
     const OBSERVE_SQL: &str = "\
         SELECT e.state, \
                e.parent_id, \
+               (e.schedule_id IS NOT NULL) AS schedule_attributed, \
                (e.nd_blocked_at IS NOT NULL) AS nd_blocked, \
                (SELECT count(*) FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
                   AND t.task_type = 'workflow' AND t.state = 'RUNNING' \
@@ -776,6 +808,7 @@ mod db {
         Ok(QuiescenceObservation {
             state: row.state,
             parent_id: row.parent_id.map(ExecutionId::from_uuid),
+            schedule_attributed: row.schedule_attributed,
             claimed_workflow_tasks: row.claimed_workflow_tasks,
             due_pending_tasks: row.due_pending_tasks,
             parked_workflow_tasks: row.parked_workflow_tasks,
@@ -1218,6 +1251,17 @@ mod db {
         };
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
+            // On a REVERSE migration (A -> B -> A) the target is a shard this
+            // run has already lived on, so it holds A's `MIGRATED` seal — the
+            // forwarding pointer every id that routes to A resolves through.
+            // Staging replaces that row, so the pointer is carried onto the
+            // staged copy and kept there until activation clears it.
+            //
+            // Without this, ids routing to A would stop at an inert `MIGRATING`
+            // copy for the whole staging window instead of reaching live B, and
+            // an abort would delete even that, leaving the execution with no row
+            // on its origin shard at all: an id that resolves nowhere.
+            let prior_seal = existing_seal(&mut *conn, exec_id).await?;
             discard_staged_copy(&mut *conn, exec_id).await?;
 
             diesel::sql_query(
@@ -1227,11 +1271,13 @@ mod db {
                              $1::jsonb || jsonb_build_object( \
                                  'shard_id', $2::int, \
                                  'state', 'MIGRATING', \
-                                 'migrated_to_shard', NULL, \
-                                 'migrated_at', NULL))",
+                                 'migrated_to_shard', $3::int, \
+                                 'migrated_at', $4::timestamptz))",
             )
             .bind::<Jsonb, _>(&execution)
             .bind::<Integer, _>(target_shard.as_i32())
+            .bind::<Nullable<Integer>, _>(prior_seal.map(|(shard, _)| shard))
+            .bind::<Nullable<Timestamptz>, _>(prior_seal.map(|(_, at)| at))
             .execute(&mut *conn)
             .await
             .map_err(database_error)?;
@@ -1317,6 +1363,61 @@ mod db {
     /// Refuses loudly if the target holds a row for this id in any other state:
     /// that is a live execution the copy would clobber, and the only safe
     /// answer is to stop.
+    /// Undo a staged copy, **restoring** any forwarding seal the target shard
+    /// held before staging replaced it.
+    ///
+    /// [`discard_staged_copy`] deletes the row outright, which is right when the
+    /// target never hosted this run. On a reverse migration (A → B → A) it is
+    /// not: the row staging replaced was A's own seal, and deleting it leaves
+    /// every id that routes to A resolving nowhere. A staged row that carries a
+    /// forwarding pointer is therefore returned to `MIGRATED` in place rather
+    /// than removed — its copied history is discarded either way, since the live
+    /// copy on the other shard is a superset of it.
+    async fn discard_staged_copy_restoring_seal(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<()> {
+        for sql in STAGED_CHILD_DELETES.iter().copied() {
+            diesel::sql_query(sql)
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+        }
+        // A carried pointer is the tell: the staged row stands where a seal
+        // stood, so restore the seal instead of removing the row.
+        let restored = diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+                SET state = 'MIGRATED', completed_at = COALESCE(completed_at, NOW()) \
+              WHERE id = $1 AND state = 'MIGRATING' AND migrated_to_shard IS NOT NULL",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .execute(&mut *conn)
+        .await
+        .map_err(database_error)?;
+        if restored == 0 {
+            diesel::sql_query(
+                "DELETE FROM harvest_workflow_executions WHERE id = $1 \
+                   AND state IN ('MIGRATING', 'MIGRATED')",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+        }
+        Ok(())
+    }
+
+    /// Everything a staged copy writes apart from the execution row itself.
+    const STAGED_CHILD_DELETES: &[&str] = &[
+        "DELETE FROM harvest_events WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_timers WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
+    ];
+
     async fn discard_staged_copy(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -1347,16 +1448,12 @@ mod db {
             }
         }
 
-        for sql in [
-            "DELETE FROM harvest_events WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_timers WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
-            "DELETE FROM harvest_workflow_executions WHERE id = $1 \
-               AND state IN ('MIGRATING', 'MIGRATED')",
-        ] {
+        for sql in STAGED_CHILD_DELETES
+            .iter()
+            .copied()
+            .chain(["DELETE FROM harvest_workflow_executions WHERE id = $1 \
+               AND state IN ('MIGRATING', 'MIGRATED')"])
+        {
             diesel::sql_query(sql)
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(conn)
@@ -1364,6 +1461,43 @@ mod db {
                 .map_err(database_error)?;
         }
         Ok(())
+    }
+
+    /// The forwarding pointer a shard is currently holding for `exec_id`, if it
+    /// holds a sealed row for it at all.
+    ///
+    /// Read **before** a staging discard on a reverse migration (A → B → A), so
+    /// the seal can be carried onto the staged copy and restored if the
+    /// migration aborts. Without it, staging onto A deletes A's `MIGRATED` row
+    /// and replaces it with a `MIGRATING` row whose pointer is NULL: every id
+    /// that routes to A stops at an inert copy instead of reaching live B, and
+    /// an abort then deletes even that, leaving the execution with no row on its
+    /// origin shard and no pointer anywhere — an id that resolves nowhere, the
+    /// one outcome this design must never produce.
+    async fn existing_seal(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Option<(i32, DateTime<Utc>)>> {
+        let row: Option<SealRow> = diesel::sql_query(
+            "SELECT migrated_to_shard AS forward, migrated_at FROM harvest_workflow_executions \
+              WHERE id = $1 AND state = 'MIGRATED' AND migrated_to_shard IS NOT NULL",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result(conn)
+        .await
+        .optional_row()?;
+        Ok(row.and_then(|r| match (r.forward, r.migrated_at) {
+            (Some(shard), Some(at)) => Some((shard, at)),
+            _ => None,
+        }))
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct SealRow {
+        #[diesel(sql_type = Nullable<Integer>)]
+        forward: Option<i32>,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        migrated_at: Option<DateTime<Utc>>,
     }
 
     // ── Phase 2: replay verification ─────────────────────────────────────────
@@ -1687,9 +1821,20 @@ mod db {
                 // verbatim (the copy is column-list-free), so appending the
                 // source shard here accumulates the full history across any
                 // number of hops without a backwards walk.
+                //
+                // `migrated_to_shard`/`migrated_at` are CLEARED here. They are
+                // normally already NULL, but on a reverse migration the staged
+                // copy deliberately carried the target shard's own old seal
+                // forward so ids kept resolving during staging. Leaving it set
+                // on a now-live row would make the run forward to the shard it
+                // just came from — a cycle, and `read_forward` matches on the
+                // pointer rather than the state, so the live row's state would
+                // not save it.
                 diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
                         SET state = 'RUNNING', \
+                            migrated_to_shard = NULL, \
+                            migrated_at = NULL, \
                             migrated_from_shards = \
                                 COALESCE(migrated_from_shards, '[]'::jsonb) \
                                 || to_jsonb($2::int) \
@@ -1813,8 +1958,12 @@ mod db {
             )));
         }
 
+        // The seal-restoring variant, because a reverse migration's target is a
+        // shard this run has lived on before: the row staging replaced there was
+        // that shard's own forwarding seal, and deleting it outright would leave
+        // every id routing to it resolving nowhere.
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
-            discard_staged_copy(&mut *conn, exec_id).await
+            discard_staged_copy_restoring_seal(&mut *conn, exec_id).await
         }))
         .await?;
         Ok(())

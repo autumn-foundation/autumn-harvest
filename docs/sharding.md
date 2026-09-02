@@ -463,6 +463,7 @@ time.
 | Holds no durable mutex (`ctx.mutex`, #691) | The lock row is shard-local and keyed by the holder; moving the holder away leaves the key held by an execution that no longer lives here, and every waiter on it blocked forever. |
 | Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
 | No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
+| Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
 | No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
 
 **A run waiting on a timer or a signal IS migratable — that is the point.** Both
@@ -589,6 +590,13 @@ anything that acts on an execution by id. The contract:
   excluded from the uniqueness index — releasing the business key while the real
   run keeps executing. Cancel or terminate the execution *by id*, which routes
   to its residence, then start again.
+- **A reverse migration keeps the origin's seal alive throughout.** `A → B → A`
+  stages onto a shard the run has lived on before, so the row it replaces is A's
+  own forwarding seal. The staged copy therefore *carries* that pointer until
+  activation clears it: ids routing to A keep resolving to live B for the whole
+  staging window, and an abort restores the seal in place rather than deleting
+  it. Without that, a failed reverse migration would leave the execution with no
+  row on its origin shard at all — an id that resolves nowhere.
 - **Reads may legitimately answer from the live copy alone.** The sealed source
   is a frozen snapshot as of the cutover, and the live copy is a superset of it
   by construction, so a history or status read that follows the pointer is

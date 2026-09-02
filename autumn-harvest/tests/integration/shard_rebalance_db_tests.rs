@@ -44,10 +44,11 @@ use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::shard_rebalance::{
-    MigrationOutcome, MigrationPhase, QuiescenceBlocker, activate_target, assess_quiescence,
-    begin_migration, commit_cutover, history_fingerprint, list_migration_candidates,
-    load_migration, migrate_execution, migrate_quiescent_executions, observe_quiescence,
-    resolve_execution_shard, resume_incomplete_migrations, stage_copy, verify_target_copy,
+    MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
+    assess_quiescence, begin_migration, commit_cutover, history_fingerprint,
+    list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
+    observe_quiescence, resolve_execution_shard, resume_incomplete_migrations, stage_copy,
+    verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -2105,4 +2106,174 @@ fn terminate_existing_start<'a>(
         start_source_ref: None,
         started_by: None,
     }
+}
+
+// ── Codex round 5 ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_reverse_migration_keeps_the_origin_seal_resolvable_throughout() {
+    // A → B → A stages onto a shard this run has lived on before, so the row
+    // staging replaces is A's own forwarding seal. Losing it during staging
+    // strands every id that routes to A at an inert copy; losing it on abort
+    // leaves the execution with no row on its origin shard at all — an id that
+    // resolves nowhere, the one outcome this design must never produce.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "there-and-back-seal").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    // Stage the reverse migration but stop before the cutover.
+    let (mut source, mut target) = (shards.target().await, shards.source().await);
+    begin_migration(&mut source, exec_id, TARGET, SOURCE)
+        .await
+        .expect("begin B -> A");
+    stage_copy(&mut source, &mut target, exec_id, SOURCE)
+        .await
+        .expect("stage onto A");
+
+    // Mid-staging, ids routing to A must still reach the live copy on B.
+    let mut a = shards.source().await;
+    assert_eq!(
+        forward_of(&mut a, exec_id).await,
+        Some(TARGET.as_i32()),
+        "the staged copy must carry A's seal so ids keep resolving during staging"
+    );
+    assert_eq!(
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve"),
+        TARGET,
+        "the run is still live on B until the reverse cutover"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+
+    // Abort before the cutover: A's seal must come back, not vanish.
+    abort_migration(
+        &mut source,
+        &mut target,
+        exec_id,
+        "operator changed their mind",
+    )
+    .await
+    .expect("abort");
+
+    let mut a = shards.source().await;
+    assert_eq!(
+        state_of(&mut a, exec_id).await.as_deref(),
+        Some("MIGRATED"),
+        "an aborted reverse migration must restore the origin seal, not delete it"
+    );
+    assert_eq!(forward_of(&mut a, exec_id).await, Some(TARGET.as_i32()));
+    assert_eq!(
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve after abort"),
+        TARGET
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}
+
+#[tokio::test]
+async fn a_completed_reverse_migration_clears_the_carried_pointer() {
+    // The staged copy deliberately carries the target's old seal so ids resolve
+    // during staging. Activation must clear it: a live row still pointing at
+    // the shard it came from is a forwarding cycle, and `read_forward` matches
+    // on the pointer rather than the state, so being RUNNING would not save it.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "there-and-back-clear").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+    migrate_execution(&shards.pool, exec_id, TARGET, SOURCE, &codecs())
+        .await
+        .expect("B -> A");
+
+    let mut a = shards.source().await;
+    assert_eq!(state_of(&mut a, exec_id).await.as_deref(), Some("RUNNING"));
+    assert_eq!(
+        forward_of(&mut a, exec_id).await,
+        None,
+        "the live row must not forward to the shard it came from"
+    );
+    assert_eq!(
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve"),
+        SOURCE
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
+async fn a_schedule_attributed_execution_is_refused_by_the_sql_predicate_too() {
+    // The pure predicate names the blocker; the cutover's SQL must agree, or an
+    // execution the candidate scan skips could still be cut over by a resume.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "scheduled-run").await;
+
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET schedule_id = gen_random_uuid() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("attribute the run to a schedule");
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(!verdict.is_eligible());
+    assert!(
+        verdict
+            .blockers()
+            .contains(&QuiescenceBlocker::ScheduleAttributed)
+    );
+
+    // And a real migration refuses it rather than moving it away from the
+    // schedule whose overlap enforcement is shard-local.
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
+async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
+    // The cancel outbox maps a terminal-state error to `ExternalCancelDelivered`
+    // and never retries. A rebalanced seal is not terminal — the run is alive
+    // elsewhere — so answering "already terminal" there would record a delivered
+    // cancellation for a workflow that goes on running. It must be retryable.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "cancel-the-seal").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut source = shards.source().await;
+    let err = autumn_harvest::execution::cancel_workflow_execution_collect(
+        &mut source,
+        exec_id,
+        "external cancel",
+    )
+    .await
+    .err()
+    .expect("cancelling a forwarding seal must not succeed");
+    assert!(
+        matches!(err, HarvestError::ShardUnavailable { .. }),
+        "expected a retryable ShardUnavailable so the delivery stays pending, got {err:?}"
+    );
+
+    // The live copy is untouched and still running.
+    let mut target = shards.target().await;
+    assert_eq!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("RUNNING")
+    );
 }

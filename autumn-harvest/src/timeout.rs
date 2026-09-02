@@ -2621,6 +2621,21 @@ async fn attempt_cancel_delivery(
                     tracing::error!(error = %e, "cancel outbox sweep: db error");
                     None
                 }
+                // The cancel landed on a shard that is not where the run lives
+                // (issue #964) — a forwarding seal, or a residence this node
+                // cannot reach. `None` leaves the row pending for a later
+                // sweep. Anything else here would record
+                // `ExternalCancelDelivered` in the sender's history for a
+                // workflow that is still running and never retry it, which is
+                // the one failure mode worse than a slow cancel.
+                Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
+                    tracing::warn!(
+                        shard_id,
+                        reason = %reason,
+                        "cancel outbox sweep: target is not on this shard; leaving pending"
+                    );
+                    None
+                }
                 // Other Err (already terminal) = no-op success.
                 Err(_) => Some(WorkflowEvent::ExternalCancelDelivered { cancel_id }),
             }

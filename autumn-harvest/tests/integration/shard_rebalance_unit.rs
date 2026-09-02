@@ -36,6 +36,7 @@ fn timer_parked() -> QuiescenceObservation {
     QuiescenceObservation {
         state: "RUNNING".to_string(),
         parent_id: None,
+        schedule_attributed: false,
         claimed_workflow_tasks: 0,
         due_pending_tasks: 0,
         parked_workflow_tasks: 1,
@@ -763,4 +764,37 @@ fn the_fingerprint_separates_an_empty_history_from_a_started_one() {
         history_fingerprint(&[]),
         history_fingerprint(&[started(json!({}))])
     );
+}
+
+// ── Codex round 5: schedule-attributed runs are out of scope ────────────────
+
+#[test]
+fn a_schedule_attributed_execution_is_blocked_from_migrating() {
+    // A schedule row does not move with its runs, and its overlap enforcement
+    // is shard-local: the tick counts RUNNING/PAUSED executions on its OWN
+    // shard for `max_active_runs`, and CancelOther/TerminateOther cancel priors
+    // with the same shard-local query. After a migration the local row reads
+    // MIGRATED, so the scheduler stops counting the still-running copy and
+    // stops cancelling it — it silently exceeds its own cap, or starts a run
+    // without terminating the prior it was told to replace.
+    let obs = QuiescenceObservation {
+        schedule_attributed: true,
+        ..timer_parked()
+    };
+    let verdict = assess_quiescence(&obs);
+    assert!(!verdict.is_eligible());
+    assert!(
+        verdict
+            .blockers()
+            .contains(&QuiescenceBlocker::ScheduleAttributed),
+        "expected a named ScheduleAttributed blocker so a dry run explains itself, \
+         got {:?}",
+        verdict.blockers()
+    );
+}
+
+#[test]
+fn an_unscheduled_execution_is_unaffected_by_the_schedule_blocker() {
+    assert!(assess_quiescence(&timer_parked()).is_eligible());
+    assert!(assess_quiescence(&signal_parked()).is_eligible());
 }
