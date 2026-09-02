@@ -973,6 +973,12 @@ fn banner_never_leaks_a_password() {
 async fn starting_against_a_remote_database_is_refused() {
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
+        // Kernel-chosen. These tests are about DSN classification, but the port
+        // is settled FIRST (deliberately — see `DevRuntime::start`), so a fixed
+        // one makes them fight each other for 127.0.0.1:3000 when the harness
+        // runs them in parallel, and the loser fails with a bind error instead
+        // of the refusal it was asserting.
+        http_port: 0,
         ..DevRuntimeConfig::default()
     })
     .await
@@ -993,6 +999,7 @@ async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         allow_suspicious_database_name: true,
+        http_port: 0,
         ..DevRuntimeConfig::default()
     })
     .await
@@ -1010,6 +1017,7 @@ async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
 async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@127.0.0.1:5432/myapp_production".to_owned()),
+        http_port: 0,
         ..DevRuntimeConfig::default()
     })
     .await
@@ -1020,6 +1028,52 @@ async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
             autumn_harvest_plugin::dev::DevError::SuspiciousDatabase { .. }
         ),
         "{error}"
+    );
+}
+
+#[test]
+fn no_test_here_reserves_the_fixed_default_http_port() {
+    // A test that starts the runtime with `DevRuntimeConfig::default()` inherits
+    // the default port 3000 and really does bind it, because `DevRuntime::start`
+    // settles the port before anything else. Several such tests run in parallel
+    // under the harness, so they fight over one global port and the loser fails
+    // with `Address already in use` instead of whatever it was asserting.
+    //
+    // It cost a red macOS CI leg, and it is invisible on a developer machine
+    // where 3000 happens to be free, so it is pinned here rather than trusted to
+    // review. Every inline `DevRuntime::start(DevRuntimeConfig { .. })` must name
+    // an `http_port`; pass 0 unless the test is specifically about a port.
+    let source = std::fs::read_to_string(
+        workspace_root().join("autumn-harvest-plugin/tests/dev_runtime_tests.rs"),
+    )
+    .expect("this test file");
+
+    // Assembled at run time, never written out whole: a literal of the pattern
+    // would appear in this very file and the scan would flag itself.
+    let call = format!("{}{}", "DevRuntime::start(DevRuntimeConfig ", '{');
+    let end = format!("{}{}", "..DevRuntimeConfig::", "default()");
+    let (call, end) = (call.as_str(), end.as_str());
+
+    let mut searched_from = 0;
+    let mut checked = 0;
+    while let Some(found) = source[searched_from..].find(call) {
+        let start = searched_from + found + call.len();
+        let stop = start
+            + source[start..]
+                .find(end)
+                .expect("a config literal must end with the struct-update default");
+        assert!(
+            source[start..stop].contains("http_port:"),
+            "a `DevRuntime::start` call at byte {start} leaves `http_port` at its default, \
+             which binds the fixed port 3000 and races every other test that does the same; \
+             pass `http_port: 0`"
+        );
+        checked += 1;
+        searched_from = stop;
+    }
+    assert!(
+        checked >= 3,
+        "the guard found only {checked} call sites, so it is no longer scanning what it thinks"
     );
 }
 
