@@ -97,6 +97,15 @@ path = "tests/property/mod.rs"
 name = "metrics_noop"
 harness = false
 
+# End-to-end benchmark suite (issue #941). `harness = false`: every scenario is
+# destructive and stateful, so libtest/criterion's repeat-the-closure model would
+# end up timing an empty queue. Needs `db` for the three engine scenarios and
+# `testing` for the replay scenario's `WorkflowReplayer`.
+[[bench]]
+name = "e2e_bench"
+harness = false
+required-features = ["db", "testing"]
+
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]

@@ -46,6 +46,7 @@
 # ordering correct by construction.
 #
 # osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
