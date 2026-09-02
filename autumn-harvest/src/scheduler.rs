@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -5280,6 +5280,98 @@ pub async fn schedule_running_basis(
     Ok(running.saturating_add(pending))
 }
 
+/// Batched form of [`schedule_running_basis`] for many schedule names at once.
+///
+/// One grouped `RUNNING`/`PAUSED` count query plus one grouped
+/// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`])
+/// covering every name in `names`, all on **one shard** connection, instead
+/// of the two queries *per name* `schedule_running_basis` issues when called
+/// in a loop over many schedules (Ledger perf pass on `GET /admin/schedules`).
+///
+/// A name with zero `RUNNING`/`PAUSED` executions and zero pending-throttle
+/// rows is absent from the returned map; callers should treat a missing key
+/// as `0`, matching what a per-name call to `schedule_running_basis` would
+/// have returned.
+///
+/// # Errors
+///
+/// Returns a database error if either grouped count query fails.
+pub async fn schedule_running_basis_batch(
+    conn: &mut AsyncPgConnection,
+    names: &[&str],
+) -> HarvestResult<HashMap<String, i64>> {
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let running: Vec<(String, i64)> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq_any(names))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        .group_by(harvest_workflow_executions::workflow_name)
+        .select((
+            harvest_workflow_executions::workflow_name,
+            diesel::dsl::count_star(),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut basis: HashMap<String, i64> = running.into_iter().collect();
+    let pending = crate::throttle::pending_throttle_counts_for_workflows(conn, names).await?;
+    for (name, count) in pending {
+        *basis.entry(name).or_insert(0) += count;
+    }
+    Ok(basis)
+}
+
+/// Pure (DB-free) core of [`resolve_effective_fire_at`]'s calendar-rebasing logic.
+///
+/// Parameterized on already-loaded calendar exclusions instead of loading
+/// them itself, so a caller resolving many schedules against a shared pool
+/// of calendars ([`crate::calendar::load_exclusions_for_calendars`]) can load
+/// each distinct calendar's exclusions once and reuse them across every
+/// schedule that references it, rather than re-querying per schedule.
+///
+/// Kept as a separate function rather than a shared refactor of
+/// `resolve_effective_fire_at` so this addition cannot change behavior for
+/// that function's existing (single-schedule) callers.
+///
+/// `excluded` should be the calendar's exclusion dates -- an empty slice is
+/// only correct when the calendar genuinely has no exclusion rows, **never**
+/// as a stand-in for "the load failed." `exclude_weekends` is a pure name
+/// check (`calendar_name == "weekends-off"`) independent of `excluded`, so
+/// an empty slice does **not** reliably degrade to "no rebasing": a
+/// `weekends-off` calendar still rebases a weekend slot on an empty slice
+/// (see `resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions`
+/// below), which can hide a genuinely overdue wedge. A caller whose
+/// exclusions load failed must skip calling this function entirely (fall
+/// back to the raw anchor) rather than pass `&[]` in its place -- see
+/// `load_schedule_overdue_aux_by_shard` in `autumn-harvest-plugin/src/api.rs`
+/// for the pattern (`Option<HashMap<..>>`, `None` on failure, short-circuits
+/// before this function is ever called).
+#[must_use]
+pub fn resolve_effective_fire_at_pure(
+    excluded: &[NaiveDate],
+    exclude_weekends: bool,
+    skip_policy_db: &str,
+    schedule_expr: Option<&str>,
+    next_run_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let (Some(slot), Some(expr)) = (next_run_at, schedule_expr) else {
+        return None;
+    };
+    let parsed = parse_schedule_from_expr(expr)?;
+    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
+    let slot_date = slot.date_naive();
+    match crate::calendar::apply_skip_policy(slot_date, skip_policy, excluded, exclude_weekends) {
+        // `SkipPolicy::Skip` on an excluded day: no adjusted fire to defer to.
+        None => None,
+        // Not excluded: no rebasing.
+        Some(adjusted) if adjusted == slot_date => None,
+        // Rebased to a business day: the effective fire is at the adjusted slot.
+        Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
+    }
+}
+
 /// Resolve the calendar-adjusted effective fire time for a schedule's pinned
 /// `next_run_at` slot (issue #696, Codex round 3).
 ///
@@ -6746,6 +6838,43 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Documents (and pins) the exact hazard `load_schedule_overdue_aux_by_shard`
+    /// (in `autumn-harvest-plugin/src/api.rs`) must avoid when a batched
+    /// `calendar::load_exclusions_for_calendars` call fails: `exclude_weekends`
+    /// is a pure name check (`calendar_name == "weekends-off"`), independent of
+    /// whatever the exclusions query returned, so an EMPTY `excluded` slice is
+    /// **not** a safe stand-in for "the query failed" -- it still lets a
+    /// "weekends-off" calendar rebase a weekend slot away from its raw anchor,
+    /// which is exactly the wedge-hiding the caller's failure handling exists to
+    /// prevent (Codex review, PR #1314). The caller's fix is to treat a failed
+    /// batch as "skip calendar resolution for this shard" (`exclusions: None`),
+    /// never as "no exclusions" (`exclusions: Some(empty map)`) -- this test
+    /// pins why: with an empty `excluded` slice, the weekend flag alone is
+    /// sufficient to trigger a real rebase.
+    #[test]
+    fn resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions()
+     {
+        // 2026-06-13 is a fixed, independently-verified Saturday (not derived
+        // from `Utc::now()`, so this test's outcome never depends on what day
+        // it happens to run).
+        let saturday = Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap();
+
+        let rebased = resolve_effective_fire_at_pure(
+            &[],  // empty exclusions -- what an "unwrap_or_default() on failure" would produce
+            true, // exclude_weekends: true, i.e. calendar_name == "weekends-off"
+            "run_next_business_day",
+            Some("interval:3600"),
+            Some(saturday),
+        );
+
+        assert!(
+            rebased.is_some_and(|r| r.date_naive() != saturday.date_naive()),
+            "empty exclusions + exclude_weekends=true must still rebase a weekend slot -- \
+             proving a caller cannot treat a failed exclusions load as 'no exclusions' \
+             without risking exactly this silent rebase, got {rebased:?}"
+        );
+    }
 
     /// A representative workflow-schedule row for `merge_schedule_patch` unit
     /// tests (no database required).
