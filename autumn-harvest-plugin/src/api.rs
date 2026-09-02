@@ -3179,6 +3179,11 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
+    // Issue #964. Both are returned by `GET /workflows`, so both must be
+    // filterable: a state the API emits but rejects as a filter value is a
+    // listing an operator can see and cannot narrow.
+    "MIGRATING",
+    "MIGRATED",
 ];
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
@@ -38051,12 +38056,28 @@ pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError>
     pool.get().await.map_err(|error| map_pool_error(&error))
 }
 
+/// Resolve a connection to the shard that currently hosts `exec_id`.
+///
+/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964)
+/// so an execution an operator has rebalanced onto another shard is still found
+/// by the `ExecutionId` a caller captured before the move — the identity
+/// contract that makes shard rebalancing safe is *"any id captured before the
+/// migration continues to resolve after it"*, and this is the chokepoint the
+/// ~40 single-execution management routes reach it through.
+///
+/// A single-shard deployment pays nothing: with one pool there is nowhere to
+/// migrate to, so the forwarding probe is skipped and this is byte-for-byte the
+/// pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
+/// primary-key lookup against a partial index that is empty until an operator
+/// rebalances.
 pub(crate) async fn db_conn_for_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    acquire_conn(pool.pool_for_execution(exec_id)).await
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(pool.sharded_pool(), exec_id)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default

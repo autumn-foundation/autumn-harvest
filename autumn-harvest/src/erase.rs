@@ -153,6 +153,19 @@ pub const TERMINAL_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
+    // Issue #964: the sealed source of a shard migration. Terminal-shaped in
+    // exactly the sense this list means -- nothing more will ever happen to it
+    // on THIS shard -- which is what lets an erasure reach the copy the
+    // migration left behind. Without it the source's plaintext payloads would
+    // be permanently unreachable: an erasure routed by ExecutionId follows the
+    // forwarding pointer to the target, tombstones that, and reports success
+    // while the source keeps every byte.
+    //
+    // Terminal for CLASSIFICATION is not the same as purgeable: the retention
+    // janitor's candidate queries enumerate their own state list and do not
+    // include `MIGRATED`, because hard-deleting a sealed row would destroy the
+    // forwarding pointer every pre-migration id resolves through.
+    "MIGRATED",
 ];
 
 /// Returns `true` when `state` is one of the recognised terminal execution

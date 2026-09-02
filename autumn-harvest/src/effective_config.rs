@@ -534,6 +534,16 @@ pub struct ShardTopologyView {
     /// replicas before accepting pinned starts. `BTreeMap` ordering makes the
     /// projection stable, so a byte comparison of two snapshots is meaningful.
     pub residency_map: BTreeMap<String, i32>,
+    /// The declared retired-shard → successor mapping (issue #964).
+    ///
+    /// Empty unless the deployment has decommissioned a shard. Surfacing it is
+    /// the same argument as `residency_map`, applied to a strictly worse
+    /// failure mode: two replicas that disagree about where a **retired**
+    /// shard's ids resolve will answer the *same* `ExecutionId` from *different*
+    /// databases — one finding the run, the other a confident `404` — while
+    /// reporting identical `readable`/`writable`/`default` sets. Diff this field
+    /// across replicas as the last step of a shard decommission.
+    pub shard_forwards: BTreeMap<i32, i32>,
 }
 
 impl ShardTopologyView {
@@ -551,6 +561,7 @@ impl ShardTopologyView {
             writable_shards,
             default_shard,
             residency_map,
+            shard_forwards,
         } = router.parts();
         Self {
             readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
@@ -559,6 +570,10 @@ impl ShardTopologyView {
             residency_map: residency_map
                 .iter()
                 .map(|(key, shard)| (key.clone(), shard.as_i32()))
+                .collect(),
+            shard_forwards: shard_forwards
+                .iter()
+                .map(|(from, to)| (from.as_i32(), to.as_i32()))
                 .collect(),
         }
     }
@@ -893,6 +908,44 @@ mod tests {
         assert!(
             view.residency_map.is_empty(),
             "a router with no declared map must report an empty projection"
+        );
+        assert!(
+            view.shard_forwards.is_empty(),
+            "a router with no decommissioned shard must report an empty forward map"
+        );
+    }
+
+    /// Issue #964: the same replica-drift argument as the residency map, applied
+    /// to a strictly worse failure mode. Two replicas that disagree about where a
+    /// RETIRED shard's ids resolve answer the *same* `ExecutionId` from
+    /// *different* databases -- one finding the run, the other a confident 404 --
+    /// while reporting identical readable/writable/default sets.
+    #[test]
+    fn shard_topology_surfaces_the_retired_shard_forwards() {
+        let replica_a = crate::shard::ShardRouter::new(
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            crate::types::ShardId::new(1),
+        )
+        .with_shard_forwards([(crate::types::ShardId::new(0), crate::types::ShardId::new(1))]);
+        // Same topology, shard 0's residents claimed by a DIFFERENT successor.
+        let replica_b = crate::shard::ShardRouter::new(
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            crate::types::ShardId::new(1),
+        )
+        .with_shard_forwards([(crate::types::ShardId::new(0), crate::types::ShardId::new(2))]);
+
+        let view_a = ShardTopologyView::from_router(&replica_a);
+        let view_b = ShardTopologyView::from_router(&replica_b);
+
+        assert_eq!(view_a.shard_forwards.get(&0), Some(&1));
+        assert_eq!(view_a.readable_shards, view_b.readable_shards);
+        assert_eq!(view_a.writable_shards, view_b.writable_shards);
+        assert_eq!(view_a.default_shard, view_b.default_shard);
+        assert_ne!(
+            view_a.shard_forwards, view_b.shard_forwards,
+            "conflicting retired-shard forwards MUST be visible in the snapshot"
         );
     }
 

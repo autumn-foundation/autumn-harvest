@@ -2590,7 +2590,7 @@ async fn should_skip_candidate(
            AND workflow_id = $2
            AND id <> $3
            AND (
-                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED','MIGRATED')
                OR completed_at IS NULL
                OR completed_at >= $4
            )",

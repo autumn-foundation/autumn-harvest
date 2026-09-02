@@ -1708,7 +1708,13 @@ pub enum ActiveConflictBehavior {
 /// treats them. SUSPENDED is not a persisted state.
 #[must_use]
 pub fn is_active_conflict_state(state: &str) -> bool {
-    matches!(state, "RUNNING" | "PAUSED")
+    // `MIGRATED` and `MIGRATING` (issue #964) are active conflicts even though
+    // neither row will ever run again where it sits. A `MIGRATED` row is the
+    // seal left behind when the run was rebalanced onto another shard: the run
+    // is still live, just elsewhere, so treating it as "terminal prior" would
+    // let a start of the same business key create a SECOND live run. A
+    // `MIGRATING` row is a staged copy holding the identity mid-migration.
+    matches!(state, "RUNNING" | "PAUSED" | "MIGRATED" | "MIGRATING")
 }
 
 /// Resolve the effective active-prior behavior from the two orthogonal axes
@@ -1953,9 +1959,15 @@ mod active_conflict_tests {
     use crate::types::WorkflowIdReusePolicy as R;
 
     #[test]
-    fn active_states_are_running_and_paused_only() {
+    fn active_states_are_the_live_and_the_migrated() {
         assert!(is_active_conflict_state("RUNNING"));
         assert!(is_active_conflict_state("PAUSED"));
+        // Issue #964: a sealed source is a live run that lives on another
+        // shard, and a staged copy holds the identity mid-migration. Treating
+        // either as a terminal prior would let a start of the same business key
+        // create a second live run.
+        assert!(is_active_conflict_state("MIGRATED"));
+        assert!(is_active_conflict_state("MIGRATING"));
         for other in [
             "SUSPENDED",
             "COMPLETED",

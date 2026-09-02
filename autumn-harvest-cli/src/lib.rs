@@ -1875,6 +1875,56 @@ enum TokenCommand {
 
 #[derive(Debug, Subcommand)]
 enum ShardCommand {
+    /// Migrate quiescent workflow executions from one shard to another (issue #964).
+    ///
+    /// Connects to the shard databases DIRECTLY rather than through the
+    /// management API: a rebalance is a two-database operation, and the node
+    /// serving the API has no reason to hold a pool for both. Supply each shard
+    /// with `--shard <ID>=<DSN>`.
+    ///
+    /// Always dry-run first. `--dry-run` walks the same code path up to the
+    /// first write and reports exactly the population a real run would move.
+    Rebalance {
+        /// Shard to migrate executions OFF, as `<ID>=<DSN>`. Repeat for the
+        /// target; both must be supplied.
+        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
+        shards: Vec<String>,
+        /// The shard id to migrate off.
+        #[arg(long)]
+        from: i32,
+        /// The shard id to migrate to.
+        #[arg(long)]
+        to: i32,
+        /// Maximum executions to move in this run.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Report what would move without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the raw JSON report instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drive any migration left unfinished by a crash forward one step (issue #964).
+    ///
+    /// Idempotent and safe to re-run. A migration killed after its cutover is
+    /// completed; one killed before it is either finished or cleanly abandoned,
+    /// depending on whether the source woke up in the meantime.
+    RebalanceResume {
+        /// Shard databases, as `<ID>=<DSN>`. Supply every shard any unfinished
+        /// migration touches.
+        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
+        shards: Vec<String>,
+        /// The shard whose migration records to drive.
+        #[arg(long)]
+        from: i32,
+        /// Maximum records to advance in this run.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        /// Print the raw JSON report instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show per-shard readiness and rollout blockers.
     Health {
         /// Evaluate this readable shard as a promotion candidate.
@@ -3502,6 +3552,18 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     // unreachable (mirrors `backup verify`).
     if let Commands::Dr { command } = &cli.command {
         return run_dr(command).await;
+    }
+
+    // `shard rebalance` moves rows between two shard databases, so like `dr` and
+    // `partition` it connects to them directly rather than through the
+    // management API -- which would need a pool for both shards on one node.
+    if let Commands::Shard { command } = &cli.command
+        && matches!(
+            command,
+            ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. }
+        )
+    {
+        return run_shard_rebalance(command, cli.actor.as_deref()).await;
     }
 
     // `partition` is shard-local DDL and inspection: it connects to each shard
@@ -10001,6 +10063,186 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
             || ApiRequest::get("/admin/shards/health"),
             |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
         ),
+        // Intercepted in `run_cli` and executed against the shard databases
+        // directly (issue #964); they never reach the management API. Kept in
+        // the match rather than a `_` arm so a future shard subcommand is a
+        // compile error here until it declares which path it takes.
+        ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. } => {
+            unreachable!("shard rebalance commands are dispatched in-process by run_cli")
+        }
+    }
+}
+
+/// Execute `harvest shard rebalance` / `shard rebalance-resume` against the
+/// shard databases directly (issue #964).
+async fn run_shard_rebalance(
+    command: &ShardCommand,
+    actor: Option<&str>,
+) -> Result<(), CliError> {
+    use autumn_harvest::payload_codec::PayloadCodecs;
+    use autumn_harvest::shard::ShardedDbPool;
+    use autumn_harvest::types::ShardId;
+
+    fn build_pool(
+        targets: &[autumn_harvest::backup_verify::ShardTarget],
+    ) -> Result<ShardedDbPool, CliError> {
+        let default = targets.first().map_or(0, |t| t.shard_id);
+        ShardedDbPool::from_dsns(
+            targets
+                .iter()
+                .map(|t| (ShardId::new(t.shard_id), t.dsn.clone())),
+            ShardId::new(default),
+            4,
+        )
+        .map_err(|e| CliError::InvalidInput(e.to_string()))
+    }
+
+    fn require_shard(
+        targets: &[autumn_harvest::backup_verify::ShardTarget],
+        shard: i32,
+        flag: &str,
+    ) -> Result<(), CliError> {
+        if targets.iter().any(|t| t.shard_id == shard) {
+            return Ok(());
+        }
+        Err(CliError::InvalidInput(format!(
+            "--{flag} names shard {shard}, but no --shard {shard}=<DSN> was supplied"
+        )))
+    }
+
+    match command {
+        ShardCommand::Rebalance {
+            shards,
+            from,
+            to,
+            limit,
+            dry_run,
+            json,
+        } => {
+            let targets = parse_shard_targets(shards)?;
+            require_shard(&targets, *from, "from")?;
+            require_shard(&targets, *to, "to")?;
+            if from == to {
+                return Err(CliError::InvalidInput(
+                    "--from and --to must name different shards".to_string(),
+                ));
+            }
+            let pool = build_pool(&targets)?;
+            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions(
+                &pool,
+                ShardId::new(*from),
+                ShardId::new(*to),
+                *limit,
+                *dry_run,
+                actor.unwrap_or("anonymous"),
+                &PayloadCodecs::default(),
+            )
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| CliError::InvalidInput(e.to_string()))?
+                );
+            } else {
+                print!("{}", format_rebalance_report(&report));
+            }
+            Ok(())
+        }
+        ShardCommand::RebalanceResume {
+            shards,
+            from,
+            limit,
+            json,
+        } => {
+            let targets = parse_shard_targets(shards)?;
+            require_shard(&targets, *from, "from")?;
+            let pool = build_pool(&targets)?;
+            let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
+                &pool,
+                ShardId::new(*from),
+                *limit,
+                actor.unwrap_or("anonymous"),
+                &PayloadCodecs::default(),
+            )
+            .await
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&outcomes)
+                        .map_err(|e| CliError::InvalidInput(e.to_string()))?
+                );
+            } else if outcomes.is_empty() {
+                println!("no unfinished shard migrations on shard {from}");
+            } else {
+                for outcome in &outcomes {
+                    println!("{}", format_rebalance_outcome(outcome));
+                }
+            }
+            Ok(())
+        }
+        ShardCommand::Health { .. } => unreachable!("health goes through the management API"),
+    }
+}
+
+/// One line per execution, plus a summary — the progress report AC8 asks for.
+fn format_rebalance_report(
+    report: &autumn_harvest::shard_rebalance::MigrationBatchReport,
+) -> String {
+    let mut out = String::new();
+    let mode = if report.dry_run { " (dry run)" } else { "" };
+    out.push_str(&format!(
+        "shard rebalance {} -> {}{mode}\n",
+        report.source_shard.as_i32(),
+        report.target_shard.as_i32()
+    ));
+    for outcome in &report.outcomes {
+        out.push_str("  ");
+        out.push_str(&format_rebalance_outcome(outcome));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\nexamined {}  migrated {}  would-migrate {}  skipped {}  aborted {}\n",
+        report.examined,
+        report.migrated(),
+        report.would_migrate(),
+        report.skipped(),
+        report.aborted()
+    ));
+    out
+}
+
+fn format_rebalance_outcome(
+    outcome: &autumn_harvest::shard_rebalance::MigrationOutcome,
+) -> String {
+    use autumn_harvest::shard_rebalance::MigrationOutcome;
+    match outcome {
+        MigrationOutcome::Migrated {
+            execution_id,
+            fingerprint,
+        } => format!("migrated      {execution_id}  (verified {})", &fingerprint[..fingerprint.len().min(12)]),
+        MigrationOutcome::WouldMigrate { execution_id } => {
+            format!("would-migrate {execution_id}")
+        }
+        MigrationOutcome::Skipped {
+            execution_id,
+            blockers,
+        } => format!(
+            "skipped       {execution_id}  ({})",
+            blockers
+                .iter()
+                .map(|b| b.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        MigrationOutcome::Aborted {
+            execution_id,
+            reason,
+        } => format!("aborted       {execution_id}  ({reason})"),
     }
 }
 

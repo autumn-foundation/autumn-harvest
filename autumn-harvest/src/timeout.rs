@@ -2436,9 +2436,22 @@ pub async fn enforce_external_signals_outbox(
 
                 let caller_shard = caller_exec_id.shard();
 
+                // Issue #964: follow the forwarding pointer a shard rebalance
+                // leaves behind. Without this the delivery routes to the shard
+                // the target *originated* on, finds the sealed row, reads it as
+                // terminal, and records `target_terminal` in the SENDER's
+                // history for a workflow that is alive on another shard.
+                let routed_shard = match active_sharded_pool.as_ref() {
+                    Some(pool) => {
+                        crate::shard_rebalance::resolve_target_shard(pool, &target, caller_shard)
+                            .await
+                    }
+                    None => caller_shard,
+                };
+
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
                     if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_target(&target, caller_shard),
+                        pool.exact_pool_for(routed_shard),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
                         std::ptr::eq(t_pool, c_pool)
@@ -2462,7 +2475,7 @@ pub async fn enforce_external_signals_outbox(
                     // Different pools, so we must have a target_pool resolved
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
+                        .and_then(|p| p.exact_pool_for(routed_shard))
                     else {
                         tracing::warn!(
                             target_shard = ?crate::shard::external_target_owning_shard(&target),
@@ -2799,9 +2812,22 @@ pub async fn enforce_external_cancels_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
+                // Issue #964: follow the forwarding pointer a shard rebalance
+                // leaves behind. Without this the delivery routes to the shard
+                // the target *originated* on, finds the sealed row, reads it as
+                // terminal, and records `target_terminal` in the SENDER's
+                // history for a workflow that is alive on another shard.
+                let routed_shard = match active_sharded_pool.as_ref() {
+                    Some(pool) => {
+                        crate::shard_rebalance::resolve_target_shard(pool, &target, caller_shard)
+                            .await
+                    }
+                    None => caller_shard,
+                };
+
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
                     if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_target(&target, caller_shard),
+                        pool.exact_pool_for(routed_shard),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
                         std::ptr::eq(t_pool, c_pool)
@@ -2839,7 +2865,7 @@ pub async fn enforce_external_cancels_outbox(
                 } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
+                        .and_then(|p| p.exact_pool_for(routed_shard))
                     else {
                         tracing::warn!(
                             target_shard = ?crate::shard::external_target_owning_shard(&target),

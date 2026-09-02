@@ -574,9 +574,21 @@ mod db {
                     // Terminate seals live runs as TERMINATED; exclude both
                     // already-sealed terminal states so a re-run never
                     // re-selects rows this batch already finalized (#504).
-                    query = query.filter(
-                        harvest_workflow_executions::state.ne_all(["CANCELLED", "TERMINATED"]),
-                    );
+                    //
+                    // `MIGRATED` and `MIGRATING` (issue #964) are excluded for a
+                    // sharper reason than tidiness. Terminating a `MIGRATED`
+                    // source would overwrite the seal an id resolves through;
+                    // terminating a `MIGRATING` staged copy would poison the
+                    // migration permanently, because `discard_staged_copy` then
+                    // refuses the row on every retry and the run is stranded
+                    // holding the target's uniqueness slot. Neither is a run an
+                    // unfiltered "terminate everything" batch means to touch.
+                    query = query.filter(harvest_workflow_executions::state.ne_all([
+                        "CANCELLED",
+                        "TERMINATED",
+                        "MIGRATED",
+                        "MIGRATING",
+                    ]));
                 }
                 BatchAction::Cancel | BatchAction::Signal => {
                     query = query
