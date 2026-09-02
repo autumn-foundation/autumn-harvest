@@ -129,6 +129,18 @@ skipping it — for a collector
 that is on by default, "preview it first" is the standard derisking move, and it
 was precisely what a skip made unavailable.
 
+The **sweep pages by that same keyset cursor**, which it needs for a different
+reason than the preview does. Deleting what it counted lets it make progress
+past the rows it *removed*, but rows the predicates RETAIN stay where they are —
+so every batch re-walked the whole retained prefix ahead of its victims,
+re-running the fullness arithmetic and both anti-joins over rows it had already
+decided to keep, up to 50 times a tick. Measured against the real predicates
+with 200k retained buckets sorting ahead of 50k collectable ones, both forms
+deleting the same 50,000 rows: **6,737 ms per tick without the cursor, 2,622 ms
+with it**, and the gap widens with the retained prefix. The trade is that a row
+skipped by `SKIP LOCKED` below the cursor waits for the next tick rather than
+the next batch, which is the right one for a periodic best-effort pass.
+
 `GET /admin/rate-limits` gains both new columns on its row shape
 (`baseline_set_at`, `last_registered_at`), so "why has this bucket never been
 collected?" and "why not yet?" are answerable from the same read an operator is
