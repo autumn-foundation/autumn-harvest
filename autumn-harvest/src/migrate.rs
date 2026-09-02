@@ -729,14 +729,48 @@ async fn apply_without_transaction(
 
     match recorded {
         Ok(_) => Ok(Applied::Yes),
-        // A concurrent migrator recorded it while this body was running. Both
-        // ran the DDL — unavoidable without a transaction to contend on, and
-        // why such a migration must be idempotent.
-        Err(DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
-            Ok(Applied::Concurrently)
+        // A unique violation here *usually* means a concurrent migrator
+        // recorded this version while the body was running. Both ran the DDL —
+        // unavoidable without a transaction to contend on, and why such a
+        // migration must be idempotent.
+        //
+        // Only the row itself proves that, though. This module is explicitly
+        // pointed at ledgers it did not create, and one may carry an extra
+        // constraint or an insert trigger that raises `unique_violation`
+        // without recording anything. Taking the error at face value would
+        // report a migration as applied, exit 0, and leave a schema change no
+        // ledger row covers — so the next run replays the body, which for a
+        // non-transactional migration is precisely the case that cannot be
+        // rolled back. Confirm the version is there before saying so.
+        Err(error @ DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
+            if version_is_recorded(conn, &script.version).await? {
+                Ok(Applied::Concurrently)
+            } else {
+                Err(error)
+            }
         }
         Err(error) => Err(error),
     }
+}
+
+/// Whether `version` is present in the ledger.
+///
+/// Both apply paths decide "already applied" with this rather than inferring it
+/// from a unique violation. A violation is ambiguous evidence: the migration's
+/// own SQL can raise one, and on a ledger this module did not create some other
+/// constraint can raise one while recording nothing. A row either is there or
+/// is not.
+async fn version_is_recorded(
+    conn: &mut AsyncPgConnection,
+    version: &str,
+) -> Result<bool, DieselError> {
+    let found: Vec<LedgerVersion> = diesel::sql_query(format!(
+        "SELECT version FROM {MIGRATION_LEDGER} WHERE version = $1"
+    ))
+    .bind::<Text, _>(version)
+    .load(conn)
+    .await?;
+    Ok(!found.is_empty())
 }
 
 /// Apply a migration inside one transaction, in Diesel's order: **body first,
@@ -802,13 +836,7 @@ async fn apply_in_transaction(
         .execute(tx)
         .await?;
 
-        let already: Vec<LedgerVersion> = diesel::sql_query(format!(
-            "SELECT version FROM {MIGRATION_LEDGER} WHERE version = $1"
-        ))
-        .bind::<Text, _>(version.as_str())
-        .load(tx)
-        .await?;
-        if !already.is_empty() {
+        if version_is_recorded(tx, version.as_str()).await? {
             return Err(ApplyError::AlreadyRecorded);
         }
 

@@ -9,7 +9,7 @@
 //! with it, and that the ledger this writes is the one Diesel and Autumn read.
 
 use autumn_harvest::migrate::{self, MigrationScript};
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -451,6 +451,67 @@ async fn the_ledger_lock_does_not_block_another_migrators_ledger_insert() {
         .execute(&mut holder)
         .await
         .expect("rollback");
+}
+
+#[tokio::test]
+async fn a_nontransactional_unique_violation_that_records_nothing_is_a_failure() {
+    // With no transaction the body has already run when the ledger insert is
+    // attempted, so a unique violation there is normally a concurrent migrator
+    // having recorded this version first — both ran the DDL, and the run is
+    // honestly reported as applied.
+    //
+    // But this module is pointed at ledgers it did not create. One may carry an
+    // extra constraint or an insert trigger that raises `unique_violation`
+    // while recording nothing. Reading that as "someone else recorded it" would
+    // exit 0 over a schema change no ledger row covers, and the next run would
+    // replay a body that cannot be rolled back.
+    let (_container, url) = empty_postgres().await;
+    migrate::apply(&url, &[]).await.expect("ledger created");
+
+    // A pre-existing ledger's own guard: raises the same SQLSTATE the primary
+    // key would, and records nothing.
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE FUNCTION harvest_ledger_guard() RETURNS trigger AS $$ \
+         BEGIN RAISE EXCEPTION 'ledger is guarded' USING ERRCODE = 'unique_violation'; END; \
+         $$ LANGUAGE plpgsql; \
+         CREATE TRIGGER harvest_ledger_guard_trigger \
+         BEFORE INSERT ON __diesel_schema_migrations \
+         FOR EACH ROW EXECUTE FUNCTION harvest_ledger_guard();",
+    )
+    .await
+    .expect("install the ledger guard");
+
+    let nontransactional = MigrationScript::with_metadata(
+        "29990104000000_harvest_migrate_probe_guarded",
+        "CREATE TABLE harvest_migrate_guarded (id INTEGER PRIMARY KEY);",
+        "run_in_transaction = false\n",
+    )
+    .expect("metadata parses");
+    assert!(!nontransactional.run_in_transaction);
+
+    let error = migrate::apply(&url, &[nontransactional])
+        .await
+        .expect_err("a violation that records nothing must fail the run");
+    assert!(
+        error.report.applied.is_empty(),
+        "nothing may be reported as applied: {:?}",
+        error.report.applied
+    );
+    assert!(
+        error.report.applied_concurrently.is_empty(),
+        "a violation that recorded no row is not another migrator's work: {:?}",
+        error.report.applied_concurrently
+    );
+
+    // The state the operator is left to inspect, and which the error must not
+    // paper over: the body ran, the version is unrecorded.
+    assert!(relation_exists(&url, "harvest_migrate_guarded").await);
+    assert!(
+        !ledger_versions(&url)
+            .await
+            .contains(&"29990104000000".to_string())
+    );
 }
 
 /// The single count the ledger-visibility migration recorded.
