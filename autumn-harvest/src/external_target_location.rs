@@ -89,6 +89,7 @@ use diesel_async::AsyncPgConnection;
 use crate::execution::{ResolvedRun, select_resolved_run};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::ShardId;
+use crate::worker::DbPool;
 
 /// A shard a by-business-key fan-out expected to inspect but could not.
 ///
@@ -151,6 +152,24 @@ pub enum TargetLocation {
         /// found and leaves the request pending, letting a later **complete**
         /// fan-out be what makes the assertion.
         uninspected: Vec<UninspectedShard>,
+        /// Shards that hold a **further live run** of the same key, besides the
+        /// one on `shard` (issue #1146, Codex round 3).
+        ///
+        /// Empty in every healthy deployment. Non-empty is the state
+        /// [`merge_locations`] warns about: `(workflow_name, workflow_id)`
+        /// uniqueness is shard-local, so pinning a key to one shard (#697) while
+        /// an unpinned start of the same key hashes to another produces two live
+        /// runs that no single shard's index can see.
+        ///
+        /// `run` is still the most recently started of them — the documented
+        /// "current run" rule, which a **signal** follows. But a **cancel** must
+        /// not report on a fan-out that saw more than one, for the same reason it
+        /// must not report on a partial one: cancelling the newest leaves the
+        /// other live, and the moment it does, *that* run becomes the current run
+        /// for the key. So the cancel path cancels what it found, withholds the
+        /// terminal, and retries — converging one live copy per sweep until none
+        /// is left and the answer is unambiguous.
+        other_live: Vec<ShardId>,
     },
     /// **Every** expected shard was inspected and none holds a run for this
     /// key. Only this outcome may become a permanent `target_unknown`.
@@ -174,16 +193,32 @@ impl TargetLocation {
         }
     }
 
-    /// Did the fan-out behind this answer inspect **every** expected shard?
+    /// May a caller assert something about the **whole business key** from this
+    /// answer — as `ExternalCancelDelivered` does when it claims nothing is
+    /// running under it?
     ///
-    /// `false` on a [`Self::Found`] reached over a partial view, and on every
-    /// [`Self::Indeterminate`]. A caller whose success event asserts something
-    /// about the business key as a whole must not record it while this is
-    /// `false` — see [`Self::Found`]'s `uninspected`.
+    /// Two things can make an answer inauthoritative in that sense, and they are
+    /// deliberately folded into one predicate because they have the same
+    /// consequence — a live run of this key that the assertion would ignore:
+    ///
+    /// * a shard that could not be inspected, which **may** hold one; and
+    /// * a shard that was inspected and **does** hold one, besides the winner.
+    ///
+    /// `true` for [`Self::NotFound`] (every shard answered, none holds the key)
+    /// and for an unambiguous [`Self::Found`]; `false` for every
+    /// [`Self::Indeterminate`].
+    ///
+    /// This says nothing about whether a caller may *act* — cancelling the run
+    /// in hand is idempotent progress either way. It governs only what may be
+    /// recorded.
     #[must_use]
-    pub const fn fanout_was_complete(&self) -> bool {
+    pub const fn is_authoritative_for_key(&self) -> bool {
         match self {
-            Self::Found { uninspected, .. } => uninspected.is_empty(),
+            Self::Found {
+                uninspected,
+                other_live,
+                ..
+            } => uninspected.is_empty() && other_live.is_empty(),
             Self::NotFound => true,
             Self::Indeterminate { .. } => false,
         }
@@ -289,6 +324,32 @@ pub fn merge_locations(
     // whole struct. The fallback is unreachable while `select_resolved_run`
     // returns one of its inputs; decoding the id's own shard bits is the
     // closest correct answer if that ever changes.
+    // Any OTHER live run of this key that a shard answered with. Only reachable
+    // when the winner itself is live (the ranking prefers live), and only in the
+    // topologies this module exists for — an explicit pin plus an unpinned start
+    // of the same key. Shard-local uniqueness cannot see it, so the fan-out is
+    // the first thing in the engine that can.
+    let other_live: Vec<ShardId> = candidates
+        .iter()
+        .filter(|(_, run)| {
+            run.exec_id != winner.exec_id && !crate::erase::is_terminal_state(&run.state)
+        })
+        .map(|(shard, _)| *shard)
+        .collect();
+    if !other_live.is_empty() {
+        tracing::warn!(
+            winner_shard = ?candidates
+                .iter()
+                .find(|(_, run)| run.exec_id == winner.exec_id)
+                .map(|(shard, _)| *shard),
+            ?other_live,
+            "by-id resolution found more than one LIVE run of this business key; \
+             (workflow_name, workflow_id) uniqueness is shard-local, so this is \
+             reachable by pinning a key to one shard while an unpinned start of it \
+             hashes to another"
+        );
+    }
+
     let shard = candidates
         .into_iter()
         .find(|(_, run)| run.exec_id == winner.exec_id)
@@ -297,6 +358,7 @@ pub fn merge_locations(
         shard,
         run: winner,
         uninspected,
+        other_live,
     }
 }
 
@@ -465,83 +527,47 @@ pub async fn resolve_location_by_workflow_id_with(
             let Some((_, conn)) = held.as_mut() else {
                 unreachable!("held_here implies held is Some")
             };
-            record_shard_answer(
-                &mut candidates,
-                &mut uninspected,
-                shard,
-                crate::execution::resolve_execution_id_by_workflow_id(
-                    conn,
-                    workflow_name,
-                    workflow_id,
-                )
-                .await,
-            );
+            match crate::execution::resolve_execution_id_by_workflow_id(
+                conn,
+                workflow_name,
+                workflow_id,
+            )
+            .await
+            {
+                Ok(Some(run)) => candidates.push((shard, run)),
+                Ok(None) => {}
+                Err(e) => mark_uninspected(
+                    &mut uninspected,
+                    memo,
+                    shard,
+                    format!("resolution query failed: {e}"),
+                ),
+            }
             continue;
         }
 
         // 2. Already known bad this sweep: report it without paying the bound
-        //    a second time.
+        //    a second time. (Recorded already, so it does not re-memoize.)
         if let Some(reason) = memo.and_then(|m| m.recorded(shard)) {
             uninspected.push(UninspectedShard { shard, reason });
             continue;
         }
 
         let Some(shard_pool) = pool.exact_pool_for(shard) else {
-            let reason = "no storage pool configured in this process".to_string();
-            if let Some(memo) = memo {
-                memo.record(shard, reason.clone());
-            }
-            uninspected.push(UninspectedShard { shard, reason });
+            mark_uninspected(
+                &mut uninspected,
+                memo,
+                shard,
+                "no storage pool configured in this process".to_string(),
+            );
             continue;
         };
 
-        // 3. The whole peer probe — acquisition AND query — under one budget,
-        //    with the tighter acquisition bound nested inside it. See
-        //    `FANOUT_ACQUIRE_BOUND` (circular wait) and `FANOUT_PEER_BOUND`
-        //    (an unhealthy peer wedging this shard's scanner).
-        let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
-            let conn = tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await;
-            let mut conn = match conn {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => {
-                    return Err(format!("could not acquire a connection: {e}"));
-                }
-                Err(_elapsed) => {
-                    return Err(format!(
-                        "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy \
-                         or unreachable)"
-                    ));
-                }
-            };
-            Ok(crate::execution::resolve_execution_id_by_workflow_id(
-                &mut conn,
-                workflow_name,
-                workflow_id,
-            )
-            .await)
-        })
-        .await;
-
-        match probe {
-            Ok(Ok(answer)) => {
-                record_shard_answer(&mut candidates, &mut uninspected, shard, answer);
-            }
-            Ok(Err(reason)) => {
-                if let Some(memo) = memo {
-                    memo.record(shard, reason.clone());
-                }
-                uninspected.push(UninspectedShard { shard, reason });
-            }
-            Err(_elapsed) => {
-                // A connection was (or was not) handed over and the probe never
-                // returned. Classified exactly like a failed acquisition:
-                // uninspected, never "absent".
-                let reason = format!("shard did not answer within {FANOUT_PEER_BOUND:?}");
-                if let Some(memo) = memo {
-                    memo.record(shard, reason.clone());
-                }
-                uninspected.push(UninspectedShard { shard, reason });
-            }
+        // 3. The peer probe, entirely inside its own budget.
+        match probe_peer_shard(shard_pool, workflow_name, workflow_id).await {
+            Ok(Some(run)) => candidates.push((shard, run)),
+            Ok(None) => {}
+            Err(reason) => mark_uninspected(&mut uninspected, memo, shard, reason),
         }
     }
 
@@ -570,23 +596,71 @@ pub async fn resolve_location_by_workflow_id_with(
     placement
 }
 
-/// Fold one shard's answer into the fan-out accumulators.
-fn record_shard_answer(
-    candidates: &mut Vec<(ShardId, ResolvedRun)>,
-    uninspected: &mut Vec<UninspectedShard>,
-    shard: ShardId,
-    answer: crate::error::HarvestResult<Option<ResolvedRun>>,
-) {
-    match answer {
-        Ok(Some(run)) => candidates.push((shard, run)),
-        Ok(None) => {}
-        // A shard that answered with an error has NOT told us the key is
-        // absent, so it counts as uninspected, never as "not there".
-        Err(e) => uninspected.push(UninspectedShard {
-            shard,
-            reason: format!("resolution query failed: {e}"),
-        }),
+/// Probe one **peer** shard for `(workflow_name, workflow_id)`, entirely inside
+/// a bounded budget.
+///
+/// `Err` is the single "this shard could not be inspected" outcome, carrying the
+/// operator-facing reason — a failed or timed-out acquisition, a failed query,
+/// or a probe that never returned. Collapsing all four into one error means the
+/// caller cannot forget to memoize one of them, which is exactly the bug this
+/// shape replaced: only the acquisition failures were recorded, so a peer whose
+/// *query* failed slowly was re-probed once per pending row instead of once per
+/// sweep (issue #1146, Codex round 3 P2).
+///
+/// A query that returns an error is `Err` and never `Ok(None)`: a shard that
+/// answered with a failure has not told us the key is absent.
+///
+/// Two nested bounds, for two different hazards — see [`FANOUT_ACQUIRE_BOUND`]
+/// (per-shard scanners waiting on each other's connections) and
+/// [`FANOUT_PEER_BOUND`] (one unhealthy peer wedging this shard's scanner,
+/// wherever it stalls).
+async fn probe_peer_shard(
+    shard_pool: &DbPool,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Result<Option<ResolvedRun>, String> {
+    let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
+        let mut conn = match tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Err(format!("could not acquire a connection: {e}")),
+            Err(_elapsed) => {
+                return Err(format!(
+                    "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy or \
+                 unreachable)"
+                ));
+            }
+        };
+        crate::execution::resolve_execution_id_by_workflow_id(&mut conn, workflow_name, workflow_id)
+            .await
+            .map_err(|e| format!("resolution query failed: {e}"))
+    })
+    .await;
+
+    match probe {
+        Ok(result) => result,
+        Err(_elapsed) => Err(format!("shard did not answer within {FANOUT_PEER_BOUND:?}")),
     }
+}
+
+/// Record that `shard` could not be inspected, in the fan-out's own list **and**
+/// in the per-sweep memo.
+///
+/// The single funnel for every uninspected outcome. It exists because the
+/// previous shape had four of them written out separately and one — a failed
+/// resolution query — silently skipped the memo, so a peer failing slowly just
+/// under the probe bound was re-probed once per pending row instead of once per
+/// sweep (issue #1146, Codex round 3 P2). Routing them all through one place
+/// removes the class rather than the instance.
+fn mark_uninspected(
+    uninspected: &mut Vec<UninspectedShard>,
+    memo: Option<&UninspectableShards>,
+    shard: ShardId,
+    reason: String,
+) {
+    if let Some(memo) = memo {
+        memo.record(shard, reason.clone());
+    }
+    uninspected.push(UninspectedShard { shard, reason });
 }
 
 /// May a delivery to `target` be attempted **inline** (issue #1146)?
@@ -717,27 +791,76 @@ mod tests {
     }
 
     #[test]
-    fn a_found_answer_reports_whether_its_fanout_was_complete() {
+    fn an_answer_reports_whether_it_is_authoritative_for_the_whole_key() {
         let live = run(0, "RUNNING", 1);
         assert!(
             merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new())
-                .fanout_was_complete(),
-            "every shard answered"
+                .is_authoritative_for_key(),
+            "every shard answered and exactly one live run exists"
         );
         assert!(
             !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)])
-                .fanout_was_complete(),
-            "a live run found over a PARTIAL view — the un-inspected shard may hold \
-             another live run of the same key, since uniqueness is shard-local. A \
-             cancel must not report success on this; a signal may still deliver."
+                .is_authoritative_for_key(),
+            "a live run found over a PARTIAL view — the un-inspected shard MAY hold \
+             another live run of the same key, since uniqueness is shard-local"
         );
         assert!(
-            merge_locations(Vec::new(), Vec::new()).fanout_was_complete(),
+            merge_locations(Vec::new(), Vec::new()).is_authoritative_for_key(),
             "`NotFound` is only ever reached from a complete fan-out"
         );
         assert!(
-            !merge_locations(Vec::new(), vec![uninspected(1)]).fanout_was_complete(),
-            "`Indeterminate` is never complete"
+            !merge_locations(Vec::new(), vec![uninspected(1)]).is_authoritative_for_key(),
+            "`Indeterminate` never is"
+        );
+    }
+
+    #[test]
+    fn two_live_runs_on_different_shards_are_not_authoritative_even_when_complete() {
+        // Codex round 3. Pinning a key to one shard (#697) while an unpinned
+        // start of the same key hashes to another produces two live runs that no
+        // shard-local unique index can see. The fan-out DOES see both, and the
+        // ranking still picks the most recently started as the current run — the
+        // documented rule, which a signal follows. But a cancel that reported
+        // success here would leave the older run live, and the instant the
+        // newest is cancelled that older one becomes the current run for the key.
+        let newer = run(1, "RUNNING", 50);
+        let older = run(0, "RUNNING", 10);
+        let merged = merge_locations(
+            vec![(ShardId::new(0), older), (ShardId::new(1), newer)],
+            Vec::new(),
+        );
+        assert_eq!(
+            merged.found_shard(),
+            Some(ShardId::new(1)),
+            "the most recently started live run is still the current run"
+        );
+        assert!(
+            !merged.is_authoritative_for_key(),
+            "but the answer cannot support a claim that nothing is running under \
+             the key — another live run is right there on shard 0"
+        );
+        match merged {
+            TargetLocation::Found { other_live, .. } => {
+                assert_eq!(other_live, vec![ShardId::new(0)], "and it is named");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_live_run_beside_terminals_is_still_authoritative() {
+        // Terminal siblings are not "another live run" — they cannot become the
+        // current run for the key, so they must not block a cancel from
+        // reporting. Without this the rule would stall every cancel of a key
+        // that has ever continued-as-new across shards.
+        let live = run(1, "RUNNING", 50);
+        let dead = run(0, "COMPLETED", 90);
+        assert!(
+            merge_locations(
+                vec![(ShardId::new(0), dead), (ShardId::new(1), live)],
+                Vec::new()
+            )
+            .is_authoritative_for_key()
         );
     }
 
@@ -749,7 +872,8 @@ mod tests {
             TargetLocation::Found {
                 shard: ShardId::new(0),
                 run: live,
-                uninspected: vec![uninspected(1)]
+                uninspected: vec![uninspected(1)],
+                other_live: Vec::new()
             }
         );
     }
@@ -769,7 +893,8 @@ mod tests {
             TargetLocation::Found {
                 shard: ShardId::new(1),
                 run: live,
-                uninspected: Vec::new()
+                uninspected: Vec::new(),
+                other_live: Vec::new()
             },
             "a first-hit-wins fan-out would signal the dead run instead"
         );

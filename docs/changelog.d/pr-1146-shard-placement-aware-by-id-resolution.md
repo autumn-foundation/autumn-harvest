@@ -180,6 +180,35 @@ one stops scanners waiting on each other's connections, the outer one caps what 
 single unhealthy peer can cost — and expiry is classified as an uninspected
 shard, never as absence.
 
+**Codex round 3 (one P1, one P2).** Round 2 stopped a cancel reporting over an
+*incomplete* fan-out. It did not stop one reporting over a **complete** fan-out
+that found two live runs — which shard-local uniqueness makes reachable exactly
+here: pin a key to one shard (#697) while an unpinned start of the same key
+hashes to another, and no single shard's partial unique index can see both. The
+ranking picks the most recently started as the current run, which is right for a
+signal; cancelling only that one and reporting success leaves the older run live,
+and the instant the newer is cancelled that older one *is* the current run for
+the key.
+
+Both cases are now one predicate. `TargetLocation::Found` carries `other_live`
+alongside `uninspected`, and `is_authoritative_for_key()` is false when either is
+non-empty — a shard that **may** hold a live run and a shard that **does** are
+the same problem, and folding them together means the next variant of it cannot
+be handled in only one place. The route field is renamed from `fanout_complete`
+to `may_assert_key_state` to say what it actually governs. The cancel converges
+either way: one live copy per sweep until an unambiguous answer can make the
+claim. Terminal siblings deliberately do not block it — they can never become the
+current run, and treating them as ambiguity would stall every cancel of a key
+that has continued-as-new across shards.
+
+The P2 was a gap the round-2 restructure introduced: only acquisition failures
+memoized, so a peer whose *query* failed just under the probe bound was re-probed
+once per pending row instead of once per sweep, turning a backlog into
+`rows x failure duration`. Every uninspected outcome now funnels through one
+`mark_uninspected`, and the peer probe is extracted into `probe_peer_shard`
+returning a single `Err(reason)` — so a caller cannot forget to memoize one of
+them, which removes the class rather than the instance.
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a

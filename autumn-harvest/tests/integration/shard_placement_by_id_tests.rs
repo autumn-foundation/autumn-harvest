@@ -1419,15 +1419,25 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
          the inline gate resolving the business key against the caller's own \
          shard and finding only the dead run — the bug #1146 closes"
     );
+    // Wait for the live run to settle rather than sampling it. The earlier
+    // assertion — "queued, or consumed and completed" — had a real window
+    // between the two: the signal consumed and the run still RUNNING mid-decision
+    // counted as neither, and it flaked there. The target workflow completes on
+    // receiving the signal, so its terminal state is the unambiguous evidence.
+    let target_state = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let observed = load_execution(&mut conn1, live).await.state;
+            if observed != "RUNNING" && observed != "PENDING" {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the live run must settle after receiving the signal");
     assert_eq!(
-        autumn_harvest::signal::load_pending_signals(&mut conn1, live)
-            .await
-            .expect("load pending on the live run")
-            .len()
-            + usize::from(load_execution(&mut conn1, live).await.state == "COMPLETED"),
-        1,
-        "the signal was delivered to the live run (still queued, or already \
-         consumed and the run completed)"
+        target_state, "COMPLETED",
+        "the signal reached the LIVE run on shard 1 and it ran to completion"
     );
 
     worker.shutdown();
@@ -1688,5 +1698,114 @@ async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
         load_execution(&mut conn1, live).await.state,
         "CANCELLED",
         "and the target is cancelled either way"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 9. Codex round 3 regression: two live runs of one key
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Codex round 3 P1. `(workflow_name, workflow_id)` uniqueness is shard-local,
+    // so pinning a key to one shard (#697) while an unpinned start of the same
+    // key hashes to another produces TWO live runs that no single shard's unique
+    // index can see. A complete fan-out sees both; the ranking picks the most
+    // recently started as the current run. Cancelling only that one and
+    // recording `ExternalCancelDelivered` would leave the older run live — and
+    // the instant the newer is cancelled, that older one IS the current run for
+    // the key.
+    let workflow_id = key_hashing_to(&router, "twin_live_wf", "twin", ShardId::new(0));
+    let older = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut conn0, "twin_live_wf", &workflow_id, older).await;
+
+    let newer = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "twin_live_wf", &workflow_id, newer).await;
+    diesel::update(harvest_workflow_executions::table.find(newer.as_uuid()))
+        .set(harvest_workflow_executions::started_at.eq(chrono::Utc::now()))
+        .execute(&mut conn1)
+        .await
+        .expect("make the shard-1 run the most recently started");
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut conn0, "by_id_caller", "twin-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut conn0,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "twin_live_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+
+    // Sweep 1: cancels the current (newer) run, but must NOT report — the other
+    // live run is still running.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("first sweep should succeed");
+    assert_eq!(
+        load_execution(&mut conn1, newer).await.state,
+        "CANCELLED",
+        "the current run must be cancelled"
+    );
+    assert!(
+        !history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "reporting here would claim nothing is running under the key while the \
+         older live run on shard 0 is still going"
+    );
+
+    // Sweep 2: the older run is now the current run. Cancel it; the answer is
+    // finally unambiguous, so the request is reported.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("second sweep should succeed");
+    assert_eq!(
+        load_execution(&mut conn0, older).await.state,
+        "CANCELLED",
+        "one live copy per sweep, until none is left"
+    );
+    assert!(
+        history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "with every live copy cancelled the claim is true and is finally recorded \
+         — withholding must converge, not strand"
     );
 }
