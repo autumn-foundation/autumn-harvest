@@ -444,9 +444,30 @@ struct QuotaUsageRow {
 /// `active` and `dl` each hit the partial indexes created by migration
 /// `20260725000000_harvest_workflow_quotas`
 /// (`idx_harvest_we_quota_active`/`idx_harvest_dl_quota`); `history` joins
-/// `harvest_events` on `workflow_exec_id`, served by the existing
-/// `(workflow_exec_id, event_id)` index — bounded to the rows belonging to
-/// the key's own active executions, never a scan of the whole event log.
+/// `harvest_events` on `workflow_exec_id`, intended to be served by the
+/// existing `(workflow_exec_id, event_id)` index — bounded to the rows
+/// belonging to the key's own active executions, never a scan of the whole
+/// event log.
+///
+/// **AC7's "never a full-table scan" is a design intent, not a guarantee the
+/// query text enforces.** `WHERE e.workflow_exec_id IN (SELECT id FROM
+/// active)` lets the planner choose either an index-bounded Nested Loop *or*
+/// a Seq Scan of the entire `harvest_events` table, and it measurably picks
+/// the Seq Scan below roughly 300k total rows in the table (a plain,
+/// production-shaped early-life or heavily-retention-pruned deployment) —
+/// see the Ledger evidence in `docs/performance-quota-history-bytes.md`. This
+/// is not flagged as a bug: at that same size a query shape that *forces*
+/// the index-bounded plan measured **worse** (a per-row correlated
+/// `LATERAL`, tested and reverted — see the doc page's negative result), so
+/// the planner's own cost-based choice is already at least as good as the
+/// alternative tried. The real, unavoidable cost this query pays regardless
+/// of which plan runs: an exact `SUM(pg_column_size(...))` requires reading
+/// every contributing row, so cost scales with the target key's own
+/// accumulated active-execution history — for a tenant sitting near its
+/// configured `max_history_bytes` cap, that is tens of thousands of buffer
+/// touches on *every* admission, recomputed from scratch each time. See the
+/// doc page for the measured numbers and why a cheaper fix (an incrementally
+/// maintained running counter) is a human decision, not a query rewrite.
 ///
 /// `SUSPENDED` does not appear in the active-state filter: it is not a
 /// persisted state (the `harvest_workflow_executions.state` CHECK constraint
@@ -469,6 +490,18 @@ const QUOTA_USAGE_SQL: &str = "\
         )::BIGINT AS history_bytes, \
         (SELECT COUNT(*) FROM harvest_dead_letters \
          WHERE workflow_name = $1 AND quota_key = $2)::BIGINT AS dead_letters";
+
+/// The exact SQL text [`load_quota_usage`] executes.
+///
+/// Exposed read-only for evidence-capture tests to `EXPLAIN` — mirrors
+/// [`crate::queue::claim_task_query`]'s identical purpose for the claim path,
+/// so a captured plan is provably the production statement rather than a
+/// hand-copied (and driftable) approximation of it.
+#[cfg(feature = "db")]
+#[must_use]
+pub const fn quota_usage_query() -> &'static str {
+    QUOTA_USAGE_SQL
+}
 
 /// Load current usage for one `(workflow_name, quota_key)` pair.
 ///
