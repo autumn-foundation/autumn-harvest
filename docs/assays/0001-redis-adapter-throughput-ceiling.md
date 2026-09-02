@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,828 vs 10,000 ops/sec — but only for this assay's own 8-worker steady-state sub-question, ledger #1)
+# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,760 vs 10,000 ops/sec — but only for this assay's own 8-worker steady-state sub-question, ledger #1)
 
 > Status: **measured.** The Pre-registration section below was committed
 > (`3a0e3b9`) before the apparatus was built or run; nothing in it has been
@@ -193,6 +193,26 @@ no`.
 > and Verdict for what's kept (the two real, honestly-labeled numbers this
 > apparatus did measure) versus what's cut (any specific "Nx" figure against
 > the Postgres control).
+>
+> **Post-review correction #3 — two apparatus bugs, unrelated to the ratio
+> question above.** A further review pass found: (1) every scenario reused a
+> fixed `"bench"` key prefix, so a rerun — or the next cell in the same
+> sweep — could inherit a previous cell's leftover stream entries, consumer
+> group, or un-acked PEL state rather than starting clean (a steady-state
+> cell that hits its wall-clock deadline with an item enqueued but not yet
+> claimed leaves exactly this kind of residue); (2) the backlog-drain
+> scenario measured elapsed time from when `main` itself returned from the
+> start barrier, but `Barrier` does not guarantee resume order, so a worker
+> that resumed first could already be claiming before `main`'s clock started
+> — on an ~80ms scenario that skew is not negligible. Both fixed: every
+> scenario now runs under a fresh, process- and time-derived key prefix
+> (mirroring the `uuid`-per-fixture pattern the crate's own integration
+> tests already use), and each drain worker times itself, with the scenario
+> folding all of them into `min(start)..max(end)` — the same window-folding
+> approach `docs/performance.md`'s own harness uses — instead of trusting
+> `main`'s barrier-return timestamp. The numbers below are from the
+> apparatus with both fixes applied; they are close to, and do not change
+> the direction of, the pre-fix numbers.
 
 **Stubs list (what was faked/skipped, and why it matters for reading the number):**
 
@@ -220,8 +240,8 @@ no`.
   the same box.
 - One canonical timed run per cell for the full sweep, with the registered
   cell (8 workers, shared queue) independently repeated three times at the
-  full 10s window: 8,586.70 / 9,091.80 / 8,805.20 ops/sec (mean 8,827.90,
-  range 5.9% of the mean) — a shared, contended stream shows more run-to-run
+  full 10s window: 8,449.80 / 8,836.80 / 8,993.40 ops/sec (mean 8,760.00,
+  range 6.2% of the mean) — a shared, contended stream shows more run-to-run
   variance than the original dedicated-stream design did (0.8% apart across
   two runs), which is itself a small piece of evidence that the fix changed
   a real contention path rather than being a no-op.
@@ -234,16 +254,16 @@ no`.
 
 ## 📊 Assay
 
-Full sweep, one canonical run, 10s measured window each, shared queue:
+Full sweep, one canonical run (of three, post-fix — see below), 10s measured window each, shared queue, isolated key prefix per cell:
 
 | concurrency (workers) | ops/sec (enqueue→claim→complete) | vs 10,000/sec line |
 |--:|--:|:--|
-| 1 | 2,540.30 | below |
-| 4 | 5,616.20 | below |
-| **8 (registered cell)** | **8,586.70** (3-run mean 8,827.90, range 8,586.70-9,091.80) | **below — 86-91% of line** |
-| 16 (supplementary) | 11,840.00 | above |
-| 32 (supplementary) | 14,457.00 | above |
-| 64 (supplementary) | 14,706.00 | above (plateau) |
+| 1 | 2,493.40 | below |
+| 4 | 6,058.40 | below |
+| **8 (registered cell)** | **8,449.80** (3-run mean 8,760.00, range 8,449.80-8,993.40) | **below — 84-90% of line** |
+| 16 (supplementary) | 11,985.10 | above |
+| 32 (supplementary) | 13,833.40 | above |
+| 64 (supplementary) | 15,635.60 | above (plateau) |
 
 Control (`docs/performance.md`, published, same reference machine shape — 4
 logical CPUs, not re-measured here): Postgres claim path sustains **640
@@ -266,14 +286,14 @@ measured, across three runs (wall-clock ceiling 60s, never approached):
 
 | run | claims/sec | drained before ceiling |
 |--:|--:|:--|
-| 1 | 12,358.76 | yes |
-| 2 | 11,738.81 | yes |
-| 3 | 12,716.71 | yes |
+| 1 | 12,138.24 | yes |
+| 2 | 11,437.72 | yes |
+| 3 | 12,436.69 | yes |
 
-Mean **12,271.43 claims/sec** — above the 10,000/sec line, and, taken on its
+Mean **12,004.22 claims/sec** — above the 10,000/sec line, and, taken on its
 own (not as a ratio against a differently-shaped Postgres number), faster
 than the registered steady-state cell at the same 8-worker concurrency
-(~8,828 mean), consistent with claim-only draining having one fewer Redis
+(~8,760 mean), consistent with claim-only draining having one fewer Redis
 round trip per op than enqueue-claim-complete and no empty-poll backoff while
 backlog remains.
 
@@ -297,7 +317,7 @@ at all: "Success = Engine can reliably sustain > 10,000 tasks/second queue
 dispatch and claim operations."
 
 On the **registered, 8-worker, steady-state sub-question**: the adapter
-measured 8,586.70-9,091.80 ops/sec (mean 8,827.90) across three runs, against
+measured 8,449.80-8,993.40 ops/sec (mean 8,760.00) across three runs, against
 the committed **≥10,000 ops/sec** line. That is a miss on every one of the
 three runs, under the single most favorable conditions this adapter will
 ever run in (no Postgres, no worker, no network hop, nothing else on the
@@ -316,7 +336,7 @@ charter instead):
 2. The exploratory backlog-drain measurement (see Assay — not a matched
    comparison against Postgres, see post-review correction #2, but still a
    real number for this adapter alone) also clears 10,000/sec at 8 workers:
-   mean 12,271.43 claims/sec.
+   mean 12,004.22 claims/sec.
 
 Read together: **the founding, unconstrained ">10,000 ops/sec, reliably
 sustained" claim looks achievable, not refuted**, under more than one
@@ -339,9 +359,9 @@ Phase-4 claim safe to keep documenting as-is): **no, but not because the
 number is false** — because it was never measured at all, and "never
 measured" is not the same finding as "measured and wrong." The doc should
 say: the founding >10,000/sec claim has now been measured and looks
-achievable (12,271 claims/sec mean under an exploratory, not
+achievable (12,004 claims/sec mean under an exploratory, not
 Postgres-matched, backlog-drain condition), an artificially narrow
-8-worker/steady-state sub-question was separately killed (8,828 mean), no
+8-worker/steady-state sub-question was separately killed (8,760 mean), no
 verified multiplier against the Postgres control exists (two were tried and
 both withdrawn), and — the part that actually gates usability — the adapter is
 unintegrated with the worker regardless of any of these numbers.

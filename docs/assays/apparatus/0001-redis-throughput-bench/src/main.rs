@@ -18,6 +18,26 @@ use tokio::sync::Barrier;
 
 const QUEUE_NAME: &str = "bench-shared";
 
+/// A fresh key prefix per scenario invocation, so a rerun (or the next cell
+/// in the same sweep) never inherits another run's leftover stream, consumer
+/// group, or un-acked entries. A fixed prefix reused across cells or runs
+/// would let stale state from one measurement bleed into the next -- e.g. a
+/// steady-state cell that hits its deadline with an enqueued-but-unclaimed
+/// entry still sitting on the stream would hand the next cell (or the
+/// backlog-drain scenario) a "seed exactly N" precondition that wasn't
+/// actually true. Mirrors the crate's own integration tests
+/// (`format!("test_{}", uuid::Uuid::new_v4().simple())`), without adding a
+/// `uuid` dependency to this throwaway apparatus.
+fn unique_prefix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos();
+    format!("bench-{}-{nanos}-{n}", std::process::id())
+}
+
 async fn run_worker(
     queue: RedisTaskQueue,
     worker_id: String,
@@ -66,6 +86,7 @@ async fn run_worker(
 }
 
 async fn sweep_one(concurrency: usize, duration: Duration, redis_url: &str) -> f64 {
+    let prefix = unique_prefix();
     let mut handles = Vec::with_capacity(concurrency);
     let counter = Arc::new(AtomicU64::new(0));
     // +1: main also waits at the gate, so the timer starts only once every
@@ -74,7 +95,7 @@ async fn sweep_one(concurrency: usize, duration: Duration, redis_url: &str) -> f
 
     for i in 0..concurrency {
         let cfg = RedisTaskQueueConfig {
-            key_prefix: "bench".to_string(),
+            key_prefix: prefix.clone(),
             ..RedisTaskQueueConfig::default()
         };
         let queue = RedisTaskQueue::connect(redis_url, cfg)
@@ -109,6 +130,14 @@ async fn sweep_one(concurrency: usize, duration: Duration, redis_url: &str) -> f
 /// a true match means reusing or porting that harness's scenario shape, not
 /// another one-off reimplementation. Numbers from this function are reported
 /// as exploratory and are never compared to the Postgres control by a ratio.
+/// Returns this worker's own (start, end) instants. `Barrier` does not
+/// guarantee the order in which released tasks resume, so for a scenario
+/// this short (~80ms observed), a timestamp taken by `main` after *its own*
+/// `wait()` returns can lag behind a worker that already resumed and started
+/// claiming -- inflating the reported rate by shrinking the denominator. Each
+/// worker times itself instead; the caller folds all of them into
+/// `min(start)..max(end)`, the same window-folding approach
+/// `docs/performance.md`'s own harness uses.
 async fn run_drain_worker(
     queue: RedisTaskQueue,
     worker_id: String,
@@ -116,12 +145,13 @@ async fn run_drain_worker(
     backlog: u64,
     completed: Arc<AtomicU64>,
     ceiling: Duration,
-) {
+) -> (Instant, Instant) {
     start_gate.wait().await;
-    let deadline = Instant::now() + ceiling;
+    let my_start = Instant::now();
+    let deadline = my_start + ceiling;
     loop {
         if completed.load(Ordering::Relaxed) >= backlog || Instant::now() >= deadline {
-            return;
+            break;
         }
         match queue.claim(std::slice::from_ref(&QUEUE_NAME.to_string()), &worker_id).await {
             Ok(Some(claimed)) => {
@@ -131,13 +161,14 @@ async fn run_drain_worker(
             }
             Ok(None) => {
                 if completed.load(Ordering::Relaxed) >= backlog {
-                    return;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_micros(200)).await;
             }
-            Err(_) => return,
+            Err(_) => break,
         }
     }
+    (my_start, Instant::now())
 }
 
 /// Returns (claims_per_sec, drained_before_ceiling).
@@ -147,8 +178,9 @@ async fn backlog_drain_scenario(
     ceiling: Duration,
     redis_url: &str,
 ) -> (f64, bool) {
+    let prefix = unique_prefix();
     let seed_cfg = RedisTaskQueueConfig {
-        key_prefix: "bench".to_string(),
+        key_prefix: prefix.clone(),
         ..RedisTaskQueueConfig::default()
     };
     let seeder = RedisTaskQueue::connect(redis_url, seed_cfg)
@@ -166,7 +198,7 @@ async fn backlog_drain_scenario(
 
     for i in 0..concurrency {
         let cfg = RedisTaskQueueConfig {
-            key_prefix: "bench".to_string(),
+            key_prefix: prefix.clone(),
             ..RedisTaskQueueConfig::default()
         };
         let queue = RedisTaskQueue::connect(redis_url, cfg)
@@ -176,16 +208,22 @@ async fn backlog_drain_scenario(
         let completed = completed.clone();
         let start_gate = start_gate.clone();
         handles.push(tokio::spawn(async move {
-            run_drain_worker(queue, worker_id, start_gate, backlog, completed, ceiling).await;
+            run_drain_worker(queue, worker_id, start_gate, backlog, completed, ceiling).await
         }));
     }
 
     start_gate.wait().await;
-    let started = Instant::now();
+    let mut window: Option<(Instant, Instant)> = None;
     for h in handles {
-        let _ = h.await;
+        if let Ok((start, end)) = h.await {
+            window = Some(match window {
+                None => (start, end),
+                Some((min_start, max_end)) => (min_start.min(start), max_end.max(end)),
+            });
+        }
     }
-    let elapsed = started.elapsed();
+    let (min_start, max_end) = window.expect("at least one worker");
+    let elapsed = max_end.duration_since(min_start);
 
     let drained = completed.load(Ordering::Relaxed);
     let drained_before_ceiling = drained >= backlog;
@@ -208,9 +246,12 @@ async fn main() {
         println!("{concurrency},{ops_per_sec:.2}");
     }
 
-    // Matched-workload comparison: drain a static 1,000-row backlog with 8
-    // claim-only workers, the same shape as docs/performance.md's headline
-    // Postgres cell (1,000 backlog, 8 concurrent claimers).
+    // Exploratory only -- NOT a matched reproduction of docs/performance.md's
+    // harness (see run_drain_worker's doc comment and assay #1's report,
+    // "post-review correction #2"): that harness spreads its backlog across
+    // 4 queues and claims only backlog/5 of it, holding depth at 80-100%;
+    // this drains one queue to zero. No ratio against the Postgres control
+    // should be derived from this number.
     let (claims_per_sec, drained) =
         backlog_drain_scenario(1_000, 8, Duration::from_secs(60), &redis_url).await;
     println!(
