@@ -216,8 +216,19 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
         match decision {
             ReapDecision::Skip(_) => continue,
             ReapDecision::StopThenRemove { postmaster_pid } => {
-                let resolved = binaries.get_or_insert_with(|| PostgresBinaries::discover().ok());
-                if !stop_orphan(resolved.as_ref(), &record, postmaster_pid) {
+                // The record's own `bin_dir` first: a cluster started from the
+                // downloaded cache lives where discovery does not look.
+                let recorded = record
+                    .bin_dir
+                    .clone()
+                    .filter(|dir| dir.is_dir())
+                    .map(PostgresBinaries::at);
+                let resolved = recorded.as_ref().or_else(|| {
+                    binaries
+                        .get_or_insert_with(|| PostgresBinaries::discover().ok())
+                        .as_ref()
+                });
+                if !stop_orphan(resolved, &record, postmaster_pid) {
                     // Still running and we could not stop it. Removing the data
                     // directory now would corrupt a live cluster, so leave both.
                     tracing::warn!(
@@ -273,7 +284,10 @@ fn postmaster_is_the_recorded_one(record: &SessionRecord, pid: u32) -> bool {
 /// `pg_ctl` is the only path that may signal, because it derives the pid from
 /// the data directory itself rather than trusting the record. A direct `kill`
 /// is used **only** when the recorded start token still matches, which proves
-/// the pid has not been reused.
+/// the pid has not been reused — and on Windows there is no such token, so
+/// `pg_ctl` is the *only* path at all. That is why the record carries the
+/// `bin_dir` that started the cluster: without it, a force-killed run that had
+/// downloaded its own `PostgreSQL` would be unstoppable on Windows.
 fn stop_orphan(
     binaries: Option<&PostgresBinaries>,
     record: &SessionRecord,

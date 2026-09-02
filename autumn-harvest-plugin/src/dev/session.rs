@@ -44,6 +44,22 @@ pub struct SessionRecord {
     pub postmaster_pid: Option<u32>,
     /// The cluster's data directory.
     pub data_dir: PathBuf,
+    /// The `bin` directory of the `PostgreSQL` install that started this
+    /// cluster.
+    ///
+    /// Recorded because *discovery cannot always find it again*. A default
+    /// `cargo dev` on a machine with no `PostgreSQL` downloads one into a
+    /// per-user cache that `PostgresBinaries::discover` does not search — so
+    /// after a force-kill, the reaper had no `pg_ctl` for that cluster. On
+    /// Windows it also had no fallback: `process_start_token` returns `None`
+    /// there, so the identity check that gates a direct `taskkill` can never
+    /// pass, and the orphaned postmaster and its data directory would have
+    /// survived every later start, forever.
+    ///
+    /// `#[serde(default)]` so a record written before this field existed still
+    /// parses rather than being skipped as unreadable.
+    #[serde(default)]
+    pub bin_dir: Option<PathBuf>,
     /// The postmaster's start time, as the kernel reports it.
     ///
     /// A pid alone does not identify a process: pids are reused, and the gap

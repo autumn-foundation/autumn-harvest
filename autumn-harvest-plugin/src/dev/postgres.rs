@@ -178,7 +178,7 @@ impl EphemeralPostgres {
         // likeliest place to be killed. A directory without a record is
         // invisible to the reaper forever, and this one already holds the
         // generated superuser password.
-        write_session_record(&session_dir, &data_dir, None)?;
+        write_session_record(&session_dir, &data_dir, None, binaries)?;
 
         match Self::provision(binaries, &session_dir, &data_dir).await {
             Ok(started) => Ok(started),
@@ -300,7 +300,12 @@ impl EphemeralPostgres {
         admin_url: &str,
         session_dir: &Path,
     ) -> Result<String, DevError> {
-        write_session_record(session_dir, &self.data_dir, Some(self.postmaster_pid))?;
+        write_session_record(
+            session_dir,
+            &self.data_dir,
+            Some(self.postmaster_pid),
+            &self.binaries,
+        )?;
 
         execute_sql(admin_url, &format!("CREATE DATABASE {DEV_DATABASE}")).await?;
         let version = query_scalar_on(&self.database_url, "SELECT version() AS value").await?;
@@ -682,12 +687,16 @@ fn write_session_record(
     session_dir: &Path,
     data_dir: &Path,
     postmaster_pid: Option<u32>,
+    binaries: &PostgresBinaries,
 ) -> Result<(), DevError> {
     write_private(
         &session_dir.join(SESSION_RECORD_FILE),
         &SessionRecord {
             owner_pid: std::process::id(),
             postmaster_pid,
+            // So the reaper can stop this cluster with the very binaries that
+            // started it, including a downloaded install discovery never sees.
+            bin_dir: Some(binaries.bin_dir().to_path_buf()),
             // Recorded together with the pid, so the reaper can later prove the
             // process at that pid is still the one we started rather than a
             // reuse of the number.

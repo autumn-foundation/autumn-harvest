@@ -18,8 +18,22 @@ That starts an ephemeral PostgreSQL, applies the engine's migrations, runs a
 worker, and serves the management API and the Vantage dashboard. It prints the
 dashboard URL and one `curl` that starts a sample workflow — an activity, a
 durable timer, another activity — so you can watch a real execution progress in
-the UI. `Ctrl-C` stops it and removes everything it created: no leftover
-processes, no leftover data directories.
+the UI, step by step through its append-only history. `Ctrl-C` stops it and
+removes everything it created: no leftover processes, no leftover data
+directories.
+
+Note the flip side of that last sentence: because the storage is thrown away on
+exit, **a `cargo dev` run cannot show you a workflow surviving a restart**. To
+watch that — the property the durable timer exists to demonstrate — point the
+runtime at a database of your own, which it will never delete:
+
+```bash
+HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev cargo dev
+```
+
+Start the sample, kill the process while the timer is counting down, and start
+it again: the engine replays the first activity from history rather than
+re-running it.
 
 The cluster it starts is **real PostgreSQL running the engine's real schema and
 real migrations**, so what you see is exactly what you would get in production.

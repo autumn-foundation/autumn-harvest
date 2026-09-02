@@ -124,6 +124,29 @@ build costs several minutes more for a sample that does one activity and one
 timer. Once built, the runtime itself reaches a completed workflow in seconds
 (plus a one-off ~30 MB Postgres download on a machine that has none).
 
+**Codex round 1 (one P1, two P2s, all real).** The P1 was the sharpest thing
+anyone said about this change: the banner told a brand-new user to *"kill this
+process mid-timer and start it again to watch the run resume from history"* —
+a demonstration provisioned storage makes impossible, because `shutdown` deletes
+the cluster and the reaper reclaims a killed run's directory. Following it would
+have shown an empty run and taught a first-time reader that the engine loses
+workflows, in the one place the feature exists to build confidence. The
+restart-resume demonstration is now offered only where it can actually work — a
+database the runtime did not create — and the provisioned banner points at
+`HARVEST_DEV_DATABASE_URL` instead.
+
+The two P2s were also genuine. Keyword/value redaction tokenised on whitespace,
+so a quoted password containing a space (`password='foo hunter2'`) left half the
+credential standing in the very string that exists to be safe to paste; it is now
+a real scanner that consumes quoted spans whole, escapes included. And the reaper
+could not stop a cluster started by *downloaded* binaries: discovery never
+searches the managed cache, and on Windows `process_start_token` is always
+`None`, so the identity check gating a direct `taskkill` can never pass — a
+force-killed `cargo dev` on Windows would have leaked its postmaster and data
+directory permanently. The session record now carries the `bin_dir` that started
+the cluster (`#[serde(default)]`, so older records still parse and are still
+reclaimed), and the reaper prefers it over discovery.
+
 **Docs.** `docs/getting-started/01-project-skeleton.md` now opens with the
 zero-setup path as the default first step and keeps the Docker/Compose route as
 the explicit "bring your own Postgres" alternative, unchanged.

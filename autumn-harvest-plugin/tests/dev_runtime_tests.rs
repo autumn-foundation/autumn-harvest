@@ -431,6 +431,7 @@ fn record(owner_pid: u32, postmaster_pid: Option<u32>) -> SessionRecord {
         owner_pid,
         postmaster_pid,
         postmaster_start_token: Some("87231".to_owned()),
+        bin_dir: Some(PathBuf::from("/usr/lib/postgresql/16/bin")),
         data_dir: PathBuf::from("/tmp/harvest-dev-0/session-1-aa/data"),
         created_at: chrono::Utc::now(),
     }
@@ -522,6 +523,36 @@ fn a_malformed_stat_line_yields_no_start_token() {
     for stat in ["", "garbage", "4243 (postgres", "4243 (postgres) S 1"] {
         assert_eq!(proc_stat_start_time(stat), None, "{stat:?}");
     }
+}
+
+#[test]
+fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
+    // Codex round 1 (P2). A default `cargo dev` on a machine with no
+    // PostgreSQL downloads one into a per-user cache that discovery does not
+    // search. Without this field the reaper had no `pg_ctl` for such a
+    // cluster — and on Windows no fallback either, since `process_start_token`
+    // is `None` there, so a force-killed run would have leaked its postmaster
+    // and data directory permanently.
+    let record = record(4242, Some(4243));
+    let decoded =
+        SessionRecord::from_json(&record.to_json().expect("serialize")).expect("deserialize");
+    assert_eq!(decoded.bin_dir, record.bin_dir);
+}
+
+#[test]
+fn a_record_written_before_bin_dir_existed_still_parses() {
+    // `#[serde(default)]`, so an older leftover is reclaimed rather than
+    // skipped as unreadable and left on disk forever.
+    let older = r#"{
+        "owner_pid": 4242,
+        "postmaster_pid": 4243,
+        "postmaster_start_token": "87231",
+        "data_dir": "/tmp/harvest-dev-0/session-1-aa/data",
+        "created_at": "2026-09-02T00:00:00Z"
+    }"#;
+    let decoded = SessionRecord::from_json(older).expect("an older record must still parse");
+    assert_eq!(decoded.owner_pid, 4242);
+    assert_eq!(decoded.bin_dir, None);
 }
 
 #[test]
@@ -814,6 +845,67 @@ fn redaction_is_not_confused_by_an_at_sign_after_the_authority() {
     let redacted = redact_dsn(dsn);
     assert!(!redacted.contains("hunter2"), "{redacted}");
     assert!(redacted.contains("@localhost:5432/app"), "{redacted}");
+}
+
+#[test]
+fn banner_does_not_promise_a_restart_demonstration_provisioned_storage_cannot_give() {
+    // Codex round 1 (P1). The banner used to say "kill this process mid-timer
+    // and start it again to watch the run resume from history". With
+    // provisioned storage that is impossible — `shutdown` deletes the cluster
+    // and the reaper reclaims a killed run's directory — so a new user
+    // following it would see an empty run and conclude the engine had lost
+    // their workflow.
+    let banner = render_banner(&banner_inputs());
+    let lowered = banner.to_lowercase();
+    assert!(
+        !lowered.contains("resume from history"),
+        "the provisioned banner must not promise restart-resume: {banner}"
+    );
+    assert!(
+        !lowered.contains("start it\n  again") && !lowered.contains("start it again"),
+        "the provisioned banner must not tell people to restart into a fresh cluster: {banner}"
+    );
+    // It should still point at where the demonstration *does* work.
+    assert!(
+        banner.contains("HARVEST_DEV_DATABASE_URL"),
+        "offer the configuration that can actually survive a restart: {banner}"
+    );
+}
+
+#[test]
+fn banner_offers_the_restart_demonstration_only_for_a_database_we_did_not_create() {
+    let mut inputs = banner_inputs();
+    inputs.storage = StorageDescription::BringYourOwn {
+        redacted_dsn: "postgres://u:***@localhost:5432/harvest_dev".to_owned(),
+    };
+    let banner = render_banner(&inputs);
+    assert!(
+        banner.to_lowercase().contains("resumes from history"),
+        "a database that outlives the process CAN demonstrate durability: {banner}"
+    );
+}
+
+#[test]
+fn redaction_survives_a_quoted_password_containing_whitespace() {
+    // Codex round 1 (P2). `split_whitespace()` redacted `password='foo` and
+    // left `hunter2'` in a string whose whole purpose is to be safe to paste.
+    for dsn in [
+        "host=localhost password='foo hunter2' dbname=app",
+        "host=localhost password = 'foo hunter2' dbname=app",
+        r"host=localhost password='it\'s hunter2' dbname=app",
+        "PASSWORD='foo hunter2' dbname=app",
+        r"host=localhost password=hunter2\ still dbname=app",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert!(
+            redacted.contains("dbname=app"),
+            "redaction must not eat the rest of the DSN: {dsn} -> {redacted}"
+        );
+    }
 }
 
 #[test]
