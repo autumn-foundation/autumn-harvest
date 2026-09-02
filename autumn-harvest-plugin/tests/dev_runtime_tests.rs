@@ -45,14 +45,37 @@ fn classify_accepts_a_loopback_url_dsn() {
     }
 }
 
+/// The socket DSN `EphemeralPostgres` produces when it listens on a socket
+/// directory rather than a TCP port.
+const UNIX_SOCKET_DSN: &str = "postgres:///harvest_dev?host=/tmp/harvest-dev-1234-ab/socket";
+
+#[cfg(unix)]
 #[test]
 fn classify_accepts_a_unix_socket_dsn() {
-    // The shape `EphemeralPostgres` itself produces when it listens on a socket
-    // directory rather than a TCP port.
-    let dsn = "postgres:///harvest_dev?host=/tmp/harvest-dev-1234-ab/socket";
     assert!(
-        matches!(classify_database_url(dsn), DatabaseSafety::Allowed),
+        matches!(
+            classify_database_url(UNIX_SOCKET_DSN),
+            DatabaseSafety::Allowed
+        ),
         "unix-socket DSN must be allowed"
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn classify_refuses_a_unix_socket_dsn_where_there_are_no_unix_sockets() {
+    // `tokio_postgres::config::Host::Unix` is `#[cfg(unix)]`, so off Unix the
+    // client parses `host=/tmp/...` as an ordinary TCP *hostname* — and the gate
+    // classifies whatever the client will actually dial, by design. A name that
+    // is not loopback is refused, which is the right answer on a platform with
+    // no Unix sockets to reach: the DSN could not have worked anyway, and
+    // failing closed beats inventing a meaning the client does not share.
+    assert!(
+        matches!(
+            classify_database_url(UNIX_SOCKET_DSN),
+            DatabaseSafety::Refused(_)
+        ),
+        "a socket path is not reachable off Unix, so it must not be allowed"
     );
 }
 
@@ -734,9 +757,16 @@ fn the_unix_socket_lives_inside_the_session_directory() {
     // postmaster then starts, fails `could not create lock file`, and shuts
     // down. Confining it here also means it is reclaimed with the session.
     let session = Path::new("/tmp/harvest-dev-1-aa");
-    let conf = postgres_conf_lines(5432, &session.join("socket")).join("\n");
+    let socket_dir = session.join("socket");
+    let conf = postgres_conf_lines(5432, &socket_dir).join("\n");
+    // Built from the same path rather than spelled out: `Path::join` uses the
+    // platform separator, so a hard-coded POSIX string asserts the separator
+    // instead of the containment this test is about.
     assert!(
-        conf.contains("unix_socket_directories = '/tmp/harvest-dev-1-aa/socket'"),
+        conf.contains(&format!(
+            "unix_socket_directories = '{}'",
+            socket_dir.display()
+        )),
         "{conf}"
     );
     assert!(
