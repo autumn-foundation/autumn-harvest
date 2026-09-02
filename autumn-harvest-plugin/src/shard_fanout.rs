@@ -36,6 +36,12 @@ pub struct ShardObservation<R> {
 /// prelude here means a new fan-out read model implements only its own query
 /// against the returned connection, not this guard by hand — it was
 /// hand-copied into eight read models before this extraction.
+///
+/// # Errors
+///
+/// Returns the [`ShardObservation`] the caller should record for this shard
+/// when no pool is configured for it, or when a connection could not be
+/// acquired from the pool.
 pub async fn acquire_shard_conn<R>(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -299,11 +305,9 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
-        let result: Result<PoolConn, ShardObservation<i64>> =
-            acquire_shard_conn(7, None).await;
-        let observation = match result {
-            Err(observation) => observation,
-            Ok(_) => panic!("no pool must be an error observation"),
+        let result: Result<PoolConn, ShardObservation<i64>> = acquire_shard_conn(7, None).await;
+        let Err(observation) = result else {
+            panic!("no pool must be an error observation");
         };
         assert_eq!(observation.shard_id, 7);
         assert!(observation.rows.is_empty());
@@ -327,9 +331,8 @@ mod tests {
 
         let result: Result<PoolConn, ShardObservation<i64>> =
             acquire_shard_conn(3, Some(pool)).await;
-        let observation = match result {
-            Err(observation) => observation,
-            Ok(_) => panic!("unreachable pool must be an error observation"),
+        let Err(observation) = result else {
+            panic!("unreachable pool must be an error observation");
         };
         assert_eq!(observation.shard_id, 3);
         assert!(observation.rows.is_empty());
