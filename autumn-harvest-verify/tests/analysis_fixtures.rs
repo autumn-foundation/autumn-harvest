@@ -1,0 +1,515 @@
+//! End-to-end analysis expectations over real MIR (D4–D7, D9).
+//!
+//! Two halves:
+//!  * the **false-positive baseline** — a real, well-behaved workspace example
+//!    that uses only sanctioned primitives and must not be flagged;
+//!  * the **laundering matrix** — `tests/fixtures/format_and_outparams.rs`, one
+//!    `#[workflow]`-shaped fn per mechanism, each with the
+//!    `__autumn_workflow_info_*` companion `entry::discover` keys on.
+//!
+//! RED phase: `entry::discover`, `analysis::analyze` and `Program::build` are all
+//! `todo!()`.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use autumn_harvest_verify::analysis;
+use autumn_harvest_verify::entry::{self, Entry};
+use autumn_harvest_verify::mir::{self, MirDoc};
+use autumn_harvest_verify::model::Model;
+use autumn_harvest_verify::resolve::{Program, SourceRoots};
+use autumn_harvest_verify::verdict::{
+    Boundary, BoundaryKind, Finding, FindingKind, TaintKind, Verdict, WorkflowVerdict,
+};
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest-verify has a parent")
+        .to_path_buf()
+}
+
+fn parse_fixture(name: &str) -> MirDoc {
+    let path = fixtures_dir().join(name);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    mir::parse("fixture", name, &text)
+}
+
+fn model() -> Model {
+    Model::builtin().expect("the embedded model must parse")
+}
+
+fn run(fixture: &str, roots: &SourceRoots) -> (Vec<Entry>, Vec<WorkflowVerdict>) {
+    let docs = vec![parse_fixture(fixture)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, roots).expect("build");
+    let verdicts = analysis::analyze(&program, &model(), &entries);
+    (entries, verdicts)
+}
+
+fn matrix() -> Vec<WorkflowVerdict> {
+    run(
+        "format_and_outparams.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1
+}
+
+fn pick<'a>(verdicts: &'a [WorkflowVerdict], workflow: &str) -> &'a WorkflowVerdict {
+    verdicts
+        .iter()
+        .find(|v| v.workflow == workflow || v.workflow.ends_with(&format!("::{workflow}")))
+        .unwrap_or_else(|| {
+            let have: Vec<&str> = verdicts.iter().map(|v| v.workflow.as_str()).collect();
+            panic!("no verdict for {workflow:?}; analyzed = {have:#?}")
+        })
+}
+
+fn findings(v: &WorkflowVerdict) -> &[Finding] {
+    match &v.verdict {
+        Verdict::NondeterminismFound { findings } => findings,
+        _ => &[],
+    }
+}
+
+/// Boundaries from both places they can appear (D9 keeps them even on a finding).
+fn boundaries(v: &WorkflowVerdict) -> Vec<&Boundary> {
+    let inner = match &v.verdict {
+        Verdict::Unknown { boundaries } => boundaries.as_slice(),
+        _ => &[],
+    };
+    inner.iter().chain(v.boundaries.iter()).collect()
+}
+
+fn boundary_kinds(v: &WorkflowVerdict) -> BTreeSet<BoundaryKind> {
+    boundaries(v).iter().map(|b| b.kind).collect()
+}
+
+fn trace_text(f: &Finding) -> String {
+    f.trace
+        .iter()
+        .map(|h| format!("{} :: {}", h.function, h.step))
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
+fn assert_clean(v: &WorkflowVerdict, why: &str) {
+    assert!(
+        findings(v).is_empty(),
+        "{} ({why}) must not be flagged; findings:\n{}",
+        v.workflow,
+        findings(v)
+            .iter()
+            .map(trace_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn assert_found(v: &WorkflowVerdict, kind: FindingKind, taint: TaintKind) -> &Finding {
+    let f = findings(v)
+        .iter()
+        .find(|f| f.kind == kind && f.taint == taint);
+    f.unwrap_or_else(|| {
+        panic!(
+            "{} must report a {kind:?}/{taint:?} finding; verdict = {:?}, boundaries = {:?}",
+            v.workflow,
+            v.verdict.name(),
+            boundary_kinds(v)
+        )
+    })
+}
+
+// ── FP baseline: a real, well-behaved workspace example ────────────────────
+
+#[test]
+fn deterministic_primitives_example_is_discovered() {
+    let docs = vec![parse_fixture("example_deterministic_primitives.mir")];
+    let entries = entry::discover(&docs);
+    assert_eq!(
+        entries.len(),
+        1,
+        "one `#[workflow]` fn in this example; got {entries:#?}"
+    );
+    let e = &entries[0];
+    assert!(
+        e.workflow.ends_with("notify_decision"),
+        "got {}",
+        e.workflow
+    );
+    assert_eq!(e.body, "notify_decision::{closure#0}");
+    assert!(
+        e.body.ends_with("::{closure#0}"),
+        "an async `#[workflow]` fn's analyzable body is its coroutine body"
+    );
+}
+
+#[test]
+fn deterministic_primitives_example_is_not_flagged() {
+    // The FP baseline. This example deliberately uses only `system_now`,
+    // `new_uuid`, `random_range` and `side_effect` — the sanctioned primitives.
+    let (_, verdicts) = run(
+        "example_deterministic_primitives.mir",
+        &SourceRoots {
+            roots: vec![workspace_root()],
+        },
+    );
+    let v = pick(&verdicts, "notify_decision");
+    assert_ne!(
+        v.verdict.name(),
+        "nondeterminism-found",
+        "false positive on the sanctioned-primitives example; findings:\n{}",
+        findings(v)
+            .iter()
+            .map(trace_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if v.verdict.name() == "unknown" {
+        // Not a failure here — this test only forbids a false positive — but the
+        // boundaries must be named so the gap is visible.
+        let named: Vec<String> = boundaries(v)
+            .iter()
+            .map(|b| format!("{}: {}", b.kind.name(), b.detail))
+            .collect();
+        println!("notify_decision is `unknown` under boundaries: {named:#?}");
+        assert!(
+            !named.is_empty(),
+            "an `unknown` verdict must name at least one boundary (D9)"
+        );
+    }
+}
+
+#[test]
+fn deterministic_primitives_example_is_proven() {
+    // The stronger claim, kept separate so a legitimate boundary shows up as a
+    // distinct failure from a false positive.
+    let (_, verdicts) = run(
+        "example_deterministic_primitives.mir",
+        &SourceRoots {
+            roots: vec![workspace_root()],
+        },
+    );
+    let v = pick(&verdicts, "notify_decision");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:#?}",
+        boundaries(v)
+            .iter()
+            .map(|b| format!("{}: {}", b.kind.name(), b.detail))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── the laundering matrix: every workflow-like fn is discovered ────────────
+
+#[test]
+fn every_companion_fn_in_the_matrix_is_discovered() {
+    let docs = vec![parse_fixture("format_and_outparams.mir")];
+    let entries = entry::discover(&docs);
+    let names: BTreeSet<&str> = entries.iter().map(|e| e.workflow.as_str()).collect();
+    for expected in [
+        "wf_format_into_activity_name",
+        "wf_out_param_launder",
+        "wf_side_effect_is_clean",
+        "wf_hashmap_iteration",
+        "wf_sorted_keys",
+        "wf_branch_on_wallclock",
+        "wf_branch_on_version",
+        "wf_try_on_clean_result",
+        "wf_await_is_clean",
+        "wf_lazylock_deref",
+        "wf_oncelock_get_or_init",
+        "wf_plain_static_is_clean",
+        "wf_static_mut_raw_read",
+        "wf_ffi_clock",
+        "wf_fn_pointer",
+        "wf_dyn_two_impls",
+        "wf_dyn_single_impl",
+        "wf_option_map_closure",
+        "wf_sort_by_ambient_comparator",
+        "wf_thread_local_counter",
+        "wf_observability_is_clean",
+    ] {
+        assert!(
+            names.contains(expected),
+            "not discovered: {expected}; got {names:#?}"
+        );
+    }
+    for e in &entries {
+        assert!(
+            e.body.ends_with("::{closure#0}"),
+            "{} -> {}",
+            e.workflow,
+            e.body
+        );
+    }
+}
+
+// ── Value taint ────────────────────────────────────────────────────────────
+
+#[test]
+fn format_of_wallclock_into_an_activity_name_is_found() {
+    let v = matrix();
+    let v = pick(&v, "wf_format_into_activity_name");
+    let f = assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+    let trace = trace_text(f);
+    assert!(
+        trace.contains("stamped_name"),
+        "the trace must name the helper: {trace}"
+    );
+    assert!(
+        trace.contains("wall_clock_secs"),
+        "and the fn that reads the clock: {trace}"
+    );
+    assert!(
+        f.sink.what.contains("execute_activity_raw"),
+        "sink site: {:?}",
+        f.sink
+    );
+}
+
+#[test]
+fn out_param_laundering_is_found() {
+    let v = matrix();
+    let v = pick(&v, "wf_out_param_launder");
+    let f = assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+    assert!(
+        trace_text(f).contains("fill_seq"),
+        "trace: {}",
+        trace_text(f)
+    );
+}
+
+#[test]
+fn side_effect_captured_wallclock_is_clean() {
+    let v = matrix();
+    let v = pick(&v, "wf_side_effect_is_clean");
+    assert_clean(v, "`side_effect` records the value once and replays it");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn lazylock_deref_is_found() {
+    let v = matrix();
+    let v = pick(&v, "wf_lazylock_deref");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+}
+
+#[test]
+fn oncelock_initializer_is_found() {
+    let v = matrix();
+    let v = pick(&v, "wf_oncelock_get_or_init");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+}
+
+#[test]
+fn thread_local_counter_is_found() {
+    let v = matrix();
+    let v = pick(&v, "wf_thread_local_counter");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+}
+
+#[test]
+fn option_map_closure_carries_taint_out() {
+    let v = matrix();
+    let v = pick(&v, "wf_option_map_closure");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+}
+
+#[test]
+fn plain_immutable_static_read_is_clean() {
+    // Textually identical to the `COUNTER` read at the use site (`const {allocN: &T}`);
+    // only the static's declared TYPE separates them (A13/M7).
+    let v = matrix();
+    let v = pick(&v, "wf_plain_static_is_clean");
+    assert_clean(v, "an immutable `static PLAIN_LIMIT: u64` is deterministic");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+// ── Order taint ────────────────────────────────────────────────────────────
+
+#[test]
+fn hashmap_iteration_driving_commands_is_found_as_order() {
+    let v = matrix();
+    let v = pick(&v, "wf_hashmap_iteration");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Order);
+}
+
+#[test]
+fn sorting_the_keys_first_is_clean() {
+    let v = matrix();
+    let v = pick(&v, "wf_sorted_keys");
+    assert_clean(v, "`sort` is a sanitizer for Order taint (D4)");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn an_ambient_comparator_taints_the_order_not_the_values() {
+    let v = matrix();
+    let v = pick(&v, "wf_sort_by_ambient_comparator");
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Order);
+}
+
+// ── Control taint ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_command_behind_a_wallclock_branch_is_control_dependent() {
+    let v = matrix();
+    let v = pick(&v, "wf_branch_on_wallclock");
+    let f = assert_found(v, FindingKind::ControlDependentSink, TaintKind::Control);
+    assert!(
+        f.source.what.contains("wall_clock_secs") || f.source.what.contains("SystemTime"),
+        "source site: {:?}",
+        f.source
+    );
+}
+
+#[test]
+fn branching_on_history_metadata_is_clean() {
+    let v = matrix();
+    let v = pick(&v, "wf_branch_on_version");
+    assert_clean(
+        v,
+        "`ctx.version()` is the sanctioned versioning idiom, not a source",
+    );
+}
+
+#[test]
+fn try_on_a_clean_result_is_not_control_taint() {
+    // `?` lowers to `Try::branch` + `switchInt(discriminant(..))`; it is the
+    // single biggest FP driver (A18/M8).
+    let v = matrix();
+    let v = pick(&v, "wf_try_on_clean_result");
+    assert_clean(v, "`?` on a clean Result");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn the_coroutine_state_switch_is_not_control_taint() {
+    // Every async body opens with `switchInt(discriminant((*_N)))`. If that were
+    // control taint, every single workflow would be flagged.
+    let v = matrix();
+    let v = pick(&v, "wf_await_is_clean");
+    assert_clean(v, "the coroutine's own resume-state switch");
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn sanctioned_and_non_sink_ctx_methods_are_clean() {
+    let v = matrix();
+    let v = pick(&v, "wf_observability_is_clean");
+    assert_clean(
+        v,
+        "`metrics` is a non-sink, `system_now` is sanctioned, `timer`'s arg is a constant",
+    );
+    assert_eq!(
+        v.verdict,
+        Verdict::ProvenDeterministic,
+        "boundaries: {:?}",
+        boundary_kinds(v)
+    );
+}
+
+// ── boundaries ─────────────────────────────────────────────────────────────
+
+#[test]
+fn static_mut_raw_read_is_an_unsafe_raw_pointer_boundary() {
+    let v = matrix();
+    let v = pick(&v, "wf_static_mut_raw_read");
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::UnsafeRawPointer),
+        "got {:?} / {:?}",
+        v.verdict.name(),
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn extern_c_call_is_an_ffi_boundary() {
+    let v = matrix();
+    let v = pick(&v, "wf_ffi_clock");
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::Ffi),
+        "got {:?} / {:?}",
+        v.verdict.name(),
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn fn_pointer_call_is_an_indirect_call_boundary() {
+    let v = matrix();
+    let v = pick(&v, "wf_fn_pointer");
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::IndirectCall),
+        "got {:?} / {:?}",
+        v.verdict.name(),
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn two_impls_behind_a_dyn_trait_is_a_dyn_dispatch_boundary() {
+    let v = matrix();
+    let v = pick(&v, "wf_dyn_two_impls");
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::DynDispatch),
+        "got {:?} / {:?}",
+        v.verdict.name(),
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn a_single_impl_behind_a_dyn_trait_is_devirtualized_and_caught() {
+    // AC3's seeded "rand behind a trait object" case only becomes
+    // `nondeterminism-found` if RTA-lite devirtualizes it (A10).
+    let v = matrix();
+    let v = pick(&v, "wf_dyn_single_impl");
+    let f = assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+    let trace = trace_text(f);
+    assert!(
+        trace.contains("now_secs") || trace.contains("SystemClock"),
+        "the trace must name the devirtualized impl: {trace}"
+    );
+    assert!(
+        !boundary_kinds(v).contains(&BoundaryKind::DynDispatch),
+        "exactly one type is unsized to `dyn Clock` here, so this is not a boundary"
+    );
+}

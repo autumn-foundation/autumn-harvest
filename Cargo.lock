@@ -2876,6 +2876,8 @@ version = "0.6.0"
 dependencies = [
  "harvest-verify-corpus-helpers-deep",
  "rand 0.8.6",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

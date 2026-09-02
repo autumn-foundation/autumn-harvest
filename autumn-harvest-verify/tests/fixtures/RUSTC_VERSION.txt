@@ -1,0 +1,36 @@
+rustc 1.94.1 (e408947bf 2026-03-25)
+binary: rustc
+commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1
+commit-date: 2026-03-25
+host: x86_64-unknown-linux-gnu
+release: 1.94.1
+LLVM version: 21.1.8
+
+cargo 1.94.1 (29ea6fb6a 2026-03-24)
+
+# How each fixture in this directory was produced
+#
+# The hand-written fixtures are compiled standalone from the source file that
+# sits next to them, from *this directory*, so that the `<impl at FILE:l:c>`
+# headers and `{closure@FILE:l:c: l:c}` spans name the checked-in `.rs` file:
+#
+#   rustc --crate-type lib --edition 2024 --emit=mir -o spike.mir              spike.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o format_and_outparams.mir format_and_outparams.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o async_multi_await.mir  async_multi_await.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o generic_layers.mir     generic_layers.rs
+#
+# `example_deterministic_primitives.mir` is a real, untrimmed dump of a real
+# workspace example (do not trim it: the bodies are interdependent). From the
+# workspace root:
+#
+#   cargo rustc -p autumn-harvest --example deterministic_primitives \
+#       --no-default-features --features testing \
+#       --target-dir target/agent-engine -- --emit=mir -C opt-level=0
+#
+# and the result was copied from
+#
+#   target/agent-engine/debug/examples/deterministic_primitives-e38e618daf843f63.mir
+#
+# Its `<impl at ...>` headers are relative to the WORKSPACE ROOT
+# (`autumn-harvest/examples/deterministic_primitives.rs`), not to this
+# directory, so resolution tests must use the workspace root as a source root.

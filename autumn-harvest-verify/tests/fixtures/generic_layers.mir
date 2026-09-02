@@ -1,0 +1,139 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at generic_layers.rs:13:1: 13:20>::score(_1: &Leaf) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = copy ((*_1).0: u64);
+        return;
+    }
+}
+
+fn <impl at generic_layers.rs:21:1: 21:36>::score(_1: &Wrapper<T>) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+    let mut _2: u64;
+    let mut _3: &T;
+    let mut _4: (u64, bool);
+
+    bb0: {
+        _3 = &((*_1).0: T);
+        _2 = <T as Score>::score(move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = AddWithOverflow(copy _2, const 1_u64);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", move _2, const 1_u64) -> [success: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = move (_4.0: u64);
+        return;
+    }
+}
+
+fn inner(_1: &T) -> u64 {
+    debug t => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = <T as Score>::score(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn outer(_1: &T) -> u64 {
+    debug t => _1;
+    let mut _0: u64;
+    let mut _2: u64;
+    let mut _3: u64;
+    let mut _4: (u64, bool);
+
+    bb0: {
+        _2 = inner::<T>(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _3 = inner::<T>(copy _1) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _4 = AddWithOverflow(copy _2, copy _3);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", move _2, move _3) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        _0 = move (_4.0: u64);
+        return;
+    }
+}
+
+fn entry() -> u64 {
+    let mut _0: u64;
+    let _1: &Wrapper<Leaf>;
+
+    bb0: {
+        _1 = const entry::promoted[0];
+        _0 = outer::<Wrapper<Leaf>>(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+const entry::promoted[0]: &Wrapper<Leaf> = {
+    let mut _0: &Wrapper<Leaf>;
+    let mut _1: Wrapper<Leaf>;
+    let mut _2: Leaf;
+
+    bb0: {
+        _2 = Leaf(const 3_u64);
+        _1 = Wrapper::<Leaf>(move _2);
+        _0 = &_1;
+        return;
+    }
+}
+
+fn Leaf(_1: u64) -> Leaf {
+    let mut _0: Leaf;
+
+    bb0: {
+        _0 = Leaf(move _1);
+        return;
+    }
+}
+
+// MIR FOR CTFE
+fn Leaf(_1: u64) -> Leaf {
+    let mut _0: Leaf;
+
+    bb0: {
+        _0 = Leaf(move _1);
+        return;
+    }
+}
+
+fn Wrapper(_1: T) -> Wrapper<T> {
+    let mut _0: Wrapper<T>;
+
+    bb0: {
+        _0 = Wrapper::<T>(move _1);
+        return;
+    }
+}
+
+// MIR FOR CTFE
+fn Wrapper(_1: T) -> Wrapper<T> {
+    let mut _0: Wrapper<T>;
+
+    bb0: {
+        _0 = Wrapper::<T>(move _1);
+        return;
+    }
+}
