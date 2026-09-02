@@ -51,7 +51,13 @@ file collides with.
 |---:|---:|---:|---:|---:|---:|
 | 550 | 777 | 8,541 | 19,821 | 39,127 | 54,425 |
 
-Growth is accelerating, not levelling off. At HEAD the file holds 312 `async
+Growth has been rapid and sustained across every release interval, without a
+clean accelerating trend: 28 lines/day (v0.1.0→v0.2.0), 518 (v0.2.0→v0.3.0),
+313 (v0.3.0→v0.4.0), 522 (v0.4.0→v0.5.0), 450 (v0.5.0→trunk-dev HEAD) — the
+most recent interval is slightly below the v0.4.0→v0.5.0 peak, not above it,
+but every interval since v0.2.0 has added the file's growth at 300+
+lines/day, and no interval shows the growth trending toward zero. At HEAD the
+file holds 312 `async
 fn` definitions in total (`grep -cE '^\s*(pub(\(.*\))? )?async fn '`: 299 at
 top level plus 13 inside `#[cfg(test)]` modules); of those, 168 are wired as
 HTTP method handlers (`get`/`post`/`put`/`patch`/`delete`) across 165
@@ -71,15 +77,20 @@ Both are present in the top 10, and they should not be treated the same way:
   construction; this is the domain, not an organization defect, and matches
   the example pattern in the Keystone process ("A and B are inherent to the
   domain").
-- **Inherent (composition-root cost, already an accepted architectural
-  choice):** `lib.rs`, `builder.rs`, `plugin.rs`, `cli/lib.rs` are the
-  re-export surface, the `HarvestBuilder` config surface, the plugin
-  registration surface, and the CLI entry point. ADR-0002 (rust-native
-  execution boundary) already commits this codebase to a single strongly
-  typed runtime with one builder — every new capability needing a
-  config knob, a re-export, or a plugin hook is the accepted cost of that
-  decision, and these files are small (876–4,107 lines): touching them is
-  cheap even when touch-frequency is high.
+- **Inherent to the current composition-root design (an implementation
+  choice, not an ADR'd decision):** `lib.rs`, `builder.rs`, `plugin.rs`,
+  `cli/lib.rs` are the re-export surface, the `HarvestBuilder` config
+  surface, the plugin registration surface, and the CLI entry point. ADR-0002
+  (rust-native execution boundary) decides that workflow/activity authoring
+  stays Rust-only and rejects a polyglot worker protocol — it does not
+  prescribe a single builder or a centralized config/re-export/plugin
+  surface, so it is not evidence that this file set's coupling was a
+  deliberate architectural choice, only that today's implementation happens
+  to route every new capability through one builder and one re-export
+  module. That routing is why touch-frequency is high here too. Unlike
+  `api.rs`, though, these files are small (876–4,107 lines), so even
+  frequent touches are cheap and low-conflict — the measured cost is much
+  lower, not the design pedigree.
 - **Accidental, and the outlier:** `api.rs` (and, at smaller scale,
   `ui.rs`) is not inherent. Every other domain concern in
   `autumn-harvest-plugin/src/` is already factored into its own file —
@@ -102,10 +113,11 @@ Both are present in the top 10, and they should not be treated the same way:
 
 Nothing about this is a one-way door and nothing about it is urgent: the file
 compiles, the tests inside it pass, and no external contract changes. Left
-alone, the trend (550 → 54,425 lines across 5 tagged releases, still
-accelerating) says the file keeps absorbing every new endpoint at the same
-rate features ship, and the 44.4%-of-commits touch rate — already the highest
-in the repo — keeps rising with it. The cost is coordination risk (near every
+alone, the trend (550 → 54,425 lines across 5 tagged releases, sustained at
+300+ lines/day since v0.2.0) says the file keeps absorbing every new endpoint
+at the same rate features ship, and the 44.4%-of-commits touch rate —
+already the highest in the repo — keeps rising with it. The cost is
+coordination risk (near every
 concurrent feature PR now edits the same file) and reviewability (a 55K-line
 file has no natural review boundary), not correctness or an outage risk.
 
