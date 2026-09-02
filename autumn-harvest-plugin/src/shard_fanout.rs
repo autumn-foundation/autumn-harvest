@@ -301,7 +301,10 @@ mod tests {
     async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
         let result: Result<PoolConn, ShardObservation<i64>> =
             acquire_shard_conn(7, None).await;
-        let observation = result.expect_err("no pool must be an error observation");
+        let observation = match result {
+            Err(observation) => observation,
+            Ok(_) => panic!("no pool must be an error observation"),
+        };
         assert_eq!(observation.shard_id, 7);
         assert!(observation.rows.is_empty());
         assert_eq!(
@@ -324,7 +327,10 @@ mod tests {
 
         let result: Result<PoolConn, ShardObservation<i64>> =
             acquire_shard_conn(3, Some(pool)).await;
-        let observation = result.expect_err("unreachable pool must be an error observation");
+        let observation = match result {
+            Err(observation) => observation,
+            Ok(_) => panic!("unreachable pool must be an error observation"),
+        };
         assert_eq!(observation.shard_id, 3);
         assert!(observation.rows.is_empty());
         assert_eq!(
