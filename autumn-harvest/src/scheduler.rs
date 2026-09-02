@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -5278,6 +5278,89 @@ pub async fn schedule_running_basis(
         .map_err(crate::error::database_error)?;
     let pending = crate::throttle::pending_throttle_count_for_workflow(conn, name).await?;
     Ok(running.saturating_add(pending))
+}
+
+/// Batched form of [`schedule_running_basis`] for many schedule names at once.
+///
+/// One grouped `RUNNING`/`PAUSED` count query plus one grouped
+/// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`])
+/// covering every name in `names`, all on **one shard** connection, instead
+/// of the two queries *per name* `schedule_running_basis` issues when called
+/// in a loop over many schedules (Ledger perf pass on `GET /admin/schedules`).
+///
+/// A name with zero `RUNNING`/`PAUSED` executions and zero pending-throttle
+/// rows is absent from the returned map; callers should treat a missing key
+/// as `0`, matching what a per-name call to `schedule_running_basis` would
+/// have returned.
+///
+/// # Errors
+///
+/// Returns a database error if either grouped count query fails.
+pub async fn schedule_running_basis_batch(
+    conn: &mut AsyncPgConnection,
+    names: &[&str],
+) -> HarvestResult<HashMap<String, i64>> {
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let running: Vec<(String, i64)> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq_any(names))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        .group_by(harvest_workflow_executions::workflow_name)
+        .select((
+            harvest_workflow_executions::workflow_name,
+            diesel::dsl::count_star(),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut basis: HashMap<String, i64> = running.into_iter().collect();
+    let pending = crate::throttle::pending_throttle_counts_for_workflows(conn, names).await?;
+    for (name, count) in pending {
+        *basis.entry(name).or_insert(0) += count;
+    }
+    Ok(basis)
+}
+
+/// Pure (DB-free) core of [`resolve_effective_fire_at`]'s calendar-rebasing logic.
+///
+/// Parameterized on already-loaded calendar exclusions instead of loading
+/// them itself, so a caller resolving many schedules against a shared pool
+/// of calendars ([`crate::calendar::load_exclusions_for_calendars`]) can load
+/// each distinct calendar's exclusions once and reuse them across every
+/// schedule that references it, rather than re-querying per schedule.
+///
+/// Kept as a separate function rather than a shared refactor of
+/// `resolve_effective_fire_at` so this addition cannot change behavior for
+/// that function's existing (single-schedule) callers.
+///
+/// `excluded` should be the calendar's exclusion dates (an empty slice when
+/// the calendar has none, or when its exclusions failed to load and the
+/// caller chooses to degrade to "no rebasing" rather than propagate the
+/// error).
+#[must_use]
+pub fn resolve_effective_fire_at_pure(
+    excluded: &[NaiveDate],
+    exclude_weekends: bool,
+    skip_policy_db: &str,
+    schedule_expr: Option<&str>,
+    next_run_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let (Some(slot), Some(expr)) = (next_run_at, schedule_expr) else {
+        return None;
+    };
+    let parsed = parse_schedule_from_expr(expr)?;
+    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
+    let slot_date = slot.date_naive();
+    match crate::calendar::apply_skip_policy(slot_date, skip_policy, excluded, exclude_weekends) {
+        // `SkipPolicy::Skip` on an excluded day: no adjusted fire to defer to.
+        None => None,
+        // Not excluded: no rebasing.
+        Some(adjusted) if adjusted == slot_date => None,
+        // Rebased to a business day: the effective fire is at the adjusted slot.
+        Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
+    }
 }
 
 /// Resolve the calendar-adjusted effective fire time for a schedule's pinned

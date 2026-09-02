@@ -162,6 +162,7 @@ linux        autumn-harvest-plugin  replay_diagnosis_integration     -          
 linux        autumn-harvest-plugin  replay_sample_export_integration  -                          -
 linux        autumn-harvest-plugin  retry_chain_routing_integration  -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
+linux        autumn-harvest-plugin  schedule_overdue_aux_perf        -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  shard_placement_integration      -                          -
 linux        autumn-harvest-plugin  stall_diagnosis_integration      -                          -

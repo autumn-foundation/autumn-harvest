@@ -1703,6 +1703,67 @@ pub async fn pending_throttle_count_for_workflow(
     Ok(row.n)
 }
 
+/// Batched form of [`pending_throttle_count_for_workflow`] for many names at once.
+///
+/// One `to_regclass` existence check and one grouped
+/// `COUNT(*) ... GROUP BY workflow_name` query covering every name in
+/// `workflow_names`, instead of one existence check plus one count query per
+/// name (Ledger perf pass on `GET /admin/schedules`, called once per schedule
+/// row via `scheduler::schedule_running_basis`).
+///
+/// A name with no pending throttle rows is absent from the returned map,
+/// matching what [`pending_throttle_count_for_workflow`] returns for it (`0`)
+/// -- callers should treat a missing key as zero.
+///
+/// # Errors
+///
+/// Returns a database error if either the existence check or the grouped
+/// count query fails.
+pub async fn pending_throttle_counts_for_workflows(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_names: &[&str],
+) -> crate::error::HarvestResult<std::collections::HashMap<String, i64>> {
+    #[derive(diesel::QueryableByName)]
+    struct Present {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    use diesel_async::RunQueryDsl;
+
+    if workflow_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let exists: Present =
+        diesel::sql_query("SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present")
+            .get_result(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    if !exists.present {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let names: Vec<String> = workflow_names.iter().map(|s| (*s).to_string()).collect();
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle \
+         WHERE workflow_name = ANY($1) GROUP BY workflow_name",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(names)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| (r.workflow_name, r.n)).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests (no DB required)
 // ---------------------------------------------------------------------------

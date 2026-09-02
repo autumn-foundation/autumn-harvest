@@ -743,6 +743,53 @@ pub async fn load_exclusions_for_calendar(
     Ok(rows)
 }
 
+/// Batched form of [`load_exclusions_for_calendar`] for many calendar names at once.
+///
+/// One query covering every name in `calendar_names` instead of one query
+/// per name (Ledger perf pass on `GET /admin/schedules`, which otherwise
+/// calls `load_exclusions_for_calendar` once per schedule row via
+/// `scheduler::resolve_effective_fire_at`, re-querying the same calendar's
+/// exclusions once per schedule that references it).
+///
+/// A name with no exclusion rows (misconfigured or exclusion-free) is simply
+/// absent from the returned map, matching what `load_exclusions_for_calendar`
+/// returns for it (an empty `Vec`) -- callers should treat a missing key the
+/// same as an empty list.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on connection or query failure.
+#[cfg(feature = "db")]
+pub async fn load_exclusions_for_calendars(
+    conn: &mut diesel_async::AsyncPgConnection,
+    calendar_names: &[&str],
+) -> crate::error::HarvestResult<std::collections::HashMap<String, Vec<NaiveDate>>> {
+    use crate::schema::harvest_calendar_exclusions;
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::RunQueryDsl;
+
+    if calendar_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let rows: Vec<(String, chrono::NaiveDate)> = harvest_calendar_exclusions::table
+        .filter(harvest_calendar_exclusions::calendar_name.eq_any(calendar_names))
+        .select((
+            harvest_calendar_exclusions::calendar_name,
+            harvest_calendar_exclusions::excluded_date,
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut map: std::collections::HashMap<String, Vec<NaiveDate>> =
+        std::collections::HashMap::new();
+    for (name, date) in rows {
+        map.entry(name).or_default().push(date);
+    }
+    Ok(map)
+}
+
 /// Load all calendars from the database.
 ///
 /// # Errors
