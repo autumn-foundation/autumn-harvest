@@ -514,6 +514,56 @@ async fn a_nontransactional_unique_violation_that_records_nothing_is_a_failure()
     );
 }
 
+#[tokio::test]
+async fn a_role_with_only_select_and_insert_on_the_ledger_can_still_migrate() {
+    // Diesel's bookkeeping reads the ledger and inserts into it — `SELECT` and
+    // `INSERT`, nothing more. Postgres, though, requires `UPDATE`, `DELETE` or
+    // `TRUNCATE` on a table to lock it in any mode above `ROW EXCLUSIVE`. So a
+    // least-privilege role granted exactly what Diesel needs on a ledger it
+    // does not own is denied this module's ledger lock — and taking that lock
+    // unconditionally would refuse a migration set `diesel migration run`
+    // applies for that role perfectly well, mid-deploy.
+    let (_container, url) = empty_postgres().await;
+    migrate::apply(&url, &[]).await.expect("ledger created");
+
+    let mut owner = connect(&url).await;
+    owner
+        .batch_execute(
+            "CREATE ROLE harvest_migrator LOGIN PASSWORD 'harvest_migrator'; \
+             GRANT USAGE, CREATE ON SCHEMA public TO harvest_migrator; \
+             GRANT SELECT, INSERT ON __diesel_schema_migrations TO harvest_migrator;",
+        )
+        .await
+        .expect("provision a least-privilege migration role");
+
+    let port = url
+        .rsplit_once(':')
+        .and_then(|(_, tail)| tail.split('/').next())
+        .expect("the container URL ends in :<port>/<db>");
+    let least_privilege =
+        format!("postgresql://harvest_migrator:harvest_migrator@127.0.0.1:{port}/postgres");
+
+    let probe = probe_migration(
+        "29990105000000",
+        "CREATE TABLE harvest_migrate_least_privilege (id INTEGER PRIMARY KEY);",
+    );
+    let report = migrate::apply(&least_privilege, std::slice::from_ref(&probe))
+        .await
+        .expect(
+            "a role with the privileges Diesel needs must be able to migrate: the ledger lock \
+             is an optimization, not a requirement",
+        );
+    assert_eq!(report.applied.len(), 1);
+
+    assert!(relation_exists(&url, "harvest_migrate_least_privilege").await);
+    assert!(
+        ledger_versions(&url)
+            .await
+            .contains(&"29990105000000".to_string()),
+        "the migration must still be recorded when it ran unlocked"
+    );
+}
+
 /// The single count the ledger-visibility migration recorded.
 async fn seen_count(url: &str) -> i64 {
     #[derive(diesel::QueryableByName)]

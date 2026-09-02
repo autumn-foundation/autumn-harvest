@@ -563,6 +563,17 @@ pub async fn apply(
 /// migrator's own ledger insert — see `apply_in_transaction` for why that
 /// second property is what keeps this deadlock-free.
 ///
+/// That serialization is best-effort by design, because it costs a privilege
+/// Diesel's own bookkeeping never needs: Postgres requires `UPDATE`, `DELETE`
+/// or `TRUNCATE` on a table to lock it in any mode above `ROW EXCLUSIVE`,
+/// while reading the ledger and inserting into it need only `SELECT` and
+/// `INSERT`. A least-privilege role granted exactly those two on a ledger it
+/// does not own would be denied the lock before any body ran. Rather than
+/// refuse a migration set `diesel migration run` would apply for that role,
+/// the run probes the privilege once (`ledger_lock_is_permitted`), warns, and
+/// proceeds unlocked — Diesel's behaviour exactly. Run migrators one at a time
+/// against such a database.
+///
 /// The ledger row itself is **not** the contention point, because it is written
 /// after the body — Diesel's order, which a body that consults the ledger can
 /// depend on. See `apply_in_transaction`.
@@ -582,6 +593,20 @@ pub async fn apply_to_connection(
 
     create_ledger(conn).await?;
 
+    // Decided once for the run: every migration's transaction takes the same
+    // lock, and the answer cannot change mid-run without someone revoking a
+    // grant underneath a deploy.
+    let lock_ledger = ledger_lock_is_permitted(conn).await?;
+    if !lock_ledger {
+        tracing::warn!(
+            ledger = MIGRATION_LEDGER,
+            mode = LEDGER_LOCK_MODE,
+            "this role may not lock the migration ledger (needs UPDATE, DELETE or TRUNCATE on \
+             it); applying without it, exactly as `diesel migration run` does. Concurrent \
+             migrators against this database are not serialized — run one at a time."
+        );
+    }
+
     let recorded = recorded_versions(conn).await?;
     let plan = build_plan(scripts, &recorded, true);
 
@@ -594,7 +619,7 @@ pub async fn apply_to_connection(
     };
 
     for script in &plan.pending {
-        match apply_one(conn, script).await {
+        match apply_one(conn, script, lock_ledger).await {
             Ok(Applied::Yes) => report.applied.push(script.name.clone()),
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
             Err(error) => {
@@ -689,9 +714,10 @@ impl From<DieselError> for ApplyError {
 async fn apply_one(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
+    lock_ledger: bool,
 ) -> Result<Applied, DieselError> {
     if script.run_in_transaction {
-        apply_in_transaction(conn, script).await
+        apply_in_transaction(conn, script, lock_ledger).await
     } else {
         apply_without_transaction(conn, script).await
     }
@@ -751,6 +777,51 @@ async fn apply_without_transaction(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Whether this role may take [`LEDGER_LOCK_MODE`] on the ledger.
+///
+/// Postgres grants `LOCK TABLE` by mode: `ACCESS SHARE` needs `SELECT`,
+/// `ROW EXCLUSIVE` needs one of `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, and
+/// every stronger mode — [`LEDGER_LOCK_MODE`] among them — needs `UPDATE`,
+/// `DELETE` or `TRUNCATE`.
+///
+/// Diesel's bookkeeping only ever reads the ledger and inserts into it, so a
+/// least-privilege deployment can grant its migration role exactly `SELECT` and
+/// `INSERT` on a ledger that role does not own. Taking the lock unconditionally
+/// would deny such a role before any body ran, on a migration set
+/// `diesel migration run` applies for it perfectly well — breaking the
+/// compatibility this module exists to keep, and doing so at the one moment an
+/// operator is mid-deploy.
+///
+/// So the lock is conditional on this probe, which is itself a plain `SELECT`.
+/// Where the privilege is absent the run falls back to exactly Diesel's
+/// behaviour — no ledger lock, no serialization between concurrent migrators —
+/// which is what that role has today and is strictly better than refusing to
+/// run at all.
+async fn ledger_lock_is_permitted(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
+    // `has_table_privilege` with a comma-separated list is true if *any* of the
+    // listed privileges is held.
+    let rows: Vec<LockPermitted> = diesel::sql_query(
+        "SELECT has_table_privilege($1, 'UPDATE, DELETE, TRUNCATE') AS lock_permitted",
+    )
+    .bind::<Text, _>(MIGRATION_LEDGER)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    // `into_iter().next()`, not `rows.first()`: `RunQueryDsl::first` is in
+    // scope and would win method resolution on the `Vec` itself.
+    Ok(rows
+        .into_iter()
+        .next()
+        .is_some_and(|row| row.lock_permitted))
+}
+
+/// One `lock_permitted` flag.
+#[derive(diesel::QueryableByName)]
+struct LockPermitted {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    lock_permitted: bool,
 }
 
 /// Whether `version` is present in the ledger.
@@ -825,16 +896,19 @@ async fn version_is_recorded(
 async fn apply_in_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
+    lock_ledger: bool,
 ) -> Result<Applied, DieselError> {
     let version = script.version.clone();
     let sql = script.sql.clone();
 
     let result: Result<(), ApplyError> = Box::pin(conn.transaction(async |tx| {
-        diesel::sql_query(format!(
-            "LOCK TABLE {MIGRATION_LEDGER} IN {LEDGER_LOCK_MODE} MODE"
-        ))
-        .execute(tx)
-        .await?;
+        if lock_ledger {
+            diesel::sql_query(format!(
+                "LOCK TABLE {MIGRATION_LEDGER} IN {LEDGER_LOCK_MODE} MODE"
+            ))
+            .execute(tx)
+            .await?;
+        }
 
         if version_is_recorded(tx, version.as_str()).await? {
             return Err(ApplyError::AlreadyRecorded);

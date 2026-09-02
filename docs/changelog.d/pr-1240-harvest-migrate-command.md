@@ -78,6 +78,17 @@ Two details worth naming:
   which is what Diesel-versus-Diesel already does. The guarantee is over
   concurrent `harvest migrate` runs, and it is not worth turning a survivable
   race into a deadlock to widen it.
+
+  The lock is also **best-effort**, for a reason worth an operator's attention.
+  Postgres requires `UPDATE`, `DELETE` or `TRUNCATE` on a table to lock it in
+  any mode above `ROW EXCLUSIVE`, while Diesel's bookkeeping — read the ledger,
+  insert a row — needs only `SELECT` and `INSERT`. A least-privilege role
+  granted exactly those two on a ledger it does not own would be denied the
+  lock before any migration body ran. Refusing a migration set that
+  `diesel migration run` applies for that role, mid-deploy, is the worse
+  outcome, so the run probes the privilege once, logs a warning naming what is
+  missing, and proceeds unlocked — Diesel's behaviour exactly. Run migrators one
+  at a time against such a database.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
   ledger. It probes with `to_regclass` and reports a ledger-less database as
   "never migrated", so the gate is safe to point at a database you are only
