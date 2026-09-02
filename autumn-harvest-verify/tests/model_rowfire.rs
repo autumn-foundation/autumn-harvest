@@ -100,10 +100,10 @@ fn documents() -> Vec<mir::MirDoc> {
 
 /// `<table>:<path>[@<receiver>]` — the key a ratchet line carries.
 fn key(table: &str, path: &str, receiver: Option<&str>) -> String {
-    match receiver {
-        Some(receiver) => format!("{table}:{path}@{receiver}"),
-        None => format!("{table}:{path}"),
-    }
+    receiver.map_or_else(
+        || format!("{table}:{path}"),
+        |receiver| format!("{table}:{path}@{receiver}"),
+    )
 }
 
 /// Every keyed row of the model, as `(key, human description)`.

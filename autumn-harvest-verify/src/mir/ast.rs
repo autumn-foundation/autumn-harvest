@@ -121,6 +121,13 @@ pub enum Statement {
 pub enum Terminator {
     Call {
         dest: Place,
+        /// The destination place's inline type annotation, when MIR printed one.
+        ///
+        /// A projected destination carries its type in the place syntax itself —
+        /// `(((*_55) as variant#3).1: std::cell::RefCell<u64>) = RefCell::<u64>::new(..)`
+        /// — which is the only type information available for a value that
+        /// lives in a coroutine's state rather than in a local of its own.
+        dest_ty: Option<String>,
         /// Callee path with generic args exactly as printed, or `None` for an indirect call (`copy _2(...)`).
         callee: Option<String>,
         /// Operand of an indirect call (fn pointer / closure value).

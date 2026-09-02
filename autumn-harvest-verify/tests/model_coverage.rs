@@ -563,17 +563,23 @@ fn ambiguous_bare_suffix_rows_are_pinned_by_dest_type() {
         );
     }
 
-    let sleep = model
+    // Both `sleep` rows are bare suffixes and both must be pinned: rustc trims
+    // `tokio::time::sleep` and `std::thread::sleep` to the same one segment, and
+    // only their destination types tell them apart (a `Sleep` future vs `()`).
+    let sleeps: BTreeSet<Option<&str>> = model
         .forbidden
         .iter()
-        .find(|r| r.path == "sleep")
-        .expect("`sleep` must be a `[[forbidden]]` row");
-    assert_eq!(
-        sleep.dest_type.as_deref(),
-        Some("tokio::time::Sleep"),
-        "the bare `sleep` suffix must be pinned to `tokio::time::sleep` by its \
-         destination type, or it also matches `WorkflowContext`-adjacent and \
-         user-defined `sleep` functions"
+        .filter(|r| r.path == "sleep")
+        .map(|r| r.dest_type.as_deref())
+        .collect();
+    assert!(
+        sleeps.contains(&Some("tokio::time::Sleep")) && sleeps.contains(&Some("()")),
+        "the bare `sleep` suffix must carry one pinned row per real target; got \
+         {sleeps:?}"
+    );
+    assert!(
+        !sleeps.contains(&None),
+        "an unpinned `sleep` row would also match a user-defined `sleep`"
     );
 
     // `collect` is only a sanitizer when it collects INTO a sorted collection.
@@ -585,6 +591,99 @@ fn ambiguous_bare_suffix_rows_are_pinned_by_dest_type() {
              preserves the hash order verbatim"
         );
     }
+}
+
+#[test]
+fn every_dual_role_sink_that_checks_all_arguments_is_accounted_for() {
+    // `Model::classify` returns `Sink` before `Sanctioned` and the analyzer's
+    // sink arm is total, so a method in both tables is treated as a sink. A sink
+    // row with `args` unset checks *every* argument, which is right for the
+    // recorded-primitive family — a tainted day count or a tainted `patched` id
+    // really does diverge the recorded history — but it is a decision, not a
+    // default. Pinning the set means a *new* dual-role row has to say which of
+    // the two it is instead of inheriting "check everything" by accident.
+    const CHECKS_EVERY_ARGUMENT: &[&str] = &[
+        "business_days_from_now",
+        "new_uuid",
+        "patched",
+        "random_f64",
+        "random_range",
+        "random_u64",
+        "random_uuid",
+        "should_continue_as_new",
+        "system_now",
+        "system_time_now",
+        "time_until_deadline",
+        "version",
+    ];
+
+    let model = builtin();
+    let sanctioned: BTreeSet<(&str, &str)> = model
+        .sanctioned
+        .iter()
+        .map(|r| (r.path.as_str(), r.receiver.as_str()))
+        .collect();
+    let unpinned: BTreeSet<&str> = model
+        .sink
+        .iter()
+        .filter(|r| r.args.is_empty())
+        .filter(|r| sanctioned.contains(&(r.path.as_str(), r.receiver.as_str())))
+        .map(|r| r.path.as_str())
+        .collect();
+    let expected: BTreeSet<&str> = CHECKS_EVERY_ARGUMENT.iter().copied().collect();
+    assert_eq!(
+        unpinned, expected,
+        "a `[[sink]]` row that is also `[[sanctioned]]` and leaves `args` unset \
+         reports every argument of a primitive the model otherwise calls clean. \
+         Either name the checked arguments or add the row here with the reason \
+         its whole argument list is history-relevant."
+    );
+}
+
+#[test]
+fn an_overlay_with_an_unknown_table_or_field_is_an_error() {
+    // A typo in an overlay used to be silently ignored: the intended rule never
+    // entered the model and the run reported `proven` under a model the user
+    // believed they had widened.
+    let typo_table = Model::from_toml(
+        r#"
+[[sourcez]]
+path = "my_clock"
+kind = "value"
+reason = "typo in the table name"
+"#,
+    );
+    assert!(
+        typo_table.is_err(),
+        "an unknown table must be an error, not a silently dropped rule"
+    );
+
+    let typo_field = Model::from_toml(
+        r#"
+[[source]]
+path = "my_clock"
+kind = "value"
+reason = "ok"
+recevier = "Clock"
+"#,
+    );
+    assert!(
+        typo_field.is_err(),
+        "an unknown field must be an error, not a silently dropped constraint"
+    );
+
+    assert!(
+        Model::from_toml(
+            r#"
+[[source]]
+path = "my_clock"
+receiver = "Clock"
+kind = "value"
+reason = "a well-formed row still parses"
+"#
+        )
+        .is_ok()
+    );
 }
 
 #[test]

@@ -39,6 +39,13 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// Source file → why it could not be indexed.
+    ///
+    /// A file MIR named that the source roots could not produce, or that `syn`
+    /// rejected: either way the impl headers, foreign-fn declarations and
+    /// generic parameter lists it holds are invisible, and every resolution that
+    /// needed them must become a named boundary rather than a silent "clean".
+    pub unreadable: BTreeMap<String, String>,
 }
 
 impl SourceIndex {
@@ -60,9 +67,22 @@ impl SourceIndex {
         }
         for file in &expanded {
             let Some(text) = read_relative(roots, file) else {
+                // Only the files MIR *named* are worth reporting; the siblings
+                // are a best-effort widening and their absence means nothing.
+                if files.contains(file) {
+                    index.unreadable.insert(
+                        file.clone(),
+                        "the source file was not found under any source root".to_string(),
+                    );
+                }
                 continue;
             };
-            index.absorb_syn(&text);
+            if !index.absorb_syn(&text) && files.contains(file) {
+                index.unreadable.insert(
+                    file.clone(),
+                    "the source file could not be parsed as Rust".to_string(),
+                );
+            }
             index
                 .files
                 .insert(file.clone(), text.lines().map(str::to_string).collect());
@@ -88,13 +108,51 @@ impl SourceIndex {
         }
         let end = brace_start(&header).unwrap_or(header.len());
         parse_impl_header(header.get(..end).unwrap_or(&header))
+            .or_else(|| self.derive_header_at(file, line, column))
     }
 
-    fn absorb_syn(&mut self, text: &str) {
+    /// The impl a `#[derive(..)]` entry stands for.
+    ///
+    /// A derived impl has no `impl` keyword to point at, so rustc anchors its
+    /// span on the **derive macro's own path** inside the attribute:
+    /// `#[derive(Debug, Serialize, Deserialize, Clone)]` at `25:41: 25:46` is
+    /// `impl Clone for <the item the attribute is on>`. Reading it back matters
+    /// because the derived body *is* in the dump — skipping the header is what
+    /// made `<Order as Clone>::clone` an `external-crate-body` boundary on a
+    /// type defined three lines away.
+    fn derive_header_at(&self, file: &str, line: usize, column: usize) -> Option<ImplHeader> {
+        let lines = self.files.get(file)?;
+        let at = lines.get(line.checked_sub(1)?)?;
+        let tail: String = at.chars().skip(column.checked_sub(1)?).collect();
+        let trait_: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if trait_.is_empty() || !trait_.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
+        // The item the attribute is attached to: the next `struct`/`enum`/`union`
+        // declaration at or below the attribute.
+        let self_ty = lines
+            .iter()
+            .skip(line.checked_sub(1)?)
+            .take(32)
+            .find_map(|text| item_name(text))?;
+        Some(ImplHeader {
+            self_ty,
+            trait_: Some(trait_),
+            generics: Vec::new(),
+        })
+    }
+
+    /// `false` when `syn` rejected the file (its `extern` blocks and generic
+    /// parameter lists are then invisible).
+    fn absorb_syn(&mut self, text: &str) -> bool {
         let Ok(file) = syn::parse_file(text) else {
-            return;
+            return false;
         };
         self.absorb_items(&file.items, 0);
+        true
     }
 
     fn absorb_items(&mut self, items: &[syn::Item], depth: u32) {
@@ -214,6 +272,28 @@ fn brace_start(header: &str) -> Option<usize> {
 }
 
 /// `impl<T: Score> Score for Wrapper<T> where ...` → the three fields.
+/// `pub struct NotificationEvent {` → `NotificationEvent`.
+fn item_name(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    for prefix in ["pub(crate) ", "pub(super) ", "pub ", "#[", "///", "//"] {
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            if prefix.starts_with('#') || prefix.starts_with('/') {
+                return None;
+            }
+            rest = stripped.trim_start();
+        }
+    }
+    let rest = ["struct ", "enum ", "union "]
+        .iter()
+        .find_map(|kind| rest.strip_prefix(kind))?
+        .trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 fn parse_impl_header(header: &str) -> Option<ImplHeader> {
     let header = header.trim();
     let rest = header.strip_prefix("impl")?;

@@ -31,6 +31,7 @@ pub const BUILTIN_MODEL_TOML: &str = include_str!("../../harvest-verify.model.to
 /// `<HashMap<K, V> as IntoIterator>::into_iter` is matched via
 /// `receiver = "HashMap"`, `path = "into_iter"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceRule {
     pub path: String,
     /// Receiver / self type name (last segment, generics stripped) for trait/inherent methods.
@@ -52,6 +53,7 @@ pub struct SourceRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkRule {
     /// Method name on `WorkflowContext` (or another receiver via `receiver`).
     pub path: String,
@@ -71,6 +73,7 @@ fn default_ctx() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CtxMethodRule {
     pub path: String,
     #[serde(default = "default_ctx")]
@@ -79,6 +82,7 @@ pub struct CtxMethodRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForbiddenRule {
     pub path: String,
     #[serde(default)]
@@ -92,6 +96,7 @@ pub struct ForbiddenRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SanitizerRule {
     pub path: String,
     #[serde(default)]
@@ -120,6 +125,7 @@ pub struct SanitizerRule {
 /// receiver means "propagate the receiver's taint through this call, **and** treat a
 /// `static` whose declared type appears in `[[ambient_type]]` as an ambient root".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypeRule {
     /// Type name (last `::` segment, generic arguments stripped), e.g. `AtomicU64`.
     pub name: String,
@@ -127,13 +133,34 @@ pub struct TypeRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedCrate {
     pub name: String,
     pub reason: String,
 }
 
+/// A body-less callee that is provably std/core/alloc even though rustc printed
+/// its path trimmed to a bare segment.
+///
+/// The default for a callee with no body in the analyzed set is a named
+/// [`crate::BoundaryKind::ExternalCrateBody`] boundary: an unemitted dependency
+/// really is code the analysis never saw. std is the exception, because it is
+/// modelled by the `[[source]]` / `[[sanitizer]]` / `[[reduction]]` tables
+/// instead — but only when the analyzer can *tell* it is std, which the declared
+/// types at the call site usually settle. These rows cover the rest: free
+/// functions whose whole signature is primitives, so no type at the call site is
+/// rooted at `std::`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdFreeFnRule {
+    /// `::`-segment suffix of the callee path, exactly as [`SourceRule::path`].
+    pub path: String,
+    pub reason: String,
+}
+
 /// The whole model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     #[serde(default)]
     pub version: String,
@@ -163,6 +190,10 @@ pub struct Model {
     /// taint roots (see [`TypeRule`]).
     #[serde(default)]
     pub ambient_type: Vec<TypeRule>,
+    /// Body-less std/core/alloc free functions rustc prints with no crate root
+    /// and no std-rooted type at the call site (see [`StdFreeFnRule`]).
+    #[serde(default)]
+    pub std_free_fn: Vec<StdFreeFnRule>,
 }
 
 impl Model {
@@ -263,7 +294,18 @@ impl Model {
             ambient_type: merge_rows(self.ambient_type, overlay.ambient_type, |r| {
                 (r.name.clone(), None, None)
             }),
+            std_free_fn: merge_rows(self.std_free_fn, overlay.std_free_fn, |r| {
+                (r.path.clone(), None, None)
+            }),
         }
+    }
+
+    /// True when a body-less callee is one of the modelled std free functions.
+    #[must_use]
+    pub fn is_std_free_fn(&self, callee: &CalleePath) -> bool {
+        self.std_free_fn
+            .iter()
+            .any(|rule| callee.ends_with_path(&rule.path))
     }
 }
 
@@ -385,6 +427,35 @@ reason = "different destination, different row"
 "#,
         ));
         assert_eq!(merged.sanitizer.len(), 2);
+    }
+
+    #[test]
+    fn an_overlay_can_declare_a_std_free_fn() {
+        // The escape hatch for the `external-crate-body` default: a std free
+        // function whose whole signature is primitives, so nothing at the call
+        // site names its crate.
+        let model = overlay(
+            r#"
+[[std_free_fn]]
+path = "black_box"
+reason = "core::hint::black_box; identity on a primitive."
+"#,
+        );
+        assert!(model.is_std_free_fn(&CalleePath::parse("black_box")));
+        assert!(model.is_std_free_fn(&CalleePath::parse("hint::black_box")));
+        assert!(!model.is_std_free_fn(&CalleePath::parse("now_ish")));
+        assert!(!Model::default().is_std_free_fn(&CalleePath::parse("black_box")));
+    }
+
+    #[test]
+    fn an_unknown_table_or_field_is_rejected() {
+        assert!(Model::from_toml("[[sourcez]]\npath = \"x\"\n").is_err());
+        assert!(
+            Model::from_toml(
+                "[[source]]\npath = \"x\"\nkind = \"value\"\nreason = \"r\"\nreceivr = \"y\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

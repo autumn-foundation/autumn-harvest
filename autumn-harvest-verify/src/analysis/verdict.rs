@@ -39,14 +39,43 @@ pub fn assemble(
     }
 }
 
-/// One finding per `(kind, source, sink)`: the same flow reached through two
-/// call contexts is one bug, and printing it twice only hides the others.
+/// Add boundaries discovered *after* [`assemble`] ran, re-deriving the verdict.
+///
+/// The pipeline learns some boundaries only once every doc has been parsed (a
+/// crate whose dump did not fully parse, a dump that was not valid UTF-8).
+/// Appending them to [`WorkflowVerdict::boundaries`] without re-deriving would
+/// leave a `proven-deterministic` verdict carrying a non-empty boundary list —
+/// the exact self-contradiction AC2 forbids.
+pub fn attach_boundaries(verdict: &mut WorkflowVerdict, extra: Vec<Boundary>) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut boundaries = std::mem::take(&mut verdict.boundaries);
+    boundaries.extend(extra);
+    verdict.boundaries = dedup_boundaries(boundaries);
+    verdict.verdict = match std::mem::replace(&mut verdict.verdict, Verdict::ProvenDeterministic) {
+        Verdict::NondeterminismFound { findings } => Verdict::NondeterminismFound { findings },
+        Verdict::Unknown { .. } | Verdict::ProvenDeterministic => Verdict::Unknown {
+            boundaries: verdict.boundaries.clone(),
+        },
+    };
+}
+
+/// One finding per `(kind, taint, source, sink)`: the same flow reached through
+/// two call contexts is one bug, and printing it twice only hides the others.
+///
+/// The taint kind is part of the key because one source can reach one sink in
+/// two different ways — an ambient comparator decides both the *order* of a
+/// collection and, through the branch inside it, the *values* that come out —
+/// and collapsing those two onto whichever arrived first would drop the more
+/// precise label from the report.
 fn dedup(findings: Vec<Finding>) -> Vec<Finding> {
-    let mut seen: BTreeSet<(String, String, String, String, String)> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, String, String, String, String, String)> = BTreeSet::new();
     let mut out = Vec::new();
     for finding in findings {
         let key = (
             format!("{:?}", finding.kind),
+            format!("{:?}", finding.taint),
             finding.source.function.clone(),
             finding.source.what.clone(),
             finding.sink.function.clone(),
@@ -138,6 +167,38 @@ mod tests {
     fn nothing_at_all_is_proven() {
         let verdict = assemble("wf", "c", Vec::new(), Vec::new());
         assert_eq!(verdict.verdict, Verdict::ProvenDeterministic);
+    }
+
+    #[test]
+    fn a_boundary_attached_after_assembly_downgrades_proven_to_unknown() {
+        let mut verdict = assemble("wf", "c", Vec::new(), Vec::new());
+        assert_eq!(verdict.verdict, Verdict::ProvenDeterministic);
+        attach_boundaries(
+            &mut verdict,
+            vec![boundary(
+                BoundaryKind::MirParse,
+                "helper: malformed fn header",
+            )],
+        );
+        assert_eq!(
+            verdict.verdict.name(),
+            "unknown",
+            "a verdict may never be `proven` while carrying a boundary"
+        );
+        assert_eq!(verdict.boundaries.len(), 1);
+    }
+
+    #[test]
+    fn a_boundary_attached_after_assembly_keeps_a_finding() {
+        let mut verdict = assemble(
+            "wf",
+            "c",
+            vec![finding("SystemTime::now", "execute_activity_raw")],
+            Vec::new(),
+        );
+        attach_boundaries(&mut verdict, vec![boundary(BoundaryKind::MirParse, "x")]);
+        assert_eq!(verdict.verdict.name(), "nondeterminism-found");
+        assert_eq!(verdict.boundaries.len(), 1);
     }
 
     #[test]

@@ -19,6 +19,27 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #   rustc --crate-type lib --edition 2024 --emit=mir -o async_multi_await.mir  async_multi_await.rs
 #   rustc --crate-type lib --edition 2024 --emit=mir -o generic_layers.mir     generic_layers.rs
 #
+# The two fixtures added for the adversarial-review gaps were produced the same
+# way but on **rustc 1.98.0 (88d9e12ae 2026-08-18)**, the toolchain CI runs, so
+# the suite exercises both ends of the validated 1.94-1.98 range rather than
+# only the older one:
+#
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         -o implicit_and_higher_order.mir implicit_and_higher_order.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o parse_drift.mir parse_drift.rs
+#
+# `parse_drift_garbled.mir` is NOT compiled: it is a byte-for-byte copy of
+# `parse_drift.mir` with exactly one call terminator rewritten from
+# `_4 = wall_clock_secs() -> [..]` to `_4 <== wall_clock_secs() -> [..]`,
+# simulating a future rustc that prints a call differently. Regenerate it with
+#
+#   sed '136s/_4 = wall_clock_secs()/_4 <== wall_clock_secs()/' \
+#       parse_drift.mir > parse_drift_garbled.mir
+#
+# after re-emitting `parse_drift.mir`, checking that line 136 is still the
+# `wall_clock_secs` call. The point of the fixture is that the mutated dump must
+# come back `unknown: mir-parse`, never `proven-deterministic`.
+#
 # `example_deterministic_primitives.mir` is a real, untrimmed dump of a real
 # workspace example (do not trim it: the bodies are interdependent). From the
 # workspace root:

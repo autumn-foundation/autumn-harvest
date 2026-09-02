@@ -108,6 +108,17 @@ pub struct Program {
     /// Crate names present in the analyzed set.
     crates: BTreeSet<String>,
     sources: impls::SourceIndex,
+    /// Item path → why the parser could not read that item's body.
+    ///
+    /// A call into one of these is a call into a body the analysis never saw,
+    /// which is a [`BoundaryKind::MirParse`], not a silent propagator.
+    parse_failed: BTreeMap<String, String>,
+    /// Method name → the `<impl at FILE>` header that could not be resolved.
+    ///
+    /// An impl block whose source file is missing or unreadable indexes no
+    /// methods at all, so `Ty::m` falls through to the body-less default. The
+    /// method name is the only thing left to key the boundary on.
+    unresolved_impl_methods: BTreeMap<String, String>,
 }
 
 impl Program {
@@ -122,6 +133,7 @@ impl Program {
             ..Self::default()
         };
         program.index_bodies();
+        program.index_parse_failures();
         let files = program.referenced_source_files();
         program.sources = impls::SourceIndex::build(&sources.roots, &files);
         program.index_impls();
@@ -249,9 +261,28 @@ impl Program {
         files
     }
 
+    /// Index every doc's parse failures by the item path they name.
+    ///
+    /// The recorded `item` is the raw header text (`fn helper((((_1: u64) -> …`),
+    /// so the path is recovered the same way the header parser recovers it: the
+    /// text between `fn ` and the first top-level `(`.
+    fn index_parse_failures(&mut self) {
+        let mut failed: BTreeMap<String, String> = BTreeMap::new();
+        for doc in &self.docs {
+            for failure in &doc.parse_failures {
+                let Some(path) = failed_item_path(&failure.item) else {
+                    continue;
+                };
+                failed.entry(path).or_insert_with(|| failure.reason.clone());
+            }
+        }
+        self.parse_failed = failed;
+    }
+
     fn index_impls(&mut self) {
         let mut methods: BTreeMap<ImplKey, String> = BTreeMap::new();
         let mut headers: BTreeMap<String, ImplHeader> = BTreeMap::new();
+        let mut unresolved: BTreeMap<String, String> = BTreeMap::new();
         for path in &self.order {
             let Some((prefix, method)) = split_last(path) else {
                 continue;
@@ -260,6 +291,18 @@ impl Program {
                 continue;
             };
             let Some(header) = self.sources.impl_header_at(&file, line, column) else {
+                // Two very different reasons land here. When the file *was*
+                // read, the span usually points at a `#[derive(..)]` attribute
+                // rather than at an `impl` keyword: derived impls are structural
+                // and following them buys nothing, so they stay silent. When the
+                // file could not be read at all (a remapped path, a path
+                // dependency outside the source roots, a deleted file), nothing
+                // about this impl is known and a call to one of its methods must
+                // not fall through to "body-less, assumed clean".
+                if let Some(reason) = self.sources.unreadable.get(&file) {
+                    let detail = format!("{prefix}: {reason}");
+                    unresolved.entry(method.to_string()).or_insert(detail);
+                }
                 continue;
             };
             let self_name = TypeName::parse(&header.self_ty).name;
@@ -282,6 +325,10 @@ impl Program {
         }
         self.impl_methods = methods;
         self.impl_headers = headers;
+        // A method that some *readable* impl does define is resolvable after
+        // all; only the ones nothing in the analyzed set defines stay boundaries.
+        unresolved.retain(|method, _| !self.impl_methods.keys().any(|(_, _, name)| name == method));
+        self.unresolved_impl_methods = unresolved;
     }
 
     /// RTA-lite: every concrete type unsized into a `dyn Trait` anywhere in the set.
@@ -448,6 +495,9 @@ impl Program {
             if let Some(body) = self.impl_method(receiver, path.trait_.as_deref(), method) {
                 return Resolution::Body(body);
             }
+            if let Some(detail) = self.unresolved_impl_methods.get(method) {
+                return Resolution::Boundary(BoundaryKind::MissingBody, detail.clone());
+            }
         }
         // 5. A closure named only in the turbofish of a body-less callee
         // (`LocalKey::<T>::with::<{closure@..}, R>`): the call goes into std,
@@ -457,12 +507,16 @@ impl Program {
                 return Resolution::Body(body.clone());
             }
         }
-        // 6. A foreign function: declared, never given a body.
+        // 6. An item whose body the parser could not read.
+        if let Some(reason) = self.parse_failed.get(&bare) {
+            return Resolution::Boundary(BoundaryKind::MirParse, format!("{bare}: {reason}"));
+        }
+        // 7. A foreign function: declared, never given a body.
         let last = path.last_segment();
         if !last.is_empty() && self.sources.foreign_fns.contains(last) {
             return Resolution::Boundary(BoundaryKind::Ffi, callee.trim().to_string());
         }
-        // 7. An explicitly rooted path we have no body for.
+        // 8. An explicitly rooted path we have no body for.
         if let Some(root) = crate_root(&bare).filter(|root| !is_std_module(root)) {
             if self.crates.contains(root) {
                 return Resolution::Boundary(BoundaryKind::MissingBody, callee.trim().to_string());
@@ -632,6 +686,35 @@ impl Program {
         out
     }
 
+    /// Does the callee **path itself** name a body in the analyzed set?
+    ///
+    /// Narrower than [`Self::resolve_call`] on purpose: `spawn::<{closure@..},
+    /// u64>` *resolves* to the closure in its turbofish, but nothing in the
+    /// analyzed set is called `spawn`. A model row keyed on a bare name needs
+    /// the second question, not the first.
+    #[must_use]
+    pub fn names_analyzed_body(&self, caller_body: &str, callee: &str) -> bool {
+        let near = self.crate_of.get(caller_body).map(String::as_str);
+        let bare = strip_generics_everywhere(callee);
+        self.body_or_coroutine(near, &bare).is_some()
+    }
+
+    /// The user `impl Drop for Ty` body for `ty`, if the analyzed set has one.
+    ///
+    /// `ty` is a declared type as MIR prints it; references and the transparent
+    /// containers are peeled and generic arguments stripped before the lookup,
+    /// so `&mut Bomb<'_>` and `Box<Bomb>` both find `Bomb`'s glue.
+    #[must_use]
+    pub fn drop_impl(&self, ty: &str) -> Option<String> {
+        let name = TypeName::parse(peel_containers(ty)).name;
+        if name.is_empty() {
+            return None;
+        }
+        self.impl_methods
+            .get(&(name, Some("Drop".to_string()), "drop".to_string()))
+            .cloned()
+    }
+
     fn impl_method(&self, self_ty: &str, trait_: Option<&str>, method: &str) -> Option<String> {
         let key = (
             self_ty.to_string(),
@@ -750,6 +833,15 @@ fn brace_span(text: &str) -> Option<(String, usize, usize)> {
 }
 
 /// `<impl at FILE:l:c: l:c>` → (FILE, l, c).
+/// `fn helper((((_1: u64) -> u64 {` → `helper`.
+fn failed_item_path(item: &str) -> Option<String> {
+    let head = item.trim().strip_prefix("fn ")?.trim_start();
+    let end = head.find('(').unwrap_or(head.len());
+    let path = head.get(..end).unwrap_or(head).trim();
+    let path = strip_generics_everywhere(path);
+    (!path.is_empty()).then_some(path)
+}
+
 fn impl_span(path: &str) -> Option<(String, usize, usize)> {
     let at = path.find("<impl at ")?;
     let rest = path.get(at.saturating_add("<impl at ".len())..)?;

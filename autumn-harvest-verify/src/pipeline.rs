@@ -15,8 +15,11 @@ use crate::driver::{self, BuildRequest, EmittedMir};
 use crate::verdict::{Boundary, BoundaryKind, Site, WorkflowVerdict};
 use crate::{Allowlist, Model, Options, Report, analysis, entry, mir, resolve};
 
-/// The rustc release the MIR parser is validated against (D1).
-const VALIDATED_RUSTC: &str = "1.94";
+/// The rustc releases the MIR parser has been exercised against (D1).
+///
+/// Matched on `major.minor` only: a patch release never changes how MIR is
+/// printed, and pinning one would make every run of a fresh toolchain warn.
+const VALIDATED_RUSTC: &[&str] = &["1.94", "1.95", "1.96", "1.97", "1.98"];
 
 /// Emit MIR for `build`, analyze it, and return the report.
 ///
@@ -36,25 +39,45 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
 
     let model = Model::load_with_overlays(&opts.model_overlays)?;
     let rustc_version = driver::rustc_version();
-    if !rustc_version.contains(VALIDATED_RUSTC) {
+    if !is_validated_rustc(&rustc_version) {
         warnings.push(format!(
-            "the MIR parser is validated on rustc {VALIDATED_RUSTC}.x; this run used \
-             `{rustc_version}`. A format change surfaces as a `mir-parse` boundary, \
-             never as a wrong verdict"
+            "the MIR parser is validated on rustc {}; this run used `{rustc_version}`. \
+             Other versions may print paths and types differently, which can make model \
+             rows stop matching — run the corpus tests \
+             (`cargo test -p autumn-harvest-verify --test corpus`) on your toolchain \
+             before trusting a clean result",
+            VALIDATED_RUSTC.join(", ")
         ));
     }
 
     let mut docs = Vec::with_capacity(emitted.len());
     for item in &emitted {
-        let text = std::fs::read_to_string(&item.path).map_err(|e| crate::Error::Io {
+        let raw = std::fs::read(&item.path).map_err(|e| crate::Error::Io {
             path: item.path.display().to_string(),
             source: e,
         })?;
-        docs.push(mir::parse(
-            &item.crate_name,
-            &item.path.display().to_string(),
-            &text,
-        ));
+        let display = item.path.display().to_string();
+        // A dump that is not valid UTF-8 is a corrupt dump, not a tool error: it
+        // becomes a `mir-parse` boundary on every workflow of that crate, so one
+        // damaged file can never abort the analysis of the others.
+        let (text, lossy) = match String::from_utf8(raw) {
+            Ok(text) => (text, false),
+            Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+        };
+        let mut doc = mir::parse(&item.crate_name, &display, &text);
+        if lossy {
+            warnings.push(format!(
+                "{display} is not valid UTF-8; it was decoded lossily and every workflow \
+                 in `{}` carries a `mir-parse` boundary",
+                item.crate_name
+            ));
+            doc.parse_failures.push(mir::ParseFailure {
+                item: display.clone(),
+                reason: "the dump is not valid UTF-8 and was decoded lossily".to_string(),
+                line: 0,
+            });
+        }
+        docs.push(doc);
     }
 
     let roots = source_roots(build, opts, &emitted);
@@ -66,11 +89,10 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
     for (verdict, entry) in workflows.iter_mut().zip(&entries) {
         verdict.workflow = qualified_workflow(&program, entry);
         if let Some(extra) = parse_failures.get(&entry.crate_name) {
-            for boundary in extra {
-                if !verdict.boundaries.contains(boundary) {
-                    verdict.boundaries.push(boundary.clone());
-                }
-            }
+            // Re-derive rather than append: a boundary added after `assemble`
+            // must still downgrade `proven-deterministic` to `unknown`, which is
+            // the whole content of AC2.
+            analysis::verdict::attach_boundaries(verdict, extra.clone());
         }
     }
     workflows.sort_by(|a, b| a.workflow.cmp(&b.workflow));
@@ -182,9 +204,35 @@ fn parse_failure_boundaries(
     out
 }
 
+/// True when `version` (the `rustc -Vv` first line) is one of [`VALIDATED_RUSTC`].
+fn is_validated_rustc(version: &str) -> bool {
+    let Some(number) = version.split_whitespace().nth(1) else {
+        return false;
+    };
+    let mut parts = number.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let major_minor = format!("{major}.{minor}");
+    VALIDATED_RUSTC.contains(&major_minor.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_validated_rustc_set_is_matched_on_major_minor() {
+        assert!(is_validated_rustc("rustc 1.98.0 (88d9e12ae 2026-08-18)"));
+        assert!(is_validated_rustc("rustc 1.94.1 (e408947bf 2026-03-25)"));
+        assert!(is_validated_rustc("rustc 1.95.0-nightly (abc 2026-04-01)"));
+        assert!(
+            !is_validated_rustc("rustc 1.99.0 (0000 2026-09-01)"),
+            "a version outside the exercised set must warn"
+        );
+        assert!(!is_validated_rustc("rustc 2.0.0 (0000 2026-09-01)"));
+        assert!(!is_validated_rustc("unknown"));
+    }
 
     #[test]
     fn the_module_segment_comes_from_the_async_shims_return_type() {

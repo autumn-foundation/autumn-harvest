@@ -799,6 +799,7 @@ fn parse_call(full: &str, head: &str, entries: &Entries<'_>) -> Terminator {
             local: Local(0),
             projections: Vec::new(),
         }),
+        dest_ty: place_annotation(dest_src),
         callee,
         indirect,
         args: lexer::split_top(args_src, b',')
@@ -809,6 +810,20 @@ fn parse_call(full: &str, head: &str, entries: &Entries<'_>) -> Terminator {
         target: entry_target(entries, "return"),
         unwind: unwind_target(entries),
     }
+}
+
+/// `(((*_55) as variant#3).1: std::cell::RefCell<u64>)` → the type after the
+/// last top-level `: `.
+///
+/// MIR annotates a *projected* place with the type of the field it names. A
+/// plain local (`_7`) carries no annotation, because its `let` declaration
+/// already has one.
+fn place_annotation(dest_src: &str) -> Option<String> {
+    let trimmed = dest_src.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let at = lexer::rfind_top(inner, ": ")?;
+    let ty = inner.get(at.saturating_add(2)..)?.trim();
+    (!ty.is_empty()).then(|| ty.to_owned())
 }
 
 fn other_terminator(full: &str, entries: &Entries<'_>) -> Terminator {

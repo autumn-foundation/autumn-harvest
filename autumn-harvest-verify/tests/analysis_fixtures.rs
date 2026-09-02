@@ -513,3 +513,338 @@ fn a_single_impl_behind_a_dyn_trait_is_devirtualized_and_caught() {
         "exactly one type is unsized to `dyn Clock` here, so this is not a boundary"
     );
 }
+
+// ── The adversarial-review gaps: implicit flow, fn items, closures, drop glue ──
+//
+// `tests/fixtures/implicit_and_higher_order.{rs,mir}` — one workflow per
+// false-negative class the soundness review found, plus the false-positive
+// traps that must survive each fix.
+
+fn gaps() -> Vec<WorkflowVerdict> {
+    run(
+        "implicit_and_higher_order.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1
+}
+
+/// Every finding's trace, so a test can assert the laundering source is named.
+fn all_trace_text(v: &WorkflowVerdict) -> String {
+    findings(v)
+        .iter()
+        .map(trace_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_flagged(v: &WorkflowVerdict, must_name: &str) {
+    assert!(
+        !findings(v).is_empty(),
+        "{} must be flagged; verdict = {}, boundaries = {:?}",
+        v.workflow,
+        v.verdict.name(),
+        boundary_kinds(v)
+    );
+    let text = all_trace_text(v);
+    assert!(
+        text.contains(must_name),
+        "{}'s trace must name {must_name}; got:\n{text}",
+        v.workflow
+    );
+}
+
+#[test]
+fn implicit_flow_through_a_tainted_branch_is_a_finding() {
+    let v = gaps();
+    // A value produced *by* a branch on ambient state carries that state.
+    assert_flagged(pick(&v, "wf_implicit_flow_inline"), "COUNTER");
+    assert_flagged(pick(&v, "wf_implicit_flow_helper"), "SystemTime::now");
+    assert_flagged(pick(&v, "wf_implicit_flow_name"), "SystemTime::now");
+}
+
+#[test]
+fn the_implicit_flow_rule_does_not_flag_clean_branches() {
+    let v = gaps();
+    assert_clean(
+        pick(&v, "wf_fp_version_branch"),
+        "`ctx.version()` is history-clean, so a branch on it decides nothing ambient",
+    );
+    assert_clean(
+        pick(&v, "wf_fp_try_chain"),
+        "`?` on a clean Result is clean by construction",
+    );
+    assert_clean(
+        pick(&v, "wf_fp_clean_branch"),
+        "a branch on clean data produces a clean value",
+    );
+}
+
+#[test]
+fn a_bare_fn_item_passed_to_a_higher_order_fn_is_followed() {
+    let v = gaps();
+    assert_flagged(pick(&v, "wf_fn_item_map"), "SystemTime::now");
+    assert_flagged(pick(&v, "wf_fn_item_or_insert_with"), "SystemTime::now");
+}
+
+#[test]
+fn a_closures_writes_to_its_captured_environment_reach_the_caller() {
+    let v = gaps();
+    assert_flagged(pick(&v, "wf_closure_env_direct"), "SystemTime::now");
+    assert_flagged(pick(&v, "wf_closure_env_retain"), "retain");
+}
+
+#[test]
+fn a_user_drop_impl_containing_a_sink_is_followed() {
+    let v = gaps();
+    let d = pick(&v, "wf_drop_glue_sink");
+    assert!(
+        !findings(d).is_empty(),
+        "a `Drop` impl that emits a command from an ambient read is a finding; \
+         verdict = {}, boundaries = {:?}",
+        d.verdict.name(),
+        boundary_kinds(d)
+    );
+}
+
+#[test]
+fn hashset_set_operations_are_order_sources() {
+    let v = gaps();
+    assert_found(
+        pick(&v, "wf_hashset_difference"),
+        FindingKind::TaintedSinkArgument,
+        TaintKind::Order,
+    );
+    assert_found(
+        pick(&v, "wf_hashset_union"),
+        FindingKind::TaintedSinkArgument,
+        TaintKind::Order,
+    );
+}
+
+#[test]
+fn thread_sleep_and_spawn_are_forbidden_even_when_rustc_trims_the_path() {
+    let v = gaps();
+    assert_found(
+        pick(&v, "wf_thread_sleep"),
+        FindingKind::ForbiddenEffect,
+        TaintKind::Value,
+    );
+    assert_found(
+        pick(&v, "wf_thread_spawn"),
+        FindingKind::ForbiddenEffect,
+        TaintKind::Value,
+    );
+}
+
+#[test]
+fn a_single_segment_forbidden_row_never_fires_on_a_user_fn_with_a_body() {
+    let v = gaps();
+    assert_clean(
+        pick(&v, "wf_user_named_sleep"),
+        "a user `fn sleep` with a body is analyzed, not matched against `std::thread::sleep`",
+    );
+}
+
+// ── Format drift inside a block must degrade to `unknown`, never to `proven` ──
+
+#[test]
+fn a_garbled_terminator_is_a_mir_parse_boundary_not_a_silent_proven() {
+    let clean = run(
+        "parse_drift.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    assert_eq!(
+        pick(&clean, "wf_helper_parse_target").verdict.name(),
+        "nondeterminism-found",
+        "the control dump reports the real flow"
+    );
+
+    let garbled = run(
+        "parse_drift_garbled.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&garbled, "wf_helper_parse_target");
+    assert_ne!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "one mutated call terminator must never flip a finding to `proven`"
+    );
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::MirParse),
+        "the shape the parser did not classify must be named as a `mir-parse` \
+         boundary; got {:?}",
+        boundary_kinds(v)
+    );
+}
+
+// ── Synthetic dumps: shapes rustc cannot be asked to produce on demand ───────
+//
+// A 1 000-deep call chain and a call into a dependency that was never asked for
+// MIR are both easier to write as MIR text than to build as a crate, and the
+// parser is tolerant by design, so a hand-written dump exercises exactly the
+// same code path a real one would.
+
+fn analyze_text(text: &str) -> Vec<WorkflowVerdict> {
+    let docs = vec![mir::parse("synthetic", "synthetic.mir", text)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots::default()).expect("build");
+    analysis::analyze(&program, &model(), &entries)
+}
+
+/// `fn PATH(_1: u64) -> u64` that tail-calls `next`, or returns its argument.
+fn chain_body(path: &str, next: Option<&str>) -> String {
+    next.map_or_else(
+        || {
+            format!(
+                "fn {path}(_1: u64) -> u64 {{\n\
+             \x20   let mut _0: u64;\n\
+             \n\
+             \x20   bb0: {{\n\
+             \x20       _0 = copy _1;\n\
+             \x20       return;\n\
+             \x20   }}\n\
+             }}\n"
+            )
+        },
+        |next| {
+            format!(
+                "fn {path}(_1: u64) -> u64 {{\n\
+             \x20   let mut _0: u64;\n\
+             \x20   let mut _2: u64;\n\
+             \n\
+             \x20   bb0: {{\n\
+             \x20       _2 = {next}(copy _1) -> [return: bb1, unwind continue];\n\
+             \x20   }}\n\
+             \n\
+             \x20   bb1: {{\n\
+             \x20       _0 = move _2;\n\
+             \x20       return;\n\
+             \x20   }}\n\
+             }}\n"
+            )
+        },
+    )
+}
+
+#[test]
+fn a_thousand_body_call_chain_is_a_recursion_boundary_not_a_stack_overflow() {
+    const DEPTH: usize = 1000;
+    let mut text = String::new();
+    text.push_str(
+        "fn __autumn_workflow_info_wf_deep() -> u8 {\n\
+         \x20   let mut _0: u8;\n\
+         \n\
+         \x20   bb0: {\n\
+         \x20       _0 = const 1_u8;\n\
+         \x20       return;\n\
+         \x20   }\n\
+         }\n",
+    );
+    text.push_str(&chain_body("wf_deep", Some("chain0")));
+    for level in 0..DEPTH {
+        let next = format!("chain{}", level.saturating_add(1));
+        let last = level.saturating_add(1) == DEPTH;
+        text.push_str(&chain_body(
+            &format!("chain{level}"),
+            (!last).then_some(next.as_str()),
+        ));
+    }
+
+    // The point of the test is that this *returns* rather than aborting the
+    // process with a stack overflow (exit 134, outside the documented contract).
+    let verdicts = analyze_text(&text);
+    let v = pick(&verdicts, "wf_deep");
+    assert_eq!(
+        v.verdict.name(),
+        "unknown",
+        "a chain too deep to follow is `unknown`, never `proven`"
+    );
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::Recursion),
+        "the depth cap must be named as a `recursion` boundary; got {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn a_body_less_non_std_callee_is_an_external_crate_body_boundary() {
+    let text = "fn __autumn_workflow_info_wf_dep() -> u8 {\n\
+                \x20   let mut _0: u8;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _0 = const 1_u8;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                fn wf_dep() -> u64 {\n\
+                \x20   let mut _0: u64;\n\
+                \x20   let mut _2: u64;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _2 = now_ish() -> [return: bb1, unwind continue];\n\
+                \x20   }\n\
+                \n\
+                \x20   bb1: {\n\
+                \x20       _0 = move _2;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n";
+    let verdicts = analyze_text(text);
+    let v = pick(&verdicts, "wf_dep");
+    assert_eq!(
+        v.verdict.name(),
+        "unknown",
+        "a dependency compiled without `--emit=mir` is a body the analysis never \
+         saw, not a clean propagator"
+    );
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::ExternalCrateBody),
+        "got {:?}",
+        boundary_kinds(v)
+    );
+}
+
+#[test]
+fn a_body_less_std_callee_is_not_a_boundary() {
+    // The same shape with a std-rooted declared type at the call site: rustc
+    // trimmed the path, but `std::string::String` says what it is.
+    let text = "fn __autumn_workflow_info_wf_std() -> u8 {\n\
+                \x20   let mut _0: u8;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _0 = const 1_u8;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                fn wf_std() -> u64 {\n\
+                \x20   let mut _0: u64;\n\
+                \x20   let mut _2: std::string::String;\n\
+                \x20   let mut _3: &str;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _3 = const \"x\";\n\
+                \x20       _2 = <str as ToString>::to_string(move _3) -> [return: bb1, unwind continue];\n\
+                \x20   }\n\
+                \n\
+                \x20   bb1: {\n\
+                \x20       _0 = const 0_u64;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n";
+    let verdicts = analyze_text(text);
+    let v = pick(&verdicts, "wf_std");
+    assert_eq!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "boundaries = {:?}",
+        boundary_kinds(v)
+    );
+}

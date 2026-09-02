@@ -545,7 +545,7 @@ reason = "See the `AtomicU64` row for `compare_exchange_weak`; this is the gener
 path = "load"
 receiver = "AtomicU64"
 kind = "value"
-reason = "Ambient atomic read. Same rule applies to every `Atomic*` receiver in `[[ambient_type]]`; the analyzer matches the receiver against that table rather than requiring one row per width."
+reason = "Ambient atomic read. The `receiver` is matched literally, so this row fires only where rustc prints the width-named alias (toolchains up to 1.97, and the checked-in 1.94 fixtures); rustc >= 1.98 prints `Atomic::<u64>::load` and the generic `Atomic` row above is the one that fires. Both spellings are kept so one model serves both."
 [[source]]
 path = "fetch_add"
 receiver = "AtomicU64"
@@ -868,6 +868,33 @@ path = "extract_if"
 receiver = "HashSet"
 kind = "order"
 reason = "`HashSet::extract_if`. See `retain`."
+
+# The four set operations are iteration entry points too: each returns a lazy
+# iterator that walks one of the two sets in its own hash-seeded order, so the
+# element sequence is per-process even though the resulting *set* is not.
+[[source]]
+path = "difference"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::difference`. The returned `Difference` iterator walks the receiver in hash order, so the elements arrive in a per-process order even though the difference itself is well defined."
+
+[[source]]
+path = "union"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::union`. See `difference`; the `Union` iterator chains both sets, each in its own hash-seeded order."
+
+[[source]]
+path = "intersection"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::intersection`. See `difference`."
+
+[[source]]
+path = "symmetric_difference"
+receiver = "HashSet"
+kind = "order"
+reason = "`HashSet::symmetric_difference`. See `difference`."
 
 # hashbrown is `std`'s HashMap implementation and is also used directly by
 # several dependencies; its maps carry the same hash-seeded order.
@@ -1862,6 +1889,34 @@ reason = "`tokio::task::spawn_local`; see `tokio::spawn`."
 [[forbidden]]
 path = "thread::spawn"
 reason = "`std::thread::spawn`; see `tokio::spawn`, and the spawned closure is never analyzed as part of the workflow."
+
+# rustc trims `std::thread::spawn` and `tokio::spawn` to the bare segment
+# `spawn` whenever nothing else in scope is called `spawn`, so the two-segment
+# rows above fire only on the untrimmed spelling. These pin the bare suffix by
+# the one thing both spawns have in common: a `JoinHandle` destination. The
+# `dest_type` suffix match covers `std::thread::JoinHandle<T>` and
+# `tokio::task::JoinHandle<T>` alike, and a single-segment row never fires on a
+# callee that has a body in the analyzed set, so a user `fn spawn` is analyzed
+# rather than flagged.
+[[forbidden]]
+path = "spawn"
+dest_type = "JoinHandle"
+reason = "`std::thread::spawn` / `tokio::spawn` as rustc prints them when the path is trimmed to one segment; see `tokio::spawn`."
+
+[[forbidden]]
+path = "spawn_blocking"
+dest_type = "JoinHandle"
+reason = "`tokio::task::spawn_blocking` trimmed to one segment; see `tokio::spawn`."
+
+[[forbidden]]
+path = "spawn_local"
+dest_type = "JoinHandle"
+reason = "`tokio::task::spawn_local` trimmed to one segment; see `tokio::spawn`."
+
+[[forbidden]]
+path = "sleep"
+dest_type = "()"
+reason = "`std::thread::sleep` as rustc prints it when the path is trimmed to one segment: it is the only `sleep` that returns `()` (tokio's returns a `Sleep` future). Blocking the worker thread for real time is not replayed."
 [[forbidden]]
 path = "Builder::spawn"
 receiver = "Builder"
@@ -2165,6 +2220,35 @@ reason = "See `len`."
 # Adding a crate here is the single highest-leverage way to make this tool lie.
 # Each row states why the crate's whole surface is effect-free apart from the
 # rows already carved out above.
+
+# ── `[[std_free_fn]]` — body-less callees that are provably std ─────────────
+#
+# A callee with no body in the analyzed set and no model row is an
+# `external-crate-body` boundary: a dependency compiled without `--emit=mir`
+# really is code the analysis never saw, and calling it "clean" is the silent
+# `proven` this table exists to prevent.
+#
+# std is the exception, because it is modelled by the tables above instead. The
+# analyzer recognises it from the *declared types* at the call site, which MIR
+# always prints fully qualified even where it trims the callee path
+# (`String::clone` has a `std::string::String` receiver; `format` has a
+# `std::string::String` destination), and from a primitive self type
+# (`<u64 as From<u32>>::from`). Those two rules cover every std call the corpus
+# and all 43 workspace examples make, which is why this table is currently
+# empty.
+#
+# Add a row here when a run reports `unknown: external-crate-body: <path>` for a
+# std/core/alloc function whose whole signature is primitives, so no type at the
+# call site names its crate:
+#
+#   [[std_free_fn]]
+#   path = "some_free_fn"
+#   reason = "core::…::some_free_fn; takes and returns primitives, so no
+#             declared type at the call site is std-rooted."
+#
+# `path` matches exactly as `[[source]] path` does: a `::`-segment suffix of the
+# callee path with generic arguments stripped. A row here says "this body is
+# std, propagate taint through it", never "this call is clean".
 
 [[trusted]]
 name = "core"
