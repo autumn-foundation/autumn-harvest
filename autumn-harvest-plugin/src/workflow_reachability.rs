@@ -298,6 +298,11 @@ pub async fn build_workflow_reachability_report(
 /// [`build_report_from_observations`] helpers as
 /// [`build_workflow_reachability_report`], so the two cannot drift.
 ///
+/// For the standalone [`HarvestRunner`](crate::runner::HarvestRunner) path,
+/// which DOES support multi-shard deployments, use the cross-shard sibling
+/// [`build_reachability_report_for_shards`] — this function is a thin
+/// delegation to it with a single shard-0 entry.
+///
 /// Infallible by construction: a DB read failure is encoded as an unreachable
 /// shard (`status == Unavailable`) inside the report rather than an `Err`, so
 /// the caller never blocks boot on the check's own failure — combined with
@@ -309,9 +314,50 @@ pub async fn build_reachability_report_single_shard(
     pool: &DbPool,
     filter: Option<String>,
 ) -> WorkflowReachabilityReport {
+    let shards = BTreeMap::from([(0, Some(pool.clone()))]);
+    build_reachability_report_for_shards(registered, &shards, filter).await
+}
+
+/// Build a reachability report across an explicit set of shard pools, **without**
+/// a started [`HarvestApiState`]/runtime — the multi-shard boot-time gate core
+/// (issue #1128).
+///
+/// The sibling of [`build_reachability_report_single_shard`], for the standalone
+/// [`HarvestRunner`](crate::runner::HarvestRunner) path, which — unlike the
+/// single-shard-only plugin — supports deployments spanning several databases
+/// (issue #522). A shard-0-only gate there would report a `complete`, clean
+/// fleet while shards 1..N host orphans.
+///
+/// `shards` maps a shard id to that shard's pool, or to `None` for a shard this
+/// process knows about (its router names it) but has no pool for. A `None` shard
+/// is reported `unavailable` rather than silently dropped — exactly the
+/// [`shard_fanout::expected_shards`] rule the started-runtime fan-out follows —
+/// so an uninspected shard degrades the report to `partial`/`unavailable`
+/// instead of letting it claim a `complete` inspection it never performed.
+///
+/// Shares [`observe_shard`] and [`build_report_from_observations`] with
+/// [`build_workflow_reachability_report`], so the boot gate and the management
+/// route cannot drift.
+///
+/// Infallible by construction: a DB read failure is encoded as an unreachable
+/// shard (`status == Unavailable`) inside the report rather than an `Err`, so
+/// the caller never blocks boot on the check's own failure — combined with
+/// [`startup_orphan_decision`]'s crash-loop rule (`Fail` + incomplete report →
+/// `Warn`, never `Abort`), a transient DB outage at boot can never hard-fail
+/// startup.
+pub async fn build_reachability_report_for_shards(
+    registered: &BTreeSet<String>,
+    shards: &BTreeMap<i32, Option<DbPool>>,
+    filter: Option<String>,
+) -> WorkflowReachabilityReport {
     let observed_at = Utc::now();
-    let observation = observe_shard(0, Some(pool.clone()), filter.clone()).await;
-    build_report_from_observations(observed_at, filter, registered, vec![observation])
+    let observations = join_all(
+        shards
+            .iter()
+            .map(|(shard_id, pool)| observe_shard(*shard_id, pool.clone(), filter.clone())),
+    )
+    .await;
+    build_report_from_observations(observed_at, filter, registered, observations)
 }
 
 async fn observe_shard(

@@ -14,7 +14,9 @@
 use autumn_harvest::shard::{GLOBAL_SHARDED_POOL, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
-use autumn_harvest_plugin::runner::{resolve_runtime_storage_pool, select_runtime_shard0_pool};
+use autumn_harvest_plugin::runner::{
+    resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
+};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
@@ -85,6 +87,46 @@ fn gate_pool_selection_does_not_install_global_pool() {
         global_shard0_tag(),
         Some(71),
         "select_runtime_shard0_pool (single case) must NOT install harvest_pool globally",
+    );
+
+    // Issue #1128: the multi-shard gate selector must be equally side-effect
+    // free. It enumerates every shard of an already-constructed pool (a read),
+    // or returns the `harvest_pool` handle as shard 0 — never constructing a
+    // `ShardedDbPool`, which is the thing that installs the global.
+    let shards = select_runtime_gate_shards(None, Some(&sharded), &harvest, None);
+    assert_eq!(
+        shards
+            .get(&0)
+            .expect("shard 0 enumerated")
+            .as_ref()
+            .expect("shard 0 pool present")
+            .status()
+            .max_size,
+        71,
+        "the gate selector must enumerate the sharded pool's own shard-0 pool",
+    );
+    assert_eq!(
+        global_shard0_tag(),
+        Some(71),
+        "select_runtime_gate_shards (sharded case) must install/overwrite nothing",
+    );
+
+    let shards = select_runtime_gate_shards(None, None, &harvest, None);
+    assert_eq!(
+        shards
+            .get(&0)
+            .expect("shard 0 enumerated")
+            .as_ref()
+            .expect("shard 0 pool present")
+            .status()
+            .max_size,
+        31,
+        "the gate selector must return the harvest_pool handle as shard 0",
+    );
+    assert_eq!(
+        global_shard0_tag(),
+        Some(71),
+        "select_runtime_gate_shards (single case) must NOT install harvest_pool globally",
     );
 
     // Contrast: the INSTALL helper the normal startup path uses DOES overwrite

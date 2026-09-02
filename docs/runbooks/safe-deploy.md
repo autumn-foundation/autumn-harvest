@@ -984,7 +984,7 @@ If a type is still `in_use` (registered) that is normal; only an `orphaned` verd
 
 ## Boot-time gate (on by default)
 
-The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
+Harvest runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
 
 ```toml
 [harvest.startup]
@@ -997,6 +997,10 @@ orphaned_workflows = "warn"
 ```
 
 (Env override: `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail`.)
+
+**Both boot paths are gated (issue #1128).** The `HarvestPlugin` web-app path and the standalone `HarvestRunner::start` embedder path run the *same* check, from the same code, driven by the same `[harvest.startup] orphaned_workflows` setting. The standalone runner runs it as the first act of `start`, before it resolves the runtime, installs any process global or syncs completion triggers, and long before it spawns a worker — so a refused standalone boot leaves the process and the database exactly as it found them. On a **multi-shard** standalone deployment (`HarvestRunnerResources::with_sharded_pool`, #522) the gate fans out across *every* shard in the resolved pool, so an orphan on a non-zero shard refuses boot just as one on shard 0 does; a shard the router names but this process has no pool for is reported `unavailable`, which degrades the report to `partial` and therefore warns rather than aborts.
+
+**A deliberately handler-free process** (a control plane that registers no `#[workflow]`s but shares the Harvest database) will see every in-flight type as orphaned. That is the setting doing what it says — under the default `warn` it logs and boots; set `orphaned_workflows = "off"` on such a process rather than leaving it to refuse boot under `fail`.
 
 **Boot cost:** the check is a single bounded cross-shard `GROUP BY … COUNT(*) … ARRAY_AGG` aggregate (never a per-execution row load), and the per-group sample slice is bounded (drop-in `LATERAL (SELECT … ORDER BY started_at LIMIT n)` fallback keeps memory bounded even on a huge group). It runs by default under `warn`; a deployment concerned about boot latency on a very large non-terminal backlog can set `orphaned_workflows = "off"` to make boot zero-cost.
 
