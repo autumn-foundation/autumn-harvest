@@ -1276,6 +1276,174 @@ async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Upgrade safety — the migration's two backfills (Codex review round 2, P1s)
+// ---------------------------------------------------------------------------
+
+/// The migration's backfill statements, read from the migration itself so this
+/// test cannot drift from what a real upgrade runs.
+///
+/// Read at runtime with `fs::read_to_string` rather than `include_str!`: a
+/// compiled-in migration include is the hand-rolled-bundle anti-pattern
+/// `migration_hygiene::no_new_handrolled_migration_bundles_outside_allowlist`
+/// exists to prevent.
+fn migration_backfills() -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql");
+    let sql = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("migration must be readable at {}: {e}", path.display()));
+    // Strip whole-line comments FIRST, then split: the commentary carries its
+    // own semicolons, which would otherwise chop a statement mid-explanation.
+    let code: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let backfills: Vec<String> = code
+        .split(';')
+        .filter(|stmt| stmt.trim_start().starts_with("UPDATE"))
+        .map(|stmt| format!("{};", stmt.trim()))
+        .collect();
+    assert_eq!(
+        backfills.len(),
+        2,
+        "expected the operator-intent and upgrade-grace backfills; got:\n{backfills:#?}"
+    );
+    backfills
+}
+
+/// Rebuild the pre-upgrade shape of a row: the two #1127 columns unset.
+async fn make_pre_upgrade(conn: &mut AsyncPgConnection, key: &str) {
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets
+            SET last_registered_at = NULL, baseline_set_at = NULL
+          WHERE key = $1",
+    )
+    .bind::<Text, _>(key)
+    .execute(conn)
+    .await
+    .expect("reset to the pre-upgrade shape");
+}
+
+#[tokio::test]
+async fn the_migration_preserves_an_operator_baseline_that_predates_the_column() {
+    // Codex review round 2, P1. `POST /admin/rate-limits/{key}` accepts any key
+    // and validates nothing against the registry, so an operator may already
+    // have clamped a per-tenant key before this release. Without the backfill
+    // that intent is indistinguishable from an ordinary bucket, and the first
+    // sweep after upgrade reverts the clamp to the code-declared rate.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(9);
+    // An operator-written row: `updated_at` moved after creation, which before
+    // #1127 only an operator or config write could do.
+    insert_bucket_at(
+        &mut conn,
+        "start-throttle:wf:clamped",
+        0.5,
+        1.0,
+        1.0,
+        old,
+        Utc::now() - chrono::Duration::days(3),
+        old,
+    )
+    .await;
+    // An engine-registered row: created and updated by the same statement.
+    insert_bucket_at(
+        &mut conn,
+        "dyn-rate:t:engine",
+        5.0,
+        10.0,
+        10.0,
+        old,
+        old,
+        old,
+    )
+    .await;
+    for key in ["start-throttle:wf:clamped", "dyn-rate:t:engine"] {
+        make_pre_upgrade(&mut conn, key).await;
+    }
+
+    for stmt in migration_backfills() {
+        diesel::sql_query(&stmt)
+            .execute(&mut conn)
+            .await
+            .expect("run the migration backfill");
+    }
+
+    // The upgrade grace (backfill 2b) protects BOTH rows for a full window, so
+    // age them past it to isolate what backfill 2a decides.
+    diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1 WHERE TRUE")
+        .bind::<Timestamptz, _>(old)
+        .execute(&mut conn)
+        .await
+        .expect("age past the upgrade grace");
+
+    let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(collected(&result), 1);
+    assert_eq!(
+        surviving_keys(&mut conn).await,
+        vec!["start-throttle:wf:clamped"],
+        "a pre-upgrade operator clamp must survive the first sweep"
+    );
+}
+
+#[tokio::test]
+async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace() {
+    // Codex review round 2, P1. The GC's interlock is taken by the WRITER, and
+    // a worker still running the previous binary does not take it — its dynamic
+    // enqueue is a bare `INSERT ... ON CONFLICT DO NOTHING` and its throttle
+    // backlog append ensured no bucket at all. But the janitor starts sweeping
+    // as soon as the first upgraded instance runs, so a rolling restart would
+    // otherwise have a new janitor collecting while old workers write
+    // unprotected. Stamping `last_registered_at` at migration time makes every
+    // pre-upgrade row ineligible for a full retention window.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // Idle for over a year, and by every other clock instantly collectable.
+    insert_idle_bucket(&mut conn, "dyn-rate:t:ancient", chrono::Duration::days(400)).await;
+    make_pre_upgrade(&mut conn, "dyn-rate:t:ancient").await;
+
+    for stmt in migration_backfills() {
+        diesel::sql_query(&stmt)
+            .execute(&mut conn)
+            .await
+            .expect("run the migration backfill");
+    }
+
+    let result = run_one_tick(
+        pool.clone(),
+        gc_only(WINDOW),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+    assert_eq!(
+        collected(&result),
+        0,
+        "a pre-upgrade bucket must not be collected inside the grace window"
+    );
+    assert!(bucket_exists(&mut conn, "dyn-rate:t:ancient").await);
+
+    // The grace is one-time, not permanent: once the window has elapsed the row
+    // ages normally, so abandoned per-tenant buckets are still reclaimed.
+    diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1")
+        .bind::<Timestamptz, _>(Utc::now() - chrono::Duration::days(2))
+        .execute(&mut conn)
+        .await
+        .expect("elapse the grace");
+
+    let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
+    assert_eq!(collected(&result), 1);
+    assert!(!bucket_exists(&mut conn, "dyn-rate:t:ancient").await);
+}
+
+// ---------------------------------------------------------------------------
 // AC5 — shard-local
 // ---------------------------------------------------------------------------
 

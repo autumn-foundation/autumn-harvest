@@ -134,6 +134,20 @@ was precisely what a skip made unavailable.
 collected?" and "why not yet?" are answerable from the same read an operator is
 already looking at.
 
+**Upgrade safety.** The migration backfills both new columns rather than leaving
+them null, because a null in either is indistinguishable from a fact the GC
+needs. `baseline_set_at` is stamped on every row whose `updated_at` moved after
+creation — before this release only an operator or config write could do that —
+so a per-tenant clamp set through `POST /admin/rate-limits/{key}` *before* the
+upgrade is exempt rather than silently reverted on the first sweep.
+`last_registered_at` is stamped on every existing row with the migration's own
+clock, which makes each ineligible for a full retention window: the GC's
+interlock is taken by the *writer*, a worker on the previous binary does not take
+it, and the janitor starts collecting the moment the first upgraded instance
+runs — so without this a rolling restart would have a new janitor sweeping while
+old workers still write unprotected. The grace is one-time, so abandoned
+per-tenant buckets are still reclaimed a window later.
+
 **One migration** (`20260902133132_harvest_rate_limit_bucket_gc`): two additive
 nullable columns (`last_registered_at`, `baseline_set_at`) and one partial index,
 `idx_harvest_task_queue_rate_limit_key_live`, backing the non-terminal-task
