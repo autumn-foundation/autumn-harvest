@@ -283,6 +283,19 @@ async fn a_nontransactional_migration_may_create_an_index_concurrently() {
             .contains(&"29990102000000".to_string()),
         "a non-transactional migration must still be recorded"
     );
+
+    // It ran unserialized however privileged this role is -- there is no
+    // transaction for the ledger lock to be held in -- and the report has to
+    // say so, naming only that migration.
+    assert!(
+        report.ledger_lock_available,
+        "the superuser this connects as can lock the ledger"
+    );
+    assert_eq!(
+        report.applied_unserialized,
+        vec!["29990102000000_harvest_migrate_probe_index".to_string()],
+        "only the run_in_transaction = false migration ran without the lock"
+    );
 }
 
 #[tokio::test]

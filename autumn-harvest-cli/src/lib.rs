@@ -5158,9 +5158,9 @@ const fn empty_migration_report() -> MigrationReport {
         already_applied: Vec::new(),
         applied_concurrently: Vec::new(),
         unrecognized: Vec::new(),
-        // Nothing ran, so nothing was locked. Never rendered as the warning
-        // below, because that is gated on the run having applied something.
-        ledger_locked: true,
+        // Nothing ran, so nothing ran unserialized.
+        ledger_lock_available: true,
+        applied_unserialized: Vec::new(),
         failed: None,
     }
 }
@@ -5223,14 +5223,33 @@ pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
         // The `harvest` binary installs no tracing subscriber, so the engine's
         // own warning about this goes nowhere. An operator only learns that
         // concurrent runs are unsafe here if the report says so.
-        if !report.ledger_locked {
+        if !report.applied_unserialized.is_empty() {
             let _ = writeln!(
                 out,
-                "    WARNING: applied without the ledger lock -- this role lacks \
-                 UPDATE/DELETE/TRUNCATE on __diesel_schema_migrations, so \
-                 concurrent migrators are NOT serialized (same as `diesel \
-                 migration run`). Run one at a time, or grant one of those."
+                "    WARNING: {} migration(s) applied WITHOUT the ledger lock, so a \
+                 concurrent migrator was not serialized against them:",
+                report.applied_unserialized.len()
             );
+            for name in &report.applied_unserialized {
+                let _ = writeln!(out, "      {name}");
+            }
+            // Two causes, two different remedies -- naming the wrong one sends
+            // an operator to change a grant that would not have helped.
+            if report.ledger_lock_available {
+                let _ = writeln!(
+                    out,
+                    "      cause: these declare run_in_transaction = false, so there is \
+                     no transaction for the lock to be held in. No grant changes this; \
+                     run migrators one at a time."
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "      cause: this role lacks UPDATE/DELETE/TRUNCATE on \
+                     __diesel_schema_migrations. Grant one of those, or run migrators \
+                     one at a time."
+                );
+            }
         }
         if *setup_failed {
             let _ = writeln!(
@@ -5306,7 +5325,8 @@ pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError
                 "already_applied": target.report.already_applied,
                 "applied_concurrently": target.report.applied_concurrently,
                 "unrecognized": target.report.unrecognized,
-                "ledger_locked": target.report.ledger_locked,
+                "ledger_lock_available": target.report.ledger_lock_available,
+                "applied_unserialized": target.report.applied_unserialized,
                 // The run could not prepare this database at all. Without it an
                 // empty report reads as "finished with nothing to do".
                 "setup_failed": target.setup_failed,
@@ -17724,23 +17744,82 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
-                ledger_locked: false,
+                ledger_lock_available: false,
+                applied_unserialized: vec!["20260801000000_x".to_string()],
             },
         }];
 
         let text = format_migrate_run_text(&targets);
         assert!(
-            text.contains("without the ledger lock"),
+            text.contains("WITHOUT the ledger lock"),
             "an unserialized apply must be visible to the operator: {text}"
+        );
+        assert!(
+            text.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "a missing grant must name the grant as the cause: {text}"
         );
         assert!(
             text.contains("one at a time"),
             "the warning must say what to do about it: {text}"
         );
+        assert!(
+            text.contains("20260801000000_x"),
+            "the warning must name which migrations ran that way: {text}"
+        );
 
         let value: Value =
             serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(value["targets"][0]["ledger_locked"], false);
+        assert_eq!(value["targets"][0]["ledger_lock_available"], false);
+        assert_eq!(
+            value["targets"][0]["applied_unserialized"][0],
+            "20260801000000_x"
+        );
+    }
+
+    #[test]
+    fn a_nontransactional_migration_warns_without_blaming_privileges() {
+        // A privileged role still cannot hold a lock across a migration that
+        // declares `run_in_transaction = false` -- there is no transaction to
+        // hold it in. Telling this operator to fix a grant would send them to
+        // change something that was never the cause.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec![
+                    "20260801000000_x".to_string(),
+                    "20260802000000_concurrent_index".to_string(),
+                ],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: vec!["20260802000000_concurrent_index".to_string()],
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("WITHOUT the ledger lock"), "{text}");
+        assert!(
+            text.contains("run_in_transaction = false"),
+            "the cause must be the migration's own metadata: {text}"
+        );
+        assert!(
+            !text.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "a privileged role must not be told to fix a grant: {text}"
+        );
+        // Scoped to the warning block: the transactional migration belongs in
+        // `applied:` above it, just not in the list of what ran unserialized.
+        let warning = text.split("WARNING:").nth(1).expect("a warning block");
+        assert!(
+            warning.contains("20260802000000_concurrent_index"),
+            "the warning names the unserialized migration: {warning}"
+        );
+        assert!(
+            !warning.contains("20260801000000_x"),
+            "the warning must not name a migration that WAS serialized: {warning}"
+        );
     }
 
     #[test]
@@ -17754,7 +17833,8 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
 
@@ -17776,7 +17856,8 @@ mod migrate_cli_tests {
                 applied_concurrently: vec!["20260802000000_y".to_string()],
                 unrecognized: Vec::new(),
                 failed: None,
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
 
@@ -17819,7 +17900,8 @@ mod migrate_cli_tests {
                     name: "20260801000000_concurrent_index".to_string(),
                     rolled_back: false,
                 }),
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
 
@@ -17856,7 +17938,8 @@ mod migrate_cli_tests {
                     name: "20260802000000_y".to_string(),
                     rolled_back: true,
                 }),
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
         let text = format_migrate_run_text(&targets);
@@ -17885,7 +17968,8 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
 
@@ -17909,7 +17993,8 @@ mod migrate_cli_tests {
                 applied_concurrently: Vec::new(),
                 unrecognized: Vec::new(),
                 failed: None,
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
         }];
         assert!(!format_migrate_run_text(&targets).contains("FAILED"));

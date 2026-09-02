@@ -440,7 +440,8 @@ impl From<HarvestError> for PartialMigration {
                 // These failures happen before the privilege is probed, and
                 // nothing was applied, so there is no unserialized apply to
                 // warn about.
-                ledger_locked: true,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
             },
             error,
         }
@@ -484,16 +485,31 @@ pub struct MigrationReport {
     /// The migration the run stopped on, when it stopped. `None` on a run that
     /// finished.
     pub failed: Option<FailedMigration>,
-    /// Whether this run held the ledger lock while applying.
+    /// Whether this role may take the ledger lock at all.
     ///
-    /// `false` means the role lacks `UPDATE`/`DELETE`/`TRUNCATE` on the ledger,
-    /// so migrations were applied *unserialized* — Diesel's behaviour, and no
-    /// worse than what that role has today, but two concurrent migrators can
-    /// then run the same body and one will fail on its own DDL. Reported here
-    /// rather than only logged, because a caller may be a CLI with no tracing
-    /// subscriber installed, and a degradation nobody sees is not a
-    /// degradation anyone can act on. See [`apply_to_connection`].
-    pub ledger_locked: bool,
+    /// `false` means it lacks `UPDATE`/`DELETE`/`TRUNCATE` on the ledger, so
+    /// *every* migration in this run was applied unserialized. This is the
+    /// cause a grant can fix; see [`applied_unserialized`](Self::applied_unserialized)
+    /// for what actually ran that way.
+    pub ledger_lock_available: bool,
+    /// Migrations this run applied **without** holding the ledger lock, in the
+    /// order applied.
+    ///
+    /// Two causes, and they take different remedies, which is why this is a
+    /// list rather than a second flag:
+    ///
+    /// * the role cannot lock the ledger at all
+    ///   ([`ledger_lock_available`](Self::ledger_lock_available) is `false`) —
+    ///   fixable with a grant, or by running migrators one at a time;
+    /// * the migration declares `run_in_transaction = false`, so there is no
+    ///   transaction for a lock to be held in. Inherent, and no grant helps:
+    ///   run migrators one at a time.
+    ///
+    /// Either way a concurrent migrator can run the same body, so this is
+    /// reported rather than only logged — a caller may be a CLI with no
+    /// tracing subscriber installed, and a degradation nobody sees is not one
+    /// anyone can act on. See [`apply_to_connection`].
+    pub applied_unserialized: Vec<String>,
 }
 
 /// Connect to `database_url`.
@@ -630,12 +646,21 @@ pub async fn apply_to_connection(
         applied_concurrently: Vec::new(),
         unrecognized: plan.unrecognized,
         failed: None,
-        ledger_locked: lock_ledger,
+        ledger_lock_available: lock_ledger,
+        applied_unserialized: Vec::new(),
     };
 
     for script in &plan.pending {
         match apply_one(conn, script, lock_ledger).await {
-            Ok(Applied::Yes) => report.applied.push(script.name.clone()),
+            Ok(Applied::Yes) => {
+                report.applied.push(script.name.clone());
+                // Not `lock_ledger` alone: a `run_in_transaction = false`
+                // migration has no transaction to hold a lock in, so it runs
+                // unserialized however privileged the role is.
+                if !lock_ledger || !script.run_in_transaction {
+                    report.applied_unserialized.push(script.name.clone());
+                }
+            }
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
             Err(error) => {
                 // Say which it was: a rolled-back migration left nothing
