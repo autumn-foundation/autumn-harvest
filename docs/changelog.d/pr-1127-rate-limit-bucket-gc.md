@@ -141,7 +141,9 @@ creation — before this release only an operator or config write could do that 
 so a per-tenant clamp set through `POST /admin/rate-limits/{key}` *before* the
 upgrade is exempt rather than silently reverted on the first sweep.
 `last_registered_at` is stamped on every existing row with the migration's own
-clock, which makes each ineligible for a full retention window: the GC's
+clock — through the column's `DEFAULT now()`, which PostgreSQL 11+ applies
+catalog-only, so it costs no table rewrite on exactly the large tables this
+pass exists to fix — which makes each ineligible for a full retention window: the GC's
 interlock is taken by the *writer*, a worker on the previous binary does not take
 it, and the janitor starts collecting the moment the first upgraded instance
 runs — so without this a rolling restart would have a new janitor sweeping while

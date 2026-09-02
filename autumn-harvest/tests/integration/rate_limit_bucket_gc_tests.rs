@@ -1305,10 +1305,81 @@ fn migration_backfills() -> Vec<String> {
         .collect();
     assert_eq!(
         backfills.len(),
-        2,
-        "expected the operator-intent and upgrade-grace backfills; got:\n{backfills:#?}"
+        1,
+        "the operator-intent backfill is the ONLY statement-level backfill: the \
+         upgrade grace is carried by the ADD COLUMN's default, because an UPDATE \
+         over every row would rewrite the table under an ACCESS EXCLUSIVE lock \
+         (Codex review round 3, P1). Got:\n{backfills:#?}"
     );
     backfills
+}
+
+/// The statements that add `last_registered_at`, read from the migration, so
+/// the grace test below exercises the real upgrade path rather than a
+/// paraphrase of it.
+fn migration_last_registered_at_ddl() -> Vec<String> {
+    migration_statements()
+        .into_iter()
+        .filter(|stmt| stmt.contains("last_registered_at") && stmt.starts_with("ALTER TABLE"))
+        .collect()
+}
+
+/// Every non-comment statement in the migration, in file order.
+fn migration_statements() -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql");
+    let sql = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("migration must be readable at {}: {e}", path.display()));
+    sql.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(|stmt| stmt.trim().to_string())
+        .filter(|stmt| !stmt.is_empty())
+        .map(|stmt| format!("{stmt};"))
+        .collect()
+}
+
+/// The lock profile itself, asserted against the migration text.
+///
+/// Codex review round 3, P1: the grace must come from the column default, and
+/// no statement in this migration may rewrite the whole bucket table while the
+/// ALTERs hold `ACCESS EXCLUSIVE` on it.
+#[test]
+fn the_migration_grants_the_grace_without_rewriting_the_bucket_table() {
+    let statements = migration_statements();
+
+    let add = statements
+        .iter()
+        .find(|stmt| stmt.contains("ADD COLUMN IF NOT EXISTS last_registered_at"))
+        .expect("the migration must add last_registered_at");
+    assert!(
+        add.contains("DEFAULT now()"),
+        "the column must be added WITH a now() default -- that is what stamps \
+         existing rows catalog-only (PG11+ attmissingval), with no rewrite: {add}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("ALTER COLUMN last_registered_at DROP DEFAULT")),
+        "and the default must then be dropped, so rows created AFTER the upgrade \
+         are stamped by ensure_rate_limit_bucket rather than by a column default"
+    );
+
+    for stmt in statements.iter().filter(|stmt| stmt.starts_with("UPDATE")) {
+        assert!(
+            stmt.contains("WHERE"),
+            "an unconditional UPDATE rewrites every row of the bucket table while \
+             the ALTERs above hold ACCESS EXCLUSIVE on it -- on the large tables \
+             this migration exists to fix, that is a dispatch outage: {stmt}"
+        );
+        assert!(
+            !stmt.contains("last_registered_at"),
+            "the upgrade grace must come from the column default, not a full-table \
+             UPDATE: {stmt}"
+        );
+    }
 }
 
 /// Rebuild the pre-upgrade shape of a row: the two #1127 columns unset.
@@ -1373,8 +1444,9 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
             .expect("run the migration backfill");
     }
 
-    // The upgrade grace (backfill 2b) protects BOTH rows for a full window, so
-    // age them past it to isolate what backfill 2a decides.
+    // A real upgrade would stamp both rows through the ADD COLUMN default; set
+    // them old here so this test isolates what the operator-intent backfill
+    // decides (the grace itself is covered by the test above).
     diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1 WHERE TRUE")
         .bind::<Timestamptz, _>(old)
         .execute(&mut conn)
@@ -1408,13 +1480,31 @@ async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace(
 
     // Idle for over a year, and by every other clock instantly collectable.
     insert_idle_bucket(&mut conn, "dyn-rate:t:ancient", chrono::Duration::days(400)).await;
-    make_pre_upgrade(&mut conn, "dyn-rate:t:ancient").await;
 
-    for stmt in migration_backfills() {
-        diesel::sql_query(&stmt)
+    // Replay the real upgrade on the real table: drop the column back to its
+    // pre-#1127 shape, then re-add it with the migration's OWN statements. That
+    // exercises the catalog-only default path an operator actually runs —
+    // stamping rows that already exist — rather than a paraphrase of it.
+    //
+    // Everything that can fail is resolved BEFORE the column is dropped, and the
+    // window between the drop and the re-add contains no assertion: a panic in
+    // there would leave the shared test database without a column every other
+    // test in this file needs, turning one failure into a cascade.
+    let ddl = migration_last_registered_at_ddl();
+    assert_eq!(
+        ddl.len(),
+        2,
+        "expected the ADD COLUMN and the DROP DEFAULT; got:\n{ddl:#?}"
+    );
+    diesel::sql_query("ALTER TABLE harvest_rate_limit_buckets DROP COLUMN last_registered_at")
+        .execute(&mut conn)
+        .await
+        .expect("return the table to its pre-upgrade shape");
+    for stmt in &ddl {
+        diesel::sql_query(stmt)
             .execute(&mut conn)
             .await
-            .expect("run the migration backfill");
+            .unwrap_or_else(|e| panic!("replay the migration DDL ({stmt}): {e}"));
     }
 
     let result = run_one_tick(

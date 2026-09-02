@@ -19,8 +19,31 @@
 --    NULL on every pre-upgrade row, which reads as "never registered since the
 --    upgrade" — the first `ensure` stamps it. `GREATEST` ignores NULLs, so an
 --    un-stamped row simply ages out on its other timestamps.
+-- Added WITH a `now()` default and then stripped of it, which is not a
+-- roundabout way of adding a nullable column: it is what gives every
+-- pre-upgrade row the grace described in 2b below WITHOUT rewriting the table.
+--
+-- Since PG11 an `ADD COLUMN ... DEFAULT <non-volatile expr>` is catalog-only:
+-- the default is evaluated ONCE and stored in `pg_attribute.attmissingval`, and
+-- existing rows read it back without being touched. `now()` is STABLE, so it
+-- qualifies. `DROP DEFAULT` then removes it for FUTURE inserts while leaving
+-- that missing value in place, so a bucket registered after the upgrade is
+-- stamped by `ensure_rate_limit_bucket` (which writes the column explicitly)
+-- rather than by a column default.
+--
+-- Measured on 300k rows: 0.6 ms + 0.3 ms, table size unchanged at 26 MB.
+-- The `UPDATE ... SET last_registered_at = NOW()` this replaces took 1,419 ms
+-- and grew the table 26 MB -> 44 MB — a full rewrite, with the WAL to match,
+-- held under the ACCESS EXCLUSIVE lock the ALTER above takes until this
+-- transaction commits. Diesel runs each migration in one transaction, so that
+-- lock covers every statement here: on a deployment with the large bucket table
+-- this migration exists to fix, the rewrite would have blocked bucket reads and
+-- writes — including the claim path's token debits — for its whole duration.
 ALTER TABLE harvest_rate_limit_buckets
-    ADD COLUMN IF NOT EXISTS last_registered_at TIMESTAMPTZ NULL;
+    ADD COLUMN IF NOT EXISTS last_registered_at TIMESTAMPTZ NULL DEFAULT now();
+
+ALTER TABLE harvest_rate_limit_buckets
+    ALTER COLUMN last_registered_at DROP DEFAULT;
 
 -- 2. `baseline_set_at` — when an operator last wrote this bucket's PERMANENT
 --    baseline through `POST /admin/rate-limits/{key}` (issue #332).
@@ -61,6 +84,11 @@ ALTER TABLE harvest_rate_limit_buckets
 --     indistinguishable from an engine-registered one. Re-apply any such clamp
 --     after upgrading, or preview a tick with `dry_run` first -- it lists exactly
 --     what would be collected and deletes nothing.
+--     Unlike 2b this cannot be a column default (it reads another column), so
+--     it stays a statement. It is a scan rather than a rewrite: only rows an
+--     operator actually wrote are updated, and matching none costs 18 ms per
+--     300k rows — the same order as the index build below, and far short of the
+--     rewrite avoided above.
 UPDATE harvest_rate_limit_buckets
    SET baseline_set_at = updated_at
  WHERE updated_at > created_at;
@@ -89,9 +117,10 @@ UPDATE harvest_rate_limit_buckets
 --     Deliberately not permanent: after that one window the rows age normally
 --     and abandoned per-tenant buckets -- the bulk of the growth this issue is
 --     about -- are still reclaimed.
-UPDATE harvest_rate_limit_buckets
-   SET last_registered_at = NOW()
- WHERE last_registered_at IS NULL;
+--     Done by the column default above, not by a statement here: an
+--     `UPDATE` over every row would rewrite the whole table under the ALTER's
+--     ACCESS EXCLUSIVE lock, which on a large bucket table means a dispatch
+--     outage for its duration (see the note on the ADD COLUMN above).
 
 -- 3. The sweep refuses to collect a bucket that any NON-TERMINAL task still
 --    references: both the claim-time gate and
