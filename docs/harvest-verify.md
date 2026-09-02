@@ -84,12 +84,13 @@ $ cargo harvest-verify --list-boundaries
 | `--example <NAME>` | Analyze one example target. Repeatable. |
 | `--all-examples` | Analyze every example target of the selected packages **whose `required-features` are enabled**. Each skipped example prints a `warning: skipping example <name>: required feature(s) not enabled: <list>` line, so the analyzed set is always visible in the output. |
 | `--bin <NAME>` | Analyze one binary target. Repeatable. |
+| `--test <NAME>` | Analyze one integration-test target (`tests/NAME.rs`). Repeatable. This is how you point the analyzer at a `#[workflow]` corpus that lives in tests rather than in `examples/` — this repo's own `harvest-verify-tests` CI job uses `--test integration`. Test targets are the most expensive shape to emit, because cargo must build the whole test binary; budget accordingly. |
 | `--features <LIST>` | Comma-separated features to enable, as for `cargo build`. |
 | `--no-default-features` | Disable default features. |
-| `--target-dir <DIR>` | Where MIR is emitted. Default: `<workspace>/target/harvest-verify`. Kept separate from `target/` on purpose — see *Stale MIR* below. |
+| `--target-dir <DIR>` | Where MIR is emitted. Default: `<workspace>/target/harvest-verify`. A **relative** path resolves against the workspace root, not the current directory, so running from a subdirectory does not quietly emit into a second tree. Kept separate from `target/` on purpose — see *Stale MIR* below. Give each distinct run shape (different packages, different features) its own subdirectory: two shapes sharing one target dir invalidate each other's units on every alternation. |
 | `--mir <PATH>` | Analyze pre-emitted `.mir` files or directories instead of building. Repeatable. |
 | `--source-root <DIR>` | Extra root for resolving `<impl at file:l:c>` headers back to source. The workspace root is always included. Repeatable. |
-| `--model <FILE>` | Overlay a model TOML on the builtin one. Repeatable, applied left to right. |
+| `--model <FILE>` | Overlay a model TOML on the builtin one. Repeatable, applied left to right. **Strict:** an unknown table or an unknown field is a hard error (exit `2`), not a silent no-op — a typo used to mean "the rule you thought you added never entered the model, and the tool reported `proven`". |
 | `--allowlist <FILE>` | Load an allowlist (conventionally `harvest-verify.allow.toml`). |
 | `--strict` | `unknown` verdicts and unused allowlist entries fail the run. |
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` emits the full report. |
@@ -145,7 +146,6 @@ proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
 
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
-warning: the MIR parser is validated on rustc 1.94.x; this run used `rustc 1.98.0 (88d9e12ae 2026-08-18)`. A format change surfaces as a `mir-parse` boundary, never as a wrong verdict
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
 verdicts hold under model 2026.09.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
@@ -159,15 +159,28 @@ Three things about that footer are worth knowing before you quote it:
   boundaries actually hit in a run appear on the individual workflows, as
   `unknown:` lines.
 - **The rustc string is the whole `rustc -V` line.** It already begins with the
-  word `rustc`, so the header does not prefix it again. (It used to, and printed
-  `rustc rustc 1.98.0 …`; the header now interpolates the line as it stands.)
-- **The version-mismatch warning overstates its guarantee.** A change to the MIR
-  *grammar* does surface as a `mir-parse` boundary. A change to how rustc
-  *spells a type* does not: the parser reads it fine and a model row silently
-  stops matching. That has already happened once —
-  [see the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
-  — so treat a toolchain bump as a reason to re-run the corpus, not as something
-  the warning has handled for you.
+  word `rustc`, so the header does not prefix it again.
+- **There is no version warning on a validated toolchain.** The parser has been
+  exercised against stable **1.94 through 1.98**, matched on `major.minor`, so
+  none of those warns — which is the point: a warning printed on every run is a
+  warning nobody reads. Outside that set you get one line, and it makes the
+  weaker, true claim rather than the stronger, false one it used to:
+
+  ```text
+  warning: the MIR parser is validated on rustc 1.94, 1.95, 1.96, 1.97, 1.98; this run
+  used `rustc X.Y.Z (…)`. Other versions may print paths and types differently, which
+  can make model rows stop matching — run the corpus tests
+  (`cargo test -p autumn-harvest-verify --test corpus`) on your toolchain before
+  trusting a clean result
+  ```
+
+  It used to end *"a format change surfaces as a `mir-parse` boundary, never as a
+  wrong verdict"*, and that sentence was false: a change to the MIR **grammar**
+  does surface as `mir-parse`, but a change to how rustc **spells a type** does
+  not — the parser reads it fine and a model row silently stops matching. That
+  has already happened once
+  ([see the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)),
+  so treat a toolchain bump as a reason to re-run the corpus.
 
 ### The shape of a finding
 
@@ -275,6 +288,20 @@ rule is how a model rots.
 Overlays compose, applied left to right. **No tool release is required to teach
 it a new primitive** (issue #962, AC4).
 
+Two things to know before you rely on an overlay:
+
+- **The merge key is `(table, path, receiver)`.** An overlay can *add* a row and
+  can *replace* a row **within the same table** — but it cannot remove a row, and
+  it cannot demote a row that lives in a different table. Adding a `[[source]]`
+  row for a method that is already `[[sanctioned]]` does not un-sanction it. This
+  is deliberate: a team should not be able to switch off a sanctioned primitive
+  from a command line, and AC4 only asks that new primitives be *addable*.
+- **Overlays are strict.** Every model struct carries
+  `#[serde(deny_unknown_fields)]`, so a misspelt table (`[[sourcez]]`) or a stray
+  key is a tool error (exit `2`) naming the problem. It used to be silently
+  ignored, which meant a typo left you believing you had widened coverage while
+  the tool reported `proven`.
+
 ### Worked example: sanctioning a first-party ctx wrapper
 
 Suppose your codebase wraps the recorded clock:
@@ -340,8 +367,8 @@ dependency graph before the first `.mir` file exists. **The performance target
 for this job is a warm-cache number.**
 
 For scale, the gate over this repository's 43 buildable example targets — 57
-`#[workflow]` fns — was measured at **25.1 s** warm, **18.6 s** on an immediate
-repeat, and **1 min 41 s** cold into a fresh `--target-dir` that ended up 4.0 GB.
+`#[workflow]` fns — was measured at **16.9 s** warm, **16.6 s** on an immediate
+repeat, and **1 min 47 s** cold into a fresh `--target-dir` that ended up 4.0 GB.
 Cold is therefore not automatically fatal, but that measurement was taken with
 cargo's registry already populated; a CI runner also pays the crate downloads,
 which is why the cache stays load-bearing and the published target stays a
@@ -377,11 +404,30 @@ The command exits non-zero on any `nondeterminism-found`, so the step fails the
 job with no extra shell plumbing. Add `--strict` once your `unknown` count is
 zero and you want it to stay there.
 
-**Ratchet the `unknown` count.** `unknown` warns by default, which means a run
-whose analysis has silently regressed — a rustc upgrade the parser does not
-understand, a new `dyn` call, a new unmodelled ctx method — stays green. Track
-the count from `--format json` and fail on an increase. Without that, the tool
-can degrade to a no-op without anybody noticing.
+**Ratchet the `unknown` count — and do not stop there.** `unknown` warns by
+default, which means a run whose analysis has silently regressed — a rustc
+upgrade the parser does not understand, a new `dyn` call, a new unmodelled ctx
+method — stays green. Track the count from `--format json` and fail on an
+increase. But an `unknown` ratchet is not sufficient on its own: this repo's own
+[coverage-rot incident](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
+took the detection rate from 29/29 to 24/29 **with the `unknown` count pinned at
+zero throughout**. The two ratchets that would have caught it are in
+`autumn-harvest-verify/tests/`, and they are worth copying:
+`corpus::every_seeded_case_is_detected` asserts the exact seeded-case count
+(`found == 29`), not a threshold, so a partial regression cannot hide above 90%;
+and `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+diffs the set of model rows that match nothing against a checked-in list, which
+may shrink freely and may only grow with a written reason.
+
+**This repository runs two jobs, not one.** `harvest-verify` is the recipe above,
+over `examples/`. `harvest-verify-tests` runs the same non-strict gate over
+`-p autumn-harvest --test integration` — the repo's `#[workflow]` **test**
+corpus, 88 workflows, `analyzed 88: proven 88, unknown 0, found 0, allowed 0`
+with no allowlist entry needed. It is a separate job because it costs 478 s and a
+7 GB target directory, which would blow the < 5 min budget the examples gate is
+measured against. Both jobs' load-bearing steps are asserted by
+`autumn-harvest-verify/tests/ci_wiring.rs`, so deleting a step cannot leave a
+green, silent build.
 
 ---
 
@@ -395,10 +441,11 @@ The ones you are most likely to meet:
   more than one implementing type, fn pointers, `extern "C"`, raw pointers, and
   callees in crates whose MIR was not emitted all produce it.
 - **The MIR text format is not a stable API, and the model is more fragile than
-  the parser.** The parser is validated against a recorded rustc version, printed
-  in every report header, and a shape it cannot parse becomes
-  `unknown("mir-parse: …")` rather than a wrong answer. But the parser is not the
-  weak point. Model rows are keyed on the *trimmed* paths and type names rustc
+  the parser.** The parser has been exercised against stable 1.94–1.98, the
+  toolchain is printed in every report header, and a shape it cannot parse
+  becomes `unknown("mir-parse: …")` rather than a wrong answer — including an
+  unrecognised statement or terminator *inside* a live block, and a dump that is
+  not valid UTF-8. But the parser is not the weak point. Model rows are keyed on the *trimmed* paths and type names rustc
   prints, so a release that renames a type in its output — not the grammar, just
   the spelling — leaves the parser happy and a row silently unmatched. On the
   `1.94 → 1.98` bump exactly that happened: `AtomicU64` began printing as
@@ -408,13 +455,16 @@ The ones you are most likely to meet:
   own output would have told you. **Re-run the corpus after any toolchain
   change**; see
   [the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot).
-- **A callee with no body and no crate-rooted path is assumed pure.** rustc's
-  trimmed paths make `format` or `String::clone` indistinguishable from a
-  first-party function whose MIR was not emitted, so both are treated as
-  taint-propagators rather than as boundaries. Anything stricter would make
-  nearly every workflow `unknown`. The cost: a non-deterministic source inside an
-  unemitted body is invisible, and you get `proven-deterministic` instead of
-  `unknown`.
+- **A body-less callee is trusted only when the call site looks like std.**
+  rustc's trimmed paths make `format` or `String::clone` indistinguishable *by
+  name* from a first-party function whose MIR was not emitted, so the
+  discriminator is the declared types at the call site, which MIR prints fully
+  qualified. A body-less callee propagates taint silently when a
+  `std`/`core`/`alloc` or `[[trusted]]` root appears in the callee text or in any
+  declared type there, when the receiver is a primitive, or when a
+  `[[std_free_fn]]` row names it; otherwise it is an `external-crate-body`
+  boundary and you get `unknown`. The residual cost: `<T as std::Trait>::m` on a
+  third-party type is trusted on the strength of the trait name alone.
 - **`tokio::select!` is invisible to it.** The macro leaves no residual token in
   MIR. HVG010/DET011 remain the gate for select-style racing.
 - **Sanitizer kills are per-place and monotone.** A `sort()` anywhere in a body
@@ -422,20 +472,38 @@ The ones you are most likely to meet:
   that run before the sort, and including on branches where the sort never runs.
   A value sorted on one path counts as sorted on all of them. This under-reports;
   it never over-reports.
-- **Recursion is cut, not solved.** A callee already on the call stack is not
-  re-entered: the analyzer records a `recursion` boundary and returns a
-  pass-through summary that reports **no sinks**. The verdict degrades to
+- **Recursion is cut, not solved.** A callee already on the call stack, a call
+  chain deeper than 96 bodies, or an exhausted 6000-body budget is not entered:
+  the analyzer records a `recursion` boundary and returns a pass-through summary
+  that reports **no sinks**. The verdict degrades to
   `unknown`, so you are told — but a command emitted only from inside a recursive
   cycle produces no finding and no trace.
 - **Single-impl devirtualization assumes a closed world.** Correct for the
   analyzed crate set; wrong the moment a downstream crate adds a second impl.
+- **A sink inside a closure handed to a higher-order function is not recorded at
+  the call site.** Only the closure's return taint and its writes through its
+  captured environment are folded back. A closure that *is* the resolved target
+  of a call is handled; one passed to somebody else's iterator adaptor is not.
+- **Implicit flow is per-body.** A value produced by a tainted branch does carry
+  that branch's taint (so `if now() % 2 == 0 { 0 } else { 1 }` is not laundered),
+  but there is no interprocedural control context: a helper *called* from inside
+  a tainted branch is not re-analyzed under it.
+- **Drop glue is followed one level.** A user `impl Drop` on the dropped type is
+  analyzed; the `Drop` impls of its *fields* are not, and glue the analyzer
+  cannot resolve raises a `drop-glue` boundary.
+- **The allowlist file is not strict about unknown keys** (the model files are).
+  A misspelt key in `harvest-verify.allow.toml` is ignored rather than rejected.
 - **Not analyzed at all:** activity bodies (activities are allowed to be
   non-deterministic), termination, panic-freedom, and anything other than
   command-sequence determinism.
-- **Stale MIR.** A plain `cargo build` after an emit run can leave an older
-  `.mir` in place under the same name. This is why the tool uses its own
-  `--target-dir` by default; if you point `--mir` at a shared `target/`, make
-  sure you emitted it in the same run.
+- **Stale MIR.** The driver accepts a `compiler-artifact` only when its
+  `package_id` is one the invocation asked for, derives the `.mir` path from the
+  artifact's exact hash (matching an example's or binary's uplifted copy back to
+  its hashed sibling by hard-link inode identity rather than by mtime), and on a
+  miss deletes the unit's fingerprint and retries the build exactly once. What it
+  cannot fix is a `--mir` directory you assembled yourself: if you point `--mir`
+  at a shared `target/`, make sure you emitted it in the same run. `--mir`
+  directory scans do not follow symlinks.
 
 ---
 
@@ -448,7 +516,7 @@ The ones you are most likely to meet:
 | Reach | The workflow body; plus one hop to a bare free-function call in the *same module* | Transitive across helpers, closures, trait impls, generic instantiations and first-party crates |
 | Sees data flow? | No | Yes — `Value`, `Order` and `Control` taint |
 | Sees interior mutability, statics, thread-locals? | Only as literal token patterns in the body | Yes, by resolving statics and classifying their types |
-| Cost | Sub-second, compile-time, always on | Requires a MIR build; opt-in. Measured on this repo: ~19–25 s warm, ~1 min 41 s cold over 43 example targets |
+| Cost | Sub-second, compile-time, always on | Requires a MIR build; opt-in. Measured on this repo: ~17 s warm, ~1 min 47 s cold over 43 example targets |
 | Verdict | Findings or nothing | Three-valued, with named boundaries |
 | Failure mode | False **negatives** (documented, deliberate) | False positives *and* `unknown`s (allowlisted, measured) |
 

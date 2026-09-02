@@ -16,7 +16,7 @@ to command-emitting **sinks**. Every `#[workflow]` fn gets one of three verdicts
 * `nondeterminism-found` — with a hop-by-hop source→sink trace naming each helper
   and its generic substitutions.
 * `unknown` — with the analysis boundary named. One of twelve
-  (`cargo harvest-verify --list-boundaries`).
+  (`cargo harvest-verify --list-boundaries`), all twelve reachable.
 
 The knowledge is **data, not code**: `harvest-verify.model.toml` classifies all
 160 public `WorkflowContext` methods, and `--model extra.toml` overlays new rows
@@ -47,8 +47,18 @@ All metrics met, measured on `rustc 1.98.0`:
 * **False-positive rate 1.8%** against a ≤ 10% budget, over `autumn-harvest`'s
   own examples: 57 workflow fns analyzed — 56 proven, 0 unknown, 0 found, 1
   allowlisted.
-* **242 tests, 0 failures** (`cargo test -p autumn-harvest-verify`).
-* Whole gate in **15–25 s warm**, 1 min 41 s cold.
+* **Test workflow corpus 88/88** — `analyzed 88: proven 88, unknown 0, found 0,
+  allowed 0` over `-p autumn-harvest --test integration`, the largest body of
+  `#[workflow]` code here that this crate's author did not write, with **no**
+  allowlist entry needed. Costs 478 s and a 7 GB target dir, which is why it is
+  its own CI job (`harvest-verify-tests`).
+* **282 tests, 0 failures** (`cargo test -p autumn-harvest-verify`; 2 further
+  ignored), including three ratchets: `corpus::every_seeded_case_is_detected`
+  (`found == 29` exactly, not a threshold),
+  `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+  (unfired model rows diffed against a checked-in list), and `ci_wiring` (the CI
+  jobs' load-bearing steps still exist).
+* Whole gate in **16.6–16.9 s warm**, 1 min 47 s cold into a 4.0 GB target dir.
 
 **Re-run the corpus after any toolchain change.** During this issue the stable
 toolchain moved `1.94.1 → 1.98.0`, which prints atomics as the generic
@@ -68,7 +78,7 @@ it is the most useful result the prototype has produced.
 | `src/resolve/` | Call-target resolution: impl bodies by source span via `syn`, closures, async bodies, generic substitution, RTA-lite devirtualization. |
 | `src/analysis/` | Taint, summaries, control dependence and verdicts. |
 | `src/model/`, `harvest-verify.model.toml` | The sanctioned/source/sink model, as data. |
-| `corpus/` | Five crates: 29 seeded bugs the syntactic layer provably misses, 13 clean cases, 4 boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. |
+| `corpus/` | Five crates: 29 seeded bugs the syntactic layer provably misses, 13 clean cases, 4 boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. **Deliberately pathological code**: the corpus crates carry no `[lints] workspace = true` and are not clippy-clean, and they are only ever built as rlibs (or `cargo check`ed) on Linux CI — never linked, and never built on macOS or Windows. |
 
 ## Docs
 

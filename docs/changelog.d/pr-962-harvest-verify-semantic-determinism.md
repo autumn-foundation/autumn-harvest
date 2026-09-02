@@ -33,10 +33,11 @@ everything it calls.
   a clean result reads as *"no non-determinism found, under model M, up to
   boundaries B"*.
 - **The model is data, not code** (AC4). `harvest-verify.model.toml` classifies all
-  **160** public `WorkflowContext` methods across ten tables — 124 sources, 85
-  sinks, 18 sanctioned primitives, 105 non-sinks, 8 handler registrations, 34
+  **160** public `WorkflowContext` methods across eleven tables — 128 sources, 85
+  sinks, 18 sanctioned primitives, 105 non-sinks, 8 handler registrations, 38
   forbidden effects, 16 sanitizers, 22 reductions, 24 trusted crates, 25 ambient
-  types — each row carrying a `context.rs` line citation. `ctx.system_now`,
+  types and an empty `[[std_free_fn]]` escape hatch — each row carrying a
+  `context.rs` line citation. `ctx.system_now`,
   `ctx.new_uuid`, `ctx.random_*`, `ctx.side_effect` (#384), `ctx.version` and
   `UserMetrics` emission (#532) are modelled as determinism-preserving, and
   `--model extra.toml` overlays new rows **without a tool release**. Auditing the
@@ -64,14 +65,57 @@ everything it calls.
   under `--strict`). A file rather than the `#[workflow(allow_unverified)]`
   attribute the AC suggests, because **AC7 forbids any macro-path change** — the
   report states that conflict and its resolution explicitly.
-- **CI gating** (AC6): a new Linux `harvest-verify` job runs the corpus and engine
-  tests, the false-positive metric over this repo's own examples, and a non-strict
-  gate run wrapped in `time` so its wall clock lands in the log. Exit `1` on any
-  finding, exit `2` on a tool error so "the tool broke" never reads as "your
-  workflow is broken". `unknown` warns by default.
+- **CI gating** (AC6): **two** new Linux jobs, because AC6 names two corpora.
+  `harvest-verify` runs the crate's own tests, the false-positive metric over this
+  repo's `examples/`, and a non-strict gate run wrapped in `time` so its wall
+  clock lands in the log. `harvest-verify-tests` runs the same gate over
+  `-p autumn-harvest --test integration` — the repo's `#[workflow]` **test**
+  corpus, which `--test <NAME>` (new) makes analyzable. It is a separate job
+  because it costs 478 s, a 175 MB `.mir` and a 7 GB target directory, which
+  would blow the < 5 min budget the examples gate is measured against. Exit `1`
+  on any finding, exit `2` on a tool error so "the tool broke" never reads as
+  "your workflow is broken". `unknown` warns by default in both.
+- **Three ratchets, so a silent regression is a red build.**
+  `corpus::every_seeded_case_is_detected` asserts `found == 29` exactly rather
+  than a 90% threshold; `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+  classifies
+  every call site in the corpus MIR against every model row and diffs the
+  never-matched set against a checked-in `tests/model_unfired_rows.txt` (245 keys)
+  that may shrink freely and may only grow with a written reason; and
+  `tests/ci_wiring.rs` asserts both CI jobs' load-bearing steps still exist. Model
+  overlays are also strict now — `#[serde(deny_unknown_fields)]` on every model
+  struct turns a misspelt table or key into a tool error instead of a silent
+  no-op.
 - **`docs/harvest-verify.md`** — the user guide: flags, exit codes, how to read a
   trace, the allowlist format, a worked example of extending the model without a
   release, a GitHub Actions recipe, and the limitations.
+- **The adversarial review of this PR closed ten false-negative classes**, each
+  of which had returned `proven-deterministic` on a real hazard, and each is now
+  a corpus- or fixture-backed behaviour: **implicit flow** (a value produced *by*
+  a tainted branch now carries that branch's taint, iterated to a fixpoint, so
+  `if now() % 2 == 0 { 0 } else { 1 }` no longer launders a clock read);
+  **garbled MIR** (an unrecognised statement or terminator inside a live block,
+  and a non-UTF-8 dump, now raise `mir-parse` where they used to be dropped, and
+  *any* boundary now downgrades `proven-deterministic` to `unknown` rather than
+  being appended after the verdict was assembled); **body-less callees** (trusted
+  only when a std/`[[trusted]]` root appears in the callee text or a declared
+  type at the call site, or the receiver is a primitive — otherwise
+  `external-crate-body`); **`std::thread::sleep` and `thread`/`tokio::spawn`**
+  (pinned by `dest_type` now that rustc prints them as one segment); **`HashSet`
+  set operations** as `Order` sources; **fn items passed to higher-order
+  functions**; **closure writes to their captured environment**; **user `Drop`
+  impls**, now followed, with `drop-glue` raised where the glue cannot be
+  resolved — which makes all twelve boundary kinds reachable for the first time;
+  and **deep recursion**, previously a stack overflow (exit 134, outside the
+  documented 0/1/2 contract), now a `recursion` boundary at a 96-body depth cap.
+  The driver was hardened in the same pass: artifact acceptance is scoped to the
+  requested `package_id`, the `.mir` is derived from the exact artifact hash
+  (uplifted examples and binaries matched back by hard-link inode identity rather
+  than by mtime), a miss deletes the unit's fingerprint and retries once, each run
+  shape emits into its own subdirectory, `--mir` scans do not follow symlinks, a
+  relative `--target-dir` resolves against the workspace root, and the opt-level
+  guard tokenizes `CARGO_ENCODED_RUSTFLAGS` on its `\x1f` separator instead of on
+  whitespace.
 
 **Every metric is met, measured on `rustc 1.98.0`.** Detection is **29/29 =
 100%** against a ≥ 90% metric, every seeded case carrying a fully named
@@ -82,10 +126,15 @@ repo's own examples the tool analyzes **57** `#[workflow]` fns (inside the 43 of
 53 example targets that build under `--no-default-features --features testing`;
 the other 10 are skipped by `required-features`, and each skip is printed) and
 reports **56 proven, 0 unknown, 0 found, 1 allowlisted — 1.8% against a 10%
-limit**. The whole gate runs in **15–25 s warm** and 1 min 41 s cold into a fresh
-4.0 GB target directory, so the `< 5 min` budget holds comfortably; it is still
-published as a warm-cache number because a CI runner also pays the crate
-downloads. The crate's own suite is **242 tests, 0 failures**.
+limit**. On the second corpus — the repo's `#[workflow]` test corpus, the largest
+body of workflow code here written by somebody other than the analyzer's author —
+it reports **`analyzed 88: proven 88, unknown 0, found 0, allowed 0`**, with no
+allowlist entry needed for any of the 88. The examples gate runs in **16.6–16.9 s
+warm** and 1 min 47 s cold into a fresh 4.0 GB target directory, so the `< 5 min`
+budget holds comfortably; it is still published as a warm-cache number because a
+CI runner also pays the crate downloads. The test-corpus gate costs 478 s and 7 GB
+and is therefore its own job. The crate's own suite is **282 tests, 0 failures**
+(2 further ignored).
 
 **The most instructive result in the issue was a regression this PR caught and
 fixed.** The prototype was validated on `rustc 1.94.1`; the toolchain then moved
@@ -109,7 +158,9 @@ because it falsifies two things the design had assumed: the planned
 moved, so the format-drift condition on the go is restated to cover the corpus
 detection rate), and the tool's own warning that "a format change surfaces as a
 `mir-parse` boundary, never as a wrong verdict" is stronger than the design
-supports. The seeded corpus paid for itself here: it is the only thing in the
+supports — so that sentence is gone from the code, replaced by a validated
+toolchain *set* (1.94–1.98, which therefore no longer warns at all) and a weaker,
+true message telling anyone outside it to re-run the corpus. The seeded corpus paid for itself here: it is the only thing in the
 repository that noticed.
 
 **Zero engine footprint (AC7), by construction.** This is a build-time tool. **No
@@ -141,8 +192,11 @@ the resolver, the taint engine (`the_coroutine_state_switch_is_not_control_taint
 `try_on_a_clean_result_is_not_control_taint`, `side_effect_captured_wallclock_is_clean`),
 the model (`every_pub_method_on_workflow_context_is_classified`,
 `model_overlay_merges_rows`), the allowlist, the report renderers, the CLI
-exit-code contract, and a source-hygiene test banning panicking constructs outside
-tests. The report itself is kept honest by a **bidirectional** guard pair —
+exit-code contract, a source-hygiene test banning panicking constructs outside
+tests, and the three ratchets above
+(`corpus::every_seeded_case_is_detected`,
+`model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`,
+`ci_wiring::{examples_metric_step_is_wired_into_ci, the_examples_gate_is_wired_into_ci, tests_corpus_step_is_wired_into_ci, the_corpus_suite_runs_in_ci, this_crate_is_linted_in_ci, the_analyzer_jobs_are_gated_like_the_rest_of_the_workflow}`). The report itself is kept honest by a **bidirectional** guard pair —
 `autumn-harvest/tests/integration/determinism_static_analysis_docs.rs` (no boundary
 row invented, every cited test exists, all 22 rule IDs present) and
 `autumn-harvest-verify/tests/docs_boundaries.rs` (no `BoundaryKind` undocumented) —

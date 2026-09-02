@@ -684,10 +684,22 @@ and a build-time tool with no engine footprint.
 **What it costs and what it catches, measured on this repository.** Over the 43
 example targets that build under `--no-default-features --features testing` — 57
 `#[workflow]` fns — the tool reports 56 proven, 0 unknown, 0 found and 1
-allowlisted entry: a 1.8% flag rate against its own 10% budget, in 15–25 seconds
-warm (1 min 41 s cold). Against the seeded corpus of 29 non-deterministic
+allowlisted entry: a 1.8% flag rate against its own 10% budget, in ~17 seconds
+warm (1 min 47 s cold). Against the seeded corpus of 29 non-deterministic
 workflows that the *entire* syntactic layer passes cleanly, it detects **29 of
-29**, each with a fully named cross-crate trace.
+29**, each with a fully named cross-crate trace. It also runs over this repo's
+`#[workflow]` **test** corpus — `--test <NAME>` analyzes an integration-test
+target the same way `--example` analyzes an example — where 88 of 88 workflows
+come back `proven-deterministic` with no allowlist entry needed at all.
+
+**In CI it is two jobs, not one.** `harvest-verify` runs the crate's own tests,
+the false-positive metric over `examples/`, and a non-strict gate over
+`--all-examples`. `harvest-verify-tests` runs the same gate over
+`--test integration`; it is separate because it costs 478 s and a 7 GB target
+directory, which would blow the < 5 min budget the examples gate is measured
+against. Both are non-strict — `unknown` warns, only a finding fails — and both
+jobs' load-bearing steps are asserted by `autumn-harvest-verify/tests/ci_wiring.rs`,
+so deleting a step cannot leave a green, silent build.
 
 > **Before you trust a clean verdict, check the toolchain.** During this issue a
 > rustc upgrade (`1.94.1 → 1.98.0`) changed how one family of types is *spelled*
@@ -695,7 +707,16 @@ workflows that the *entire* syntactic layer passes cleanly, it detects **29 of
 > `proven-deterministic` — no warning, no boundary raised, `unknown` count still
 > zero. The MIR parser handled the upgrade perfectly; the analyzer's model did
 > not, and nothing in the tool's output said so. It was caught only because the
-> seeded corpus is asserted in CI, and it is fixed.
+> seeded corpus is asserted in CI, and it is fixed — as are the two ratchets that
+> would have named it on the day it happened:
+> `corpus::every_seeded_case_is_detected` pins the exact seeded-case count rather
+> than a 90% threshold, and
+> `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+> diffs the model rows that match nothing against a checked-in list. The tool's
+> version warning no longer over-promises either: stable 1.94–1.98 are the
+> exercised set and do not warn at all, and anything outside it is told that
+> model rows may stop matching — not that a format change "never" produces a
+> wrong verdict.
 > **Re-run the corpus after any toolchain change**, and read
 > [§A measured instance of coverage rot](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
 > before treating this layer as a defence rather than an experiment. The

@@ -16,7 +16,7 @@
 > under model M, up to boundaries B"*, and read §Soundness boundaries before
 > quoting any verdict.
 
-**Audit date:** 2026-09-02. **Audited revision:** `ed3e6e2`.
+**Audit date:** 2026-09-02. **Audited revision:** `09b257b`.
 
 **Two toolchains, and the difference between them is itself a result.** The
 checked-in golden MIR fixtures were generated on
@@ -60,15 +60,15 @@ rustc; no-go for a default gate in v1.**
 |---|---|
 | Can a semantic determinism analysis be built on **stable** Rust at all? | **Yes, via `rustc --emit=mir` text.** Verified on rustc 1.94.1: inherent- and trait-impl bodies, generic bodies with call-site substitution, async state machines, closures, statics, thread-locals, `RefCell`, `HashMap` iteration and `dyn` calls are all textually identifiable. No nightly, no `rustc_private`, no `RUSTC_BOOTSTRAP`. |
 | Does it work on *this repo's* code, or only on a toy? | **Yes — measured on real examples.** The `__autumn_workflow_info_*` discovery anchor the `#[workflow]` macro emits appears verbatim, and so do `WorkflowContext::execute_activity` / `system_now` / `side_effect` / `random_range` / `new_uuid` — the sink and sanctioned rows of the model, spelled the way the model spells them. A real, untrimmed example dump is checked in as `tests/fixtures/example_deterministic_primitives.mir` and parsed by `parse_fixtures::real_example_dump_parses_without_failures`. |
-| Does it fit the CI budget? | **Yes, warm — and on this hardware, cold too.** The whole gate over 43 example targets / 57 workflows runs in **19–25 s warm** and **1 min 41 s cold** into a fresh 4.0 GB `--target-dir`. `< 5 min` remains stated as a **warm-cache** metric because the cold number is measured on one machine with an already-populated cargo registry, and a CI runner also pays the crate downloads; `Swatinem/rust-cache` stays load-bearing. See §Success metrics for the commands. |
+| Does it fit the CI budget? | **Yes, warm — and on this hardware, cold too.** The whole gate over 43 example targets / 57 workflows runs in **16.6–16.9 s warm** and **1 min 47 s cold** into a fresh 4.0 GB `--target-dir`. `< 5 min` remains stated as a **warm-cache** metric because the cold number is measured on one machine with an already-populated cargo registry, and a CI runner also pays the crate downloads; `Swatinem/rust-cache` stays load-bearing. See §Success metrics for the commands. |
 | Where is the real difficulty? | **Precision, not scale.** Volume is tractable (a few hundred KB of MIR per example). But a 111-line, deliberately well-behaved example lowers to hundreds of `switchInt` terminators, one of which is the coroutine state dispatch of every `.await`. Control-dependence analysis — the part needed for the `is_replaying`-in-a-branch case that most motivates the feature — is simultaneously the highest-value and the highest-false-positive-risk component. |
 | What does it cost to *keep* built? | **The MIR text format is not a stable API** — `--emit=mir`'s own documentation calls the output subject to change without notice. The binding condition on any "go" is format-drift containment: the validated `rustc -Vv` is recorded and printed, a parse failure degrades to `unknown("mir-parse: …")` rather than to silence, and the `unknown` count must be ratcheted so analysis coverage cannot rot while CI stays green. |
-| Is the verdict `proven-deterministic` honest? | **Only with its boundary set attached**, which is why the tool never prints it alone. Twelve named boundaries (§Soundness boundaries) each force `unknown` — eleven of them reachable in the shipped code, `drop-glue` declared but never emitted — and the corpus pins four with deliberately-unanalyzable workflows asserted to come back `unknown` and never `proven-deterministic`. |
+| Is the verdict `proven-deterministic` honest? | **Only with its boundary set attached**, which is why the tool never prints it alone. Twelve named boundaries (§Soundness boundaries) each force `unknown`, **all twelve reachable in the shipped code** (`drop-glue` was declared-but-dead in an earlier revision and is emitted as of the audited one), and the corpus pins four with deliberately-unanalyzable workflows asserted to come back `unknown` and never `proven-deterministic`. |
 | Does it catch what the syntactic layer provably cannot? | **Yes, by construction.** All 29 seeded corpus workflows compile under `#[workflow]` (so HVG001–HVG011 report nothing at any severity) and produce zero `det_check` findings *and* zero suppressions — asserted by `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`, not claimed in prose. |
 | Is there a hazard class nobody has a rule for? | **Yes: replay-varying `WorkflowContext` reads.** `ctx.is_replaying()` and `ctx.history_event_count()` differ between the live run and a replay by design, appear in this repo's own examples, and **none of the 22 HVG+DET rules covers them**. A semantic model gets them for one table row. |
 | What is the false-positive cost on code the tool's author did not write? | **1.8% — measured, and comfortably inside the 10% budget.** Over `autumn-harvest`'s own examples: 57 workflow fns analyzed, 56 proven, 0 unknown, 0 found, 1 allowlisted. This is the only metric not produced by the analyzer's own test material, and the go/no-go hinges on it. |
 | Does the analysis survive a toolchain bump? | **The parser did; the model did not — and only the corpus noticed.** Across `1.94.1 → 1.98.0` the MIR parser raised **zero** `mir-parse` boundaries, but rustc began printing `AtomicU64` as the generic `Atomic<u64>` and five seeded corpus bugs silently became `proven-deterministic` with the `unknown` count pinned at zero. Caught by the corpus, fixed in this PR, and recorded in §A measured instance of coverage rot — which is the single most important result in this report, because it falsifies the mitigation the go was conditioned on. |
-| Which syntactic checks can now retire? | **None.** The syntactic layer is always-on, sub-second and compile-time; this pass is opt-in and needs its own MIR build (measured: ~19–25 s warm, ~1 min 41 s cold over this repo's 43 example targets). Retiring a hard blocker in favour of an opt-in check is a net safety regression. §Relationship to the syntactic baseline substantiates that rule by rule rather than asserting it. |
+| Which syntactic checks can now retire? | **None.** The syntactic layer is always-on, sub-second and compile-time; this pass is opt-in and needs its own MIR build (measured: ~17 s warm, ~1 min 47 s cold over this repo's 43 example targets). Retiring a hard blocker in favour of an opt-in check is a net safety regression. §Relationship to the syntactic baseline substantiates that rule by rule rather than asserting it. |
 | Engine footprint? | **Zero, by construction** (§Engine footprint). |
 | What if the false-positive budget is missed? | **The report says so and recommends a narrower scope** — first-party-transitive-only, or call-graph-purity-only — rather than the model being loosened until the number passes. Deciding this in advance is what keeps the metric meaningful. |
 
@@ -155,6 +155,33 @@ verdict, so an output can always be traced to the rules that produced it.
 | `Order` | The value is history-derived but its *sequence* is hash-seeded. | Order sanitizers (`sort*`, `collect::<BTreeMap/BTreeSet>`, `BinaryHeap::into_sorted_vec`) and order-killing reductions (`len`, `count`, `sum`, `min`, `max`, `all`, `any`, `is_empty`). |
 | `Control` | A branch condition is `Value`- or `Order`-tainted, so *which* commands are emitted is non-deterministic even when every argument is constant. | Nothing — it is a property of the branch, not of a value. |
 
+**Control taint also flows back into values: implicit flow is modelled.** A
+branch is not only a decision about *which* commands run, it is also a decision
+about *what the values are* — so the standard laundering idiom would otherwise
+defeat the analysis completely:
+
+```rust
+let shard = if COUNTER.load(SeqCst) % 2 == 0 { 0 } else { 1 };
+ctx.execute_activity_raw("charge".into(), shard).await?;   // shard is not a constant
+```
+
+Every place written in a block that is control-dependent on a tainted
+`switchInt` — a statement's destination or a call's destination — therefore
+gains that branch's facts, **re-labelled `Value`** and carrying a hop that names
+the branch, so the trace reads `control-dependent on tainted <operand> at bbN`.
+Post-dominating blocks are excluded by the same
+`ControlGraph::is_control_dependent` the control-dependent-sink pass uses, which
+is what keeps the code *after* an `if` clean. The injection alternates with the
+ordinary taint fixpoint (`MAX_IMPLICIT_PASSES = 8`) because a control-derived
+value can itself decide a later branch. `analysis/summary.rs::implicit_flow` is
+the implementation.
+
+The imprecision that remains, stated rather than buried: implicit flow is
+**per-body**. There is no interprocedural control context, so a helper called
+from inside a tainted branch does not have its own body re-analyzed under that
+branch's taint — only the values that branch writes in the *calling* body, the
+call destination included, carry it.
+
 `Order` exists as its own kind because collapsing it into `Value` gets two whole
 corpus families wrong in opposite directions: a `HashMap::values().sum::<u64>()`
 is deterministic (the reduction is commutative) while
@@ -165,16 +192,17 @@ hash-ordered iterator.
 
 | Table | Rows | What it does |
 |---|---:|---|
-| `[[source]]` | 124 (105 `value`, 19 `order`) | Where taint starts: wall clock, rng, env, process/thread identity, `LocalKey::*`, interior-mutable statics, hash-container iteration entry points, and the two replay-varying ctx reads. |
+| `[[source]]` | 128 (105 `value`, 23 `order`) | Where taint starts: wall clock, rng, env, process/thread identity, `LocalKey::*`, interior-mutable statics, hash-container iteration entry points, the four `HashSet` set operations (`difference`, `union`, `intersection`, `symmetric_difference`, all of which walk their receiver in hash-seeded order), and the two replay-varying ctx reads. |
 | `[[sink]]` | 85 | `WorkflowContext` methods that emit a history-matched command. |
 | `[[sanctioned]]` | 18 | ctx primitives whose **return** is clean because it is recorded and replayed (AC4). |
 | `[[non_sink]]` | 105 | Observability, metadata and history-clean reads: neither sink nor source. |
 | `[[handler_registration]]` | 8 | ctx methods whose closure argument is analyzed as an entry-adjacent body. |
-| `[[forbidden]]` | 34 | Effects that are findings on **reachability alone** — no taint flow required (e.g. `tokio::time::sleep`). |
+| `[[forbidden]]` | 38 | Effects that are findings on **reachability alone** — no taint flow required (e.g. `tokio::time::sleep`, `std::thread::sleep`, `thread::spawn`/`tokio::spawn`). |
 | `[[sanitizer]]` | 16 | Calls that clear a taint kind. |
 | `[[reduction]]` | 22 | Order-killing reductions and keyed lookups. |
 | `[[trusted]]` | 24 | Crates with no MIR available, modelled as pure taint-**propagators** rather than as `unknown`. |
 | `[[ambient_type]]` | 25 | Interior-mutable / lazily-initialised types whose `static` instances are ambient roots. |
+| `[[std_free_fn]]` | 0 | Escape hatch for a body-less free function whose whole signature is primitives, so no `std::`-rooted type at the call site identifies it as std. The table exists and is honoured; **no row is needed empirically** on this repo's corpus and examples. |
 
 All **160** public methods of `impl WorkflowContext` are classified, not merely
 the **70** distinct ones this repo's examples happen to call
@@ -185,6 +213,34 @@ every workflow that touches one un-verifiable.
 `model_coverage::every_pub_method_on_workflow_context_is_classified` re-derives
 the method list from `autumn-harvest/src/context.rs` with `syn` and fails if any
 is missing, so the model cannot silently fall behind a still-growing context.
+Every row count above is `grep -c '^\[\[<table>\]\]' harvest-verify.model.toml`.
+
+**A row that matches nothing is now a ratcheted fact, not a silent one.**
+`model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+classifies every call site and declared type in the corpus MIR plus the
+checked-in fixtures against every model row, and compares the unfired set to the
+checked-in `autumn-harvest-verify/tests/model_unfired_rows.txt` (**245 keys**
+under a 17-line explanatory header). Removing a line is free — that is a row gaining
+coverage; **adding** one requires a comment saying why the row cannot fire here.
+Over 13 `.mir` documents at the audited revision the test prints:
+
+```text
+model row firing over 13 .mir document(s):
+  ambient_type    10 fired /   25 rows  (15 unfired)
+  forbidden        3 fired /   35 rows  (32 unfired)
+  reduction        7 fired /   22 rows  (15 unfired)
+  sanitizer        2 fired /   14 rows  (12 unfired)
+  sink            13 fired /   85 rows  (72 unfired)
+  source          29 fired /  128 rows  (99 unfired)
+```
+
+(The `forbidden` and `sanitizer` row totals differ from the inventory table
+above because the ratchet keys rows on `(table, path, receiver)` and the TOML
+carries a few rows that share a key while differing in `dest_type`.) Most of the
+unfired mass is "the corpus does not call it", not "it cannot match" — but that
+was exactly the state the `Atomic<T>` rot hid in, which is why it is now written
+down and asserted rather than assumed. This test is the mechanism §A measured
+instance of coverage rot asks for.
 
 ### The sink oracle, stated once
 
@@ -293,10 +349,28 @@ versioned workflow in the repository.
 
 ### Interprocedural summaries
 
-Analysis is bottom-up over the call graph, with summaries memoized on
-`(body, substitution)`: return taint (`FromParam(i)` where it is pass-through),
-per-parameter out-taint for `&mut` arguments, sink sites with their parameter
-dependencies, boundaries, and forbidden effects.
+Analysis is bottom-up over the call graph, and the shipped mechanism is
+**context-sensitive expansion with memoisation, not symbolic per-parameter
+summaries** — the weaker of the two, described here as it is rather than as it
+was planned. A callee body is re-analyzed with its parameters seeded from the
+*actual* taint at the call site, and the result is memoised on
+`(path, substitution, argument signature)`. The summary itself
+(`analysis/summary.rs::BodyOutcome`) carries exactly three things:
+
+```rust
+pub struct BodyOutcome {
+    pub ret: TaintSet,                    // taint of the return value
+    pub out: BTreeMap<usize, TaintSet>,   // taint written back through `&mut` param i
+    pub has_sink: bool,                   // this body (or something it calls) emits a command
+}
+```
+
+There is no `FromParam(i)` symbolic return, no per-summary sink list, no
+per-summary boundary or forbidden-effect set: findings and boundaries are pushed
+onto the analyzer as they are discovered, and the call-site taint is what makes
+the expansion sound for that call site. The cost of the choice is re-analysis
+work; the benefit is that a helper called once with clean arguments and once with
+tainted ones gets two honest answers instead of one merged approximation.
 
 **Recursion is cut, not solved — and the prototype is weaker here than a reader
 would assume.** There is no SCC condensation and no interprocedural fixpoint.
@@ -331,10 +405,27 @@ threading `T := HashMap<String, u32>` through the callee body, AC3's mandatory
 the substitution (`[T := HashMap<String, u32>]`) so a reader can see which
 instantiation produced the finding.
 
-**Closures passed as call arguments are assumed invoked.** Their summaries
-contribute: sinks inside them count as control-dependent on the call site, and a
-source-derived return taints the call result. `side_effect` closures and closures
-passed to non-sink observability calls are exempt by model row.
+**Closures passed as call arguments are assumed invoked**, and so are bare `fn`
+items. A closure argument's body is analyzed with its environment seeded from
+that argument's own taint; a **fn item** — a ZST that MIR passes as the constant
+`add_clock`, with no `{closure@…}` brace form — is resolved to its body and
+followed the same way, so `.map(Uuid::new_v4)`, `.unwrap_or_else(Instant::now)`
+and `.or_insert_with(SystemTime::now)` are visible rather than invisible. Two
+things flow back out of such a body: its **return taint**, onto the call
+destination, and what it **wrote through its environment**, onto the places the
+closure captured (`write_back_closure_captures` finds them as the operands of the
+`{closure@..} { field: move _4, … }` aggregate that constructed it), which is the
+only way a capture-by-`&mut` mutation can reach the caller. `side_effect`
+closures and closures passed to non-sink observability calls are exempt by model
+row.
+
+**A known imprecision, stated here rather than in a footnote: a sink *inside* a
+closure handed to a higher-order function is not recorded at the call site.**
+Only `ret` and the environment write-back are folded back, so a closure passed to
+a std HOF that emits a command contributes no `SinkRecord` there. It works when
+the closure is the *resolved target* of the call (`follow_call`'s `has_sink`
+path), which is the common case for `ctx.race`-style handler registration, and
+not when it is an argument to somebody else's iterator adaptor.
 
 ### Devirtualization: RTA-lite, and its deliberate limit
 
@@ -366,19 +457,21 @@ this table equal to it in both directions.
 | `ffi` | A call into an `extern "C"` declaration | `unknown` | A foreign function has no MIR body to summarize. The corpus case calls `abs`, which *is* pure — the point being that the verdict is `unknown` because the analyzer cannot know, not because the call is suspicious. |
 | `unsafe-raw-pointer` | A raw-pointer dereference, including `std::ptr::read(&raw const STATIC)` | `unknown` | The place's root is a pointer local, so the `allocN (static: NAME)` footer that resolves ordinary static reads does not apply. Resolving it needs a points-to pass. |
 | `inline-asm` | An `asm!` block | `unknown` | Out of scope by the issue's own text. |
-| `external-crate-body` | A callee in a crate with no emitted MIR and no `[[trusted]]` row | `unknown`, naming the path | Whole-graph MIR emission measured **383 MB / 11.17 M lines** for a single example (see §Success metrics). Emitting it by default is not viable; an opt-in flag is future work. |
+| `external-crate-body` | A callee with no body in the analyzed set that the analyzer cannot show is std/`core`/`alloc` or a `[[trusted]]` crate | `unknown`, naming the path | Whole-graph MIR emission measured **383 MB / 11.17 M lines** for a single example (see §Success metrics). Emitting it by default is not viable; an opt-in flag is future work. |
 | `unmodeled-ctx-method` | A `WorkflowContext::*` method with no row in any model table | `unknown`, naming the method | Deliberate fail-loud default. Assuming an unknown ctx method is clean is how a model rots into a rubber stamp. All 160 current methods are classified, so this fires only on new API. |
 | `unresolved-generic` | A callee whose type parameter cannot be bound from the call site | `unknown` | Substitution is by unification of the callee's declared parameter types against call-site argument types plus turbofish; a parameter that binds through neither is not guessed. |
-| `recursion` | A callee already on the active call stack (direct or mutual recursion), or the 6000-body analysis budget running out | `unknown`, naming the body the cycle re-entered | The cycle is **cut**, not iterated: the analyzer returns a partial pass-through summary rather than a fixpoint (§Interprocedural summaries). Honest, and weaker than it sounds. |
-| `mir-parse` | Any MIR shape the parser does not recognise, including truncated or garbled input | `unknown`, carrying the parse detail | **The format-drift tripwire.** A rustc that emits a shape the parser has not seen degrades to a named `unknown`, never to a panic and never to a silent `proven`. `parse_fixtures::truncated_input_never_panics` and `::injected_junk_lines_never_panic_and_are_recorded` pin this. |
-| `missing-body` | A callee resolved by name to a body that is simply absent from the analyzed dump set | `unknown` | Usually means a target was not built into the MIR set; reported rather than assumed. |
-| `drop-glue` | A `drop(place)` terminator whose glue could run user code with effects | **Declared, never emitted by the prototype.** No code path constructs it; a `drop` terminator is currently walked as an ordinary statement with no boundary raised | `drop` terminators carry no callee path; resolving glue is a large lift for a rare hazard. The variant exists so the name is reserved and the `--list-boundaries` contract does not change when it is implemented — but a reader must **not** read a clean verdict as evidence that drop glue was checked. |
+| `recursion` | A callee already on the active call stack (direct or mutual recursion), a call chain deeper than `MAX_DEPTH = 96` bodies, or the 6000-body analysis budget running out | `unknown`, naming the body the cycle re-entered or the chain that got too deep | The cycle is **cut**, not iterated: the analyzer returns a partial pass-through summary rather than a fixpoint (§Interprocedural summaries). Honest, and weaker than it sounds. |
+| `mir-parse` | A malformed item header, an unterminated body, a dump that is not valid UTF-8, or **any statement or terminator inside a live block whose head is not on the parser's known list** | `unknown`, carrying the parse detail | **The format-drift tripwire.** Three separate paths feed it, because an earlier revision had only the first: an unparsed item is recorded and re-raised at the call that names it (`resolve_call` step 6); a non-UTF-8 dump is decoded lossily, warned about, and carries the boundary on every workflow of its crate; and an unrecognised statement/terminator head inside a reachable non-cleanup block raises it where it stands (`BENIGN_STATEMENT_HEADS` / `BENIGN_TERMINATOR_HEADS` in `analysis/summary.rs` are the allow-lists, so a *new* MIR shape is loud rather than dropped). `parse_fixtures::truncated_input_never_panics` and `::injected_junk_lines_never_panic_and_are_recorded` pin the parser half. |
+| `missing-body` | A callee resolved by name to a body absent from the analyzed dump set, **or** an `<impl at FILE:l:c>` body whose source file could not be read or parsed | `unknown` | Usually means a target was not built into the MIR set. The second half matters more than it looks: impl bodies are located by scanning the source line the MIR header names, so an unreadable file (a remapped path, a path dependency outside the source roots) used to make the body silently invisible — which meant the *same* `.mir` gave different verdicts from different working directories. It is a boundary now. |
+| `drop-glue` | A `drop(place)` terminator on a place whose type has a user `impl Drop` that the analyzer cannot resolve to a body | `unknown`, naming the dropped type | **Emitted since the audited revision.** A resolvable user `Drop` impl is now *followed* — the glue is analyzed with the dropped place as the `&mut self` argument, exactly as an explicit `Ty::drop(&mut place)` would be, so a `Drop` body that reads ambient state or emits a command is visible. The boundary is what is left: glue the analyzer cannot resolve. Its residual limit is **nested-field glue** — dropping a struct runs its fields' `Drop` impls too, and only the outermost type is looked up. |
 
-Eleven of the twelve are reachable in the shipped code; `drop-glue` is the sole
-declared-but-never-emitted kind, and the row above says so rather than letting
-the table imply coverage the analyzer does not have. `inline-asm`,
-`unresolved-generic`, `recursion` and `missing-body` *are* emitted — by
-`analysis/summary.rs`, `resolve/mod.rs`, `analysis/summary.rs` and both,
+**All twelve are reachable in the shipped code.** An earlier revision of this
+report recorded `drop-glue` as declared-but-never-emitted; the soundness review
+of this PR turned that into a demonstrated false negative (a `Drop` impl
+containing a sink came back `proven-deterministic`), and it is now both followed
+and, where unresolvable, raised. `inline-asm`, `unresolved-generic`, `recursion`,
+`missing-body` and `drop-glue` are emitted — by `analysis/summary.rs`,
+`resolve/mod.rs`, `analysis/summary.rs`, both, and `analysis/summary.rs`
 respectively — even though no corpus case currently pins them.
 
 Four of the twelve are pinned by corpus workflows asserted to come back
@@ -395,30 +488,39 @@ These do not produce an `unknown`. They are places where the model itself is
 approximate, and a reader who quotes a verdict needs them.
 
 - **The MIR text format is not an API.** `--emit=mir`'s own documentation states
-  the output is subject to change without notice. The parser is validated on
-  `rustc 1.94.1 (e408947bf 2026-03-25)`, recorded in
-  `tests/fixtures/RUSTC_VERSION.txt` and printed in every report header; another
-  version produces a warning line rather than a refusal, and any resulting parse
-  failure surfaces as `mir-parse` rather than as a wrong answer. **The residual
-  risk this does not cover is coverage rot**: `unknown` warns by default, so a
-  parser that silently stops understanding half the corpus leaves CI green. The
-  mitigation is a ratchet on the `unknown` count, and it is a *condition of the
-  go*, not a nicety.
-- **A callee with no body and no crate-rooted path is assumed to be a pure taint
-  propagator, not a boundary.** This is the single largest deliberate
-  unsoundness in the design, and it is load-bearing. rustc prints *trimmed*
-  def-paths, so the overwhelming majority of std calls arrive as `String::clone`
-  or `format` with no crate root at all — indistinguishable, textually, from a
-  first-party function whose MIR simply was not emitted. Treating them as
-  `external-crate-body` boundaries would make essentially **every** workflow
-  `unknown` and the tool useless; so they resolve to `Resolution::External`,
-  through which taint flows but which never *starts* taint. The consequence: a
-  genuine non-deterministic source inside an unemitted body is invisible, and the
-  verdict is `proven-deterministic` rather than `unknown`. The reasoning is
-  recorded at the resolution table in
-  `autumn-harvest-verify/src/resolve/mod.rs`, and it is why
-  `external-crate-body` fires only for a callee that *is* crate-rooted at a crate
-  that is neither analyzed nor `[[trusted]]`.
+  the output is subject to change without notice. The golden fixtures were
+  generated on `rustc 1.94.1 (e408947bf 2026-03-25)`, recorded in
+  `tests/fixtures/RUSTC_VERSION.txt`; the parser has since been exercised against
+  every stable from **1.94 through 1.98**, which is the validated set
+  `pipeline.rs::VALIDATED_RUSTC` carries and matches on `major.minor` (a patch
+  release does not change how MIR is printed, and pinning one would make every
+  fresh toolchain warn). Anything outside that set produces a warning line rather
+  than a refusal, and the warning's own wording is now honest about what it does
+  *not* promise — see §A measured instance of coverage rot. **The residual risk
+  is coverage rot**: `unknown` warns by default, so an analysis that silently
+  stops understanding half the corpus leaves CI green. The mitigations are the
+  corpus detection ratchet and the model row-firing ratchet, and they are a
+  *condition of the go*, not a nicety.
+- **A body-less callee is trusted only when something at the call site says
+  std.** This is the largest deliberate unsoundness in the design, and its exact
+  shape matters. rustc prints *trimmed* def-paths, so the overwhelming majority
+  of std calls arrive as `String::clone` or `format` with no crate root at all —
+  textually indistinguishable from a first-party function whose MIR was not
+  emitted. Treating every trimmed path as a boundary makes essentially **every**
+  workflow `unknown`; treating every trimmed path as an opaque propagator is a
+  silent `proven` on a dependency that reads the wall clock, which is what the
+  soundness review of this PR demonstrated. The discriminator shipped is the
+  **declared types at the call site**, which MIR always prints fully qualified. A
+  body-less callee is trusted as a pure taint-propagator iff one of four things
+  holds: a `std`/`core`/`alloc` or `[[trusted]]` crate root appears anywhere in
+  the callee text; the same appears in any declared type at the call site
+  (receiver, an argument, or the destination); the receiver is a primitive type
+  (the language reserves inherent impls on primitives, and rustc prints them
+  trimmed); or a `[[std_free_fn]]` row names it. Otherwise it is an
+  `external-crate-body` boundary. `[[std_free_fn]]` is the escape hatch for the
+  residue — a free function whose whole signature is primitives — and **no row is
+  needed empirically** on this repo. The reasoning is recorded at
+  `Analyzer::is_trusted_bodyless` in `autumn-harvest-verify/src/analysis/summary.rs`.
 - **Sanitizer kills are per-place and monotone, not flow-sensitive.** Taint is a
   per-body fixpoint over places and the kill set only ever grows, so a `sort()`
   anywhere in a body kills `Order` taint on that place for the whole body,
@@ -450,6 +552,48 @@ approximate, and a reader who quotes a verdict needs them.
 - **Out of scope by the issue's own text, restated so no reader over-reads the
   verdict:** activity bodies (activities may be non-deterministic), termination,
   panic-freedom, and runtime drift (#798, #603 — complementary, not superseded).
+
+### Known imprecisions in the shipped analyzer
+
+The list above is the *design*'s approximations. This one is narrower and less
+flattering: specific residual unsoundnesses in the code as it stands at the
+audited revision, each one a place where a determined counterexample gets a
+`proven-deterministic` it does not deserve. They are recorded here because a
+reader who has to decide whether to trust a verdict needs the list that was not
+fixed, not only the list that was.
+
+1. **`<T as std::Trait>::m` on an unemitted dependency's type is trusted.** The
+   std-root test scans the whole callee text, so the qualifying trait name alone
+   is enough — a third-party type's `impl std::fmt::Display` body is treated as
+   std and never becomes a boundary.
+2. **Single-fn-name aliasing.** Bodies are indexed by their trimmed printed path.
+   Two crates exporting the same bare name collapse onto one key, and
+   `real_path_near` breaks the tie by proximity, falling back to the first
+   indexed candidate. Deterministic, but arbitrary: a finding could name the
+   wrong file.
+3. **`MAX_FACTS = 6` per place is kind-blind.** Six `Value` facts saturating a
+   place before an `Order` fact arrives would hide the order flow. No probe has
+   made it bite, and no slot is reserved per `TaintKind`.
+4. **`write_back_refs` tests the root local's declared type**, so an `&mut`
+   argument passed as a projection (`move (_5.0)`) is skipped when `_5` is not
+   itself `&mut`.
+5. **`is_clean_ctx_call()` returns before descending closures.** A closure handed
+   to a `[[non_sink]]` ctx method (`await_condition(|| …)`, say) is not analyzed,
+   so a source or a sink inside it is lost. `side_effect` is handled correctly by
+   `opaque_closure_args`; the non-sink family has no equivalent.
+6. **Nested-field drop glue is not followed.** Dropping a struct runs its fields'
+   `Drop` impls; only the outermost type is resolved (§Soundness boundaries,
+   `drop-glue`).
+7. **Implicit flow is per-body.** There is no interprocedural control context: a
+   helper called from inside a tainted branch is not re-analyzed under that
+   branch's taint.
+8. **`Allowlist` has no `deny_unknown_fields`.** The *model* structs do — a typo
+   in an overlay is a hard error — but a misspelt key in
+   `harvest-verify.allow.toml` is silently ignored.
+9. **Sanitizer kills are per-place and monotone** (restated: it is both a design
+   approximation and the residual imprecision most likely to matter).
+10. **`tokio::select!` is invisible in MIR**, so HVG010/DET011 remain its only
+    defence.
 
 ---
 
@@ -579,35 +723,55 @@ flaky, and a flaky gate is worse than a table.
 | Syntactic layer passes the corpus cleanly | Corpus builds under `RUSTFLAGS=-D warnings` (⇒ zero HVG at any severity) **and** `det_check::check_paths` yields zero findings and zero suppressions **and** no escape hatch appears in corpus code | Compilation + the `det_check` engine | `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` | **PASS.** AC3's premise holds: all 29 seeded bugs defeat the full syntactic layer. |
 | Every `unknown` names its boundary | Each of the 4 boundary cases returns `unknown` carrying its expected `BoundaryKind`, and never `proven-deterministic` | Live run | `corpus::every_unknown_names_its_boundary` | **PASS — 4/4**, each with the expected kind: `wf_dyn_unknown_impl` → `dyn-dispatch`, `wf_fn_pointer` → `indirect-call`, `wf_extern_c` → `ffi`, `wf_raw_pointer_static_mut` → `unsafe-raw-pointer`. |
 | False-positive budget **≤ 10%** | `allowlisted_or_found / analyzed` over `autumn-harvest`'s own examples corpus | Env-gated run (`HARVEST_VERIFY_EXAMPLES=1`) over `--all-examples`; prints the proven/unknown/found triple | `examples_metrics::examples_corpus_allowlist_ratio_within_budget` | **PASS — 1.8%.** `analyzed 57, proven 56, unknown 0, found 0, allowed 1`; `(0 + 1) / 57 = 1.8%` against a 10% limit. |
-| CI budget **< 5 min** (warm cache) | Wall clock of the whole gate — MIR emit plus analysis — over `-p autumn-harvest --all-examples` | The CI job wraps the gate run in `time`, so the wall clock lands in the job log | *Deliberately not asserted* — published here and in the job log | **PASS locally: 15–25 s warm** (four runs: 25.1 s, 18.6 s, 16.5 s, 15.5 s — the spread is whether the binary itself needed relinking); **1 min 41 s** cold into a fresh 4.0 GB target dir. The authoritative number is the `harvest-verify` job log; these are the only measurements taken so far. |
+| CI budget **< 5 min** (warm cache) | Wall clock of the whole gate — MIR emit plus analysis — over `-p autumn-harvest --all-examples` | The `harvest-verify` CI job wraps the gate run in `time`, so the wall clock lands in the job log | *Deliberately not asserted* — published here and in the job log | **PASS locally: 16.9 s then 16.6 s** on two consecutive warm repeats of the row-6 command at the audited revision; **1 min 47 s** cold, after `rm -rf target/harvest-verify/debug`, into a target dir that ended up **4.0 GB**. The authoritative number is the `harvest-verify` job log. |
+| Second corpus: the repo's own `#[workflow]` **test** corpus | The same gate over `-p autumn-harvest --test integration`, which is the largest body of workflow code here that the analyzer's author did not write | The `harvest-verify-tests` CI job, wrapped in `time` | *Deliberately not asserted* — published in the job log; the step's wiring is asserted by `ci_wiring::tests_corpus_step_is_wired_into_ci` | **PASS — `analyzed 88: proven 88, unknown 0, found 0, allowed 0`**, with **no allowlist entry needed for any of the 88**. Measured cold on a 4-core dev box at the audited revision: **478 s** wall, a **175 MB** `.mir`, a **7.0 GB** target directory and ~6 GB peak rustc RSS — which is why it is a separate CI job rather than a fourth step in `harvest-verify`. |
 
-Reproduce every row above with these four commands, from the workspace root on
-`rustc 1.98.0`:
+Reproduce every row above with these five commands, from the workspace root on
+`rustc 1.98.0 (88d9e12ae 2026-08-18)`:
 
 ```console
-# Rows 1–4 (and the whole 238-test suite; --no-fail-fast so one red target
+# Rows 1–4 (and the whole 282-test suite; --no-fail-fast so one red target
 # does not hide the others).
 $ cargo test -p autumn-harvest-verify --no-fail-fast
 
 # Rows 1–4 alone, with the per-case matrix and the detection line printed.
 $ cargo test -p autumn-harvest-verify --test corpus -- --nocapture
 
-# Row 5. A few minutes warm; MIR is emitted into target/harvest-verify.
+# Row 5. MIR is emitted into target/harvest-verify/examples.
 $ HARVEST_VERIFY_EXAMPLES=1 cargo test -p autumn-harvest-verify \
     --test examples_metrics -- --nocapture
 
-# Row 6.
+# Row 6. Emits into target/harvest-verify (the default).
 $ time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
     harvest-verify -p autumn-harvest --all-examples \
     --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
+
+# Row 7 — the test workflow corpus. Budget ~8 min and ~7 GB of disk.
+$ time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
+    harvest-verify -p autumn-harvest --test integration \
+    --features db,testing,schema,debugger,unified-dag-execution \
+    --allowlist harvest-verify.allow.toml --report \
+    --target-dir target/harvest-verify/tests
 ```
 
-The suite is **242 tests, 0 failures** across the library and twelve integration
-targets — 114 lib unit tests (2 further ignored), plus `parse_fixtures` 29,
-`analysis_fixtures` 25, `resolve_fixtures` 18, `report` 16, `cli` 11,
-`allowlist` 10, `model_coverage` 7, `corpus` 5, `docs_boundaries` 3,
-`hygiene` 3, `examples_metrics` 1.
+The suite is **282 tests, 0 failures** (`cargo test -p autumn-harvest-verify`;
+2 further ignored) across the library and fifteen integration targets — 130 lib
+unit tests, plus `analysis_fixtures` 37, `parse_fixtures` 29, `resolve_fixtures`
+18, `report` 16, `cli` 11, `allowlist` 10, `model_coverage` 9, `ci_wiring` 7,
+`corpus` 6 (which is what runs rows 1–4), `docs_boundaries` 3, `hygiene` 3,
+`model_rowfire` 2, `examples_metrics` 1.
+
+Three of those targets are **ratchets** rather than ordinary tests, and they
+exist because of §A measured instance of coverage rot:
+
+- `corpus::every_seeded_case_is_detected` — asserts `found == 29`, the exact
+  seeded-row count, not merely that the rate clears 90%. A drop from 29/29 to
+  27/29 clears the metric and fails the ratchet, which is the point.
+- `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+  — the row-firing ratchet described in §Row inventory.
+- `ci_wiring` — asserts that the two CI jobs' load-bearing steps still exist, so
+  a deleted step cannot leave a green, silent build.
 
 ### What is already measured
 
@@ -618,8 +782,10 @@ are why the design is shaped the way it is:
 |---|---|---|
 | Examples that build under `--no-default-features --features testing` | **43 of 53** — the other 10 are skipped by `required-features`, and the run names each one: 3 × `unified-dag-execution`, 3 × `db`, 2 × `schema`, 1 × `debugger`, 1 × `wasm-activities` | The false-positive denominator is the set actually analyzed. Any example excluded from the emit run must be **subtracted in the same table where the ratio is computed**, never silently dropped — so the run prints a `warning: skipping example …` line per exclusion. |
 | `#[workflow]` fns inside those 43 targets | **57** — the false-positive denominator | 43 *targets* contain 57 *workflow functions*; the two numbers are not interchangeable and the metric is per function. |
-| Whole gate, warm | **25.1 s**, then **18.6 s** on an immediate repeat | Comfortably inside the 5-minute budget, with the second figure showing what a fully warm CI cache buys. |
-| Whole gate, cold `--target-dir` | **1 min 41 s**, producing a **4.0 GB** target directory | Measured, and *better* than an earlier estimate of 3–7 min that this table used to carry. It is still reported as a warm-cache metric: this machine's cargo registry was already populated, and a CI runner also pays the crate downloads. The honest claim is "cold is not obviously fatal here", not "cold is fine everywhere". |
+| Whole gate, warm | **16.9 s**, then **16.6 s** on an immediate repeat | Comfortably inside the 5-minute budget, with the second figure showing what a fully warm CI cache buys. |
+| Whole gate, cold `--target-dir` | **1 min 47 s**, producing a **4.0 GB** target directory | Measured by deleting `target/harvest-verify/debug` and re-running row 6. Better than an earlier estimate of 3–7 min that this table used to carry, but it is still reported as a warm-cache metric: this machine's cargo registry was already populated, and a CI runner also pays the crate downloads. The honest claim is "cold is not obviously fatal here", not "cold is fine everywhere". |
+| The test workflow corpus, cold | **478 s**, a **175 MB** `.mir`, a **7.0 GB** target directory, ~6 GB peak rustc RSS, for `analyzed 88: proven 88, unknown 0, found 0, allowed 0` | An order of magnitude past the examples gate, almost all of it the `cargo rustc --test integration` build. Folding it into `harvest-verify` would push that job past the < 5 min budget it is measured against and make the two numbers incomparable, so it is the separate `harvest-verify-tests` job. |
+| Each run shape gets its **own** emit directory | `target/harvest-verify/{debug,corpus,examples,tests,guardrail-build}` | Not cosmetic. The driver accepts a `compiler-artifact` only when its `package_id` is one the invocation asked for, and derives the `.mir` from the exact artifact hash — but two run shapes with different feature sets sharing one target dir still invalidate each other's units on every alternation, and a stray `.mir` from a differently-scoped run is exactly the failure that turned 13 clean corpus cases `unknown` during review. |
 | Whole-graph emission via `RUSTFLAGS="--emit=mir"` | **383 MB / 11.17 M lines** across 275 crates for one example, including proc-macro crates (pure waste) | This is why the driver uses per-target `cargo rustc -- --emit=mir` (which applies the flag to the selected target only and leaves cached dependencies alone) rather than `RUSTFLAGS`, which changes every crate's fingerprint and forces a full-graph rebuild. It is also why `external-crate-body` is a boundary rather than a solved problem. |
 | MIR emission requires codegen | The example executables are linked alongside the `.mir` | You cannot get MIR from the cheaper `cargo check`. That is a fixed floor on the emit phase. |
 | `-C opt-level=0` is mandatory | MIR inlining is **on at opt-level ≥ 1 on stable**: a helper call is inlined away, leaving only a `scope N (inlined …)` annotation and no `Call` terminator | The driver refuses optimized builds. A transitive analysis over inlined MIR silently loses the helper hops the traces are supposed to name. |
@@ -694,7 +860,7 @@ type-name change rather than to anything structural.
 **Why this matters more than the parser result.** The report's format-drift
 mitigation, and condition C1, is built on this promise: *a rustc that emits a
 shape the parser has not seen degrades to a named `unknown`, never to a silent
-`proven`.* The tool even prints that promise on every mismatched run —
+`proven`.* The tool printed that promise on every mismatched run at the time —
 
 ```text
 warning: the MIR parser is validated on rustc 1.94.x; this run used `rustc 1.98.0
@@ -702,7 +868,8 @@ warning: the MIR parser is validated on rustc 1.94.x; this run used `rustc 1.98.
 never as a wrong verdict
 ```
 
-— and on this bump **the promise did not hold**. The drift was not a *parse*
+— and on this bump **the promise did not hold**. (That is the *historical* text;
+it has since been reworded, see follow-up 3 below.) The drift was not a *parse*
 failure, so no boundary fired; it was a *type-name* change, which the parser
 reads perfectly and the model quietly fails to match. There is no third verdict
 for "the model no longer recognises what it is looking at". Five real bugs became
@@ -726,9 +893,29 @@ whole follow-up list:
    fact (§Rows are keyed on trimmed paths). A test that asserts each key still
    matches something in a freshly emitted dump would have turned this from a
    silent regression into a red build naming the row.
-3. **The version warning's wording is wrong and should be corrected in code.**
+3. **The version warning's wording was wrong and has been corrected in code.**
    "A format change surfaces as a `mir-parse` boundary, never as a wrong verdict"
-   is a stronger claim than the design supports, and this run falsified it.
+   is a stronger claim than the design supports, and this run falsified it. It
+   no longer prints. `pipeline.rs` now carries a validated *set*
+   (`VALIDATED_RUSTC = ["1.94", "1.95", "1.96", "1.97", "1.98"]`, matched on
+   `major.minor`), so the toolchains actually exercised do not warn at all, and
+   the text that a toolchain outside the set gets makes the weaker, true claim:
+
+   ```text
+   warning: the MIR parser is validated on rustc 1.94, 1.95, 1.96, 1.97, 1.98;
+   this run used `rustc X.Y.Z (…)`. Other versions may print paths and types
+   differently, which can make model rows stop matching — run the corpus tests
+   (`cargo test -p autumn-harvest-verify --test corpus`) on your toolchain
+   before trusting a clean result
+   ```
+
+**All three follow-ups are now built.** (1) The corpus runs as a CI gate *and*
+`corpus::every_seeded_case_is_detected` ratchets `found == 29` rather than
+`rate >= 90%`, so a partial regression is red instead of merely "still above
+threshold". (2) `model_rowfire` checks every model key against freshly emitted
+dumps and diffs the unfired set against a checked-in list, which is precisely the
+test that would have named the `Atomic` row on the day it stopped matching.
+(3) The warning is reworded, above. C1 is met on all three counts; see §Go / no-go.
 
 **Status: fixed in this PR, and the fix is deliberately small.** An `Atomic` row
 in `[[ambient_type]]` keyed on the generic name, plus `receiver = "Atomic"`
@@ -874,12 +1061,19 @@ artifact.
 | `1` | Any `nondeterminism-found`; or, under `--strict`, any `unknown` or any unused allowlist entry. |
 | `2` | Tool or build error — a cargo failure, a malformed model, an invalid allowlist, an unreadable input. Distinct from `1` so "the tool broke" never reads as "your workflow is broken". |
 
-The `harvest-verify` job in `.github/workflows/ci.yml` is Linux-only, gated on
-the `changes` filter exactly like `test`, draft-skipped like every expensive job,
-and runs three things: the crate's own tests (corpus + engine), the env-gated
-false-positive metric over the examples corpus, and a non-strict gate run over
-`autumn-harvest --all-examples` with the checked-in allowlist. The gate run is
-wrapped in `time`, so its wall clock lands in the job log rather than in a claim.
+AC6 asks for a CI run over "the repo's own examples/ + test workflow corpus".
+That is **two jobs** in `.github/workflows/ci.yml`, both Linux-only, both gated
+on the `changes` filter exactly like `test`, both draft-skipped:
+
+| Job | What it runs | Why it is its own job |
+|---|---|---|
+| `harvest-verify` | Three steps: the crate's own tests (`cargo test -p autumn-harvest-verify` — corpus, ratchets, engine), the env-gated false-positive metric over the examples corpus, and a non-strict gate over `-p autumn-harvest --all-examples` with the checked-in allowlist | The < 5 min budget is measured against this job |
+| `harvest-verify-tests` | One step: the same non-strict gate over `-p autumn-harvest --test integration`, emitting into `target/harvest-verify/tests`, preceded by a free-runner-disk step | 478 s and 7 GB (§Success metrics). Folded into the job above it would blow the budget the examples gate is measured against and make the two numbers incomparable |
+
+Both gate runs are wrapped in `time`, so their wall clocks land in the job logs
+rather than in a claim. Their steps are asserted by
+`autumn-harvest-verify/tests/ci_wiring.rs`, so deleting one cannot leave a green,
+silent build — the same idiom as `guards_run_on_docs_only_changes`.
 
 One correction to an earlier draft of this section, so the log is not read as
 saying more than it does: `time` wraps the **whole** gate command, which means
@@ -888,11 +1082,12 @@ tool's `--report` flag prints the analyzed/proven/unknown/found/allowed counts o
 stderr; it does not print a phase breakdown. If the emit/analyze split is wanted,
 it has to be built — nothing publishes it today.
 
-**The job is not `--strict` in v1**, deliberately. `unknown` warns, consistent
+**Neither job is `--strict` in v1**, deliberately. `unknown` warns, consistent
 with AC6, so adoption never turns an analysis boundary into a broken build. The
-honest counterweight — and a condition of the go — is that a warning nobody must
-fix becomes invisible within two sprints, so **the `unknown` count must be
-ratcheted** before this is treated as a live defence rather than an experiment.
+counterweight — a warning nobody must fix becomes invisible within two sprints —
+is now carried by the ratchets rather than by good intentions: the seeded-case
+ratchet pins `found == 29`, the row-firing ratchet pins the model's coverage, and
+both are ordinary `cargo test` failures in the first job.
 
 ---
 
@@ -907,22 +1102,26 @@ The go is conditional on three falsifiable conditions, each with a named owner i
 code. Three, not seven: a recommendation with seven conditions is a
 recommendation whose author could not decide.
 
-- **C1 — Format-drift containment. NOT MET as originally specified, and now known
-  to have been specified wrongly.**
+- **C1 — Format-drift containment. MET, on a restated condition — and the
+  restatement is itself a result.**
   The validated `rustc -Vv` is recorded and printed, and parse failures do
   degrade to `mir-parse` rather than to silence — that half held across
   `1.94.1 → 1.98.0` with zero parse boundaries. The other half did not: the
   `1.98` bump rotted the *model* instead of the parser, silently, with the
   `unknown` count pinned at zero throughout (§A measured instance of coverage
   rot). C1 as originally written — an `unknown`-count ratchet — **would not have
-  caught the failure it exists to catch.** The specific regression is fixed, but
-  the *condition* is not met until the mechanism is: C1 is restated as **the
-  corpus detection rate runs as a CI gate, the ratchet covers the detection rate
-  and not only the boundary count, and every model key is checked against a
-  freshly emitted dump.** The first of those three already holds — the
-  `harvest-verify` job runs `cargo test -p autumn-harvest-verify`, which is what
-  turned this regression red. The other two are unbuilt, and they are
-  unambiguously the highest-priority follow-up.
+  caught the failure it exists to catch**, so it is restated as three
+  mechanisms: **the corpus runs as a CI gate, the ratchet covers the detection
+  rate and not only the boundary count, and every model key is checked against a
+  freshly emitted dump.** All three now hold. The `harvest-verify` job runs
+  `cargo test -p autumn-harvest-verify`, which is what turned the regression red;
+  `corpus::every_seeded_case_is_detected` asserts `found == 29` exactly, so a
+  partial regression cannot hide above a threshold; and
+  `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
+  diffs the live unfired-row set against a checked-in list that may shrink freely
+  and may only grow with a written reason. The residual gap is honest and worth
+  naming: the row-firing ratchet proves a row still *matches something*, not that
+  it matches the right thing, and neither ratchet covers the examples corpus.
 - **C2 — The false-positive budget is met on code the analyzer's author did not
   write. MET.** 1.8% — `(found 0 + allowed 1) / analyzed 57` over the examples
   corpus, against a ≤ 10% budget, asserted by
@@ -936,12 +1135,14 @@ recommendation whose author could not decide.
   `proven-deterministic` (`corpus::every_unknown_names_its_boundary`).
 
 **Net effect on the recommendation: the conditional go stands, and its condition
-got sharper.** C2 and C3 — the two conditions about whether the tool is
-*good enough* — are met with room to spare. C1, the condition about whether the
-tool can be *kept* good, is the one that failed, and it failed in the specific
-way this report predicted and in a way the planned mitigation would have missed.
-That is an argument for building C1 properly before treating any verdict as a
-defence, not an argument against the direction.
+got sharper before it was met.** C2 and C3 — the two conditions about whether the
+tool is *good enough* — are met with room to spare. C1, the condition about
+whether the tool can be *kept* good, failed first, in the specific way this
+report predicted and in a way the planned mitigation would have missed; it is met
+now because the mitigation was rewritten to match the failure that actually
+happened rather than the one that was imagined. The verdict is unchanged — a go
+for an opt-in second line, a no-go for a default gate — and the reason to keep
+the boundary section attached to every quoted verdict is unchanged with it.
 
 **What a no-go would look like, decided in advance.** If C2 misses — if the
 measured false-positive rate lands at 40–60% rather than 10%, which
@@ -1057,8 +1258,12 @@ correcting a misclassification a two-file edit and discourage it).
 
 In rough priority order, all explicitly deferred rather than silently omitted:
 
-1. **The `unknown`-count ratchet** (condition C1). Without it the tool can
-   degrade to a no-op while CI stays green. Highest priority by a wide margin.
+1. **Extend the ratchets to the examples corpus and to row *meaning*.**
+   Condition C1's three mechanisms are built (§Go / no-go), and they cover the
+   seeded corpus and the model's row coverage. Two gaps remain: nothing pins the
+   examples corpus's `proven 56, unknown 0` triple, so a regression there is a
+   warning rather than a red build; and `model_rowfire` proves a row matches
+   *something*, not that it matches the intended callee. Highest priority.
 2. **`rustc_public` / StableMIR migration.** The parser is isolated behind one
    module precisely so this swap does not touch the taint engine. This is the
    long-term answer to the format-stability risk, and it retires the maintenance
