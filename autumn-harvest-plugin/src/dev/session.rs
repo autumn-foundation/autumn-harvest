@@ -40,6 +40,14 @@ pub const SESSION_ROOT_PREFIX: &str = "harvest-dev-";
 pub struct SessionRecord {
     /// Process that created the session and is responsible for tearing it down.
     pub owner_pid: u32,
+    /// The owner's start time, as the kernel reports it.
+    ///
+    /// The same reasoning as [`postmaster_start_token`](Self::postmaster_start_token),
+    /// applied to the other pid in this record: a force-killed run frees its
+    /// pid, and an unrelated process that inherits the number would make the
+    /// session look permanently alive, so it would never be reclaimed.
+    #[serde(default)]
+    pub owner_start_token: Option<String>,
     /// The postmaster this session started, once it is running.
     pub postmaster_pid: Option<u32>,
     /// The cluster's data directory.

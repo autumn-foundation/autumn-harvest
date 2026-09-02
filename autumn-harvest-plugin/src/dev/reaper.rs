@@ -207,7 +207,7 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
 
         let decision = decide_reap(
             &record,
-            process_is_alive(record.owner_pid),
+            owner_is_the_recorded_one(&record),
             record
                 .postmaster_pid
                 .is_some_and(|pid| postmaster_is_the_recorded_one(&record, pid)),
@@ -260,6 +260,32 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
     }
 
     Ok(reclaimed)
+}
+
+/// Whether the process at the recorded owner pid is still the run that created
+/// this session.
+///
+/// Liveness alone is not enough, for the same reason it is not enough for the
+/// postmaster: a force-killed run frees its pid, and an unrelated long-lived
+/// process that inherits the number makes the session look permanently active —
+/// so its cluster and data directory would survive every later start, forever.
+/// The recorded start time is what tells the two apart.
+///
+/// Falls back to plain liveness when either side has no token (a record written
+/// before the field existed; a platform that cannot supply one). That is the
+/// pre-existing behaviour, and the conservative direction: it can only make us
+/// skip a session, never reap a live one.
+fn owner_is_the_recorded_one(record: &SessionRecord) -> bool {
+    if !process_is_alive(record.owner_pid) {
+        return false;
+    }
+    match (
+        &record.owner_start_token,
+        process_start_token(record.owner_pid),
+    ) {
+        (Some(recorded), Some(current)) => recorded == &current,
+        _ => true,
+    }
 }
 
 /// Whether the process at `pid` is still the postmaster this record recorded.
@@ -376,8 +402,7 @@ pub fn process_is_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .is_some_and(|stat| proc_stat_is_live(&stat))
+            .is_ok_and(|stat| proc_stat_is_live(&stat))
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {

@@ -147,6 +147,29 @@ directory permanently. The session record now carries the `bin_dir` that started
 the cluster (`#[serde(default)]`, so older records still parse and are still
 reclaimed), and the reaper prefers it over discovery.
 
+**Codex round 2 (two P2s) and a CI lint failure.** An IPv6 `http_host` — `::1`
+is a perfectly valid loopback address — was interpolated straight into
+`http://{host}:{port}`, producing `http://::1:3000`, which no URL parser
+accepts; the readiness poll could then never succeed and the runtime would
+report `ServerNotReady` after its full 180-second budget with the real cause
+absent from the message. `http_authority` now brackets an IPv6 literal
+(identified by parsing, not by counting colons), and `reserve_http_port` binds
+the host it will actually serve on rather than a hard-coded `127.0.0.1`.
+
+The second was the mirror of the pid-reuse hardening already applied to the
+postmaster, applied to the other pid in the record: the reaper skipped a session
+whose *owner* pid was merely alive, so an unrelated long-lived process that
+inherited a force-killed run's pid made that session look permanently active and
+its cluster and data directory would have survived every later start. The record
+now carries an `owner_start_token` too.
+
+The CI lint failure was a toolchain-version gap worth recording: CI resolves
+`dtolnay/rust-toolchain@stable` to 1.98 while this workspace's pinned stable is
+1.94, so two lints that do not exist locally (`manual_is_variant_and`,
+`unused_async_trait_impl`) failed a build that was clean here. Both are fixed,
+and 1.98 is now installed alongside so the exact CI command can be run before
+pushing rather than discovered afterwards.
+
 **Docs.** `docs/getting-started/01-project-skeleton.md` now opens with the
 zero-setup path as the default first step and keeps the Docker/Compose route as
 the explicit "bring your own Postgres" alternative, unchanged.

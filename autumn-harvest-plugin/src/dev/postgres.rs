@@ -693,6 +693,7 @@ fn write_session_record(
         &session_dir.join(SESSION_RECORD_FILE),
         &SessionRecord {
             owner_pid: std::process::id(),
+            owner_start_token: process_start_token(std::process::id()),
             postmaster_pid,
             // So the reaper can stop this cluster with the very binaries that
             // started it, including a downloaded install discovery never sees.

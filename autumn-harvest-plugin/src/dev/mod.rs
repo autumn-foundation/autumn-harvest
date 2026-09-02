@@ -351,11 +351,11 @@ impl DevRuntime {
         // `process::exit(1)`s on a bind failure, which skips every destructor
         // and both teardown paths — so a busy port used to leak a postmaster
         // and its data directory outright. Failing here costs nothing.
-        let http_port = reserve_http_port(config.http_port)?;
+        let http_port = reserve_http_port(&config.http_host, config.http_port)?;
 
         let (database_url, storage, postgres) = provision_storage(&config).await?;
 
-        let base = format!("http://{}:{http_port}", config.http_host);
+        let base = format!("http://{}", http_authority(&config.http_host, http_port));
         let api_url = format!("{base}{}", config.api_path);
         let ui_url = format!("{api_url}/ui");
 
@@ -645,14 +645,33 @@ async fn resolve_binaries() -> Result<PostgresBinaries, DevError> {
     }
 }
 
+/// The `host:port` authority for a URL, bracketing an IPv6 literal.
+///
+/// `::1` is a perfectly valid loopback host, and
+/// `format!("http://{host}:{port}")` turns it into `http://::1:3000`, which no
+/// URL parser accepts — so the readiness poll could never succeed and the
+/// runtime would report `ServerNotReady` after its full budget, with the real
+/// cause nowhere in the message.
+#[must_use]
+pub fn http_authority(host: &str, port: u16) -> String {
+    // A name or an IPv4 literal needs no brackets; only an IPv6 literal does,
+    // and it is identified by parsing, not by counting colons.
+    if host.starts_with('[') || host.parse::<std::net::Ipv6Addr>().is_err() {
+        return format!("{host}:{port}");
+    }
+    format!("[{host}]:{port}")
+}
+
 /// Settle the HTTP port, proving it is bindable.
 ///
 /// `0` asks the kernel to choose. A concrete port is bound and released, which
 /// turns "something else is already on 3000" into a legible error here instead
 /// of a `process::exit(1)` deep inside autumn-web's boot — which skips every
 /// destructor and would strand the cluster we are about to create.
-fn reserve_http_port(requested: u16) -> Result<u16, DevError> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", requested)).map_err(|source| {
+fn reserve_http_port(host: &str, requested: u16) -> Result<u16, DevError> {
+    // Bind the host we will actually serve on, not a hard-coded `127.0.0.1`:
+    // otherwise `--http-host ::1` proves a port free on the wrong interface.
+    let listener = std::net::TcpListener::bind((host, requested)).map_err(|source| {
         DevError::HttpPortUnavailable {
             port: requested,
             source,
@@ -779,9 +798,13 @@ struct DevConfigLoader {
 }
 
 impl autumn_web::config::ConfigLoader for DevConfigLoader {
-    async fn load(
+    // Not an `async fn`: the body never awaits, so it is a ready value dressed
+    // up as a future. `unused_async_trait_impl` (clippy 1.98) says so.
+    fn load(
         &self,
-    ) -> Result<autumn_web::config::AutumnConfig, autumn_web::config::ConfigError> {
+    ) -> impl std::future::Future<
+        Output = Result<autumn_web::config::AutumnConfig, autumn_web::config::ConfigError>,
+    > + Send {
         let mut config = autumn_web::config::AutumnConfig {
             // `dev` is what makes Autumn *apply* pending migrations rather than
             // merely report them — the same switch the Docker quickstart sets
@@ -793,6 +816,6 @@ impl autumn_web::config::ConfigLoader for DevConfigLoader {
         config.server.port = self.port;
         config.database.url = Some(self.database_url.clone());
         config.database.auto_migrate = Some(true);
-        Ok(config)
+        std::future::ready(Ok(config))
     }
 }

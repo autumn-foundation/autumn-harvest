@@ -21,7 +21,7 @@ use autumn_harvest_plugin::dev::MAX_UNIX_SOCKET_PATH_LEN;
 use autumn_harvest_plugin::dev::{
     BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, ReapDecision,
     RefusalReason, SessionRecord, StorageDescription, SuspicionReason, candidate_bin_dirs,
-    classify_database_url, decide_reap, effective_postmaster_pid, ephemeral_dsn,
+    classify_database_url, decide_reap, effective_postmaster_pid, ephemeral_dsn, http_authority,
     parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live, proc_stat_start_time,
     record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir, unix_socket_path_len,
 };
@@ -430,6 +430,7 @@ fn record(owner_pid: u32, postmaster_pid: Option<u32>) -> SessionRecord {
     SessionRecord {
         owner_pid,
         postmaster_pid,
+        owner_start_token: Some("11002".to_owned()),
         postmaster_start_token: Some("87231".to_owned()),
         bin_dir: Some(PathBuf::from("/usr/lib/postgresql/16/bin")),
         data_dir: PathBuf::from("/tmp/harvest-dev-0/session-1-aa/data"),
@@ -540,6 +541,30 @@ fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
 }
 
 #[test]
+fn an_ipv6_host_produces_a_parseable_url() {
+    // Codex round 2 (P2). `format!("http://{host}:{port}")` turns the valid
+    // loopback host `::1` into `http://::1:3000`, which no URL parser accepts —
+    // so the readiness poll could never succeed and the runtime would report
+    // `ServerNotReady` after its full budget, with the real cause absent from
+    // the message.
+    assert_eq!(http_authority("::1", 3000), "[::1]:3000");
+    assert_eq!(http_authority("fe80::1", 3000), "[fe80::1]:3000");
+    // Already bracketed, and the non-IPv6 cases, are left alone.
+    assert_eq!(http_authority("[::1]", 3000), "[::1]:3000");
+    assert_eq!(http_authority("127.0.0.1", 3000), "127.0.0.1:3000");
+    assert_eq!(http_authority("localhost", 3000), "localhost:3000");
+
+    // And the result is actually a URL.
+    for host in ["::1", "127.0.0.1", "localhost"] {
+        let url = format!("http://{}/api/harvest/health", http_authority(host, 3000));
+        assert!(
+            url.parse::<reqwest::Url>().is_ok(),
+            "{host} produced an unparseable URL: {url}"
+        );
+    }
+}
+
+#[test]
 fn a_record_written_before_bin_dir_existed_still_parses() {
     // `#[serde(default)]`, so an older leftover is reclaimed rather than
     // skipped as unreadable and left on disk forever.
@@ -553,6 +578,23 @@ fn a_record_written_before_bin_dir_existed_still_parses() {
     let decoded = SessionRecord::from_json(older).expect("an older record must still parse");
     assert_eq!(decoded.owner_pid, 4242);
     assert_eq!(decoded.bin_dir, None);
+    assert_eq!(decoded.owner_start_token, None);
+}
+
+#[test]
+fn a_session_record_remembers_the_owner_that_created_it() {
+    // Codex round 2 (P2). Liveness alone lets a REUSED owner pid make an
+    // abandoned session look permanently active, so its cluster and data
+    // directory would survive every later start. The start time tells the
+    // recorded run apart from whoever inherited its pid.
+    let record = record(4242, Some(4243));
+    let decoded =
+        SessionRecord::from_json(&record.to_json().expect("serialize")).expect("deserialize");
+    assert_eq!(decoded.owner_start_token, record.owner_start_token);
+    assert_ne!(
+        decoded.owner_start_token, decoded.postmaster_start_token,
+        "the two pids in a record carry their own tokens"
+    );
 }
 
 #[test]
