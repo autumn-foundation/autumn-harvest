@@ -6,13 +6,17 @@ only (the workspace crates with source history relevant to the management
 API and the execution kernel — `autumn-harvest-macros`, `autumn-harvest-redis`
 and `autumn-harvest-sqlite` are deliberately excluded from both the query and
 the denominator below), full commit history from the first commit
-(2026-03-28) through `trunk-dev` HEAD (2026-08-27), 478 commits touching
-tracked `*.rs` files in those three crates.
+(2026-03-28) through `trunk-dev` HEAD as of 2026-08-27
+(`562c7815118e2a486350e8a3ceb879caa28c0212`), 478 commits touching tracked
+`*.rs` files in those three crates.
 
 ## Reproduce
 
 ```sh
-git log --format='@@%H' --name-only trunk-dev -- \
+# 562c7815118e2a486350e8a3ceb879caa28c0212 is trunk-dev HEAD as of the
+# analyzed cutoff (2026-08-27); pinned so this reproduces the documented
+# 478-commit denominator even after trunk-dev advances further.
+git log --format='@@%H' --name-only 562c7815118e2a486350e8a3ceb879caa28c0212 -- \
   'autumn-harvest/src/*.rs' 'autumn-harvest-plugin/src/*.rs' 'autumn-harvest-cli/src/*.rs' \
   > cochange_raw.txt
 # then: parse '@@<sha>' blocks, count per-file touch frequency and pairwise
