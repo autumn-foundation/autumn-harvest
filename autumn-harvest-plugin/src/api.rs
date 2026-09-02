@@ -26538,6 +26538,43 @@ async fn load_schedule_overdue_aux_by_shard(
         let Ok(schedules) = schedules else {
             continue;
         };
+
+        // Batched, once per shard: replaces what used to be up to three DB
+        // round trips *per schedule row* (`schedule_running_basis`'s two
+        // queries plus `resolve_effective_fire_at`'s calendar-exclusions
+        // load) with exactly two grouped queries covering every schedule on
+        // the shard at once (issue #786-class N+1; Ledger perf pass).
+        // `unwrap_or_default()` on either batch degrades the same way the
+        // old per-row `Err(_) => false` / `.unwrap_or(None)` arms did: a
+        // missing name/calendar reads as "0 running" / "no exclusions",
+        // which never *suppresses* an overdue wedge signal, only fails to
+        // hide one.
+        let names: Vec<&str> = schedules
+            .iter()
+            .map(|s| {
+                s.dag_name
+                    .as_deref()
+                    .or(s.workflow_name.as_deref())
+                    .unwrap_or("")
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let basis = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &names)
+            .await
+            .unwrap_or_default();
+
+        let calendar_names: Vec<&str> = schedules
+            .iter()
+            .filter_map(|s| s.calendar_name.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let exclusions =
+            autumn_harvest::calendar::load_exclusions_for_calendars(&mut conn, &calendar_names)
+                .await
+                .unwrap_or_default();
+
         for s in schedules {
             let name = s
                 .dag_name
@@ -26545,21 +26582,22 @@ async fn load_schedule_overdue_aux_by_shard(
                 .or(s.workflow_name.as_deref())
                 .unwrap_or("");
             // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            let at_capacity =
-                match autumn_harvest::scheduler::schedule_running_basis(&mut conn, name).await {
-                    Ok(basis) => basis >= i64::from(s.max_active_runs),
-                    Err(_) => false, // count failed → don't suppress the wedge signal
-                };
-            // Calendar-adjusted fire time (Codex round 3), resolved on this shard.
-            let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
-                &mut conn,
-                s.calendar_name.as_deref(),
-                &s.skip_policy,
-                s.schedule_expr.as_deref(),
-                s.next_run_at,
-            )
-            .await
-            .unwrap_or(None); // resolve failed → raw anchor (don't hide a wedge)
+            let at_capacity = basis.get(name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+            // Calendar-adjusted fire time (Codex round 3), computed in-memory
+            // against this shard's preloaded exclusions map.
+            let effective_fire_at = s.calendar_name.as_deref().and_then(|cal_name| {
+                let empty: Vec<chrono::NaiveDate> = Vec::new();
+                let excluded = exclusions.get(cal_name).unwrap_or(&empty);
+                let exclude_weekends =
+                    autumn_harvest::calendar::calendar_excludes_weekends(cal_name);
+                autumn_harvest::scheduler::resolve_effective_fire_at_pure(
+                    excluded,
+                    exclude_weekends,
+                    &s.skip_policy,
+                    s.schedule_expr.as_deref(),
+                    s.next_run_at,
+                )
+            });
             aux.insert(
                 s.id,
                 ScheduleOverdueAux {
