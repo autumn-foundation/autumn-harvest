@@ -25,6 +25,13 @@ the PAUSED skip. The other five are present in the query and held constant, so
 this page says nothing about what they cost; see
 [known limitations](#known-limitations).
 
+> **Looking for end-to-end numbers?** This page measures the claim and enqueue
+> path in isolation. [`benchmarks.md`](benchmarks.md) publishes what the engine
+> does end to end — workflows/sec, dispatch and signal latency, replay
+> throughput — at 1, 2 and 4 shards, with a one-command reproduction. The two
+> are complements: when an end-to-end number there moves, this page is where you
+> find out whether the claim path is why.
+
 > **These are starter reference numbers, not an SLO.** They were taken on one
 > machine with one Postgres configuration (below). Your hardware, your
 > `shared_buffers`, your backlog shape, and your queue count all move them.

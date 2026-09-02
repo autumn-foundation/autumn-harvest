@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+default-run = "quickstart"
 
 [dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["db"] }

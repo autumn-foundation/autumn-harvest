@@ -29,7 +29,21 @@ map, a workflow-porting checklist, and a dual-run cutover playbook.
 
 ## Quick example
 
-Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
+Try it end-to-end with **no database, no Docker, and nothing to configure**:
+
+```bash
+cargo dev
+```
+
+That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
+serves the management API and the Vantage dashboard — then prints the dashboard
+URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
+it created. It is development-only and refuses to point at anything that is not
+a local database; see
+[Chapter 1](docs/getting-started/01-project-skeleton.md).
+
+Prefer to bring your own Postgres? `cargo run -p quickstart` (see
+[`examples/quickstart/`](examples/quickstart/)).
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
@@ -298,9 +312,13 @@ a non-web context.
 
 ## CLI
 
-The `harvest` binary is a thin HTTP client for the optional management API. It
-does not talk to Postgres directly, so workflow queries, DAG triggers, auth, and
-runtime-owned behavior stay behind the same API surface your service exposes.
+The `harvest` binary is a thin HTTP client for the optional management API, so
+workflow queries, DAG triggers, auth, and runtime-owned behavior stay behind the
+same API surface your service exposes. A few commands take a database DSN
+instead, because they exist for the moments when no app is up to ask:
+[`harvest migrate`](#migrating-a-dedicated-harvest-database) (the schema step
+before replicas roll) and `harvest backup verify` (a restore drill against
+scratch databases).
 
 ```bash
 cargo run -p autumn-harvest-cli -- health
@@ -334,6 +352,57 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+### Migrating a dedicated Harvest database
+
+In the default `harvest.mode = "embedded"`, Harvest's migrations are Autumn's:
+they are registered with the framework and applied by `autumn migrate` (or
+automatically under the `dev` profile). Under `harvest.mode = "split"` or
+`"external"`, Harvest storage is a database Autumn has no handle on — that one
+is `harvest migrate`'s job:
+
+```bash
+export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+
+harvest migrate status          # what is applied, what is pending
+harvest migrate status --check  # same, but exits non-zero while anything is pending
+                                # (give it the same --include-dir you give `run`,
+                                #  or it gates on fewer sets than you apply)
+harvest migrate run             # apply every pending migration, in version order
+harvest migrate run --dry-run   # print the plan, change nothing
+
+# Sets the binary does not embed — the plugin's connector dead-letter table,
+# or your application's own — ride along:
+harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+
+# One invocation per shard database. Pass each DSN through the environment,
+# not `--database-url`: a command line is visible host-wide (`ps`, /proc) for
+# as long as the migration runs, and a shard DSN carries a password. `set -e`
+# keeps the repeated-flag behaviour of stopping before later shards on failure.
+set -e
+HARVEST_DATABASE_URL="$SHARD_A" harvest migrate run
+HARVEST_DATABASE_URL="$SHARD_B" harvest migrate run
+```
+
+Harvest's own migrations are embedded in the binary, so this needs neither a
+source tree nor the `diesel` CLI. A migration runs in one transaction together
+with its row in `__diesel_schema_migrations` — the same ledger Autumn and
+Diesel read — so it is applied exactly once whichever of them applies it, and a
+failure leaves neither the schema change nor the record of it.
+
+A migration whose `metadata.toml` says `run_in_transaction = false`, as a
+`CREATE INDEX CONCURRENTLY` migration must, is applied without one, exactly as
+Diesel applies it — and **the exactly-once guarantee above does not extend to
+it**. With no transaction there is nothing to hold a lock in and nothing to
+roll back, so two migrators racing can both execute its body; the loser reports
+it under `applied_unserialized` rather than pretending otherwise. Run migrators
+one at a time against a database, and write such migrations to be idempotent
+(`IF NOT EXISTS`), exactly as `diesel migration run` requires.
+
+TLS is supported and always *verified* — chain and hostname, against the
+platform trust store — so `sslmode=require`, `verify-ca` and `verify-full` all
+connect (a self-signed certificate has to be in that trust store).
+`sslmode=disable` still connects in plaintext.
 
 ### Deployment preflight
 
@@ -377,8 +446,14 @@ in [`docs/alerts/README.md`](docs/alerts/README.md).
 
 ### Measured performance baselines
 
-[`docs/performance.md`](docs/performance.md) publishes measured task-claim and
-enqueue baselines: how claim latency scales with pending-backlog depth (the
+[`docs/benchmarks.md`](docs/benchmarks.md) publishes **end-to-end** numbers —
+sustained workflows/sec for a canonical 3-activity workflow, activity dispatch
+and signal round-trip percentiles, and replay throughput, each at 1, 2 and 4
+shards — with a committed `docker-compose.yml` and a one-command runner so you
+can reproduce any of them on your own hardware.
+
+[`docs/performance.md`](docs/performance.md) is the component-level complement:
+it publishes measured task-claim and enqueue baselines: how claim latency scales with pending-backlog depth (the
 number that answers *"when do I add a shard?"*), what five representative
 claim-path predicates cost (five more are in the query on every claim but are
 left on their cheapest null/empty path, so they are evaluated rather than
@@ -927,7 +1002,8 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV)
-- Postgres 12+
+- Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
+  downloads one for you
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.

@@ -52,7 +52,10 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
 /// already-migrated database. It also keeps the same dev/prod policy the plugin
 /// applied by hand before: auto-apply under the `dev` profile, warn-only
-/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas —
+/// and, for the dedicated Harvest database under `Split`/`External` that
+/// `autumn migrate` cannot reach, `harvest migrate run`; see
+/// [`ensure_runtime_migrations_blocking`]).
 ///
 /// Registering here rather than migrating ourselves is what lets Autumn resolve
 /// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
@@ -1540,6 +1543,51 @@ impl Drop for AdmissionGlobalsGuard {
     }
 }
 
+/// The application configuration this startup hook should read.
+///
+/// `state.config()` first, **not** `AutumnConfig::load()`. Re-loading reads
+/// `autumn.toml` + `AUTUMN_*` from scratch and so silently ignores any
+/// `ConfigLoader` the embedder installed via `AppBuilder::with_config_loader` —
+/// the seam autumn-web documents for exactly this. Autumn had already resolved
+/// the database URL through that loader, applied the migrations with it and
+/// built the pool from it; this function then looked at a *different* config
+/// and refused to start with "requires database.url when harvest.mode is
+/// embedded".
+///
+/// But `state.config()` is not always populated. `autumn_web::test::TestApp`
+/// starts from `AutumnConfig::default()`, and `AppState::config_arc` falls back
+/// to a default when no config extension is present — so a harness that
+/// supplies its database another way leaves `database.url` empty while the
+/// process environment still carries it. Reading only `state.config()` broke
+/// exactly those suites.
+///
+/// So: prefer the config the app is actually running on, and fall back to the
+/// ambient one **only when the app's own config names no database at all**. The
+/// fallback can add a URL where there was none; it can never override one the
+/// embedder resolved, which is what the `ConfigLoader` fix depends on.
+fn resolve_app_config(state: &AppState) -> AutumnConfig {
+    preferred_app_config(state.config(), AutumnConfig::load().ok())
+}
+
+/// The choice [`resolve_app_config`] makes, as a pure function of both configs.
+///
+/// Split out so the rule is unit-testable: the bug it fixes only reproduced
+/// inside a live `TestApp` against a Docker-backed database, which is the
+/// slowest possible place to notice a one-line policy change.
+fn preferred_app_config(from_state: AutumnConfig, ambient: Option<AutumnConfig>) -> AutumnConfig {
+    if from_state.database.url.is_some() {
+        return from_state;
+    }
+    match ambient {
+        Some(ambient) if ambient.database.url.is_some() => ambient,
+        // Neither names a database. Return the app's own config so the caller
+        // reports the invariant it actually cares about ("requires
+        // database.url when harvest.mode is embedded") rather than a difference
+        // between two empty configs.
+        _ => from_state,
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::unused_async)]
 async fn start_harvest_runtime(
     state: &AppState,
@@ -1548,8 +1596,7 @@ async fn start_harvest_runtime(
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
-    let app_config = AutumnConfig::load()
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
@@ -2511,6 +2558,7 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+        HARVEST_MIGRATE_REMEDY,
     )?;
 
     // Plugin-owned tables that live in the harvest database (issue #944's
@@ -2522,14 +2570,55 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         PLUGIN_HARVEST_MIGRATIONS,
         "Harvest plugin storage",
+        PLUGIN_HARVEST_MIGRATE_REMEDY,
     )
 }
+
+/// The command that applies [`HARVEST_MIGRATIONS`] to a dedicated Harvest
+/// database.
+///
+/// `autumn migrate` is deliberately NOT named: this path only ever runs for a
+/// dedicated Harvest database (`ensure_runtime_migrations_blocking` returns
+/// early under `Embedded`), which that command cannot reach — it applies the
+/// application database's sets and exits 0 having changed nothing (issue
+/// #1240).
+const HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run` ",
+    // The DSN usually carries a password, and a command line is readable by
+    // every process on the host (`ps`, /proc) for as long as the migration
+    // runs. `--database-url` still works and is right for a passwordless DSN.
+    "to apply them. Prefer the environment variable over `--database-url`: a ",
+    "command line is visible host-wide, and this DSN usually carries a password."
+);
+
+/// The command that applies [`PLUGIN_HARVEST_MIGRATIONS`].
+///
+/// **Not the same command.** The `harvest` binary embeds Harvest's own
+/// migrations, not the plugin's, so this set only applies when its directory is
+/// named explicitly. An operator given [`HARVEST_MIGRATE_REMEDY`] for *this*
+/// warning would see a successful exit and roll replicas with
+/// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
+/// added the table to prevent, since the first poison message then fails its
+/// dead-letter write and redelivers forever.
+const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run ",
+    "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
+    "Prefer the environment variable over `--database-url`: a command line is ",
+    "visible host-wide, and this DSN usually carries a password. ",
+    // Said out loud because the process logging this is usually a container
+    // with installed binaries and no checkout: unlike Harvest's own set, this
+    // one is NOT embedded in the `harvest` binary, so a workspace-relative
+    // path would send an operator at a directory that does not exist there.
+    "That directory ships in the autumn-harvest-plugin crate source, not in the ",
+    "`harvest` binary, so make it available wherever you run the command."
+);
 
 fn apply_migrations_for_profile(
     profile: &str,
     database_url: &str,
     migrations: EmbeddedMigrations,
     label: &str,
+    remedy: &str,
 ) -> autumn_web::AutumnResult<()> {
     if profile == "dev" {
         let result = autumn_web::migrate::run_pending(database_url, migrations)
@@ -2552,7 +2641,8 @@ fn apply_migrations_for_profile(
             tracing::warn!(
                 target = label,
                 count = pending.len(),
-                "Pending migrations detected. Run `autumn migrate` to apply them."
+                remedy,
+                "Pending migrations detected."
             );
             for migration in pending {
                 tracing::warn!(target = label, migration = %migration, "Pending migration");
@@ -2564,6 +2654,77 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_remedy_tests {
+    use super::{HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY};
+
+    #[test]
+    fn both_remedies_name_the_command_that_can_reach_a_dedicated_harvest_database() {
+        // `autumn migrate` reaches the application database only; naming it in
+        // either warning sends the operator to a command that exits 0 having
+        // changed nothing (issue #1240).
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("harvest migrate run"),
+                "remedy must name the dedicated-database command: {remedy}"
+            );
+            assert!(
+                !remedy.contains("autumn migrate"),
+                "remedy must not name a command that cannot apply these: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_remedy_puts_the_dsn_in_a_command_line() {
+        // These strings are copied verbatim by an operator mid-incident, and
+        // the DSN they substitute usually carries a password. A command line
+        // is readable by every process on the host (`ps`, /proc) for as long
+        // as the migration runs, so the remedy must demonstrate the
+        // environment form.
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("HARVEST_DATABASE_URL="),
+                "remedy must show the environment form: {remedy}"
+            );
+            assert!(
+                !remedy.contains("--database-url <"),
+                "remedy must not demonstrate passing the DSN as an argument: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_plugin_remedy_names_the_plugin_migration_directory() {
+        // The `harvest` binary embeds Harvest's own migrations, not the
+        // plugin's: without `--include-dir` the plugin set is silently not
+        // applied, and the operator rolls replicas with
+        // `harvest_connector_dead_letters` absent.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the plugin-storage warning must name its own migration directory: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("migrations/harvest"),
+            "{PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        // The process logging this is usually a container with no checkout, so
+        // the warning must say where that directory comes from rather than
+        // implying a path relative to the working directory.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("crate source"),
+            "the warning must say where the directory comes from: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            !HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the core-storage warning needs no extra directory -- the binary \
+             embeds that set: {HARVEST_MIGRATE_REMEDY}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2771,6 +2932,60 @@ mod tests {
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
+
+    /// An `AutumnConfig` naming `url`, or naming no database when `None`.
+    fn config_naming(url: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            database: DatabaseConfig {
+                url: url.map(str::to_owned),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_app_s_own_config_wins_over_the_ambient_one() {
+        // The whole point of reading `state.config()`: a `ConfigLoader` the
+        // embedder installed must not be silently overridden by `autumn.toml`
+        // or `AUTUMN_*`. This is the dev runtime's case.
+        let chosen = preferred_app_config(
+            config_naming(Some("postgres://loader/db")),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(chosen.database.url.as_deref(), Some("postgres://loader/db"));
+    }
+
+    #[test]
+    fn the_ambient_config_fills_in_when_the_app_names_no_database() {
+        // Regression: `autumn_web::test::TestApp` starts from
+        // `AutumnConfig::default()`, and `AppState::config_arc` falls back to a
+        // default when no config extension is present — so a harness that
+        // supplies its database another way leaves `database.url` empty while
+        // the process environment still carries it. Reading only
+        // `state.config()` broke those suites with "requires database.url when
+        // harvest.mode is embedded".
+        let chosen = preferred_app_config(
+            config_naming(None),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(
+            chosen.database.url.as_deref(),
+            Some("postgres://ambient/db")
+        );
+    }
+
+    #[test]
+    fn no_database_anywhere_still_reports_the_real_invariant() {
+        // The fallback may only ever ADD a URL. With neither source naming one
+        // the caller must still fail with the embedded-mode message, not with
+        // something about configuration precedence.
+        let chosen = preferred_app_config(config_naming(None), Some(config_naming(None)));
+        assert!(chosen.database.url.is_none());
+
+        let chosen = preferred_app_config(config_naming(None), None);
+        assert!(chosen.database.url.is_none());
+    }
 
     /// Shutting a fleet of connectors down must not serialize their drains.
     ///

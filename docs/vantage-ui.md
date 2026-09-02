@@ -53,6 +53,172 @@ Shows a single workflow execution in full detail.
 
 Status badges include `aria-label="Status: {state}"` and `role="status"` for screen-reader accessibility.
 
+### Schedules — `/schedules`
+
+The operator surface for cron/interval schedules: one row per schedule across every
+shard, with the health, policy and bounded-run state needed to answer *"is this
+schedule healthy, when does it fire next, and how did its last runs end?"* without
+composing API calls by hand.
+
+Every field is read from the existing `GET /admin/schedules` response fields, and every
+mutation goes through an already-audited endpoint. The page adds **no new backend
+endpoint, no new `WorkflowEvent` variant, and no migration**.
+
+**List columns**
+
+| Column | Source | Notes |
+|---|---|---|
+| Schedule ID | `harvest_schedules.id` | Truncated; links to the drill-downs |
+| Kind / Target | `dag_name` / `workflow_name` | `Dag` or `Workflow` |
+| Expression | `schedule_expr` | Cron or `interval:*` |
+| Timezone | `timezone` | UTC is subdued; other zones get a badge |
+| Next Run | `next_run_at` | Plus the jitter-adjusted **effective** fire time and the jitter window when `jitter_secs > 0` (#240) |
+| Last Run | `last_run_at` | |
+| Health | derived | See badges below |
+| Overlap | `overlap_policy` (#241) | Buffering policies also show `buffered <n>` (and `/<cap>` under `buffer_all`) |
+| Catchup | `catchup_policy` (#484) | Effective policy, the `window` duration, and `dropped <n>` from the most recent recovery tick |
+| Bounded runs | `max_runs` / `runs_started` / `end_at` / `exhausted_reason` (#478) | `<remaining> of <max> left · ends <ts> · exhausted: <reason>`. `max_runs = 0` is the engine's *unlimited* (every bound check guards on `max > 0`), so no budget is rendered for it. |
+| Created | `created_at` | |
+| Shard | fan-out | Multi-shard deployments only |
+
+**Health badges and ordering**
+
+A healthy schedule renders one calm `Active` badge. An unhealthy one renders a badge per
+condition:
+
+| Badge | Condition |
+|---|---|
+| `Paused` | `is_paused` |
+| `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
+| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
+| `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
+
+Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing
+`next_run_at`-ascending order among themselves. A "Needs attention" strip at the top of
+the page counts each bucket, and the **Health** filter (`?health=Unhealthy` /
+`?health=Healthy`) narrows the list. An unrecognised value is a `400`.
+
+**Filters** — `target`, `kind`, `paused`, `health`, `shard_id`, `limit`, `refresh`.
+All of them round-trip into the bulk pause/resume actions, and both bulk handlers apply
+the *same* `ScheduleUiFilters::matches` predicate the list does — so "Pause all matching
+(N)" acts on exactly the N rows on screen.
+
+**Per-row actions** — Pause, Resume, Run now, and Delete, each behind a confirmation
+dialog and each writing an audit record with `source = ui` and the matching operation
+(`schedule.pause`, `schedule.resume`, `schedule.trigger`, `schedule.delete`). The UI
+adds no unaudited mutation path.
+
+A row is offered **Resume** when `is_paused` **or** `auto_paused_at` is set. The
+scheduler's auto-pause (#360) sets `auto_paused_at` *without* setting `is_paused`, so a
+row can be non-firing with `is_paused = false`; keying the action on `is_paused` alone
+would show an "Auto-paused" badge next to a Pause button and leave no way to restore
+firing. Resume — per row and in bulk — clears `auto_paused_at` and resets
+`consecutive_failure_count`, exactly as `POST /admin/schedules/{id}/resume` does, so the
+next tick does not immediately re-pause the schedule.
+
+The `paused` filter matches the `is_paused` column only; use `health=Unhealthy` to find
+auto-paused schedules alongside the other non-firing states.
+
+#### Fire-time preview — `/schedules/{id}/preview`
+
+Renders the next N fire times from the same computation as
+`GET /admin/schedules/{id}/preview` (#348), so the two can never disagree:
+
+- **Scheduled** (the raw cron instant), **Local** (in the schedule's timezone), and
+  **Effective** (after calendar adjustment and jitter) side by side.
+- Calendar-excluded entries show `suppressed` with reason `skipped:calendar-excluded`;
+  rebased entries show `deferred:calendar`.
+- The jitter window (`[scheduled_at, scheduled_at + jitter_secs]`) per entry.
+- An advisory **Overlap risk** flag when `skip`/`buffer_one` could drop the firing.
+- Bounded-run truncation (#478/#543) is applied, and a preview that comes back empty
+  says *why*: paused (with the pause reason), **auto-paused** (#360 — the scheduler's
+  due-list filters on `auto_paused_at IS NULL`, so such a schedule will not fire even
+  though its `is_paused` column is false), exhausted (with `exhausted_reason`), the
+  `end_at` cutoff, or an expression with no future firings.
+
+`?count=N` (1–100, default 10) controls how many entries are projected.
+
+#### Run history — `/schedules/{id}/runs`
+
+Consumes `GET /admin/schedules/{id}/runs` (#534/#762). Newest-slot-first rows with
+`nominal_fire_time` (`— (no slot)` for a manual trigger), started/completed timestamps,
+a terminal state badge, `origin` (`scheduled` / `backfill` / `manual_trigger`), the
+first line of a terminal failure, and a link to the execution detail view.
+
+Above the table, the **scheduled-run summary** counts `scheduled`-origin runs only, so a
+backfill storm or an ad-hoc trigger never inflates the failure ratio.
+
+A filter bar exposes `limit` (1–200), `origin`, and `state`. The **Next** link carries the
+active filters alongside the cursor, because a keyset cursor is only meaningful under the
+filters it was computed with.
+
+Cross-shard degradation is always visible, never silent:
+
+| Response `status` | Rendering |
+|---|---|
+| `complete` | No banner |
+| `partial` | "Some shards unreachable" banner listing each unavailable shard and its error; the summary is flagged as possibly understated |
+| `unavailable` | "No shard could be reached" banner; **no** "no runs yet" message, because nothing could be read |
+
+A schedule that exists but has never run renders an explicit "No runs yet." card.
+Paging uses the endpoint's own keyset cursor (`?limit=`, `?cursor=`).
+
+This page is **admin-gated**, matching `GET /admin/schedules/{id}/runs` — the one
+schedule read route the management API gates.
+
+#### Backfill launcher — `/schedules/{id}/backfill`
+
+A two-stage flow over `POST /admin/schedules/{id}/backfill` (#337):
+
+1. `GET` renders the window form (start, end, max slots, include-paused). This is a
+   pure read — it dispatches nothing.
+2. Submitting posts `stage=preview`, which runs the endpoint's **dry run** and renders
+   the planned slot count, the would-dispatch and would-skip counts, the machine-readable
+   skip reasons, and the first 20 planned fire times.
+3. Only an explicit `stage=commit` (behind a `confirm()` dialog) dispatches. A POST that
+   omits `stage` falls back to the dry run, so a bare form post can never dispatch work.
+4. On success the operator is redirected to that schedule's **run history**, which renders
+   a flash summarising what was dispatched — including the failure count, which is
+   reported nowhere else.
+
+The submitted window is normalised with `SecondsFormat::AutoSi`, preserving sub-second
+precision: an `interval:` backfill treats `from` as its first slot, so truncating
+`…00.900Z` to `…00Z` would shift every slot in the plan rather than merely respelling the
+window.
+
+`max_count` is capped at the engine's `DEFAULT_BACKFILL_MAX_COUNT` (1,000). The endpoint
+treats a supplied `max_count` as the planning limit that *replaces* its own default, so an
+uncapped value from a browser form could make one request enumerate millions of timestamps.
+
+A paused **DAG** schedule cannot be committed at all (the endpoint rejects it, because
+backfilled runs would sit `QUEUED` until the schedule resumes), so the confirmation says so
+instead of offering a button that can only fail. A rejected submission re-renders the form
+with the operator's own window still in it.
+
+The dry run is a POST rather than a GET because it writes a `harvest_backfill_log` row
+and an audit record — the read path stays side-effect-free. Both stages are audited
+through the API handler with `source = ui`, and every guard the endpoint enforces
+(paused, exhausted, `max_active_runs`, `max_runs`, window size) applies unchanged; a
+rejection is rendered on the form rather than as a bare error page.
+
+A malformed or inverted window is a rendered form error, never a 500.
+
+#### Not-found vs. indeterminate
+
+All three drill-downs resolve the schedule through the API's own
+`resolve_schedule_with_shard`, so an unparseable id is a `400`, "checked every expected
+shard and none had it" is a `404`, and "a shard could not be checked" is a `503` — never a
+`404` claiming a schedule was deleted when a shard was merely unreachable.
+
+`load_schedule_by_id_with_shard` — the lookup behind the preview and backfill endpoints —
+delegates to the same resolver, so a schedule on a healthy shard is found even while an
+earlier shard is down, and a not-found result during an outage is a `503` rather than a
+`404`. The preview additionally passes its already-resolved row to
+`compute_schedule_preview_for`, avoiding a second lookup entirely.
+
+**Out of scope (tracked elsewhere):** creating or editing schedules from the UI (#771),
+overdue-schedule detection (#696), recent-runs enrichment (#762).
+
 ## Event label mapping
 
 Vantage translates raw `WorkflowEvent` type strings to friendlier labels:
@@ -86,6 +252,9 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 | `/workflows/{exec_id}` | Workflow detail |
 | `/workers` | Worker fleet |
 | `/schedules` | Cron/interval schedules |
+| `/schedules/{id}/preview` | Next-fire-time preview for one schedule |
+| `/schedules/{id}/runs` | Per-schedule run history (admin) |
+| `/schedules/{id}/backfill` | Backfill launcher (form → dry run → commit) |
 | `/dags` | DAG list |
 | `/dags/{dag_name}` | DAG detail |
 | `/dlq` | Dead letter queue |

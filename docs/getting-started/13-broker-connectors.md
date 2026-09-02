@@ -134,10 +134,26 @@ Under `AUTUMN_PROFILE=dev` it is applied automatically at startup — by Autumn
 in the default `embedded` mode (the plugin registers its migrations with the
 framework), or by the plugin itself under `split` / `external`, where the
 harvest database is one Autumn has no handle on. Outside dev, a pending
-migration is only *warned* about — run your normal migration step
-(`autumn migrate`) before enabling a connector, or the first poison message
-will fail its dead-letter write, be downgraded to a retry, and redeliver
-forever.
+migration is only *warned* about, and it must be applied before you enable a
+connector: otherwise the first poison message will fail its dead-letter write,
+be downgraded to a retry, and redeliver forever.
+
+Which command applies it depends on the mode, because `autumn migrate` only
+ever reaches the **application** database:
+
+```bash
+# embedded (default): the application database IS the harvest database.
+autumn migrate
+
+# split / external: the harvest database is a separate one. `autumn migrate`
+# does NOT apply this table there -- name the plugin's set explicitly.
+export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+```
+
+The `--include-dir` set rides along with Harvest's own embedded migrations, so
+that one command leaves the harvest database fully migrated. See
+[Migrations](10-operations.md#migrations) for the whole procedure.
 (Use `.broker_native_dead_letter()` on SQS if you would rather not have the
 table at all — that needs a redrive policy on the queue; see
 [Poison messages](#poison-messages).)

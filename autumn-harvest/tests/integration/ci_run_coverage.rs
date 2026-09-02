@@ -479,7 +479,13 @@ fn plugin_required_features(source: &str) -> Vec<String> {
         let t = line.trim();
         if let Some(idx) = t.find("#![cfg(") {
             let seg = &t[idx..];
-            for feat in ["webhooks", "mcp", "metrics", "unified-dag-execution"] {
+            for feat in [
+                "webhooks",
+                "mcp",
+                "metrics",
+                "unified-dag-execution",
+                "dev-runtime",
+            ] {
                 let needle = format!("feature = \"{feat}\"");
                 if seg.contains(&needle) {
                     feats.push(feat.to_string());

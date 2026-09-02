@@ -422,3 +422,168 @@ specifically, not a broader refactor of every redundant call to
 `task_reach`/`resolved_upstream_status`/`gate_status` for the recursive gate-
 reachability call sites) would be a reasonable next Bolt pass, profiled and
 evidenced independently.
+
+## Follow-up: fixing the second redundant call site
+
+This section closes the gap the scope note above left open. Same workload,
+same harness, same machine and session as the measurement below -- only the
+code changed.
+
+### Profile (before this follow-up, i.e. the "after" trace above)
+
+```
+558,402,889 (100.0%)  PROGRAM TOTALS
+
+111,588,603 (19.98%)  __memcmp_avx2_movbe [libc]
+ 61,593,000 (11.03%)  BTreeMap::bulk_build_from_sorted_iter
+ 58,608,000 (10.50%)  <Map<I,F> as Iterator>::fold
+ 44,265,900 ( 7.93%)  <Vec<T> as SpecFromIter<T,I>>::from_iter
+ 35,843,400 ( 6.42%)  autumn_harvest_plugin::dag_retry::node_outcome
+```
+
+(Figures re-measured fresh in this session -- 558,402,889 Ir, essentially
+identical to the 558,799,610 recorded above; the ~0.07% difference is
+run-to-run/toolchain noise on this machine, not a code change.)
+`node_outcome`'s own self-cost alone (6.42%) clears the >=5%-of-workload
+floor before counting its share of the `BTreeSet`-construction family it
+drives jointly with the elsewhere-fixed call site.
+
+### Hypothesis
+
+`node_outcome(events, node)` (called once per non-gate node directly from
+`build_run_graph`, and recursively from `resolved_upstream_status` once per
+resolved upstream edge during gate-reachability walks) rebuilds
+`dispatched_activity_names(events)` -- an O(events) scan plus a fresh
+`BTreeSet<&str>` allocation -- on every call, exactly the redundancy class
+the primary fix above already removed from `latest_scheduled`. Unlike
+`latest_scheduled` (called exactly once per non-gate node), `node_outcome`
+is also reachable recursively through `resolved_upstream_status` for every
+upstream edge `task_reach` walks while resolving gate reachability, so its
+call count -- and therefore the win from hoisting -- is not bounded by the
+non-gate node count alone. Threading a single `dispatched: &BTreeSet<&str>`
+(the value `build_run_graph` already computes once) down through
+`node_outcome`, `gate_status`, `task_reach`, and `resolved_upstream_status`
+should remove the rebuild from every one of those calls at zero behavior
+change: each call already computed the identical set from the identical
+`events` slice.
+
+### Change
+
+`autumn-harvest-plugin/src/dag_retry.rs`:
+
+* `node_outcome` gains a `dispatched: &BTreeSet<&str>` parameter and no
+  longer computes it internally.
+* `resolve_retry_plan` (the only other production caller, driving the #366
+  retry-node-validation loop over a handful of user-requested node names)
+  now computes `dispatched_activity_names(events)` once before its loop
+  instead of once per `node_outcome` call inside it -- the same hoist,
+  applied at its own call site. This path is not exercised by the
+  `dag_graph_profile` harness (it is admin-retry-triggered, not part of the
+  run-graph read path), so its win is not claimed in the measurement below;
+  it is a free consequence of updating the call site for the signature
+  change, not a separately profiled fix.
+
+`autumn-harvest-plugin/src/dag_graph.rs`:
+
+* `gate_status`, `task_reach`, and `resolved_upstream_status` each gain a
+  `dispatched: &BTreeSet<&str>` parameter, threaded through their existing
+  mutual-recursion call chain (`gate_status` -> `task_reach` ->
+  `resolved_upstream_status` -> `task_reach` | `node_outcome`).
+* `build_run_graph` passes its already-computed `dispatched` (the same
+  value the primary fix above introduced) to both the `gate_status` call
+  (gate nodes) and the `node_outcome` call (activity nodes) instead of
+  letting either recompute it.
+
+No behavior change: every call site receives the exact `BTreeSet<&str>`
+value it used to build internally, from the same `events` slice. The
+gate-only-DAG short-circuit the primary fix introduced (`dispatched` stays
+`BTreeSet::new()`, computed with no `O(events)` scan, when every task is a
+gate) is unaffected -- a gate-only DAG still never reaches a non-gate
+`resolved_upstream_status` arm that would dereference a populated set.
+
+### Measurement
+
+Both binaries built from the identical harness/`Cargo.toml` bench
+declaration, differing only by the `dag_retry.rs`/`dag_graph.rs` diff above,
+same `valgrind --tool=callgrind --branch-sim=no --cache-sim=no` and
+`valgrind --tool=dhat` invocations, same session.
+
+#### Instructions (Ir)
+
+| | Instructions (Ir) |
+|---|---|
+| Before | 558,402,889 |
+| After  | 254,350,860 |
+| **Reduction** | **304,052,029 (54.45%)** |
+
+Clears the >=5% floor by ~11x -- far above the 6.42% `node_outcome`
+self-cost alone predicted, because the recursive `resolved_upstream_status`
+call sites (invisible to a per-node-count estimate) were paying the same
+rebuild many more times than once per non-gate node.
+
+After-trace flat profile:
+
+```
+254,350,860 (100.0%)  PROGRAM TOTALS
+
+ 90,626,100 (35.63%)  <Map<I,F> as Iterator>::fold
+ 47,621,059 (18.72%)  __memcmp_avx2_movbe [libc]
+ 25,766,937 (10.13%)  malloc.c:_int_malloc
+ 14,361,805 ( 5.65%)  malloc.c:_int_free
+ 11,408,100 ( 4.49%)  autumn_harvest_plugin::dag_graph::has_skip_marker   <- unchanged
+```
+
+`node_outcome` and the `BTreeMap`-construction lines it drove
+(`bulk_build_from_sorted_iter`, `Vec::from_iter`, `BTreeMap::insert`, the
+`Drop` glue) no longer appear above the 98%-of-total threshold at all --
+consistent with the mechanism, not merely correlated with it.
+`has_skip_marker`'s self-cost is unchanged at 11,408,100 Ir, byte-for-byte
+identical to both traces above it in this document, independent
+confirmation that this change touches nothing else in the classification
+path. The remaining `__memcmp_avx2_movbe` and `Iterator::fold` cost is
+`Vec<TaskStatus>` construction inside `task_reach` and genuine `&str`
+activity-name comparisons in `node_outcome`'s and `latest_scheduled`'s scans
+-- inherent event-matching work, not redundant construction.
+
+#### Allocations (`valgrind --tool=dhat`)
+
+| dhat | Before | After | Reduction |
+|---|---|---|---|
+| Total blocks | 523,125 | 203,025 | 320,100 (**61.19%**) |
+| Total bytes  | 112,327,303 | 18,276,103 | 94,051,200 (**83.73%**) |
+
+Both independently clear the alternate >=10%-allocation floor as well as
+the primary Ir floor, and by a wider margin than the primary fix's own
+35.70%/43.17% -- expected, since this fix removes the recursively-called
+site the first one deliberately left alone.
+
+#### Correctness
+
+* `cargo fmt -p autumn-harvest-plugin -- --check` -- clean.
+* `cargo clippy -p autumn-harvest-plugin --lib --benches --features "webhooks,mcp,metrics,connectors,unified-dag-execution" -- -D warnings` -- clean.
+* `cargo test -p autumn-harvest-plugin --lib --features "webhooks,mcp,metrics,connectors,unified-dag-execution"` --
+  **1,240 passed, 0 failed** (971 passed, 0 failed with
+  `--no-default-features`), including every `dag_graph::tests::*` and
+  `dag_retry::tests::*` unit test, unchanged in expectation: no test's
+  asserted value needed to change, since every call site receives the
+  identical `BTreeSet<&str>` it used to build internally.
+* No other crate in the workspace references `node_outcome` or
+  `dispatched_activity_names` (confirmed by grep across
+  `autumn-harvest-cli`, `autumn-harvest-sqlite`, and `examples/`), and no
+  other bench in `autumn-harvest-plugin/benches` calls either function --
+  this change's blast radius is exactly the two files touched.
+
+### Reproduce
+
+```bash
+BIN=$(cargo bench -p autumn-harvest-plugin --no-default-features \
+  --bench dag_graph_profile --no-run --message-format=json 2>/dev/null \
+  | jq -r 'select(.reason=="compiler-artifact" and .target.name=="dag_graph_profile") | .executable')
+
+# Instruction count:
+valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg.out "$BIN"
+callgrind_annotate --threshold=98 cg.out | head -30
+
+# Allocation counts/bytes:
+valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
+```

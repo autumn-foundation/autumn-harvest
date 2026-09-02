@@ -19,6 +19,17 @@ categories = ["command-line-utilities", "asynchronous"]
 # diesel for the core crate.
 autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+# `harvest migrate` builds its own Postgres connection so it can offer TLS,
+# which `AsyncPgConnection::establish` (NoTls) cannot -- a managed Harvest
+# database with `sslmode=require` is the common production shape (issue #1240).
+# Every crate here is already in the workspace lockfile at these versions via
+# autumn-web's own migration path, so this unifies rather than widening.
+diesel-async = { workspace = true }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+url = "2"
 crossterm = "0.29.0"
 percent-encoding = "2"
 ratatui = "0.30.0"

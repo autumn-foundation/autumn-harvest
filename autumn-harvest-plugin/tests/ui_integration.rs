@@ -2049,6 +2049,1566 @@ async fn ui_all_pages_have_schedules_nav_link() {
     }
 }
 
+// ── issue #951: schedules management page ───────────────────────────────────
+
+/// Health / policy columns the #951 list view must surface. Every value maps to
+/// an existing `harvest_schedules` column, so this seeds a row exactly as the
+/// scheduler would leave it.
+#[derive(Default)]
+struct ScheduleFixture<'a> {
+    kind: &'a str,
+    name: &'a str,
+    is_paused: bool,
+    jitter_secs: i64,
+    overlap_policy: Option<&'a str>,
+    catchup_policy: Option<&'a str>,
+    catchup_window_secs: Option<i64>,
+    last_catchup_dropped: i32,
+    max_runs: Option<i32>,
+    runs_started: i32,
+    exhausted_reason: Option<&'a str>,
+    /// Force `exhausted_at` even with no reason recorded — a state the schema
+    /// permits and the badge renderer handles separately.
+    exhausted: bool,
+    auto_paused: bool,
+    next_run_at_sql: Option<&'a str>,
+    schedule_expr: Option<&'a str>,
+}
+
+async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'_>) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let mut conn = AsyncPgConnection::establish(database_url)
+        .await
+        .expect("failed to connect for schedule fixture insert");
+    // Quote-escape every interpolated literal so a fixture can seed a hostile
+    // name (the pure tests use one containing a single quote) and get a row
+    // rather than a syntax error.
+    let sql_lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let (dag_col, wf_col) = if fixture.kind == "Dag" {
+        (sql_lit(fixture.name), "NULL".to_string())
+    } else {
+        ("NULL".to_string(), sql_lit(fixture.name))
+    };
+    let sql_opt_str = |v: Option<&str>| v.map_or_else(|| "NULL".to_string(), sql_lit);
+    let sql_opt_i = |v: Option<i64>| v.map_or_else(|| "NULL".to_string(), |n| n.to_string());
+    let sql = format!(
+        "INSERT INTO harvest_schedules \
+            (id, dag_name, workflow_name, schedule_expr, timezone, catchup, \
+             max_active_runs, is_paused, paused_at, created_at, updated_at, \
+             jitter_secs, overlap_policy, catchup_policy, catchup_window_secs, \
+             last_catchup_dropped, last_catchup_at, max_runs, runs_started, \
+             exhausted_at, exhausted_reason, auto_paused_at, next_run_at) \
+         VALUES \
+            ('{id}', {dag_col}, {wf_col}, {expr}, 'UTC', false, 1, {is_paused}, \
+             {paused_at}, NOW(), NOW(), {jitter}, {overlap}, {catchup_policy}, \
+             {catchup_window}, {dropped}, {last_catchup_at}, {max_runs}, {runs_started}, \
+             {exhausted_at}, {exhausted_reason}, {auto_paused_at}, {next_run_at})",
+        expr = sql_opt_str(Some(fixture.schedule_expr.unwrap_or("0 * * * *"))),
+        is_paused = fixture.is_paused,
+        paused_at = if fixture.is_paused { "NOW()" } else { "NULL" },
+        jitter = fixture.jitter_secs,
+        overlap = sql_opt_str(Some(fixture.overlap_policy.unwrap_or("skip"))),
+        catchup_policy = sql_opt_str(fixture.catchup_policy),
+        catchup_window = sql_opt_i(fixture.catchup_window_secs),
+        dropped = fixture.last_catchup_dropped,
+        last_catchup_at = if fixture.last_catchup_dropped > 0 {
+            "NOW()"
+        } else {
+            "NULL"
+        },
+        max_runs = sql_opt_i(fixture.max_runs.map(i64::from)),
+        runs_started = fixture.runs_started,
+        exhausted_at = if fixture.exhausted_reason.is_some() || fixture.exhausted {
+            "NOW()"
+        } else {
+            "NULL"
+        },
+        exhausted_reason = sql_opt_str(fixture.exhausted_reason),
+        auto_paused_at = if fixture.auto_paused { "NOW()" } else { "NULL" },
+        next_run_at = fixture.next_run_at_sql.unwrap_or("NULL"),
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_schedule_fixture failed");
+    id
+}
+
+/// Seed one execution attributed to a schedule, as the scheduler/backfill/manual
+/// trigger paths do (`schedule_id` + `origin` + `scheduled_for`), so the run
+/// history drill-down has something to render.
+async fn insert_schedule_run(
+    database_url: &str,
+    shard: ShardId,
+    schedule_id: uuid::Uuid,
+    workflow_name: &str,
+    state: &str,
+    origin: &str,
+    scheduled_for_sql: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = AsyncPgConnection::establish(database_url)
+        .await
+        .expect("failed to connect for schedule run insert");
+    let completed = if state == "RUNNING" { "NULL" } else { "NOW()" };
+    let sql = format!(
+        "INSERT INTO harvest_workflow_executions \
+            (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+             queue_name, started_at, completed_at, schedule_id, scheduled_for, origin) \
+         VALUES \
+            ('{exec}', '{workflow_name}', '{exec}', gen_random_uuid(), {shard}, '{state}', \
+             '{{}}'::jsonb, 'default', NOW() - INTERVAL '1 hour', {completed}, \
+             '{schedule_id}', {scheduled_for_sql}, '{origin}')",
+        exec = exec_id.as_uuid(),
+        shard = shard.as_i32(),
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_schedule_run failed");
+    exec_id
+}
+
+/// AC2/AC3: a list containing a paused schedule and an exhausted schedule
+/// renders every policy/health field and floats the unhealthy rows to the top.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ui_schedules_list_renders_health_policy_and_bounded_run_state() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let healthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "healthy_nightly",
+            jitter_secs: 300,
+            overlap_policy: Some("buffer_all"),
+            next_run_at_sql: Some("NOW() + INTERVAL '1 hour'"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let paused = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "paused_billing",
+            is_paused: true,
+            next_run_at_sql: Some("NOW() + INTERVAL '10 hours'"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let exhausted = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Dag",
+            name: "exhausted_etl",
+            max_runs: Some(3),
+            runs_started: 3,
+            exhausted_reason: Some("max_runs_exhausted"),
+            next_run_at_sql: Some("NOW() + INTERVAL '20 hours'"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dropped = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "catchup_dropped_sync",
+            catchup_policy: Some("window"),
+            catchup_window_secs: Some(3600),
+            last_catchup_dropped: 5,
+            next_run_at_sql: Some("NOW() + INTERVAL '30 hours'"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK, "schedules page must render: {html}");
+
+    // AC2: every field group is on the page.
+    assert!(html.contains("Health"), "health column missing: {html}");
+    assert!(html.contains("Overlap"), "overlap column missing: {html}");
+    assert!(html.contains("Catchup"), "catchup column missing: {html}");
+    assert!(
+        html.contains("Bounded runs"),
+        "bounded-run column missing: {html}"
+    );
+    assert!(
+        html.contains("buffer_all"),
+        "overlap policy value missing: {html}"
+    );
+    assert!(
+        html.contains("effective"),
+        "jitter-adjusted effective fire time missing: {html}"
+    );
+    assert!(
+        html.contains("window (3600s)"),
+        "catchup policy + window missing: {html}"
+    );
+    assert!(
+        html.contains("dropped 5"),
+        "catchup drop count missing: {html}"
+    );
+    assert!(
+        html.contains("0 of 3 left"),
+        "bounded-run budget missing: {html}"
+    );
+
+    // AC3: each unhealthy state has its own badge.
+    assert!(html.contains("Paused"), "paused badge missing: {html}");
+    assert!(
+        html.contains("Exhausted"),
+        "exhausted badge missing: {html}"
+    );
+    assert!(
+        html.contains("max_runs_exhausted"),
+        "exhaustion reason missing: {html}"
+    );
+    assert!(
+        html.contains("Catchup dropped"),
+        "catchup-dropped badge missing: {html}"
+    );
+    assert!(
+        html.contains("Needs attention"),
+        "unhealthy summary strip missing: {html}"
+    );
+
+    // AC3: unhealthy rows sort above the healthy one despite firing later.
+    let pos = |id: uuid::Uuid| {
+        html.find(&id.to_string())
+            .unwrap_or_else(|| panic!("schedule {id} missing from page: {html}"))
+    };
+    let healthy_pos = pos(healthy);
+    for unhealthy in [paused, exhausted, dropped] {
+        assert!(
+            pos(unhealthy) < healthy_pos,
+            "unhealthy schedule {unhealthy} must sort above the healthy row: {html}"
+        );
+    }
+
+    assert!(!html.contains("<script"), "no script tags allowed: {html}");
+}
+
+/// AC3: `health=Unhealthy` narrows the list to schedules that need attention.
+#[tokio::test]
+async fn ui_schedules_health_filter_narrows_to_unhealthy_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "healthy_row",
+            ..Default::default()
+        },
+    )
+    .await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "paused_row",
+            is_paused: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?health=Unhealthy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("paused_row"), "unhealthy row missing: {html}");
+    assert!(
+        !html.contains("healthy_row"),
+        "healthy row must be filtered out: {html}"
+    );
+
+    let (status, html) = fetch_html(&app, "/schedules?health=bogus").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown health value must be a 400, not a silent all-match: {html}"
+    );
+}
+
+/// AC4: the pause action round-trips through the audited endpoint and the row
+/// comes back paused with an audit record naming the UI as the source.
+#[tokio::test]
+async fn ui_schedules_pause_action_round_trip_writes_audit() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "pause_round_trip",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+
+    // The list offers a confirmed pause action for an active schedule.
+    let (_, html) = fetch_html(&app, "/schedules").await;
+    assert!(
+        html.contains(&format!("schedules/{id}/pause")),
+        "pause action missing: {html}"
+    );
+    assert!(
+        html.contains("return confirm("),
+        "pause must be confirmed before it fires: {html}"
+    );
+
+    let (status, headers, body) = post_form(&app, &format!("/schedules/{id}/pause"), "").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "pause must redirect back to the list: {body}"
+    );
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.contains("schedules"),
+        "redirect target: {location}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for pause assertion");
+    let paused: bool = diesel::sql_query(format!(
+        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{id}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("schedule row must still exist")
+    .value;
+    assert!(paused, "the schedule must be paused after the round trip");
+
+    let audits: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS value FROM harvest_audit_log \
+         WHERE target_id = '{id}' AND operation = 'schedule.pause' AND source = 'ui'"
+    ))
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("audit count query")
+    .value;
+    assert_eq!(
+        audits, 1,
+        "the UI pause must write exactly one audit record"
+    );
+
+    // And the list now offers resume instead.
+    let (_, html) = fetch_html(&app, "/schedules").await;
+    assert!(
+        html.contains(&format!("schedules/{id}/resume")),
+        "resume action missing after pause: {html}"
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct BoolValue {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    value: bool,
+}
+
+/// `auto_paused_at`-cleared + failure-counter probe for the #360 resume tests.
+#[derive(diesel::QueryableByName)]
+struct AutoPauseState {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    cleared: bool,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    failures: i32,
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountValue {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    value: i64,
+}
+
+/// AC5: the preview drill-down renders the next fire times, with the jitter
+/// window and the schedule's local rendering.
+#[tokio::test]
+async fn ui_schedules_preview_modal_renders_fire_times() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "preview_wf",
+            jitter_secs: 120,
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview?count=3")).await;
+    assert_eq!(status, StatusCode::OK, "preview must render: {html}");
+    assert!(
+        html.contains("Fire-time preview"),
+        "heading missing: {html}"
+    );
+    assert!(html.contains("preview_wf"), "target missing: {html}");
+    assert!(
+        html.contains("cron+jitter"),
+        "jitter reason missing from a jittered schedule: {html}"
+    );
+    assert!(
+        html.contains("Jitter window"),
+        "jitter bounds column missing: {html}"
+    );
+    assert!(!html.contains("<script"), "no script tags allowed: {html}");
+}
+
+/// AC5 (#543): a bounded schedule with a spent budget previews zero entries and
+/// says why — never a blank panel (AC8).
+#[tokio::test]
+async fn ui_schedules_preview_explains_an_exhausted_schedule() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "spent_wf",
+            max_runs: Some(2),
+            runs_started: 2,
+            exhausted_reason: Some("max_runs_exhausted"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("exhausted") || html.contains("Exhausted"),
+        "must say the schedule is exhausted: {html}"
+    );
+    assert!(
+        html.contains("max_runs_exhausted"),
+        "must name the exhaustion reason: {html}"
+    );
+    assert!(
+        html.contains("No upcoming fire times"),
+        "must render an explicit empty state: {html}"
+    );
+}
+
+/// An unknown schedule id is a 404 on every drill-down, not a blank page.
+#[tokio::test]
+async fn ui_schedules_drilldowns_404_on_unknown_id() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let missing = uuid::Uuid::new_v4();
+    for leaf in ["preview", "runs", "backfill"] {
+        let (status, html) = fetch_html(&app, &format!("/schedules/{missing}/{leaf}")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{leaf} drill-down for an unknown id must 404: {html}"
+        );
+    }
+}
+
+/// AC7: run history renders newest-first rows with nominal fire time, origin,
+/// terminal badges, the scheduled-only summary, and execution links.
+#[tokio::test]
+async fn ui_schedules_run_history_renders_rows_and_summary() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "runs_wf",
+            next_run_at_sql: Some("NOW() + INTERVAL '1 hour'"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let scheduled_ok = insert_schedule_run(
+        &database_url,
+        ShardId::new(0),
+        id,
+        "runs_wf",
+        "COMPLETED",
+        "scheduled",
+        "NOW() - INTERVAL '1 hour'",
+    )
+    .await;
+    let scheduled_failed = insert_schedule_run(
+        &database_url,
+        ShardId::new(0),
+        id,
+        "runs_wf",
+        "FAILED",
+        "scheduled",
+        "NOW() - INTERVAL '2 hours'",
+    )
+    .await;
+    let backfilled = insert_schedule_run(
+        &database_url,
+        ShardId::new(0),
+        id,
+        "runs_wf",
+        "COMPLETED",
+        "backfill",
+        "NOW() - INTERVAL '3 hours'",
+    )
+    .await;
+    let manual = insert_schedule_run(
+        &database_url,
+        ShardId::new(0),
+        id,
+        "runs_wf",
+        "RUNNING",
+        "manual_trigger",
+        "NULL",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
+    assert_eq!(status, StatusCode::OK, "run history must render: {html}");
+
+    for exec in [scheduled_ok, scheduled_failed, backfilled, manual] {
+        assert!(
+            html.contains(&format!("workflows/{}", exec.as_uuid())),
+            "run {} must link to its execution detail view: {html}",
+            exec.as_uuid()
+        );
+    }
+    assert!(
+        html.contains("scheduled"),
+        "scheduled origin missing: {html}"
+    );
+    assert!(html.contains("backfill"), "backfill origin missing: {html}");
+    assert!(
+        html.contains("manual_trigger"),
+        "manual_trigger origin missing: {html}"
+    );
+    assert!(
+        html.contains("Scheduled-run summary"),
+        "cadence summary missing: {html}"
+    );
+    assert!(
+        html.contains("Nominal fire time"),
+        "nominal fire time column missing: {html}"
+    );
+    // The cadence summary counts scheduled-origin runs only: 1 succeeded, 1
+    // failed — the backfilled COMPLETED run must not inflate it.
+    let summary_start = html
+        .find("Scheduled-run summary")
+        .expect("summary section present");
+    let summary = &html[summary_start..];
+    let succeeded_at = summary.find("Succeeded").expect("succeeded row present");
+    assert!(
+        summary[succeeded_at..succeeded_at + 80].contains(">1<"),
+        "only the scheduled COMPLETED run may be counted: {summary}"
+    );
+    assert!(!html.contains("<script"), "no script tags allowed: {html}");
+}
+
+/// AC7/AC8: a schedule with no runs yet renders an explicit message.
+#[tokio::test]
+async fn ui_schedules_run_history_empty_state() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "never_run_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("No runs yet"),
+        "no-runs empty state missing: {html}"
+    );
+}
+
+/// AC7: a cross-shard `partial` response renders a visible "some shards
+/// unreachable" banner rather than silently truncated history.
+#[tokio::test]
+async fn ui_schedules_run_history_partial_shard_banner() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &good_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "partial_runs_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+    insert_schedule_run(
+        &good_url,
+        ShardId::new(0),
+        id,
+        "partial_runs_wf",
+        "COMPLETED",
+        "scheduled",
+        "NOW() - INTERVAL '1 hour'",
+    )
+    .await;
+
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), good_pool);
+    pools.insert(ShardId::new(1), bad_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unreachable shard must degrade, never 5xx: {html}"
+    );
+    assert!(
+        html.contains("Some shards unreachable"),
+        "partial-shard banner missing: {html}"
+    );
+    assert!(
+        html.contains("may be understated"),
+        "summary must be flagged as possibly understated: {html}"
+    );
+    assert!(
+        html.contains("partial_runs_wf"),
+        "the reachable shard's data must still render: {html}"
+    );
+}
+
+/// AC6: the backfill launcher renders a window form, previews with a dry run
+/// before dispatching, and lands the operator on the run history afterwards.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ui_schedules_backfill_form_previews_then_dispatches() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+
+    // The form itself is a pure GET.
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
+    assert_eq!(status, StatusCode::OK, "backfill form must render: {html}");
+    assert!(
+        html.contains("name=\"from\""),
+        "start field missing: {html}"
+    );
+    assert!(html.contains("name=\"to\""), "end field missing: {html}");
+    assert!(
+        html.contains("name=\"stage\" value=\"preview\""),
+        "the form must submit the dry-run stage: {html}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for backfill assertions");
+    let runs_before: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("count query")
+    .value;
+    assert_eq!(runs_before, 0, "the GET form must dispatch nothing");
+
+    // Stage 1: dry run → confirmation with the planned count.
+    let window = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z&stage=preview";
+    let (status, _headers, html) =
+        post_form(&app, &format!("/schedules/{id}/backfill"), window).await;
+    assert_eq!(status, StatusCode::OK, "dry run must render: {html}");
+    assert!(
+        html.contains("Confirm backfill"),
+        "confirm heading missing: {html}"
+    );
+    assert!(
+        html.contains("Planned slots"),
+        "planned count missing: {html}"
+    );
+    assert!(
+        html.contains("name=\"stage\" value=\"commit\""),
+        "confirmation must carry an explicit commit stage: {html}"
+    );
+
+    let dispatched_after_dry_run: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("count query")
+    .value;
+    assert_eq!(
+        dispatched_after_dry_run, 0,
+        "the dry run must not dispatch anything"
+    );
+
+    // Stage 2: commit → dispatch, then redirect to this schedule's run history.
+    let commit = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z&stage=commit";
+    let (status, headers, body) =
+        post_form(&app, &format!("/schedules/{id}/backfill"), commit).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a committed backfill must redirect: {body}"
+    );
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.contains(&format!("schedules/{id}/runs")),
+        "the commit must land on this schedule's run history: {location}"
+    );
+
+    let dispatched: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("count query")
+    .value;
+    assert!(
+        dispatched > 0,
+        "the committed backfill must dispatch runs, got {dispatched}"
+    );
+
+    let audits: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS value FROM harvest_audit_log \
+         WHERE target_id = '{id}' AND source = 'ui' \
+           AND route_or_command = 'POST /ui/schedules/{{id}}/backfill'"
+    ))
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("audit count query")
+    .value;
+    assert!(
+        audits >= 2,
+        "both the dry run and the commit must be audited as UI-sourced, got {audits}"
+    );
+}
+
+/// AC6: a malformed window is a rendered form error, never a 500.
+#[tokio::test]
+async fn ui_schedules_backfill_rejects_a_malformed_window() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=yesterday&to=today&stage=preview",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a malformed window must render an error, not 5xx: {html}"
+    );
+    assert!(
+        html.contains("Backfill not started"),
+        "the form must explain the rejection: {html}"
+    );
+    assert!(
+        html.contains("RFC 3339"),
+        "the error must say what a valid instant looks like: {html}"
+    );
+
+    // An inverted window is rejected the same way.
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-02T00%3A00%3A00Z&to=2026-08-01T00%3A00%3A00Z&stage=preview",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "inverted window must not 5xx: {html}"
+    );
+    assert!(
+        html.contains("at or after"),
+        "the inverted-window error must explain itself: {html}"
+    );
+}
+
+/// AC6 defence-in-depth: a POST that omits `stage` runs the dry run. A bare
+/// form post can never dispatch work.
+#[tokio::test]
+async fn ui_schedules_backfill_without_a_stage_defaults_to_the_dry_run() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "must render the confirmation: {html}"
+    );
+    assert!(
+        html.contains("Confirm backfill"),
+        "must be the dry run: {html}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for dispatch assertion");
+    let dispatched: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("count query")
+    .value;
+    assert_eq!(dispatched, 0, "a stage-less POST must dispatch nothing");
+}
+
+/// The schedules list links every row to its three drill-downs (AC5/AC6/AC7).
+#[tokio::test]
+async fn ui_schedules_rows_link_to_drilldowns() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "linked_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    for leaf in ["preview", "runs", "backfill"] {
+        assert!(
+            html.contains(&format!("schedules/{id}/{leaf}")),
+            "row must link to the {leaf} drill-down: {html}"
+        );
+    }
+}
+
+/// AC4: the drill-downs mirror their endpoints' admin-auth posture — the run
+/// history is gated (as `GET /admin/schedules/{id}/runs` is), preview and
+/// backfill are not (as their API routes are not).
+#[tokio::test]
+async fn ui_schedules_drilldown_auth_matches_the_api_routes() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "gated_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // `set_admin_auth_boundary(false)` with no session = not an admin.
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(false);
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "run history must be admin-gated, matching its API route: {html}"
+    );
+
+    for leaf in ["preview", "backfill"] {
+        let (status, html) = fetch_html(&app, &format!("/schedules/{id}/{leaf}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{leaf} must stay ungated, matching its API route: {html}"
+        );
+    }
+}
+
+/// AC6: the flash a committed backfill redirects with is actually rendered on
+/// the run-history page — the dispatch counts (including failures) are only
+/// reported there.
+#[tokio::test]
+async fn ui_schedules_backfill_flash_renders_on_the_run_history() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let commit = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=commit";
+    let (status, headers, body) =
+        post_form(&app, &format!("/schedules/{id}/backfill"), commit).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "commit must redirect: {body}"
+    );
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect carries a location")
+        .to_string();
+    assert!(
+        location.contains("flash="),
+        "redirect must carry a flash: {location}"
+    );
+
+    // Follow the redirect the way a browser would, resolving it against the
+    // request path /schedules/{id}/backfill.
+    let Some(rest) = location.strip_prefix("../../") else {
+        panic!("unexpected redirect shape: {location}");
+    };
+    let followed = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &followed).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the redirect target must resolve: {html}"
+    );
+    assert!(
+        html.contains("Backfill dispatched"),
+        "the dispatch summary must be rendered on the run history: {html}"
+    );
+}
+
+/// AC6: `max_count` is validated and capped rather than passed through, because
+/// the endpoint treats it as the planning limit that replaces its own guard.
+#[tokio::test]
+async fn ui_schedules_backfill_validates_and_caps_max_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&max_count=lots&stage=preview",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
+    assert!(
+        html.contains("invalid max count"),
+        "a non-numeric max count must be a rendered error: {html}"
+    );
+    assert!(
+        html.contains("value=\"lots\""),
+        "the rejected form must echo what was typed: {html}"
+    );
+
+    // An enormous window with an enormous max_count is capped, not enumerated.
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=1990-01-01T00%3A00%3A00Z&to=2030-01-01T00%3A00%3A00Z&max_count=100000000&stage=preview",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
+    assert!(
+        html.contains("Backfill not started") || html.contains("Confirm backfill"),
+        "an over-wide window must be answered, not hung: {html}"
+    );
+}
+
+/// AC3/AC4: a bulk action acts on exactly the health-filtered set the button
+/// counted — not on every schedule on the shard.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_respects_the_health_filter() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let healthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "healthy_bulk",
+            ..Default::default()
+        },
+    )
+    .await;
+    let unhealthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "dropping_bulk",
+            last_catchup_dropped: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) =
+        post_form(&app, "/schedules/bulk-pause", "health=Unhealthy").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "bulk pause must redirect: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for bulk assertion");
+    let paused_healthy: bool = diesel::sql_query(format!(
+        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{healthy}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("healthy row exists")
+    .value;
+    let paused_unhealthy: bool = diesel::sql_query(format!(
+        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{unhealthy}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("unhealthy row exists")
+    .value;
+    assert!(
+        paused_unhealthy,
+        "the health-filtered bulk pause must pause the matching schedule"
+    );
+    assert!(
+        !paused_healthy,
+        "a bulk pause under health=Unhealthy must not touch a healthy schedule"
+    );
+}
+
+/// The audit `source` fix covers every schedule mutation, not just pause.
+#[tokio::test]
+async fn ui_schedules_every_mutation_is_audited_as_ui_sourced() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pause_id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_pause",
+            ..Default::default()
+        },
+    )
+    .await;
+    let delete_id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_delete",
+            ..Default::default()
+        },
+    )
+    .await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_bulk",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    post_form(&app, &format!("/schedules/{pause_id}/pause"), "").await;
+    post_form(&app, &format!("/schedules/{pause_id}/resume"), "").await;
+    post_form(&app, &format!("/schedules/{delete_id}/delete"), "").await;
+    post_form(&app, "/schedules/bulk-pause", "target=audit_bulk").await;
+    post_form(&app, "/schedules/bulk-resume", "target=audit_bulk").await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for audit assertion");
+    let api_sourced: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_audit_log \
+         WHERE route_or_command LIKE 'POST /ui/schedules%' AND source <> 'ui'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("audit query")
+    .value;
+    assert_eq!(
+        api_sourced, 0,
+        "every /ui/schedules audit record must be source = ui"
+    );
+
+    for op in ["schedule.pause", "schedule.resume", "schedule.delete"] {
+        let n: i64 = diesel::sql_query(format!(
+            "SELECT COUNT(*) AS value FROM harvest_audit_log \
+             WHERE operation = '{op}' AND source = 'ui'"
+        ))
+        .get_result::<CountValue>(&mut conn)
+        .await
+        .expect("audit query")
+        .value;
+        assert!(n > 0, "{op} must be audited as UI-sourced, got {n}");
+    }
+}
+
+/// A per-row mutation's redirect resolves back to the list, not to a path
+/// nested under the schedule id.
+#[tokio::test]
+async fn ui_schedules_pause_redirect_resolves_to_the_list() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "redirect_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "redirect_target",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (_status, headers, _body) = post_form(&app, &format!("/schedules/{id}/pause"), "").await;
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect carries a location")
+        .to_string();
+
+    // Resolve it the way a browser would against /schedules/{id}/pause, whose
+    // base directory is /schedules/{id}/.
+    let Some(rest) = location.strip_prefix("../") else {
+        panic!("per-row redirect must climb a segment: {location}");
+    };
+    let resolved = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &resolved).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the pause redirect must land on the schedules list: {html}"
+    );
+    assert!(
+        html.contains("redirect_wf"),
+        "landed on the wrong page: {html}"
+    );
+}
+
+/// Codex round 1 #3: an auto-paused schedule (#360 sets `auto_paused_at`
+/// **without** `is_paused`) must be resumable from Vantage — per row and in
+/// bulk — and the resume must clear the auto-pause state the way the API's does,
+/// or the next tick immediately re-pauses it.
+#[tokio::test]
+async fn ui_schedules_auto_paused_row_can_be_resumed() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "auto_paused_wf",
+            auto_paused: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for auto-pause setup");
+    conn.batch_execute(&format!(
+        "UPDATE harvest_schedules SET consecutive_failure_count = 5 WHERE id = '{id}'"
+    ))
+    .await
+    .expect("seed a failure count");
+
+    let app = build_single_shard_ui_app(&database_url);
+
+    // The row offers Resume, not Pause, even though `is_paused` is false.
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Auto-paused"),
+        "auto-paused badge missing: {html}"
+    );
+    assert!(
+        html.contains(&format!("schedules/{id}/resume")),
+        "an auto-paused row must offer Resume: {html}"
+    );
+    assert!(
+        !html.contains(&format!("schedules/{id}/pause")),
+        "an auto-paused row must not offer Pause: {html}"
+    );
+
+    let (status, _headers, body) = post_form(&app, &format!("/schedules/{id}/resume"), "").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "resume must redirect: {body}"
+    );
+
+    let state: AutoPauseState = diesel::sql_query(format!(
+        "SELECT (auto_paused_at IS NULL) AS cleared, consecutive_failure_count AS failures \
+         FROM harvest_schedules WHERE id = '{id}'"
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("row still exists");
+    assert!(
+        state.cleared,
+        "resume must clear auto_paused_at, or the schedule stays held back"
+    );
+    assert_eq!(
+        state.failures, 0,
+        "resume must reset the failure counter, or the next tick re-pauses it"
+    );
+}
+
+/// The same for the bulk resume path, which selected solely on `is_paused`.
+#[tokio::test]
+async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "auto_paused_bulk",
+            auto_paused: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) =
+        post_form(&app, "/schedules/bulk-resume", "target=auto_paused_bulk").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "bulk resume must redirect: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for bulk resume assertion");
+    let cleared: bool = diesel::sql_query(format!(
+        "SELECT (auto_paused_at IS NULL) AS value FROM harvest_schedules WHERE id = '{id}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("row exists")
+    .value;
+    assert!(
+        cleared,
+        "a bulk resume must reach an auto-paused schedule, not just is_paused rows"
+    );
+}
+
+/// Codex round 1 #2: the preview drill-down must render for a schedule on a
+/// healthy shard even when an earlier shard is unreachable — the resilient
+/// resolver found the row, so a second fragile lookup must not undo that.
+#[tokio::test]
+async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &good_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "later_shard_wf",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Shard 0 is unreachable; the schedule lives on shard 1.
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), bad_pool);
+    pools.insert(ShardId::new(1), good_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(1),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a preview for a schedule on a healthy shard must render \
+         despite an unreachable earlier shard: {html}"
+    );
+    assert!(
+        html.contains("later_shard_wf"),
+        "the resolved schedule must be rendered: {html}"
+    );
+}
+
+/// Codex round 2 #2: the backfill launcher must work for a schedule on a
+/// healthy shard while an earlier shard is unreachable. Round 1 fixed the
+/// preview instance; the shared lookup underneath is now resilient, so the
+/// backfill path is covered by the same rule.
+#[tokio::test]
+async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &good_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Shard 0 is unreachable; the schedule lives on shard 1.
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), bad_pool);
+    pools.insert(ShardId::new(1), good_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(1),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the backfill form must render despite an unreachable earlier shard: {html}"
+    );
+
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=preview",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the dry run must reach the schedule on the healthy shard: {html}"
+    );
+    assert!(
+        html.contains("Confirm backfill"),
+        "the dry run must produce a confirmation, not a resolution failure: {html}"
+    );
+}
+
+/// Codex round 2 #3: a schedule that is terminal on its live bounds but whose
+/// tick never stamped `exhausted_at` must still read as unhealthy on the list.
+#[tokio::test]
+async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() {
+    let (database_url, _container) = setup_test_database_url().await;
+    // `runs_started == max_runs`, `exhausted_at` still NULL.
+    let bounded = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "unstamped_bounded",
+            max_runs: Some(4),
+            runs_started: 4,
+            next_run_at_sql: Some("NOW() + INTERVAL '10 hours'"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let healthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "still_healthy",
+            next_run_at_sql: Some("NOW() + INTERVAL '1 minute'"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("run budget spent"),
+        "an unstamped exhaustion must be badged with its bound: {html}"
+    );
+
+    // It sorts above the healthy row despite firing much later.
+    let pos = |id: uuid::Uuid| {
+        html.find(&id.to_string())
+            .unwrap_or_else(|| panic!("schedule {id} missing: {html}"))
+    };
+    assert!(
+        pos(bounded) < pos(healthy),
+        "a live-bounded-out row must sort to the top: {html}"
+    );
+
+    // And the health filter finds it.
+    let (status, html) = fetch_html(&app, "/schedules?health=Unhealthy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("unstamped_bounded"),
+        "health=Unhealthy must include it: {html}"
+    );
+    assert!(
+        !html.contains("still_healthy"),
+        "the healthy row must be filtered out: {html}"
+    );
+}
+
+/// Codex round 2 #1: a legacy `max_runs = 0` row is unlimited, and must not be
+/// rendered as a spent budget or flagged unhealthy.
+#[tokio::test]
+async fn ui_schedules_zero_run_cap_renders_as_unlimited() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "zero_cap_wf",
+            max_runs: Some(0),
+            runs_started: 9,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("zero_cap_wf"), "row missing: {html}");
+    assert!(
+        !html.contains("of 0 left"),
+        "max_runs = 0 is unlimited and must not render a budget: {html}"
+    );
+    assert!(
+        !html.contains("Needs attention"),
+        "an unlimited schedule must not be counted unhealthy: {html}"
+    );
+}
+
 /// Timezone column renders and differentiates UTC (subdued) from other timezones (prominent badge).
 #[tokio::test]
 async fn ui_schedules_displays_timezone() {

@@ -46,6 +46,7 @@
 # ordering correct by construction.
 #
 # osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
@@ -54,10 +55,12 @@ allos        autumn-harvest         property                         db         
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
 allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -
+allos        autumn-harvest-plugin  dev_runtime_tests                dev-runtime                -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
+compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
 linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
@@ -87,6 +90,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
+linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
@@ -135,6 +139,7 @@ linux        autumn-harvest-plugin  conflict_policy_integration      -          
 linux        autumn-harvest-plugin  connector_integration            connectors                 -
 linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
+linux        autumn-harvest-plugin  dev_runtime_lifecycle            dev-runtime                -
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
