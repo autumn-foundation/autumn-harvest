@@ -169,11 +169,11 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .unhealthy-summary{border-color:#b45309;background:#292524;color:#fed7aa;font-size:13px}
 .unhealthy-summary strong{color:#fdba74}
 .subtle{color:#94a3b8;font-size:11px;margin-top:2px}
+.table-scroll{overflow-x:auto;max-width:100%}
 .health-badges{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
 tr.schedule-unhealthy td{background:#1c1917}
 a.drilldown{font-size:12px;color:#93c5fd;border:1px solid #334155;border-radius:6px;padding:5px 9px}
 a.drilldown:hover{background:#1e293b;text-decoration:none}
-.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;font-size:13px}
 .kv dt{color:#94a3b8}
 .kv dd{margin:0;color:#e2e8f0}
 .view-toggle{display:inline-flex;gap:2px;margin:0 0 16px;border:1px solid #334155;border-radius:6px;overflow:hidden;font-size:13px}
@@ -7907,6 +7907,8 @@ async fn list_schedules_ui(
     sort_schedule_rows(&mut all_rows);
 
     let total_filtered = all_rows.len();
+    // Computed over the whole filtered set, before pagination slices it.
+    let unhealthy_summary = schedule_health_summary(&all_rows);
     let distribution = schedule_kind_distribution(&all_rows);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -7930,6 +7932,7 @@ async fn list_schedules_ui(
         limit,
         has_next,
         total_filtered,
+        &unhealthy_summary,
         &distribution,
         params.refresh,
         params.flash.as_deref(),
@@ -8541,28 +8544,22 @@ async fn schedule_bulk_pause_ui(
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        // Load just id + name fields to apply kind/target filters without N+1 updates.
-        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
+        // Select whole rows and reuse `ScheduleUiFilters::matches` — the *same*
+        // predicate the list page applies (issue #951). A partial projection
+        // cannot see the health filter, and the button's count and confirmation
+        // text come from the list's filtered total: a bulk action that matched a
+        // wider set than the operator was shown would pause schedules the dialog
+        // never mentioned.
+        let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
             .filter(dsl::is_paused.ne(true))
-            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
+            .select(HarvestSchedule::as_select())
             .load(&mut conn)
             .await
             .unwrap_or_default();
         let matching_ids: Vec<uuid::Uuid> = candidates
             .into_iter()
-            .filter(|(_, wf, dag)| {
-                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
-                match filters.kind {
-                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
-                    ScheduleKindFilter::Dag if dag.is_none() => return false,
-                    _ => {}
-                }
-                filters
-                    .target
-                    .as_deref()
-                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
-            })
-            .map(|(id, _, _)| id)
+            .filter(|row| filters.matches(shard_id, row))
+            .map(|row| row.id)
             .collect();
         if matching_ids.is_empty() {
             continue;
@@ -8602,7 +8599,7 @@ async fn schedule_bulk_pause_ui(
         }
     }
 
-    schedule_redirect(&format!("Paused {acted_on} schedule(s)"))
+    schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
 }
 
 async fn schedule_bulk_resume_ui(
@@ -8629,27 +8626,18 @@ async fn schedule_bulk_resume_ui(
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
+        // Whole rows + the list's own matcher, so the health filter applies and
+        // the acted-on set is exactly the set the confirmation counted (#951).
+        let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
             .filter(dsl::is_paused.eq(true))
-            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
+            .select(HarvestSchedule::as_select())
             .load(&mut conn)
             .await
             .unwrap_or_default();
         let matching_ids: Vec<uuid::Uuid> = candidates
             .into_iter()
-            .filter(|(_, wf, dag)| {
-                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
-                match filters.kind {
-                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
-                    ScheduleKindFilter::Dag if dag.is_none() => return false,
-                    _ => {}
-                }
-                filters
-                    .target
-                    .as_deref()
-                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
-            })
-            .map(|(id, _, _)| id)
+            .filter(|row| filters.matches(shard_id, row))
+            .map(|row| row.id)
             .collect();
         if matching_ids.is_empty() {
             continue;
@@ -8690,13 +8678,31 @@ async fn schedule_bulk_resume_ui(
         }
     }
 
-    schedule_redirect(&format!("Resumed {acted_on} schedule(s)"))
+    schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
 }
 
-fn schedule_redirect(flash: &str) -> axum::response::Response {
+/// Redirect back to the schedules list with a flash message.
+///
+/// `depth` is how many path segments below the UI mount point the *redirecting*
+/// route sits, because the `Location` header is resolved relative to the
+/// request URL. `/schedules/bulk-pause` is one segment deep, so a bare
+/// `schedules?flash=…` is right there; `/schedules/{id}/pause` is **two**, where
+/// the same string resolves to `<mount>/schedules/{id}/schedules` and 404s.
+fn schedule_redirect_from(depth: usize, flash: &str) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    let location = format!("schedules?flash={}", url_encode(flash));
+    let up = "../".repeat(depth.saturating_sub(1));
+    let location = format!("{up}schedules?flash={}", url_encode(flash));
     axum::response::Redirect::to(&location).into_response()
+}
+
+/// Redirect from a `/schedules/{id}/…` per-row action (two segments deep).
+fn schedule_redirect(flash: &str) -> axum::response::Response {
+    schedule_redirect_from(2, flash)
+}
+
+/// Redirect from a `/schedules/…` list-level action (one segment deep).
+fn schedule_bulk_redirect(flash: &str) -> axum::response::Response {
+    schedule_redirect_from(1, flash)
 }
 
 // ---------------------------------------------------------------------------
@@ -8733,6 +8739,10 @@ fn render_schedules_page(
     limit: i64,
     has_next: bool,
     total_filtered: usize,
+    // Unhealthy counts over the whole *filtered* set, not just this page: the
+    // strip is the first thing an operator reads, so a page-scoped count would
+    // understate a fleet-wide problem.
+    unhealthy_summary: &str,
     distribution: &str,
     refresh: Option<u64>,
     flash: Option<&str>,
@@ -8744,7 +8754,6 @@ fn render_schedules_page(
             div.flash { (message) }
         }
 
-        @let unhealthy_summary = schedule_health_summary(rows);
         @if !unhealthy_summary.is_empty() {
             div.card.unhealthy-summary role="status" {
                 strong { "Needs attention: " }
@@ -8778,13 +8787,15 @@ fn render_schedules_page(
                     (error)
                 }
             }
-            (render_schedule_table(rows, is_multi_shard, decisions))
+            // 13 columns (14 multi-shard) overflow a narrow viewport; scroll the
+            // table rather than the page.
+            div."table-scroll" { (render_schedule_table(rows, is_multi_shard, decisions)) }
         }
 
         (render_schedule_pagination(page, limit, has_next, filters, refresh))
     };
 
-    layout_schedules("Schedules · Vantage", &body, refresh)
+    layout_schedules("Schedules · Vantage", &body, refresh, "")
 }
 
 fn render_schedule_filters(
@@ -9067,13 +9078,16 @@ fn render_schedule_health_badges(row: &HarvestSchedule) -> Markup {
             span.badge.CANCELLED role="status" aria-label="Health: paused" { "Paused" }
         }
         @if health.exhausted {
-            span.badge.TERMINATED role="status" aria-label="Health: exhausted" {
+            // No `aria-label`: it would *replace* the accessible name, and the
+            // visible text already carries the reason. `state_badge`'s label is
+            // a superset of its text; here it would be a subset.
+            span.badge.TERMINATED role="status" {
                 "Exhausted"
                 @if let Some(ref reason) = row.exhausted_reason { ": " (reason) }
             }
         }
         @if health.catchup_dropped {
-            span.badge.FAILED role="status" aria-label="Health: catchup slots dropped" {
+            span.badge.FAILED role="status" {
                 "Catchup dropped ×" (row.last_catchup_dropped)
             }
         }
@@ -9193,24 +9207,27 @@ fn schedule_target_name(row: &HarvestSchedule) -> &str {
         .unwrap_or("—")
 }
 
-/// Href from a `/schedules/{id}/{leaf}` drill-down page back into the UI tree.
+/// Relative prefix reaching the UI mount point from a `/schedules/{id}/{leaf}`
+/// drill-down.
 ///
 /// Vantage mounts under a caller-configured prefix, so every link is relative.
-/// A drill-down lives two segments below the mount point, so `../../` returns to
-/// the root and the rest of the path is spelled out — which also keeps every
-/// link greppable as a literal `schedules/{id}/…`.
+/// A drill-down is served at `<mount>/schedules/{id}/{leaf}`, whose RFC 3986
+/// base directory is `<mount>/schedules/{id}/` — two segments below the mount
+/// point. Every link *out* of a drill-down (nav chrome included) must carry
+/// this prefix; a link that forgets it silently resolves under the schedule id
+/// and 404s.
+const SCHEDULE_DRILLDOWN_BASE: &str = "../../";
+
+/// Href from a drill-down page to another `schedules/{id}/{leaf}` page.
 fn schedule_drilldown_href(id: &str, leaf: &str) -> String {
-    format!("../../{}", schedule_leaf_path(id, leaf))
+    format!("{SCHEDULE_DRILLDOWN_BASE}{}", schedule_leaf_path(id, leaf))
 }
 
-/// The `schedules/{id}/{leaf}` path fragment shared by the list's row links and
-/// the drill-downs' own cross-links.
+/// The `schedules/{id}/{leaf}` path fragment. Correct as-is from the list page
+/// (base `<mount>/`); prefix it with [`SCHEDULE_DRILLDOWN_BASE`] from a
+/// drill-down.
 fn schedule_leaf_path(id: &str, leaf: &str) -> String {
-    if leaf.is_empty() {
-        format!("schedules/{id}")
-    } else {
-        format!("schedules/{id}/{leaf}")
-    }
+    format!("schedules/{id}/{leaf}")
 }
 
 fn schedule_state_badge(is_paused: bool) -> Markup {
@@ -9313,21 +9330,60 @@ pub(crate) struct ScheduleRunsUiParams {
     origin: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    /// Flash message carried over from a committed backfill's redirect.
+    #[serde(default)]
+    flash: Option<String>,
 }
 
-/// Resolve the schedule row for a drill-down page, mapping "unknown id" to a
-/// rendered 404 rather than a blank panel.
+/// The run-history view's own filter state, kept so the page can re-emit it on
+/// its "Next" link — a keyset cursor is only meaningful under the filters it
+/// was computed with, so dropping them would silently page into different data.
+#[derive(Debug, Clone, Default)]
+struct ScheduleRunsView {
+    limit: Option<i64>,
+    origin: Option<String>,
+    state: Option<String>,
+}
+
+impl ScheduleRunsView {
+    /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
+    fn query_suffix(&self) -> String {
+        let mut out = String::new();
+        if let Some(limit) = self.limit {
+            let _ = write!(out, "&limit={limit}");
+        }
+        if let Some(ref origin) = self.origin {
+            let _ = write!(out, "&origin={}", url_encode(origin));
+        }
+        if let Some(ref state) = self.state {
+            let _ = write!(out, "&state={}", url_encode(state));
+        }
+        out
+    }
+}
+
+/// Resolve the schedule row for a drill-down page.
+///
+/// Delegates to the API's own `resolve_schedule_with_shard` rather than the
+/// list page's `find_schedule_row`, so the three outcomes stay distinct and
+/// match the endpoints these pages render:
+///
+/// * an unparseable id is a `400`;
+/// * "checked every expected shard, no such row" is a `404`;
+/// * "a shard could not be checked, so existence is indeterminate" is a `503`.
+///
+/// `find_schedule_row` collapses the last two into "not found", which during a
+/// shard outage would tell an operator that a schedule they can see on the list
+/// page has been deleted — the precise false negative the API's `503` exists to
+/// prevent.
 async fn load_schedule_for_drilldown(
     api_state: &HarvestApiState,
     id_str: &str,
 ) -> Result<(HarvestSchedule, ShardId), AutumnError> {
-    let found = find_schedule_row(api_state, id_str)
-        .await
-        .map_err(|_| AutumnError::bad_request_msg(format!("invalid schedule id '{id_str}'")))?;
-    match found {
-        Some((row, shard_id, _conn)) => Ok((row, shard_id)),
-        None => Err(AutumnError::not_found_msg(format!("schedule {id_str}"))),
-    }
+    let id = uuid::Uuid::parse_str(id_str.trim()).map_err(|_| {
+        AutumnError::bad_request_msg(format!("invalid schedule id '{id_str}'; expected a UUID"))
+    })?;
+    crate::api::resolve_schedule_with_shard(api_state, id).await
 }
 
 /// `GET /schedules/{id}/preview` — the next N fire times for one schedule
@@ -9430,7 +9486,8 @@ fn render_schedule_preview_page(
                                         (format_timestamp(Some(effective_at)))
                                     }
                                     None => {
-                                        span.badge.CANCELLED { "suppressed" }
+                                        span.badge.CANCELLED role="status"
+                                            aria-label="Firing suppressed" { "suppressed" }
                                     }
                                 }
                             }
@@ -9447,7 +9504,10 @@ fn render_schedule_preview_page(
                             }
                             td {
                                 @if entry.would_skip_if_active {
-                                    span.badge.FAILED { "may be skipped" }
+                                    span.badge.FAILED role="status"
+                                        aria-label="May be skipped by the overlap policy" {
+                                        "may be skipped"
+                                    }
                                 } @else {
                                     "—"
                                 }
@@ -9467,7 +9527,12 @@ fn render_schedule_preview_page(
             a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
         }
     };
-    layout_schedules("Schedule preview · Vantage", &body, None)
+    layout_schedules(
+        "Schedule preview · Vantage",
+        &body,
+        None,
+        SCHEDULE_DRILLDOWN_BASE,
+    )
 }
 
 /// `GET /schedules/{id}/runs` — per-schedule run history (issue #951 AC7, over
@@ -9505,8 +9570,30 @@ async fn schedule_runs_ui(
         crate::schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
             .map_err(AutumnError::bad_request_msg)?;
 
+    let view = ScheduleRunsView {
+        limit: params.limit,
+        origin: params
+            .origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        state: params
+            .state
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+
     let response = crate::api::load_schedule_runs(&api_state, row.id, runs_params).await?;
-    Ok(render_schedule_runs_page(&row, shard_id, &response))
+    Ok(render_schedule_runs_page(
+        &row,
+        shard_id,
+        &response,
+        &view,
+        params.flash.as_deref(),
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9514,6 +9601,8 @@ fn render_schedule_runs_page(
     row: &HarvestSchedule,
     shard_id: ShardId,
     response: &crate::schedule_runs::ScheduleRunsResponse,
+    view: &ScheduleRunsView,
+    flash: Option<&str>,
 ) -> Markup {
     use crate::shard_fanout::FanoutStatus;
 
@@ -9527,7 +9616,16 @@ fn render_schedule_runs_page(
 
     let body = html! {
         h2 { "Run history — " code { (schedule_target_name(row)) } }
+
+        // A committed backfill redirects here with its dispatch counts; the
+        // "failed" count is the only place the operator is told about a partial
+        // dispatch, so the message must not be dropped.
+        @if let Some(message) = flash {
+            div.flash role="status" { (message) }
+        }
+
         (render_schedule_drilldown_header(row, shard_id, "runs"))
+        (render_schedule_runs_filters(&id_str, view))
 
         // AC7: a partial cross-shard answer is always visible, never silently
         // truncated data.
@@ -9625,8 +9723,13 @@ fn render_schedule_runs_page(
             div.pagination {
                 span { "Showing " (response.runs.len()) " of at most " (response.limit) }
                 @if let Some(ref cursor) = response.next_cursor {
-                    a href={ (schedule_leaf_path(&id_str, "runs")) "?limit=" (response.limit)
-                             "&cursor=" (url_encode(cursor)) } {
+                    // `schedule_drilldown_href`, not the bare leaf path: this
+                    // page is itself a drill-down, so the link needs the
+                    // `../../` prefix. The filters ride along because the
+                    // cursor is only meaningful under them.
+                    a href={ (schedule_drilldown_href(&id_str, "runs"))
+                             "?cursor=" (url_encode(cursor))
+                             (PreEscaped(&view.query_suffix())) } {
                         "Next " (PreEscaped("&rarr;"))
                     }
                 } @else {
@@ -9640,7 +9743,51 @@ fn render_schedule_runs_page(
             a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
         }
     };
-    layout_schedules("Schedule runs · Vantage", &body, None)
+    layout_schedules(
+        "Schedule runs · Vantage",
+        &body,
+        None,
+        SCHEDULE_DRILLDOWN_BASE,
+    )
+}
+
+/// Filter/limit controls for the run history. The endpoint has always accepted
+/// `limit`/`origin`/`state`; without a form they were reachable only by editing
+/// the URL by hand.
+fn render_schedule_runs_filters(id_str: &str, view: &ScheduleRunsView) -> Markup {
+    let limit_val = view.limit.map(|l| l.to_string()).unwrap_or_default();
+    let origin_val = view.origin.as_deref().unwrap_or("");
+    let state_val = view.state.as_deref().unwrap_or("");
+    html! {
+        form.filters method="get" action=(schedule_drilldown_href(id_str, "runs")) {
+            label {
+                "Rows"
+                input type="number" name="limit" min="1"
+                    max=(crate::schedule_runs::MAX_LIMIT) value=(limit_val)
+                    placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
+            }
+            label {
+                "Origin"
+                select name="origin" {
+                    option value="" selected[origin_val.is_empty()] { "All" }
+                    @for origin in ["scheduled", "backfill", "manual_trigger"] {
+                        option value=(origin) selected[origin_val == origin] { (origin) }
+                    }
+                }
+            }
+            label {
+                "State"
+                select name="state" {
+                    option value="" selected[state_val.is_empty()] { "All" }
+                    @for state in KNOWN_STATES {
+                        option value=(state) selected[state_val == *state] { (state) }
+                    }
+                }
+            }
+            button type="submit" { "Apply" }
+            a.reset href=(schedule_drilldown_href(id_str, "runs")) { "Reset" }
+        }
+    }
 }
 
 fn render_unavailable_shard_list(
@@ -9748,7 +9895,11 @@ impl BackfillFormParams {
         })
     }
 
-    /// Build the request for the shared `api::schedule_backfill` handler.
+    /// Build the request for the shared backfill implementation.
+    ///
+    /// `dry_run` is the API's own flag: `true` projects, `false` dispatches. It
+    /// is deliberately *not* the same polarity as the UI's `commit` stage —
+    /// `commit` must map to `dry_run: false` — so callers pass `!commit`.
     fn to_request(&self, dry_run: bool) -> Result<crate::api::ScheduleBackfillRequest, String> {
         let parse_one = |raw: &str| {
             chrono::DateTime::parse_from_rfc3339(raw)
@@ -9791,7 +9942,12 @@ async fn schedule_backfill_form_ui(
     Path(id_str): Path<String>,
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-    Ok(render_schedule_backfill_form(&row, shard_id, None))
+    Ok(render_schedule_backfill_form(
+        &row,
+        shard_id,
+        None,
+        &BackfillFormEcho::default(),
+    ))
 }
 
 /// `POST /schedules/{id}/backfill` — the two-stage backfill launcher.
@@ -9812,14 +9968,21 @@ async fn schedule_backfill_ui(
         Err(e) => return e.into_response(),
     };
 
+    // Echoed back verbatim on every rejection below, so a typo in one field
+    // does not cost the operator the whole window.
+    let echo = BackfillFormEcho::from(&form);
+
     let max_count = match form
         .max_count
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        // Clamped: `max_count` *replaces* the endpoint's default planning
+        // guard rather than being capped by it, so an unbounded value from a
+        // form would let a wide window enumerate millions of timestamps.
         Some(raw) => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => Some(n),
+            Ok(n) if n > 0 => Some(n.min(SCHEDULE_BACKFILL_MAX_SLOTS)),
             _ => {
                 return render_schedule_backfill_form(
                     &row,
@@ -9827,6 +9990,7 @@ async fn schedule_backfill_ui(
                     Some(&format!(
                         "invalid max count '{raw}': expected a positive integer"
                     )),
+                    &echo,
                 )
                 .into_response();
             }
@@ -9838,17 +10002,21 @@ async fn schedule_backfill_ui(
     let params = match BackfillFormParams::parse(&form.from, &form.to, max_count, include_paused) {
         Ok(params) => params,
         Err(message) => {
-            return render_schedule_backfill_form(&row, shard_id, Some(&message)).into_response();
+            return render_schedule_backfill_form(&row, shard_id, Some(&message), &echo)
+                .into_response();
         }
     };
 
     // Default to the dry run: only an explicit `stage=commit` dispatches.
     let commit = form.stage.as_deref() == Some("commit");
 
-    let request = match params.to_request(commit) {
+    // `dry_run` is the inverse of `commit`: the preview stage projects, the
+    // commit stage dispatches.
+    let request = match params.to_request(!commit) {
         Ok(request) => request,
         Err(message) => {
-            return render_schedule_backfill_form(&row, shard_id, Some(&message)).into_response();
+            return render_schedule_backfill_form(&row, shard_id, Some(&message), &echo)
+                .into_response();
         }
     };
 
@@ -9859,16 +10027,21 @@ async fn schedule_backfill_ui(
         axum::http::HeaderValue::from_static(SOURCE_UI),
     );
 
-    let result = crate::api::schedule_backfill(
-        Extension(api_state),
-        axum::extract::Path(id_str.clone()),
-        headers,
-        axum::Json(request),
+    // Shares the endpoint's body (every guard, the backfill log row and the
+    // audit record) but labels the audit with the UI's own route, so a
+    // dashboard-initiated backfill is not recorded as an API call. Mirrors
+    // `dag_retry_commit_ui`.
+    let result = crate::api::schedule_backfill_inner(
+        &api_state,
+        &id_str,
+        &headers,
+        request,
+        "POST /ui/schedules/{id}/backfill",
     )
     .await;
 
     match result {
-        Ok(axum::Json(response)) => {
+        Ok(response) => {
             if commit {
                 // AC6: land the operator on this schedule's run history so the
                 // runs they just launched are one click from the confirmation.
@@ -9889,8 +10062,28 @@ async fn schedule_backfill_ui(
         // A rejected backfill (paused, exhausted, window too large, unknown DAG)
         // comes back as the API's own message, rendered on the form rather than
         // as a bare error page.
-        Err(e) => {
-            render_schedule_backfill_form(&row, shard_id, Some(&e.to_string())).into_response()
+        Err(e) => render_schedule_backfill_form(&row, shard_id, Some(&e.to_string()), &echo)
+            .into_response(),
+    }
+}
+
+/// Raw, unvalidated form values echoed back when a submission is rejected, so
+/// the operator does not have to retype two RFC 3339 instants.
+#[derive(Debug, Clone, Default)]
+struct BackfillFormEcho {
+    from: String,
+    to: String,
+    max_count: String,
+    include_paused: bool,
+}
+
+impl From<&ScheduleBackfillForm> for BackfillFormEcho {
+    fn from(form: &ScheduleBackfillForm) -> Self {
+        Self {
+            from: form.from.clone(),
+            to: form.to.clone(),
+            max_count: form.max_count.clone().unwrap_or_default(),
+            include_paused: form.include_paused.is_some(),
         }
     }
 }
@@ -9899,6 +10092,7 @@ fn render_schedule_backfill_form(
     row: &HarvestSchedule,
     shard_id: ShardId,
     error: Option<&str>,
+    echo: &BackfillFormEcho,
 ) -> Markup {
     let id_str = row.id.to_string();
     let body = html! {
@@ -9921,22 +10115,24 @@ fn render_schedule_backfill_form(
                 div.filters {
                     label {
                         "Start (RFC 3339 UTC)"
-                        input type="text" name="from" required
+                        input type="text" name="from" required value=(echo.from)
                             placeholder="2026-08-01T00:00:00Z";
                     }
                     label {
                         "End (RFC 3339 UTC)"
-                        input type="text" name="to" required
+                        input type="text" name="to" required value=(echo.to)
                             placeholder="2026-08-02T00:00:00Z";
                     }
                     label {
                         "Max slots"
                         input type="number" name="max_count" min="1"
-                            placeholder="default";
+                            max=(SCHEDULE_BACKFILL_MAX_SLOTS) value=(echo.max_count)
+                            placeholder=(SCHEDULE_BACKFILL_MAX_SLOTS);
                     }
                     label {
                         "Include paused"
-                        input type="checkbox" name="include_paused" value="1";
+                        input type="checkbox" name="include_paused" value="1"
+                            checked[echo.include_paused];
                     }
                 }
                 div.actions { button type="submit" { "Preview backfill" } }
@@ -9948,7 +10144,12 @@ fn render_schedule_backfill_form(
             a.drilldown href=(schedule_drilldown_href(&id_str, "runs")) { "Run history" }
         }
     };
-    layout_schedules("Schedule backfill · Vantage", &body, None)
+    layout_schedules(
+        "Schedule backfill · Vantage",
+        &body,
+        None,
+        SCHEDULE_DRILLDOWN_BASE,
+    )
 }
 
 fn render_schedule_backfill_confirm(
@@ -9958,6 +10159,11 @@ fn render_schedule_backfill_confirm(
     form: &BackfillFormParams,
 ) -> Markup {
     let id_str = row.id.to_string();
+    // `schedule_backfill` rejects a paused *DAG* schedule in non-dry-run mode
+    // outright, so the dry run can report a healthy `dispatched` count for a
+    // commit that can only ever 400. Say so instead of offering a button that
+    // cannot succeed.
+    let paused_dag = row.is_paused && row.dag_name.is_some();
     let nothing_to_do = dry_run.total == 0 || dry_run.dispatched == 0;
     let mut skip_reasons: Vec<(&String, &usize)> = dry_run.skipped_reasons.iter().collect();
     skip_reasons.sort_by(|a, b| a.0.cmp(b.0));
@@ -10008,7 +10214,13 @@ fn render_schedule_backfill_confirm(
             }
         }
 
-        @if nothing_to_do {
+        @if paused_dag {
+            div.card.empty {
+                "This DAG schedule is paused, so a backfill cannot be dispatched: "
+                "backfilled runs would sit QUEUED and never execute. "
+                "Resume the schedule first, then preview again."
+            }
+        } @else if nothing_to_do {
             div.card.empty {
                 "Nothing to backfill in this window — no slot would be dispatched. "
                 "Widen the window, or clear whatever is skipping these slots, and preview again."
@@ -10039,11 +10251,24 @@ fn render_schedule_backfill_confirm(
             }
         }
     };
-    layout_schedules("Confirm backfill · Vantage", &body, None)
+    layout_schedules(
+        "Confirm backfill · Vantage",
+        &body,
+        None,
+        SCHEDULE_DRILLDOWN_BASE,
+    )
 }
 
 /// How many planned fire times the confirmation lists before rolling up.
 const SCHEDULE_BACKFILL_PREVIEW_ROWS: usize = 20;
+
+/// Ceiling on the launcher's `max_count`.
+///
+/// The endpoint treats `max_count` as the *planning* limit — supplying one
+/// replaces `DEFAULT_BACKFILL_MAX_COUNT` rather than being capped by it — so an
+/// unbounded value from a browser form could enumerate millions of timestamps
+/// in one request. The UI caps it at the endpoint's own default.
+const SCHEDULE_BACKFILL_MAX_SLOTS: usize = autumn_harvest::scheduler::DEFAULT_BACKFILL_MAX_COUNT;
 
 // ── Admission gates UI (issue #377) ──────────────────────────────────────────
 
@@ -10231,7 +10456,14 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
     }
 }
 
-fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+/// Chrome for the schedules pages.
+///
+/// `base_href` is the relative prefix that reaches the UI mount point from the
+/// page being rendered, exactly as [`layout`] takes one: the list at
+/// `/schedules` passes `""`, and the `/schedules/{id}/{leaf}` drill-downs pass
+/// [`SCHEDULE_DRILLDOWN_BASE`] (`../../`). Without it every nav link on a
+/// drill-down resolves relative to `/schedules/{id}/` and 404s.
+fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -10247,15 +10479,15 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
             body {
                 header {
                     h1 {
-                        a href="workflows" { "🔭 Vantage" }
+                        a href={ (base_href) "workflows" } { "🔭 Vantage" }
                         span.subtitle { "Harvest dashboard" }
                     }
                     nav {
-                        a href="workflows" { "Workflows" }
-                        a href="workers" { "Workers" }
-                        a.active href="schedules" { "Schedules" }
-                        a href="dead-letters" { "Dead Letters" }
-                        a href="build-routing" { "Build Routing" }
+                        a href={ (base_href) "workflows" } { "Workflows" }
+                        a href={ (base_href) "workers" } { "Workers" }
+                        a.active href={ (base_href) "schedules" } { "Schedules" }
+                        a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -11163,7 +11395,7 @@ mod tests {
     #[test]
     fn layout_schedules_has_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None).into_string();
+        let html = layout_schedules("Test", &body, None, "").into_string();
         assert!(
             html.contains("schedules"),
             "layout_schedules must include schedules link"
@@ -11181,10 +11413,10 @@ mod tests {
     #[test]
     fn layout_schedules_auto_refresh_tag() {
         let body = html! { p { "test" } };
-        let html_with = layout_schedules("T", &body, Some(30)).into_string();
+        let html_with = layout_schedules("T", &body, Some(30), "").into_string();
         assert!(html_with.contains("http-equiv=\"refresh\""));
         assert!(html_with.contains("content=\"30\""));
-        let html_without = layout_schedules("T", &body, None).into_string();
+        let html_without = layout_schedules("T", &body, None, "").into_string();
         assert!(!html_without.contains("http-equiv=\"refresh\""));
     }
 
@@ -11859,7 +12091,7 @@ mod tests {
     #[test]
     fn layout_schedules_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None).into_string();
+        let html = layout_schedules("Test", &body, None, "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_schedules must include a Build Routing nav link"
@@ -13985,7 +14217,14 @@ mod tests {
         ];
         let exec_ids: Vec<_> = runs.iter().map(|r| r.execution_id).collect();
         let response = runs_response(runs, crate::shard_fanout::FanoutStatus::Complete, vec![]);
-        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView::default(),
+            None,
+        )
+        .into_string();
 
         for id in &exec_ids {
             assert!(
@@ -13993,13 +14232,22 @@ mod tests {
                 "run must link to the execution detail view: {html}"
             );
         }
-        assert!(html.contains("scheduled"), "origin missing: {html}");
-        assert!(html.contains("backfill"), "backfill origin missing: {html}");
-        assert!(
-            html.contains("manual_trigger"),
-            "manual_trigger origin missing: {html}"
-        );
-        assert!(html.contains("COMPLETED") && html.contains("FAILED"));
+        // Origin names and state names also appear in the page chrome (the
+        // summary note, the footer's "Backfill" link) and in the inlined
+        // stylesheet's `.COMPLETED` / `.FAILED` rules, so assert on the actual
+        // table cells.
+        for origin in ["scheduled", "backfill", "manual_trigger"] {
+            assert!(
+                html.contains(&format!("<td><code>{origin}</code></td>")),
+                "{origin} origin cell missing: {html}"
+            );
+        }
+        for state in ["COMPLETED", "FAILED", "RUNNING"] {
+            assert!(
+                html.contains(&format!(">{state}</span>")),
+                "{state} badge missing: {html}"
+            );
+        }
         assert!(
             html.contains("2026-09-01 12:00:00"),
             "nominal fire time missing: {html}"
@@ -14036,7 +14284,14 @@ mod tests {
                 },
             ],
         );
-        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView::default(),
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("some shards unreachable") || html.contains("Some shards unreachable"),
             "partial-shard banner missing: {html}"
@@ -14057,7 +14312,14 @@ mod tests {
     fn runs_page_renders_no_runs_yet_empty_state() {
         let row = make_schedule(Some("payments"), None, false);
         let response = runs_response(vec![], crate::shard_fanout::FanoutStatus::Complete, vec![]);
-        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView::default(),
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("no runs yet") || html.contains("No runs yet"),
             "no-runs empty state missing: {html}"
@@ -14077,7 +14339,14 @@ mod tests {
                 error: Some("pool timeout".to_string()),
             }],
         );
-        let html = render_schedule_runs_page(&row, ShardId::new(0), &response).into_string();
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView::default(),
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("No shard could be reached")
                 || html.contains("no shard could be reached"),
@@ -14097,7 +14366,13 @@ mod tests {
     fn backfill_form_posts_to_the_preview_step_first() {
         let row = make_schedule(Some("payments"), None, false);
         let id = row.id.to_string();
-        let html = render_schedule_backfill_form(&row, ShardId::new(0), None).into_string();
+        let html = render_schedule_backfill_form(
+            &row,
+            ShardId::new(0),
+            None,
+            &BackfillFormEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains(&format!("schedules/{id}/backfill")),
             "form must post to the backfill route: {html}"
@@ -14156,8 +14431,16 @@ mod tests {
         };
         let html =
             render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
-        assert!(html.contains("24"), "planned total missing: {html}");
-        assert!(html.contains("20"), "would-dispatch count missing: {html}");
+        // Assert on the labelled cells: the inlined stylesheet contains bare
+        // "24"/"20" on several lines, so a plain `contains` proves nothing.
+        assert!(
+            html.contains("<dt>Planned slots</dt><dd>24</dd>"),
+            "planned total missing: {html}"
+        );
+        assert!(
+            html.contains("<dt>Would dispatch</dt><dd>20</dd>"),
+            "would-dispatch count missing: {html}"
+        );
         assert!(
             html.contains("already_exists"),
             "skip reasons must be shown: {html}"
@@ -14209,12 +14492,18 @@ mod tests {
         let html =
             render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
         assert!(
-            html.contains("nothing to backfill") || html.contains("Nothing to backfill"),
+            html.contains("Nothing to backfill"),
             "empty window must render an explicit message: {html}"
         );
+        // The page inlines the stylesheet, so a bare `contains("disabled")`
+        // would be satisfied by a CSS rule. Assert the button is simply absent.
         assert!(
-            !html.contains("type=\"submit\"") || html.contains("disabled"),
-            "an empty window must not offer an enabled dispatch button: {html}"
+            !html.contains("type=\"submit\""),
+            "an empty window must not offer a dispatch button at all: {html}"
+        );
+        assert!(
+            !html.contains("value=\"commit\""),
+            "an empty window must not carry a commit stage: {html}"
         );
     }
 
@@ -14300,6 +14589,364 @@ mod tests {
         assert!(
             markup_html.contains("&lt;script&gt;"),
             "the name must appear escaped as display text: {markup_html}"
+        );
+    }
+
+    // -- issue #951 review follow-ups: bugs the first round shipped --
+
+    /// The polarity of `dry_run` versus the UI's `commit` stage.
+    ///
+    /// These are opposites, and getting them the same way round makes the
+    /// "Preview backfill" button *dispatch* while the confirmation button only
+    /// projects — with the confirmation page still reading "Nothing has been
+    /// dispatched yet." over the counts of runs it just launched. Pinned here as
+    /// a pure test because the end-to-end version needs a database.
+    #[test]
+    fn backfill_request_dry_run_is_the_inverse_of_the_commit_stage() {
+        let params = BackfillFormParams {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "2026-08-02T00:00:00Z".to_string(),
+            max_count: None,
+            include_paused: false,
+        };
+        // The preview stage must project.
+        let commit = false;
+        let request = params
+            .to_request(!commit)
+            .expect("a normalised window converts");
+        assert!(
+            request.dry_run,
+            "the preview stage must send dry_run = true"
+        );
+        // The commit stage must dispatch.
+        let commit = true;
+        let request = params
+            .to_request(!commit)
+            .expect("a normalised window converts");
+        assert!(
+            !request.dry_run,
+            "the commit stage must send dry_run = false"
+        );
+    }
+
+    /// `to_request` carries the window and options through unchanged, so the
+    /// committed backfill is provably the one that was previewed.
+    #[test]
+    fn backfill_request_round_trips_the_previewed_window() {
+        let params = BackfillFormParams::parse(
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T06:30:00Z",
+            Some(42),
+            true,
+        )
+        .expect("a well-formed window parses");
+        let request = params.to_request(true).expect("converts");
+        assert_eq!(request.from.to_rfc3339(), "2026-08-01T00:00:00+00:00");
+        assert_eq!(request.to.to_rfc3339(), "2026-08-02T06:30:00+00:00");
+        assert_eq!(request.max_count, Some(42));
+        assert!(request.include_paused);
+        // And the normalised strings the confirmation round-trips are the same
+        // instants, so a re-parse cannot drift.
+        let reparsed = BackfillFormParams::parse(
+            &params.from,
+            &params.to,
+            params.max_count,
+            params.include_paused,
+        )
+        .expect("normalised values re-parse");
+        assert_eq!(reparsed, params);
+    }
+
+    /// Every link out of a drill-down page carries the `../../` that reaches the
+    /// UI mount point. A link that forgets it resolves under the schedule id and
+    /// 404s — which is invisible to a `contains` assertion on the path itself.
+    #[test]
+    fn drilldown_pages_link_out_with_the_mount_point_prefix() {
+        let row = make_schedule(Some("payments"), None, false);
+        let id = row.id.to_string();
+        let response = runs_response(
+            vec![run_entry(
+                "COMPLETED",
+                "scheduled",
+                Some("2026-09-01T12:00:00Z"),
+            )],
+            crate::shard_fanout::FanoutStatus::Complete,
+            vec![],
+        );
+        let response = crate::schedule_runs::ScheduleRunsResponse {
+            next_cursor: Some(
+                "2026-09-01T12:00:00.000000Z|00000000-0000-0000-0000-000000000001".to_string(),
+            ),
+            ..response
+        };
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView {
+                limit: Some(5),
+                origin: Some("scheduled".to_string()),
+                state: None,
+            },
+            None,
+        )
+        .into_string();
+
+        // Nav chrome.
+        for leaf in [
+            "workflows",
+            "workers",
+            "schedules",
+            "dead-letters",
+            "build-routing",
+        ] {
+            assert!(
+                html.contains(&format!("href=\"../../{leaf}\"")),
+                "nav link to {leaf} must be mount-relative: {html}"
+            );
+        }
+        assert!(
+            !html.contains("href=\"workflows\""),
+            "a bare depth-0 nav href would 404 from a drill-down: {html}"
+        );
+        // The next-page link, and the filters it must preserve.
+        assert!(
+            html.contains(&format!("href=\"../../schedules/{id}/runs?cursor=")),
+            "the next-page link must be mount-relative: {html}"
+        );
+        assert!(
+            html.contains("&limit=5") && html.contains("&origin=scheduled"),
+            "the next-page link must carry the filters the cursor was computed under: {html}"
+        );
+    }
+
+    /// A committed backfill's flash reaches the run-history page it redirects to.
+    #[test]
+    fn runs_page_renders_the_backfill_flash() {
+        let row = make_schedule(Some("payments"), None, false);
+        let response = runs_response(vec![], crate::shard_fanout::FanoutStatus::Complete, vec![]);
+        let html = render_schedule_runs_page(
+            &row,
+            ShardId::new(0),
+            &response,
+            &ScheduleRunsView::default(),
+            Some("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
+        )
+        .into_string();
+        assert!(
+            html.contains("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
+            "the flash must be rendered, not silently dropped: {html}"
+        );
+    }
+
+    /// A per-row action redirects to the list, not to a path nested under the
+    /// schedule id.
+    #[test]
+    fn schedule_redirect_depth_resolves_to_the_list() {
+        let per_row = schedule_redirect_from(2, "Paused it");
+        let location = per_row
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .expect("a redirect carries a location");
+        assert!(
+            location.starts_with("../schedules?flash="),
+            "a /schedules/{{id}}/pause redirect must climb one segment: {location}"
+        );
+
+        let bulk = schedule_redirect_from(1, "Paused 3");
+        let location = bulk
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .expect("a redirect carries a location");
+        assert!(
+            location.starts_with("schedules?flash="),
+            "a /schedules/bulk-pause redirect is already at the right depth: {location}"
+        );
+    }
+
+    /// The bulk actions must act on exactly the set the list counted, health
+    /// filter included — the confirmation dialog quotes that count.
+    #[test]
+    fn bulk_filters_apply_the_health_filter() {
+        let healthy = make_schedule(Some("healthy"), None, false);
+        let unhealthy = HarvestSchedule {
+            last_catchup_dropped: 3,
+            ..make_schedule(Some("dropping"), None, false)
+        };
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: Some("Unhealthy".to_string()),
+            shard_id: None,
+        });
+        assert!(
+            !filters.matches(ShardId::new(0), &healthy),
+            "a healthy schedule must not be swept up by a health=Unhealthy bulk action"
+        );
+        assert!(filters.matches(ShardId::new(0), &unhealthy));
+    }
+
+    /// A paused DAG schedule cannot be committed (the endpoint rejects it), so
+    /// the confirmation must not offer a button that can only fail.
+    #[test]
+    fn backfill_confirm_refuses_to_offer_a_commit_for_a_paused_dag() {
+        let row = make_schedule(None, Some("nightly_etl"), true);
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        let dry_run = crate::api::ScheduleBackfillResponse {
+            status: "dry_run".to_string(),
+            schedule_id: row.id,
+            kind: crate::api::ScheduleKind::Dag,
+            name: "nightly_etl".to_string(),
+            from: parse("2026-08-01T00:00:00Z"),
+            to: parse("2026-08-02T00:00:00Z"),
+            planned_timestamps: vec![parse("2026-08-01T00:00:00Z")],
+            total: 24,
+            dispatched: 24,
+            skipped: 0,
+            failed: 0,
+            skipped_reasons: std::collections::HashMap::new(),
+            partial_shard_failures: vec![],
+            paused_schedule_warning: Some("Schedule is paused; …".to_string()),
+        };
+        let form = BackfillFormParams {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "2026-08-02T00:00:00Z".to_string(),
+            max_count: None,
+            include_paused: true,
+        };
+        let html =
+            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
+        assert!(
+            html.contains("paused, so a backfill cannot be dispatched"),
+            "must explain why the commit is unavailable: {html}"
+        );
+        assert!(
+            !html.contains("value=\"commit\""),
+            "must not offer a commit that the endpoint will reject: {html}"
+        );
+    }
+
+    /// The rejection path echoes the operator's window back into the form.
+    #[test]
+    fn backfill_form_echoes_submitted_values_on_rejection() {
+        let row = make_schedule(Some("payments"), None, false);
+        let echo = BackfillFormEcho {
+            from: "2026-08-01T00:00:00Z".to_string(),
+            to: "not-a-date".to_string(),
+            max_count: "50".to_string(),
+            include_paused: true,
+        };
+        let html = render_schedule_backfill_form(
+            &row,
+            ShardId::new(0),
+            Some("invalid end 'not-a-date'"),
+            &echo,
+        )
+        .into_string();
+        assert!(
+            html.contains("value=\"2026-08-01T00:00:00Z\""),
+            "start lost: {html}"
+        );
+        assert!(html.contains("value=\"not-a-date\""), "end lost: {html}");
+        assert!(html.contains("value=\"50\""), "max count lost: {html}");
+        assert!(html.contains("checked"), "include-paused lost: {html}");
+        assert!(
+            html.contains("Backfill not started"),
+            "error missing: {html}"
+        );
+    }
+
+    /// The "Needs attention" strip counts the whole filtered set, so it cannot
+    /// under-report a fleet-wide problem when the page is one of many.
+    #[test]
+    fn health_summary_is_computed_over_the_filtered_set_not_the_page() {
+        let all: Vec<(ShardId, HarvestSchedule)> = (0..30)
+            .map(|i| {
+                (
+                    ShardId::new(0),
+                    make_schedule(Some(&format!("wf_{i}")), None, true),
+                )
+            })
+            .collect();
+        let summary = schedule_health_summary(&all);
+        assert!(
+            summary.contains("30 paused"),
+            "the summary must count every filtered row: {summary}"
+        );
+        // A page slice would report 25 with the default page size; the page
+        // renderer is handed the full-set summary, so the value it displays is
+        // the one computed here.
+        let page: Vec<(ShardId, HarvestSchedule)> = all.iter().take(25).cloned().collect();
+        assert!(schedule_health_summary(&page).contains("25 paused"));
+    }
+
+    /// An exhausted schedule with no recorded reason still gets a badge.
+    #[test]
+    fn health_badges_render_bare_exhausted_without_a_reason() {
+        let row = HarvestSchedule {
+            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_reason: None,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let html = render_schedule_health_badges(&row).into_string();
+        assert!(
+            html.contains("Exhausted"),
+            "bare exhausted badge missing: {html}"
+        );
+        assert!(
+            !html.contains("Exhausted:"),
+            "no dangling separator: {html}"
+        );
+    }
+
+    /// `next_run_at` absent but jitter configured: nothing to offset, so no
+    /// effective line.
+    #[test]
+    fn next_fire_cell_has_no_effective_line_without_a_next_run() {
+        let row = HarvestSchedule {
+            next_run_at: None,
+            jitter_secs: 600,
+            ..make_schedule(Some("wf"), None, false)
+        };
+        let html = schedule_next_fire_cell(&row).into_string();
+        assert!(
+            !html.contains("effective"),
+            "no next_run_at means no effective fire time: {html}"
+        );
+    }
+
+    /// The "show only unhealthy" shortcut keeps the other active filters and
+    /// does not stack a second `health=` param.
+    #[test]
+    fn unhealthy_shortcut_link_preserves_other_filters() {
+        let filters = ScheduleUiFilters {
+            target: Some("billing".to_string()),
+            kind: ScheduleKindFilter::Workflow,
+            paused: SchedulePausedFilter::All,
+            health: ScheduleHealthFilter::All,
+            shard_id: Some(1),
+        };
+        let qs = build_schedule_query_string(
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            &ScheduleUiFilters {
+                health: ScheduleHealthFilter::All,
+                ..filters
+            },
+            None,
+        );
+        assert!(qs.contains("target=billing"), "target lost: {qs}");
+        assert!(qs.contains("kind=Workflow"), "kind lost: {qs}");
+        assert!(qs.contains("shard_id=1"), "shard lost: {qs}");
+        assert!(
+            !qs.contains("health="),
+            "the shortcut supplies health itself; the suffix must not repeat it: {qs}"
         );
     }
 

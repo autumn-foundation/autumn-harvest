@@ -99,8 +99,9 @@ the page counts each bucket, and the **Health** filter (`?health=Unhealthy` /
 `?health=Healthy`) narrows the list. An unrecognised value is a `400`.
 
 **Filters** — `target`, `kind`, `paused`, `health`, `shard_id`, `limit`, `refresh`.
-All of them round-trip into the bulk pause/resume actions, so "pause all matching"
-always means the set on screen.
+All of them round-trip into the bulk pause/resume actions, and both bulk handlers apply
+the *same* `ScheduleUiFilters::matches` predicate the list does — so "Pause all matching
+(N)" acts on exactly the N rows on screen.
 
 **Per-row actions** — Pause, Resume, Run now, and Delete, each behind a confirmation
 dialog and each writing an audit record with `source = ui` and the matching operation
@@ -134,6 +135,10 @@ first line of a terminal failure, and a link to the execution detail view.
 Above the table, the **scheduled-run summary** counts `scheduled`-origin runs only, so a
 backfill storm or an ad-hoc trigger never inflates the failure ratio.
 
+A filter bar exposes `limit` (1–200), `origin`, and `state`. The **Next** link carries the
+active filters alongside the cursor, because a keyset cursor is only meaningful under the
+filters it was computed with.
+
 Cross-shard degradation is always visible, never silent:
 
 | Response `status` | Rendering |
@@ -159,8 +164,18 @@ A two-stage flow over `POST /admin/schedules/{id}/backfill` (#337):
    skip reasons, and the first 20 planned fire times.
 3. Only an explicit `stage=commit` (behind a `confirm()` dialog) dispatches. A POST that
    omits `stage` falls back to the dry run, so a bare form post can never dispatch work.
-4. On success the operator is redirected to that schedule's **run history** with a flash
-   summarising what was dispatched, so the new runs are one click away.
+4. On success the operator is redirected to that schedule's **run history**, which renders
+   a flash summarising what was dispatched — including the failure count, which is
+   reported nowhere else.
+
+`max_count` is capped at the engine's `DEFAULT_BACKFILL_MAX_COUNT` (1,000). The endpoint
+treats a supplied `max_count` as the planning limit that *replaces* its own default, so an
+uncapped value from a browser form could make one request enumerate millions of timestamps.
+
+A paused **DAG** schedule cannot be committed at all (the endpoint rejects it, because
+backfilled runs would sit `QUEUED` until the schedule resumes), so the confirmation says so
+instead of offering a button that can only fail. A rejected submission re-renders the form
+with the operator's own window still in it.
 
 The dry run is a POST rather than a GET because it writes a `harvest_backfill_log` row
 and an audit record — the read path stays side-effect-free. Both stages are audited
@@ -169,6 +184,13 @@ through the API handler with `source = ui`, and every guard the endpoint enforce
 rejection is rendered on the form rather than as a bare error page.
 
 A malformed or inverted window is a rendered form error, never a 500.
+
+#### Not-found vs. indeterminate
+
+All three drill-downs resolve the schedule through the API's own
+`resolve_schedule_with_shard`, so an unparseable id is a `400`, "checked every expected
+shard and none had it" is a `404`, and "a shard could not be checked" is a `503` — never a
+`404` claiming a schedule was deleted when a shard was merely unreachable.
 
 **Out of scope (tracked elsewhere):** creating or editing schedules from the UI (#771),
 overdue-schedule detection (#696), recent-runs enrichment (#762).

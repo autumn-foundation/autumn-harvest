@@ -2067,6 +2067,9 @@ struct ScheduleFixture<'a> {
     max_runs: Option<i32>,
     runs_started: i32,
     exhausted_reason: Option<&'a str>,
+    /// Force `exhausted_at` even with no reason recorded — a state the schema
+    /// permits and the badge renderer handles separately.
+    exhausted: bool,
     auto_paused: bool,
     next_run_at_sql: Option<&'a str>,
     schedule_expr: Option<&'a str>,
@@ -2077,12 +2080,16 @@ async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'
     let mut conn = AsyncPgConnection::establish(database_url)
         .await
         .expect("failed to connect for schedule fixture insert");
+    // Quote-escape every interpolated literal so a fixture can seed a hostile
+    // name (the pure tests use one containing a single quote) and get a row
+    // rather than a syntax error.
+    let sql_lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
     let (dag_col, wf_col) = if fixture.kind == "Dag" {
-        (format!("'{}'", fixture.name), "NULL".to_string())
+        (sql_lit(fixture.name), "NULL".to_string())
     } else {
-        ("NULL".to_string(), format!("'{}'", fixture.name))
+        ("NULL".to_string(), sql_lit(fixture.name))
     };
-    let sql_opt_str = |v: Option<&str>| v.map_or_else(|| "NULL".to_string(), |s| format!("'{s}'"));
+    let sql_opt_str = |v: Option<&str>| v.map_or_else(|| "NULL".to_string(), sql_lit);
     let sql_opt_i = |v: Option<i64>| v.map_or_else(|| "NULL".to_string(), |n| n.to_string());
     let sql = format!(
         "INSERT INTO harvest_schedules \
@@ -2111,7 +2118,7 @@ async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'
         },
         max_runs = sql_opt_i(fixture.max_runs.map(i64::from)),
         runs_started = fixture.runs_started,
-        exhausted_at = if fixture.exhausted_reason.is_some() {
+        exhausted_at = if fixture.exhausted_reason.is_some() || fixture.exhausted {
             "NOW()"
         } else {
             "NULL"
@@ -2935,6 +2942,336 @@ async fn ui_schedules_rows_link_to_drilldowns() {
             "row must link to the {leaf} drill-down: {html}"
         );
     }
+}
+
+/// AC4: the drill-downs mirror their endpoints' admin-auth posture — the run
+/// history is gated (as `GET /admin/schedules/{id}/runs` is), preview and
+/// backfill are not (as their API routes are not).
+#[tokio::test]
+async fn ui_schedules_drilldown_auth_matches_the_api_routes() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "gated_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // `set_admin_auth_boundary(false)` with no session = not an admin.
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(false);
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "run history must be admin-gated, matching its API route: {html}"
+    );
+
+    for leaf in ["preview", "backfill"] {
+        let (status, html) = fetch_html(&app, &format!("/schedules/{id}/{leaf}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{leaf} must stay ungated, matching its API route: {html}"
+        );
+    }
+}
+
+/// AC6: the flash a committed backfill redirects with is actually rendered on
+/// the run-history page — the dispatch counts (including failures) are only
+/// reported there.
+#[tokio::test]
+async fn ui_schedules_backfill_flash_renders_on_the_run_history() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let commit = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=commit";
+    let (status, headers, body) =
+        post_form(&app, &format!("/schedules/{id}/backfill"), commit).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "commit must redirect: {body}"
+    );
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect carries a location")
+        .to_string();
+    assert!(
+        location.contains("flash="),
+        "redirect must carry a flash: {location}"
+    );
+
+    // Follow the redirect the way a browser would, resolving it against the
+    // request path /schedules/{id}/backfill.
+    let Some(rest) = location.strip_prefix("../../") else {
+        panic!("unexpected redirect shape: {location}");
+    };
+    let followed = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &followed).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the redirect target must resolve: {html}"
+    );
+    assert!(
+        html.contains("Backfill dispatched"),
+        "the dispatch summary must be rendered on the run history: {html}"
+    );
+}
+
+/// AC6: `max_count` is validated and capped rather than passed through, because
+/// the endpoint treats it as the planning limit that replaces its own guard.
+#[tokio::test]
+async fn ui_schedules_backfill_validates_and_caps_max_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "echo",
+            schedule_expr: Some("0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&max_count=lots&stage=preview",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
+    assert!(
+        html.contains("invalid max count"),
+        "a non-numeric max count must be a rendered error: {html}"
+    );
+    assert!(
+        html.contains("value=\"lots\""),
+        "the rejected form must echo what was typed: {html}"
+    );
+
+    // An enormous window with an enormous max_count is capped, not enumerated.
+    let (status, _headers, html) = post_form(
+        &app,
+        &format!("/schedules/{id}/backfill"),
+        "from=1990-01-01T00%3A00%3A00Z&to=2030-01-01T00%3A00%3A00Z&max_count=100000000&stage=preview",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
+    assert!(
+        html.contains("Backfill not started") || html.contains("Confirm backfill"),
+        "an over-wide window must be answered, not hung: {html}"
+    );
+}
+
+/// AC3/AC4: a bulk action acts on exactly the health-filtered set the button
+/// counted — not on every schedule on the shard.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_respects_the_health_filter() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let healthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "healthy_bulk",
+            ..Default::default()
+        },
+    )
+    .await;
+    let unhealthy = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "dropping_bulk",
+            last_catchup_dropped: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) =
+        post_form(&app, "/schedules/bulk-pause", "health=Unhealthy").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "bulk pause must redirect: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for bulk assertion");
+    let paused_healthy: bool = diesel::sql_query(format!(
+        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{healthy}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("healthy row exists")
+    .value;
+    let paused_unhealthy: bool = diesel::sql_query(format!(
+        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{unhealthy}'"
+    ))
+    .get_result::<BoolValue>(&mut conn)
+    .await
+    .expect("unhealthy row exists")
+    .value;
+    assert!(
+        paused_unhealthy,
+        "the health-filtered bulk pause must pause the matching schedule"
+    );
+    assert!(
+        !paused_healthy,
+        "a bulk pause under health=Unhealthy must not touch a healthy schedule"
+    );
+}
+
+/// The audit `source` fix covers every schedule mutation, not just pause.
+#[tokio::test]
+async fn ui_schedules_every_mutation_is_audited_as_ui_sourced() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pause_id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_pause",
+            ..Default::default()
+        },
+    )
+    .await;
+    let delete_id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_delete",
+            ..Default::default()
+        },
+    )
+    .await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "audit_bulk",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    post_form(&app, &format!("/schedules/{pause_id}/pause"), "").await;
+    post_form(&app, &format!("/schedules/{pause_id}/resume"), "").await;
+    post_form(&app, &format!("/schedules/{delete_id}/delete"), "").await;
+    post_form(&app, "/schedules/bulk-pause", "target=audit_bulk").await;
+    post_form(&app, "/schedules/bulk-resume", "target=audit_bulk").await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect for audit assertion");
+    let api_sourced: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM harvest_audit_log \
+         WHERE route_or_command LIKE 'POST /ui/schedules%' AND source <> 'ui'",
+    )
+    .get_result::<CountValue>(&mut conn)
+    .await
+    .expect("audit query")
+    .value;
+    assert_eq!(
+        api_sourced, 0,
+        "every /ui/schedules audit record must be source = ui"
+    );
+
+    for op in ["schedule.pause", "schedule.resume", "schedule.delete"] {
+        let n: i64 = diesel::sql_query(format!(
+            "SELECT COUNT(*) AS value FROM harvest_audit_log \
+             WHERE operation = '{op}' AND source = 'ui'"
+        ))
+        .get_result::<CountValue>(&mut conn)
+        .await
+        .expect("audit query")
+        .value;
+        assert!(n > 0, "{op} must be audited as UI-sourced, got {n}");
+    }
+}
+
+/// A per-row mutation's redirect resolves back to the list, not to a path
+/// nested under the schedule id.
+#[tokio::test]
+async fn ui_schedules_pause_redirect_resolves_to_the_list() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "redirect_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "redirect_target",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (_status, headers, _body) = post_form(&app, &format!("/schedules/{id}/pause"), "").await;
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect carries a location")
+        .to_string();
+
+    // Resolve it the way a browser would against /schedules/{id}/pause, whose
+    // base directory is /schedules/{id}/.
+    let Some(rest) = location.strip_prefix("../") else {
+        panic!("per-row redirect must climb a segment: {location}");
+    };
+    let resolved = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &resolved).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the pause redirect must land on the schedules list: {html}"
+    );
+    assert!(
+        html.contains("redirect_wf"),
+        "landed on the wrong page: {html}"
+    );
 }
 
 /// Timezone column renders and differentiates UTC (subdued) from other timezones (prominent badge).

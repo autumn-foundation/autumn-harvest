@@ -25521,6 +25521,27 @@ async fn resolve_schedule_for_runs(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<HarvestSchedule, AutumnError> {
+    resolve_schedule_with_shard(api_state, schedule_id)
+        .await
+        .map(|(row, _shard)| row)
+}
+
+/// [`resolve_schedule_for_runs`], also reporting which shard the row was found
+/// on.
+///
+/// Shared with the Vantage schedule drill-downs (issue #951) so a page opened
+/// during a shard outage reports `503 indeterminate` exactly as the API does,
+/// rather than telling an operator mid-incident that a schedule they can see in
+/// the list does not exist.
+///
+/// # Errors
+///
+/// `404` when every expected shard was checked and none had the row; `503` when
+/// any expected shard could not be checked. Never `500`.
+pub(crate) async fn resolve_schedule_with_shard(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+) -> Result<(HarvestSchedule, autumn_harvest::types::ShardId), AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     // Consult every shard the router knows about, not just those with a live
@@ -25552,7 +25573,7 @@ async fn resolve_schedule_for_runs(
             .await
             .optional();
         match row {
-            Ok(Some(row)) => return Ok(row),
+            Ok(Some(row)) => return Ok((row, autumn_harvest::types::ShardId::new(*shard_id))),
             Ok(None) => {}
             // A per-shard lookup error (DB restarted after checkout, shard
             // mid-migration) is treated like an unreachable shard: mark it and
@@ -28838,18 +28859,47 @@ pub(crate) struct ScheduleBackfillResponse {
     pub paused_schedule_warning: Option<String>,
 }
 
-#[allow(clippy::too_many_lines)]
-pub(crate) async fn schedule_backfill(
+async fn schedule_backfill(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ScheduleBackfillRequest>,
 ) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
-    let (actor, source, req_id) = audit_context(&headers, &api_state);
-    let route = "POST /admin/schedules/{id}/backfill";
+    schedule_backfill_inner(
+        &api_state,
+        &id,
+        &headers,
+        request,
+        "POST /admin/schedules/{id}/backfill",
+    )
+    .await
+    .map(Json)
+}
+
+/// The backfill implementation, with the audited `route_or_command` supplied by
+/// the caller.
+///
+/// The Vantage backfill launcher (issue #951) shares this body so it inherits
+/// every guard, the `harvest_backfill_log` row and the audit record — but it
+/// passes its **own** route string, so a dashboard-initiated backfill is
+/// recorded as `POST /ui/schedules/{id}/backfill` rather than masquerading as an
+/// API call. Mirrors how `retry_dag_run_inner` is shared with `dag_retry_commit_ui`.
+///
+/// # Errors
+///
+/// Propagates the same errors as `POST /admin/schedules/{id}/backfill`.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn schedule_backfill_inner(
+    api_state: &HarvestApiState,
+    id: &str,
+    headers: &axum::http::HeaderMap,
+    request: ScheduleBackfillRequest,
+    route: &str,
+) -> Result<ScheduleBackfillResponse, AutumnError> {
+    let (actor, source, req_id) = audit_context(headers, api_state);
     let started_at = chrono::Utc::now();
 
-    let schedule_id = parse_uuid(&id, "schedule id")?;
+    let schedule_id = parse_uuid(id, "schedule id")?;
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
@@ -28860,8 +28910,7 @@ pub(crate) async fn schedule_backfill(
     }
 
     // Load the schedule row (fan out across shards; schedule rows are not shard-assigned).
-    let (schedule, schedule_shard) =
-        load_schedule_by_id_with_shard(&api_state, schedule_id).await?;
+    let (schedule, schedule_shard) = load_schedule_by_id_with_shard(api_state, schedule_id).await?;
 
     // Respect paused state unless the caller explicitly opts in.
     if schedule.is_paused && !request.include_paused {
@@ -29045,12 +29094,12 @@ pub(crate) async fn schedule_backfill(
             &source,
             req_id.as_deref(),
             route,
-            &id,
+            id,
             STATUS_SUCCEEDED,
             None,
         )
         .await;
-        return Ok(Json(ScheduleBackfillResponse {
+        return Ok(ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id,
             kind,
@@ -29065,7 +29114,7 @@ pub(crate) async fn schedule_backfill(
             skipped_reasons,
             partial_shard_failures: vec![],
             paused_schedule_warning,
-        }));
+        });
     }
 
     // Non-dry-run: dispatch each timestamp idempotently, respecting max_active_runs.
@@ -29137,7 +29186,7 @@ pub(crate) async fn schedule_backfill(
             )
             .await;
 
-            return Ok(Json(ScheduleBackfillResponse {
+            return Ok(ScheduleBackfillResponse {
                 status: status.to_string(),
                 schedule_id,
                 kind,
@@ -29152,7 +29201,7 @@ pub(crate) async fn schedule_backfill(
                 skipped_reasons,
                 partial_shard_failures: count_failures,
                 paused_schedule_warning,
-            }));
+            });
         }
     };
     // A throttled scheduled/backfill fire (issue #607) durably defers before any
@@ -29204,7 +29253,7 @@ pub(crate) async fn schedule_backfill(
                 )
                 .await;
 
-                return Ok(Json(ScheduleBackfillResponse {
+                return Ok(ScheduleBackfillResponse {
                     status: status.to_string(),
                     schedule_id,
                     kind,
@@ -29219,7 +29268,7 @@ pub(crate) async fn schedule_backfill(
                     skipped_reasons,
                     partial_shard_failures: count_failures,
                     paused_schedule_warning,
-                }));
+                });
             }
         }
     } else {
@@ -30218,7 +30267,7 @@ pub(crate) async fn schedule_backfill(
     )
     .await;
 
-    Ok(Json(ScheduleBackfillResponse {
+    Ok(ScheduleBackfillResponse {
         status: status.to_string(),
         schedule_id,
         kind,
@@ -30233,7 +30282,7 @@ pub(crate) async fn schedule_backfill(
         skipped_reasons,
         partial_shard_failures: shard_failures,
         paused_schedule_warning,
-    }))
+    })
 }
 
 /// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the

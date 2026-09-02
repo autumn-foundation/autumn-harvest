@@ -99,3 +99,67 @@ state, the partial-shard banner against a genuinely unreachable second shard, th
 backfill form → dry-run → commit flow asserting nothing is dispatched until the commit
 and that both stages are audited as UI-sourced, the malformed and inverted window
 errors, and the stage-less POST defaulting to the dry run.
+
+**Multi-angle review, and the bug that made the whole feature dangerous.** Four reviews
+(security, correctness, AC compliance, UX/a11y/test-quality) ran against the first
+implementation. The AC review found the one that mattered: `to_request(commit)` passed
+the UI's `commit` stage straight into the API's `dry_run` field, which are *opposite*
+polarity. `stage=preview` therefore sent `dry_run: false` and really dispatched the
+backfill — then rendered a confirmation page reading "Nothing has been dispatched yet."
+over the counts of the runs it had just launched — while `stage=commit` sent
+`dry_run: true`, dispatched nothing, and redirected with "Backfill dispatched N runs".
+A stage-less POST dispatched too, inverting the exact safety property the two-stage design
+was built for. The integration tests were written correctly and assert precisely this, but
+no Postgres was available where the change was authored, so they had never executed. The
+fix is `to_request(!commit)`; the polarity is now pinned by a *pure* test that runs
+without a database, because that is the layer where the mistake was reachable.
+
+Ten more findings were fixed. Three were P1-class in their own right. **Bulk pause/resume
+ignored the new health filter** while the button's count and its `confirm()` text came
+from the health-filtered total — select "Unhealthy", see "Pause all matching (3)", pause
+all 200. Both handlers now select whole rows and apply `ScheduleUiFilters::matches`, the
+same predicate the list uses, so the acted-on set is the counted set by construction (this
+also fixes the pre-existing `paused` filter being ignored). **Every nav link on all four
+drill-down pages 404'd**: `layout_schedules` hard-codes depth-0 relative hrefs, correct for
+`/schedules` and wrong two segments down; it now takes a `base_href` like `layout` already
+did. **The run-history "Next" link** was missing the same prefix, making the history
+unpageable, and dropped the `origin`/`state` filters the cursor was computed under.
+
+The rest: the committed backfill's flash — the only report of a partial dispatch — was
+URL-encoded into a redirect the runs page did not accept or render; the drill-downs mapped
+an unreachable shard to `404 "schedule not found"` mid-incident, and now share the API's
+`resolve_schedule_with_shard` so `503 indeterminate` survives; a UI backfill was audited
+under `POST /admin/schedules/{id}/backfill`, reintroducing inverted the very
+route/source mismatch this change set out to fix, so `schedule_backfill` was split into a
+`schedule_backfill_inner` taking the caller's own route string (mirroring
+`retry_dag_run_inner`); `max_count` was unbounded on a form that replaces the engine's
+planning guard; a rejection discarded the operator's typed window; the "Needs attention"
+strip counted the page rather than the filtered set; `aria-label` on the exhausted and
+catchup-dropped badges *replaced* the visible text, making the reason and the drop count
+inaudible; and two preview badges skipped the `role="status"` convention entirely.
+
+One pre-existing bug was fixed alongside: `schedule_redirect` emitted a bare
+`schedules?flash=…`, correct from `/schedules/bulk-pause` but resolving to
+`/schedules/{id}/schedules` from `/schedules/{id}/pause|resume|delete|trigger-now` — so
+every per-row action on the list page landed on a 404. Depth is now explicit.
+
+The test review found one assertion that could not fail (`|| html.contains("disabled")`,
+satisfied by a CSS rule in the inlined stylesheet) and four more satisfied by page chrome
+or the stylesheet rather than by the thing under test — `contains("24")`,
+`contains("COMPLETED")`, `contains("scheduled")`, `contains("backfill")`. All now assert
+on the specific cell markup. Twelve pure tests and six integration tests were added for
+what nothing covered: the `dry_run` polarity, the window round-trip, mount-relative links
+on every drill-down (nav chrome and the next-page link), the flash actually rendering,
+redirect depth, the health filter through a bulk action, the paused-DAG dead end, form
+echo on rejection, filtered-vs-page summary scope, a bare "Exhausted" badge with no
+reason, `max_count` validation and capping, and admin-gating parity across all three
+drill-downs. The integration fixture now quote-escapes its literals so a hostile name can
+be seeded at all.
+
+**Known gap, deliberately not fixed here.** Vantage has no CSRF protection on any POST —
+no token, no `Origin`/`Sec-Fetch-Site` check — and the backfill launcher is the first UI
+route that dispatches unbounded scheduled work, so a logged-in operator visiting a hostile
+page could be made to submit `stage=commit`. This is a repo-wide property of every Vantage
+mutation (cancel, terminate, signal, reset, DLQ replay, gate lift, schedule pause/delete/
+trigger), not something this page introduces, and a fix belongs at the router layer for
+all of them at once. Filed as a follow-up rather than bolted onto one form.
