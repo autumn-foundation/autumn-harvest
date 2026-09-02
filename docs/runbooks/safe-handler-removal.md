@@ -134,7 +134,7 @@ rg -n 'continue_as_new_as(_type)?\b' --glob '*.rs' | rg 'legacy_export'
 
 This is the *delete* direction of the same rule the #803 rollout ordering states
 for the *deploy* direction ("deploy the new phase's handler fleet-wide first").
-See the "Cross-type continue-as-new" section in `CLAUDE.md`.
+See the "Cross-type continue-as-new" section in [`docs/architecture.md`](../architecture.md#cross-type-continue-as-new--multi-phase-entities-issue-803).
 
 ---
 

@@ -40179,7 +40179,7 @@ impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
 ///
 /// The distinction is load-bearing for the gate. `pool.iter_shards()` yields
 /// only shards wired up in *this* process, but during a shard-add rollout the
-/// router's `readable_shards` is widened first (see the workspace CLAUDE.md
+/// router's `readable_shards` is widened first (see `docs/architecture.md`
 /// "add a shard" procedure), so a shard can be routable — and already holding
 /// in-flight executions — while this node has no pool for it. Enumerating only
 /// the pools would omit that shard *silently*: it would appear in neither
