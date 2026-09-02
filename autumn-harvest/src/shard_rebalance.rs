@@ -396,7 +396,7 @@ pub enum MigrationAction {
 /// Only `Verified → Committed` changes who is authoritative, and it is a
 /// single-statement commit on one database.
 #[must_use]
-pub fn next_migration_action(obs: &MigrationObservation) -> MigrationAction {
+pub const fn next_migration_action(obs: &MigrationObservation) -> MigrationAction {
     match obs.phase {
         MigrationPhase::Done | MigrationPhase::Aborted => MigrationAction::Retire,
         // Past the cutover the source is sealed; rolling back would strand the
@@ -465,8 +465,9 @@ pub fn resolve_forward_chain(
     })
 }
 
-/// Relations copied verbatim to the target shard, in insert order (parents
-/// first). `harvest_events` is copied separately because its `id` is a
+/// Relations copied verbatim to the target shard, in insert order.
+///
+/// Parents first. `harvest_events` is copied separately because its `id` is a
 /// shard-local `BIGSERIAL` that must **not** be carried across.
 ///
 /// Named here rather than inline so the schema-parity guard and the copy walk
@@ -507,8 +508,13 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
 /// shard, so both are re-derived by the target's own defaults. Everything that
 /// is part of the history's meaning — `event_id`, `event_type`, `event_data`,
 /// `timestamp` — is carried byte-for-byte.
-pub const COPIED_EVENT_COLUMNS: &[&str] =
-    &["workflow_exec_id", "event_id", "event_type", "event_data", "timestamp"];
+pub const COPIED_EVENT_COLUMNS: &[&str] = &[
+    "workflow_exec_id",
+    "event_id",
+    "event_type",
+    "event_data",
+    "timestamp",
+];
 
 /// A `WorkflowReplayer`-grade fingerprint of the state a history replays to.
 ///
@@ -529,8 +535,8 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
 
     // 1. The decoded events themselves, in order.
     for event in events {
-        let canonical = serde_json::to_string(event)
-            .unwrap_or_else(|e| format!("<unserializable event: {e}>"));
+        let canonical =
+            serde_json::to_string(event).unwrap_or_else(|e| format!("<unserializable event: {e}>"));
         hasher.update(canonical.as_bytes());
         hasher.update([0u8]);
     }
@@ -567,16 +573,17 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, ShardMigrationCandidate,
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
-    conn_for_execution_forwarded,
-    resolve_target_shard, list_migration_candidates, load_migration, migrate_execution,
+    conn_for_execution_forwarded, list_migration_candidates, load_migration, migrate_execution,
     migrate_quiescent_executions, observe_quiescence, resolve_execution_shard,
-    resume_incomplete_migrations, stage_copy, verify_target_copy,
+    resolve_target_shard, resume_incomplete_migrations, stage_copy, verify_target_copy,
 };
 
 #[cfg(feature = "db")]
 mod db {
     use chrono::{DateTime, Utc};
-    use diesel::sql_types::{BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+    use diesel::sql_types::{
+        BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+    };
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use serde::Serialize;
     use serde_json::Value;
@@ -588,11 +595,9 @@ mod db {
     use crate::types::{ExecutionId, ShardId};
 
     use super::{
-        MAX_FORWARD_HOPS, MAX_RESUME_STEPS, MigrationAction,
-        MigrationObservation, MigrationPhase, Quiescence, QuiescenceBlocker,
-        history_fingerprint,
-        SCHEMA_PARITY_RELATIONS,
-        QuiescenceObservation, assess_quiescence, next_migration_action, resolve_forward_chain,
+        MAX_FORWARD_HOPS, MAX_RESUME_STEPS, MigrationAction, MigrationObservation, MigrationPhase,
+        Quiescence, QuiescenceBlocker, QuiescenceObservation, SCHEMA_PARITY_RELATIONS,
+        assess_quiescence, history_fingerprint, next_migration_action, resolve_forward_chain,
     };
 
     /// The SQL half of the quiescence predicate, as one AND-able fragment over
@@ -976,17 +981,19 @@ mod db {
         .await
         .optional_row()?;
 
-        match row {
-            Some(row) => row.into_record(),
-            // `DO UPDATE ... WHERE` matched nothing: a migration for this
-            // execution is already in flight. Never silently adopt it — the
-            // in-flight one may be targeting a different shard.
-            None => Err(HarvestError::AlreadyExists {
-                existing_exec_id: exec_id,
-                existing_state: "a shard migration for this execution is already in flight"
-                    .to_string(),
-            }),
-        }
+        // `DO UPDATE ... WHERE` matching nothing means a migration for this
+        // execution is already in flight. Never silently adopt it — the
+        // in-flight one may be targeting a different shard.
+        row.map_or_else(
+            || {
+                Err(HarvestError::AlreadyExists {
+                    existing_exec_id: exec_id,
+                    existing_state: "a shard migration for this execution is already in flight"
+                        .to_string(),
+                })
+            },
+            MigrationRow::into_record,
+        )
     }
 
     async fn record_attempt(
@@ -1091,6 +1098,8 @@ mod db {
     /// [`HarvestError::NotFound`] when the execution is not on the source,
     /// [`HarvestError::AlreadyExists`] when the target already holds a live row
     /// for this id, [`HarvestError::Database`] on failure.
+    #[allow(clippy::too_many_lines)] // One linear copy sequence: splitting it
+    // would scatter the single target transaction that makes staging atomic.
     pub async fn stage_copy(
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
@@ -1180,11 +1189,10 @@ mod db {
         };
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
-            {
-                    discard_staged_copy(&mut *conn, exec_id).await?;
+            discard_staged_copy(&mut *conn, exec_id).await?;
 
-                    diesel::sql_query(
-                        "INSERT INTO harvest_workflow_executions \
+            diesel::sql_query(
+                "INSERT INTO harvest_workflow_executions \
                          SELECT * FROM jsonb_populate_record( \
                              NULL::harvest_workflow_executions, \
                              $1::jsonb || jsonb_build_object( \
@@ -1192,44 +1200,43 @@ mod db {
                                  'state', 'MIGRATING', \
                                  'migrated_to_shard', NULL, \
                                  'migrated_at', NULL))",
-                    )
-                    .bind::<Jsonb, _>(&execution)
-                    .bind::<Integer, _>(target_shard.as_i32())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
+            )
+            .bind::<Jsonb, _>(&execution)
+            .bind::<Integer, _>(target_shard.as_i32())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
 
-                    diesel::sql_query(
-                        "INSERT INTO harvest_events \
+            diesel::sql_query(
+                "INSERT INTO harvest_events \
                              (workflow_exec_id, event_id, event_type, event_data, timestamp) \
                          SELECT workflow_exec_id, event_id, event_type, event_data, \"timestamp\" \
                          FROM jsonb_to_recordset($1::jsonb) AS r( \
                              workflow_exec_id uuid, event_id integer, event_type text, \
                              event_data jsonb, \"timestamp\" timestamptz) \
                          ORDER BY event_id",
-                    )
-                    .bind::<Jsonb, _>(&events)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
+            )
+            .bind::<Jsonb, _>(&events)
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
 
-                    for (table, rows) in [
-                        ("harvest_timers", &timers),
-                        ("harvest_signals", &signals),
-                        ("harvest_payload_refs", &payload_refs),
-                        ("harvest_workflow_logs", &workflow_logs),
-                    ] {
-                        diesel::sql_query(format!(
-                            "INSERT INTO {table} SELECT * FROM \
+            for (table, rows) in [
+                ("harvest_timers", &timers),
+                ("harvest_signals", &signals),
+                ("harvest_payload_refs", &payload_refs),
+                ("harvest_workflow_logs", &workflow_logs),
+            ] {
+                diesel::sql_query(format!(
+                    "INSERT INTO {table} SELECT * FROM \
                              jsonb_populate_recordset(NULL::{table}, $1::jsonb)"
-                        ))
-                        .bind::<Jsonb, _>(rows)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(database_error)?;
-                    }
-                    Ok(())
+                ))
+                .bind::<Jsonb, _>(rows)
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
             }
+            Ok(())
         }))
         .await?;
 
@@ -1243,7 +1250,13 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        set_phase(source, exec_id, MigrationPhase::Pending, MigrationPhase::Copied).await
+        set_phase(
+            source,
+            exec_id,
+            MigrationPhase::Pending,
+            MigrationPhase::Copied,
+        )
+        .await
     }
 
     /// Delete a staged (`MIGRATING`) copy from the target, or verify there is
@@ -1266,21 +1279,18 @@ mod db {
 
         match existing.and_then(|r| r.value).as_deref() {
             None => return Ok(()),
-            // A staged copy from this or a previous attempt.
-            Some("MIGRATING") => {}
-            // A row this execution left behind when it was migrated OFF this
-            // shard earlier. Accepting it is what makes a drain reversible:
+            // Either a staged copy from this or a previous attempt, or a row
+            // this execution left behind when it was migrated OFF this shard
+            // earlier. Accepting the latter is what makes a drain reversible:
             // without it, `--from A --to B` over a large population could never
             // be undone by `--from B --to A`, because A still holds the sealed
             // row. The fresh copy carries the same history plus everything that
             // happened since, so replacing it loses nothing.
-            Some("MIGRATED") => {}
+            Some("MIGRATING" | "MIGRATED") => {}
             Some(other) => {
                 return Err(HarvestError::AlreadyExists {
                     existing_exec_id: exec_id,
-                    existing_state: format!(
-                        "already present on the target shard in state {other}"
-                    ),
+                    existing_state: format!("already present on the target shard in state {other}"),
                 });
             }
         }
@@ -1356,8 +1366,10 @@ mod db {
             });
         }
 
-        let source_history = crate::store::load_history_with_codecs(source, exec_id, codecs).await?;
-        let target_history = crate::store::load_history_with_codecs(target, exec_id, codecs).await?;
+        let source_history =
+            crate::store::load_history_with_codecs(source, exec_id, codecs).await?;
+        let target_history =
+            crate::store::load_history_with_codecs(target, exec_id, codecs).await?;
 
         let source_fingerprint = history_fingerprint(&source_history.events);
         let target_fingerprint = history_fingerprint(&target_history.events);
@@ -1663,7 +1675,7 @@ mod db {
     impl ShardMigrationCandidate {
         /// Is this candidate migratable?
         #[must_use]
-        pub fn is_eligible(&self) -> bool {
+        pub const fn is_eligible(&self) -> bool {
             self.blockers.is_empty()
         }
     }
@@ -1889,7 +1901,8 @@ mod db {
             });
         }
 
-        let fingerprint = match verify_target_copy(&mut source, &mut target, exec_id, codecs).await {
+        let fingerprint = match verify_target_copy(&mut source, &mut target, exec_id, codecs).await
+        {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 let reason = error.to_string();
@@ -1973,8 +1986,8 @@ mod db {
             let mut source = checkout(pool, source_shard).await?;
             // Scan wide enough that a shard whose head is busy still yields a
             // full batch, but bounded so one call cannot walk the whole shard.
-            let scan_limit = i64::try_from(limit.saturating_mul(4).clamp(1, 10_000))
-                .unwrap_or(10_000);
+            let scan_limit =
+                i64::try_from(limit.saturating_mul(4).clamp(1, 10_000)).unwrap_or(10_000);
             list_migration_candidates(&mut source, scan_limit).await?
         };
 
@@ -2028,14 +2041,8 @@ mod db {
             // already sealed its source — the one record an operator most needs.
             {
                 let mut source = checkout(pool, source_shard).await?;
-                record_migration_audit(
-                    &mut source,
-                    actor,
-                    source_shard,
-                    target_shard,
-                    &outcome,
-                )
-                .await?;
+                record_migration_audit(&mut source, actor, source_shard, target_shard, &outcome)
+                    .await?;
             }
             outcomes.push(outcome);
         }
@@ -2131,6 +2138,8 @@ mod db {
     ///
     /// [`HarvestError::Database`] on query failure. An individual row that
     /// cannot be advanced records its error and does not fail the sweep.
+    #[allow(clippy::too_many_lines)] // The phase machine's dispatch is one
+    // exhaustive `match`; extracting arms would hide which step each phase takes.
     pub async fn resume_incomplete_migrations(
         pool: &ShardedDbPool,
         source_shard: ShardId,
@@ -2162,117 +2171,124 @@ mod db {
             let mut phase = record.phase;
 
             for _ in 0..MAX_RESUME_STEPS {
-            // Propagated, never swallowed: `unwrap_or(false)` here would turn a
-            // pool blip into "the source is no longer quiescent", and the phase
-            // machine would abort a perfectly good migration and record a reason
-            // naming a wake that never happened.
-            let source_still_quiescent = if phase.is_past_cutover() {
-                false
-            } else {
-                assess_quiescence(&observe_quiescence(&mut source, exec_id).await?).is_eligible()
-            };
+                // Propagated, never swallowed: `unwrap_or(false)` here would turn a
+                // pool blip into "the source is no longer quiescent", and the phase
+                // machine would abort a perfectly good migration and record a reason
+                // naming a wake that never happened.
+                let source_still_quiescent = if phase.is_past_cutover() {
+                    false
+                } else {
+                    assess_quiescence(&observe_quiescence(&mut source, exec_id).await?)
+                        .is_eligible()
+                };
 
-            let action = next_migration_action(&MigrationObservation {
-                phase,
-                source_still_quiescent,
-            });
-            if action == MigrationAction::Retire {
-                break;
-            }
-
-            let stepped: HarvestResult<Option<MigrationOutcome>> = async {
-                match action {
-                    MigrationAction::StageCopy => {
-                        stage_copy(&mut source, &mut target, exec_id, record.target_shard).await?;
-                        Ok(None)
-                    }
-                    MigrationAction::Verify => {
-                        verify_target_copy(&mut source, &mut target, exec_id, codecs).await?;
-                        Ok(None)
-                    }
-                    MigrationAction::Cutover => {
-                        if commit_cutover(&mut source, exec_id, record.target_shard).await? {
-                            Ok(None)
-                        } else {
-                            Ok(Some(MigrationOutcome::Aborted {
-                                execution_id: exec_id,
-                                reason: "no longer quiescent at cutover".to_string(),
-                            }))
-                        }
-                    }
-                    MigrationAction::ActivateTarget => {
-                        activate_target(&mut source, &mut target, exec_id).await?;
-                        collapse_forward_chain(pool, exec_id, record.source_shard,
-                                               record.target_shard).await;
-                        Ok(Some(MigrationOutcome::Migrated {
-                            execution_id: exec_id,
-                            fingerprint: record
-                                .verified_fingerprint
-                                .clone()
-                                .unwrap_or_default(),
-                        }))
-                    }
-                    MigrationAction::Abort => {
-                        abort_migration(
-                            &mut source,
-                            &mut target,
-                            exec_id,
-                            "the execution woke up before cutover",
-                        )
-                        .await?;
-                        Ok(Some(MigrationOutcome::Aborted {
-                            execution_id: exec_id,
-                            reason: "the execution woke up before cutover".to_string(),
-                        }))
-                    }
-                    MigrationAction::Retire => Ok(None),
-                }
-            }
-            .await;
-
-            match stepped {
-                Ok(Some(outcome)) => {
-                    // The resume path performs real cutovers and activations,
-                    // so it is audited exactly like the batch path; without this
-                    // a migration completed by `rebalance-resume` would leave no
-                    // audit record at all.
-                    record_migration_audit(
-                        &mut source,
-                        actor,
-                        record.source_shard,
-                        record.target_shard,
-                        &outcome,
-                    )
-                    .await?;
-                    outcomes.push(outcome);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let reason = error.to_string();
-                    record_attempt(&mut source, exec_id, &reason).await?;
-                    outcomes.push(MigrationOutcome::Aborted {
-                        execution_id: exec_id,
-                        reason,
-                    });
-                    // A failed step leaves the phase where it was; stop rather
-                    // than re-attempting it in a tight loop. The next sweep
-                    // picks it up, under the recorded backoff.
+                let action = next_migration_action(&MigrationObservation {
+                    phase,
+                    source_still_quiescent,
+                });
+                if action == MigrationAction::Retire {
                     break;
                 }
-            }
 
-            // Re-read rather than infer: `commit_cutover` can decline (the run
-            // woke) and `abort_migration` can be a no-op past the cutover, so
-            // the stored phase is the only honest source of what happened.
-            let Some(next) = load_migration(&mut source, exec_id).await? else {
-                break;
-            };
-            if next.phase == phase {
-                // No forward progress — a declined cutover, or a step that
-                // could not advance. Leave it for the next sweep.
-                break;
-            }
-            phase = next.phase;
+                let stepped: HarvestResult<Option<MigrationOutcome>> = async {
+                    match action {
+                        MigrationAction::StageCopy => {
+                            stage_copy(&mut source, &mut target, exec_id, record.target_shard)
+                                .await?;
+                            Ok(None)
+                        }
+                        MigrationAction::Verify => {
+                            verify_target_copy(&mut source, &mut target, exec_id, codecs).await?;
+                            Ok(None)
+                        }
+                        MigrationAction::Cutover => {
+                            if commit_cutover(&mut source, exec_id, record.target_shard).await? {
+                                Ok(None)
+                            } else {
+                                Ok(Some(MigrationOutcome::Aborted {
+                                    execution_id: exec_id,
+                                    reason: "no longer quiescent at cutover".to_string(),
+                                }))
+                            }
+                        }
+                        MigrationAction::ActivateTarget => {
+                            activate_target(&mut source, &mut target, exec_id).await?;
+                            collapse_forward_chain(
+                                pool,
+                                exec_id,
+                                record.source_shard,
+                                record.target_shard,
+                            )
+                            .await;
+                            Ok(Some(MigrationOutcome::Migrated {
+                                execution_id: exec_id,
+                                fingerprint: record
+                                    .verified_fingerprint
+                                    .clone()
+                                    .unwrap_or_default(),
+                            }))
+                        }
+                        MigrationAction::Abort => {
+                            abort_migration(
+                                &mut source,
+                                &mut target,
+                                exec_id,
+                                "the execution woke up before cutover",
+                            )
+                            .await?;
+                            Ok(Some(MigrationOutcome::Aborted {
+                                execution_id: exec_id,
+                                reason: "the execution woke up before cutover".to_string(),
+                            }))
+                        }
+                        MigrationAction::Retire => Ok(None),
+                    }
+                }
+                .await;
+
+                match stepped {
+                    Ok(Some(outcome)) => {
+                        // The resume path performs real cutovers and activations,
+                        // so it is audited exactly like the batch path; without this
+                        // a migration completed by `rebalance-resume` would leave no
+                        // audit record at all.
+                        record_migration_audit(
+                            &mut source,
+                            actor,
+                            record.source_shard,
+                            record.target_shard,
+                            &outcome,
+                        )
+                        .await?;
+                        outcomes.push(outcome);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let reason = error.to_string();
+                        record_attempt(&mut source, exec_id, &reason).await?;
+                        outcomes.push(MigrationOutcome::Aborted {
+                            execution_id: exec_id,
+                            reason,
+                        });
+                        // A failed step leaves the phase where it was; stop rather
+                        // than re-attempting it in a tight loop. The next sweep
+                        // picks it up, under the recorded backoff.
+                        break;
+                    }
+                }
+
+                // Re-read rather than infer: `commit_cutover` can decline (the run
+                // woke) and `abort_migration` can be a no-op past the cutover, so
+                // the stored phase is the only honest source of what happened.
+                let Some(next) = load_migration(&mut source, exec_id).await? else {
+                    break;
+                };
+                if next.phase == phase {
+                    // No forward progress — a declined cutover, or a step that
+                    // could not advance. Leave it for the next sweep.
+                    break;
+                }
+                phase = next.phase;
             }
         }
         Ok(outcomes)
@@ -2364,14 +2380,12 @@ mod db {
         // where the pool map and the router legitimately disagree) is
         // unchanged.
         let origin = pool.routed_shard_for_execution(exec_id);
-        let mut conn = pool
-            .pool_for_execution(exec_id)
-            .get()
-            .await
-            .map_err(|e| HarvestError::ShardUnavailable {
+        let mut conn = pool.pool_for_execution(exec_id).get().await.map_err(|e| {
+            HarvestError::ShardUnavailable {
                 shard_id: origin.as_i32(),
                 reason: format!("pool checkout failed: {e}"),
-            })?;
+            }
+        })?;
 
         if pool.len() <= 1 {
             return Ok(conn);
@@ -2417,9 +2431,7 @@ mod db {
         fallback_shard: ShardId,
     ) -> ShardId {
         let unforwarded = match target {
-            crate::types::ExternalTarget::ExecutionId(id) => {
-                pool.routed_shard_for_execution(*id)
-            }
+            crate::types::ExternalTarget::ExecutionId(id) => pool.routed_shard_for_execution(*id),
             crate::types::ExternalTarget::WorkflowId { .. } => {
                 crate::shard::external_target_owning_shard(target).unwrap_or(fallback_shard)
             }

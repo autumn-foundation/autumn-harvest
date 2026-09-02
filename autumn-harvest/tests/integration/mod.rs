@@ -183,11 +183,11 @@ mod scheduler_overdue_tests;
 #[cfg(feature = "db")]
 mod scheduler_registration_tests;
 mod security;
-#[cfg(feature = "db")]
-mod sharded_runtime_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod shard_rebalance_db_tests;
 mod shard_rebalance_unit;
+#[cfg(feature = "db")]
+mod sharded_runtime_tests;
 mod sharding_unit;
 mod signal_tests;
 #[cfg(feature = "db")]

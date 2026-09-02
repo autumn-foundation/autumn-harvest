@@ -10075,10 +10075,9 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
 
 /// Execute `harvest shard rebalance` / `shard rebalance-resume` against the
 /// shard databases directly (issue #964).
-async fn run_shard_rebalance(
-    command: &ShardCommand,
-    actor: Option<&str>,
-) -> Result<(), CliError> {
+#[allow(clippy::too_many_lines)] // Two sibling subcommands whose argument
+// handling reads better side by side than split across helpers.
+async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Result<(), CliError> {
     use autumn_harvest::payload_codec::PayloadCodecs;
     use autumn_harvest::shard::ShardedDbPool;
     use autumn_harvest::types::ShardId;
@@ -10193,38 +10192,43 @@ async fn run_shard_rebalance(
 fn format_rebalance_report(
     report: &autumn_harvest::shard_rebalance::MigrationBatchReport,
 ) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     let mode = if report.dry_run { " (dry run)" } else { "" };
-    out.push_str(&format!(
-        "shard rebalance {} -> {}{mode}\n",
+    let _ = writeln!(
+        out,
+        "shard rebalance {} -> {}{mode}",
         report.source_shard.as_i32(),
         report.target_shard.as_i32()
-    ));
+    );
     for outcome in &report.outcomes {
         out.push_str("  ");
         out.push_str(&format_rebalance_outcome(outcome));
         out.push('\n');
     }
-    out.push_str(&format!(
-        "\nexamined {}  migrated {}  would-migrate {}  skipped {}  aborted {}\n",
+    let _ = writeln!(
+        out,
+        "\nexamined {}  migrated {}  would-migrate {}  skipped {}  aborted {}",
         report.examined,
         report.migrated(),
         report.would_migrate(),
         report.skipped(),
         report.aborted()
-    ));
+    );
     out
 }
 
-fn format_rebalance_outcome(
-    outcome: &autumn_harvest::shard_rebalance::MigrationOutcome,
-) -> String {
+fn format_rebalance_outcome(outcome: &autumn_harvest::shard_rebalance::MigrationOutcome) -> String {
     use autumn_harvest::shard_rebalance::MigrationOutcome;
     match outcome {
         MigrationOutcome::Migrated {
             execution_id,
             fingerprint,
-        } => format!("migrated      {execution_id}  (verified {})", &fingerprint[..fingerprint.len().min(12)]),
+        } => format!(
+            "migrated      {execution_id}  (verified {})",
+            &fingerprint[..fingerprint.len().min(12)]
+        ),
         MigrationOutcome::WouldMigrate { execution_id } => {
             format!("would-migrate {execution_id}")
         }

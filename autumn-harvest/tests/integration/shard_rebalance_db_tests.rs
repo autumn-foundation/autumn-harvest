@@ -38,8 +38,6 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
-
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
@@ -228,7 +226,11 @@ fn started(input: Value) -> WorkflowEvent {
     }
 }
 
-async fn append_history(conn: &mut AsyncPgConnection, exec_id: ExecutionId, events: &[WorkflowEvent]) {
+async fn append_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+) {
     store::append_events_with_codecs(conn, exec_id, events, 0, &codecs())
         .await
         .expect("append events");
@@ -419,7 +421,10 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
 
     let mut target = shards.target().await;
-    assert_eq!(state_of(&mut target, exec_id).await.as_deref(), Some("RUNNING"));
+    assert_eq!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("RUNNING")
+    );
     // The `shard_id` column follows the run; the ExecutionId deliberately does not.
     let shard_col = count(
         &mut target,
@@ -489,7 +494,10 @@ async fn the_copy_is_byte_identical_and_replay_verified() {
         .expect("load")
         .expect("row exists");
     assert_eq!(record.phase, MigrationPhase::Verified);
-    assert_eq!(record.verified_fingerprint.as_deref(), Some(fingerprint.as_str()));
+    assert_eq!(
+        record.verified_fingerprint.as_deref(),
+        Some(fingerprint.as_str())
+    );
 
     // The source is still fully authoritative: verification writes nothing there.
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
@@ -501,8 +509,12 @@ async fn verification_rejects_a_tampered_copy_and_leaves_the_source_untouched() 
     let exec_id = quiescent_fixture(&shards, "entity-tamper").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
-    stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
 
     // Corrupt exactly one stored event on the target. This is the failure mode
     // a hand-rolled copy would produce silently.
@@ -524,7 +536,10 @@ async fn verification_rejects_a_tampered_copy_and_leaves_the_source_untouched() 
     );
 
     // The source never moved.
-    assert_eq!(state_of(&mut source, exec_id).await.as_deref(), Some("RUNNING"));
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("RUNNING")
+    );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
 }
 
@@ -542,7 +557,9 @@ async fn a_schema_mismatch_refuses_the_copy_before_anything_is_written() {
         .await
         .expect("drop a column to simulate a stale target");
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
     let error = stage_copy(&mut source, &mut target, exec_id, TARGET)
         .await
         .expect_err("a schema mismatch must refuse the copy");
@@ -569,8 +586,14 @@ async fn the_source_is_sealed_with_a_forwarding_pointer_and_never_deleted() {
         .expect("migrate");
 
     let mut source = shards.source().await;
-    assert_eq!(state_of(&mut source, exec_id).await.as_deref(), Some("MIGRATED"));
-    assert_eq!(forward_of(&mut source, exec_id).await, Some(TARGET.as_i32()));
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("MIGRATED")
+    );
+    assert_eq!(
+        forward_of(&mut source, exec_id).await,
+        Some(TARGET.as_i32())
+    );
 
     // Audit survives: the history is still there on the sealed source.
     assert!(
@@ -626,7 +649,10 @@ async fn the_sealed_source_keeps_the_business_key_slot_so_no_duplicate_can_start
 
     // And the copy holds the identity on the target, in its own index.
     let mut target = shards.target().await;
-    assert_eq!(state_of(&mut target, exec_id).await.as_deref(), Some("RUNNING"));
+    assert_eq!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("RUNNING")
+    );
 }
 
 // ── AC1: wakes are never lost and never doubled ──────────────────────────────
@@ -637,8 +663,12 @@ async fn a_signal_arriving_mid_migration_aborts_the_cutover_and_is_not_lost() {
     let exec_id = quiescent_fixture(&shards, "entity-race").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
-    stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
     verify_target_copy(&mut source, &mut target, exec_id, &codecs())
         .await
         .expect("verify");
@@ -655,7 +685,10 @@ async fn a_signal_arriving_mid_migration_aborts_the_cutover_and_is_not_lost() {
     );
 
     // The source is untouched and still holds the signal.
-    assert_eq!(state_of(&mut source, exec_id).await.as_deref(), Some("RUNNING"));
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("RUNNING")
+    );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
     assert_eq!(
         count(
@@ -676,10 +709,20 @@ async fn a_signal_arriving_after_cutover_is_delivered_to_the_target() {
     let exec_id = quiescent_fixture(&shards, "entity-late").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
-    stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
-    verify_target_copy(&mut source, &mut target, exec_id, &codecs()).await.expect("verify");
-    assert!(commit_cutover(&mut source, exec_id, TARGET).await.expect("cutover"));
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
 
     // Past the cutover, an id-routed write resolves through the seal to the
     // target — which is where the signal lands.
@@ -691,7 +734,9 @@ async fn a_signal_arriving_after_cutover_is_delivered_to_the_target() {
 
     // Activation must notice the pending wake and schedule it NOW rather than
     // leaving it waiting on a timer seven days out.
-    activate_target(&mut source, &mut target, exec_id).await.expect("activate");
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
 
     let due_now = count(
         &mut target,
@@ -701,7 +746,10 @@ async fn a_signal_arriving_after_cutover_is_delivered_to_the_target() {
         exec_id,
     )
     .await;
-    assert_eq!(due_now, 1, "the post-cutover wake must be dispatchable, not lost");
+    assert_eq!(
+        due_now, 1,
+        "the post-cutover wake must be dispatchable, not lost"
+    );
 
     // Never doubled: the source has no copy of it and nothing claimable.
     assert_eq!(
@@ -758,23 +806,43 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
 
     for (label, mutate) in [
         ("quiescent", None::<&str>),
-        ("claimed", Some(
-            "UPDATE harvest_task_queue SET state='RUNNING', worker_id='w', started_at=NOW() \
-              WHERE workflow_exec_id = $1")),
-        ("due", Some(
-            "UPDATE harvest_task_queue SET state='PENDING', scheduled_at=NOW() - interval '1 hour' \
-              WHERE workflow_exec_id = $1")),
-        ("wake_requested", Some(
-            "UPDATE harvest_task_queue SET wake_requested = TRUE WHERE workflow_exec_id = $1")),
-        ("signal", Some(
-            "INSERT INTO harvest_signals (id, workflow_exec_id, signal_name, payload, consumed) \
-             VALUES (gen_random_uuid(), $1, 's', '{}'::jsonb, FALSE)")),
-        ("nd_blocked", Some(
-            "UPDATE harvest_workflow_executions SET nd_blocked_at = NOW() WHERE id = $1")),
-        ("session", Some(
-            "INSERT INTO harvest_sessions (id, workflow_exec_id, host_worker_id, queue_name, \
+        (
+            "claimed",
+            Some(
+                "UPDATE harvest_task_queue SET state='RUNNING', worker_id='w', started_at=NOW() \
+              WHERE workflow_exec_id = $1",
+            ),
+        ),
+        (
+            "due",
+            Some(
+                "UPDATE harvest_task_queue SET state='PENDING', scheduled_at=NOW() - interval '1 hour' \
+              WHERE workflow_exec_id = $1",
+            ),
+        ),
+        (
+            "wake_requested",
+            Some("UPDATE harvest_task_queue SET wake_requested = TRUE WHERE workflow_exec_id = $1"),
+        ),
+        (
+            "signal",
+            Some(
+                "INSERT INTO harvest_signals (id, workflow_exec_id, signal_name, payload, consumed) \
+             VALUES (gen_random_uuid(), $1, 's', '{}'::jsonb, FALSE)",
+            ),
+        ),
+        (
+            "nd_blocked",
+            Some("UPDATE harvest_workflow_executions SET nd_blocked_at = NOW() WHERE id = $1"),
+        ),
+        (
+            "session",
+            Some(
+                "INSERT INTO harvest_sessions (id, workflow_exec_id, host_worker_id, queue_name, \
                                            state, created_at, expires_at) \
-             VALUES (gen_random_uuid(), $1, 'w', 'default', 'ACTIVE', NOW(), NOW() + interval '1 h')")),
+             VALUES (gen_random_uuid(), $1, 'w', 'default', 'ACTIVE', NOW(), NOW() + interval '1 h')",
+            ),
+        ),
     ] {
         let exec_id = quiescent_fixture(&shards, &format!("agree-{label}")).await;
         let mut source = shards.source().await;
@@ -787,13 +855,17 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
         }
 
         let pure_says = assess_quiescence(
-            &observe_quiescence(&mut source, exec_id).await.expect("observe"),
+            &observe_quiescence(&mut source, exec_id)
+                .await
+                .expect("observe"),
         )
         .is_eligible();
 
         // Drive the SQL half by attempting a real cutover against a migration
         // row parked at VERIFIED, then roll the effect back by inspection.
-        begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
+        begin_migration(&mut source, exec_id, SOURCE, TARGET)
+            .await
+            .expect("begin");
         diesel::sql_query(
             "UPDATE harvest_shard_migrations SET phase = 'VERIFIED' WHERE execution_id = $1",
         )
@@ -841,7 +913,9 @@ async fn every_id_holder_class_still_resolves_after_migration() {
         captured_by_a_schedule_lineage,
     ] {
         assert_eq!(
-            resolve_execution_shard(&shards.pool, held).await.expect("resolve"),
+            resolve_execution_shard(&shards.pool, held)
+                .await
+                .expect("resolve"),
             SOURCE
         );
     }
@@ -853,11 +927,23 @@ async fn every_id_holder_class_still_resolves_after_migration() {
     // After: the same captured ids resolve to the target, with no rewrite of
     // anything anywhere.
     for (label, held) in [
-        ("parent's ChildWorkflowStarted.child_id", captured_by_parent_child_started),
+        (
+            "parent's ChildWorkflowStarted.child_id",
+            captured_by_parent_child_started,
+        ),
         ("a stored WorkflowHandle", captured_by_a_stored_handle),
-        ("an external signal/cancel target", captured_by_an_external_signal_target),
-        ("a webhook's stored execution reference", captured_by_a_webhook_row),
-        ("a schedule's carryover lineage", captured_by_a_schedule_lineage),
+        (
+            "an external signal/cancel target",
+            captured_by_an_external_signal_target,
+        ),
+        (
+            "a webhook's stored execution reference",
+            captured_by_a_webhook_row,
+        ),
+        (
+            "a schedule's carryover lineage",
+            captured_by_a_schedule_lineage,
+        ),
     ] {
         let resolved = resolve_execution_shard(&shards.pool, held)
             .await
@@ -885,7 +971,9 @@ async fn a_twice_migrated_run_resolves_through_the_chain_and_collapses_it() {
         .await
         .expect("A -> B");
     assert_eq!(
-        resolve_execution_shard(&shards.pool, exec_id).await.expect("resolve"),
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve"),
         TARGET
     );
 
@@ -931,13 +1019,11 @@ async fn a_sealed_source_keeps_forwarding_after_an_operator_force_terminates_it(
         .expect("migrate");
 
     let mut source = shards.source().await;
-    diesel::sql_query(
-        "UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut source)
-    .await
-    .expect("an operator override must not be refused by the forwarding CHECK");
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("an operator override must not be refused by the forwarding CHECK");
 
     assert_eq!(
         resolve_execution_shard(&shards.pool, exec_id)
@@ -1015,13 +1101,11 @@ async fn signal_idempotency_keys_and_timers_survive_the_copy() {
     {
         let mut source = shards.source().await;
         deliver_signal(&mut source, exec_id, "webhook", Some("delivery-42")).await;
-        diesel::sql_query(
-            "UPDATE harvest_signals SET consumed = TRUE WHERE workflow_exec_id = $1",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .execute(&mut source)
-        .await
-        .expect("consume");
+        diesel::sql_query("UPDATE harvest_signals SET consumed = TRUE WHERE workflow_exec_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut source)
+            .await
+            .expect("consume");
     }
 
     migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
@@ -1083,9 +1167,13 @@ async fn a_crash_at_every_phase_leaves_exactly_one_authoritative_shard() {
         let exec_id = quiescent_fixture(&shards, &format!("kill-{kill_after}")).await;
         let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-        begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
+        begin_migration(&mut source, exec_id, SOURCE, TARGET)
+            .await
+            .expect("begin");
         if kill_after != "begin" {
-            stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
+            stage_copy(&mut source, &mut target, exec_id, TARGET)
+                .await
+                .expect("stage");
             // A staged copy is inert: it must not be claimable even though its
             // rows exist.
             assert_eq!(
@@ -1100,7 +1188,11 @@ async fn a_crash_at_every_phase_leaves_exactly_one_authoritative_shard() {
                 .expect("verify");
         }
         if kill_after == "cutover" {
-            assert!(commit_cutover(&mut source, exec_id, TARGET).await.expect("cutover"));
+            assert!(
+                commit_cutover(&mut source, exec_id, TARGET)
+                    .await
+                    .expect("cutover")
+            );
             // Between the cutover and activation the run is claimable NOWHERE —
             // a liveness gap, never a correctness one. What must never happen is
             // TWO.
@@ -1138,13 +1230,26 @@ async fn resume_finishes_a_migration_killed_after_the_cutover() {
     let exec_id = quiescent_fixture(&shards, "entity-resume").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
-    stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
-    verify_target_copy(&mut source, &mut target, exec_id, &codecs()).await.expect("verify");
-    assert!(commit_cutover(&mut source, exec_id, TARGET).await.expect("cutover"));
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
 
     // Crash here. The durable COMMITTED record is the only thing that knows.
-    let record = load_migration(&mut source, exec_id).await.expect("load").expect("row");
+    let record = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
     assert_eq!(record.phase, MigrationPhase::Committed);
 
     resume_incomplete_migrations(&shards.pool, SOURCE, 10, "tester", &codecs())
@@ -1152,7 +1257,10 @@ async fn resume_finishes_a_migration_killed_after_the_cutover() {
         .expect("resume");
 
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
-    let settled = load_migration(&mut source, exec_id).await.expect("load").expect("row");
+    let settled = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
     assert_eq!(settled.phase, MigrationPhase::Done);
 
     // Idempotent: a second sweep changes nothing.
@@ -1168,15 +1276,22 @@ async fn a_resume_aborts_a_pre_cutover_migration_whose_source_woke_up() {
     let exec_id = quiescent_fixture(&shards, "entity-woke").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("begin");
-    stage_copy(&mut source, &mut target, exec_id, TARGET).await.expect("stage");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
     deliver_signal(&mut source, exec_id, "poke", None).await;
 
     resume_incomplete_migrations(&shards.pool, SOURCE, 10, "tester", &codecs())
         .await
         .expect("resume");
 
-    let settled = load_migration(&mut source, exec_id).await.expect("load").expect("row");
+    let settled = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
     assert_eq!(settled.phase, MigrationPhase::Aborted);
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
     assert_eq!(
@@ -1201,9 +1316,10 @@ async fn a_dry_run_writes_nothing_and_reports_the_population_a_real_run_would_mo
         deliver_signal(&mut source, busy, "poke", None).await;
     }
 
-    let dry = migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 10, true, "tester", &codecs())
-        .await
-        .expect("dry run");
+    let dry =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 10, true, "tester", &codecs())
+            .await
+            .expect("dry run");
     assert!(dry.dry_run);
     assert_eq!(dry.would_migrate(), 3);
     assert_eq!(dry.migrated(), 0);
@@ -1225,9 +1341,10 @@ async fn a_dry_run_writes_nothing_and_reports_the_population_a_real_run_would_mo
     );
 
     // The real run moves exactly the population the dry run named.
-    let real = migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 10, false, "tester", &codecs())
-        .await
-        .expect("real run");
+    let real =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 10, false, "tester", &codecs())
+            .await
+            .expect("real run");
     assert_eq!(real.migrated(), dry.would_migrate());
     assert_eq!(real.skipped(), dry.skipped());
 }
@@ -1239,29 +1356,40 @@ async fn the_batch_is_bounded_by_its_limit_and_reports_every_outcome() {
         quiescent_fixture(&shards, &format!("batch-{n}")).await;
     }
 
-    let report = migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 2, false, "tester", &codecs())
-        .await
-        .expect("batch");
-    assert_eq!(report.migrated(), 2, "the limit must bound what actually moves");
+    let report =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 2, false, "tester", &codecs())
+            .await
+            .expect("batch");
+    assert_eq!(
+        report.migrated(),
+        2,
+        "the limit must bound what actually moves"
+    );
     assert_eq!(report.source_shard, SOURCE);
     assert_eq!(report.target_shard, TARGET);
     assert!(
-        report.outcomes.iter().all(|o| o.execution_id().shard() == SOURCE),
+        report
+            .outcomes
+            .iter()
+            .all(|o| o.execution_id().shard() == SOURCE),
         "every outcome names the execution it is about"
     );
 
     // The remaining three are still on the source and still eligible.
     let mut source = shards.source().await;
-    let remaining = list_migration_candidates(&mut source, 100).await.expect("candidates");
+    let remaining = list_migration_candidates(&mut source, 100)
+        .await
+        .expect("candidates");
     assert_eq!(remaining.iter().filter(|c| c.is_eligible()).count(), 3);
 }
 
 #[tokio::test]
 async fn a_batch_to_the_same_shard_is_refused() {
     let shards = setup_two_shards().await;
-    let error = migrate_quiescent_executions(&shards.pool, SOURCE, SOURCE, 1, true, "tester", &codecs())
-        .await
-        .expect_err("a self-migration is meaningless and would forward a row to itself");
+    let error =
+        migrate_quiescent_executions(&shards.pool, SOURCE, SOURCE, 1, true, "tester", &codecs())
+            .await
+            .expect_err("a self-migration is meaningless and would forward a row to itself");
     assert!(matches!(error, HarvestError::Config(_)), "got {error:?}");
 }
 
@@ -1271,11 +1399,16 @@ async fn a_second_concurrent_migration_for_the_same_execution_is_refused() {
     let exec_id = quiescent_fixture(&shards, "entity-double").await;
     let mut source = shards.source().await;
 
-    begin_migration(&mut source, exec_id, SOURCE, TARGET).await.expect("first");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("first");
     let error = begin_migration(&mut source, exec_id, SOURCE, TARGET)
         .await
         .expect_err("two operators must not open two migrations for one run");
-    assert!(matches!(error, HarvestError::AlreadyExists { .. }), "got {error:?}");
+    assert!(
+        matches!(error, HarvestError::AlreadyExists { .. }),
+        "got {error:?}"
+    );
 }
 
 // ── Signal-parked runs: the other half of the eligible population ────────────

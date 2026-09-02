@@ -306,9 +306,18 @@ fn multiple_blockers_are_all_reported_not_just_the_first() {
         ..timer_parked()
     };
     let found = blockers(&obs);
-    assert!(found.contains(&QuiescenceBlocker::ClaimedWorkflowTask), "{found:?}");
-    assert!(found.contains(&QuiescenceBlocker::UnconsumedSignal), "{found:?}");
-    assert!(found.contains(&QuiescenceBlocker::ActiveSession), "{found:?}");
+    assert!(
+        found.contains(&QuiescenceBlocker::ClaimedWorkflowTask),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&QuiescenceBlocker::UnconsumedSignal),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&QuiescenceBlocker::ActiveSession),
+        "{found:?}"
+    );
     assert_eq!(found.len(), 3, "{found:?}");
 }
 
@@ -556,7 +565,11 @@ fn a_live_shards_ids_are_unaffected_by_a_forward_for_another_shard() {
 
 #[test]
 fn the_forward_map_is_empty_by_default() {
-    let router = ShardRouter::new(vec![ShardId::new(0)], vec![ShardId::new(0)], ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
     assert!(
         router.shard_forwards().is_empty(),
         "no deployment gets forwarding behaviour it did not ask for"
@@ -572,14 +585,21 @@ fn the_forward_map_is_surfaced_in_the_router_parts_projection() {
     let router = successor_router();
     let parts = router.parts();
     assert_eq!(parts.shard_forwards.len(), 1);
-    assert_eq!(parts.shard_forwards.get(&ShardId::new(0)), Some(&ShardId::new(2)));
+    assert_eq!(
+        parts.shard_forwards.get(&ShardId::new(0)),
+        Some(&ShardId::new(2))
+    );
 }
 
 #[test]
 #[should_panic(expected = "cannot be forwarded to itself")]
 fn a_self_forward_panics_at_construction() {
-    let _ = ShardRouter::new(vec![ShardId::new(1)], vec![ShardId::new(1)], ShardId::new(1))
-        .with_shard_forwards([(ShardId::new(1), ShardId::new(1))]);
+    let _ = ShardRouter::new(
+        vec![ShardId::new(1)],
+        vec![ShardId::new(1)],
+        ShardId::new(1),
+    )
+    .with_shard_forwards([(ShardId::new(1), ShardId::new(1))]);
 }
 
 #[test]
@@ -598,8 +618,12 @@ fn forwarding_a_still_readable_shard_panics_at_construction() {
 #[test]
 #[should_panic(expected = "which is not in the readable set")]
 fn forwarding_to_an_unreadable_shard_panics_at_construction() {
-    let _ = ShardRouter::new(vec![ShardId::new(1)], vec![ShardId::new(1)], ShardId::new(1))
-        .with_shard_forwards([(ShardId::new(0), ShardId::new(9))]);
+    let _ = ShardRouter::new(
+        vec![ShardId::new(1)],
+        vec![ShardId::new(1)],
+        ShardId::new(1),
+    )
+    .with_shard_forwards([(ShardId::new(0), ShardId::new(9))]);
 }
 
 #[test]
@@ -641,7 +665,10 @@ fn an_unencoded_execution_id_still_resolves_to_the_default_shard() {
     // `ExecutionId::new()` carries the UNENCODED sentinel. Forwarding must not
     // change what that means.
     let router = successor_router();
-    assert_eq!(router.shard_for_execution(ExecutionId::new()), ShardId::new(1));
+    assert_eq!(
+        router.shard_for_execution(ExecutionId::new()),
+        ShardId::new(1)
+    );
 }
 
 // ── AC2: the replay fingerprint must actually discriminate ───────────────────
