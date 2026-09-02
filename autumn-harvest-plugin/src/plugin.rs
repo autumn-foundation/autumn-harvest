@@ -3320,13 +3320,13 @@ mod tests {
                 outbox: HarvestOutboxConfig::default(),
                 batch: crate::config::HarvestBatchConfig::default(),
                 readiness: crate::config::HarvestReadinessConfig::default(),
-                // `off` keeps this unit test hermetic: it asserts the classic-DAG
-                // rejection, and the boot-time orphan gate (issue #1128) is the
-                // first thing `start` does, so any other action would have it
-                // reach for a database this DB-free `--lib` test never provides.
-                startup: crate::config::HarvestStartupConfig {
-                    orphaned_workflows: crate::config::OrphanStartupAction::Off,
-                },
+                // Deliberately the DEFAULT action (`warn`), not `off`: the
+                // classic-DAG rejection is pure configuration validation that
+                // `start` runs BEFORE the issue-#1128 orphan gate, so this
+                // `--lib` test stays DB-free with the gate fully enabled. If the
+                // rejection ever moved back behind the gate, this test would
+                // start reaching for a database it has no access to.
+                startup: crate::config::HarvestStartupConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )

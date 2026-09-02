@@ -25,9 +25,9 @@ use std::pin::Pin;
 use autumn_harvest::WorkflowContext;
 use autumn_harvest::WorkflowEvent;
 use autumn_harvest::builder::HarvestBuilder;
-use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::info::{DagInfo, WorkflowInfo};
 use autumn_harvest::models::NewWorkflowExecution;
-use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::shard::{GLOBAL_SHARDED_POOL, ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
@@ -84,12 +84,54 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     }
 }
 
+/// A UNIFIED dag (`workflow_handler: Some`) — the only kind this runtime accepts,
+/// and the kind whose name must count as a registered workflow type.
+fn unified_dag_info_named(name: &'static str) -> DagInfo {
+    const fn build(_dag: &mut autumn_harvest::dag::DagBuilder) {}
+
+    DagInfo {
+        name,
+        module: "tests",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default"),
+        builder: build,
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+        execution_timeout: None,
+        sla: None,
+    }
+}
+
 fn build_test_pool(database_url: &str) -> DbPool {
+    build_test_pool_sized(database_url, 4)
+}
+
+/// A pool tagged by its `max_size`, so a specific pool is identifiable through
+/// `status().max_size` without opening a connection — the trick
+/// `gate_no_global_install.rs` uses to tell two pools apart.
+fn build_test_pool_sized(database_url: &str, max_size: usize) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(4)
+        .max_size(max_size)
         .build()
         .expect("failed to build test pool")
+}
+
+/// The `max_size` of the shard-0 pool currently installed in `GLOBAL_SHARDED_POOL`.
+fn installed_global_shard0_tag() -> Option<usize> {
+    GLOBAL_SHARDED_POOL
+        .read()
+        .expect("read global sharded pool")
+        .as_ref()
+        .map(|sharded| sharded.pool_for(ShardId::new(0)).status().max_size)
 }
 
 async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgres>) {
@@ -112,37 +154,49 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
     (url, container)
 }
 
-/// A live, migrated Harvest database: the `HARVEST_TEST_DATABASE_URL` server
-/// when one is exported, otherwise a throwaway container (CI, one per test).
+/// A live, migrated Harvest database, isolated to this one test.
+///
+/// The boot gate inspects the **whole** database — it has no `?workflow_type=`
+/// filter, because a boot gate that only looked at some types would not be a
+/// gate. So every test here needs a database of its own: on a shared
+/// `HARVEST_TEST_DATABASE_URL` server, one test's seeded orphan would otherwise
+/// decide another's verdict, and `standalone_start_boots_under_fail_when_clean`
+/// could not be written at all. The container path already gives that isolation
+/// (one container per test); the shared-server path gets it by provisioning a
+/// fresh, uniquely-named, migrated database per call — the same
+/// `provision_ephemeral_db` pattern `autumn-harvest/tests/integration/canary_tests.rs`
+/// uses, for the same reason.
 async fn setup_db_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (url, None);
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (provision_ephemeral_db(&base_url).await, None);
     }
     let (url, container) = setup_database_url_with_migrations().await;
     (url, Some(container))
 }
 
-/// Create a SECOND migrated database on the same server as `database_url` and
-/// return its URL. Used for the multi-shard case, where shard 1 must be a
-/// genuinely different database than shard 0.
-async fn sibling_database_with_migrations(database_url: &str) -> String {
-    let name = format!("harvest_gate_shard_{}", uuid::Uuid::new_v4().simple());
+/// Provision a fresh, uniquely-named, migrated database off `base_url`. The base
+/// role must be able to `CREATE DATABASE`.
+///
+/// Also used to give the multi-shard test a genuinely separate database for
+/// shard 1.
+async fn provision_ephemeral_db(base_url: &str) -> String {
+    let db_name = format!("harvest_gate_{}", uuid::Uuid::new_v4().simple());
     {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        let mut admin = <AsyncPgConnection as AsyncConnection>::establish(base_url)
             .await
-            .expect("connect to create sibling database");
-        diesel::sql_query(format!("CREATE DATABASE {name}"))
-            .execute(&mut conn)
+            .expect("connect to base database");
+        diesel::sql_query(format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&mut admin)
             .await
-            .expect("create sibling database");
+            .expect("create ephemeral database");
     }
-    let sibling = match database_url.rsplit_once('/') {
-        Some((prefix, _)) => format!("{prefix}/{name}"),
-        None => panic!("database url has no path component: {database_url}"),
-    };
-    autumn_web::migrate::run_pending(&sibling, autumn_harvest::MIGRATIONS)
-        .expect("failed to run Harvest migrations on the sibling database");
-    sibling
+    let (prefix, _old_db) = base_url
+        .rsplit_once('/')
+        .expect("base url must carry a /<database> path segment");
+    let url = format!("{prefix}/{db_name}");
+    autumn_web::migrate::run_pending(&url, autumn_harvest::MIGRATIONS)
+        .expect("failed to run Harvest migrations on the ephemeral database");
+    url
 }
 
 /// Seed a non-terminal execution of `workflow_name` on `shard`.
@@ -236,42 +290,6 @@ async fn insert_claimable_task(database_url: &str, exec_id: ExecutionId) -> uuid
     task_id
 }
 
-/// Every workflow type that currently has a non-terminal execution in this
-/// database.
-///
-/// The gate inspects the WHOLE database (it has no `?workflow_type=` filter —
-/// a boot gate must see every orphan), so a "clean fleet" test cannot simply
-/// register its own type and hope the database holds nothing else: a shared
-/// `HARVEST_TEST_DATABASE_URL` server carries other suites' rows. Registering
-/// exactly the set of in-flight types makes "no orphans" true by construction,
-/// in both the container and shared-server modes.
-async fn non_terminal_workflow_types(database_url: &str) -> Vec<String> {
-    use autumn_harvest::schema::harvest_workflow_executions as e;
-
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("connect to list non-terminal types");
-    // The exact complement of the terminal-state list in the engine's
-    // `NON_TERMINAL_COUNTS_SQL`, so this can only ever be a SUPERSET of what the
-    // gate counts — never a subset, which would leave an orphan unregistered
-    // and make the "clean fleet" assertion a false failure.
-    let names: Vec<String> = e::table
-        .filter(e::state.ne_all(vec![
-            "COMPLETED",
-            "FAILED",
-            "CANCELLED",
-            "TIMED_OUT",
-            "CONTINUED_AS_NEW",
-            "TERMINATED",
-        ]))
-        .select(e::workflow_name)
-        .distinct()
-        .load(&mut conn)
-        .await
-        .expect("load non-terminal workflow names");
-    names
-}
-
 fn runtime_config(action: OrphanStartupAction, worker_enabled: bool) -> HarvestRuntimeConfig {
     HarvestRuntimeConfig {
         worker_enabled,
@@ -324,17 +342,41 @@ async fn standalone_start_refuses_boot_on_orphan_under_fail() {
         .workflows(vec![workflow_info_named("runner_gate_registered")])
         .build();
 
+    // Deterministic ordering pin, alongside the row assertions below. Those are
+    // a race detector: if the gate ran AFTER the worker spawn, `start` would
+    // still return `Err` and whether the spawned poll loop got to the row first
+    // would be timing. This is not timing — `PreparedHarvestRuntime::build`
+    // resolves the storage pool through `ShardedDbPool::single`, which WRITES
+    // `GLOBAL_SHARDED_POOL`. So if the gate ran after `build`, the global would
+    // afterwards carry THIS test's distinctively-tagged pool. Snapshot rather
+    // than assert `None`: a sibling test in this binary installs a global of its
+    // own, and libtest gives no ordering guarantee.
+    let pool = build_test_pool_sized(&database_url, 61);
+    let global_before = installed_global_shard0_tag();
+
     let result = HarvestRunner::start(
         built,
         &runtime_config(OrphanStartupAction::Fail, true),
-        HarvestRunnerResources::new(build_test_pool(&database_url))
-            .with_shard_router(single_shard_router()),
+        HarvestRunnerResources::new(pool).with_shard_router(single_shard_router()),
     )
     .await;
 
     let Err(error) = result else {
         panic!("standalone start must refuse to boot with an orphaned workflow type");
     };
+
+    assert_eq!(
+        installed_global_shard0_tag(),
+        global_before,
+        "a refused boot must install no process-global sharded pool — a changed \
+         value means the gate ran after PreparedHarvestRuntime::build, i.e. after \
+         the point where a worker becomes reachable",
+    );
+    assert_ne!(
+        installed_global_shard0_tag(),
+        Some(61),
+        "the aborted boot's own pool must never reach the process global",
+    );
     let message = error.to_string();
     assert!(
         message.contains(&orphan_type),
@@ -450,19 +492,14 @@ async fn standalone_start_boots_under_fail_when_clean() {
     )
     .await;
 
-    // Register every in-flight type (see `non_terminal_workflow_types`) so the
-    // fleet is orphan-free by construction on a shared test server too.
-    let registered: Vec<WorkflowInfo> = non_terminal_workflow_types(&database_url)
-        .await
-        .into_iter()
-        .map(|name| workflow_info_named(Box::leak(name.into_boxed_str())))
-        .collect();
-    assert!(
-        registered.iter().any(|info| info.name == in_use_type),
-        "the seeded in-use type must be among the registered handlers"
-    );
-
-    let built = HarvestBuilder::new().workflows(registered).build();
+    // This database is this test's alone (see `setup_db_env_or_container`), so
+    // registering the one seeded type makes the fleet orphan-free outright: the
+    // type is `in_use`, not `orphaned`.
+    let built = HarvestBuilder::new()
+        .workflows(vec![workflow_info_named(Box::leak(
+            in_use_type.clone().into_boxed_str(),
+        ))])
+        .build();
     let runner = HarvestRunner::start(
         built,
         &runtime_config(OrphanStartupAction::Fail, false),
@@ -485,7 +522,7 @@ async fn standalone_start_boots_under_fail_when_clean() {
 #[tokio::test]
 async fn standalone_gate_detects_an_orphan_on_a_non_zero_shard() {
     let (shard0_url, _container) = setup_db_env_or_container().await;
-    let shard1_url = sibling_database_with_migrations(&shard0_url).await;
+    let shard1_url = provision_ephemeral_db(&shard0_url).await;
 
     let orphan_type = format!(
         "runner_gate_shard1_orphan_{}",
@@ -568,4 +605,104 @@ async fn standalone_start_skips_the_gate_when_the_caller_already_ran_it() {
     .await
     .expect("a caller that already ran the gate must not be gated twice");
     runner.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// AC5 — crash-loop safety, end to end on the standalone path
+// ---------------------------------------------------------------------------
+
+/// `fail` + a REAL orphan + a shard this process cannot inspect must **warn**,
+/// never abort.
+///
+/// This is the branch whose failure mode is a production boot loop, and the
+/// whole `Option<DbPool>` shape of the gate's shard enumeration exists to feed
+/// it: a shard the router names but this process has no pool for is reported
+/// `unavailable`, which degrades the report to `partial`, which
+/// `startup_orphan_decision` turns into a warning. Covered until now only by the
+/// pure decision table and by a unit test asserting the map *shape* — nothing
+/// asserted that a real orphan plus an uninspectable shard actually boots.
+///
+/// Calls the gate directly rather than `HarvestRunner::start`, because `start`
+/// would then reject this router/pool pair for an unrelated reason
+/// (`missing_router_shards`); the gate is the unit whose crash-loop rule is
+/// under test.
+#[tokio::test]
+async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = format!(
+        "runner_gate_partial_orphan_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        &orphan_type,
+        &format!("rgp-{}", uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    // Shard 1 is readable per the router, but this process has no pool for it.
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    let built = HarvestBuilder::new()
+        .workflows(vec![workflow_info_named("runner_gate_registered")])
+        .build();
+    let resources =
+        HarvestRunnerResources::new(build_test_pool(&database_url)).with_shard_router(router);
+
+    autumn_harvest_plugin::runner::run_startup_orphan_gate(
+        OrphanStartupAction::Fail,
+        &built,
+        &resources,
+    )
+    .await
+    .expect(
+        "an incomplete report must warn, never abort: a boot loop has no human in it, so a \
+         shard that could not be inspected must not hard-fail startup",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC6 — a unified DAG's in-flight runs are not orphans
+// ---------------------------------------------------------------------------
+
+/// A registered unified DAG with in-flight runs must NOT read as an orphan.
+///
+/// The DAG half of the registered-set union is load-bearing: executions of a
+/// unified DAG are stored with `workflow_name = <dag name>`, but the handler
+/// registry's workflow map does not carry DAG names. A registered set built from
+/// workflows alone would call every running DAG an orphan and refuse boot under
+/// `fail` — an outage for a correctly configured deployment. Pinned at the
+/// name-set level by a `runner.rs` unit test; this asserts it end to end,
+/// against a real database, through the gate an operator's `fail` action runs.
+#[tokio::test]
+async fn standalone_gate_does_not_orphan_a_registered_unified_dag() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let dag_name: &'static str =
+        Box::leak(format!("runner_gate_dag_{}", uuid::Uuid::new_v4().simple()).into_boxed_str());
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        dag_name,
+        &format!("rgd-{}", uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    // Registered as a unified DAG only — it is deliberately NOT in `workflows`.
+    let built = HarvestBuilder::new()
+        .dags(vec![unified_dag_info_named(dag_name)])
+        .build();
+    let resources = HarvestRunnerResources::new(build_test_pool(&database_url))
+        .with_shard_router(single_shard_router());
+
+    autumn_harvest_plugin::runner::run_startup_orphan_gate(
+        OrphanStartupAction::Fail,
+        &built,
+        &resources,
+    )
+    .await
+    .expect("a registered unified DAG's in-flight runs are in_use, not orphaned");
 }

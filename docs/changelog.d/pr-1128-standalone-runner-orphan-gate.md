@@ -11,10 +11,10 @@ code*, not an equivalent copy.
 orphaned non-terminal executions — a workflow type with in-flight runs but no
 registered `#[workflow]` handler — entirely unflagged. Those runs cannot replay;
 they wedge and surface days later as timeouts or DLQ entries. `[harvest.startup]
-orphaned_workflows` was already parsed and validated on the standalone path (it
-lives on `HarvestRuntimeConfig`, which `HarvestRunner::start` already takes), so
-an operator could set `fail` on a standalone deployment and get nothing at all
-for it.
+orphaned_workflows` already lived on `HarvestRuntimeConfig` — the very struct
+`HarvestRunner::start` takes — and was already parsed and validated by
+`HarvestRuntimeConfig::load()`, so an operator could set `fail` on a standalone
+deployment and get nothing at all for it.
 
 **What shipped.**
 
@@ -72,6 +72,38 @@ the config error; boot is refused either way.
 `harvest_events` footprint.** The gate is a read-only `GROUP BY workflow_name`
 over non-terminal executions plus a pool *selection*.
 
+- **Every shard's gate query is bounded** (`STARTUP_GATE_SHARD_TIMEOUT`, 10s).
+  Harvest configures no deadpool `Timeouts`, so a bare `pool.get().await` is an
+  *unbounded* wait — tolerable for the management route, which serves a request
+  with its own deadline, but not for a check that is the first act of `start`
+  with nothing yet in existence to time it out. A shard that is
+  reachable-but-silent (a dropped security-group rule, a primary mid-failover, a
+  wedged pooler) would otherwise park the boot forever: no error, no crash loop,
+  just a process that never becomes ready — a worse outcome than the one the
+  crash-loop rule exists to prevent, and made worse by the fan-out, where one
+  parked shard strands the whole gate. An elapsed shard is reported
+  `unavailable` like any other unreadable shard, so it flows into the existing
+  incomplete-report rule and degrades to `Warn`.
+- **The two `Warn` outcomes no longer share a log line.**
+  `startup_orphan_decision` returns `Warn` both for "orphans found" and for "the
+  report was incomplete", and the plugin's single message asserted the former in
+  both cases. On the plugin's single shard the incomplete case was
+  near-unreachable; on a multi-shard standalone fleet one flaky shard makes it
+  routine, so every boot would have logged "orphaned workflow types detected"
+  with an empty list — either paging an operator who alerts on that string, or
+  training them to filter away the real detection. The incomplete case now has
+  its own message naming the uninspected shard ids and stating plainly that boot
+  continues.
+- **Pure configuration validation moved ahead of the gate.** The classic-DAG
+  rejection lived inside `PreparedHarvestRuntime::build`, which now runs after
+  the gate. Two reasons to hoist it into `start` rather than leave it there:
+  a classic DAG's in-flight runs read as orphans (the registered set counts only
+  *unified* DAGs), so under `fail` the operator would have got an orphan refusal
+  for what is really an unsupported-configuration error; and inside `build` the
+  check ran *after* `install_completion_callback_config`, so rejecting a
+  configuration that can never boot had already replaced a process-global. It
+  now replaces nothing.
+
 **Test evidence.**
 
 - `runner.rs` unit tests (DB-free, `max_size`-tagged pools so nothing connects
@@ -93,6 +125,32 @@ over non-terminal executions plus a pool *selection*.
   present; `fail` boots a clean fleet; a **multi-shard** runner refuses boot for
   an orphan seeded on shard **1** (the case the plugin's single-shard gate could
   not see); and a caller that already ran the gate is not gated twice.
+- The same suite pins the two branches whose failure modes are outages rather
+  than test failures: **crash-loop safety** end to end (a real orphan plus a
+  shard the router names but this process cannot inspect, under `fail`, must
+  warn and continue — previously covered only by the pure decision table and a
+  unit test asserting the *map shape*), and **a registered unified DAG's
+  in-flight runs are `in_use`, not orphaned** (the DAG half of the registered-set
+  union is load-bearing: without it a correctly configured DAG deployment
+  refuses to boot under `fail`).
+- The refuse-to-boot test also carries a **deterministic** ordering pin
+  alongside its row assertions. Those assertions are a race detector — if the
+  gate ran after the worker spawn, `start` would still return `Err` and whether
+  the spawned poll loop reached the row first would be timing. The pin is not
+  timing: `PreparedHarvestRuntime::build` resolves the storage pool through
+  `ShardedDbPool::single`, which *writes* `GLOBAL_SHARDED_POOL`, so a gate that
+  ran after `build` would leave the global carrying that test's
+  distinctively-tagged pool. It snapshots and compares instead of asserting
+  `None`, because a sibling test installs a global of its own and libtest
+  guarantees no ordering.
+- Each test gets its **own database** — a fresh container in CI, and a freshly
+  provisioned, uniquely-named, migrated database against a shared
+  `HARVEST_TEST_DATABASE_URL` server (the `provision_ephemeral_db` pattern
+  `canary_tests.rs` already uses). The gate deliberately has no
+  `?workflow_type=` filter — a boot gate that inspected only some types would
+  not be a gate — so without per-test isolation one test's seeded orphan would
+  decide another's verdict, and the clean-fleet test could not be written at
+  all.
 - `gate_no_global_install.rs` additionally pins that the multi-shard selector
   installs no `GLOBAL_SHARDED_POOL`, in its own test binary so global state is
   deterministic.

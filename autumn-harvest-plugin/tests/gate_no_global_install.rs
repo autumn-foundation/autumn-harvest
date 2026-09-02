@@ -6,10 +6,14 @@
 //! aborted second-runtime startup in the same process would leave
 //! completion-trigger / timeout code pointing at the aborted runtime's DB.
 //!
-//! The gate instead uses the READ-ONLY `select_runtime_shard0_pool`, which
-//! reads shard 0 from an already-constructed pool (or returns `harvest_pool`
-//! directly) and installs nothing. This test lives in its own binary so
-//! `GLOBAL_SHARDED_POOL` starts unset and no parallel test races it.
+//! The gate instead uses a READ-ONLY selector, which reads pools from an
+//! already-constructed `ShardedDbPool` (or returns `harvest_pool` directly) and
+//! installs nothing. Since issue #1128 that selector is the cross-shard
+//! `select_runtime_gate_shards`; `select_runtime_shard0_pool` is its
+//! single-shard sibling, kept as public API and still pinned here because it
+//! shares the same precedence and the same no-install guarantee. This test lives
+//! in its own binary so `GLOBAL_SHARDED_POOL` starts unset and no parallel test
+//! races it.
 
 use autumn_harvest::shard::{GLOBAL_SHARDED_POOL, ShardedDbPool};
 use autumn_harvest::types::ShardId;

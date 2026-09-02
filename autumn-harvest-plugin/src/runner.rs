@@ -109,38 +109,6 @@ impl HarvestRunnerResources {
         self
     }
 
-    /// The explicit runner-level sharded-pool override, if set.
-    ///
-    /// Used by the plugin's boot-time orphaned-workflow gate (issue #700 P2) to
-    /// select the same shard-0 pool `HarvestRunner::start` will run against, by
-    /// feeding this into [`select_runtime_shard0_pool`] with the exact inputs
-    /// `build` uses — so the gate queries the database the workers actually poll
-    /// rather than assuming `harvest_pool`. Borrowed (not cloned) so the gate's
-    /// selection touches no process global.
-    #[must_use]
-    pub(crate) const fn sharded_pool_override(&self) -> Option<&ShardedDbPool> {
-        self.sharded_pool.as_ref()
-    }
-
-    /// The default Harvest storage pool this bundle was created with.
-    ///
-    /// Read by the boot-time orphaned-workflow gate (issue #1128) so it inspects
-    /// the same database the runner will resolve, without cloning it.
-    #[must_use]
-    pub(crate) const fn harvest_pool(&self) -> &DbPool {
-        &self.harvest_pool
-    }
-
-    /// The shard router this bundle carries, if any.
-    ///
-    /// The boot-time gate adds the router's readable/default shards to the set
-    /// it inspects, so a shard this process has no pool for is reported
-    /// `unavailable` rather than silently omitted (issue #1128).
-    #[must_use]
-    pub(crate) const fn shard_router_override(&self) -> Option<&ShardRouter> {
-        self.shard_router.as_ref()
-    }
-
     /// Declare that the boot-time orphaned-workflow-type gate has **already
     /// been run** by the caller, so [`HarvestRunner::start`] skips it.
     ///
@@ -153,7 +121,14 @@ impl HarvestRunnerResources {
     /// identical warning.
     ///
     /// An embedder driving its own custom boot sequence can use it for the same
-    /// reason, having called the equivalent check itself.
+    /// reason, having called [`run_startup_orphan_gate`] itself.
+    ///
+    /// **This is an assertion the runtime trusts, not one it verifies.** Nothing
+    /// checks that an equivalent check ran, under the same action, over the same
+    /// pools. Setting it without having run the gate does not skip a duplicate —
+    /// it disables the gate outright, including under
+    /// `orphaned_workflows = "fail"`. [`HarvestRunner::start`] logs the skip at
+    /// debug level, so a boot log always records which of the two happened.
     #[must_use]
     pub const fn with_startup_orphan_gate_already_run(mut self) -> Self {
         self.startup_orphan_gate_already_run = true;
@@ -182,8 +157,9 @@ enum RuntimePoolSource<'a> {
 /// A runner-level `resources.sharded_pool` override wins, then a
 /// `WorkerConfig::with_sharded_pool` carried on the build, then the single
 /// `harvest_pool`. Pure SELECTION — installs no process global. Both the
-/// install path ([`resolve_runtime_storage_pool`]) and the boot-gate's read
-/// path ([`select_runtime_shard0_pool`]) route through it, so the
+/// install path ([`resolve_runtime_storage_pool`]) and both read paths
+/// ([`select_runtime_gate_shards`], which the boot gate uses, and
+/// [`select_runtime_shard0_pool`]) route through it, so the
 /// `sharded_pool`-over-`harvest_pool` precedence can never drift between the
 /// gate and the runner.
 const fn pick_runtime_pool_source<'a>(
@@ -206,7 +182,7 @@ const fn pick_runtime_pool_source<'a>(
 ///
 /// The boot-time orphaned-workflow gate must NOT call this — an aborting gate
 /// must mutate no process global (issue #700 P4). It uses
-/// [`select_runtime_shard0_pool`] instead, which shares this function's exact
+/// [`select_runtime_gate_shards`] instead, which shares this function's exact
 /// precedence (via [`pick_runtime_pool_source`]) but installs nothing.
 #[must_use]
 pub fn resolve_runtime_storage_pool(
@@ -229,12 +205,16 @@ pub fn resolve_runtime_storage_pool(
 /// Honors the same precedence as [`resolve_runtime_storage_pool`] but
 /// **without installing any process global** (issue #700 P2 + P4).
 ///
-/// The boot-time orphaned-workflow gate reads through this so an `Abort` mutates
-/// no `GLOBAL_SHARDED_POOL`: it reads shard 0 from an already-constructed
-/// `ShardedDbPool` (`pool_for`, a read), or returns the `harvest_pool` handle
-/// directly — it never calls `ShardedDbPool::single`/`from_map`. Preserves the
-/// P2 guarantee (the gate queries the same database the runner will) while
-/// keeping an aborted gate side-effect-free.
+/// It reads shard 0 from an already-constructed `ShardedDbPool` (`pool_for`, a
+/// read), or returns the `harvest_pool` handle directly — it never calls
+/// `ShardedDbPool::single`/`from_map`.
+///
+/// This is the **single-shard** read selector. The boot-time orphaned-workflow
+/// gate read through it until issue #1128 made the gate cross-shard; it now uses
+/// [`select_runtime_gate_shards`], which enumerates every shard under the same
+/// precedence and the same no-install guarantee. Retained as public API — and
+/// exercised by `tests/gate_no_global_install.rs` — for callers that want only
+/// shard 0.
 #[must_use]
 pub fn select_runtime_shard0_pool(
     resources_sharded_pool: Option<&ShardedDbPool>,
@@ -304,6 +284,43 @@ pub fn select_runtime_gate_shards(
     shards
 }
 
+/// Reject classic (non-unified) DAGs — pure configuration validation, run
+/// before anything with a side effect.
+///
+/// It lived inside `PreparedHarvestRuntime::build` until issue #1128 put the
+/// boot-time orphan gate ahead of `build`. Two reasons to hoist it rather than
+/// leave it behind the gate:
+///
+/// 1. **Diagnostics.** `registered_workflow_type_names` counts only *unified*
+///    DAGs, so a classic-DAG build's in-flight runs read as orphans and, under
+///    `orphaned_workflows = "fail"`, the operator would get an orphan refusal
+///    for what is really an unsupported-configuration error. Boot is refused
+///    either way; this decides which message they see.
+/// 2. **Side effects.** Inside `build` this check ran *after*
+///    `install_completion_callback_config`, so rejecting a configuration that
+///    can never boot had already replaced a process-global. Run here, it
+///    replaces nothing.
+///
+/// # Errors
+///
+/// Returns an error naming every classic DAG in the build.
+fn reject_classic_dags(built: &BuiltHarvest) -> autumn_web::AutumnResult<()> {
+    let classic_dag_names = built
+        .dags()
+        .iter()
+        .filter(|dag| dag.workflow_handler.is_none())
+        .map(|dag| dag.name)
+        .collect::<Vec<_>>();
+    if !classic_dag_names.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "classic DAG execution is not supported by this runtime; \
+             rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
+            classic_dag_names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// The workflow-type names this build registers a handler for: plain workflow
 /// names UNION unified-DAG names.
 ///
@@ -348,7 +365,8 @@ fn registered_workflow_type_names(built: &BuiltHarvest) -> BTreeSet<String> {
 /// protection the gate exists to provide. Both callers run it before that is
 /// possible:
 ///
-/// - [`HarvestRunner::start`] calls it as its first act, before
+/// - [`HarvestRunner::start`] calls it as its first act after the pure
+///   configuration validation, and before
 ///   `PreparedHarvestRuntime::build` — so an abort has installed no global
 ///   router, no completion-callback config and no sharded pool, and synced no
 ///   completion triggers.
@@ -393,10 +411,10 @@ pub async fn run_startup_orphan_gate(
 
     let registered = registered_workflow_type_names(built);
     let shards = select_runtime_gate_shards(
-        resources.sharded_pool_override(),
+        resources.sharded_pool.as_ref(),
         built.worker_config().sharded_pool.as_ref(),
-        resources.harvest_pool(),
-        resources.shard_router_override(),
+        &resources.harvest_pool,
+        resources.shard_router.as_ref(),
     );
     let report = build_reachability_report_for_shards(&registered, &shards, None).await;
     let orphaned_types: Vec<&str> = report
@@ -408,6 +426,33 @@ pub async fn run_startup_orphan_gate(
 
     match startup_orphan_decision(action, report.orphaned, report.status) {
         StartupOrphanDecision::Continue => Ok(()),
+        // `startup_orphan_decision` returns `Warn` for two materially different
+        // situations, and they must not share a log line. An INCOMPLETE report
+        // warns regardless of `orphaned` — detection did not run everywhere — and
+        // on the multi-shard standalone path that is a routine case (one flaky
+        // shard), not the near-unreachable one it was on the plugin's single
+        // shard. Logging "orphaned workflow types detected" with an EMPTY list
+        // would either page an operator alerting on that string, or teach them to
+        // filter away the real detection.
+        StartupOrphanDecision::Warn if orphaned_types.is_empty() => {
+            let unavailable_shards: Vec<i32> = report
+                .shards
+                .iter()
+                .filter(|shard| shard.error.is_some())
+                .map(|shard| shard.shard_id)
+                .collect();
+            tracing::warn!(
+                status = ?report.status,
+                unavailable_shards = ?unavailable_shards,
+                "the boot-time orphaned-workflow check did not complete: at least one \
+                 shard could not be inspected, so an unreachable shard could still host \
+                 in-flight runs whose #[workflow] handler is gone. Boot continues — an \
+                 incomplete check never refuses startup, even under \
+                 orphaned_workflows = fail. See docs/runbooks/safe-deploy.md \
+                 (Pre-cutover handler-coverage gate)."
+            );
+            Ok(())
+        }
         StartupOrphanDecision::Warn => {
             tracing::warn!(
                 orphaned_types = ?orphaned_types,
@@ -656,19 +701,6 @@ impl PreparedHarvestRuntime {
         // restore afterwards cannot un-send the records it exported to a sink
         // that never came into service.
         let built = built.deferring_audit_export_install();
-        let classic_dag_names = built
-            .dags()
-            .iter()
-            .filter(|dag| dag.workflow_handler.is_none())
-            .map(|dag| dag.name)
-            .collect::<Vec<_>>();
-        if !classic_dag_names.is_empty() {
-            return Err(AutumnError::service_unavailable_msg(format!(
-                "classic DAG execution is not supported by this runtime; \
-                 rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
-                classic_dag_names.join(", ")
-            )));
-        }
         let registered_dag_names = built
             .dags()
             .iter()
@@ -695,10 +727,12 @@ impl PreparedHarvestRuntime {
         // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
         let resources_sharded_pool = resources.sharded_pool.is_some();
         // Single source of truth for the pool-resolution precedence (issue #700
-        // P2): the plugin's boot-time orphan gate calls the very same
-        // `resolve_runtime_storage_pool` so it queries the exact database the
-        // workers will poll, and the `sharded_pool`-over-`harvest_pool`
-        // precedence can never drift between the two.
+        // P2): the boot-time orphan gate resolves its shard pools through the
+        // very same `pick_runtime_pool_source`, via `select_runtime_gate_shards`
+        // (the read-only sibling of this install helper), so it queries the exact
+        // databases the workers will poll and the
+        // `sharded_pool`-over-`harvest_pool` precedence can never drift between
+        // the two.
         let storage_pool = resolve_runtime_storage_pool(
             resources.sharded_pool.as_ref(),
             built.worker_config().sharded_pool.as_ref(),
@@ -844,14 +878,23 @@ impl HarvestRunner {
     ///
     /// # Errors
     ///
-    /// Returns an error if the workflow/activity registrations are invalid or
-    /// the worker configuration cannot be materialized.
+    /// Returns an error if the build registers classic (non-unified) DAGs, if
+    /// the boot-time orphaned-workflow-type gate refuses startup
+    /// (`[harvest.startup] orphaned_workflows = "fail"` with orphaned types
+    /// present and a complete report — see [`run_startup_orphan_gate`]), if the
+    /// workflow/activity registrations are invalid, or if the worker
+    /// configuration cannot be materialized.
     #[allow(clippy::too_many_lines)]
     pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        // Pure configuration validation first: it touches no database and no
+        // process global, so a build that can never boot is rejected with the
+        // error that actually names its problem (see `reject_classic_dags`).
+        reject_classic_dags(&built)?;
+
         // Issue #1128: the boot-time orphaned-workflow-type gate, on the
         // STANDALONE path. It runs HERE — the first act of `start`, before
         // `PreparedHarvestRuntime::build` — so an abort spawns no worker poll
@@ -860,7 +903,12 @@ impl HarvestRunner {
         // / completion-callback config, and syncs no completion triggers. The
         // plugin boot path runs the same gate earlier still and marks its
         // resources, so this is a no-op there rather than a second scan.
-        if !resources.startup_orphan_gate_already_run() {
+        if resources.startup_orphan_gate_already_run() {
+            tracing::debug!(
+                action = ?config.startup.orphaned_workflows,
+                "boot-time orphaned-workflow gate skipped: the caller declared it already run"
+            );
+        } else {
             run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
         }
 
