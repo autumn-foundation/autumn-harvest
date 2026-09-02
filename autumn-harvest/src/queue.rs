@@ -4650,6 +4650,17 @@ fn idle_rate_limit_bucket_predicates() -> String {
 /// The cost is that a row skipped by `SKIP LOCKED` below the cursor waits for
 /// the next tick rather than the next batch, which is the right trade for a
 /// periodic best-effort pass.
+///
+/// The deletion is wrapped in a CTE so the statement can end in
+/// `SELECT ... ORDER BY key`, which is not decoration: a `DELETE ... RETURNING`
+/// has no defined row order, and the caller needs the page's boundary key to
+/// advance the cursor. Taking it in SQL rather than in Rust also makes the
+/// boundary obey the DATABASE's collation. Rust's `str` comparison is bytewise;
+/// a database in a locale-aware collation orders differently (under
+/// `en-US-x-icu`, `dyn-rate:t:a` sorts BEFORE `dyn-rate:t:B`, the reverse of
+/// their bytes), so a Rust-side `max()` could sit below the true boundary and
+/// hand the next page rows this one already returned (issue #1127, Codex review
+/// round 5).
 #[must_use]
 fn idle_rate_limit_bucket_sweep_sql() -> String {
     let predicates = idle_rate_limit_bucket_predicates();
@@ -4661,11 +4672,13 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
               ORDER BY b.key \
               LIMIT $2 \
               FOR UPDATE SKIP LOCKED \
+         ), deleted AS ( \
+             DELETE FROM harvest_rate_limit_buckets d \
+              USING victims v \
+              WHERE d.key = v.key \
+             RETURNING d.key \
          ) \
-         DELETE FROM harvest_rate_limit_buckets d \
-          USING victims v \
-          WHERE d.key = v.key \
-         RETURNING d.key"
+         SELECT key FROM deleted ORDER BY key"
     )
 }
 
@@ -4756,11 +4769,14 @@ pub async fn sweep_idle_rate_limit_buckets(
             .await
             .map_err(crate::error::database_error)?;
         let swept = rows.len();
-        // The MAXIMUM key, not the last row: the preview's `SELECT` is ordered,
-        // but a `DELETE ... RETURNING` is not, so "the last row" would be an
-        // arbitrary one and could rewind the cursor into rows already handled.
-        if let Some(highest) = rows.iter().map(|row| &row.key).max() {
-            cursor.clone_from(highest);
+        // The LAST row, because both statements end in `ORDER BY key` and so
+        // hand back the page in the DATABASE's collation order. Deriving the
+        // boundary here instead — `rows.iter().max()` — would compare bytewise,
+        // which is a different order under any locale-aware collation, and a
+        // boundary below the page's true end re-serves rows the next page
+        // already returned.
+        if let Some(last) = rows.last() {
+            cursor.clone_from(&last.key);
         }
         for row in rows {
             // A key that no longer classifies cannot happen (the SQL filters on
@@ -6033,6 +6049,22 @@ mod tests {
                 "the {label}'s cursor is only sound over that ordering"
             );
         }
+        // ...and each must HAND BACK its page in that order, so the caller takes
+        // the boundary from the last row. Deriving it in Rust instead would
+        // compare bytewise, a different order under any locale-aware database
+        // collation, and a boundary below the page's true end re-serves rows the
+        // next page already returned.
+        assert!(
+            preview.trim_end().ends_with("LIMIT $2"),
+            "the preview's ORDER BY/LIMIT is what orders its page: {preview}"
+        );
+        assert!(
+            sweep
+                .trim_end()
+                .ends_with("SELECT key FROM deleted ORDER BY key"),
+            "a DELETE ... RETURNING has no defined order, so the sweep must \
+             re-order its page in SQL: {sweep}"
+        );
     }
 
     // -----------------------------------------------------------------------

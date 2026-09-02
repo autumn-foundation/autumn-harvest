@@ -1317,6 +1317,70 @@ async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() 
     assert!(survivors.iter().all(|key| key.starts_with("dyn-rate:aaa:")));
 }
 
+#[tokio::test]
+async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() {
+    // Codex review round 5, P2. The cursor's next page is `key > $3` evaluated
+    // in the DATABASE's collation, so the boundary has to be the page's last row
+    // in THAT order. Deriving it in Rust compares bytewise, and the two orders
+    // disagree under any locale-aware collation: bytewise `B` (0x42) precedes
+    // `a` (0x61), while `en-US-x-icu` puts `a` first. A boundary below the
+    // page's true end re-serves rows the previous page already returned — which
+    // in a dry run, where nothing is deleted, inflates the forecast and burns
+    // the per-tick budget re-counting the same keys.
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    for key in ["dyn-rate:t:a", "dyn-rate:t:B", "dyn-rate:t:c"] {
+        insert_idle_bucket(&mut conn, key, day_old()).await;
+    }
+
+    // Put the column in a collation where the two orders differ. ICU is not
+    // compiled into every Postgres build, so a failure here means the property
+    // is untestable in this environment, not violated.
+    let switched = diesel::sql_query(
+        "ALTER TABLE harvest_rate_limit_buckets            ALTER COLUMN key TYPE TEXT COLLATE \"en-US-x-icu\"",
+    )
+    .execute(&mut conn)
+    .await
+    .is_ok();
+
+    // Gather while switched, restore, and only THEN assert: a panic with the
+    // column still in a collation the rest of this file did not ask for would
+    // leak into every test that runs after it.
+    let outcome = if switched {
+        let config = RetentionConfig {
+            dry_run: true,
+            batch_size: 2,
+            ..gc_only(WINDOW)
+        };
+        Some(run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await)
+    } else {
+        None
+    };
+    diesel::sql_query("ALTER TABLE harvest_rate_limit_buckets ALTER COLUMN key TYPE TEXT")
+        .execute(&mut conn)
+        .await
+        .expect("restore the column's default collation");
+
+    let Some(result) = outcome else {
+        return;
+    };
+    // Two pages: [a, B] then [c]. With a bytewise boundary the first page ends
+    // at `a`, so `B` comes back a second time and the forecast reads 4.
+    assert_eq!(
+        collected(&result),
+        3,
+        "a dry run must forecast each eligible bucket exactly once"
+    );
+    assert_eq!(
+        surviving_keys(&mut conn).await.len(),
+        3,
+        "and a dry run still deletes nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Upgrade safety — the migration's two backfills (Codex review round 2, P1s)
 // ---------------------------------------------------------------------------

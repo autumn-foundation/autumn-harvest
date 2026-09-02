@@ -141,6 +141,15 @@ with it**, and the gap widens with the retained prefix. The trade is that a row
 skipped by `SKIP LOCKED` below the cursor waits for the next tick rather than
 the next batch, which is the right one for a periodic best-effort pass.
 
+Both statements end in an `ORDER BY key` and the caller takes the boundary from
+the last row, rather than computing it in Rust. `key > $3` is evaluated in the
+**database's** collation, and Rust's comparison is bytewise — under a
+locale-aware collation the two disagree (`en-US-x-icu` sorts `dyn-rate:t:a`
+before `dyn-rate:t:B`, the reverse of their bytes), so a Rust-derived boundary
+can sit below the page's true end and hand the next page rows it already
+returned. In a dry run, where nothing is deleted, that double-counts the
+forecast and spends the per-tick budget re-reading the same keys.
+
 `GET /admin/rate-limits` gains both new columns on its row shape
 (`baseline_set_at`, `last_registered_at`), so "why has this bucket never been
 collected?" and "why not yet?" are answerable from the same read an operator is
