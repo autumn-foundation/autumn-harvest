@@ -9,9 +9,13 @@ fixes the reachable findings it turned up:
 - Four wasmtime advisories (RUSTSEC-2026-0222/0223/0268/0269 — VM-state/
   type-index corruption, guest-controlled host heap allocation, a
   filesystem sandbox escape) against `wasmtime` 46.0.1, the direct
-  dependency behind the `wasm-activities` sandbox feature. Fixed within the
-  already-declared `wasmtime = "46"` range (→ 46.0.3): a lockfile-only
-  `cargo update`, no manifest change, no new MSRV.
+  dependency behind the `wasm-activities` sandbox feature. Fixed in
+  `Cargo.lock` (→ 46.0.3) and, after review pointed out that a workspace's
+  own lockfile never propagates to a downstream consumer, in the manifest
+  floor too: `wasmtime = { version = "46", ... }` → `{ version = "46.0.3",
+  ... }`, matching the `tokio-postgres = { version = "0.7.18", ... }`
+  exact-floor precedent already in the same file. `metrics` (below) got the
+  same manifest-floor treatment for the same reason.
 - RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) against `h2` 0.4.13,
   reached via hyper 1.x → axum → autumn-web, our production HTTP server
   path. Fixed the same way: `cargo update -p h2@0.4.13` → 0.4.19. A second
@@ -27,14 +31,19 @@ fixes the reachable findings it turned up:
 - `metrics` 0.24.5, independently yanked upstream, moves to 0.24.6 the same
   way.
 
-All of the above are lockfile-only `cargo update` moves — zero manifest
-changes. Two of them (h2, crossbeam-epoch) were caught by PR review after
-an initial pass wrongly deferred them as "transitive through autumn-web, so
-the fix needs an autumn-web release" — that reasoning conflated "not a
-direct dependency" with "not fixable via `cargo update`," which doesn't
-follow. After the second catch, every remaining deferred entry was
-re-verified with `cargo update -p <crate> --dry-run` rather than assumed,
-which is also how the two missed yanked-crate fixes turned up.
+Review caught three real mistakes across this PR's history, each fixed in
+its own follow-up commit: (1) h2 and (2) crossbeam-epoch were both first
+wrongly deferred as "transitive through autumn-web, so the fix needs an
+autumn-web release" — that conflated "not a direct dependency" with "not
+fixable via `cargo update`," which doesn't follow, and which also surfaced
+two more wrongly-deferred yanked crates once every remaining entry was
+re-verified with `cargo update --dry-run` instead of assumed; (3) even the
+correctly-applied `cargo update -p wasmtime` in `Cargo.lock` doesn't help a
+downstream consumer of the published `autumn-harvest` crate, whose own
+resolution reads the manifest constraint, not this workspace's lockfile —
+fixed by raising the manifest floor (see above). h2, crossbeam-epoch,
+chacha20, and spin didn't need a manifest-floor fix: none of them are
+direct dependencies in any published crate's manifest in this workspace.
 
 Five findings remain genuinely deferred in `deny.toml` (each confirmed
 stuck via dry-run, not assumed): `lru` (direct dependency — `cache.rs` does
