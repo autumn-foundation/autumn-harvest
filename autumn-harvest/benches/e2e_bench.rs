@@ -69,10 +69,10 @@ mod e2e_bench_support;
 
 use e2e_bench_support::{
     BenchScenario, CHECK_ENV_VAR, Metric, PUBLISHED_BASELINES, REPLAY_CONTROL_DRIFT_PCT,
-    REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR, SHARD_FILTER_ENV_VAR,
+    REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR,
     ScenarioReport, baseline_for, relative_error_pct, render_matrix, render_value,
     replay_control_drift_pct, repro_verdict, selected_scenarios, selected_shard_counts,
-    unknown_scenario_ids,
+    unknown_scenario_ids, unknown_shard_counts,
 };
 
 fn main() {
@@ -96,6 +96,19 @@ async fn run() {
             BenchScenario::all()
                 .iter()
                 .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let unknown_shards = unknown_shard_counts(shard_filter.as_deref());
+    if !unknown_shards.is_empty() {
+        println!(
+            "\n> `{SHARD_FILTER_ENV_VAR}` names no published shard count: {}. This matrix \
+             publishes {}.\n",
+            unknown_shards.join(", "),
+            SHARD_COUNTS
+                .iter()
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         );

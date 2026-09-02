@@ -274,6 +274,16 @@ happened.
   dropped on every ordinary exit, including the error paths. A panic or a Ctrl-C
   can still leave a handful behind on a server you supplied; they are all named
   `harvest_e2e_*` and safe to drop.
+* **The throughput window does not verify every shard stayed loaded.** Each
+  shard runs a fixed completion quota, and the sustained rate is taken over the
+  middle half of all shards' completions pooled together. If one shard finishes
+  its quota appreciably earlier than its peers, it can be idle for part of that
+  window, and the published multi-shard rate is then partly a
+  fewer-shards rate. Every current guard inspects a shard's *own* lifetime, so
+  none of them catches it. On the reference runs the shards finish within a few
+  seconds of each other, so the effect is small — but it is unmeasured, and
+  closing it needs an aligned per-shard window. Tracked in
+  [#1288](https://github.com/autumn-foundation/autumn-harvest/issues/1288).
 * **A supplied URL must be able to `CREATE DATABASE`.** `HARVEST_BENCH_SHARD_URLS`
   and `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. A role without
   that right produces a skip notice, not an error.

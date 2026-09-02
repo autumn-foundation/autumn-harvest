@@ -238,6 +238,27 @@ pub fn unknown_scenario_ids(filter: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Entries of a shard-count filter that name no published shard count.
+///
+/// The counterpart of [`unknown_scenario_ids`]. Without it,
+/// `HARVEST_BENCH_SHARDS=1,3` silently runs only the 1-shard cells while
+/// appearing to have accepted the whole request, and `=3` runs nothing and then
+/// prints the unrelated "no Postgres" guidance -- a reproduction that looks
+/// like it succeeded and did not (Codex review, PR #1282).
+#[must_use]
+pub fn unknown_shard_counts(filter: Option<&str>) -> Vec<String> {
+    let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
+        return Vec::new();
+    };
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| !s.parse::<u32>().is_ok_and(|c| SHARD_COUNTS.contains(&c)))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Parse a comma-separated shard-count filter, keeping only counts the
 /// published matrix covers.
 #[must_use]
@@ -1780,6 +1801,18 @@ mod tests {
         );
         assert!(unknown_scenario_ids(Some("throughput")).is_empty());
         assert!(unknown_scenario_ids(None).is_empty());
+
+        // Shard counts get the same treatment. `1,3` used to run only the
+        // 1-shard cells while looking like it had accepted the whole request,
+        // and `3` ran nothing and then blamed a missing Postgres -- a
+        // reproduction that appears to have succeeded and has not.
+        assert_eq!(unknown_shard_counts(Some("1,3")), vec!["3".to_owned()]);
+        assert_eq!(
+            unknown_shard_counts(Some("2,banana")),
+            vec!["banana".to_owned()]
+        );
+        assert!(unknown_shard_counts(Some("1,2,4")).is_empty());
+        assert!(unknown_shard_counts(None).is_empty());
         assert_eq!(
             selected_shard_counts(Some("3")),
             Vec::<u32>::new(),
