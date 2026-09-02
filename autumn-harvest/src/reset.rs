@@ -1642,6 +1642,7 @@ mod tests {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
+            migrated_from_shards: None,
             id: ExecutionId::new().as_uuid(),
             workflow_name: "wf".into(),
             workflow_id: "id".into(),

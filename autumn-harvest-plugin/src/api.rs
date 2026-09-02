@@ -43945,11 +43945,18 @@ pub async fn poll_update_result(
         loop {
             let result = {
                 // Scope the connection so it is returned to the pool before sleeping.
-                let mut c = pool
-                    .pool_for_execution(exec_id)
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                // Forwarding-aware (issue #964): the admit-and-wake half of an
+                // update routes through `db_conn_for_execution`, which follows
+                // the durable pointer to the live copy. If the poll did not, a
+                // rebalanced workflow would have its update run on the target
+                // while this loop read the sealed source's frozen history —
+                // never observing `UpdateCompleted`/`UpdateFailed`, and
+                // answering 504 for an update that in fact completed.
+                let mut c = autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await?;
                 let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
@@ -53513,6 +53520,7 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
+            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),

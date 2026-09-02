@@ -644,6 +644,34 @@ mod db {
         AND NOT EXISTS (SELECT 1 FROM harvest_dead_letters dl \
             WHERE dl.workflow_exec_id = e.id)";
 
+    /// The second half of the cutover's `WHERE`: "the source history is still
+    /// exactly the history verification passed on".
+    ///
+    /// Quiescence alone is not enough to license a seal. Verification proves the
+    /// copy matches the source *as of the copy*; the cutover happens afterwards —
+    /// immediately in the end-to-end path, but possibly hours later on a resume
+    /// after a crash at `VERIFIED`. In between, the run can legitimately wake,
+    /// execute a full decision cycle, append events and park again on a fresh
+    /// timer. It is quiescent once more, and every predicate in
+    /// [`QUIESCENCE_SQL`] passes — so a cutover checking only quiescence would seal
+    /// it and activate a copy missing everything that cycle did. Lost progress, not
+    /// a lost wake, and invisible afterwards.
+    ///
+    /// Events are append-only with a monotonic per-execution `event_id`, so the
+    /// `(count, max)` pair recorded at verification moves on any append. A record
+    /// with no recorded mark — one written before this guard existed — matches
+    /// nothing and declines, which is the fail-closed direction.
+    const HISTORY_UNCHANGED_SQL: &str = "\
+        EXISTS (SELECT 1 FROM harvest_shard_migrations m \
+                 WHERE m.execution_id = e.id \
+                   AND m.verified_event_count IS NOT NULL \
+                   AND m.verified_max_event_id IS NOT NULL \
+                   AND m.verified_event_count = (SELECT count(*) FROM harvest_events ev \
+                                                  WHERE ev.workflow_exec_id = e.id) \
+                   AND m.verified_max_event_id = \
+                         COALESCE((SELECT max(ev.event_id) FROM harvest_events ev \
+                                    WHERE ev.workflow_exec_id = e.id), -1))";
+
     #[derive(diesel::QueryableByName)]
     struct QuiescenceRow {
         #[diesel(sql_type = Text)]
@@ -1414,10 +1442,23 @@ mod db {
             });
         }
 
+        // Stamp the SOURCE history's high-water mark alongside the fingerprint,
+        // computed from the same connection in the same step. `commit_cutover`
+        // requires it to still hold, which is what stops a run that woke, ran a
+        // decision cycle and re-parked between here and the cutover from being
+        // handed to a copy that predates that cycle. The subqueries are the
+        // marks themselves rather than values read into Rust and bound back,
+        // so there is no read-then-write window of our own making.
         diesel::sql_query(
-            "UPDATE harvest_shard_migrations \
-                SET phase = 'VERIFIED', verified_fingerprint = $2, updated_at = NOW() \
-              WHERE execution_id = $1 AND phase = 'COPIED'",
+            "UPDATE harvest_shard_migrations m \
+                SET phase = 'VERIFIED', verified_fingerprint = $2, updated_at = NOW(), \
+                    verified_event_count = \
+                        (SELECT count(*) FROM harvest_events ev \
+                          WHERE ev.workflow_exec_id = m.execution_id), \
+                    verified_max_event_id = \
+                        COALESCE((SELECT max(ev.event_id) FROM harvest_events ev \
+                                   WHERE ev.workflow_exec_id = m.execution_id), -1) \
+              WHERE m.execution_id = $1 AND m.phase = 'COPIED'",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .bind::<Text, _>(&source_fingerprint)
@@ -1477,7 +1518,7 @@ mod db {
                  UPDATE harvest_workflow_executions e \
                     SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW(), \
                         completed_at = COALESCE(e.completed_at, NOW()) \
-                  WHERE e.id = $1 AND {QUIESCENCE_SQL} \
+                  WHERE e.id = $1 AND {QUIESCENCE_SQL} AND {HISTORY_UNCHANGED_SQL} \
                  RETURNING e.id \
              ), cancelled AS ( \
                  UPDATE harvest_task_queue t \
@@ -1577,26 +1618,51 @@ mod db {
         target: &mut AsyncPgConnection,
         exec_id: ExecutionId,
     ) -> HarvestResult<()> {
-        let staged_task: Option<Value> = {
-            let row: Option<NullableJsonRow> = diesel::sql_query(
-                "SELECT staged_task AS payload FROM harvest_shard_migrations \
-                  WHERE execution_id = $1",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .get_result(source)
-            .await
-            .optional_row()?;
-            row.and_then(|r| r.payload)
-        };
+        // `staged_task` and the shard this copy came FROM, in one read. The
+        // source shard is taken from the migration record rather than from the
+        // source row's own `shard_id`, so a resume long after the cutover still
+        // appends the shard the migration actually moved the run off.
+        let staged: ActivationRow = diesel::sql_query(
+            "SELECT staged_task AS payload, source_shard FROM harvest_shard_migrations \
+              WHERE execution_id = $1",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result(source)
+        .await
+        .optional_row()?
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "cannot activate {exec_id} on the target: no migration record exists \
+                 on the source shard"
+            ))
+        })?;
+        let staged_task: Option<Value> = staged.payload;
+        let source_shard: i32 = staged.source_shard;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             let staged_task = staged_task.clone();
             {
+                // The residence-history append rides on the SAME statement as
+                // the state transition, and inherits its `state = 'MIGRATING'`
+                // guard. That is what makes it exactly-once across the
+                // idempotent re-runs this function is required to tolerate: a
+                // second activation matches zero rows and appends nothing,
+                // instead of growing the array on every resume sweep.
+                //
+                // The copy carried the source's own `migrated_from_shards`
+                // verbatim (the copy is column-list-free), so appending the
+                // source shard here accumulates the full history across any
+                // number of hops without a backwards walk.
                 diesel::sql_query(
-                    "UPDATE harvest_workflow_executions SET state = 'RUNNING' \
+                    "UPDATE harvest_workflow_executions \
+                        SET state = 'RUNNING', \
+                            migrated_from_shards = \
+                                COALESCE(migrated_from_shards, '[]'::jsonb) \
+                                || to_jsonb($2::int) \
                       WHERE id = $1 AND state = 'MIGRATING'",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .bind::<Integer, _>(source_shard)
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
@@ -2388,11 +2454,18 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<ShardId> {
-        let chain = residence_chain(pool, exec_id).await?;
-        Ok(chain
-            .last()
-            .copied()
-            .unwrap_or_else(|| pool.routed_shard_for_execution(exec_id)))
+        let origin = pool.routed_shard_for_execution(exec_id);
+        let mut current = origin;
+        for _ in 0..MAX_FORWARD_HOPS {
+            let mut conn = checkout(pool, current).await?;
+            match read_forward(&mut conn, exec_id).await? {
+                None => return Ok(current),
+                Some(next) => current = next,
+            }
+        }
+        // Mirrors `resolve_forward_chain`'s bound and error exactly; the pure
+        // function is what the unit tests pin, this is its async twin.
+        resolve_forward_chain(origin, |_| Some(origin))
     }
 
     /// Every shard this execution has ever physically occupied, oldest first,
@@ -2406,34 +2479,78 @@ mod db {
     /// rather than just its live ones — GDPR payload erasure above all — has to
     /// visit this whole list, not only its last element.
     ///
+    /// **It is read from `migrated_from_shards`, not walked backwards along the
+    /// forwarding pointers, and that distinction is load-bearing.** The pointers
+    /// are deliberately *collapsed*: a completed migration best-effort rewrites
+    /// the origin's pointer to skip straight to the newest residence, so hops do
+    /// not accumulate past [`MAX_FORWARD_HOPS`]. After A → B → C that leaves A
+    /// pointing at C and no trace of B anywhere in the pointer graph — while B's
+    /// sealed copy still holds the run's full payloads. A chain derived from the
+    /// pointers would therefore report `[A, C]` and an erasure built on it would
+    /// claim success having never touched B. The durable array is appended to at
+    /// every activation and is never collapsed, so it is exact regardless of
+    /// what the routing layer does to the pointers.
+    ///
     /// The chain is `[origin]` for every execution that has never moved, which
     /// is every execution on a single-shard deployment and all but a handful
     /// anywhere else.
     ///
     /// # Errors
     ///
-    /// [`HarvestError::ShardUnavailable`] when a shard on the chain has no pool
-    /// here, or when the chain exceeds [`MAX_FORWARD_HOPS`].
+    /// [`HarvestError::ShardUnavailable`] when the live shard has no pool here
+    /// or the forwarding walk exceeds [`MAX_FORWARD_HOPS`];
+    /// [`HarvestError::Database`] when the stored residence array cannot be
+    /// decoded — fail closed, because a caller that must reach every copy must
+    /// not be handed a silently-shortened list.
     pub async fn residence_chain(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<Vec<ShardId>> {
-        let origin = pool.routed_shard_for_execution(exec_id);
-        let mut chain = vec![origin];
-        let mut current = origin;
-        for _ in 0..MAX_FORWARD_HOPS {
-            let mut conn = checkout(pool, current).await?;
-            match read_forward(&mut conn, exec_id).await? {
-                None => return Ok(chain),
-                Some(next) => {
-                    current = next;
-                    chain.push(next);
-                }
-            }
-        }
-        // Mirrors `resolve_forward_chain`'s bound and error exactly; the pure
-        // function is what the unit tests pin, this is its async twin.
-        resolve_forward_chain(origin, |_| Some(origin)).map(|shard| vec![shard])
+        let live = resolve_execution_shard(pool, exec_id).await?;
+        let mut conn = checkout(pool, live).await?;
+        let row: Option<PriorShardsRow> = diesel::sql_query(
+            "SELECT migrated_from_shards AS shards FROM harvest_workflow_executions \
+              WHERE id = $1",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result(&mut *conn)
+        .await
+        .optional_row()?;
+
+        let mut chain: Vec<ShardId> = match row.and_then(|r| r.shards) {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value::<Vec<i32>>(value)
+                .map_err(|e| {
+                    HarvestError::Database(format!(
+                        "execution {exec_id} has an undecodable migrated_from_shards \
+                         residence history: {e}"
+                    ))
+                })?
+                .into_iter()
+                .map(ShardId::new)
+                .collect(),
+        };
+        chain.push(live);
+        // A run migrated away and later back onto a shard it already occupied
+        // lists it twice. Every consumer is idempotent, but a de-duplicated
+        // chain is what an operator reading `prior_residences` expects.
+        let mut seen = std::collections::HashSet::new();
+        chain.retain(|shard| seen.insert(*shard));
+        Ok(chain)
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ActivationRow {
+        #[diesel(sql_type = Nullable<Jsonb>)]
+        payload: Option<Value>,
+        #[diesel(sql_type = Integer)]
+        source_shard: i32,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct PriorShardsRow {
+        #[diesel(sql_type = Nullable<Jsonb>)]
+        shards: Option<Value>,
     }
 
     /// Check out a connection to one specific shard, failing closed when this

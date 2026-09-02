@@ -3027,8 +3027,26 @@ pub async fn enforce_external_cancels_outbox(
                 // only `.shard()` internally, so the two are provably
                 // equivalent without needing `caller_exec_id` itself here.
                 for (exec_id, workflow_name) in deferred_checks {
+                    // Forwarding-aware (issue #964). These ids come back from a
+                    // cancel that already ran on the target's CURRENT residence,
+                    // but an id still encodes the shard it originated on. For a
+                    // rebalanced target `exact_pool_for_execution` would hand
+                    // back the origin pool and this check would report on the
+                    // sealed source's frozen history — and append its findings
+                    // to a row nothing reads. Resolve the residence first; a
+                    // failure degrades to the un-forwarded shard, which is the
+                    // pre-#964 behaviour.
+                    let residence = match outer_sharded_pool.as_ref() {
+                        Some(pool) => Some(
+                            crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
+                                .await
+                                .unwrap_or_else(|_| pool.routed_shard_for_execution(exec_id)),
+                        ),
+                        None => None,
+                    };
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id)
+                        residence
+                            .and_then(|shard| pool.exact_pool_for(shard))
                             .is_some_and(|e_pool| std::ptr::eq(e_pool, pool.pool_for(caller_shard)))
                     });
                     if same_pool_as_caller {
@@ -3048,7 +3066,8 @@ pub async fn enforce_external_cancels_outbox(
                         }
                     } else if let Some(pool) = outer_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(exec_id))
+                        .zip(residence)
+                        .and_then(|(p, shard)| p.exact_pool_for(shard))
                     {
                         match pool.get().await {
                             Ok(mut target_conn) => {

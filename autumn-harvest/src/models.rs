@@ -231,6 +231,14 @@ pub struct WorkflowExecution {
     /// Non-NULL exactly when `state = 'MIGRATED'`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Every shard that previously hosted this execution (issue #964), oldest
+    /// first, as a JSON array of shard ids. `None` for a run that never moved.
+    /// Together with the shard this row is on, it is the complete set of shards
+    /// still holding a copy of the run's bytes — which is what a cross-residence
+    /// payload erasure traverses, and why it is kept separately from the
+    /// deliberately-collapsed `migrated_to_shard` pointer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /

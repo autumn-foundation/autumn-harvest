@@ -164,6 +164,17 @@ diesel::table! {
         /// Wall-clock of the cutover commit that sealed this row (issue #964).
         /// Non-NULL exactly when `state = 'MIGRATED'`.
         migrated_at -> Nullable<Timestamptz>,
+        /// Every shard that PREVIOUSLY hosted this execution (issue #964), as a
+        /// JSONB array of shard ids, oldest first. Appended to at each
+        /// activation; NULL for an execution that never moved.
+        ///
+        /// Distinct from `migrated_to_shard` on purpose. The pointer is
+        /// collapsed so routing hops do not accumulate, which destroys the
+        /// evidence of intermediate residences; this array does not, so the
+        /// live row's array plus the live row's own shard is the COMPLETE set
+        /// of shards still holding a copy of this run's bytes. That is what a
+        /// cross-residence payload erasure has to traverse.
+        migrated_from_shards -> Nullable<Jsonb>,
     }
 }
 
@@ -1095,6 +1106,13 @@ diesel::table! {
         /// The replay-verification fingerprint the target copy produced, kept
         /// so an operator can see WHAT was verified, not only that it passed.
         verified_fingerprint -> Nullable<Text>,
+        /// The source history's high-water mark at the instant verification
+        /// passed. The cutover seals only while the source's live counts still
+        /// equal these, so a run that woke, ran a decision cycle and re-parked
+        /// between verification and cutover is refused rather than cut over to
+        /// a copy that no longer contains its latest events.
+        verified_event_count -> Nullable<Int8>,
+        verified_max_event_id -> Nullable<Int4>,
         abort_reason -> Nullable<Text>,
         /// The source's parked workflow task row, captured verbatim at stage
         /// time and re-inserted on the target at activation. Held here rather

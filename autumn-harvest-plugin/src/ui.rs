@@ -11836,6 +11836,7 @@ mod tests {
         autumn_harvest::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
+            migrated_from_shards: None,
             quota_key: None,
             id: Uuid::new_v4(),
             workflow_name: "test_workflow".to_string(),

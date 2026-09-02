@@ -63,6 +63,7 @@ use uuid::Uuid;
 
 const SOURCE: ShardId = ShardId::new(0);
 const TARGET: ShardId = ShardId::new(1);
+const THIRD: ShardId = ShardId::new(2);
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -98,6 +99,34 @@ async fn setup_two_shards() -> TwoShards {
         source_url,
         target_url,
         _containers: c1.into_iter().chain(c2).collect(),
+    }
+}
+
+/// Three isolated databases, for the cases that need an INTERMEDIATE residence:
+/// after A → B → C the forwarding pointer is collapsed past B, so B is only
+/// reachable through the durable residence history. Two shards cannot express
+/// that — a second hop there lands back on the origin.
+struct ThreeShards {
+    pool: ShardedDbPool,
+    urls: Vec<String>,
+    _containers: Vec<ContainerAsync<Postgres>>,
+}
+
+async fn setup_three_shards() -> ThreeShards {
+    let (a, c1) = setup_isolated_db().await;
+    let (b, c2) = setup_isolated_db().await;
+    let (c, c3) = setup_isolated_db().await;
+    let pools = [
+        (SOURCE, build_pool(&a)),
+        (TARGET, build_pool(&b)),
+        (THIRD, build_pool(&c)),
+    ]
+    .into_iter()
+    .collect();
+    ThreeShards {
+        pool: ShardedDbPool::from_map(pools, SOURCE),
+        urls: vec![a, b, c],
+        _containers: c1.into_iter().chain(c2).chain(c3).collect(),
     }
 }
 
@@ -232,6 +261,25 @@ async fn append_history(
     events: &[WorkflowEvent],
 ) {
     store::append_events_with_codecs(conn, exec_id, events, 0, &codecs())
+        .await
+        .expect("append events");
+}
+
+/// Append events CONTINUING an existing history, rather than starting one.
+///
+/// `append_history` always begins at event id 0, so a second call collides on
+/// `harvest_events_workflow_exec_id_event_id_key`. Modelling "the run woke and
+/// executed another cycle" needs the real next id.
+async fn append_more(conn: &mut AsyncPgConnection, exec_id: ExecutionId, events: &[WorkflowEvent]) {
+    let next: ScalarInt = diesel::sql_query(
+        "SELECT (COALESCE(max(event_id), -1) + 1)::INTEGER AS value FROM harvest_events \
+          WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .expect("next event id");
+    store::append_events_with_codecs(conn, exec_id, events, next.value.unwrap_or(0), &codecs())
         .await
         .expect("append events");
 }
@@ -866,8 +914,18 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
         begin_migration(&mut source, exec_id, SOURCE, TARGET)
             .await
             .expect("begin");
+        // A VERIFIED record is not just a phase: `commit_cutover` also requires
+        // the source history to still match the high-water mark verification
+        // recorded. Stamp it from the live history so this test exercises the
+        // quiescence half in isolation, which is what it is here to pin.
         diesel::sql_query(
-            "UPDATE harvest_shard_migrations SET phase = 'VERIFIED' WHERE execution_id = $1",
+            "UPDATE harvest_shard_migrations m SET phase = 'VERIFIED', \
+                 verified_event_count = (SELECT count(*) FROM harvest_events ev \
+                                          WHERE ev.workflow_exec_id = m.execution_id), \
+                 verified_max_event_id = \
+                     COALESCE((SELECT max(ev.event_id) FROM harvest_events ev \
+                                WHERE ev.workflow_exec_id = m.execution_id), -1) \
+               WHERE m.execution_id = $1",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .execute(&mut source)
@@ -1595,4 +1653,194 @@ async fn payload_bearing_events(conn: &mut AsyncPgConnection, exec_id: Execution
         exec_id,
     )
     .await
+}
+
+// ── Codex round 2: verification is a snapshot, and pointers are collapsed ────
+
+#[tokio::test]
+async fn a_cutover_refuses_a_source_whose_history_advanced_since_verification() {
+    // The window the quiescence re-check alone does not close. Between
+    // verification and the cutover — instant in the end-to-end path, but hours
+    // on a resume after a crash at VERIFIED — the run can legitimately wake,
+    // execute a whole decision cycle, append events, and park again. It is
+    // quiescent once more, so every predicate in the cutover's WHERE passes.
+    // Sealing then hands authority to a copy that predates that cycle: not a
+    // lost wake but lost PROGRESS, and invisible afterwards.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-advanced").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // The run wakes, runs a cycle, and re-parks on a fresh long timer. Modelled
+    // exactly as the engine would leave it: new events appended, and a task row
+    // that is parked again rather than claimed.
+    append_more(
+        &mut source,
+        exec_id,
+        &[
+            WorkflowEvent::TimerFired {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake-2"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    // Re-park the SAME task row on a fresh timer, which is what the engine
+    // does: a second row would itself be a quiescence blocker and would not
+    // model a woken-and-re-parked run at all.
+    diesel::sql_query(
+        "UPDATE harvest_timers SET fired = TRUE WHERE workflow_exec_id = $1 AND timer_id = 'wake'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("fire the old timer");
+    diesel::sql_query(
+        "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+         VALUES (gen_random_uuid(), $1, 'wake-2', NOW() + interval '7 days', FALSE)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("start the new timer");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, \
+             started_at = NULL, scheduled_at = NOW() + interval '7 days' \
+           WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("re-park the task row");
+
+    // Quiescence alone says yes...
+    assert!(
+        assess_quiescence(
+            &observe_quiescence(&mut source, exec_id)
+                .await
+                .expect("observe")
+        )
+        .is_eligible(),
+        "precondition: the re-parked run is quiescent again, so quiescence \
+         alone would license the cutover"
+    );
+
+    // ...and the cutover still refuses, because the verified copy is stale.
+    let committed = commit_cutover(&mut source, exec_id, TARGET)
+        .await
+        .expect("cutover query");
+    assert!(
+        !committed,
+        "the cutover must refuse a source whose history advanced past the \
+         verified copy"
+    );
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("RUNNING"),
+        "the source must be left untouched"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+
+    // And the refusal is not a wedge. A resume sweep settles the record — it
+    // declines the cutover for the same reason and aborts — leaving exactly one
+    // authoritative shard and nothing for an operator to clean up by hand. The
+    // run is simply migrated later, from its current history.
+    resume_incomplete_migrations(&shards.pool, SOURCE, 10, "tester", &codecs())
+        .await
+        .expect("resume");
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+    let record = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(record.phase, MigrationPhase::Aborted);
+}
+
+#[tokio::test]
+async fn erasing_a_twice_migrated_run_scrubs_the_intermediate_shard_too() {
+    // The forwarding pointers are deliberately COLLAPSED: after A -> B -> C,
+    // A points straight at C and B has vanished from the pointer graph. B's
+    // sealed copy still holds every payload it had. A residence chain derived
+    // from the pointers would therefore report [A, C] and an erasure built on
+    // it would claim success having never touched B.
+    let shards = setup_three_shards().await;
+    let mut a = connect(&shards.urls[0]).await;
+    let exec_id = insert_execution(&mut a, "entity_flow", "gdpr-two-hop").await;
+    append_history(&mut a, exec_id, &[started(json!({"pii": "subject"}))]).await;
+    park_on_signal(&mut a, exec_id).await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+    migrate_execution(&shards.pool, exec_id, TARGET, THIRD, &codecs())
+        .await
+        .expect("B -> C");
+
+    // The pointer graph has been collapsed past B...
+    let mut a = connect(&shards.urls[0]).await;
+    assert_eq!(
+        forward_of(&mut a, exec_id).await,
+        Some(THIRD.as_i32()),
+        "precondition: the origin's pointer was collapsed straight to the newest \
+         residence, erasing B from the pointer graph"
+    );
+    // ...but B still holds the payloads.
+    let mut b = connect(&shards.urls[1]).await;
+    assert!(
+        payload_bearing_events(&mut b, exec_id).await > 0,
+        "precondition: the intermediate sealed copy still holds the subject's data"
+    );
+
+    let mut c = connect(&shards.urls[2]).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut c)
+    .await
+    .expect("complete the migrated run");
+
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_all_residences(
+        &shards.pool,
+        exec_id,
+        "gdpr subject request",
+    )
+    .await
+    .expect("erase across every residence");
+
+    for (label, url) in [
+        ("A", &shards.urls[0]),
+        ("B", &shards.urls[1]),
+        ("C", &shards.urls[2]),
+    ] {
+        let mut conn = connect(url).await;
+        assert_eq!(
+            payload_bearing_events(&mut conn, exec_id).await,
+            0,
+            "shard {label} still holds un-erased payloads"
+        );
+    }
+    let named: Vec<i32> = outcome
+        .prior_residences
+        .iter()
+        .map(|r| r.shard_id)
+        .collect();
+    assert_eq!(
+        named,
+        vec![SOURCE.as_i32(), TARGET.as_i32()],
+        "both prior residences must be named, oldest first"
+    );
 }

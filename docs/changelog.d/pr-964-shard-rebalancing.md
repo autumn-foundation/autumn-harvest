@@ -62,10 +62,16 @@ without a pointer" — an id that resolves nowhere — unrepresentable; it is
 one-directional, so an operator's `terminate` force-write is still the
 idempotent no-op the contract promises rather than a constraint violation.
 
-**Never lost, never doubled.** The cutover re-evaluates the *whole* quiescence
-predicate inside its own `UPDATE ... WHERE`, so a wake arriving at any point
-since the candidate scan makes it match zero rows: the migration aborts and the
-untouched source processes the wake normally. Past the cutover a wake resolves
+**Never lost, never doubled — and never silently rewound.** The cutover
+re-evaluates the *whole* quiescence predicate inside its own `UPDATE ... WHERE`,
+so a wake arriving at any point since the candidate scan makes it match zero
+rows: the migration aborts and the untouched source processes the wake normally.
+Quiescence alone is not sufficient, though, and the gap is subtle: a run that
+wakes, executes a full decision cycle and re-parks is quiescent *again*, so every
+predicate passes while the verified copy is now missing everything that cycle
+did. Verification therefore records the source history's high-water mark and the
+cutover seals only while the source still matches it — lost progress being a
+strictly worse failure than a lost wake, because nothing afterwards reveals it. Past the cutover a wake resolves
 through the seal to the target, and activation notices the pending signal and
 schedules the restored task at `NOW()` rather than leaving it on a timer days
 out. Signals are copied *with* their `idempotency_key`, so a keyed redelivery
@@ -82,7 +88,13 @@ pointer every pre-migration id resolves through). And the erasure entry point
 became **cross-residence**: `erase_workflow_payloads_all_residences` walks the
 execution's whole residence chain — every shard that still holds a copy of its
 bytes, not just the one its id currently routes to — and scrubs each, reporting
-the extra ones in the response's `prior_residences`. The live residence is
+the extra ones in the response's `prior_residences`. That chain is a durable
+`migrated_from_shards` array on the live row rather than a backwards walk of the
+forwarding pointers, because the pointers are deliberately *collapsed*: after
+A → B → C, A points straight at C and B has vanished from the pointer graph while
+B's sealed copy still holds the subject's data. Routing wants the shortest path
+and erasure wants the complete set; they are different questions and now have
+different mechanisms. The live residence is
 erased first and its result is the answer, because it is the only copy whose
 state can honour the terminal-state and legal-hold gates; a sealed source always
 reads as terminal, so gating on one would let a live run be erased through its
@@ -99,7 +111,10 @@ batch executor's per-target dispatch all resolve the *current* residence before
 choosing a pool. Batch is the sharpest case: its all-shard scan discovers a
 rebalanced run on the live target copy, but the id it hands back still encodes
 the origin, so an origin-only pool lookup would send the cancel or terminate into
-the sealed source — sealing the wrong copy while the live one kept running.
+the sealed source — sealing the wrong copy while the live one kept running. The
+update-result poll is the same shape with a different symptom: an update admitted
+on the live target while the poll read the sealed source's frozen history would
+answer `504` for an update that in fact completed.
 
 **Crash-safe by construction.** `harvest_shard_migrations` lives on the *source*
 shard — the database that stays authoritative right up to the cutover — and

@@ -34235,6 +34235,7 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
+            migrated_from_shards: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "trial_subscription".to_string(),
             workflow_id: "sub-42".to_string(),

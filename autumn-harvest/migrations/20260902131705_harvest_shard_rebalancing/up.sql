@@ -80,6 +80,26 @@ ALTER TABLE harvest_workflow_executions
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;
 
+-- ## The durable residence history, and why the forwarding pointer is not it
+--
+-- `migrated_to_shard` answers "where do I write?" and is deliberately
+-- *collapsed*: a run migrated A -> B -> C has A's pointer rewritten straight to
+-- C so hops do not accumulate past the bounded walk depth. That is the right
+-- shape for routing and the wrong shape for anything that must reach every byte
+-- the run has ever left behind, because collapsing A -> C erases the only
+-- evidence that B ever hosted it -- and B's sealed copy still holds the full
+-- payloads until B's own retention collects them.
+--
+-- Erasure is exactly that second question. This column answers it directly and
+-- independently of pointer topology: a JSONB array of every shard that
+-- PREVIOUSLY hosted this execution, oldest first, appended to at each
+-- activation. The live row's array plus the shard the live row is on is the
+-- complete residence set, with no walk and no bound.
+--
+-- NULL for every execution that never moved.
+ALTER TABLE harvest_workflow_executions
+    ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;
+
 -- ## The active-uniqueness index is deliberately LEFT ALONE
 --
 -- Issue #964's AC3 points at the reset path's `TERMINATED` sealing as the
@@ -146,6 +166,25 @@ CREATE TABLE IF NOT EXISTS harvest_shard_migrations (
     -- The replay-verification fingerprint the target copy produced, retained so
     -- an operator can see WHAT was verified rather than only that it passed.
     verified_fingerprint TEXT NULL,
+    -- The SOURCE history's high-water mark at the instant verification passed:
+    -- the number of event rows and the highest per-execution `event_id`.
+    --
+    -- Verification proves the copy matches the source *as of the copy*. The
+    -- cutover happens later -- immediately in the end-to-end path, but possibly
+    -- hours later on a resume after a crash at VERIFIED -- and in between the
+    -- run can legitimately wake, execute a whole decision cycle, append events
+    -- and park again. It is quiescent once more, so a cutover that re-checked
+    -- only quiescence would happily seal it and hand authority to a copy that
+    -- is now missing everything the run did in that window: silently lost
+    -- progress, the worst outcome this feature can produce.
+    --
+    -- Recording the mark makes "the history is still the history we verified" a
+    -- condition of the seal. Events are append-only with a monotonic
+    -- per-execution `event_id`, so any append moves both numbers, and a cutover
+    -- whose record predates this column (NULL) declines rather than proceeding
+    -- unguarded.
+    verified_event_count BIGINT NULL,
+    verified_max_event_id INTEGER NULL,
     -- Why an aborted migration aborted, in operator-readable words.
     abort_reason TEXT NULL,
     -- The source's parked workflow task row, captured verbatim at stage time.

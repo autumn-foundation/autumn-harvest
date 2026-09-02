@@ -11,6 +11,9 @@ ALTER TABLE harvest_workflow_executions
     DROP CONSTRAINT IF EXISTS harvest_we_migrated_forward_check;
 
 ALTER TABLE harvest_workflow_executions
+    DROP COLUMN IF EXISTS migrated_from_shards;
+
+ALTER TABLE harvest_workflow_executions
     DROP COLUMN IF EXISTS migrated_at;
 
 ALTER TABLE harvest_workflow_executions

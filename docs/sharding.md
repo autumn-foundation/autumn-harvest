@@ -497,12 +497,25 @@ outstanding:
 |---|---|---|
 | `PENDING` | re-stage (the inert target copy is discarded and re-made) | yes |
 | `COPIED` | verify | yes |
-| `VERIFIED` | re-check quiescence, then cut over | yes |
+| `VERIFIED` | re-check quiescence **and that the history has not advanced**, then cut over | yes |
 | `COMMITTED` | activate the target (idempotent) | **no** — the target is |
 | `DONE` / `ABORTED` | retire the row | — |
 
 Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
 statement on one database. Run `harvest shard rebalance-resume` after any crash.
+
+**Why the cutover re-checks the history and not only quiescence.** Verification
+proves the copy matches the source *as of the copy*. On the end-to-end path the
+cutover follows within milliseconds, but a resume after a crash at `VERIFIED`
+can arrive hours later — and in between the run may legitimately wake, execute a
+whole decision cycle, append events and park again on a fresh timer. It is
+quiescent once more, so every quiescence predicate passes. Sealing then would
+hand authority to a copy that predates that cycle: not a lost *wake* but lost
+*progress*, and invisible afterwards. Verification therefore records the source
+history's high-water mark (`verified_event_count` / `verified_max_event_id`), and
+the cutover seals only while the source still matches it. A stale record declines
+and the resume sweep aborts it, so the run is simply migrated later from its
+current history rather than wedged.
 
 > **The one honest gap.** Between the cutover commit and the target's activation
 > the run is claimable on *neither* shard. That is a **liveness** gap, not a
@@ -549,7 +562,11 @@ anything that acts on an execution by id. The contract:
 - **Erasure goes to *every* residence, not just the live one.**
   `POST /workflows/{id}/erase-payloads` walks the whole residence chain and
   scrubs each shard that still holds a copy, listing the extra ones in the
-  response's `prior_residences`. The terminal-state and legal-hold gates are
+  response's `prior_residences`. That chain is read from the live row's durable
+  `migrated_from_shards` array, **not** walked backwards along the forwarding
+  pointers — the pointers are deliberately collapsed so hops do not accumulate,
+  which after A → B → C leaves A pointing straight at C and no trace of B, whose
+  sealed copy still holds every payload it had. The terminal-state and legal-hold gates are
   evaluated against the **live** residence only: a sealed source always reads as
   terminal, so gating on one would let a still-running execution be erased
   through its own stale shadow. A source copy retention has already collected
