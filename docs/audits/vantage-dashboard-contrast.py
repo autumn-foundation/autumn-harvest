@@ -102,7 +102,9 @@ def extract_inline_style_pairs(src: str):
     out = []
     for style_m in re.finditer(r'style="([^"]*)"', src):
         decls = style_m.group(1)
-        fg_m = re.search(r"color:\s*(#[0-9a-fA-F]{3,6})", decls)
+        # Same `border-color:`-vs-`color:` leftmost-match hazard as the STYLE
+        # block parse below — see the comment there.
+        fg_m = re.search(r"(?<!-)color:\s*(#[0-9a-fA-F]{3,6})", decls)
         if not fg_m:
             continue
         bg_m = re.search(r"background:\s*(#[0-9a-fA-F]{3,6})", decls)
@@ -159,7 +161,12 @@ def main():
     for selector, decls in rules:
         selector = selector.strip()
         bg_m = re.search(r"background:\s*(#[0-9a-fA-F]{3,6})", decls)
-        fg_m = re.search(r"(?:color|fill):\s*(#[0-9a-fA-F]{3,6})", decls)
+        # `(?<!-)` keeps this from matching the "color:" tail of `border-color:`
+        # (or any other `*-color:` property) — without it, a rule that sets
+        # `border-color` before its real `color:` declaration has its border
+        # color misread as the text color, since `re.search` returns the
+        # leftmost match.
+        fg_m = re.search(r"(?<!-)(?:color|fill):\s*(#[0-9a-fA-F]{3,6})", decls)
         if not fg_m:
             continue
         # Only treat `fill:` as text color when paired with a `font:` decl
