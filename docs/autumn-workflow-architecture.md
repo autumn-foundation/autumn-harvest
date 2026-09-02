@@ -1009,10 +1009,12 @@ Autumn Harvest uses Postgres as the task queue. No external broker (Redis, Rabbi
 
 - **Operational simplicity.** Autumn already requires Postgres. Adding Redis or RabbitMQ doubles the infrastructure surface area for a capability (queueing) that Postgres handles well at the scale Harvest targets.
 - **Transactional consistency.** Enqueuing a task and recording an event in the workflow history happens in a single Postgres transaction. With an external broker, you need distributed transactions or outbox patterns.
-- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second. Harvest targets workloads up to ~10,000 tasks/second, which is well within Postgres' capability.
+- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second, though the measured ceiling is well below the "~10,000 tasks/second" figure once cited here — see the measured numbers below.
 - **Simplicity of deployment.** One binary, one database. This matters enormously for adoption.
 
-**When Postgres is not enough:** If a deployment needs >10,000 tasks/second sustained, Harvest will support an optional `autumn-harvest-redis` adapter crate (Phase 4) that uses Redis Streams for the task queue while keeping Postgres for history and state. But this is an escape hatch, not the default path.
+**Measured, not targeted.** The "~10,000 tasks/second" framing above described a target, not a measurement, and the measured claim path falls well short of it: `docs/performance.md` publishes 640 claims/sec at an 8-concurrent-claimer / 1,000-row-backlog scenario on a 4-core reference machine, falling to 29/sec at a 10,000-row backlog. The bottleneck is a documented, partially-fixed structural query-plan defect (a non-indexable `ORDER BY` forcing a full sequential scan and sort per claim), not a flat ops/sec wall — see that page for the detail and the fixes already landed.
+
+**When Postgres is not enough:** an optional `autumn-harvest-redis` adapter crate exists (see `autumn-harvest-redis/`) that uses Redis Streams for the task queue while keeping Postgres for history and state — an escape hatch, not the default path. Its standalone throughput has been measured (docs/assays/0001-redis-adapter-throughput-ceiling.md): 8,643 ops/sec at 8 concurrent workers on the same reference-machine shape — 13.5x the measured Postgres number above at matched concurrency, though short of the crate's own originally-stated >10,000/sec bar at that concurrency (it crosses 10k only above roughly 16 workers). More importantly, **the adapter is not yet wired into the worker** (`autumn-harvest-redis/src/lib.rs` documents the required transactional-boundary refactor as unbuilt), so it cannot be turned on by an operator today regardless of throughput.
 
 ### 9.2 Queue Semantics
 
