@@ -148,6 +148,38 @@ has no test seam, so the classifier is split out for the same reason
 test was written first and **discarded**: it passed with the fix disabled, because
 the seal never landed inside the window. It would have been evidence of nothing.)
 
+**Codex round 2 (two more P1s).** The first is a distinction between signal and
+cancel that the merge rule had collapsed. `merge_locations` returns `Found` for a
+live run even when a shard could not be inspected, on the reasoning that a live
+run in hand is a real target. That holds for a signal. It does **not** hold for a
+cancel, because `ExternalCancelDelivered` does not report a delivery — it asserts
+a property of the whole business key, "nothing is running under it" — and
+shard-local uniqueness means the shard that could not be read may hold another
+live run the cancellation never touched. Recorded, it durably closes the request
+and the outbox never looks again.
+
+The asymmetry in the fix follows from idempotence, not taste. Cancelling is
+idempotent, so the cancel path still **acts** on the run it found — withholding
+that would leave a live run running through an unrelated shard's outage — and
+withholds only the terminal event, leaving the row pending until a fan-out that
+inspected every shard can make the assertion. It converges: the run just
+cancelled is terminal, so the next complete sweep resolves it and reports.
+Signal delivery is *not* idempotent without an idempotency key, so "deliver but
+stay pending" would deliver the signal twice on the retry; the signal path
+therefore delivers and records as before. `TargetLocation::Found` now carries the
+`uninspected` list so the two paths can decide differently from the same answer.
+
+The second P1: `FANOUT_ACQUIRE_BOUND` bounded only the *checkout*. A connection
+handed over by a peer that then never answers — the database becomes a network
+black hole after checkout, or an `ACCESS EXCLUSIVE` DDL lock blocks the read — is
+just as fatal, and wedges the caller shard's timeout checker, which also runs
+task timeouts, SLA enforcement, session reclaim and every other outbox. The whole
+peer probe is now inside `FANOUT_PEER_BOUND`, with the tighter acquisition bound
+nested inside it: two bounds because they answer different questions — the inner
+one stops scanners waiting on each other's connections, the outer one caps what a
+single unhealthy peer can cost — and expiry is classified as an uninspected
+shard, never as absence.
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a

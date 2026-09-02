@@ -371,7 +371,7 @@ async fn fanout_finds_a_target_pinned_off_its_hash_shard() {
         resolve_location_by_workflow_id(&sharded, Some(&router), "pinned_entity", &workflow_id)
             .await;
     match placement {
-        TargetLocation::Found { shard, run } => {
+        TargetLocation::Found { shard, run, .. } => {
             assert_eq!(shard, ShardId::new(1));
             assert_eq!(run.exec_id, pinned);
         }
@@ -450,7 +450,7 @@ async fn fanout_prefers_the_live_run_over_a_stale_terminal_on_the_hash_shard() {
     )
     .await;
     match placement {
-        TargetLocation::Found { shard, run } => {
+        TargetLocation::Found { shard, run, .. } => {
             assert_eq!(shard, ShardId::new(1));
             assert_eq!(
                 run.exec_id, live,
@@ -1515,5 +1515,178 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
         !types.contains(&"ExternalSignalFailed".to_string())
             && !types.contains(&"ExternalSignalDelivered".to_string()),
         "an uninspectable peer leaves the request pending; got {types:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 8. Codex round 2 regressions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_cancel_by_id_withholds_its_terminal_while_a_shard_is_uninspected() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        ShardId::new(0),
+    );
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Codex round 2 P1. `ExternalCancelDelivered` asserts something about the
+    // whole business key — "nothing is running under it". Uniqueness is
+    // shard-local, so a shard that could not be inspected may hold another live
+    // run this cancellation never touched. Recording success over a partial view
+    // durably closes the request and the outbox never looks again.
+    //
+    // Router knows shards 0, 1 and 2; this process has pools for 0 and 1 only,
+    // so shard 2 is permanently uninspected. A live run sits on shard 1.
+    let workflow_id = key_hashing_to(&router, "partial_cancel_wf", "partial", ShardId::new(0));
+    let live = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "partial_cancel_wf", &workflow_id, live).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    insert_running_row(
+        &mut caller_conn,
+        "by_id_caller",
+        "partial-can-caller",
+        caller,
+    )
+    .await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "partial_cancel_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+
+    // The cancel ACTS — cancelling is idempotent, so acting on the run it found
+    // is pure progress and must not be withheld.
+    assert_eq!(
+        load_execution(&mut conn1, live).await.state,
+        "CANCELLED",
+        "the run that WAS found must still be cancelled; withholding the action \
+         would leave a live run running during an unrelated shard's outage"
+    );
+
+    // …but it must not REPORT, because shard 2 was never inspected.
+    let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        !types.contains(&"ExternalCancelDelivered".to_string()),
+        "`ExternalCancelDelivered` asserts nothing is running under this key, \
+         which a partial fan-out cannot establish; got {types:?}"
+    );
+    assert!(
+        !types.contains(&"ExternalCancelFailed".to_string()),
+        "and it is certainly not a failure; got {types:?}"
+    );
+}
+
+#[tokio::test]
+async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // The convergence half of the test above: withholding the terminal must not
+    // strand the request. Sweep 1 runs with shard 1 un-poolable, sweep 2 with the
+    // full pool map, and the same pending row is then reported.
+    let workflow_id = key_hashing_to(&router, "converge_cancel_wf", "conv", ShardId::new(0));
+    let live = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "converge_cancel_wf", &workflow_id, live).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut caller_conn, "by_id_caller", "conv-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "converge_cancel_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool_without(ShardId::new(1))),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("degraded sweep should succeed");
+    assert!(
+        !history_event_types(&mut caller_conn, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "nothing is reported while a shard is uninspectable"
+    );
+
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("recovered sweep should succeed");
+    assert!(
+        history_event_types(&mut caller_conn, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "once every shard answers, the cancel is reported — withholding must not \
+         strand the request"
+    );
+    assert_eq!(
+        load_execution(&mut conn1, live).await.state,
+        "CANCELLED",
+        "and the target is cancelled either way"
     );
 }

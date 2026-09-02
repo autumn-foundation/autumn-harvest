@@ -2235,6 +2235,8 @@ enum DeliveryRoute {
     Caller {
         /// See [`DeliveryRoute::CrossShard::expected_live`].
         expected_live: bool,
+        /// See [`DeliveryRoute::CrossShard::fanout_complete`].
+        fanout_complete: bool,
     },
     /// Deliver on a fresh connection from `shard`'s pool.
     CrossShard {
@@ -2264,6 +2266,23 @@ enum DeliveryRoute {
         /// and the single-shard short-circuit (where "another shard" does not
         /// exist). Both then behave exactly as they did pre-#1146.
         expected_live: bool,
+        /// Every expected shard was inspected while resolving this target
+        /// (issue #1146, Codex round 2).
+        ///
+        /// `false` only for a live run found over a *partial* view. A signal
+        /// still delivers and records — re-delivery is not idempotent without
+        /// an idempotency key, so staying pending would duplicate it. A cancel
+        /// still cancels, because cancelling is idempotent, but must **not**
+        /// record `ExternalCancelDelivered`: that event asserts "nothing is
+        /// running under this business key", and the shard that could not be
+        /// read may hold another live run of it (uniqueness is shard-local).
+        /// The request stays pending so a later complete fan-out makes the
+        /// assertion instead.
+        ///
+        /// `true` whenever no global resolution ran — `ExecutionId` targets and
+        /// the single-shard short-circuit — since there is no partial view to
+        /// worry about.
+        fanout_complete: bool,
     },
     /// Every expected shard was inspected and none holds a run for this
     /// business key. The caller applies its not-found policy (leave pending
@@ -2326,6 +2345,7 @@ async fn resolve_delivery_route(
     let Some(pool) = sharded_pool else {
         return DeliveryRoute::Caller {
             expected_live: false,
+            fanout_complete: true,
         };
     };
 
@@ -2335,7 +2355,7 @@ async fn resolve_delivery_route(
         caller_exec_id.shard()
     };
 
-    let (target_shard, expected_live) = match target {
+    let (target_shard, expected_live, fanout_complete) = match target {
         ExternalTarget::ExecutionId(id) => {
             let encoded = id.shard();
             let shard = if encoded.is_unencoded() {
@@ -2344,7 +2364,7 @@ async fn resolve_delivery_route(
                 encoded
             };
             // Authoritative by construction; nothing was resolved by observation.
-            (shard, false)
+            (shard, false, true)
         }
         ExternalTarget::WorkflowId {
             workflow_name,
@@ -2364,7 +2384,7 @@ async fn resolve_delivery_route(
                 // No global resolution ran, so there is no live-run expectation
                 // to compare a shard-local read against — and with one shard
                 // there is nowhere else for the key to be.
-                (*only, false)
+                (*only, false, true)
             } else {
                 match crate::external_target_location::resolve_location_by_workflow_id_with(
                     pool,
@@ -2376,9 +2396,15 @@ async fn resolve_delivery_route(
                 )
                 .await
                 {
-                    crate::external_target_location::TargetLocation::Found { shard, run } => {
-                        (shard, !crate::erase::is_terminal_state(&run.state))
-                    }
+                    crate::external_target_location::TargetLocation::Found {
+                        shard,
+                        run,
+                        uninspected,
+                    } => (
+                        shard,
+                        !crate::erase::is_terminal_state(&run.state),
+                        uninspected.is_empty(),
+                    ),
                     crate::external_target_location::TargetLocation::NotFound => {
                         return DeliveryRoute::NoRunAnywhere;
                     }
@@ -2415,11 +2441,15 @@ async fn resolve_delivery_route(
         pool.exact_pool_for_execution(caller_exec_id),
     ) {
         (Some(target_pool), Some(caller_pool)) if std::ptr::eq(target_pool, caller_pool) => {
-            DeliveryRoute::Caller { expected_live }
+            DeliveryRoute::Caller {
+                expected_live,
+                fanout_complete,
+            }
         }
         (Some(_), _) => DeliveryRoute::CrossShard {
             shard: target_shard,
             expected_live,
+            fanout_complete,
         },
         (None, _) => DeliveryRoute::Retry {
             reason: format!("target shard {target_shard} has no storage pool in this process"),
@@ -2754,7 +2784,15 @@ pub async fn enforce_external_signals_outbox(
                 .await;
 
                 let terminal_opt = match route {
-                    DeliveryRoute::Caller { expected_live } => {
+                    // `fanout_complete` is deliberately unused on the signal
+                    // path: a live run found over a partial view is still real
+                    // delivery, and re-delivery is not idempotent without an
+                    // idempotency key, so staying pending would duplicate the
+                    // signal (issue #1146, Codex round 2).
+                    DeliveryRoute::Caller {
+                        expected_live,
+                        fanout_complete: _,
+                    } => {
                         attempt_signal_delivery(
                             conn,
                             SignalDeliveryRequest {
@@ -2772,6 +2810,7 @@ pub async fn enforce_external_signals_outbox(
                     DeliveryRoute::CrossShard {
                         shard: target_shard,
                         expected_live,
+                        fanout_complete: _,
                     } => {
                         let Some(pool) = active_sharded_pool
                             .as_ref()
@@ -3211,8 +3250,13 @@ pub async fn enforce_external_cancels_outbox(
                 };
 
                 let mut target_conn_opt = None;
+                let mut cancel_fanout_complete = true;
                 let terminal_opt = match route {
-                    DeliveryRoute::Caller { expected_live } => {
+                    DeliveryRoute::Caller {
+                        expected_live,
+                        fanout_complete,
+                    } => {
+                    cancel_fanout_complete = fanout_complete;
                     attempt_cancel_delivery(
                         conn,
                         &target,
@@ -3239,7 +3283,9 @@ pub async fn enforce_external_cancels_outbox(
                     DeliveryRoute::CrossShard {
                         shard: target_shard,
                         expected_live,
+                        fanout_complete,
                     } => {
+                    cancel_fanout_complete = fanout_complete;
                     let Some(pool) = active_sharded_pool
                         .as_ref()
                         .and_then(|p| p.exact_pool_for(target_shard))
@@ -3296,6 +3342,40 @@ pub async fn enforce_external_cancels_outbox(
                     target_conn_opt = Some(target_conn);
                     terminal
                     }
+                };
+
+                // A cancellation reached over a PARTIAL fan-out may act but may
+                // not report (issue #1146, Codex round 2).
+                // `ExternalCancelDelivered` asserts "nothing is running under
+                // this business key", and `(workflow_name, workflow_id)`
+                // uniqueness is shard-local — so a shard we could not read may
+                // hold another live run of the same key, which this
+                // cancellation did not touch. Recording success here would
+                // durably close the request over that run and the outbox would
+                // never look again.
+                //
+                // The cancel itself stands: cancelling is idempotent, so acting
+                // on the run we found is pure progress. Only the terminal event
+                // is withheld, leaving the row pending until a fan-out that
+                // inspected every shard can make the assertion. That converges
+                // — the run just cancelled is terminal, so the next complete
+                // sweep resolves it (or a sibling) and records the outcome.
+                //
+                // The signal path deliberately does NOT do this: re-delivery is
+                // not idempotent without an idempotency key, so staying pending
+                // would deliver the signal twice.
+                let terminal_opt = match terminal_opt {
+                    Some(WorkflowEvent::ExternalCancelDelivered { .. })
+                        if !cancel_fanout_complete =>
+                    {
+                        tracing::warn!(
+                            caller_exec_id = %caller_exec_id,
+                            "by-id cancel: acted on the run found, but a shard could not be \
+                             inspected; withholding the terminal until a complete fan-out"
+                        );
+                        None
+                    }
+                    other => other,
                 };
 
                 let CancelDeliveryAccumulators {

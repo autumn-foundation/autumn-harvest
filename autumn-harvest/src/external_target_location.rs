@@ -134,6 +134,23 @@ pub enum TargetLocation {
         shard: ShardId,
         /// The winning run under the [`select_resolved_run`] ranking.
         run: ResolvedRun,
+        /// Shards that could not be inspected, if any. **Non-empty means this
+        /// answer is a live run found over a partial view**, and the caller must
+        /// decide whether its operation may act on that (issue #1146, Codex
+        /// round 2).
+        ///
+        /// A **signal** may. Delivering to a live run in hand is real delivery,
+        /// and re-delivery is not idempotent without an idempotency key — so
+        /// "deliver but stay pending" would duplicate the signal on the retry.
+        ///
+        /// A **cancel** may act but must not *report*. `ExternalCancelDelivered`
+        /// asserts something about the whole business key — "nothing is running
+        /// under it" — and because `(workflow_name, workflow_id)` uniqueness is
+        /// shard-local, the shard that could not be read may hold another live
+        /// run. Cancelling is idempotent, so the cancel path cancels what it
+        /// found and leaves the request pending, letting a later **complete**
+        /// fan-out be what makes the assertion.
+        uninspected: Vec<UninspectedShard>,
     },
     /// **Every** expected shard was inspected and none holds a run for this
     /// key. Only this outcome may become a permanent `target_unknown`.
@@ -154,6 +171,21 @@ impl TargetLocation {
         match self {
             Self::Found { shard, .. } => Some(*shard),
             _ => None,
+        }
+    }
+
+    /// Did the fan-out behind this answer inspect **every** expected shard?
+    ///
+    /// `false` on a [`Self::Found`] reached over a partial view, and on every
+    /// [`Self::Indeterminate`]. A caller whose success event asserts something
+    /// about the business key as a whole must not record it while this is
+    /// `false` — see [`Self::Found`]'s `uninspected`.
+    #[must_use]
+    pub const fn fanout_was_complete(&self) -> bool {
+        match self {
+            Self::Found { uninspected, .. } => uninspected.is_empty(),
+            Self::NotFound => true,
+            Self::Indeterminate { .. } => false,
         }
     }
 }
@@ -261,7 +293,11 @@ pub fn merge_locations(
         .into_iter()
         .find(|(_, run)| run.exec_id == winner.exec_id)
         .map_or_else(|| winner.exec_id.shard(), |(shard, _)| shard);
-    TargetLocation::Found { shard, run: winner }
+    TargetLocation::Found {
+        shard,
+        run: winner,
+        uninspected,
+    }
 }
 
 /// How long a fan-out will wait for a **peer** shard's connection before giving
@@ -295,6 +331,32 @@ pub fn merge_locations(
 /// `ExecutionId` targets) and was unbounded; `timeout.rs` now bounds it with
 /// this constant too.
 pub const FANOUT_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Total budget for one **peer** shard probe — acquisition *and* query
+/// (issue #1146, Codex round 2 P1).
+///
+/// [`FANOUT_ACQUIRE_BOUND`] bounds only the checkout. A connection that is
+/// handed over and then never answers is just as fatal: the peer database
+/// becomes a network black hole after checkout, or an `ACCESS EXCLUSIVE` DDL
+/// lock blocks the read, and the `await` on the query hangs forever. That
+/// wedges the *caller* shard's timeout checker, which also runs task timeouts,
+/// SLA enforcement, session reclaim and every other outbox — so one unhealthy
+/// peer halts unrelated enforcement on a healthy shard indefinitely.
+///
+/// The whole peer probe is therefore wrapped in this bound, with the tighter
+/// acquisition bound nested inside it. Two bounds rather than one because they
+/// answer different questions: the inner one keeps per-shard scanners from
+/// waiting on each other's connections at all (a circular wait), while this one
+/// caps what a single unhealthy peer can cost. Expiry is classified exactly like
+/// a failed acquisition — an [`UninspectedShard`], hence `Indeterminate` and a
+/// retry, never "the key is not there".
+///
+/// Generous relative to a healthy probe (an indexed lookup on
+/// `(workflow_name, workflow_id)`) so ordinary load never trips it, and small
+/// enough that N shards cannot dominate a scanner tick — the per-sweep
+/// [`UninspectableShards`] memo caps the cost at one bound per shard per sweep
+/// rather than per row.
+pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Shards a sweep has already found uninspectable, memoized for the length of
 /// that sweep (issue #1146).
@@ -433,45 +495,54 @@ pub async fn resolve_location_by_workflow_id_with(
             continue;
         };
 
-        // 3. Tightly bounded acquisition — see `FANOUT_ACQUIRE_BOUND`. This is a
-        //    peer pool, reached while holding a connection from another pool in
-        //    the same process, so it must fail fast rather than wait out
-        //    contention.
-        let acquired = tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await;
-        let mut conn = match acquired {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
-                let reason = format!("could not acquire a connection: {e}");
-                if let Some(memo) = memo {
-                    memo.record(shard, reason.clone());
+        // 3. The whole peer probe — acquisition AND query — under one budget,
+        //    with the tighter acquisition bound nested inside it. See
+        //    `FANOUT_ACQUIRE_BOUND` (circular wait) and `FANOUT_PEER_BOUND`
+        //    (an unhealthy peer wedging this shard's scanner).
+        let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
+            let conn = tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await;
+            let mut conn = match conn {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    return Err(format!("could not acquire a connection: {e}"));
                 }
-                uninspected.push(UninspectedShard { shard, reason });
-                continue;
-            }
-            Err(_elapsed) => {
-                let reason = format!(
-                    "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy or \
-                     unreachable)"
-                );
-                if let Some(memo) = memo {
-                    memo.record(shard, reason.clone());
+                Err(_elapsed) => {
+                    return Err(format!(
+                        "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy \
+                         or unreachable)"
+                    ));
                 }
-                uninspected.push(UninspectedShard { shard, reason });
-                continue;
-            }
-        };
-
-        record_shard_answer(
-            &mut candidates,
-            &mut uninspected,
-            shard,
-            crate::execution::resolve_execution_id_by_workflow_id(
+            };
+            Ok(crate::execution::resolve_execution_id_by_workflow_id(
                 &mut conn,
                 workflow_name,
                 workflow_id,
             )
-            .await,
-        );
+            .await)
+        })
+        .await;
+
+        match probe {
+            Ok(Ok(answer)) => {
+                record_shard_answer(&mut candidates, &mut uninspected, shard, answer);
+            }
+            Ok(Err(reason)) => {
+                if let Some(memo) = memo {
+                    memo.record(shard, reason.clone());
+                }
+                uninspected.push(UninspectedShard { shard, reason });
+            }
+            Err(_elapsed) => {
+                // A connection was (or was not) handed over and the probe never
+                // returned. Classified exactly like a failed acquisition:
+                // uninspected, never "absent".
+                let reason = format!("shard did not answer within {FANOUT_PEER_BOUND:?}");
+                if let Some(memo) = memo {
+                    memo.record(shard, reason.clone());
+                }
+                uninspected.push(UninspectedShard { shard, reason });
+            }
+        }
     }
 
     let placement = merge_locations(candidates, uninspected.clone());
@@ -646,13 +717,39 @@ mod tests {
     }
 
     #[test]
+    fn a_found_answer_reports_whether_its_fanout_was_complete() {
+        let live = run(0, "RUNNING", 1);
+        assert!(
+            merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new())
+                .fanout_was_complete(),
+            "every shard answered"
+        );
+        assert!(
+            !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)])
+                .fanout_was_complete(),
+            "a live run found over a PARTIAL view — the un-inspected shard may hold \
+             another live run of the same key, since uniqueness is shard-local. A \
+             cancel must not report success on this; a signal may still deliver."
+        );
+        assert!(
+            merge_locations(Vec::new(), Vec::new()).fanout_was_complete(),
+            "`NotFound` is only ever reached from a complete fan-out"
+        );
+        assert!(
+            !merge_locations(Vec::new(), vec![uninspected(1)]).fanout_was_complete(),
+            "`Indeterminate` is never complete"
+        );
+    }
+
+    #[test]
     fn a_live_winner_settles_the_question_despite_an_uninspected_shard() {
         let live = run(0, "RUNNING", 1);
         assert_eq!(
             merge_locations(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]),
             TargetLocation::Found {
                 shard: ShardId::new(0),
-                run: live
+                run: live,
+                uninspected: vec![uninspected(1)]
             }
         );
     }
@@ -671,7 +768,8 @@ mod tests {
             ),
             TargetLocation::Found {
                 shard: ShardId::new(1),
-                run: live
+                run: live,
+                uninspected: Vec::new()
             },
             "a first-hit-wins fan-out would signal the dead run instead"
         );
