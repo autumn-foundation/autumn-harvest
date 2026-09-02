@@ -573,6 +573,22 @@ anything that acts on an execution by id. The contract:
   contributes nothing and is not an error; a residence this node cannot reach
   fails the call, because an erasure that cannot be shown to be complete must
   not be reported as complete.
+- **Business-key targets resolve through the seal, not by hash alone.** The
+  migration deliberately keeps `MIGRATED` inside the active-uniqueness index, so
+  `(workflow_name, workflow_id)` never moves off the shard it hashes to — the
+  seal is what still holds it. An external signal or cancel aimed at a business
+  key therefore resolves the key to its execution id on the hashed shard first,
+  then follows that id's pointer. Stopping at the hash would deliver to the
+  seal, where a cancel reads as already-terminal and reports success for a
+  workflow that keeps running.
+- **A start that would replace a rebalanced prior is refused, not honoured.**
+  `conflict_policy=terminate_existing` (and `reuse_policy=terminate_if_running`)
+  against a `MIGRATED`/`MIGRATING` prior returns a retryable `503` naming the
+  live residence. The terminate cannot reach the live copy from the prior's
+  shard, and replacing would seal the prior `CONTINUED_AS_NEW` — which is
+  excluded from the uniqueness index — releasing the business key while the real
+  run keeps executing. Cancel or terminate the execution *by id*, which routes
+  to its residence, then start again.
 - **Reads may legitimately answer from the live copy alone.** The sealed source
   is a frozen snapshot as of the cutover, and the live copy is a superset of it
   by construction, so a history or status read that follows the pointer is

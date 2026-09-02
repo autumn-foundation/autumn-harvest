@@ -1237,6 +1237,40 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
+                    // A rebalanced prior (issue #964) cannot be terminated
+                    // FROM HERE, and replacing it would be actively unsafe.
+                    //
+                    // `MIGRATED`/`MIGRATING` are active conflicts because the
+                    // run is still live — just on another shard. But this
+                    // branch's `inline_cancel` only matches `RUNNING`/`PAUSED`,
+                    // so it would no-op against the seal, and `replace_execution`
+                    // would then seal that row `CONTINUED_AS_NEW` and insert a
+                    // fresh run here. `CONTINUED_AS_NEW` is excluded from the
+                    // active-uniqueness index, so the business key would be
+                    // released while the real run keeps executing on its target
+                    // shard: TWO live runs for one key, the exact outcome
+                    // widening `is_active_conflict_state` exists to prevent.
+                    //
+                    // Terminating the live copy is not this function's to do —
+                    // it holds one connection to one shard and the live copy is
+                    // on another database. So refuse, retryably, naming where
+                    // the run actually is. The caller cancels it there and
+                    // starts again, or waits for the migration to settle.
+                    if matches!(existing.state.as_str(), "MIGRATED" | "MIGRATING") {
+                        return Err(HarvestError::ShardUnavailable {
+                            shard_id: existing.migrated_to_shard.unwrap_or(existing.shard_id),
+                            reason: format!(
+                                "workflow_id '{}' is held by execution {} which has been \
+                                 rebalanced onto another shard (state {}); its live copy \
+                                 cannot be terminated from this shard, so the start is \
+                                 refused rather than creating a second live run. Cancel or \
+                                 terminate the execution by id, then retry.",
+                                request.workflow_id,
+                                ExecutionId::from_uuid(existing.id),
+                                existing.state,
+                            ),
+                        });
+                    }
                     let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),

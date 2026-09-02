@@ -104,11 +104,20 @@ call outright — an erasure that cannot be shown to be complete must not be
 reported as complete. Workflow logs are copied rather than stranded, and the
 migration record clears its cached task payload on settle.
 
-**Every id-routed write follows the pointer, not the id.** The forwarding
-resolution is not just for reads. The external-signal, external-cancel and
-external-await outboxes, the plugin's exact-shard connection resolver and the
-batch executor's per-target dispatch all resolve the *current* residence before
-choosing a pool. Batch is the sharpest case: its all-shard scan discovers a
+**Every id-routed write follows the pointer, not the id — and so does every
+business-key one.** The forwarding resolution is not just for reads. The
+external-signal, external-cancel and external-await outboxes, the plugin's
+exact-shard connection resolver, its update-result poll and the batch executor's
+per-target dispatch all resolve the *current* residence before choosing a pool.
+A `WorkflowId` target needs one more hop: the business key deliberately never
+moves off the shard it hashes to (the seal keeps it in the uniqueness index), so
+the key is resolved to its execution id *there* and then followed, rather than
+delivering to the seal — where a cancel reads as already-terminal and reports
+success for a workflow that is still running. For the same reason a start with
+`terminate_existing` against a rebalanced prior is refused with a retryable
+error naming the live residence rather than replacing it: the terminate cannot
+reach the live copy from here, and replacing would seal the prior
+`CONTINUED_AS_NEW`, releasing the business key while the real run keeps going. Batch is the sharpest case: its all-shard scan discovers a
 rebalanced run on the live target copy, but the id it hands back still encodes
 the origin, so an origin-only pool lookup would send the cancel or terminate into
 the sealed source — sealing the wrong copy while the live one kept running. The

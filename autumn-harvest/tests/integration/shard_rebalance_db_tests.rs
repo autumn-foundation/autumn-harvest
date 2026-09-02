@@ -1950,3 +1950,159 @@ async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id(
         None
     );
 }
+
+// ── Codex round 4 ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_terminate_existing_start_refuses_a_rebalanced_prior_instead_of_replacing_it() {
+    // `MIGRATED` counts as an active conflict because the run is still live,
+    // just elsewhere. The terminate-and-replace branch cannot honour that from
+    // here: its `inline_cancel` matches only RUNNING/PAUSED so it no-ops
+    // against the seal, and `replace_execution` would then seal the row
+    // CONTINUED_AS_NEW — which is excluded from the active-uniqueness index —
+    // and insert a fresh run, releasing the business key while the real run
+    // keeps executing on its target shard. Two live runs for one key.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "terminate-me").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut source = shards.source().await;
+    let err = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_existing_start("entity_flow", "terminate-me"),
+        None,
+    )
+    .await
+    .expect_err("a start that would replace a rebalanced prior must be refused");
+    assert!(
+        matches!(err, HarvestError::ShardUnavailable { .. }),
+        "expected a retryable ShardUnavailable naming the live residence, got {err:?}"
+    );
+
+    // The seal is untouched, so the business key is still held and the live
+    // copy on the target is still the only run.
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("MIGRATED")
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}
+
+#[tokio::test]
+async fn a_business_key_target_resolves_through_the_seal_to_the_live_copy() {
+    // A `WorkflowId` target hashes to a fixed shard, and that shard is exactly
+    // where the seal sits — the migration deliberately keeps `MIGRATED` inside
+    // the active-uniqueness index, so the business key never moves. Routing by
+    // the hash alone therefore delivers to the seal: the cancel outbox reads it
+    // as terminal and reports success for a workflow that keeps running.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "by-key").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let by_key = autumn_harvest::types::ExternalTarget::WorkflowId {
+        workflow_name: "entity_flow".to_string(),
+        workflow_id: "by-key".to_string(),
+    };
+    let routed =
+        autumn_harvest::shard_rebalance::resolve_target_shard(&shards.pool, &by_key, SOURCE).await;
+    assert_eq!(
+        routed, TARGET,
+        "a business-key target must resolve through the seal to the live residence"
+    );
+
+    // And an id target still resolves the same way, so the two agree.
+    let by_id = autumn_harvest::types::ExternalTarget::ExecutionId(exec_id);
+    assert_eq!(
+        autumn_harvest::shard_rebalance::resolve_target_shard(&shards.pool, &by_id, SOURCE).await,
+        TARGET
+    );
+}
+
+#[tokio::test]
+async fn a_reverse_migration_keeps_the_live_shard_last_in_the_residence_chain() {
+    // A → B → A is supported precisely so a drain can be undone. The stored
+    // history is then [A, B] and the run is live on A, so the raw chain is
+    // [A, B, A]. A first-occurrence dedup collapses that to [A, B] and leaves
+    // the SEALED copy in the final position — which every consumer reads as the
+    // live residence, so the erase would gate on the wrong copy.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "there-and-back").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+    migrate_execution(&shards.pool, exec_id, TARGET, SOURCE, &codecs())
+        .await
+        .expect("B -> A");
+
+    let chain = autumn_harvest::shard_rebalance::residence_chain(&shards.pool, exec_id)
+        .await
+        .expect("residence chain");
+    assert_eq!(
+        chain,
+        vec![TARGET, SOURCE],
+        "the live shard must be last, and each residence must appear once"
+    );
+    assert_eq!(
+        chain.last().copied(),
+        Some(SOURCE),
+        "the run is live on SOURCE again, so SOURCE must be the final element"
+    );
+}
+
+/// A `TerminateExisting` start for `(workflow_name, workflow_id)` — the policy
+/// that, before the round-4 fix, would seal a rebalanced prior
+/// `CONTINUED_AS_NEW` and start a second live run for the same business key.
+fn terminate_existing_start<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+) -> autumn_harvest::execution::StartWorkflowParams<'a> {
+    autumn_harvest::execution::StartWorkflowParams {
+        workflow_name,
+        workflow_id,
+        exec_id: ExecutionId::new_for_shard(SOURCE),
+        input: json!({"seed": 2}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
+    }
+}

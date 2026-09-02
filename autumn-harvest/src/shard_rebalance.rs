@@ -1442,31 +1442,65 @@ mod db {
             });
         }
 
-        // Stamp the SOURCE history's high-water mark alongside the fingerprint,
-        // computed from the same connection in the same step. `commit_cutover`
-        // requires it to still hold, which is what stops a run that woke, ran a
-        // decision cycle and re-parked between here and the cutover from being
-        // handed to a copy that predates that cycle. The subqueries are the
-        // marks themselves rather than values read into Rust and bound back,
-        // so there is no read-then-write window of our own making.
+        // Stamp the high-water mark of THE HISTORY THIS CALL ACTUALLY VERIFIED,
+        // derived from `source_raw` — the very rows the byte-identity check
+        // above compared — rather than re-queried here.
+        //
+        // Re-querying would reopen the hole the mark exists to close, one step
+        // earlier: the source can wake, run a decision cycle, append and re-park
+        // between the fingerprint reads and this UPDATE, and a freshly-computed
+        // mark would then record a history that was never copied. The cutover
+        // would find both quiescence and the mark unchanged and seal, losing
+        // that cycle silently — exactly the failure the guard was added for,
+        // just with a shorter window.
+        //
+        // Binding what was read makes the mark and the verified copy the same
+        // artifact by construction. If the source moved on in the meantime, the
+        // mark simply no longer matches the live history and the cutover
+        // declines, which is the fail-closed direction.
+        let (verified_count, verified_max) = history_high_water_mark(&source_raw);
         diesel::sql_query(
             "UPDATE harvest_shard_migrations m \
                 SET phase = 'VERIFIED', verified_fingerprint = $2, updated_at = NOW(), \
-                    verified_event_count = \
-                        (SELECT count(*) FROM harvest_events ev \
-                          WHERE ev.workflow_exec_id = m.execution_id), \
-                    verified_max_event_id = \
-                        COALESCE((SELECT max(ev.event_id) FROM harvest_events ev \
-                                   WHERE ev.workflow_exec_id = m.execution_id), -1) \
+                    verified_event_count = $3, verified_max_event_id = $4 \
               WHERE m.execution_id = $1 AND m.phase = 'COPIED'",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .bind::<Text, _>(&source_fingerprint)
+        .bind::<BigInt, _>(verified_count)
+        .bind::<Integer, _>(verified_max)
         .execute(source)
         .await
         .map_err(database_error)?;
 
         Ok(source_fingerprint)
+    }
+
+    /// `(event count, highest event_id)` of the verified history, read out of
+    /// the raw tuple array that verification itself compared.
+    ///
+    /// `RAW_SQL` returns `[[event_id, event_type, event_data, timestamp], ...]`
+    /// ordered by `event_id`, so the count is the array length and the maximum
+    /// is the first field of the last element. An empty history marks as
+    /// `(0, -1)`, matching the `COALESCE(..., -1)` the cutover compares against
+    /// so a run migrated before its first event still cuts over.
+    fn history_high_water_mark(source_raw: &Value) -> (i64, i32) {
+        let Some(rows) = source_raw.as_array() else {
+            return (0, -1);
+        };
+        let count = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+        // `as_slice()` on both: the diesel prelude is in scope here and brings
+        // `LimitDsl::first` with it, which shadows `Vec`'s inherent method and
+        // sends inference off into query-builder traits.
+        let max = rows
+            .as_slice()
+            .last()
+            .and_then(|row| row.as_array())
+            .and_then(|fields| fields.as_slice().first())
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or(-1);
+        (count, max)
     }
 
     // ── Phase 3: the single atomic cutover commit ────────────────────────────
@@ -2542,12 +2576,20 @@ mod db {
                 .map(ShardId::new)
                 .collect(),
         };
-        chain.push(live);
-        // A run migrated away and later back onto a shard it already occupied
-        // lists it twice. Every consumer is idempotent, but a de-duplicated
-        // chain is what an operator reading `prior_residences` expects.
+        // De-duplicate PRESERVING THE LIVE SHARD AS THE LAST ELEMENT.
+        //
+        // A reverse migration (A → B → A, which the design supports so a drain
+        // can be undone) stores `[A, B]` and is live on A, giving `[A, B, A]`.
+        // A first-occurrence dedup would collapse that to `[A, B]` and leave B
+        // in the final position — and every consumer reads the last element as
+        // the live residence. `erase_workflow_payloads_all_residences` would
+        // then apply the terminal-state and legal-hold gates to the SEALED copy
+        // and report its outcome as the answer. So the live shard's earlier
+        // occurrence is dropped, not its final one.
+        chain.retain(|shard| *shard != live);
         let mut seen = std::collections::HashSet::new();
         chain.retain(|shard| seen.insert(*shard));
+        chain.push(live);
         Ok(chain)
     }
 
@@ -2735,17 +2777,67 @@ mod db {
                 crate::shard::external_target_owning_shard(target).unwrap_or(fallback_shard)
             }
         };
-        let crate::types::ExternalTarget::ExecutionId(exec_id) = target else {
-            // A business-key target is resolved by hash on every shard, so
-            // there is no per-execution pointer to follow.
-            return unforwarded;
-        };
         if pool.len() <= 1 {
             return unforwarded;
         }
-        resolve_execution_shard(pool, *exec_id)
+        let exec_id = match target {
+            crate::types::ExternalTarget::ExecutionId(id) => *id,
+            // A business-key target hashes to a fixed shard, and that shard is
+            // exactly where a rebalanced run's SEAL still sits — the migration
+            // deliberately keeps `MIGRATED` inside the active-uniqueness index,
+            // so the business key never moves. Stopping there would deliver to
+            // the seal: the cancel outbox reads it as terminal and records
+            // `ExternalCancelDelivered` for a workflow that keeps running, and
+            // the signal outbox sits on it forever. So resolve the key to its
+            // execution id on the hashed shard first, then follow that id's
+            // pointer like any other.
+            crate::types::ExternalTarget::WorkflowId {
+                workflow_name,
+                workflow_id,
+            } => match resolve_business_key(pool, unforwarded, workflow_name, workflow_id).await {
+                Some(id) => id,
+                None => return unforwarded,
+            },
+        };
+        resolve_execution_shard(pool, exec_id)
             .await
             .unwrap_or(unforwarded)
+    }
+
+    /// The execution id currently holding `(workflow_name, workflow_id)` on
+    /// `shard`, if any.
+    ///
+    /// Best-effort, like its caller: `None` means "route as before", never an
+    /// error. The lookup deliberately includes `MIGRATED`/`MIGRATING` — that is
+    /// the whole point, since the seal is what still holds the business key on
+    /// the hashed shard after the run itself has moved.
+    async fn resolve_business_key(
+        pool: &ShardedDbPool,
+        shard: ShardId,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Option<ExecutionId> {
+        let mut conn = checkout(pool, shard).await.ok()?;
+        let row: Option<BusinessKeyRow> = diesel::sql_query(
+            "SELECT id FROM harvest_workflow_executions \
+              WHERE workflow_name = $1 AND workflow_id = $2 \
+                AND state IN ('RUNNING', 'PAUSED', 'MIGRATED', 'MIGRATING') \
+              ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind::<Text, _>(workflow_name)
+        .bind::<Text, _>(workflow_id)
+        .get_result(&mut *conn)
+        .await
+        .optional_row()
+        .ok()
+        .flatten();
+        row.map(|r| ExecutionId::from_uuid(r.id))
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct BusinessKeyRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
     }
 
     /// Best-effort: repoint the execution's **origin** shard straight at the new
