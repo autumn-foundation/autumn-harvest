@@ -144,14 +144,14 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.RUNNING{background:#1d4ed8;color:#dbeafe}
 .badge.COMPLETED{background:#166534;color:#dcfce7}
 .badge.FAILED{background:#991b1b;color:#fee2e2}
-.badge.CANCELLED{background:#6b7280;color:#f3f4f6}
+.badge.CANCELLED{background:#4b5563;color:#f3f4f6}
 .badge.TERMINATED{background:#52525b;color:#f4f4f5}
 .badge.UNKNOWN{background:#334155;color:#e2e8f0}
 .badge.Active{background:#166534;color:#dcfce7}
 .badge.Draining{background:#92400e;color:#fef3c7}
 .badge.Stopped{background:#334155;color:#e2e8f0}
 .badge.timezone{background:#1e3a8a;color:#93c5fd;border:1px solid #3b82f6}
-.timezone-utc{color:#64748b;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.timezone-utc{color:#94a3b8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .badge-owner{background:#312e81;color:#c7d2fe;border:1px solid #4338ca}
 .badge-sev-sev1{background:#7f1d1d;color:#fee2e2;border:1px solid #b91c1c}
 .badge-sev-sev2{background:#7c2d12;color:#ffedd5;border:1px solid #c2410c}
@@ -193,9 +193,9 @@ pre{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;
 details{margin-top:8px}
 details summary{cursor:pointer;color:#93c5fd;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .detail-block{display:grid;gap:10px;margin-top:10px}
-footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
+footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
 .event-label{font-size:13px}
-.event-label code{font-size:11px;color:#64748b;margin-left:4px}
+.event-label code{font-size:11px;color:#94a3b8;margin-left:4px}
 .operator-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
 .operator-actions form{margin:0}
 .operator-actions button,.operator-actions a.btn{background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;text-decoration:none;display:inline-block}
@@ -210,13 +210,13 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .dag-legend,.timeline-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
 .dag-legend span,.timeline-legend span{display:inline-flex;align-items:center;gap:4px}
 .dag-legend .swatch,.timeline-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
-.dag-run-current{color:#64748b;font-size:11px;margin-left:6px}
+.dag-run-current{color:#94a3b8;font-size:11px;margin-left:6px}
 .dag-run-detail{color:#94a3b8;font-size:11px;margin-left:8px}
 .gantt-scroll{overflow:auto;max-width:100%;max-height:75vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
 .gantt-lane-label{fill:#cbd5e1;font:11px system-ui,-apple-system,sans-serif}
 .gantt-lane-group{fill:#93c5fd;font:600 11px system-ui,-apple-system,sans-serif}
 .gantt-axis-tick{stroke:#334155;stroke-width:1}
-.gantt-axis-label{fill:#64748b;font:10px system-ui,-apple-system,sans-serif}
+.gantt-axis-label{fill:#94a3b8;font:10px system-ui,-apple-system,sans-serif}
 .gantt-span{stroke:#0f172a;stroke-width:1}
 .gantt-span-open{stroke-dasharray:4 3;stroke:#94a3b8;stroke-width:1.5}
 .gantt-span-slowest{stroke:#f8fafc;stroke-width:2}
@@ -230,7 +230,7 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .gantt-nd-label{fill:#f97316;font:10px system-ui,-apple-system,sans-serif}
 .timeline-rollup{display:flex;flex-wrap:wrap;gap:16px;margin:8px 0;font-size:.85rem;color:#cbd5e1}
 .timeline-rollup .stat{display:flex;flex-direction:column;gap:2px}
-.timeline-rollup .stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
+.timeline-rollup .stat .label{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
 .timeline-rollup .stat .value{font-size:1rem;color:#e2e8f0}
 "#;
 
@@ -3924,7 +3924,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                         td { (worker_status_badge(&row.worker.status, is_stale)) }
                         td {
                             @if row.worker.build_id.is_empty() {
-                                span style="color:#475569" { "—" }
+                                span style="color:#94a3b8" { "—" }
                             } @else {
                                 a href={ "build-routing?build_id=" (url_encode(&row.worker.build_id)) }
                                   title="View in Build Routing" {
@@ -3936,7 +3936,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                             @if let Some(ref dep) = row.worker.deployment_name {
                                 code { (dep) }
                             } @else {
-                                span style="color:#475569" { "—" }
+                                span style="color:#94a3b8" { "—" }
                             }
                         }
                         td {
@@ -7168,7 +7168,7 @@ fn render_build_policies_card(policies: &[BuildPolicy]) -> Markup {
                                     @if let Some(ref dep) = policy.deployment_name {
                                         code { (dep) }
                                     } @else {
-                                        span style="color:#475569" { "—" }
+                                        span style="color:#94a3b8" { "—" }
                                     }
                                 }
                                 td { (format_timestamp(Some(policy.updated_at))) }
@@ -7218,7 +7218,7 @@ fn render_build_reachability_card(reachability: &[BuildReachability]) -> Markup 
                                             }
                                         }
                                     } @else {
-                                        span style="color:#475569;font-size:12px" { "Not yet safe" }
+                                        span style="color:#94a3b8;font-size:12px" { "Not yet safe" }
                                     }
                                 }
                             }
@@ -8788,7 +8788,7 @@ fn render_schedule_table(
                                                     div style="display: flex; align-items: center; justify-content: space-between; gap: 8px" {
                                                         span class=(dec_badge_class) style="font-size: 10px; padding: 1px 6px" { (dec.decision) }
                                                         span style="color: #cbd5e1; font-family: monospace" { (dec.reason_code) }
-                                                        span style="color: #64748b" { (format_timestamp(Some(dec.occurred_at))) }
+                                                        span style="color: #94a3b8" { (format_timestamp(Some(dec.occurred_at))) }
                                                     }
                                                 }
                                             }
