@@ -10,6 +10,22 @@ together with a `background:`, or falls back to the page background
 WCAG relative-luminance contrast ratio for each pair and flags anything
 below the AA thresholds (4.5:1 normal text, 3:1 large text/UI components).
 
+CSS `opacity` on an ancestor changes the *rendered* contrast of everything
+inside it: both a text color and its local background are independently
+alpha-blended toward whatever sits behind the opacity-bearing element, and
+because WCAG contrast is a nonlinear function of (gamma-corrected)
+luminance, that blend shrinks the ratio between them — usually well past
+what a linear reading of the opacity value suggests. This script does not
+generally model ancestor opacity (that needs real DOM/cascade awareness,
+not regex extraction) — but every `style="opacity:..."` wrapper found in
+`ui.rs` is checked explicitly by `check_opacity_wrapped_badges`, which
+locates the badge class rendered inside it, resolves that badge's own
+(text, background) pair from the STYLE rules above, and recomputes the
+composited ratio. Extend OPACITY-affected markup gets this same explicit
+treatment if it's ever added elsewhere, since there is currently exactly
+one such wrapper in the file (issue found in PR review, see
+`check_opacity_wrapped_badges`).
+
 Usage:
     python3 docs/audits/vantage-dashboard-contrast.py
 
@@ -56,6 +72,20 @@ def contrast(hex1, hex2):
     return (lighter + 0.05) / (darker + 0.05)
 
 
+def blend_toward(fg_hex, alpha, backdrop_hex):
+    """Alpha-composite `fg_hex` at `alpha` opacity over `backdrop_hex`,
+    per-channel, the same way a browser composites an opacity-bearing
+    element's rendered layer onto whatever is behind it."""
+    fg, bd = hex_to_rgb(fg_hex), hex_to_rgb(backdrop_hex)
+    return tuple(fg[i] * alpha + bd[i] * (1 - alpha) for i in range(3))
+
+
+def contrast_rgb(rgb1, rgb2):
+    l1, l2 = rel_lum(rgb1), rel_lum(rgb2)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 def extract_style_block(src: str) -> str:
     m = re.search(r'const STYLE: &str = r#"\n(.*?)\n"#;', src, re.S)
     if not m:
@@ -78,6 +108,45 @@ def extract_inline_style_pairs(src: str):
         bg_m = re.search(r"background:\s*(#[0-9a-fA-F]{3,6})", decls)
         out.append((fg_m.group(1), bg_m.group(1) if bg_m else None))
     return out
+
+
+def extract_badge_colors(css: str) -> dict:
+    """Map badge class name (e.g. "COMPLETED") -> (text, background) hex,
+    from `.badge.NAME{background:...;color:...}` rules in STYLE."""
+    colors = {}
+    for m in re.finditer(
+        r"\.badge\.([A-Za-z0-9_-]+)\{[^{}]*?background:\s*(#[0-9a-fA-F]{3,6})[^{}]*?color:\s*(#[0-9a-fA-F]{3,6})",
+        css,
+    ):
+        colors[m.group(1)] = (m.group(3), m.group(2))  # (text, background)
+    return colors
+
+
+def check_opacity_wrapped_badges(src: str, badge_colors: dict, body_bg: str):
+    """Find every `style="...opacity:N..."` wrapper and, if a `.badge.NAME`
+    is rendered inside it, recompute that badge's composited contrast (see
+    module docstring) instead of trusting its unwrapped STYLE-rule ratio.
+
+    Scoped to the wrapper's own markup block (up to the next `}` in the
+    maud `html! { }` source) so it doesn't reach into unrelated markup."""
+    results = []
+    for m in re.finditer(r'style="[^"]*opacity:\s*([0-9.]+)[^"]*"', src):
+        alpha = float(m.group(1))
+        if alpha >= 1.0:
+            continue
+        window = src[m.end() : m.end() + 400]
+        end = window.find("\n                }")
+        window = window if end == -1 else window[:end]
+        badge_m = re.search(r"badge[. ]([A-Za-z0-9_-]+)", window)
+        if not badge_m or badge_m.group(1) not in badge_colors:
+            continue
+        fg, bg = badge_colors[badge_m.group(1)]
+        eff_fg = blend_toward(fg, alpha, body_bg)
+        eff_bg = blend_toward(bg, alpha, body_bg)
+        ratio = contrast_rgb(eff_fg, eff_bg)
+        label = f'(opacity:{alpha} wrapper) badge {badge_m.group(1)}'
+        results.append((label, f"{fg}@{alpha}", f"{bg}@{alpha}", ratio))
+    return results
 
 
 def main():
@@ -106,11 +175,20 @@ def main():
         label = "(inline style span)" if bg else "(inline style span, on #0f172a panel)"
         results.append((label, fg, bg or body_bg))
 
+    # Badges rendered under a `style="opacity:..."` ancestor — see module
+    # docstring. These carry their own (fg, bg) already composited to the
+    # effective rendered colors, so they flow through the same thresholding
+    # below like any other pair.
+    badge_colors = extract_badge_colors(css)
+    opacity_results = check_opacity_wrapped_badges(src, badge_colors, body_bg)
+
+    all_rows = [(sel, fg, bg, contrast(fg, bg)) for sel, fg, bg in results]
+    all_rows += [(sel, fg, bg, ratio) for sel, fg, bg, ratio in opacity_results]
+
     real_failures = []
     exempt = []
     passes = []
-    for sel, fg, bg in results:
-        ratio = contrast(fg, bg)
+    for sel, fg, bg, ratio in all_rows:
         row = (sel, fg, bg, ratio)
         if ratio >= 4.5:
             passes.append(row)
@@ -121,7 +199,8 @@ def main():
 
     real_failures.sort(key=lambda r: r[3])
     print(f"WCAG 1.4.3 AA contrast audit — {UI_RS}")
-    print(f"{len(results)} text/background pairs checked.\n")
+    print(f"{len(all_rows)} text/background pairs checked "
+          f"({len(opacity_results)} of them opacity-composited).\n")
 
     if real_failures:
         print(f"FAILING (below 4.5:1 for normal text) — {len(real_failures)}:")

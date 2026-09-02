@@ -9051,7 +9051,7 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                 }
                 @for row in &lifted {
                     @let id_short = &row.id.to_string()[..8];
-                    div.card style="opacity:0.6" {
+                    div.card style="opacity:0.8" {
                         code { (id_short) }
                         " "
                         span.badge.COMPLETED { "LIFTED" }
