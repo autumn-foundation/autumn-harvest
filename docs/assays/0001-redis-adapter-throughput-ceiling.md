@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,643 vs 10,000 ops/sec @ matched concurrency, ledger #1)
+# ⛏️ Prospect: does the Redis adapter clear its own >10k ops/sec bar? (kill: 8,828 vs 10,000 ops/sec @ matched concurrency, ledger #1)
 
 > Status: **measured.** The Pre-registration section below was committed
 > (`3a0e3b9`) before the apparatus was built or run; nothing in it has been
@@ -128,15 +128,37 @@ crate's existing public API (`RedisTaskQueue::connect`, `enqueue`, `claim`,
 `complete`) — zero lines of `autumn-harvest-redis` or `autumn-harvest` were
 touched.
 
-Per worker task: enqueue one ~40-byte JSON payload to a queue name owned by
-that worker, then loop `claim` (200µs backoff between empty polls) until it
-gets the task back, then `complete` it, then repeat until the deadline. One
-full round trip = one op. Concurrency swept 1 / 4 / 8 (the registered cell,
-matching the Postgres control's "8 concurrent claimers") / 16 / 32 / 64 (the
-last three are supplementary, added after seeing the 8-worker result — flagged
-as such, not folded into the registered verdict). 10s measured window per
-cell. Machine: this session's 4-logical-CPU container, local `redis-server`
-7.0.15 on loopback, `save ""` / `appendonly no`.
+Per worker task: enqueue one ~40-byte JSON payload to the **one shared queue**
+named in the pre-registration, then loop `claim` (200µs backoff between empty
+polls, claiming as its own distinct consumer identity within the queue's
+consumer group) until it gets a task back — not necessarily the one it just
+enqueued, since any of the N workers may claim any pending entry, which is
+exactly the shared-queue contention a single queue name is meant to exercise
+— then `complete` it, then repeat until the deadline. A round trip counts
+**only if `complete` returns `Ok`**, so a transient ack failure cannot inflate
+the number. All workers connect and reach a `tokio::sync::Barrier` before any
+of them starts the enqueue/claim/complete loop, and the measured window
+starts only once every worker has cleared that barrier, so no worker runs
+solo while others are still opening a connection. Concurrency swept 1 / 4 / 8
+(the registered cell, matching the Postgres control's "8 concurrent
+claimers") / 16 / 32 / 64 (the last three are supplementary, added after
+seeing the 8-worker result — flagged as such, not folded into the registered
+verdict). 10s measured window per cell. Machine: this session's 4-logical-CPU
+container, local `redis-server` 7.0.15 on loopback, `save ""` / `appendonly
+no`.
+
+> **Post-review correction.** The first version of this apparatus (commit
+> `368abec`) gave each worker its own dedicated stream rather than the single
+> shared queue the pre-registration committed to, counted a round trip before
+> checking whether `complete` succeeded, and started its measured window
+> before every worker had a live connection. All three were flagged by
+> automated review on the PR and are fixed in the version described above and
+> archived here; the numbers in this report are from the corrected apparatus.
+> The corrected, contention-bearing shared-queue numbers landed within noise
+> of the original dedicated-stream numbers (registered cell: 8,586-9,092
+> ops/sec across three shared-queue runs vs. 8,578-8,643 ops/sec across the
+> original dedicated-stream runs) — the fix changed what was actually being
+> tested, not the verdict.
 
 **Stubs list (what was faked/skipped, and why it matters for reading the number):**
 
@@ -147,13 +169,6 @@ cell. Machine: this session's 4-logical-CPU container, local `redis-server`
   condition a reader should discount for if their deployment enables AOF/RDB.
 - One fixed small payload shape (~40 bytes) only. No large-payload or
   worst-case-payload cell.
-- Each concurrent worker used its **own dedicated stream**
-  (`bench-worker-{i}`), not a shared queue with N workers load-balancing via
-  the consumer group. This isolates raw per-round-trip server cost from
-  consumer-group claim contention on one hot stream — the number below is a
-  ceiling on aggregate server throughput, not a measurement of fairness or
-  contention when many workers compete for the same queue, which a real
-  deployment would have.
 - `claim` polls (no Redis `BLOCK`); at saturation this is a non-issue since a
   worker's own enqueue always precedes its claim, but it is a stub relative to
   a production polling/backoff strategy.
@@ -169,11 +184,13 @@ cell. Machine: this session's 4-logical-CPU container, local `redis-server`
 - No auth/TLS, no `record_heartbeat`/`recover_pending`/`fail`/
   `requeue_for_retry`/`queue_depths` exercised, no concurrent Postgres load on
   the same box.
-- One canonical timed run per cell, with the registered cell (8 workers)
-  independently reproduced once beforehand at a shorter window as a sanity
-  check (8,578.20 ops/sec at 8s vs 8,642.60 ops/sec at 10s in the canonical
-  run — 0.8% apart, well inside noise for this kind of loopback IO-bound
-  loop).
+- One canonical timed run per cell for the full sweep, with the registered
+  cell (8 workers, shared queue) independently repeated three times at the
+  full 10s window: 8,586.70 / 9,091.80 / 8,805.20 ops/sec (mean 8,827.90,
+  range 5.9% of the mean) — a shared, contended stream shows more run-to-run
+  variance than the original dedicated-stream design did (0.8% apart across
+  two runs), which is itself a small piece of evidence that the fix changed
+  a real contention path rather than being a no-op.
 - The Postgres control is **not** re-measured on this machine (see
   Pre-registration — admissible as-is); reproducing it would require draining
   a 10,000-row backlog under the existing `claim_bench` harness, which the
@@ -183,16 +200,16 @@ cell. Machine: this session's 4-logical-CPU container, local `redis-server`
 
 ## 📊 Assay
 
-All cells, one canonical run, 10s measured window each:
+Full sweep, one canonical run, 10s measured window each, shared queue:
 
 | concurrency (workers) | ops/sec (enqueue→claim→complete) | vs 10,000/sec line |
 |--:|--:|:--|
-| 1 | 2,456.20 | below |
-| 4 | 5,653.70 | below |
-| **8 (registered cell)** | **8,642.60** | **below — 86.4% of line** |
-| 16 (supplementary) | 12,058.50 | above |
-| 32 (supplementary) | 14,193.20 | above |
-| 64 (supplementary) | 14,774.80 | above (plateau) |
+| 1 | 2,540.30 | below |
+| 4 | 5,616.20 | below |
+| **8 (registered cell)** | **8,586.70** (3-run mean 8,827.90, range 8,586.70-9,091.80) | **below — 86-91% of line** |
+| 16 (supplementary) | 11,840.00 | above |
+| 32 (supplementary) | 14,457.00 | above |
+| 64 (supplementary) | 14,706.00 | above (plateau) |
 
 Control (`docs/performance.md`, published, same reference machine shape — 4
 logical CPUs, not re-measured here): Postgres claim path sustains **640
@@ -200,31 +217,32 @@ claims/sec** at an 8-concurrent-claimer / 1,000-row-backlog scenario, falling
 to **29/sec** at a 10,000-row backlog.
 
 At the concurrency shape the control was measured under (8 concurrent
-workers/claimers), the adapter beats the Postgres number by **13.5x**
-(8,642.60 vs 640 claims/sec) — a large, real margin, even though it misses the
-crate's own flat 10,000/sec bar at that same concurrency. The adapter does
-cross 10,000/sec, but only once concurrency roughly doubles past the
-registered/control-matched shape, then plateaus near 14.5-14.8k ops/sec by 32
-workers — consistent with a single Redis instance's serialized command
+workers/claimers), the adapter beats the Postgres number by **13.8x**
+(8,827.90 mean vs 640 claims/sec) — a large, real margin, even though it
+misses the crate's own flat 10,000/sec bar at that same concurrency. The
+adapter does cross 10,000/sec, but only once concurrency roughly doubles past
+the registered/control-matched shape, then plateaus near 14.5-14.7k ops/sec by
+32 workers — consistent with a single Redis instance's serialized command
 throughput becoming the limit, not this box's 4 cores (workers 8→64 is an
 8x concurrency increase for only a 1.7x throughput increase).
 
 ## 🏁 Verdict
 
 **KILL** — on the pre-registered claim, at the pre-registered condition. The
-adapter measured 8,642.60 ops/sec at 8 concurrent workers, against the
-committed **≥10,000 ops/sec** line. That is a miss, under the single most
-favorable conditions this adapter will ever run in (no Postgres, no worker,
-no network hop, nothing else on the box). Per the pre-registration, this is a
-no, not a rounding call — 400 vs a 200ms line was never the test here, and
-neither is 8,643 vs 10,000.
+adapter measured 8,586.70-9,091.80 ops/sec (mean 8,827.90) across three runs
+at 8 concurrent workers on the pre-registered shared queue, against the
+committed **≥10,000 ops/sec** line. That is a miss on every one of the three
+runs, under the single most favorable conditions this adapter will ever run
+in (no Postgres, no worker, no network hop, nothing else on the box). Per the
+pre-registration, this is a no, not a rounding call — 400 vs a 200ms line was
+never the test here, and neither is 8,800-ish vs 10,000.
 
 Two things sit alongside that kill and change what it means for the decision,
 rather than reversing it:
 
 1. **The adapter is not dead technology.** Against the actual measured control
    (not the vendor-style "~10k ceiling" narrative the spec and architecture
-   doc assert but never measured), it wins by 13.5x at matched concurrency,
+   doc assert but never measured), it wins by 13.8x at matched concurrency,
    and does clear 10,000/sec at roughly double the worker count. The founding
    claim is wrong as a flat, concurrency-independent number, but the
    underlying approach clearly outperforms Postgres by a wide margin on this
