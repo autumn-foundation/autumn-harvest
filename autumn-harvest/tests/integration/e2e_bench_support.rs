@@ -2233,12 +2233,22 @@ pub mod db {
                 failures.push(format!("{name}: could not reconnect to drop it"));
                 continue;
             };
-            if let Err(e) =
-                diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                    .execute(&mut admin)
+            // `WITH (FORCE)` is PostgreSQL 13+, and the engine supports 12+
+            // (README). On 12 it is a *syntax error*, and these failures are
+            // only recorded -- so every scenario would silently leak its
+            // databases against a documented-supported server. The sibling
+            // harness already solved this; reuse it rather than grow a second
+            // definition of "drop a database on every PostgreSQL we support".
+            super::super::claim_bench_support::db::drop_database_version_neutral(&mut admin, name)
+                .await;
+            let still_there =
+                diesel::sql_query("SELECT COUNT(*) AS n FROM pg_database WHERE datname = $1")
+                    .bind::<diesel::sql_types::Text, _>(name)
+                    .get_result::<CountRow>(&mut admin)
                     .await
-            {
-                failures.push(format!("{name}: {e}"));
+                    .map_or(0, |row| row.n);
+            if still_there > 0 {
+                failures.push(format!("{name}: still present after terminate-and-drop"));
             }
         }
         failures
@@ -2679,11 +2689,11 @@ pub mod db {
         /// burning CPU through the remaining cells of a twelve-cell sweep --
         /// perturbing the measurements those cells publish. So the handle is
         /// kept and aborted.
-        pub async fn stop(self) {
+        pub async fn stop(mut self) {
             for worker in &self.workers {
                 worker.shutdown();
             }
-            for handle in self.handles {
+            for handle in std::mem::take(&mut self.handles) {
                 let abort = handle.abort_handle();
                 if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
                     .await
@@ -2691,6 +2701,30 @@ pub mod db {
                 {
                     abort.abort();
                 }
+            }
+        }
+    }
+
+    /// Abort every worker when a `Fleet` is dropped without [`Fleet::stop`].
+    ///
+    /// The panic path (Codex review, PR #1282). `benches/e2e_bench.rs` runs each
+    /// cell in its own task so a panic fails that cell instead of aborting the
+    /// sweep -- but unwinding only *drops* the `Fleet`, and dropping a
+    /// `JoinHandle` detaches its task rather than stopping it. Those workers
+    /// then keep polling the abandoned databases for the remaining eleven
+    /// cells, consuming CPU and connections and perturbing exactly the
+    /// measurements the containment was supposed to protect.
+    ///
+    /// `abort()` is synchronous, so it works from `Drop` where an async
+    /// shutdown cannot. On the ordinary path `stop` has already taken the
+    /// handles and this loop is empty.
+    impl Drop for Fleet {
+        fn drop(&mut self) {
+            for worker in &self.workers {
+                worker.shutdown();
+            }
+            for handle in &self.handles {
+                handle.abort();
             }
         }
     }
