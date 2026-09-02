@@ -263,7 +263,7 @@ Full sweep, one canonical run (of three, post-fix — see below), 10s measured w
 | **8 (registered cell)** | **8,449.80** (3-run mean 8,760.00, range 8,449.80-8,993.40) | **below — 84-90% of line** |
 | 16 (supplementary) | 11,985.10 | above |
 | 32 (supplementary) | 13,833.40 | above |
-| 64 (supplementary) | 15,635.60 | above (plateau) |
+| 64 (supplementary) | 15,635.60 | above (still rising, not a plateau) |
 
 Control (`docs/performance.md`, published, same reference machine shape — 4
 logical CPUs, not re-measured here): Postgres claim path sustains **640
@@ -298,11 +298,14 @@ round trip per op than enqueue-claim-complete and no empty-poll backoff while
 backlog remains.
 
 Separately, the steady-state sweep does show the adapter crossing 10,000/sec
-once concurrency roughly doubles past the registered 8-worker shape,
-plateauing near 14.5-14.7k ops/sec by 32 workers — consistent with a single
-Redis instance's serialized command throughput becoming the limit, not this
-box's 4 cores (workers 8→64 is an 8x concurrency increase for only a 1.7x
-throughput increase).
+once concurrency roughly doubles past the registered 8-worker shape: 11,985.10
+at 16 workers, 13,833.40 at 32, 15,635.60 at 64. That is sharply sub-linear
+(an 8x concurrency increase from 8 to 64 workers buys only an ~1.8x
+throughput increase) — consistent with a single Redis instance's serialized
+command throughput becoming the dominant constraint rather than this box's 4
+cores — but it has **not** flattened into a plateau by 64 workers: 32→64 is
+still a 13.0% gain. An earlier draft of this report called this a plateau at
+32 workers; that claim outran the data and is corrected here.
 
 ## 🏁 Verdict
 
@@ -331,8 +334,9 @@ Two pieces of evidence, both gathered honestly but neither pre-registered
 charter instead):
 
 1. The steady-state sweep itself crosses 10,000/sec once concurrency doubles
-   past 8 workers: 11,840-12,058 ops/sec at 16 workers, plateauing near
-   14.5-14.7k by 32.
+   past 8 workers: 11,268.50-11,985.10 ops/sec at 16 workers, and keeps
+   rising (sub-linearly, without a firm plateau) through 15,635.60 at 64
+   workers in the canonical run.
 2. The exploratory backlog-drain measurement (see Assay — not a matched
    comparison against Postgres, see post-review correction #2, but still a
    real number for this adapter alone) also clears 10,000/sec at 8 workers:
