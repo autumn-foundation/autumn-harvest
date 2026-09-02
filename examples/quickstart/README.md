@@ -3,6 +3,12 @@
 A minimal runnable example for [autumn-harvest](../../README.md): one `#[workflow]`, one `#[activity]`, one durable timer.
 From `git clone` on a machine with Docker to a running durable workflow in under 5 minutes.
 
+> Only want to *see* a durable workflow run? `cargo dev` from the workspace root
+> needs neither Docker nor a database — it provisions an ephemeral Postgres,
+> serves the dashboard, and cleans up after itself. See
+> [Chapter 1](../../docs/getting-started/01-project-skeleton.md). This example
+> is the bring-your-own-Postgres path, and is unchanged.
+
 ## Prerequisites
 
 - Stable Rust toolchain (`rustup default stable`)

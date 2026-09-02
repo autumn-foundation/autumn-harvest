@@ -1548,8 +1548,16 @@ async fn start_harvest_runtime(
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
-    let app_config = AutumnConfig::load()
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // `state.config()`, NOT `AutumnConfig::load()`. Re-loading here reads
+    // `autumn.toml` + `AUTUMN_*` from scratch and so silently ignores any
+    // `ConfigLoader` the embedder installed via
+    // `AppBuilder::with_config_loader` — the seam autumn-web documents for
+    // exactly this. Autumn had already resolved the database URL through that
+    // loader, applied the migrations with it and built the pool from it; this
+    // function then looked at a *different* config and refused to start with
+    // "requires database.url when harvest.mode is embedded". `state.config()`
+    // is the config the rest of the app is actually running on.
+    let app_config = state.config();
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;

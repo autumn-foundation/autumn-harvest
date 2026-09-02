@@ -4,6 +4,66 @@
 
 ---
 
+## The fastest path: `cargo dev`
+
+If you just want to *see* a durable workflow run, you do not need a database, a
+`compose.yaml`, or Docker. From a clone of this repository, with only the Rust
+toolchain installed:
+
+```bash
+cargo dev
+```
+
+That starts an ephemeral PostgreSQL, applies the engine's migrations, runs a
+worker, and serves the management API and the Vantage dashboard. It prints the
+dashboard URL and one `curl` that starts a sample workflow — an activity, a
+durable timer, another activity — so you can watch a real execution progress in
+the UI. `Ctrl-C` stops it and removes everything it created: no leftover
+processes, no leftover data directories.
+
+The cluster it starts is **real PostgreSQL running the engine's real schema and
+real migrations**, so what you see is exactly what you would get in production.
+The dev runtime automates the database *lifecycle*, not the database.
+
+A few things worth knowing:
+
+- **It is development-only, and it enforces that.** It refuses to start against
+  anything it cannot show to be a local database: a non-loopback host, a DSN
+  demanding TLS, or a known hosted-Postgres endpoint are all rejected outright.
+  Its banner says it is not for production on every start.
+- **It does not need Postgres installed.** `cargo dev` enables the
+  `dev-runtime-managed` feature, which downloads a platform-matched PostgreSQL
+  build into a per-user cache the first time you run it (about 30 MB, once). If
+  you already have Postgres installed, it uses that and never touches the
+  network — and you can build the lighter tier explicitly:
+
+  ```bash
+  cargo run -p autumn-harvest-plugin --features dev-runtime --bin harvest-dev
+  ```
+
+- **Bring your own database** if you would rather:
+
+  ```bash
+  HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev cargo dev
+  ```
+
+  It still goes through the same safety gate, and it is left exactly as it is on
+  exit — the dev runtime only ever deletes storage it created itself.
+- **On Windows** the whole path is pure Rust (no libpq, no OpenSSL). Provisioning
+  finds a standard EnterpriseDB install under
+  `C:\Program Files\PostgreSQL\<version>\bin`, and the managed tier downloads
+  a Windows build.
+
+`harvest-dev --help` lists the rest (`--port`, `--session-root`,
+`--allow-suspicious-database-name`).
+
+Everything from here on builds the same skeleton **by hand**, against a Postgres
+you provide, because that is what your own project will look like.
+
+---
+
+## Bring your own Postgres
+
 > **Shortcut:** `harvest new <name>` scaffolds this entire skeleton — a
 > `Cargo.toml`, a runnable `#[workflow]`/`#[activity]` pair with `HarvestPlugin`
 > wiring, a `compose.yaml` Postgres, an `autumn.toml`, and a README whose
