@@ -38,7 +38,11 @@ FAILED_STEP=""
 
 step_start() {
   local name="$1"
-  echo "=== [$( date -u +%H:%M:%S )] STEP: $name ===" | tee -a "$STEP_LOG"
+  # Callers capture this function's stdout as `t0=$(step_start ...)`, so only
+  # the timestamp may go to stdout — the log line goes to stderr (still
+  # `tee`'d into STEP_LOG) or it becomes part of $t0 and breaks the
+  # arithmetic in step_end.
+  echo "=== [$( date -u +%H:%M:%S )] STEP: $name ===" | tee -a "$STEP_LOG" >&2
   date +%s
 }
 
