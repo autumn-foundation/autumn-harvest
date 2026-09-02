@@ -10,7 +10,7 @@ description = "Seeded determinism corpus for harvest-verify (issue #962); delibe
 path = "src/lib.rs"
 
 [dependencies]
-harvest-verify-corpus-helpers-deep = { path = "../helpers-deep" }
+harvest-verify-corpus-helpers-deep = { version = "0.6.0", path = "../helpers-deep" }
 rand = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

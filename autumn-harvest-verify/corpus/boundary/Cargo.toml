@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../../autumn-harvest", default-features = false, features = ["testing"] }
-harvest-verify-corpus-helpers = { path = "../helpers" }
-harvest-verify-corpus-helpers-deep = { path = "../helpers-deep" }
+harvest-verify-corpus-helpers = { version = "0.6.0", path = "../helpers" }
+harvest-verify-corpus-helpers-deep = { version = "0.6.0", path = "../helpers-deep" }
 serde = { workspace = true }
 serde_json = { workspace = true }

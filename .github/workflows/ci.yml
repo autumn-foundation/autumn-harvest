@@ -731,6 +731,28 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace
 
+  # Dependency ledger harness (Ballast). Runs `cargo deny check` against
+  # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
+  # `ignore` entry in deny.toml carries a reachability verdict and a revisit
+  # trigger, not a blanket suppression), licenses (an explicit allowlist plus
+  # narrowly-scoped exceptions), bans (wildcard/git-ref rejection; duplicate
+  # versions are tracked but non-blocking — see deny.toml's [bans] comment),
+  # and sources (registry/git origin pinning). Pure metadata + advisory-DB
+  # checks against Cargo.lock, so it needs neither the DB/Docker services nor
+  # the build/test matrix below.
+  dependency-audit:
+    name: Dependency ledger (cargo-deny)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo deny check (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
   # Issue #962: the semantic (MIR-level) determinism analyzer, `harvest-verify`.
   # This is the SECOND line behind the syntactic HVG/DET guardrails — opt-in, and
   # deliberately NON-STRICT here: `unknown` verdicts warn, only a
