@@ -30,6 +30,36 @@ Four scenarios, each run at **1 shard**, **2 shards** and **4 shards**.
 | `signal_roundtrip` | signal round-trip p50/p99 | an HTTP signal request leaving the client → the workflow's own code resuming past `wait_for_signal` |
 | `replay_throughput` | replay events/sec | the issue #135 10 001-event history, in memory |
 
+### Headline numbers, v0.6.0
+
+Four logical CPUs, Postgres 16.13, durability off, one worker per shard. The
+full environment, the per-cell notes and the verbatim run output are in
+[`benchmarks/results-v0.6.0.md`](benchmarks/results-v0.6.0.md).
+
+| scenario | metric | 1 shard | 2 shards | 4 shards |
+|:--|:--|--:|--:|--:|
+| `throughput` | workflows/sec | 22.65 | 34.97 | 33.53 |
+| `dispatch_latency` | p50 ms | 37.78 | 43.56 | 45.74 |
+| `dispatch_latency` | p99 ms | 55.60 | 62.23 | 100.03 |
+| `signal_roundtrip` | p50 ms | 55.79 | 59.66 | 45.60 |
+| `signal_roundtrip` | p99 ms | 65.44 | 69.02 | 80.24 |
+| `replay_throughput` | events/sec | 9 960 371.64 | 9 657 651.19 | 9 096 540.11 |
+
+Three things a reader should take from that table before anything else:
+
+* **Sharding bought 1.54x at two shards and then stopped.** Four shards is
+  slower than two *on this machine*. See
+  [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show)
+  — the run's own replay control drifted -8.7% across the sweep, which is the
+  box getting busier, not the engine getting worse.
+* **The tail degrades faster than the median.** Dispatch p99 nearly doubles
+  across the sweep while p50 moves 21%.
+* **p99 is the least reproducible number here.** It is published and checked
+  because #941's success metric names it, but a tail measured on a box that is
+  also running the harness is partly a measurement of that box's run queue —
+  the reason issue #786 gates p50 rather than p99. A p99 outside tolerance on a
+  busy machine is expected, not a regression.
+
 ### Results by release
 
 Each release's numbers are kept, not overwritten:

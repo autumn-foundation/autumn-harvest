@@ -725,7 +725,43 @@ pub struct Baseline {
 }
 
 /// The numbers published in `docs/benchmarks/results-v0.6.0.md`.
-pub const PUBLISHED_BASELINES: &[Baseline] = &[];
+///
+/// These are the *headline* metrics only — the ones issue #941's success metric
+/// names. The report also prints context metrics (sample counts, achieved pace,
+/// the measured window) which are diagnostic rather than published claims, so
+/// they are deliberately absent here.
+///
+/// `HARVEST_BENCH_CHECK=1` compares a fresh run against these at
+/// [`REPRO_TOLERANCE_PCT`]. That is a *report*, never a gate — see the module
+/// docs and `benchmarks_docs.rs`.
+///
+/// **On the p99 entries.** The tail is the least reproducible number on the
+/// page, for the reason issue #786 derived at length before gating p50 rather
+/// than p99: a tail measured on a box that is also running the harness is
+/// partly a measurement of that box's run queue. They are published, and they
+/// are checked, because #941's success metric names them — but a p99 outside
+/// tolerance on a busy machine is the expected outcome, not a regression.
+/// `docs/benchmarks.md` says so where the numbers appear.
+pub const PUBLISHED_BASELINES: &[Baseline] = &[
+    Baseline { scenario: BenchScenario::Throughput, shards: 1, metric: "workflows_per_sec", value: 22.65 },
+    Baseline { scenario: BenchScenario::Throughput, shards: 2, metric: "workflows_per_sec", value: 34.97 },
+    Baseline { scenario: BenchScenario::Throughput, shards: 4, metric: "workflows_per_sec", value: 33.53 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 1, metric: "p50_ms", value: 37.78 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 1, metric: "p99_ms", value: 55.60 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 2, metric: "p50_ms", value: 43.56 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 2, metric: "p99_ms", value: 62.23 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 4, metric: "p50_ms", value: 45.74 },
+    Baseline { scenario: BenchScenario::DispatchLatency, shards: 4, metric: "p99_ms", value: 100.03 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 1, metric: "p50_ms", value: 55.79 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 1, metric: "p99_ms", value: 65.44 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 2, metric: "p50_ms", value: 59.66 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 2, metric: "p99_ms", value: 69.02 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 4, metric: "p50_ms", value: 45.60 },
+    Baseline { scenario: BenchScenario::SignalRoundtrip, shards: 4, metric: "p99_ms", value: 80.24 },
+    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 1, metric: "events_per_sec", value: 9_960_371.64 },
+    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 2, metric: "events_per_sec", value: 9_657_651.19 },
+    Baseline { scenario: BenchScenario::ReplayThroughput, shards: 4, metric: "events_per_sec", value: 9_096_540.11 },
+];
 
 /// Look up a published baseline.
 #[must_use]
