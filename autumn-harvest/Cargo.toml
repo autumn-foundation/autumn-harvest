@@ -60,6 +60,13 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+# Reads a migration's `metadata.toml` in `crate::migrate` with the SAME parser
+# Diesel reads it with, so what this applies and what `diesel migration run`
+# applies can never disagree. A hand-rolled subset was tried first and leaked
+# five separate ways (unknown keys, duplicate keys, non-`key = value` lines,
+# unbalanced key quotes, non-ASCII whitespace); already in the workspace
+# lockfile via the plugin, so this unifies rather than widening.
+toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.16"

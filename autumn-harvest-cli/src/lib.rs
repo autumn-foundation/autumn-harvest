@@ -10,6 +10,9 @@ use autumn_harvest::backup_verify::{
     Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
     dsn_targets_same_database, redact_dsn, verify_restore,
 };
+use autumn_harvest::migrate::{
+    MigrationPlan, MigrationReport, MigrationScript, UnserializedReason,
+};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
@@ -17,6 +20,7 @@ use autumn_harvest::{
     dropped_acknowledgements, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use diesel_async::AsyncPgConnection;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -455,6 +459,19 @@ pub enum SchemaCheckFormat {
     #[default]
     Text,
     /// Machine-readable diff JSON for CI consumption.
+    Json,
+}
+
+/// Output format for the `migrate` subcommands (issue #1240).
+///
+/// This is a **local** flag (`--format`); it is deliberately distinct from the
+/// global `--output` used for API responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum MigrateFormat {
+    /// Human-readable per-database summary (default).
+    #[default]
+    Text,
+    /// Machine-readable JSON for deploy pipelines.
     Json,
 }
 
@@ -907,6 +924,40 @@ pub enum CliError {
         /// The underlying error, rendered.
         reason: String,
     },
+
+    /// A `migrate` operation failed against one database (issue #1240).
+    ///
+    /// The DSN is redacted before it reaches this message: a migration command
+    /// is run from deploy pipelines whose logs are far more widely readable
+    /// than the credential in `harvest.database.url`. Exit code is `1`.
+    #[error("migrate: {database}: {reason}")]
+    Migrate {
+        /// Redacted DSN of the database the operation was pointed at.
+        database: String,
+        /// The underlying failure, rendered.
+        reason: String,
+    },
+
+    /// `migrate status --check` found a pending migration (issue #1240).
+    ///
+    /// The report itself is already printed; this only signals the exit code.
+    /// Exit code is `1` — "determined: not migrated", as distinct from the
+    /// exit-`2` gates that mean "could not determine".
+    // The remedy names the flags on purpose: this gate reports on exactly the
+    // sets it was handed, so a bare `harvest migrate run` after a `--check`
+    // that carried `--include-dir` would apply the embedded set only, exit 0,
+    // and leave the very migration that failed the gate unapplied.
+    #[error(
+        "migrate status: {pending} pending migration(s) across {databases} database(s) — \
+         run `harvest migrate run` with the SAME --database-url and --include-dir \
+         flags you passed here, before rolling replicas"
+    )]
+    MigrationsPending {
+        /// Total pending migrations across every inspected database.
+        pending: usize,
+        /// How many databases still have at least one pending migration.
+        databases: usize,
+    },
 }
 
 impl CliError {
@@ -1327,6 +1378,28 @@ enum Commands {
         command: DebugCommand,
     },
 
+    /// Apply Harvest's schema migrations to a dedicated Harvest database
+    /// (issue #1240).
+    ///
+    /// For `harvest.mode = "split"` / `"external"` deployments, where Harvest
+    /// storage is a database Autumn has no handle on: `autumn migrate` reaches
+    /// the application database only, and outside the `dev` profile the plugin
+    /// warns about pending Harvest migrations rather than applying them.
+    ///
+    /// Talks to Postgres directly — no management API, no running app — and
+    /// uses the same `__diesel_schema_migrations` ledger Autumn and Diesel use,
+    /// so a migration is applied exactly once no matter which of them applies
+    /// it. Under `embedded` mode use `autumn migrate` instead; the two Harvest
+    /// sets are Autumn's there.
+    ///
+    /// Harvest's own migrations are embedded in this binary. Sets that are not
+    /// (the plugin's connector dead-letter table, an application's own) are
+    /// applied by pointing `--include-dir` at their migration directories.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
+
     /// Gate backward-incompatible workflow payload-schema changes (issue #794).
     ///
     /// Read-only file comparison: no database, no network.
@@ -1360,6 +1433,84 @@ enum Commands {
         /// Template to emit. Currently only `minimal` ships.
         #[arg(long, value_enum, default_value_t)]
         template: ScaffoldTemplate,
+    },
+}
+
+/// `harvest migrate` subcommands (issue #1240).
+///
+/// Both talk to Postgres directly and never to the management API. `status` is
+/// strictly read-only — it does not even create the migration ledger — so it is
+/// safe to point at a database you are only inspecting.
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Report applied and pending migrations without changing anything.
+    ///
+    /// Exits `0` normally, and `1` with `--check` when any target still has a
+    /// pending migration (the deploy-gate form: run it before rolling
+    /// replicas).
+    Status {
+        /// Harvest database to inspect: the value of `harvest.database.url`.
+        ///
+        /// Repeat once per shard database for a multi-shard deployment; each
+        /// one needs the full set.
+        #[arg(
+            long = "database-url",
+            env = "HARVEST_DATABASE_URL",
+            hide_env_values = true,
+            value_name = "URL",
+            required = true
+        )]
+        database_url: Vec<String>,
+        /// Additional migration directory to include, e.g.
+        /// `autumn-harvest-plugin/migrations/harvest` for the connector
+        /// dead-letter table. Repeatable; each is a directory of
+        /// `<version>_<description>/up.sql` migrations.
+        #[arg(long = "include-dir", value_name = "DIR")]
+        include_dir: Vec<PathBuf>,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: MigrateFormat,
+        /// Exit non-zero while any target has a pending migration.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+    },
+    /// Apply every pending migration, in version order.
+    ///
+    /// Each migration runs inside one transaction together with its ledger row,
+    /// so a failure leaves neither the schema change nor the record of it —
+    /// with one exception, which the report names when it happens: a migration
+    /// whose `metadata.toml` sets `run_in_transaction = false` (what `CREATE
+    /// INDEX CONCURRENTLY` requires) has no transaction to roll back, so any
+    /// statement of it that already succeeded still stands. A failing target
+    /// stops the run: remaining targets are left untouched rather than
+    /// half-migrated behind a database that already failed.
+    Run {
+        /// Harvest database to migrate: the value of `harvest.database.url`.
+        ///
+        /// Repeat once per shard database for a multi-shard deployment; they
+        /// are migrated in the order given.
+        #[arg(
+            long = "database-url",
+            env = "HARVEST_DATABASE_URL",
+            hide_env_values = true,
+            value_name = "URL",
+            required = true
+        )]
+        database_url: Vec<String>,
+        /// Additional migration directory to include, e.g.
+        /// `autumn-harvest-plugin/migrations/harvest` for the connector
+        /// dead-letter table. Repeatable; each is a directory of
+        /// `<version>_<description>/up.sql` migrations.
+        #[arg(long = "include-dir", value_name = "DIR")]
+        include_dir: Vec<PathBuf>,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: MigrateFormat,
+        /// Report what would be applied and exit without applying it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -3233,26 +3384,20 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
-            Commands::Backup { .. } => {
-                unreachable!("Backup handles its own execution locally")
-            }
-            Commands::Dr { .. } => {
-                unreachable!("Dr handles its own execution locally")
-            }
-            Commands::Partition { .. } => {
-                unreachable!("Partition handles its own execution locally")
-            }
-            Commands::DetCheck { .. } => {
-                unreachable!("DetCheck handles its own execution locally")
-            }
-            Commands::Debug { .. } => {
-                unreachable!("Debug handles its own execution locally")
-            }
-            Commands::Schema { .. } => {
-                unreachable!("Schema handles its own execution locally")
-            }
-            Commands::New { .. } => {
-                unreachable!("New handles its own execution locally")
+            // Locally-executed commands: each returns from `run` before the
+            // API-request mapper is reached, so none of them can arrive here.
+            // Grouped rather than listed one arm apiece -- a three-line arm per
+            // command is what pushed this function past `too_many_lines`, and
+            // it would do so again on the next local command.
+            cmd @ (Commands::Backup { .. }
+            | Commands::Dr { .. }
+            | Commands::Partition { .. }
+            | Commands::DetCheck { .. }
+            | Commands::Debug { .. }
+            | Commands::Schema { .. }
+            | Commands::Migrate { .. }
+            | Commands::New { .. }) => {
+                unreachable!("{cmd:?} handles its own execution locally")
             }
         }
     }
@@ -3439,6 +3584,26 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 acknowledge.as_deref(),
                 recorded_in.as_deref(),
             ),
+        };
+    }
+
+    // `migrate` talks to the Harvest database directly (issue #1240): no HTTP,
+    // and deliberately no running app — it is the step that happens *before*
+    // replicas roll (mirrors `backup verify`).
+    if let Commands::Migrate { command } = &cli.command {
+        return match command {
+            MigrateCommand::Status {
+                database_url,
+                include_dir,
+                format,
+                check,
+            } => run_migrate_status(database_url, include_dir, *format, *check).await,
+            MigrateCommand::Run {
+                database_url,
+                include_dir,
+                format,
+                dry_run,
+            } => run_migrate_run(database_url, include_dir, *format, *dry_run).await,
         };
     }
 
@@ -4536,6 +4701,891 @@ pub async fn run_backup_verify(
     }
 
     backup_verify_gate(&report).map_or(Ok(()), Err)
+}
+
+// ── harvest migrate: dedicated Harvest-database migrations (issue #1240) ────
+
+/// Assemble the migration set to apply: Harvest's own, embedded in this binary,
+/// plus every `--include-dir` set in the order given.
+///
+/// The combined set is validated for duplicate versions here rather than per
+/// directory, because that is exactly where a collision arises — two
+/// independently authored sets that picked the same version. Diesel's ledger is
+/// keyed by version alone, so one of them would otherwise be recorded and never
+/// run.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when a directory cannot be read, when a migration
+/// in it has no readable `up.sql`, or when two migrations share a version.
+fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliError> {
+    let mut scripts = autumn_harvest::migrate::embedded();
+    for dir in include_dir {
+        let extra = autumn_harvest::migrate::from_directory(dir).map_err(|error| {
+            CliError::InvalidInput(format!("--include-dir `{}`: {error}", dir.display()))
+        })?;
+        scripts.extend(extra);
+    }
+    autumn_harvest::migrate::validate_versions(&scripts)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+    Ok(scripts)
+}
+
+/// Establish the connection `harvest migrate` works over.
+///
+/// Deliberately not [`autumn_harvest::migrate::connect`]: that is
+/// `AsyncPgConnection::establish`, which is `NoTls` and so cannot reach a
+/// database whose `sslmode` demands TLS — the common shape of a managed
+/// Harvest database, and exactly the production case this command exists for
+/// (issue #1240). This builds the same rustls-backed connector autumn-web's
+/// own migration path uses, so the two agree about which databases are
+/// reachable.
+///
+/// **TLS is always verified** — certificate chain *and* hostname, against the
+/// platform's trust store. That is stricter than libpq, whose `require` and
+/// `prefer` encrypt without authenticating: a certificate this cannot verify is
+/// refused here, where libpq would connect.
+///
+/// What that means per mode, precisely:
+///
+/// * `disable` — plaintext, no trust store consulted.
+/// * `prefer` (the default) — TLS is attempted; tokio-postgres falls back to
+///   plaintext only when the **server declines** TLS, not when the handshake
+///   fails. So an untrusted or hostname-mismatched certificate is an error
+///   here rather than a silent downgrade to an unauthenticated connection.
+///   Deliberate: this command carries a database password and applies schema
+///   changes, and "the certificate was wrong so we sent the credential in
+///   clear" is not a fallback worth having. Use `sslmode=disable` to say
+///   plaintext out loud, or put the CA in the trust store.
+/// * `require` / `verify-ca` / `verify-full` — TLS, verified. An empty trust
+///   store is a named error rather than a downgrade.
+///
+/// # Errors
+///
+/// [`CliError::Migrate`] when the DSN cannot be parsed, when the platform has
+/// no usable trust store, or when the connection cannot be established.
+async fn connect_for_migration(
+    database_url: &str,
+    redacted: &str,
+) -> Result<AsyncPgConnection, CliError> {
+    let dsn = normalize_sslmode(database_url);
+    let config: tokio_postgres::Config = dsn
+        .parse()
+        .map_err(|error: tokio_postgres::Error| migrate_error(database_url, redacted, &error))?;
+
+    // `sslmode=disable` never touches the TLS configuration, so it must not be
+    // gated on one: a minimal container with no CA bundle is a perfectly good
+    // place to migrate a plaintext database, and failing there would contradict
+    // what this command promises.
+    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+        return autumn_harvest::migrate::connect(database_url)
+            .await
+            .map_err(|error| migrate_error(database_url, redacted, &error));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A malformed certificate in the system store is not a reason to fail:
+        // rustls rejects it, the rest still anchor the chain.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        // With no anchors, every TLS handshake would fail verification. What
+        // that should mean depends on whether the operator asked for TLS:
+        // under `require` it is a hard error, and under `prefer` -- which is
+        // libpq's "TLS if it works, plaintext otherwise" -- plaintext is the
+        // documented degradation. Never the reverse: a `require` DSN is never
+        // quietly downgraded.
+        if config.get_ssl_mode() == tokio_postgres::config::SslMode::Prefer {
+            eprintln!(
+                "warning: {redacted}: no usable certificates in the platform trust \
+                 store, so no TLS connection could be verified; sslmode=prefer \
+                 therefore connects in PLAINTEXT. Install your distribution's \
+                 ca-certificates package, or pass sslmode=require to fail instead. \
+                 (With a trust store present, a certificate that fails to verify \
+                 is an error, not a downgrade.)"
+            );
+            return autumn_harvest::migrate::connect(database_url)
+                .await
+                .map_err(|error| migrate_error(database_url, redacted, &error));
+        }
+        return Err(CliError::Migrate {
+            database: redacted.to_string(),
+            reason: format!(
+                "no usable certificates in the platform trust store, so a TLS \
+                 connection cannot be verified (install your distribution's \
+                 ca-certificates package). Loader errors: {:?}",
+                native.errors
+            ),
+        });
+    }
+
+    // An explicit provider rather than the process-wide default: nothing else
+    // in this binary installs one, and `ClientConfig::builder()` panics when
+    // there is none.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| migrate_error(database_url, redacted, &error))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let (client, connection) = config
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
+        .await
+        .map_err(|error| migrate_error(database_url, redacted, &error))?;
+
+    // `try_from_client_and_connection` drives the connection task itself and
+    // surfaces its errors on the connection, so a dropped socket mid-migration
+    // is reported rather than hanging.
+    AsyncPgConnection::try_from_client_and_connection(client, connection)
+        .await
+        .map_err(|error| migrate_error(database_url, redacted, &error))
+}
+
+/// Rewrite `sslmode=verify-ca` / `verify-full` to `require`.
+///
+/// tokio-postgres 0.7 accepts only `disable`, `prefer` and `require`, and
+/// **fails to parse** the DSN otherwise — so a `verify-full` DSN that libpq and
+/// the `diesel` CLI accept would be rejected before a connection is attempted.
+///
+/// Substituting `require` is not a downgrade: verification is the rustls
+/// connector's job here, and it always checks the chain and the hostname. The
+/// two verify modes therefore describe what [`connect_for_migration`] already
+/// does unconditionally.
+///
+/// Handles both DSN spellings — a URL (`postgres://…?sslmode=verify-full`) and
+/// libpq keyword form (`host=… sslmode=verify-full`) — and leaves anything else
+/// byte-identical.
+#[must_use]
+pub fn normalize_sslmode(dsn: &str) -> String {
+    const VERIFY_MODES: [&str; 2] = ["verify-ca", "verify-full"];
+
+    if let Ok(mut url) = url::Url::parse(dsn) {
+        let needs_rewrite = url
+            .query_pairs()
+            .any(|(k, v)| k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()));
+        if !needs_rewrite {
+            return dsn.to_string();
+        }
+        let rewritten: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                if k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()) {
+                    (k.into_owned(), "require".to_string())
+                } else {
+                    (k.into_owned(), v.into_owned())
+                }
+            })
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(rewritten)
+            .finish();
+        return url.to_string();
+    }
+
+    rewrite_keyword_dsn(dsn, &VERIFY_MODES)
+}
+
+/// Rewrite the top-level `sslmode` option of a libpq **keyword/value** DSN
+/// (`host=… sslmode=verify-full`), leaving every other byte alone.
+///
+/// Scans the DSN the way libpq reads it — options separated by whitespace,
+/// optional whitespace around `=`, values optionally single-quoted with `\`
+/// escapes — rather than splitting on whitespace. A whitespace split cannot see
+/// quoting, so `password='abc sslmode=verify-full def'` would have had the text
+/// *inside the password* rewritten, corrupting the credential and failing
+/// authentication. It also could not see `sslmode = verify-full`, which libpq
+/// accepts and this now rewrites.
+///
+/// A DSN this cannot scan (an unterminated quote, a missing `=`) is returned
+/// **unchanged**, so tokio-postgres reports its own parse error rather than
+/// this mangling the input first.
+fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
+    scan_keyword_dsn(dsn, |key, value| {
+        (key == "sslmode" && verify_modes.contains(&value)).then(|| "require".to_string())
+    })
+    .unwrap_or_else(|| dsn.to_string())
+}
+
+/// Redact the secrets in a libpq **keyword/value** DSN, leaving the rest legible.
+///
+/// [`redact_dsn`] parses URLs, and answers `<unparseable dsn>` for the keyword
+/// form. That is safe but useless as a *label*: repeat `--database-url` with
+/// three keyword-form shards and every line of the report reads the same, which
+/// is exactly the "which databases did we already migrate?" question a partial
+/// report exists to answer.
+///
+/// Returns `None` when the DSN cannot be scanned, so a caller can fall back
+/// rather than print something it has not actually inspected.
+fn redact_keyword_dsn(dsn: &str) -> Option<String> {
+    // Any key whose name carries `password` — `password`, and a future
+    // `sslpassword` — loses its value. Everything else (host, dbname, user,
+    // port) is what makes one target tellable from another.
+    scan_keyword_dsn(dsn, |key, _| {
+        key.to_ascii_lowercase()
+            .contains("password")
+            .then(|| "***".to_string())
+    })
+}
+
+/// Scan a libpq keyword/value DSN, replacing the values `replace` returns
+/// `Some` for and copying every other byte verbatim.
+///
+/// Reads the DSN the way libpq does — options separated by whitespace, optional
+/// whitespace around `=`, values optionally single-quoted, backslash escaping
+/// the next character in either form. A whitespace split cannot see quoting, so
+/// `password='abc sslmode=verify-full def'` would otherwise have the text
+/// *inside the password* rewritten.
+///
+/// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
+/// `=`, a value that never arrives — leaving the caller to pass the original
+/// through so tokio-postgres reports its own parse error rather than this
+/// mangling the input first.
+fn scan_keyword_dsn(
+    dsn: &str,
+    mut replace: impl FnMut(&str, &str) -> Option<String>,
+) -> Option<String> {
+    let bytes = dsn.as_bytes();
+    let mut out = String::with_capacity(dsn.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Whitespace between options, copied verbatim.
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(&dsn[start..i]);
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Keyword, then `=` with optional whitespace on either side.
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &dsn[key_start..i];
+        // The key must be a keyword libpq actually recognizes, not merely
+        // keyword-SHAPED. Checking only the character set is not enough: a
+        // mistyped URL that keeps a credential but loses the `://`
+        // (`postgres=//alice:hunter2@db/harvest`) scans as the "keyword"
+        // `postgres`, needs no redaction because there is no `password=`, and
+        // comes back whole -- password included -- as if it had been examined.
+        // Rejecting here yields the caller's `<unparseable dsn>` label, which
+        // is what an input tokio-postgres will also reject should produce.
+        if !is_connection_keyword(key) {
+            return None;
+        }
+        let spacing_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // A DSN that ends after `=` (`host=db password=`) has no value to read;
+        // indexing here would panic before tokio-postgres could say so.
+        if i >= bytes.len() {
+            return None;
+        }
+        out.push_str(key);
+        out.push_str(&dsn[spacing_start..i]);
+
+        // Value: single-quoted or bare, `\` escaping the next character in both.
+        let value_start = i;
+        let mut value = String::new();
+        if bytes[i] == b'\'' {
+            i += 1;
+            loop {
+                if i >= bytes.len() {
+                    // Unterminated quote: not ours to interpret.
+                    return None;
+                }
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        // Advance past the WHOLE escaped character: `\é` is
+                        // three bytes, and `i += 2` would leave `i` inside it,
+                        // so the next `dsn[i..]` slice panics on a non-char
+                        // boundary instead of connecting.
+                        let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
+                        value.push(escaped);
+                        i += 1 + escaped.len_utf8();
+                    }
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {
+                        let c = dsn[i..].chars().next().unwrap_or_default();
+                        value.push(c);
+                        i += c.len_utf8();
+                    }
+                }
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
+                    value.push(escaped);
+                    i += 1 + escaped.len_utf8();
+                } else {
+                    let c = dsn[i..].chars().next().unwrap_or_default();
+                    value.push(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+
+        match replace(key, &value) {
+            Some(replacement) => out.push_str(&replacement),
+            // Verbatim, quotes and escapes included: only the options the
+            // caller asked about are ever touched.
+            None => out.push_str(&dsn[value_start..i]),
+        }
+    }
+
+    Some(out)
+}
+
+/// The label a migration target is reported under: its DSN with the credential
+/// removed, and — when it cannot be redacted at all — an ordinal, so repeated
+/// targets stay tellable apart.
+///
+/// `ordinal` is the target's 1-based position on the command line.
+#[must_use]
+pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
+    const UNPARSEABLE: &str = "<unparseable dsn>";
+    /// `redact_dsn`'s other whole-DSN withholding: a URL carrying its password
+    /// in the query string cannot be rewritten safely, so it returns this
+    /// instead. Like the unparseable case it is the same for every target.
+    const WITHHELD: &str = "<redacted dsn>";
+
+    // Decide the FORM first, then redact with the reader for that form. The
+    // other order leaks: `redact_dsn` parses with a general URL parser, and
+    // `alice:hunter2@db.internal/harvest` is a syntactically fine URL whose
+    // scheme is `alice` and whose password is nowhere the parser looks — so it
+    // came back unredacted and went into the log. libpq's own rule is the
+    // scheme prefix, so use exactly that.
+    let trimmed = dsn.trim_start();
+    let is_url_form = ["postgres://", "postgresql://"].iter().any(|scheme| {
+        trimmed
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    });
+
+    if is_url_form {
+        let redacted = redact_dsn(dsn);
+        // A URL is a URL, malformed or not: if the URL reader cannot read it,
+        // the keyword scanner has no business trying. Whenever the reader
+        // withholds the WHOLE DSN -- unparseable, or a password in the query
+        // string it cannot rewrite -- the label carries no identity, so every
+        // target would report the same. Keep the reason and add the ordinal.
+        return if redacted == UNPARSEABLE || redacted == WITHHELD {
+            format!("{redacted} #{ordinal}")
+        } else {
+            redacted
+        };
+    }
+
+    redact_keyword_dsn(dsn).unwrap_or_else(|| format!("{UNPARSEABLE} #{ordinal}"))
+}
+
+/// Whether `key` is a libpq connection keyword.
+///
+/// Deliberately a superset of what tokio-postgres itself accepts. Erring wide
+/// only risks handing back a redacted label for a DSN the driver will reject
+/// anyway; erring narrow would downgrade a legitimate DSN's label to
+/// `<unparseable dsn>` and cost an operator the identity of the failing shard.
+/// What it must not admit is a token that is keyword-shaped but not a keyword,
+/// which is how a mistyped URL smuggles a password past redaction.
+fn is_connection_keyword(key: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "application_name",
+        "channel_binding",
+        "client_encoding",
+        "connect_timeout",
+        "dbname",
+        "fallback_application_name",
+        "gssdelegation",
+        "gssencmode",
+        "gsslib",
+        "host",
+        "hostaddr",
+        "keepalives",
+        "keepalives_count",
+        "keepalives_idle",
+        "keepalives_interval",
+        "krbsrvname",
+        "load_balance_hosts",
+        "options",
+        "passfile",
+        "password",
+        "port",
+        "replication",
+        "require_auth",
+        "requirepeer",
+        "requiressl",
+        "scram_client_key",
+        "scram_server_key",
+        "service",
+        "ssl_max_protocol_version",
+        "ssl_min_protocol_version",
+        "sslcert",
+        "sslcertmode",
+        "sslcompression",
+        "sslcrl",
+        "sslcrldir",
+        "sslkey",
+        "sslmode",
+        "sslnegotiation",
+        "sslpassword",
+        "sslrootcert",
+        "sslsni",
+        "target_session_attrs",
+        "tcp_user_timeout",
+        "user",
+    ];
+    // libpq keywords are lowercase; compare case-insensitively so a DSN
+    // written `Host=db` keeps its label rather than being called unparseable.
+    KEYWORDS
+        .iter()
+        .any(|keyword| key.eq_ignore_ascii_case(keyword))
+}
+
+/// Render a migration failure without leaking the DSN.
+///
+/// A migration command runs from deploy pipelines whose logs are read far more
+/// widely than the credential in `harvest.database.url`, and a driver is free
+/// to quote the connection string it was handed. Substituting the redacted form
+/// costs nothing and removes the whole class.
+fn migrate_error(database_url: &str, redacted: &str, error: &impl std::fmt::Display) -> CliError {
+    CliError::Migrate {
+        database: redacted.to_string(),
+        reason: error.to_string().replace(database_url, redacted),
+    }
+}
+
+/// Human-readable `migrate status` report: one block per database.
+///
+/// `heading` distinguishes a plain status report from `run --dry-run`, which
+/// renders the same plan under a different promise.
+#[must_use]
+pub fn format_migrate_plan_text(heading: &str, targets: &[(String, MigrationPlan)]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{heading}");
+    for (database, plan) in targets {
+        let _ = writeln!(out, "  {database}");
+        if !plan.ledger_exists {
+            let _ = writeln!(
+                out,
+                "    ledger:  absent — this database has never been migrated"
+            );
+        }
+        let _ = writeln!(out, "    applied: {}", plan.already_applied.len());
+        let _ = writeln!(out, "    pending: {}", plan.pending.len());
+        for script in &plan.pending {
+            let _ = writeln!(out, "      {}", script.name);
+        }
+        // Reported, never removed: the usual cause is a newer build having
+        // already migrated this database, but it also catches a DSN pointed at
+        // the wrong one.
+        if !plan.unrecognized.is_empty() {
+            let _ = writeln!(
+                out,
+                "    unrecognized: {} ledger row(s) this binary does not know \
+                 (is it older than the deployed schema?)",
+                plan.unrecognized.len()
+            );
+            for version in &plan.unrecognized {
+                let _ = writeln!(out, "      {version}");
+            }
+        }
+    }
+    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
+    let _ = write!(
+        out,
+        "{pending} pending migration(s) across {} database(s)",
+        targets.len()
+    );
+    out
+}
+
+/// A report for a target the run could not even inspect.
+const fn empty_migration_report() -> MigrationReport {
+    MigrationReport {
+        applied: Vec::new(),
+        already_applied: Vec::new(),
+        applied_concurrently: Vec::new(),
+        unrecognized: Vec::new(),
+        // Nothing ran, so nothing ran unserialized.
+        ledger_lock_available: true,
+        applied_unserialized: Vec::new(),
+        failed: None,
+    }
+}
+
+/// One database's outcome in a `migrate run` report.
+#[derive(Debug)]
+pub struct MigrateRunTarget {
+    /// Redacted DSN, or an ordinal label when it could not be redacted.
+    pub database: String,
+    /// What the run did here.
+    pub report: MigrationReport,
+    /// The run never reached a migration on this target: connecting, creating
+    /// the ledger, or reading it failed.
+    ///
+    /// Distinguished because an empty report is otherwise indistinguishable
+    /// from "finished, nothing to do" — a JSON consumer would read `applied:
+    /// []`, `failed: null` on a database the run could not even inspect and
+    /// call it done.
+    pub setup_failed: bool,
+}
+
+/// Human-readable `migrate run` report: one block per database.
+#[must_use]
+pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "harvest migrate run");
+    for MigrateRunTarget {
+        database,
+        report,
+        setup_failed,
+    } in targets
+    {
+        let _ = writeln!(out, "  {database}");
+        let _ = writeln!(out, "    applied: {}", report.applied.len());
+        for name in &report.applied {
+            let _ = writeln!(out, "      {name}");
+        }
+        let _ = writeln!(out, "    already applied: {}", report.already_applied.len());
+        // Another migrator committed these between the plan and the apply. Said
+        // out loud because "applied: 0" on the database an operator is watching
+        // otherwise looks like the command did nothing.
+        if !report.applied_concurrently.is_empty() {
+            let _ = writeln!(
+                out,
+                "    applied by a concurrent migrator: {}",
+                report.applied_concurrently.len()
+            );
+            for name in &report.applied_concurrently {
+                let _ = writeln!(out, "      {name}");
+            }
+        }
+        if !report.unrecognized.is_empty() {
+            let _ = writeln!(
+                out,
+                "    unrecognized: {} ledger row(s) this binary does not know \
+                 (is it older than the deployed schema?)",
+                report.unrecognized.len()
+            );
+        }
+        // The `harvest` binary installs no tracing subscriber, so the engine's
+        // own warning about this goes nowhere. An operator only learns that
+        // concurrent runs are unsafe here if the report says so.
+        if !report.applied_unserialized.is_empty() {
+            let _ = writeln!(
+                out,
+                "    WARNING: {} migration(s) applied WITHOUT the ledger lock, so a \
+                 concurrent migrator was not serialized against them:",
+                report.applied_unserialized.len()
+            );
+            // Per migration, not per run: a run can contain both reasons, and
+            // they take different remedies. Naming one cause for the whole
+            // list would send an operator to change a grant that cannot help
+            // the non-transactional entries.
+            for entry in &report.applied_unserialized {
+                let cause = match entry.reason {
+                    UnserializedReason::LedgerLockUnavailable => {
+                        "this role lacks UPDATE/DELETE/TRUNCATE on __diesel_schema_migrations"
+                    }
+                    UnserializedReason::NoTransaction => {
+                        "declares run_in_transaction = false, so there is no transaction \
+                         to hold the lock in -- no grant changes this"
+                    }
+                };
+                let _ = writeln!(out, "      {} -- {cause}", entry.name);
+            }
+            let _ = writeln!(
+                out,
+                "      Run migrators one at a time against this database."
+            );
+        }
+        if *setup_failed {
+            let _ = writeln!(
+                out,
+                "    FAILED: before any migration ran -- this database could not \
+                 be prepared (see the error below); nothing was applied here"
+            );
+        }
+        if let Some(failed) = &report.failed {
+            let _ = writeln!(out, "    FAILED: {}", failed.name);
+            let _ = writeln!(
+                out,
+                "      {}",
+                if failed.rolled_back {
+                    "rolled back -- this database is as it was before that migration"
+                } else {
+                    "NOT rolled back (run_in_transaction = false) -- any statement \
+                     of it that already succeeded still stands. Inspect what it \
+                     left behind and repair it before deciding whether a re-run \
+                     is safe: nothing here can know the body is idempotent"
+                }
+            );
+        }
+    }
+    let applied: usize = targets.iter().map(|t| t.report.applied.len()).sum();
+    let _ = write!(
+        out,
+        "{applied} migration(s) applied across {} database(s)",
+        targets.len()
+    );
+    out
+}
+
+/// Machine-readable `migrate status` / `run --dry-run` report.
+///
+/// # Errors
+///
+/// [`CliError::SerializeResponse`] if the report cannot be serialized.
+pub fn migrate_plan_json(
+    command: &str,
+    targets: &[(String, MigrationPlan)],
+) -> Result<String, CliError> {
+    let body = json!({
+        "command": command,
+        "targets": targets
+            .iter()
+            .map(|(database, plan)| json!({
+                "database": database,
+                "ledger_exists": plan.ledger_exists,
+                "already_applied": plan.already_applied,
+                "pending": plan.pending.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                "unrecognized": plan.unrecognized,
+            }))
+            .collect::<Vec<_>>(),
+        "pending_total": targets.iter().map(|(_, plan)| plan.pending.len()).sum::<usize>(),
+    });
+    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
+}
+
+/// Machine-readable `migrate run` report.
+///
+/// # Errors
+///
+/// [`CliError::SerializeResponse`] if the report cannot be serialized.
+pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError> {
+    let body = json!({
+        "command": "migrate run",
+        "targets": targets
+            .iter()
+            .map(|target| json!({
+                "database": target.database,
+                "applied": target.report.applied,
+                "already_applied": target.report.already_applied,
+                "applied_concurrently": target.report.applied_concurrently,
+                "unrecognized": target.report.unrecognized,
+                "ledger_lock_available": target.report.ledger_lock_available,
+                "applied_unserialized": target.report.applied_unserialized,
+                // The run could not prepare this database at all. Without it an
+                // empty report reads as "finished with nothing to do".
+                "setup_failed": target.setup_failed,
+                // `null` on a target that finished. On one that did not, the
+                // migration it stopped on and whether that rolled back -- the
+                // difference between "nothing changed" and "something changed
+                // and the run cannot say what".
+                "failed": target.report.failed.as_ref().map(|failed| json!({
+                    "name": failed.name,
+                    "rolled_back": failed.rolled_back,
+                })),
+            }))
+            .collect::<Vec<_>>(),
+        "applied_total": targets.iter().map(|t| t.report.applied.len()).sum::<usize>(),
+    });
+    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
+}
+
+/// The `--check` deploy gate: pending migrations anywhere fail the command.
+#[must_use]
+pub fn migrate_pending_gate(targets: &[(String, MigrationPlan)]) -> Option<CliError> {
+    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
+    if pending == 0 {
+        return None;
+    }
+    Some(CliError::MigrationsPending {
+        pending,
+        databases: targets
+            .iter()
+            .filter(|(_, plan)| plan.has_pending())
+            .count(),
+    })
+}
+
+/// Read every target's migration plan, leaving all of them untouched.
+async fn migrate_plans(
+    database_url: &[String],
+    scripts: &[MigrationScript],
+) -> Result<Vec<(String, MigrationPlan)>, CliError> {
+    let mut targets = Vec::with_capacity(database_url.len());
+    for (ordinal, url) in database_url.iter().enumerate() {
+        let redacted = migrate_target_label(url, ordinal + 1);
+        let mut conn = connect_for_migration(url, &redacted).await?;
+        let plan = autumn_harvest::migrate::plan_on_connection(&mut conn, scripts)
+            .await
+            .map_err(|error| migrate_error(url, &redacted, &error))?;
+        targets.push((redacted, plan));
+    }
+    Ok(targets)
+}
+
+/// Print the targets a `run` finished before it failed, then return the
+/// failure.
+///
+/// A multi-shard run stops at the first failing target, so what came before it
+/// is already migrated and what comes after is untouched. Reporting that split
+/// is the difference between "re-run the command" and "work out by hand which
+/// databases moved".
+fn report_and_fail(
+    targets: &[MigrateRunTarget],
+    format: MigrateFormat,
+    failure: CliError,
+) -> Result<(), CliError> {
+    if !targets.is_empty() {
+        match format {
+            MigrateFormat::Text => println!("{}", format_migrate_run_text(targets)),
+            MigrateFormat::Json => println!("{}", migrate_run_json(targets)?),
+        }
+    }
+    Err(failure)
+}
+
+/// Run `harvest migrate status` end to end.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
+/// migration version; [`CliError::Migrate`] when a database cannot be reached;
+/// [`CliError::MigrationsPending`] when `--check` is set and any target still
+/// has a pending migration. The report is printed before the gate fires.
+pub async fn run_migrate_status(
+    database_url: &[String],
+    include_dir: &[PathBuf],
+    format: MigrateFormat,
+    check: bool,
+) -> Result<(), CliError> {
+    let scripts = migration_set(include_dir)?;
+    let targets = migrate_plans(database_url, &scripts).await?;
+
+    match format {
+        MigrateFormat::Text => println!(
+            "{}",
+            format_migrate_plan_text("harvest migrate status", &targets)
+        ),
+        MigrateFormat::Json => println!("{}", migrate_plan_json("migrate status", &targets)?),
+    }
+
+    if let Some(error) = check.then(|| migrate_pending_gate(&targets)).flatten() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Run `harvest migrate run` end to end.
+///
+/// Databases are migrated in the order given and a failure stops the run: the
+/// remaining targets are left untouched rather than migrated behind a database
+/// that already failed. Whatever completed first is still reported, so an
+/// operator can see exactly how far the deploy step got.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
+/// migration version; [`CliError::Migrate`] when a database cannot be reached
+/// or a migration fails.
+pub async fn run_migrate_run(
+    database_url: &[String],
+    include_dir: &[PathBuf],
+    format: MigrateFormat,
+    dry_run: bool,
+) -> Result<(), CliError> {
+    let scripts = migration_set(include_dir)?;
+
+    if dry_run {
+        let targets = migrate_plans(database_url, &scripts).await?;
+        match format {
+            MigrateFormat::Text => println!(
+                "{}",
+                format_migrate_plan_text("harvest migrate run --dry-run", &targets)
+            ),
+            MigrateFormat::Json => {
+                println!("{}", migrate_plan_json("migrate run --dry-run", &targets)?);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut targets = Vec::with_capacity(database_url.len());
+    for (ordinal, url) in database_url.iter().enumerate() {
+        let redacted = migrate_target_label(url, ordinal + 1);
+        // Every failure past the first target -- connecting to it as much as
+        // migrating it -- goes through `report_and_fail`: on a multi-shard run
+        // the operator needs to know which databases are already migrated
+        // before deciding what to do next, and an unreachable third shard says
+        // nothing about the two behind it.
+        let mut conn = match connect_for_migration(url, &redacted).await {
+            Ok(conn) => conn,
+            Err(failure) => {
+                // Named as a target that never started, rather than omitted:
+                // "absent" would be indistinguishable from the targets after it
+                // that the run simply never reached.
+                targets.push(MigrateRunTarget {
+                    database: redacted,
+                    report: empty_migration_report(),
+                    setup_failed: true,
+                });
+                return report_and_fail(&targets, format, failure);
+            }
+        };
+        match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
+            Ok(report) => targets.push(MigrateRunTarget {
+                database: redacted,
+                report,
+                setup_failed: false,
+            }),
+            Err(partial) => {
+                let failure = migrate_error(url, &redacted, &partial.error);
+                // The failing target always joins the report, even with nothing
+                // applied: a `run_in_transaction = false` migration that failed
+                // part-way leaves changes it cannot list, and "no report at
+                // all" and "nothing happened" must not look the same to the
+                // tooling reading this.
+                //
+                // `failed: None` means no migration failed, so the run never
+                // got that far -- the ledger could not be created or read.
+                // Flagged, or an empty report would read as a clean finish.
+                let setup_failed = partial.report.failed.is_none();
+                targets.push(MigrateRunTarget {
+                    database: redacted,
+                    report: partial.report,
+                    setup_failed,
+                });
+                return report_and_fail(&targets, format, failure);
+            }
+        }
+    }
+
+    match format {
+        MigrateFormat::Text => println!("{}", format_migrate_run_text(&targets)),
+        MigrateFormat::Json => println!("{}", migrate_run_json(&targets)?),
+    }
+    Ok(())
 }
 
 // ── harvest dr: cross-region disaster recovery (issue #954) ─────────────────
@@ -16478,5 +17528,971 @@ mod debug_cli_tests {
     #[test]
     fn debug_diff_requires_two_paths() {
         assert!(try_parse(&["debug", "diff", "only-one.json"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod migrate_cli_tests {
+    //! `harvest migrate` argument mapping, rendering, and the `--check` gate
+    //! (issue #1240). No database: the DB half is covered by
+    //! `autumn-harvest/tests/integration/migrate_tests.rs`.
+    use super::*;
+    use autumn_harvest::migrate::{
+        FailedMigration, MigrationPlan, MigrationReport, MigrationScript, UnserializedMigration,
+    };
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn script(name: &str) -> MigrationScript {
+        MigrationScript::new(name, "SELECT 1;").expect("well-formed migration name")
+    }
+
+    fn plan(pending: &[&str], already: usize, unrecognized: &[&str]) -> MigrationPlan {
+        MigrationPlan {
+            already_applied: (0..already)
+                .map(|i| format!("2026010{i}000000_applied"))
+                .collect(),
+            pending: pending.iter().map(|n| script(n)).collect(),
+            unrecognized: unrecognized.iter().map(|v| (*v).to_string()).collect(),
+            ledger_exists: true,
+        }
+    }
+
+    // ── argument mapping ────────────────────────────────────────────────────
+
+    #[test]
+    fn migrate_status_parses_repeated_targets_and_include_dirs() {
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+            "--database-url",
+            "postgres://harvest/b",
+            "--include-dir",
+            "autumn-harvest-plugin/migrations/harvest",
+            "--format",
+            "json",
+            "--check",
+        ]);
+        let Commands::Migrate {
+            command:
+                MigrateCommand::Status {
+                    database_url,
+                    include_dir,
+                    format,
+                    check,
+                },
+        } = cli.command
+        else {
+            panic!("expected migrate status");
+        };
+        // A multi-shard deployment migrates every shard database; one flag per
+        // shard, not a delimiter-split single value.
+        assert_eq!(
+            database_url,
+            vec!["postgres://harvest/a", "postgres://harvest/b"]
+        );
+        assert_eq!(
+            include_dir,
+            vec![PathBuf::from("autumn-harvest-plugin/migrations/harvest")]
+        );
+        assert_eq!(format, MigrateFormat::Json);
+        assert!(check);
+    }
+
+    #[test]
+    fn migrate_defaults_are_text_and_ungated() {
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+        ]);
+        let Commands::Migrate {
+            command:
+                MigrateCommand::Status {
+                    include_dir,
+                    format,
+                    check,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected migrate status");
+        };
+        assert!(include_dir.is_empty());
+        assert_eq!(format, MigrateFormat::Text);
+        assert!(!check, "the deploy gate must be opt-in");
+    }
+
+    #[test]
+    fn migrate_run_dry_run_is_opt_in() {
+        let cli = parse(&[
+            "migrate",
+            "run",
+            "--database-url",
+            "postgres://harvest/a",
+            "--dry-run",
+        ]);
+        let Commands::Migrate {
+            command: MigrateCommand::Run { dry_run, .. },
+        } = cli.command
+        else {
+            panic!("expected migrate run");
+        };
+        assert!(dry_run);
+
+        let cli = parse(&["migrate", "run", "--database-url", "postgres://harvest/a"]);
+        let Commands::Migrate {
+            command: MigrateCommand::Run { dry_run, .. },
+        } = cli.command
+        else {
+            panic!("expected migrate run");
+        };
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn migrate_requires_a_database_url() {
+        // Nothing to default to: the whole point is a database Autumn cannot
+        // reach, so guessing one would migrate the wrong database.
+        assert!(
+            Cli::try_parse_from(["harvest", "migrate", "run"]).is_err()
+                || std::env::var("HARVEST_DATABASE_URL").is_ok(),
+            "--database-url must be required when the env var is unset"
+        );
+    }
+
+    #[test]
+    fn migrate_is_not_routed_through_the_api() {
+        // Guards the local-execution early return in `run_cli`: if a future
+        // edit drops it, this panics instead of the command silently trying to
+        // build an HTTP request.
+        let cli = parse(&[
+            "migrate",
+            "status",
+            "--database-url",
+            "postgres://harvest/a",
+        ]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.api_request()));
+        assert!(
+            result.is_err(),
+            "migrate must be handled locally, never mapped to an API request"
+        );
+    }
+
+    // ── include-dir loading ─────────────────────────────────────────────────
+
+    #[test]
+    fn include_dir_extends_the_embedded_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("29990101000000_extra")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("29990101000000_extra").join("up.sql"),
+            "SELECT 1;",
+        )
+        .expect("write up.sql");
+
+        let scripts = migration_set(&[dir.path().to_path_buf()]).expect("set loads");
+        let embedded = autumn_harvest::migrate::embedded();
+        assert_eq!(scripts.len(), embedded.len() + 1);
+        assert!(scripts.iter().any(|s| s.name == "29990101000000_extra"));
+    }
+
+    #[test]
+    fn an_include_dir_reusing_an_embedded_version_is_refused() {
+        // Diesel's ledger is keyed by version alone: one of the two would be
+        // recorded and never run. Refused up front, before any connection.
+        let embedded = autumn_harvest::migrate::embedded();
+        let collision = embedded
+            .first()
+            .expect("Harvest has migrations")
+            .version
+            .clone();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = format!("{collision}_collides");
+        std::fs::create_dir(dir.path().join(&name)).expect("mkdir");
+        std::fs::write(dir.path().join(&name).join("up.sql"), "SELECT 1;").expect("write up.sql");
+
+        let error = migration_set(&[dir.path().to_path_buf()])
+            .expect_err("a duplicate version must be refused");
+        assert!(error.to_string().contains(&collision), "{error}");
+    }
+
+    #[test]
+    fn a_missing_include_dir_names_the_path() {
+        let error = migration_set(&[PathBuf::from("/nonexistent/harvest/migrations")])
+            .expect_err("a missing directory must fail loudly");
+        assert!(
+            error
+                .to_string()
+                .contains("/nonexistent/harvest/migrations"),
+            "{error}"
+        );
+    }
+
+    // ── rendering ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_text_lists_pending_migrations_per_database() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            ("postgres://harvest/b".to_string(), plan(&[], 3, &[])),
+        ];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("postgres://harvest/a"));
+        assert!(text.contains("20260801000000_x"));
+        assert!(
+            text.contains("1 pending migration(s) across 2 database(s)"),
+            "the summary must total across databases: {text}"
+        );
+    }
+
+    #[test]
+    fn status_text_says_when_a_database_has_never_been_migrated() {
+        let mut empty = plan(&["20260801000000_x"], 0, &[]);
+        empty.ledger_exists = false;
+        let targets = vec![("postgres://harvest/a".to_string(), empty)];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("never been migrated"), "{text}");
+    }
+
+    #[test]
+    fn status_text_flags_ledger_rows_the_binary_does_not_know() {
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            plan(&[], 2, &["29990101000000"]),
+        )];
+        let text = format_migrate_plan_text("harvest migrate status", &targets);
+        assert!(text.contains("unrecognized"), "{text}");
+        assert!(text.contains("29990101000000"), "{text}");
+    }
+
+    #[test]
+    fn status_json_reports_names_and_a_pending_total() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            (
+                "postgres://harvest/b".to_string(),
+                plan(&["20260802000000_y"], 2, &[]),
+            ),
+        ];
+        let rendered = migrate_plan_json("migrate status", &targets).expect("serializes");
+        let value: Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["command"], "migrate status");
+        assert_eq!(value["pending_total"], 2);
+        assert_eq!(value["targets"][0]["database"], "postgres://harvest/a");
+        assert_eq!(value["targets"][0]["pending"][0], "20260801000000_x");
+        assert_eq!(value["targets"][1]["ledger_exists"], true);
+    }
+
+    #[test]
+    fn an_unlocked_run_says_so_in_text_and_json() {
+        // The engine logs this through `tracing`, and the `harvest` binary
+        // installs no subscriber -- so if the report did not carry it, an
+        // operator would get no signal that concurrent runs are unsafe here.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: false,
+                applied_unserialized: vec![UnserializedMigration {
+                    name: "20260801000000_x".to_string(),
+                    reason: UnserializedReason::LedgerLockUnavailable,
+                }],
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            text.contains("WITHOUT the ledger lock"),
+            "an unserialized apply must be visible to the operator: {text}"
+        );
+        assert!(
+            text.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "a missing grant must name the grant as the cause: {text}"
+        );
+        assert!(
+            text.contains("one at a time"),
+            "the warning must say what to do about it: {text}"
+        );
+        assert!(
+            text.contains("20260801000000_x"),
+            "the warning must name which migrations ran that way: {text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["ledger_lock_available"], false);
+        assert_eq!(
+            value["targets"][0]["applied_unserialized"][0]["name"],
+            "20260801000000_x"
+        );
+        assert_eq!(
+            value["targets"][0]["applied_unserialized"][0]["reason"],
+            "ledger_lock_unavailable"
+        );
+    }
+
+    #[test]
+    fn a_nontransactional_migration_warns_without_blaming_privileges() {
+        // A privileged role still cannot hold a lock across a migration that
+        // declares `run_in_transaction = false` -- there is no transaction to
+        // hold it in. Telling this operator to fix a grant would send them to
+        // change something that was never the cause.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec![
+                    "20260801000000_x".to_string(),
+                    "20260802000000_concurrent_index".to_string(),
+                ],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: vec![UnserializedMigration {
+                    name: "20260802000000_concurrent_index".to_string(),
+                    reason: UnserializedReason::NoTransaction,
+                }],
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("WITHOUT the ledger lock"), "{text}");
+        assert!(
+            text.contains("run_in_transaction = false"),
+            "the cause must be the migration's own metadata: {text}"
+        );
+        assert!(
+            !text.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "a privileged role must not be told to fix a grant: {text}"
+        );
+        // Scoped to the warning block: the transactional migration belongs in
+        // `applied:` above it, just not in the list of what ran unserialized.
+        let warning = text.split("WARNING:").nth(1).expect("a warning block");
+        assert!(
+            warning.contains("20260802000000_concurrent_index"),
+            "the warning names the unserialized migration: {warning}"
+        );
+        assert!(
+            !warning.contains("20260801000000_x"),
+            "the warning must not name a migration that WAS serialized: {warning}"
+        );
+    }
+
+    #[test]
+    fn a_locked_run_carries_no_warning() {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            !text.contains("without the ledger lock"),
+            "the normal path must not cry wolf: {text}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_run_gives_each_migration_its_own_cause() {
+        // A role without the privilege applies everything unserialized, and a
+        // `run_in_transaction = false` migration in the same run is
+        // unserialized for a reason no grant fixes. Attributing the whole list
+        // to the missing grant would tell an operator that granting it makes
+        // the run safe, which for the second entry is false.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec![
+                    "20260801000000_x".to_string(),
+                    "20260802000000_concurrent_index".to_string(),
+                ],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: false,
+                applied_unserialized: vec![
+                    UnserializedMigration {
+                        name: "20260801000000_x".to_string(),
+                        reason: UnserializedReason::LedgerLockUnavailable,
+                    },
+                    UnserializedMigration {
+                        name: "20260802000000_concurrent_index".to_string(),
+                        reason: UnserializedReason::NoTransaction,
+                    },
+                ],
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        let warning = text.split("WARNING:").nth(1).expect("a warning block");
+        assert!(
+            warning.contains("lacks UPDATE/DELETE/TRUNCATE"),
+            "the privilege cause must appear: {warning}"
+        );
+        assert!(
+            warning.contains("run_in_transaction = false"),
+            "the non-transactional cause must appear too, not be collapsed into \
+             the privilege one: {warning}"
+        );
+        assert!(
+            warning.contains("no grant changes this"),
+            "the operator must be told the grant will not fix that entry: {warning}"
+        );
+
+        // Each cause sits on its own migration's line.
+        let index_line = warning
+            .lines()
+            .find(|line| line.contains("20260802000000_concurrent_index"))
+            .expect("a line for the non-transactional migration");
+        assert!(
+            index_line.contains("run_in_transaction = false"),
+            "the cause must be attached to the migration it explains: {index_line}"
+        );
+        assert!(
+            !index_line.contains("lacks UPDATE"),
+            "and not to the other one's: {index_line}"
+        );
+    }
+
+    #[test]
+    fn run_text_and_json_report_what_was_applied() {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: vec!["20260101000000_a".to_string()],
+                applied_concurrently: vec!["20260802000000_y".to_string()],
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("20260801000000_x"), "{text}");
+        assert!(
+            text.contains("applied by a concurrent migrator"),
+            "a concurrent apply must not read as 'nothing happened': {text}"
+        );
+        assert!(
+            text.contains("1 migration(s) applied across 1 database(s)"),
+            "{text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["command"], "migrate run");
+        assert_eq!(value["applied_total"], 1);
+        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
+        assert_eq!(
+            value["targets"][0]["applied_concurrently"][0],
+            "20260802000000_y"
+        );
+    }
+
+    #[test]
+    fn a_failing_target_is_reported_even_when_nothing_applied() {
+        // The case that matters: a `run_in_transaction = false` migration that
+        // failed part-way left changes it cannot list. An empty report for that
+        // target would read as "nothing happened".
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: Vec::new(),
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: Some(FailedMigration {
+                    name: "20260801000000_concurrent_index".to_string(),
+                    rolled_back: false,
+                }),
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(
+            text.contains("FAILED: 20260801000000_concurrent_index"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT rolled back"),
+            "an unrolled-back failure must say so: {text}"
+        );
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(
+            value["targets"][0]["failed"]["name"],
+            "20260801000000_concurrent_index"
+        );
+        assert_eq!(value["targets"][0]["failed"]["rolled_back"], false);
+    }
+
+    #[test]
+    fn a_transactional_failure_says_the_database_is_unchanged() {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: Some(FailedMigration {
+                    name: "20260802000000_y".to_string(),
+                    rolled_back: true,
+                }),
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("rolled back"), "{text}");
+        assert!(!text.contains("NOT rolled back"), "{text}");
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["failed"]["rolled_back"], true);
+        // What DID apply is still listed beside the failure.
+        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
+    }
+
+    #[test]
+    fn a_target_the_run_could_not_prepare_is_not_reported_as_finished() {
+        // Creating or reading the ledger failed, so no migration ever ran: the
+        // report is empty and `failed` is None. Without the flag that is
+        // byte-identical to "finished with nothing to do" -- a JSON consumer
+        // would mark a database the run could not even inspect as done.
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: true,
+            report: MigrationReport {
+                applied: Vec::new(),
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+
+        let text = format_migrate_run_text(&targets);
+        assert!(text.contains("FAILED: before any migration ran"), "{text}");
+
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert_eq!(value["targets"][0]["setup_failed"], true);
+        assert!(value["targets"][0]["failed"].is_null());
+    }
+
+    #[test]
+    fn a_finished_target_reports_no_failure() {
+        let targets = vec![MigrateRunTarget {
+            database: "postgres://harvest/a".to_string(),
+            setup_failed: false,
+            report: MigrationReport {
+                applied: vec!["20260801000000_x".to_string()],
+                already_applied: Vec::new(),
+                applied_concurrently: Vec::new(),
+                unrecognized: Vec::new(),
+                failed: None,
+                ledger_lock_available: true,
+                applied_unserialized: Vec::new(),
+            },
+        }];
+        assert!(!format_migrate_run_text(&targets).contains("FAILED"));
+        let value: Value =
+            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
+        assert!(value["targets"][0]["failed"].is_null());
+        assert_eq!(value["targets"][0]["setup_failed"], false);
+    }
+
+    // ── the deploy gate ─────────────────────────────────────────────────────
+
+    #[test]
+    fn the_check_gate_is_silent_when_every_database_is_migrated() {
+        let targets = vec![("postgres://harvest/a".to_string(), plan(&[], 3, &[]))];
+        assert!(migrate_pending_gate(&targets).is_none());
+    }
+
+    #[test]
+    fn the_check_gate_counts_pending_migrations_and_databases() {
+        let targets = vec![
+            (
+                "postgres://harvest/a".to_string(),
+                plan(&["20260801000000_x"], 2, &[]),
+            ),
+            ("postgres://harvest/b".to_string(), plan(&[], 2, &[])),
+            (
+                "postgres://harvest/c".to_string(),
+                plan(&["20260801000000_x", "20260802000000_y"], 2, &[]),
+            ),
+        ];
+        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
+        match error {
+            CliError::MigrationsPending { pending, databases } => {
+                assert_eq!(pending, 3);
+                assert_eq!(databases, 2);
+            }
+            other => panic!("expected MigrationsPending, got {other:?}"),
+        }
+        // Exit 1 = "determined: not migrated", distinct from the exit-2
+        // "could not determine" gates.
+        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
+        assert_eq!(error.exit_code(), 1);
+        // The remedy must carry the flags forward: a bare `run` after a
+        // `--check` with `--include-dir` applies fewer sets than the gate
+        // examined, exits 0, and leaves the gating migration unapplied.
+        let message = error.to_string();
+        assert!(message.contains("--include-dir"), "{message}");
+        assert!(message.contains("--database-url"), "{message}");
+    }
+
+    #[test]
+    fn an_unrecognized_ledger_row_alone_never_gates() {
+        // The database is ahead of this binary. That is worth reporting, but it
+        // is not a reason to fail a deploy that has nothing to apply.
+        let targets = vec![(
+            "postgres://harvest/a".to_string(),
+            plan(&[], 3, &["29990101000000"]),
+        )];
+        assert!(migrate_pending_gate(&targets).is_none());
+    }
+
+    // ── TLS / DSN normalization ─────────────────────────────────────────────
+
+    #[test]
+    fn a_verify_dsn_is_rewritten_so_tokio_postgres_can_parse_it() {
+        // tokio-postgres 0.7 knows only disable/prefer/require and FAILS TO
+        // PARSE anything else, so a `verify-full` DSN that libpq and the
+        // `diesel` CLI accept would be rejected before we ever connect. rustls
+        // verifies the chain and the hostname regardless, so `require` here
+        // describes what the connector already does.
+        for mode in ["verify-ca", "verify-full"] {
+            let rewritten = normalize_sslmode(&format!(
+                "postgres://u:p@db.internal/harvest?sslmode={mode}"
+            ));
+            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
+            assert!(!rewritten.contains(mode), "{rewritten}");
+            rewritten
+                .parse::<tokio_postgres::Config>()
+                .expect("the rewritten DSN must parse");
+        }
+    }
+
+    #[test]
+    fn other_ssl_modes_and_dsns_pass_through_byte_identical() {
+        for dsn in [
+            "postgres://u:p@db.internal/harvest",
+            "postgres://u:p@db.internal/harvest?sslmode=require",
+            "postgres://u:p@db.internal/harvest?sslmode=disable",
+            "postgres://u:p@db.internal/harvest?application_name=harvest%20migrate",
+        ] {
+            assert_eq!(normalize_sslmode(dsn), dsn, "must not be rewritten: {dsn}");
+        }
+    }
+
+    #[test]
+    fn the_libpq_keyword_form_is_rewritten_too() {
+        let rewritten = normalize_sslmode("host=db.internal dbname=harvest sslmode=verify-full");
+        assert_eq!(rewritten, "host=db.internal dbname=harvest sslmode=require");
+        rewritten
+            .parse::<tokio_postgres::Config>()
+            .expect("the rewritten DSN must parse");
+    }
+
+    #[test]
+    fn a_password_that_merely_contains_the_text_is_untouched() {
+        // Only a whole `sslmode=<verify mode>` option is rewritten.
+        let dsn = "host=db.internal password=sslmode=verify-full-not-really sslmode=require";
+        assert_eq!(normalize_sslmode(dsn), dsn);
+    }
+
+    #[test]
+    fn a_quoted_value_containing_whitespace_is_never_rewritten_inside() {
+        // A whitespace split cannot see quoting, so it would rewrite the text
+        // INSIDE the password -- corrupting the credential and failing
+        // authentication against a database that was reachable.
+        let dsn = "password='abc sslmode=verify-full def' sslmode=verify-full";
+        let rewritten = normalize_sslmode(dsn);
+        assert_eq!(
+            rewritten, "password='abc sslmode=verify-full def' sslmode=require",
+            "only the top-level option may change"
+        );
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(
+            config.get_password(),
+            Some(b"abc sslmode=verify-full def".as_slice())
+        );
+    }
+
+    #[test]
+    fn spacing_around_the_equals_sign_is_handled() {
+        // libpq accepts it, so a DSN using it must not slip past unrewritten
+        // and then fail to parse.
+        let rewritten = normalize_sslmode("host=db.internal sslmode = verify-full");
+        assert_eq!(rewritten, "host=db.internal sslmode = require");
+        rewritten
+            .parse::<tokio_postgres::Config>()
+            .expect("the rewritten DSN must parse");
+    }
+
+    #[test]
+    fn a_quoted_sslmode_value_is_rewritten_and_an_escaped_password_survives() {
+        let rewritten = normalize_sslmode(r"password='a\'b c' sslmode='verify-ca'");
+        assert_eq!(rewritten, r"password='a\'b c' sslmode=require");
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(config.get_password(), Some(b"a'b c".as_slice()));
+    }
+
+    #[test]
+    fn a_backslash_escape_in_a_bare_value_is_understood() {
+        // tokio-postgres honours `\` escapes in unquoted values too, so
+        // `password=abc\ def` is ONE value. Stopping at the escaped space
+        // would take `def` for the next keyword and abandon the rewrite,
+        // leaving a `verify-full` the driver then refuses.
+        let rewritten = normalize_sslmode(r"password=abc\ def sslmode=verify-full");
+        assert_eq!(rewritten, r"password=abc\ def sslmode=require");
+        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+        assert_eq!(config.get_password(), Some(b"abc def".as_slice()));
+    }
+
+    #[test]
+    fn an_escaped_multibyte_character_does_not_panic() {
+        // `\é` is three bytes: advancing two would leave the scanner inside
+        // the character and the next slice would panic on a non-char boundary.
+        for dsn in [
+            r"password='a\éb' sslmode=verify-full",
+            r"password=a\éb sslmode=verify-full",
+        ] {
+            let rewritten = normalize_sslmode(dsn);
+            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
+            let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
+            assert_eq!(config.get_password(), Some("aéb".as_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_dsn_this_cannot_scan_is_returned_unchanged() {
+        // An unterminated quote is tokio-postgres's error to report, not ours
+        // to paper over by mangling the string first. `host=db password=` ends
+        // after the `=`: reading a value there indexed past the end and
+        // panicked, which an empty templated environment value would trip.
+        for dsn in [
+            "password='unterminated sslmode=verify-full",
+            "host",
+            "host=db password=",
+            "host=db password=   ",
+            "host=db sslmode=",
+        ] {
+            assert_eq!(normalize_sslmode(dsn), dsn);
+        }
+    }
+
+    // ── target labels ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_keyword_form_target_is_labelled_by_its_own_dsn() {
+        // `redact_dsn` only parses URLs, so every keyword-form shard used to
+        // report as the same `<unparseable dsn>` -- and a partial report that
+        // cannot tell shard A from shard B answers nothing.
+        let label = migrate_target_label("host=shard-a dbname=harvest password='s e cret'", 1);
+        assert!(label.contains("host=shard-a"), "{label}");
+        assert!(label.contains("dbname=harvest"), "{label}");
+        assert!(
+            !label.contains("cret"),
+            "the credential must not survive: {label}"
+        );
+    }
+
+    #[test]
+    fn keyword_form_targets_stay_distinguishable() {
+        let a = migrate_target_label("host=shard-a dbname=harvest", 1);
+        let b = migrate_target_label("host=shard-b dbname=harvest", 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_url_target_still_uses_the_url_redaction() {
+        let label = migrate_target_label("postgres://u:hunter2@db.internal/harvest", 1);
+        assert!(!label.contains("hunter2"), "{label}");
+        assert!(label.contains("db.internal"), "{label}");
+    }
+
+    #[test]
+    fn a_malformed_url_never_reaches_the_keyword_scanner() {
+        // `redact_dsn` cannot parse this (`notaport`), and the keyword scanner
+        // would take the whole prefix for one keyword whose value needs no
+        // redaction -- handing the password straight to the deploy log.
+        let label = migrate_target_label(
+            "postgres://alice:hunter2@db:notaport/harvest?sslmode=require",
+            1,
+        );
+        assert!(
+            !label.contains("hunter2"),
+            "credential leaked into: {label}"
+        );
+        assert_eq!(label, "<unparseable dsn> #1");
+    }
+
+    #[test]
+    fn a_url_password_option_other_than_password_is_withheld_too() {
+        // The URL branch delegates to `redact_dsn`, which matched the exact
+        // key `password` while the keyword branch matched any key *containing*
+        // it. So the same secret was redacted or not depending purely on how
+        // the DSN was spelled, and `?sslpassword=` -- a real libpq option --
+        // reached the migration report.
+        for dsn in [
+            "postgres://db.prod/harvest?sslpassword=hunter2",
+            "postgresql://db.prod/harvest?sslmode=require&sslpassword=hunter2",
+        ] {
+            let label = migrate_target_label(dsn, 2);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label} (from {dsn})"
+            );
+            // Withholding the whole DSN costs the label its identity, so the
+            // ordinal is what keeps two targets apart.
+            assert_eq!(label, "<redacted dsn> #2", "from {dsn}");
+        }
+    }
+
+    #[test]
+    fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
+        // A mistyped URL that loses the `://` but keeps the credential scans
+        // as the "keyword" `postgres`: character-set-valid, and with no
+        // `password=` key there is nothing for the scanner to redact, so the
+        // whole DSN came back as if it had been examined. Only requiring a
+        // keyword libpq actually recognizes catches it.
+        for dsn in [
+            "postgres=//alice:hunter2@db/harvest",
+            "postgresql=//alice:hunter2@db/harvest",
+            "notakeyword=alice:hunter2@db",
+        ] {
+            let label = migrate_target_label(dsn, 1);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label} (from {dsn})"
+            );
+            assert_eq!(label, "<unparseable dsn> #1", "from {dsn}");
+        }
+    }
+
+    #[test]
+    fn recognized_keywords_still_produce_a_usable_label() {
+        // The refusal above must not swallow legitimate keyword DSNs: an
+        // operator needs the shard's identity to know which one failed, and
+        // libpq keywords are case-insensitive.
+        let label = migrate_target_label("host=db.internal port=5432 dbname=harvest", 1);
+        assert!(label.contains("db.internal"), "{label}");
+        assert!(!label.starts_with("<unparseable"), "{label}");
+
+        let mixed_case = migrate_target_label("Host=db.internal DBName=harvest", 1);
+        assert!(!mixed_case.starts_with("<unparseable"), "{mixed_case}");
+
+        // And a password in a recognized keyword DSN is still redacted.
+        let with_password =
+            migrate_target_label("host=db.internal password=hunter2 dbname=harvest", 1);
+        assert!(
+            !with_password.contains("hunter2"),
+            "credential leaked into: {with_password}"
+        );
+    }
+
+    #[test]
+    fn a_credential_bearing_non_url_is_not_passed_through_either() {
+        // No scheme, so not caught by the URL check -- caught instead by the
+        // scanner refusing a "keyword" that is not `[A-Za-z0-9_]+`.
+        for dsn in [
+            "alice:hunter2@db.internal/harvest?sslmode=require",
+            "postgres://alice:hunter2@db/harvest",
+        ] {
+            let label = migrate_target_label(dsn, 3);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked into: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn wholly_withheld_url_targets_stay_distinguishable() {
+        // A password in the query string cannot be rewritten, so `redact_dsn`
+        // withholds the whole DSN -- identically for every shard. Without the
+        // ordinal a partial multi-shard report cannot say which database moved.
+        let a = migrate_target_label("postgres://db-a/harvest?password=secret", 1);
+        let b = migrate_target_label("postgres://db-b/harvest?password=secret", 2);
+        assert!(!a.contains("secret"), "{a}");
+        assert!(!b.contains("secret"), "{b}");
+        assert_eq!(a, "<redacted dsn> #1");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn an_unredactable_target_falls_back_to_an_ordinal() {
+        // Neither a URL nor a scannable keyword DSN: it must still be tellable
+        // apart from the next one, and must not print anything unexamined.
+        let first = migrate_target_label("host=db password='unterminated", 1);
+        let second = migrate_target_label("host=db password='unterminated", 2);
+        assert_eq!(first, "<unparseable dsn> #1");
+        assert_ne!(first, second);
+    }
+
+    // ── credential hygiene ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_failure_message_carries_the_redacted_dsn_not_the_password() {
+        let url = "postgres://harvest:hunter2@db.internal:5432/harvest";
+        let redacted = autumn_harvest::backup_verify::redact_dsn(url);
+        let error = migrate_error(
+            url,
+            &redacted,
+            &format!("connection to `{url}` was refused"),
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("hunter2"),
+            "a deploy log must not learn the database password: {rendered}"
+        );
+        assert!(rendered.contains(&redacted), "{rendered}");
+        assert_eq!(error.exit_code(), 1);
     }
 }

@@ -972,9 +972,15 @@ pub fn redact_dsn(dsn: &str) -> String {
     };
     // A password can hide in the query string as well as in the userinfo. We
     // cannot rewrite what we cannot enumerate, so withhold the whole thing.
+    //
+    // Any key whose name *carries* `password`, not just the exact word:
+    // libpq's `sslpassword` is one, and matching exactly let
+    // `?sslpassword=hunter2` through whole. This is the same rule the keyword
+    // form uses (`redact_keyword_dsn`), so the two DSN spellings cannot
+    // disagree about what counts as a secret.
     if url
         .query_pairs()
-        .any(|(k, _)| k.eq_ignore_ascii_case("password"))
+        .any(|(k, _)| k.to_ascii_lowercase().contains("password"))
     {
         return "<redacted dsn>".to_string();
     }
@@ -3416,6 +3422,32 @@ mod tests {
         assert!(redacted.contains("db.prod"));
         assert!(redacted.contains("harvest"));
         assert_eq!(redact_dsn("::: not a dsn :::"), "<unparseable dsn>");
+    }
+
+    #[test]
+    fn redact_dsn_withholds_any_password_bearing_query_key() {
+        // `sslpassword` is a libpq option like `password`, and matching the
+        // exact word let it through whole. The keyword-form scanner already
+        // used a `contains` rule; the URL form must not be laxer, or the same
+        // secret is redacted or not depending on how the DSN was spelled.
+        for dsn in [
+            "postgres://db.prod/harvest?password=hunter2",
+            "postgres://db.prod/harvest?sslpassword=hunter2",
+            "postgres://db.prod/harvest?sslmode=require&sslpassword=hunter2",
+            "postgres://db.prod/harvest?SSLPassword=hunter2",
+        ] {
+            let redacted = redact_dsn(dsn);
+            assert!(
+                !redacted.contains("hunter2"),
+                "credential leaked from {dsn}: {redacted}"
+            );
+            assert_eq!(redacted, "<redacted dsn>", "from {dsn}");
+        }
+
+        // A DSN with no secret in the query keeps its identity: an operator
+        // needs to know which database a failure was about.
+        let plain = redact_dsn("postgres://db.prod/harvest?sslmode=require");
+        assert!(plain.contains("db.prod"), "got {plain}");
     }
 
     #[test]
