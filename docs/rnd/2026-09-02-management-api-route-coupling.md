@@ -2,14 +2,18 @@
 
 **Status:** findings memo — no RFC, no decision required from architecture review.
 **Scope examined:** `autumn-harvest/`, `autumn-harvest-plugin/`, `autumn-harvest-cli/`
-(the workspace crates with source history), full commit history from the first
-commit (2026-03-28) through `trunk-dev` HEAD (2026-08-27), 483 commits touching
-tracked `*.rs` files.
+only (the workspace crates with source history relevant to the management
+API and the execution kernel — `autumn-harvest-macros`, `autumn-harvest-redis`
+and `autumn-harvest-sqlite` are deliberately excluded from both the query and
+the denominator below), full commit history from the first commit
+(2026-03-28) through `trunk-dev` HEAD (2026-08-27), 478 commits touching
+tracked `*.rs` files in those three crates.
 
 ## Reproduce
 
 ```sh
-git log --format='@@%H' --name-only trunk-dev -- 'autumn-harvest/src/*.rs' 'autumn-harvest-*/src/*.rs' \
+git log --format='@@%H' --name-only trunk-dev -- \
+  'autumn-harvest/src/*.rs' 'autumn-harvest-plugin/src/*.rs' 'autumn-harvest-cli/src/*.rs' \
   > cochange_raw.txt
 # then: parse '@@<sha>' blocks, count per-file touch frequency and pairwise
 # co-change frequency across files in the same commit (see script in this
@@ -19,20 +23,20 @@ git log --format='@@%H' --name-only trunk-dev -- 'autumn-harvest/src/*.rs' 'autu
 
 ## Evidence (tier 2 — repository & delivery record)
 
-Top 10 files by commit-touch frequency, over 483 commits:
+Top 10 files by commit-touch frequency, over 478 commits:
 
 | touches | % of commits | file | lines (HEAD) |
 |---:|---:|---|---:|
-| 212 | 43.9% | `autumn-harvest-plugin/src/api.rs` | 55,185 |
-| 163 | 33.7% | `autumn-harvest/src/worker.rs` | 35,926 |
-| 163 | 33.7% | `autumn-harvest/src/lib.rs` | 876 |
-| 125 | 25.9% | `autumn-harvest/src/context.rs` | 29,178 |
-| 89 | 18.4% | `autumn-harvest/src/builder.rs` | — |
-| 84 | 17.4% | `autumn-harvest-cli/src/lib.rs` | — |
-| 81 | 16.8% | `autumn-harvest-plugin/src/ui.rs` | 15,431 |
-| 80 | 16.6% | `autumn-harvest-plugin/src/plugin.rs` | 4,107 |
-| 74 | 15.3% | `autumn-harvest/src/telemetry.rs` | — |
-| 69 | 14.3% | `autumn-harvest/src/schema.rs` | — |
+| 212 | 44.4% | `autumn-harvest-plugin/src/api.rs` | 55,185 |
+| 163 | 34.1% | `autumn-harvest/src/worker.rs` | 35,926 |
+| 163 | 34.1% | `autumn-harvest/src/lib.rs` | 876 |
+| 125 | 26.2% | `autumn-harvest/src/context.rs` | 29,178 |
+| 89 | 18.6% | `autumn-harvest/src/builder.rs` | — |
+| 84 | 17.6% | `autumn-harvest-cli/src/lib.rs` | — |
+| 81 | 16.9% | `autumn-harvest-plugin/src/ui.rs` | 15,431 |
+| 80 | 16.7% | `autumn-harvest-plugin/src/plugin.rs` | 4,107 |
+| 74 | 15.5% | `autumn-harvest/src/telemetry.rs` | — |
+| 69 | 14.4% | `autumn-harvest/src/schema.rs` | — |
 
 `api.rs` also anchors the great majority of the strongest pairwise co-change
 edges in the whole graph (e.g. it co-changes with `worker.rs` in 79 commits,
@@ -47,10 +51,15 @@ file collides with.
 |---:|---:|---:|---:|---:|---:|
 | 550 | 777 | 8,541 | 19,821 | 39,127 | 54,425 |
 
-Growth is accelerating, not levelling off. At HEAD the file holds 266 `async
-fn` handlers, a single `Router::new()` with 165 chained `.route()` calls, and
-no `Router::merge()` — every management-API endpoint in the product is
-registered and (mostly) handled inline in this one file.
+Growth is accelerating, not levelling off. At HEAD the file holds 312 `async
+fn` definitions in total (`grep -cE '^\s*(pub(\(.*\))? )?async fn '`: 299 at
+top level plus 13 inside `#[cfg(test)]` modules); of those, 168 are wired as
+HTTP method handlers (`get`/`post`/`put`/`patch`/`delete`) across 165
+`.route()` calls inside a single 670-line `harvest_api_router` function built
+as one `Router::new()` chain, with no `Router::merge()` — every
+management-API endpoint in the product is registered, and most are handled,
+inline in this one file. (The remaining ~130 `async fn`s are shared helpers,
+audit/validation plumbing, and inline tests — not separate endpoints.)
 
 ## Is this inherent or accidental?
 
@@ -83,8 +92,8 @@ Both are present in the top 10, and they should not be treated the same way:
   was never split the same way — a sampled handler
   (`create_gate_handler`, `api.rs:3773`) is a thin
   validate-then-delegate-to-`admission_gate_db::create_gate` shape, the same
-  shape repeated 266 times, all in the one file. This is the file-size
-  outlier in a codebase that otherwise organizes by domain everywhere else,
+  shape repeated across the file's 168 wired handlers, all in the one file.
+  This is the file-size outlier in a codebase that otherwise organizes by domain everywhere else,
   and it is why it collides with nearly every other feature file: any PR
   that adds or changes a management-API endpoint edits this file, regardless
   of which domain the endpoint belongs to.
@@ -95,7 +104,7 @@ Nothing about this is a one-way door and nothing about it is urgent: the file
 compiles, the tests inside it pass, and no external contract changes. Left
 alone, the trend (550 → 54,425 lines across 5 tagged releases, still
 accelerating) says the file keeps absorbing every new endpoint at the same
-rate features ship, and the 43.9%-of-commits touch rate — already the highest
+rate features ship, and the 44.4%-of-commits touch rate — already the highest
 in the repo — keeps rising with it. The cost is coordination risk (near every
 concurrent feature PR now edits the same file) and reviewability (a 55K-line
 file has no natural review boundary), not correctness or an outage risk.
@@ -118,8 +127,8 @@ the scarcest resource" case the charter warns against.
 ## What this memo is
 
 A recorded, reproducible measurement: `api.rs` is the top code-coupling cost
-in the repository by a wide margin over the next-largest file (43.9% vs.
-33.7% of all commits touching tracked source, and more than 3x the byte size
+in the repository by a wide margin over the next-largest file (44.4% vs.
+34.1% of all commits touching tracked source, and more than 3x the byte size
 of the next-largest file in the same directory), it is the accidental outlier
 against the codebase's own established per-domain organization, and the fix
 is a low-cost, reversible refactor that does not need architecture-review
