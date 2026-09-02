@@ -338,7 +338,7 @@ fn more_than_one_parked_workflow_task_blocks_migration() {
 
 // ── AC7: the phase machine, i.e. the kill-point contract ─────────────────────
 
-fn obs_at(phase: MigrationPhase) -> MigrationObservation {
+const fn obs_at(phase: MigrationPhase) -> MigrationObservation {
     MigrationObservation {
         phase,
         source_still_quiescent: true,

@@ -1439,3 +1439,160 @@ async fn a_signal_parked_execution_migrates_with_its_parked_task_row() {
     .await;
     assert_eq!(parked, 1);
 }
+
+// ── Codex round 1: the two copies of a rebalanced run ────────────────────────
+//
+// A rebalance seals the source rather than deleting it, so for as long as the
+// source shard's retention has not collected the row an execution's bytes exist
+// in two databases. Every operation that reasons about "the execution" has to
+// pick the right one — or, for erasure, both. These two tests pin the two
+// places where picking the wrong one is a correctness failure rather than a
+// latency cost.
+
+#[tokio::test]
+async fn erasing_a_migrated_execution_scrubs_the_sealed_source_copy_too() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "gdpr-subject").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // Retire the live copy so the erase gate admits it.
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    // Both databases hold the subject's payload right now. That is the whole
+    // hazard: an erase that visits only the shard the id routes to reports
+    // success over a complete, readable second copy.
+    let mut source = shards.source().await;
+    assert!(
+        payload_bearing_events(&mut source, exec_id).await > 0,
+        "precondition: the sealed source still holds the subject's payloads"
+    );
+
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_all_residences(
+        &shards.pool,
+        exec_id,
+        "gdpr subject request",
+    )
+    .await
+    .expect("erase across every residence");
+
+    let mut source = shards.source().await;
+    assert_eq!(
+        payload_bearing_events(&mut source, exec_id).await,
+        0,
+        "the sealed source copy must be scrubbed, not just the live one"
+    );
+    let mut target = shards.target().await;
+    assert_eq!(payload_bearing_events(&mut target, exec_id).await, 0);
+
+    // And the response says so: the prior residence is named, so an operator
+    // answering a regulator can point at the evidence rather than at intent.
+    assert_eq!(outcome.prior_residences.len(), 1);
+    assert_eq!(outcome.prior_residences[0].shard_id, SOURCE.as_i32());
+    assert!(outcome.prior_residences[0].outcome.events_scrubbed > 0);
+}
+
+#[tokio::test]
+async fn a_batch_signal_reaches_the_migrated_copy_not_the_sealed_source() {
+    use autumn_harvest::batch::{
+        BatchAction, BatchExecutorConfig, BatchFilter, BatchSubmission, get_batch_job,
+        run_executor_once, submit_batch_job,
+    };
+
+    let shards = setup_two_shards().await;
+    let exec_id = insert_execution(&mut shards.source().await, "entity_flow", "batch-target").await;
+    let mut source = shards.source().await;
+    append_history(&mut source, exec_id, &[started(json!({}))]).await;
+    park_on_signal(&mut source, exec_id).await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // The batch's all-shard scan finds the live RUNNING copy on the target. Its
+    // id, though, still encodes SOURCE — the identity is deliberately never
+    // re-minted — so an origin-only pool lookup would dispatch the signal into
+    // the sealed source, where the row reads as MIGRATED and the send fails.
+    let mut target = shards.target().await;
+    let job_id = submit_batch_job(
+        &mut target,
+        BatchSubmission {
+            action: BatchAction::Signal,
+            filter: BatchFilter {
+                states: vec!["RUNNING".to_string()],
+                workflow_name: Some("entity_flow".to_string()),
+                search_attrs: vec![],
+            },
+            signal_name: Some("wake".to_string()),
+            signal_payload: Some(json!({"from": "batch"})),
+            idempotency_key: None,
+            created_by: Some("test".to_string()),
+        },
+    )
+    .await
+    .expect("submit batch job");
+
+    run_executor_once(&shards.pool, &BatchExecutorConfig::default())
+        .await
+        .expect("executor tick");
+
+    let mut target = shards.target().await;
+    let job = get_batch_job(&mut target, job_id)
+        .await
+        .expect("load job")
+        .expect("job row");
+    assert_eq!(job.completed, 1, "job errors: {:?}", job.errors);
+    assert_eq!(job.failed, 0, "job errors: {:?}", job.errors);
+
+    // The signal landed where the run actually lives, and nowhere else.
+    let mut target = shards.target().await;
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals \
+              WHERE workflow_exec_id = $1 AND signal_name = 'wake'",
+            exec_id
+        )
+        .await,
+        1
+    );
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals \
+              WHERE workflow_exec_id = $1 AND signal_name = 'wake'",
+            exec_id
+        )
+        .await,
+        0,
+        "the sealed source must not accumulate deliveries for a run it no longer hosts"
+    );
+}
+
+/// Event rows for `exec_id` that still carry an un-tombstoned payload field.
+async fn payload_bearing_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    count(
+        conn,
+        "SELECT count(*)::BIGINT AS value FROM harvest_events e \
+          WHERE e.workflow_exec_id = $1 \
+            AND jsonb_typeof(e.event_data->'data') = 'object' \
+            AND EXISTS ( \
+              SELECT 1 FROM jsonb_each(e.event_data->'data') AS f(k, v) \
+               WHERE k = ANY(ARRAY['input','output','payload','details','value', \
+                                   'last_completion_result']) \
+                 AND v <> '{\"_harvest_erased\": true}'::jsonb)",
+        exec_id,
+    )
+    .await
+}

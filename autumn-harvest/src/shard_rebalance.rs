@@ -573,9 +573,10 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, ShardMigrationCandidate,
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
-    conn_for_execution_forwarded, list_migration_candidates, load_migration, migrate_execution,
-    migrate_quiescent_executions, observe_quiescence, resolve_execution_shard,
-    resolve_target_shard, resume_incomplete_migrations, stage_copy, verify_target_copy,
+    conn_for_execution_forwarded, conn_for_shard, list_migration_candidates, load_migration,
+    migrate_execution, migrate_quiescent_executions, observe_quiescence, residence_chain,
+    resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations, stage_copy,
+    verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -1225,7 +1226,6 @@ mod db {
                 ("harvest_timers", &timers),
                 ("harvest_signals", &signals),
                 ("harvest_payload_refs", &payload_refs),
-                ("harvest_workflow_logs", &workflow_logs),
             ] {
                 diesel::sql_query(format!(
                     "INSERT INTO {table} SELECT * FROM \
@@ -1236,6 +1236,30 @@ mod db {
                 .await
                 .map_err(database_error)?;
             }
+
+            // `harvest_workflow_logs` gets an EXPLICIT column list, for exactly
+            // the reason `harvest_events` does: its `id` is a shard-local
+            // `BIGSERIAL`. Carrying the source's value would either collide
+            // with a row the target already has -- two independent sequences
+            // hand out the same small integers -- or, worse, land in a gap
+            // WITHOUT advancing the target's sequence, so a later log insert on
+            // the target collides with the copy instead. Letting the target
+            // mint the id keeps `seq`, which is the per-execution ordering that
+            // actually carries the meaning.
+            diesel::sql_query(
+                "INSERT INTO harvest_workflow_logs \
+                     (workflow_exec_id, seq, level, message, occurred_at) \
+                 SELECT workflow_exec_id, seq, level, message, occurred_at \
+                 FROM jsonb_to_recordset($1::jsonb) AS r( \
+                     workflow_exec_id uuid, seq bigint, level text, \
+                     message text, occurred_at timestamptz) \
+                 ORDER BY seq",
+            )
+            .bind::<Jsonb, _>(&workflow_logs)
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+
             Ok(())
         }))
         .await?;
@@ -1463,12 +1487,6 @@ mod db {
                     AND t.state IN ('PENDING', 'RUNNING') \
                     AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING t.id \
-             ), advanced AS ( \
-                 UPDATE harvest_shard_migrations m \
-                    SET phase = 'COMMITTED', updated_at = NOW() \
-                  WHERE m.execution_id = $1 AND m.phase = 'VERIFIED' \
-                    AND EXISTS (SELECT 1 FROM sealed) \
-                 RETURNING m.execution_id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
         );
@@ -1496,12 +1514,38 @@ mod db {
                 .await
                 .map_err(database_error)?;
 
-                diesel::sql_query(&sql)
+                let row: CutoverRow = diesel::sql_query(&sql)
                     .bind::<SqlUuid, _>(exec_id.as_uuid())
                     .bind::<Integer, _>(target_shard.as_i32())
                     .get_result(&mut *conn)
                     .await
-                    .map_err(database_error)
+                    .map_err(database_error)?;
+
+                if row.sealed_rows > 0 {
+                    // The seal happened, so the phase MUST advance with it —
+                    // they are the same commit. A zero here means a concurrent
+                    // abort claimed the record out from under us (it takes the
+                    // same row lock above, so it cannot have interleaved *within*
+                    // this transaction, only before it). Fail, which rolls the
+                    // seal back rather than leaving a sealed row whose record
+                    // still says it was never cut over.
+                    let advanced = diesel::sql_query(
+                        "UPDATE harvest_shard_migrations \
+                            SET phase = 'COMMITTED', updated_at = NOW() \
+                          WHERE execution_id = $1 AND phase = 'VERIFIED'",
+                    )
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
+                    if advanced == 0 {
+                        return Err(HarvestError::Config(format!(
+                            "cutover of {exec_id} sealed the source but its migration \
+                             record was no longer VERIFIED; rolling back"
+                        )));
+                    }
+                }
+                Ok(row)
             },
         ))
         .await?;
@@ -1619,23 +1663,53 @@ mod db {
         exec_id: ExecutionId,
         reason: &str,
     ) -> HarvestResult<()> {
-        // Refuse PAST THE CUTOVER, before touching anything. This is the guard
-        // that makes a lost cutover race survivable rather than fatal: two
-        // operators can legitimately drive the same migration (the runbook tells
-        // them to run `rebalance-resume` after an interruption), and the loser's
-        // `commit_cutover` answers `false` because the source is ALREADY sealed —
-        // indistinguishable, at that call site, from "the run woke up". Without
-        // this check the loser would then discard the target copy of a run whose
-        // source is sealed and forwarding to it: the execution would exist
-        // nowhere, unrecoverably.
-        if let Some(record) = load_migration(source, exec_id).await?
-            && record.phase.is_past_cutover()
-        {
+        // Serialize against `commit_cutover` on the execution row it locks, so
+        // the claim below and the seal there are mutually exclusive rather than
+        // merely unlikely to interleave.
+        diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *source)
+            .await
+            .map_err(database_error)?;
+
+        // CLAIM the abort atomically, before touching the target.
+        //
+        // A plain read-then-act would still race: two operators can legitimately
+        // drive the same migration (the runbook tells them to run
+        // `rebalance-resume` after an interruption), and a concurrent
+        // `commit_cutover` could seal the source in the window between the read
+        // and the delete — leaving a `MIGRATED` source forwarding to a copy this
+        // call has just destroyed. The execution would then exist nowhere.
+        //
+        // So the phase transition happens FIRST, as a conditional UPDATE that
+        // only a pre-cutover row matches. Winning it is what licenses the
+        // delete; `commit_cutover`'s own seal is conditional on the phase still
+        // being `VERIFIED`, so the two are mutually exclusive by the same row.
+        let claimed = diesel::sql_query(
+            "UPDATE harvest_shard_migrations \
+                SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, \
+                    updated_at = NOW() \
+              WHERE execution_id = $1 \
+                AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<Text, _>(reason)
+        .execute(source)
+        .await
+        .map_err(database_error)?;
+
+        if claimed == 0 {
+            // Either the migration is past its cutover — the source is sealed
+            // and the target copy is the only live one — or there is no record
+            // at all. Neither is ours to discard.
+            let phase = load_migration(source, exec_id)
+                .await?
+                .map_or_else(|| "absent".to_string(), |r| r.phase.as_db().to_string());
             return Err(HarvestError::Config(format!(
-                "refusing to abort the migration of {exec_id}: it is already past its \
-                 cutover (phase {}), so the source is sealed and the target copy is the \
-                 only live one. Run the resume sweep to finish it instead.",
-                record.phase.as_db()
+                "refusing to abort the migration of {exec_id}: its record is in phase \
+                 {phase}, not a pre-cutover phase this call may claim. Past the cutover \
+                 the source is sealed and the target copy is the only live one — run the \
+                 resume sweep to finish it instead."
             )));
         }
 
@@ -1643,17 +1717,6 @@ mod db {
             discard_staged_copy(&mut *conn, exec_id).await
         }))
         .await?;
-
-        diesel::sql_query(
-            "UPDATE harvest_shard_migrations \
-                SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, updated_at = NOW() \
-              WHERE execution_id = $1 AND phase <> 'DONE' AND phase <> 'COMMITTED'",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .bind::<Text, _>(reason)
-        .execute(source)
-        .await
-        .map_err(database_error)?;
         Ok(())
     }
 
@@ -2205,9 +2268,21 @@ mod db {
                             if commit_cutover(&mut source, exec_id, record.target_shard).await? {
                                 Ok(None)
                             } else {
+                                // A declined cutover has to CLEAN UP, not merely
+                                // report. Without this the record stays
+                                // `VERIFIED`, the target keeps its `MIGRATING`
+                                // copy and that shard's uniqueness slot, and the
+                                // loop exits because the phase did not advance —
+                                // so the command says "aborted" while nothing was
+                                // undone, and a second resume is needed to
+                                // actually finish the job.
+                                let reason = "the execution woke up before the \
+                                              cutover; the source is untouched"
+                                    .to_string();
+                                abort_migration(&mut source, &mut target, exec_id, &reason).await?;
                                 Ok(Some(MigrationOutcome::Aborted {
                                     execution_id: exec_id,
-                                    reason: "no longer quiescent at cutover".to_string(),
+                                    reason,
                                 }))
                             }
                         }
@@ -2313,18 +2388,70 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<ShardId> {
+        let chain = residence_chain(pool, exec_id).await?;
+        Ok(chain
+            .last()
+            .copied()
+            .unwrap_or_else(|| pool.routed_shard_for_execution(exec_id)))
+    }
+
+    /// Every shard this execution has ever physically occupied, oldest first,
+    /// ending with the shard that hosts it **now**.
+    ///
+    /// [`resolve_execution_shard`] answers "where do I write?" and is what the
+    /// runtime paths want. This answers "where does a copy of this run's data
+    /// still sit?", which is a different and strictly larger question: a
+    /// rebalance leaves the source copy in place, sealed, until retention
+    /// collects it. Anything that must reach **all** of an execution's bytes
+    /// rather than just its live ones — GDPR payload erasure above all — has to
+    /// visit this whole list, not only its last element.
+    ///
+    /// The chain is `[origin]` for every execution that has never moved, which
+    /// is every execution on a single-shard deployment and all but a handful
+    /// anywhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`] when a shard on the chain has no pool
+    /// here, or when the chain exceeds [`MAX_FORWARD_HOPS`].
+    pub async fn residence_chain(
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Vec<ShardId>> {
         let origin = pool.routed_shard_for_execution(exec_id);
+        let mut chain = vec![origin];
         let mut current = origin;
         for _ in 0..MAX_FORWARD_HOPS {
             let mut conn = checkout(pool, current).await?;
             match read_forward(&mut conn, exec_id).await? {
-                None => return Ok(current),
-                Some(next) => current = next,
+                None => return Ok(chain),
+                Some(next) => {
+                    current = next;
+                    chain.push(next);
+                }
             }
         }
         // Mirrors `resolve_forward_chain`'s bound and error exactly; the pure
         // function is what the unit tests pin, this is its async twin.
-        resolve_forward_chain(origin, |_| Some(origin))
+        resolve_forward_chain(origin, |_| Some(origin)).map(|shard| vec![shard])
+    }
+
+    /// Check out a connection to one specific shard, failing closed when this
+    /// node has no pool for it.
+    ///
+    /// Exposed for the cross-residence sweeps that walk a [`residence_chain`]:
+    /// they already hold the shard ids and must not re-derive them through any
+    /// path that can fall back to the default shard.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`] when no pool is configured for
+    /// `shard` on this node, or when the checkout itself fails.
+    pub async fn conn_for_shard(
+        pool: &ShardedDbPool,
+        shard: ShardId,
+    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        checkout(pool, shard).await
     }
 
     /// The forwarding probe: "has this execution been rebalanced off this

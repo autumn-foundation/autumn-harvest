@@ -3211,9 +3211,27 @@ pub async fn enforce_external_awaits_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
+                // Issue #964: follow the forwarding pointer, exactly as the
+                // signal and cancel outboxes do. Without it the reader lands on
+                // the target's sealed `MIGRATED` row, whose unknown state
+                // `read_external_await_outcome` maps to `NotYetTerminal` — so
+                // the await stays pending FOREVER, even after the live copy on
+                // the other shard completes.
+                let routed_shard = match active_sharded_pool.as_ref() {
+                    Some(pool) => {
+                        crate::shard_rebalance::resolve_target_shard(
+                            pool,
+                            &crate::types::ExternalTarget::ExecutionId(target),
+                            target.shard(),
+                        )
+                        .await
+                    }
+                    None => target.shard(),
+                };
+
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
                     if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for(routed_shard),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
                         std::ptr::eq(t_pool, c_pool)
@@ -3285,10 +3303,10 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(target))
+                        .and_then(|p| p.exact_pool_for(routed_shard))
                     else {
                         tracing::warn!(
-                            target_shard = %target.shard(),
+                            target_shard = %routed_shard,
                             "await outbox sweep: target shard not configured locally; skipping"
                         );
                         return Ok(Some((false, Some(row.id))));

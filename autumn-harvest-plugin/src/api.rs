@@ -7113,6 +7113,7 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+                "prior_residences",
             ]),
         ),
         (
@@ -22917,7 +22918,21 @@ async fn erase_workflow_payloads_handler(
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
-    let result = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, &reason).await;
+    // Cross-residence (issue #964): a rebalanced execution's payloads exist on
+    // the sealed source shard as well as the live target, and an erasure that
+    // scrubbed only the shard the id routes to would leave a complete readable
+    // copy of the subject's data behind on another database.
+    let result = match api_state.storage_pool() {
+        Ok(pool) => {
+            autumn_harvest::erase::erase_workflow_payloads_all_residences(
+                pool.sharded_pool(),
+                exec_id,
+                &reason,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -38110,7 +38125,19 @@ pub(crate) async fn db_conn_for_execution_exact(
 ) -> Result<Option<PoolConn>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
-        return acquire_conn(shard_pool).await.map(Some);
+        // Issue #964: the origin shard is reachable, but the run may have been
+        // rebalanced off it. Follow the durable forwarding pointer, preserving
+        // this helper's exact/no-default contract — without it `/tree`, `/logs`
+        // and `PATCH /triage` read (and, for triage, WRITE) the sealed source
+        // instead of the live copy, and report success for doing so.
+        let _ = shard_pool;
+        return ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| map_pool_error(&error));
     }
     let shard = exec_id.shard().as_i32();
     let pools = crate::shard_fanout::pools_by_shard(api_state);
@@ -53484,6 +53511,8 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),

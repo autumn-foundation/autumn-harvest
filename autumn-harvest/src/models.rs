@@ -219,6 +219,18 @@ pub struct WorkflowExecution {
     /// aggregate queries in `quota.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_key: Option<String>,
+    /// Forwarding pointer for a shard-rebalanced execution (issue #964): the
+    /// shard this run now physically lives on, after an operator migrated it
+    /// off this one. Non-NULL exactly when `state = 'MIGRATED'`, and `None` for
+    /// every execution that never moved. The `ExecutionId` is never re-minted
+    /// by a migration, so an id captured before the move still routes to this
+    /// row and resolves through this column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_to_shard: Option<i32>,
+    /// Wall-clock of the cutover commit that sealed this row (issue #964).
+    /// Non-NULL exactly when `state = 'MIGRATED'`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /

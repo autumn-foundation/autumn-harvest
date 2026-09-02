@@ -72,14 +72,34 @@ out. Signals are copied *with* their `idempotency_key`, so a keyed redelivery
 collides on the target exactly as it would have on the source.
 
 **Erasure and retention were part of the change, not left to a follow-up.** A
-sealed source keeps every payload it had, and `erase.rs` would have refused it as
-non-terminal — so a GDPR erasure routed by `ExecutionId` would follow the
-forwarding pointer, tombstone the target, report success, and leave the source's
-plaintext intact forever. `MIGRATED` therefore joins `erase::TERMINAL_STATES`
-(terminal for *classification*: the retention janitor's own candidate lists still
-exclude it, because hard-deleting the row would destroy the pointer every
-pre-migration id resolves through), workflow logs are copied rather than
-stranded, and the migration record clears its cached task payload on settle.
+sealed source keeps every payload it had, so a GDPR erasure routed by
+`ExecutionId` would follow the forwarding pointer, tombstone the target, report
+success, and leave the source's plaintext intact forever. Two things were needed
+and both ship here. `MIGRATED` joins `erase::TERMINAL_STATES` so the sealed copy
+is erasable at all (terminal for *classification*: the retention janitor's own
+candidate lists still exclude it, because hard-deleting the row would destroy the
+pointer every pre-migration id resolves through). And the erasure entry point
+became **cross-residence**: `erase_workflow_payloads_all_residences` walks the
+execution's whole residence chain — every shard that still holds a copy of its
+bytes, not just the one its id currently routes to — and scrubs each, reporting
+the extra ones in the response's `prior_residences`. The live residence is
+erased first and its result is the answer, because it is the only copy whose
+state can honour the terminal-state and legal-hold gates; a sealed source always
+reads as terminal, so gating on one would let a live run be erased through its
+own stale shadow. A source copy retention has already collected contributes
+nothing and is not an error, but a residence this node cannot reach fails the
+call outright — an erasure that cannot be shown to be complete must not be
+reported as complete. Workflow logs are copied rather than stranded, and the
+migration record clears its cached task payload on settle.
+
+**Every id-routed write follows the pointer, not the id.** The forwarding
+resolution is not just for reads. The external-signal, external-cancel and
+external-await outboxes, the plugin's exact-shard connection resolver and the
+batch executor's per-target dispatch all resolve the *current* residence before
+choosing a pool. Batch is the sharpest case: its all-shard scan discovers a
+rebalanced run on the live target copy, but the id it hands back still encodes
+the origin, so an origin-only pool lookup would send the cancel or terminate into
+the sealed source — sealing the wrong copy while the live one kept running.
 
 **Crash-safe by construction.** `harvest_shard_migrations` lives on the *source*
 shard — the database that stays authoritative right up to the cutover — and

@@ -1640,6 +1640,8 @@ mod tests {
 
     fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
             id: ExecutionId::new().as_uuid(),
             workflow_name: "wf".into(),
             workflow_id: "id".into(),

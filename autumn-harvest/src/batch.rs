@@ -726,6 +726,32 @@ mod db {
         }
     }
 
+    /// The pool for the shard `target` **currently** lives on.
+    ///
+    /// The all-shard scan finds a rebalanced run on its live target copy, but
+    /// the id it hands back still encodes the shard the run was minted on. A
+    /// plain `pool_for_execution` would therefore dispatch the cancel, the
+    /// terminate or the signal back to the sealed source, where the row reads
+    /// as `MIGRATED`: signals come back shard-unavailable and a terminate
+    /// would seal the wrong copy while the live one keeps running. Following
+    /// the forwarding pointer is what makes "the scan found it, so the write
+    /// reaches it" true.
+    ///
+    /// Single-shard deployments take the original path verbatim — there is
+    /// nowhere to migrate to, so there is no pointer to read.
+    async fn dispatch_pool_for(pool: &ShardedDbPool, target: ExecutionId) -> HarvestResult<DbPool> {
+        if pool.len() <= 1 {
+            return Ok(pool.pool_for_execution(target).clone());
+        }
+        let shard = crate::shard_rebalance::resolve_execution_shard(pool, target).await?;
+        pool.exact_pool_for(shard)
+            .cloned()
+            .ok_or_else(|| HarvestError::ShardUnavailable {
+                shard_id: shard.as_i32(),
+                reason: "no database pool is configured for this shard on this node".to_string(),
+            })
+    }
+
     /// Drive every open batch job to terminal status across all shards.
     ///
     /// One tick is sufficient for a 1k-target batch on a laptop-class
@@ -847,11 +873,14 @@ mod db {
         for chunk in targets_to_dispatch.chunks(concurrency) {
             let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
             for target in chunk.iter().copied() {
-                let pool_for_target = pool.pool_for_execution(target).clone();
                 let signal_name = signal_name.clone();
                 let signal_payload = signal_payload.clone();
                 let metrics = Arc::clone(&metrics);
                 tasks.push(async move {
+                    let pool_for_target = match dispatch_pool_for(pool, target).await {
+                        Ok(p) => p,
+                        Err(e) => return (target, Err(e.to_string())),
+                    };
                     let mut conn = match pool_for_target.get().await {
                         Ok(c) => c,
                         Err(e) => return (target, Err(e.to_string())),

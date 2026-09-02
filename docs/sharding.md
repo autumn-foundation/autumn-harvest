@@ -530,6 +530,37 @@ statement on one database. Run `harvest shard rebalance-resume` after any crash.
 | Completion-trigger fire ledger | ❌ | a trigger whose source run migrated may fire once more; triggers are already at-least-once |
 | Audit log | ❌ | the **source** shard records every attempt in its own `harvest_audit_log`. Note the consequence for a decommission: retiring the shard retires its audit trail, so ship audit off-box (issue #953's export) before step 5 of the runbook. |
 
+### Two copies until retention collects the source
+
+The source is **sealed, not deleted**, so between the cutover and the source
+shard's own retention pass an execution's bytes exist in two databases. That is
+deliberate — the sealed row is the forwarding pointer every pre-migration id
+resolves through — but it makes "which copy did you mean?" a real question for
+anything that acts on an execution by id. The contract:
+
+- **Every id-routed write follows the pointer, not the id.** The external
+  signal, cancel and await outboxes, the management API's per-execution
+  connection resolver, and the batch executor's per-target dispatch all resolve
+  the current residence before choosing a pool. Batch is the sharpest case: its
+  all-shard scan finds the live copy on the target, but the id it hands back
+  still encodes the origin, so an origin-only lookup would send a cancel or a
+  terminate into the sealed source — sealing the wrong copy while the live one
+  kept running.
+- **Erasure goes to *every* residence, not just the live one.**
+  `POST /workflows/{id}/erase-payloads` walks the whole residence chain and
+  scrubs each shard that still holds a copy, listing the extra ones in the
+  response's `prior_residences`. The terminal-state and legal-hold gates are
+  evaluated against the **live** residence only: a sealed source always reads as
+  terminal, so gating on one would let a still-running execution be erased
+  through its own stale shadow. A source copy retention has already collected
+  contributes nothing and is not an error; a residence this node cannot reach
+  fails the call, because an erasure that cannot be shown to be complete must
+  not be reported as complete.
+- **Reads may legitimately answer from the live copy alone.** The sealed source
+  is a frozen snapshot as of the cutover, and the live copy is a superset of it
+  by construction, so a history or status read that follows the pointer is
+  complete.
+
 ### Zero new event variants; the append-only invariant is untouched
 
 A migration appends **nothing** to `harvest_events` and rewrites **nothing**. The

@@ -282,6 +282,31 @@ pub struct EraseOutcome {
     /// succeeded but one or more children could not be erased).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<EraseFailure>,
+    /// Erase outcomes for the **sealed source copies** a shard rebalance
+    /// (issue #964) left behind on shards that previously hosted this run.
+    ///
+    /// A rebalance copies an execution to a new shard and seals — but does not
+    /// delete — the original, which keeps its full event payloads until the
+    /// source shard's own retention collects it. An erase that visited only the
+    /// live residence would therefore report success while leaving a complete,
+    /// readable copy of the subject's data on another database. Each entry here
+    /// is the proof that one such copy was scrubbed too.
+    ///
+    /// Empty — and omitted from the JSON entirely — for every execution that has
+    /// never been rebalanced, which is every execution on a single-shard
+    /// deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_residences: Vec<ErasedResidence>,
+}
+
+/// One previously-hosting shard's contribution to a cross-residence erase
+/// (issue #964).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ErasedResidence {
+    /// The shard whose sealed source copy was scrubbed.
+    pub shard_id: i32,
+    /// What the erase found and tombstoned there.
+    pub outcome: EraseOutcome,
 }
 
 // ── DB-gated core function ────────────────────────────────────────────────────
@@ -306,11 +331,12 @@ mod db {
         harvest_completion_deliveries, harvest_dead_letters, harvest_events,
         harvest_execution_summaries, harvest_signals, harvest_workflow_executions,
     };
+    use crate::shard::ShardedDbPool;
     use crate::types::ExecutionId;
 
     use super::{
-        EraseFailure, EraseOutcome, SkippedChild, erasure_tombstone, is_terminal_state,
-        tombstone_payload_fields,
+        EraseFailure, EraseOutcome, ErasedResidence, SkippedChild, erasure_tombstone,
+        is_terminal_state, tombstone_payload_fields,
     };
 
     type EraseFuture<'a> = Pin<Box<dyn Future<Output = HarvestResult<EraseOutcome>> + Send + 'a>>;
@@ -393,6 +419,76 @@ mod db {
             // unchanged.
             Err(e) => Err(e),
         }
+    }
+
+    /// Erase an execution's payloads at **every shard that still holds a copy
+    /// of them** — the live residence and every sealed source a shard rebalance
+    /// (issue #964) left behind.
+    ///
+    /// This is the entry point an erasure request must use on a sharded
+    /// deployment. [`erase_workflow_payloads`] takes a connection, so it scrubs
+    /// exactly one database; after a rebalance an execution's bytes exist in two
+    /// (the live copy on the target, the sealed copy on the source, which stays
+    /// readable until the source shard's own retention collects it). Scrubbing
+    /// only the shard the id currently routes to would report a clean erasure
+    /// while a complete copy of the subject's data sat on another database —
+    /// exactly the outcome the erasure exists to prevent.
+    ///
+    /// **The live residence is erased first, and its result is the answer.**
+    /// It is the only copy whose state can answer the gate questions: a
+    /// non-terminal run must be refused (409) and a legal hold must be honoured
+    /// *before* anything is destroyed anywhere. A sealed source always reads as
+    /// terminal, so gating on it would let a live run be erased through its own
+    /// stale shadow.
+    ///
+    /// Prior residences are then scrubbed in order and reported individually in
+    /// [`EraseOutcome::prior_residences`]. A source copy that has already been
+    /// collected yields `NotFound` there, which is success — nothing to scrub is
+    /// not a gap. Every other failure propagates: an unscrubbed source copy is a
+    /// compliance failure, not a partial one, so the caller must see it. The
+    /// whole operation is idempotent, so a retry after such a failure is safe.
+    ///
+    /// On a single-shard deployment, and for any execution that has never been
+    /// rebalanced, this is [`erase_workflow_payloads`] plus one pointer read.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`erase_workflow_payloads`] returns, plus
+    /// [`HarvestError::ShardUnavailable`] when a shard on the residence chain
+    /// has no pool on this node — the erase cannot be shown to be complete, so
+    /// it is not reported as complete.
+    pub async fn erase_workflow_payloads_all_residences(
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+        reason: &str,
+    ) -> HarvestResult<EraseOutcome> {
+        let chain = crate::shard_rebalance::residence_chain(pool, exec_id).await?;
+        // `residence_chain` always yields at least the origin shard.
+        let Some((live, priors)) = chain.split_last() else {
+            return Err(HarvestError::Database(
+                "residence chain resolved to no shard at all".to_string(),
+            ));
+        };
+
+        let mut conn = crate::shard_rebalance::conn_for_shard(pool, *live).await?;
+        let mut outcome = erase_workflow_payloads(&mut conn, exec_id, reason).await?;
+        drop(conn);
+
+        for shard in priors {
+            let mut conn = crate::shard_rebalance::conn_for_shard(pool, *shard).await?;
+            match erase_workflow_payloads(&mut conn, exec_id, reason).await {
+                Ok(prior) => outcome.prior_residences.push(ErasedResidence {
+                    shard_id: shard.as_i32(),
+                    outcome: prior,
+                }),
+                // The sealed copy can legitimately be gone already: retention on
+                // the source shard collects it on its own schedule, and a
+                // collected copy holds nothing left to erase.
+                Err(HarvestError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(outcome)
     }
 
     /// Scrub the payload of a matching `harvest_execution_summaries` row
@@ -512,6 +608,7 @@ mod db {
                 children,
                 skipped_children,
                 failures,
+                prior_residences: Vec::new(),
             }))
         })
     }
@@ -835,12 +932,15 @@ mod db {
             children,
             skipped_children,
             failures,
+            prior_residences: Vec::new(),
         })
     }
 }
 
 #[cfg(feature = "db")]
-pub use db::{erase_execution_summary, erase_workflow_payloads};
+pub use db::{
+    erase_execution_summary, erase_workflow_payloads, erase_workflow_payloads_all_residences,
+};
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -1044,6 +1144,7 @@ mod tests {
             children: vec![],
             skipped_children: vec![],
             failures: vec![],
+            prior_residences: vec![],
         };
         let v = serde_json::to_value(&outcome).unwrap();
         // empty vecs are omitted
@@ -1084,6 +1185,7 @@ mod tests {
             children: vec![],
             skipped_children: vec![],
             failures: vec![],
+            prior_residences: vec![],
         };
         let v = serde_json::to_value(&outcome).unwrap();
         assert_eq!(v["summary_scrubbed"], true);

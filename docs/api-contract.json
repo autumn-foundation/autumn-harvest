@@ -1790,7 +1790,7 @@
       "path": "/workflows/{id}/erase-payloads",
       "category": "workflow",
       "read_only": false,
-      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED).",
+      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED). Scrubs EVERY shard that still holds a copy of the execution: a shard rebalance (issue #964) seals rather than deletes the source, so a rebalanced run's payloads live on both the live target and the sealed source until the source shard's retention collects it, and each additional residence that was scrubbed is reported in the response's prior_residences array. The terminal-state and legal-hold gates are evaluated against the LIVE residence only, so a still-running execution can never be erased through its own sealed shadow. A residence whose copy has already been collected contributes nothing and is not an error; a residence this node cannot reach fails the whole call, because an erasure that cannot be shown to be complete must not be reported as complete.",
       "idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
       "params": [
         {
@@ -1825,7 +1825,8 @@
           "dead_letters_scrubbed",
           "children",
           "skipped_children",
-          "failures"
+          "failures",
+          "prior_residences"
         ]
       },
       "error_responses": [
