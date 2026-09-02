@@ -209,6 +209,39 @@ once per pending row instead of once per sweep, turning a backlog into
 returning a single `Err(reason)` — so a caller cannot forget to memoize one of
 them, which removes the class rather than the instance.
 
+**Codex round 4 (two P1s, neither fixable here — and that is the finding).**
+Both are real, both are limits rather than defects, and both were being
+*overclaimed* by this change's own comments, which is what actually needed
+fixing.
+
+The first: the fan-out reads shards sequentially with no shared snapshot, so a
+run of the key starting on an already-read shard while a later shard is being
+read is invisible to that pass — and a cancel can then report success while it is
+live. `expected_live` does not catch it, correctly: the selected run is still
+live, so the shard-local re-read has nothing to disagree with. Closing it means
+cross-shard key uniqueness, a coordination primitive the sharding design has so
+far declined to add; it is issue #1313, with options. What is fixed here is the
+overclaim: `is_authoritative_for_key()` now documents that it is authoritative
+over *the observations the fan-out made*, not over an instant, and
+`docs/sharding.md` says the same. Two things bound it — it needs two live runs of
+one key, which needs a deployment to mix pinned and unpinned starts of the same
+`workflow_id` against the documented discipline, and it is strictly better than
+the pre-#1146 behaviour, which missed a second live run unconditionally rather
+than only under a race.
+
+The second corrected a claim in round 1's own comment. `FANOUT_ACQUIRE_BOUND`
+guarantees **bounded return, not progress**: with one connection per pool, a peer
+read succeeds only if it lands during that peer scanner's sleep window. That is
+likely — passes are short relative to the poll interval, and two independent
+tasks doing different work do not stay in phase — but it is a probability, and
+the bound does nothing to create it, which round 1's "the next tick, whose phase
+has drifted" wrongly implied. The guarantee is capacity, so
+`Worker::run_multi_shard` now **warns at startup**, naming the shard, when a
+process polling several shards has a pool below two connections: one for that
+shard's own scanner, one for a peer's read. That turns an invisible degradation
+into a visible misconfiguration, which is the most a library can do about a
+deployment's connection budget.
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a

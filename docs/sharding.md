@@ -297,6 +297,20 @@ own shard is therefore probed on the connection already in hand, and a sweep
 memoizes the shards it has already failed to reach so a backlog of pending rows
 pays an acquisition bound once per shard rather than once per row.
 
+**A by-id resolution is authoritative over what it observed, not over an
+instant.** The shards are read sequentially, on separate connections to separate
+databases, with no shared snapshot — Postgres has no cross-shard transaction and
+Harvest deliberately adds no coordinator. A run of the key that starts on an
+already-read shard while a later shard is being read is therefore invisible to
+that fan-out, and a cancel can report success while it is live. This needs two
+live runs of one business key to be possible at all, which needs a deployment to
+mix pinned and unpinned starts of the same `workflow_id` — exactly the discipline
+the *Caveats* section above asks you to keep, and for exactly this reason. It is
+also strictly better than the pre-#1146 behaviour, which consulted one
+hash-derived shard and missed a second live run unconditionally rather than only
+under a race. Closing it properly means cross-shard key uniqueness, which is an
+architectural addition rather than a fix — see issue #1313 for the options.
+
 **Size each shard pool at 2 or more in a process that polls several shards.**
 `Worker` spawns one timeout checker per assigned shard, and each holds its own
 shard pool's connection for the whole scanner pass. So a process with
@@ -305,12 +319,18 @@ pool 1 exactly while checker 1 is holding it, and vice versa. Peer acquisitions
 in the fan-out and in cross-shard delivery are bounded tightly
 (`external_target_location::FANOUT_ACQUIRE_BOUND`) precisely so neither scanner
 ever *waits* on the other and the circular wait cannot form — a peer whose only
-connection is busy is simply uninspected and the row is retried on the next tick,
-whose phase has drifted. That keeps such a deployment degraded rather than
-stalled, but the deterministic answer is capacity: one connection for that
-shard's own scanner, one for a peer's cross-shard read. A deployment that runs
-one process per shard is unaffected either way, since each process holds only its
-own shard's connection.
+connection is busy is simply uninspected and the row is retried on the next tick.
+
+What that buys is **bounded return, not progress**. A one-connection pool has
+nothing to spare while its own scanner is mid-pass, so a peer read succeeds only
+if it lands during that scanner's sleep window; likely, since passes are short
+relative to the poll interval and two independent tasks do not stay in phase, but
+a probability rather than a guarantee. The guarantee is capacity: one connection
+for that shard's own scanner, one for a peer's cross-shard read. A multi-shard
+worker configured below that now logs a warning naming the shard at startup, so
+the degradation is visible rather than silent. A deployment that runs one process
+per shard is unaffected either way, since each process holds only its own shard's
+connection.
 
 **A shard you cannot reach stalls by-id delivery rather than failing it, without
 a bound.** That is the deliberate trade: `target_unknown` is written into an

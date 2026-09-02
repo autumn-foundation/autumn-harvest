@@ -211,6 +211,28 @@ impl TargetLocation {
     /// This says nothing about whether a caller may *act* — cancelling the run
     /// in hand is idempotent progress either way. It governs only what may be
     /// recorded.
+    ///
+    /// # What `true` does not mean (issue #1146, Codex round 4)
+    ///
+    /// It is authoritative over **the observations this fan-out made**, not over
+    /// an instant in time. The shards are read sequentially, on separate
+    /// connections to separate databases, with no shared snapshot — Postgres has
+    /// no cross-shard transaction and this engine deliberately does not add a
+    /// coordinator. So a run of the key can start on shard 0 *after* shard 0
+    /// answered "nothing" and *before* shard 1 answers, and the merge will not
+    /// see it. A cancel can then report success while that run is live.
+    ///
+    /// Two things bound how much that matters. It requires two live runs of one
+    /// business key to be possible at all, which needs a deployment to mix
+    /// pinned and unpinned starts of the same `workflow_id` — the discipline
+    /// `docs/sharding.md` already asks operators to keep, precisely because
+    /// `(workflow_name, workflow_id)` uniqueness is shard-local. And it is
+    /// strictly better than the pre-#1146 behaviour, which consulted exactly one
+    /// hash-derived shard and so missed a second live run unconditionally rather
+    /// than only under a race.
+    ///
+    /// Closing it properly means cross-shard key uniqueness, which is an
+    /// architectural addition rather than a fix — tracked as issue #1313.
     #[must_use]
     pub const fn is_authoritative_for_key(&self) -> bool {
         match self {
@@ -374,19 +396,26 @@ pub fn merge_locations(
 /// The cycle: `Worker` spawns one timeout checker per assigned shard, and each
 /// holds its own shard pool's connection for the whole `enforce_timeouts_once`
 /// pass. With `shard_assignments = [0, 1]` and one connection per pool, checker
-/// 0 can sit waiting for pool 1 while checker 1 waits for pool 0. Nothing is
-/// deadlocked — both bounds expire — but with a generous bound both scanners
-/// stall for it on every tick, delaying every other scanner resident, and by-id
-/// delivery makes no progress. Failing fast means neither ever *waits* on the
-/// other, so the cycle cannot form: a peer whose only connection is busy right
-/// now is simply uninspected, the row is retried, and the next tick — whose
-/// phase has drifted — finds the pool free.
+/// 0 can sit waiting for pool 1 while checker 1 waits for pool 0. Nothing
+/// deadlocks — both bounds expire — but with a *generous* bound both scanners
+/// stall for it on every tick, delaying every other resident of that pass.
 ///
-/// **The deterministic answer is capacity, not timing.** A process that runs
-/// checkers for more than one shard should size each shard pool at **2 or
-/// more**: one connection for that shard's own scanner, one for a peer's
-/// cross-shard read. `docs/sharding.md` says so. This bound is what keeps a
-/// deployment that has not done so degraded rather than stalled.
+/// **What this bound guarantees is bounded return, not progress**, and the
+/// distinction matters (Codex round 4). A one-connection pool has nothing to
+/// spare while its own scanner is mid-pass, so a peer read succeeds only if it
+/// lands during that scanner's sleep window. That is likely — passes are short
+/// relative to `poll_interval`, and two independent tasks doing different work
+/// do not stay in phase — but it is a probability, not a guarantee, and this
+/// constant does nothing to create it. An earlier version of this comment
+/// claimed the bound induced the drift; it does not.
+///
+/// **The guarantee is capacity, not timing.** A process that runs checkers for
+/// more than one shard should size each shard pool at **2 or more**: one
+/// connection for that shard's own scanner, one for a peer's cross-shard read.
+/// `docs/sharding.md` says so, and `Worker::run_multi_shard` now warns at
+/// startup when a multi-shard process is configured below it, so the
+/// degradation is visible rather than silent. This bound is what keeps such a
+/// deployment degraded-and-retrying rather than stalled, which is all it is for.
 ///
 /// Note the same circular shape applies to the *delivery* acquisition in the
 /// outbox scanners, which predates this issue (it existed for cross-shard

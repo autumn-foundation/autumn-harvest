@@ -23476,6 +23476,38 @@ impl Worker {
         // below would never start at all — stranding every healthy shard. A
         // bounded failure instead arms that shard's pending flag, which its own
         // heartbeat task retries. See `shard_acquire_bound`.
+        // Cross-shard reads need a connection this process does not already
+        // hold. One timeout checker runs per assigned shard and holds its own
+        // shard pool's connection for the whole `enforce_timeouts_once` pass, so
+        // a pool of one has nothing left for a peer's read: `workflow_id`-addressed
+        // signal/cancel resolution (issue #1146) and cross-shard `ExecutionId`
+        // delivery (issue #492, which has always had this requirement) both
+        // degrade to "peer uninspected, retry next tick" for as long as the peer's
+        // own pass is running. Both are bounded, so nothing wedges — but progress
+        // then depends on a peer's connection happening to be free, which is not
+        // a guarantee. Two connections per shard pool makes it one.
+        //
+        // Warn rather than refuse: a single-shard process needs no peer read at
+        // all, this one may simply not use by-id addressing, and refusing to
+        // start over a capacity hint would be a far worse failure than the
+        // degradation it prevents.
+        for (shard, shard_pool) in &shard_targets {
+            let max_size = shard_pool.status().max_size;
+            if max_size < 2 {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    shard = shard.as_i32(),
+                    max_size,
+                    "shard pool has fewer than 2 connections while this process polls \
+                     {} shards; this shard's own scanner holds one for its whole pass, \
+                     leaving none for a peer shard's cross-shard read. Cross-shard \
+                     signal/cancel delivery will degrade to retries. See \
+                     docs/sharding.md",
+                    shard_targets.len()
+                );
+            }
+        }
+
         let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
             Vec::with_capacity(shard_targets.len());
