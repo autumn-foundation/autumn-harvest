@@ -61,17 +61,18 @@ pub fn expected_shards(
 ) -> BTreeSet<i32> {
     // Delegates to the canonical core rule (issue #1146). The engine's own
     // by-business-key resolution
-    // (`external_target_placement::resolve_placement_by_workflow_id`) fans out
+    // (`external_target_location::resolve_location_by_workflow_id`) fans out
     // over exactly this set, and a management-API read that inspected a
     // different set of shards than the engine would answer differently about
     // the same key. Keeping one definition removes that drift by construction,
     // the way `select_resolved_run` already does for the ranking.
     let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
-    let router = api_state
-        .runtime()
-        .ok()
-        .map(|runtime| runtime.router().clone());
-    autumn_harvest::external_target_placement::fanout_shards(&pool_shards, router.as_ref())
+    let runtime = api_state.runtime().ok();
+    let router_parts = runtime.as_ref().map(|runtime| {
+        let router = runtime.router();
+        (router.readable_shards(), router.default_shard())
+    });
+    autumn_harvest::external_target_location::fanout_shards_from_parts(&pool_shards, router_parts)
         .into_iter()
         .map(ShardId::as_i32)
         .collect()

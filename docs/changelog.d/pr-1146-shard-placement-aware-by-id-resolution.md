@@ -18,7 +18,7 @@ the unknown-target grace window elapsed — wrote `target_unknown` durably into
 the caller's append-only history for a target that was running the whole time.
 
 **Resolve by observation, not prediction.** The new
-`external_target_placement` module fans a read out across every expected shard
+`external_target_location` module fans a read out across every expected shard
 and merges the per-shard answers with `execution::select_resolved_run` — the
 same active-run-first ranking the management API's by-id endpoints already use
 (issue #805), so the engine and the HTTP surface cannot disagree about which run
@@ -42,7 +42,7 @@ Two rules are load-bearing, and are what a naive fan-out gets wrong:
   is down.
 - **"Could not inspect" is never "not there."** A shard with no pool in this
   process (mid a shard-add rollout) or one that cannot be reached yields
-  `TargetPlacement::Indeterminate`, and the outbox leaves the row pending.
+  `TargetLocation::Indeterminate`, and the outbox leaves the row pending.
   `NotFound` — the only outcome that may become a permanent `target_unknown` —
   requires a fan-out that inspected *every* expected shard. Without this, a
   transient outage lasting longer than the grace window would have been written
@@ -70,11 +70,33 @@ where the hash already sent `(N-1)/N` of these deliveries.
 construction. `ExecutionId`-addressed signal/cancel is entirely unchanged: the
 shard is decoded from the id and is always authoritative.
 
-**Cost.** One row read per expected shard per by-id delivery attempt, on the
-outbox scanners rather than the hot dispatch path — which is what makes an
-O(shards) resolution acceptable here. The fan-out is sequential and holds at
-most one extra connection at a time. A single-shard deployment expects exactly
-one shard, so it makes exactly the one query it already made.
+**Cost, and the connection budget.** One to two row reads per expected shard per
+by-id delivery attempt (the per-shard resolver probes active-first, then
+most-recent-terminal only when a shard holds no active run), on the outbox
+scanners rather than the hot dispatch path — which is what makes an O(shards)
+resolution acceptable here. A single-shard deployment expects one shard and
+**skips the fan-out entirely**, so the default deployment shape is genuinely
+unchanged rather than merely cheap.
+
+Connections, not queries, turned out to be the scarce resource, and the first
+cut of this change got it wrong: the fan-out asked the caller's own shard pool
+for a second connection while the sweep held one from it inside an open
+transaction. `pool.get()` is an unbounded wait — Harvest configures no deadpool
+`Timeouts` — so on a one-connection pool that parks forever and wedges every
+later resident of the scanner tick, exactly the hazard `codec_rotation.rs` and
+`audit_export.rs` were each fixed for. Three rules close it: the single-shard
+short-circuit above; the caller's own shard probed on the connection already in
+hand (equivalent under READ COMMITTED, where each statement takes a fresh
+snapshot); and every remaining acquisition bounded by
+`audit_export::SHARD_ACQUIRE_BOUND`, with a per-sweep memo so a backlog of
+pending rows pays that bound once per shard rather than once per row. A shard
+that times out becomes `Indeterminate` — a retry — not a wrong answer.
+
+**Note for the changelog collator.** `docs/shipped-work.md`'s issue #751 entry
+(AC8) and its #777 entry both still state that by-id addressing resolves a
+`WorkflowId` target's shard "via the identical hash" and that the hash "cannot
+disagree with where a real start would place it". Both are superseded by this
+entry and should be reconciled when this fragment is folded in.
 
 **API changes.** `shard::external_target_owning_shard` is retained and still
 correct for the question it answers — *where would this key be placed?* — which
@@ -83,24 +105,61 @@ is what `worker::reject_cross_shard_continue_as_new` and the re-run
 carrying a known-limitation note. `ShardedDbPool::exact_pool_for_target` is
 `#[deprecated]`: asking which *pool* holds a target is always a "where does it
 live" question, and the hash cannot answer it. The plugin's
-`shard_fanout::expected_shards` now delegates to the core `fanout_shards`, so
-the management API and the engine inspect the same shard set by construction.
+`shard_fanout::expected_shards` now delegates to the core `fanout_shards`, and
+`version_usage.rs`'s third hand-rolled copy of the same rule delegates to that —
+so the management API and the engine inspect the same shard set by construction.
+`fanout_shards_from_parts` exists so that delegation costs no `ShardRouter`
+clone per management-API request. The new type is `TargetLocation`, not
+`TargetPlacement`: `ShardPlacement` is a policy for where new work goes, this is
+an observation of where existing work is, and confusing the two is what issue
+#1146 *is*.
+
+**Deliberate non-fix: an unreachable shard stalls by-id delivery without a
+bound.** `target_unknown` goes into an append-only history and cannot be taken
+back, so it is recorded only from a *complete* fan-out. The consequence is that a
+shard which is permanently uninspectable in a process — a router naming a shard
+no pool was configured for — leaves every affected by-id request pending forever,
+and a workflow awaiting the outcome waits with it. Previously that situation
+resolved, sometimes wrongly. There is no metric for it yet; the signal is the
+per-row `by-id target resolution inconclusive` warning naming the shard, and
+`docs/sharding.md` and the backup-restore runbook both say so plainly.
 
 **Test evidence, TDD red → green → refactor.** The three end-to-end outbox tests
 were written first and observed failing against the pre-fix engine with exactly
 the issue's symptom (`ExternalSignalFailed` / `ExternalCancelFailed` with
 `target_unknown` against a running target). 12 no-database unit tests in
-`external_target_placement` cover the merge rules, the expected-shard union and
-the inline gate. `tests/integration/shard_placement_by_id_tests.rs` adds 17 tests
-against **two genuinely separate Postgres databases** (a single database mocked
-as two shards cannot distinguish "found by fanning out" from "found because both
-shards are the same table"): a target pinned off its hash shard is signalled and
-cancelled; a run left behind by a `writable_shards` change is still found; the
-live run wins over a stale terminal on the hash shard; an un-poolable shard is
-`Indeterminate` and produces no `target_unknown` even with the grace window fully
-expired; and a complete fan-out that finds nothing still fails `target_unknown`,
-so the fix does not make that outcome unreachable. The issue #751 suite
-(26 tests) and the cross-workflow / cross-shard / sharding suites pass unchanged.
+`external_target_location` cover the merge rules, the expected-shard union and
+the inline gate. `tests/integration/shard_placement_by_id_tests.rs` adds **16
+DB-backed tests against two genuinely separate Postgres databases** — a single
+database mocked as two shards cannot distinguish "found by fanning out" from
+"found because both shards are the same table" — and deliberately does not
+duplicate the pure rules the unit module already pins:
+
+- a target pinned off its hash shard is signalled, and cancelled;
+- a run left behind by a `writable_shards` change is still found;
+- the live run wins over a stale terminal both at the resolver level and
+  end-to-end through the outbox, with the dead run asserted to receive nothing;
+- signal and cancel keep their opposite #751 semantics against a terminal run
+  found on *another* shard (`not_running` failure vs. no-op success);
+- an un-poolable shard yields no `target_unknown` on either the signal or the
+  cancel outbox, even with the grace window fully expired, and the same pending
+  row is then delivered on the next sweep once the shard returns — liveness, not
+  just the absence of a wrong answer;
+- a complete fan-out that finds nothing still fails `target_unknown`, so the fix
+  does not make that outcome unreachable;
+- the sweep completes against pools holding **exactly one connection**, the
+  production shape that would have deadlocked before the connection fixes above;
+- and a real `Worker` drives the inline gate end-to-end: a caller whose own shard
+  holds a stale `COMPLETED` run of the key, while the live run is on another
+  shard, must reach the live one. Verified red on revert — flipping the gate back
+  to "always inline" reproduces the permanent `not_running`.
+
+Every DB test restores the process-global router and pool on drop, so the shared
+`integration` binary's later files do not inherit a two-shard topology pointing
+at dropped databases. The suite is registered in `.github/ci/integration-suites.txt`
+(without which the repo's own `ci_run_coverage` guard fails and the file would
+compile but never run). The issue #751 suite (26 tests) and the cross-workflow /
+cross-shard / sharding suites pass unchanged.
 
 **Documented in** `docs/sharding.md` (new *Business-key addressing finds a
 pinned run wherever it is* section under issue #697), `docs/security-posture.md`

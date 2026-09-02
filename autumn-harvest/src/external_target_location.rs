@@ -45,20 +45,46 @@
 //!   expected shard is asked before a terminal answer is accepted.
 //! * **"Could not inspect" is not "not there."** A shard this process has no
 //!   pool for, or cannot get a connection to, leaves the answer
-//!   [`TargetPlacement::Indeterminate`] — never [`TargetPlacement::NotFound`].
+//!   [`TargetLocation::Indeterminate`] — never [`TargetLocation::NotFound`].
 //!   `NotFound` is what the outbox converts into a permanent `target_unknown`
 //!   once the grace window expires, so treating an outage as absence would
 //!   turn a transient, retryable condition into a wrong answer written
 //!   irreversibly into the caller's append-only history.
 //!
-//! # Cost
+//! # Cost, and the connection budget
 //!
-//! One query per expected shard, per by-id delivery attempt. A single-shard
-//! deployment expects exactly one shard, so it makes exactly the one query it
-//! already made and is unchanged. By-id signal/cancel delivery is asynchronous
-//! and off the hot dispatch path (it runs in the outbox scanners), which is
-//! what makes an O(shards) resolution acceptable here and not, say, on task
-//! claim.
+//! One or two queries per expected shard, per by-id delivery attempt
+//! ([`crate::execution::resolve_execution_id_by_workflow_id`] probes
+//! active-first and then, only when a shard holds no active run, most-recent
+//! terminal). By-id signal/cancel delivery is asynchronous and off the hot
+//! dispatch path — it runs in the outbox scanners — which is what makes an
+//! O(shards) resolution acceptable here and not, say, on task claim.
+//!
+//! **Connections are the scarce resource, not queries.** The outbox calls this
+//! from inside a transaction on a connection it already holds from its own
+//! shard's pool, and Harvest configures no deadpool `Timeouts`, so a bare
+//! `pool.get().await` is an *unbounded* wait — a sweep that reached back into
+//! its own pool for a second connection parks forever on a one-connection pool
+//! and wedges every later resident of that scanner tick (the hazard
+//! `codec_rotation.rs` and `audit_export.rs` were both fixed for). Three rules
+//! keep that from happening here:
+//!
+//! * The caller's own shard is probed on the **connection the caller already
+//!   holds** ([`resolve_location_by_workflow_id_with`]'s `held` argument), so
+//!   the fan-out never re-enters that pool.
+//! * `resolve_delivery_route` short-circuits entirely when only one shard is
+//!   expected, so a single-shard deployment issues no fan-out at all and is
+//!   byte-for-byte what it was before this module existed.
+//! * Every remaining acquisition is bounded by
+//!   [`crate::audit_export::SHARD_ACQUIRE_BOUND`]; a shard that does not yield
+//!   a connection in time becomes an [`UninspectedShard`] — i.e. `Indeterminate`
+//!   and a retry — rather than an indefinite park.
+//!
+//! [`UninspectableShards`] then memoizes, for the length of one sweep, the
+//! shards that already failed, so a backlog of N pending rows pays that bound
+//! once rather than N times.
+
+use diesel_async::AsyncPgConnection;
 
 use crate::execution::{ResolvedRun, select_resolved_run};
 use crate::shard::{ShardRouter, ShardedDbPool};
@@ -66,9 +92,15 @@ use crate::types::ShardId;
 
 /// A shard a by-business-key fan-out expected to inspect but could not.
 ///
-/// Its presence in a [`TargetPlacement::Indeterminate`] is the reason the
+/// Its presence in a [`TargetLocation::Indeterminate`] is the reason the
 /// resolution is being reported as inconclusive rather than as an answer.
+///
+/// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log line
+/// today, and the obvious next addition is a machine-readable discriminant
+/// (no-pool vs. acquisition-timeout vs. query-error) that callers can act on
+/// differently. Adding it must not be a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UninspectedShard {
     /// The shard that could not be queried.
     pub shard: ShardId,
@@ -78,8 +110,20 @@ pub struct UninspectedShard {
 }
 
 /// Where a `(workflow_name, workflow_id)`-addressed target actually lives.
+///
+/// Named *location*, not *placement*, and the distinction is the whole point of
+/// this module: [`crate::shard::ShardPlacement`] is a policy for where **new**
+/// work should go, decided before an execution exists. This is an observation
+/// of where an **existing** run is. Issue #1146 is precisely what happens when
+/// the first is used to answer the second.
+///
+/// `#[non_exhaustive]`: a fourth outcome is one bug report away — an
+/// "ambiguous, several live runs across shards" verdict is the obvious
+/// candidate, since `(workflow_name, workflow_id)` uniqueness is shard-local
+/// and today's rule silently takes the most recently started of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TargetPlacement {
+#[non_exhaustive]
+pub enum TargetLocation {
     /// The key resolves to `run`, which lives on `shard`.
     ///
     /// `run` may be terminal — the caller applies its own semantics to that
@@ -103,7 +147,7 @@ pub enum TargetPlacement {
     },
 }
 
-impl TargetPlacement {
+impl TargetLocation {
     /// The shard holding the resolved run, if the resolution found one.
     #[must_use]
     pub const fn found_shard(&self) -> Option<ShardId> {
@@ -121,7 +165,7 @@ impl TargetPlacement {
 /// deduplicated.
 ///
 /// The union — rather than just the local pools — is what makes
-/// [`TargetPlacement::Indeterminate`] meaningful. Mid a shard-add rollout the
+/// [`TargetLocation::Indeterminate`] meaningful. Mid a shard-add rollout the
 /// router's `readable_shards` is widened before every process has the new
 /// shard's pool wired up (see the "add a shard" procedure in
 /// `docs/sharding.md`); a resolution that silently omitted such a shard from
@@ -132,10 +176,28 @@ impl TargetPlacement {
 /// matching the pre-sharding default every other lookup path uses.
 #[must_use]
 pub fn fanout_shards(pool_shards: &[ShardId], router: Option<&ShardRouter>) -> Vec<ShardId> {
+    fanout_shards_from_parts(
+        pool_shards,
+        router.map(|r| (r.readable_shards(), r.default_shard())),
+    )
+}
+
+/// [`fanout_shards`], taking the router's placement-relevant parts directly.
+///
+/// Same rule, same result. Exists for callers that hold a `&ShardRouter` behind
+/// a guard or a `Result` they cannot keep borrowed across the call, so that
+/// reaching the canonical rule does not cost a `ShardRouter` clone —
+/// `ShardRouter` owns a `residency_map`, so cloning it per management-API
+/// request to answer a set question is pure waste.
+#[must_use]
+pub fn fanout_shards_from_parts(
+    pool_shards: &[ShardId],
+    router_parts: Option<(&[ShardId], ShardId)>,
+) -> Vec<ShardId> {
     let mut shards: std::collections::BTreeSet<ShardId> = pool_shards.iter().copied().collect();
-    if let Some(router) = router {
-        shards.extend(router.readable_shards().iter().copied());
-        shards.insert(router.default_shard());
+    if let Some((readable, default_shard)) = router_parts {
+        shards.extend(readable.iter().copied());
+        shards.insert(default_shard);
     }
     if shards.is_empty() {
         shards.insert(ShardId::new(0));
@@ -152,10 +214,19 @@ pub fn fanout_shards(pool_shards: &[ShardId], router: Option<&ShardRouter>) -> V
 ///
 /// The completeness rules on top of that ranking:
 ///
-/// * A **live (non-terminal) winner is authoritative even when a shard was
-///   missed.** At most one run per business key is active, so a live run found
-///   *is* the target; refusing to deliver to it because an unrelated shard is
-///   down would be strictly worse than delivering.
+/// * A **live (non-terminal) winner is delivered to even when a shard was
+///   missed.** Note what this does *not* rest on: `(workflow_name,
+///   workflow_id)` uniqueness is shard-local, so two live runs of one key are
+///   possible in exactly the topologies this module exists for (pin key K to
+///   shard 2 while an unpinned start of K hashes to shard 0 — shard 0's partial
+///   unique index cannot see shard 2). The rule is therefore "deliver to the
+///   most recently started live run that was found", and a shard that could not
+///   be inspected may hold a newer one. That is deliberate and conservative in
+///   the direction that matters: a live run in hand is a real target, and
+///   withholding delivery from it because an *unrelated* shard is unreachable
+///   would strand a signal whose recipient is right there. The incomplete
+///   fan-out is logged by [`resolve_location_by_workflow_id_with`] so the
+///   ambiguity is visible rather than silent.
 /// * A **terminal winner with a shard missed is `Indeterminate`.** A terminal
 ///   run on an inspected shard does not rule out a live run on the shard that
 ///   was not inspected, and the two lead to opposite outcomes for a signal
@@ -163,21 +234,21 @@ pub fn fanout_shards(pool_shards: &[ShardId], router: Option<&ShardRouter>) -> V
 /// * **No candidates at all with a shard missed is `Indeterminate`**, never
 ///   `NotFound`.
 #[must_use]
-pub fn merge_placement(
+pub fn merge_locations(
     candidates: Vec<(ShardId, ResolvedRun)>,
     uninspected: Vec<UninspectedShard>,
-) -> TargetPlacement {
+) -> TargetLocation {
     let runs: Vec<ResolvedRun> = candidates.iter().map(|(_, run)| run.clone()).collect();
     let Some(winner) = select_resolved_run(runs) else {
         return if uninspected.is_empty() {
-            TargetPlacement::NotFound
+            TargetLocation::NotFound
         } else {
-            TargetPlacement::Indeterminate { uninspected }
+            TargetLocation::Indeterminate { uninspected }
         };
     };
 
     if !uninspected.is_empty() && crate::erase::is_terminal_state(&winner.state) {
-        return TargetPlacement::Indeterminate { uninspected };
+        return TargetLocation::Indeterminate { uninspected };
     }
 
     // `select_resolved_run` returns one of the candidates verbatim, so the
@@ -190,66 +261,229 @@ pub fn merge_placement(
         .into_iter()
         .find(|(_, run)| run.exec_id == winner.exec_id)
         .map_or_else(|| winner.exec_id.shard(), |(shard, _)| shard);
-    TargetPlacement::Found { shard, run: winner }
+    TargetLocation::Found { shard, run: winner }
+}
+
+/// Shards a sweep has already found uninspectable, memoized for the length of
+/// that sweep (issue #1146).
+///
+/// An outbox sweep processes one pending row per step and may see hundreds in a
+/// backlog. A shard that failed to hand over a connection on the first row has
+/// not recovered by the two-hundredth, and each re-probe costs the full
+/// [`crate::audit_export::SHARD_ACQUIRE_BOUND`] — so without this, one
+/// unreachable shard turns a sweep into `rows × bound` of dead wall-clock,
+/// starving every scanner resident sequenced after the outbox.
+///
+/// Memoizing can only push an answer toward [`TargetLocation::Indeterminate`],
+/// which is the safe direction: a shard recorded here is reported uninspected,
+/// so the row is retried rather than resolved from a partial view. The memo is
+/// per-sweep, never process-wide, so a shard that comes back is re-probed on the
+/// very next sweep.
+#[derive(Clone, Debug, Default)]
+pub struct UninspectableShards {
+    shards: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<ShardId, String>>>,
+}
+
+impl UninspectableShards {
+    /// A fresh, empty memo for one sweep.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The recorded reason `shard` could not be inspected earlier in this sweep.
+    #[must_use]
+    pub fn recorded(&self, shard: ShardId) -> Option<String> {
+        self.shards
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&shard).cloned())
+    }
+
+    /// Record that `shard` could not be inspected. The first reason wins, so the
+    /// log names the original failure rather than a later re-derivation of it.
+    pub fn record(&self, shard: ShardId, reason: String) {
+        if let Ok(mut guard) = self.shards.lock() {
+            guard.entry(shard).or_insert(reason);
+        }
+    }
 }
 
 /// Resolve where `(workflow_name, workflow_id)` actually lives, by inspecting
 /// every expected shard (issue #1146).
+///
+/// Convenience wrapper over [`resolve_location_by_workflow_id_with`] for
+/// callers that hold no connection of their own and need no per-sweep memo.
+/// **The outbox must not use this form** — see the connection-budget rules in
+/// the module docs.
+pub async fn resolve_location_by_workflow_id(
+    pool: &ShardedDbPool,
+    router: Option<&ShardRouter>,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> TargetLocation {
+    resolve_location_by_workflow_id_with(pool, router, workflow_name, workflow_id, None, None).await
+}
+
+/// Resolve where `(workflow_name, workflow_id)` actually lives, reusing a
+/// connection the caller already holds and memoizing unreachable shards
+/// (issue #1146).
 ///
 /// `router` is the topology snapshot used to widen the fan-out beyond this
 /// process's own pools; pass `None` when no router is installed (tests,
 /// embedders that never call [`crate::shard::install_global_router`]), in which
 /// case only the configured pools are inspected.
 ///
-/// The fan-out is **sequential** — one connection held at a time — so it is
-/// safe against a pool sized down to a single connection, matching
-/// `api::resolve_workflow_by_business_id`'s established shape. Read-only: no
-/// row is locked and nothing is written.
-pub async fn resolve_placement_by_workflow_id(
+/// `held` names a shard the caller is **already connected to**, with that
+/// connection. That shard is probed on it instead of acquiring a second
+/// connection from its pool — which is not an optimisation but the fix for a
+/// self-deadlock: the outbox calls this from inside a transaction on a
+/// connection checked out of that very pool, and `pool.get()` is an unbounded
+/// wait. Reading through the held connection is equivalent: the transaction is
+/// READ COMMITTED, so each statement takes a fresh snapshot and sees exactly
+/// what a separate connection would.
+///
+/// `memo` carries the shards this sweep has already failed to reach, so a
+/// backlog pays [`crate::audit_export::SHARD_ACQUIRE_BOUND`] once per shard
+/// rather than once per row.
+///
+/// The fan-out is **sequential**, and holds at most one connection beyond the
+/// caller's own at a time. Read-only: no row is locked and nothing is written.
+pub async fn resolve_location_by_workflow_id_with(
     pool: &ShardedDbPool,
     router: Option<&ShardRouter>,
     workflow_name: &str,
     workflow_id: &str,
-) -> TargetPlacement {
+    mut held: Option<(ShardId, &mut AsyncPgConnection)>,
+    memo: Option<&UninspectableShards>,
+) -> TargetLocation {
     let expected = fanout_shards(&pool.shard_ids(), router);
     let mut candidates: Vec<(ShardId, ResolvedRun)> = Vec::new();
     let mut uninspected: Vec<UninspectedShard> = Vec::new();
 
     for shard in expected {
-        let Some(shard_pool) = pool.exact_pool_for(shard) else {
-            uninspected.push(UninspectedShard {
+        // 1. The caller's own shard: probe it on the connection already in hand.
+        //    Never re-enter that pool — see this function's doc comment.
+        let held_here = held
+            .as_ref()
+            .is_some_and(|(held_shard, _)| *held_shard == shard);
+        if held_here {
+            let Some((_, conn)) = held.as_mut() else {
+                unreachable!("held_here implies held is Some")
+            };
+            record_shard_answer(
+                &mut candidates,
+                &mut uninspected,
                 shard,
-                reason: "no storage pool configured in this process".to_string(),
-            });
+                crate::execution::resolve_execution_id_by_workflow_id(
+                    conn,
+                    workflow_name,
+                    workflow_id,
+                )
+                .await,
+            );
+            continue;
+        }
+
+        // 2. Already known bad this sweep: report it without paying the bound
+        //    a second time.
+        if let Some(reason) = memo.and_then(|m| m.recorded(shard)) {
+            uninspected.push(UninspectedShard { shard, reason });
+            continue;
+        }
+
+        let Some(shard_pool) = pool.exact_pool_for(shard) else {
+            let reason = "no storage pool configured in this process".to_string();
+            if let Some(memo) = memo {
+                memo.record(shard, reason.clone());
+            }
+            uninspected.push(UninspectedShard { shard, reason });
             continue;
         };
-        let mut conn = match shard_pool.get().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                uninspected.push(UninspectedShard {
-                    shard,
-                    reason: format!("could not acquire a connection: {e}"),
-                });
+
+        // 3. Bounded acquisition. An unbounded `pool.get()` here would convert
+        //    an unreachable or saturated shard into an indefinite park inside
+        //    the caller's open transaction.
+        let acquired =
+            tokio::time::timeout(crate::audit_export::SHARD_ACQUIRE_BOUND, shard_pool.get()).await;
+        let mut conn = match acquired {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                let reason = format!("could not acquire a connection: {e}");
+                if let Some(memo) = memo {
+                    memo.record(shard, reason.clone());
+                }
+                uninspected.push(UninspectedShard { shard, reason });
+                continue;
+            }
+            Err(_elapsed) => {
+                let reason = format!(
+                    "connection acquisition exceeded {:?}",
+                    crate::audit_export::SHARD_ACQUIRE_BOUND
+                );
+                if let Some(memo) = memo {
+                    memo.record(shard, reason.clone());
+                }
+                uninspected.push(UninspectedShard { shard, reason });
                 continue;
             }
         };
-        match crate::execution::resolve_execution_id_by_workflow_id(
-            &mut conn,
-            workflow_name,
-            workflow_id,
-        )
-        .await
-        {
-            Ok(Some(run)) => candidates.push((shard, run)),
-            Ok(None) => {}
-            Err(e) => uninspected.push(UninspectedShard {
-                shard,
-                reason: format!("resolution query failed: {e}"),
-            }),
-        }
+
+        record_shard_answer(
+            &mut candidates,
+            &mut uninspected,
+            shard,
+            crate::execution::resolve_execution_id_by_workflow_id(
+                &mut conn,
+                workflow_name,
+                workflow_id,
+            )
+            .await,
+        );
     }
 
-    merge_placement(candidates, uninspected)
+    let placement = merge_locations(candidates, uninspected.clone());
+
+    // A `Found` reached over an incomplete fan-out is an answer with a caveat:
+    // shard-local uniqueness means the shard we could not read might hold a
+    // newer live run of the same key. Delivering to the run in hand is the right
+    // call (see `merge_locations`), but the ambiguity must not be silent.
+    if !uninspected.is_empty()
+        && let Some(shard) = placement.found_shard()
+    {
+        tracing::warn!(
+            workflow_name,
+            workflow_id,
+            resolved_shard = %shard,
+            uninspected = %uninspected
+                .iter()
+                .map(|u| format!("{} ({})", u.shard, u.reason))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "by-id target resolved over an incomplete shard fan-out"
+        );
+    }
+
+    placement
+}
+
+/// Fold one shard's answer into the fan-out accumulators.
+fn record_shard_answer(
+    candidates: &mut Vec<(ShardId, ResolvedRun)>,
+    uninspected: &mut Vec<UninspectedShard>,
+    shard: ShardId,
+    answer: crate::error::HarvestResult<Option<ResolvedRun>>,
+) {
+    match answer {
+        Ok(Some(run)) => candidates.push((shard, run)),
+        Ok(None) => {}
+        // A shard that answered with an error has NOT told us the key is
+        // absent, so it counts as uninspected, never as "not there".
+        Err(e) => uninspected.push(UninspectedShard {
+            shard,
+            reason: format!("resolution query failed: {e}"),
+        }),
+    }
 }
 
 /// May a delivery to `target` be attempted **inline** (issue #1146)?
@@ -257,11 +491,11 @@ pub async fn resolve_placement_by_workflow_id(
 /// "Inline" means inside the caller's own decision transaction, on the caller's
 /// own shard connection, rather than left to the cross-shard outbox.
 ///
-/// * An [`ExternalTarget::ExecutionId`] may, exactly when its encoded shard is
-///   the caller's. Unchanged from issue #492/#751: the id is authoritative, so
-///   this comparison can never be wrong.
-/// * An [`ExternalTarget::WorkflowId`] may only in a **single-shard**
-///   deployment.
+/// * An [`crate::types::ExternalTarget::ExecutionId`] may, exactly when its
+///   encoded shard is the caller's. Unchanged from issue #492/#751: the id is
+///   authoritative, so this comparison can never be wrong.
+/// * An [`crate::types::ExternalTarget::WorkflowId`] may only in a
+///   **single-shard** deployment.
 ///
 /// The `WorkflowId` rule is the deliberate part. Inline delivery resolves the
 /// business key against the caller's shard alone, and
@@ -282,7 +516,7 @@ pub async fn resolve_placement_by_workflow_id(
 /// already: the pre-#1146 rule sent every key whose hash missed the caller's
 /// shard — `(N-1)/N` of them — down exactly this path.
 #[must_use]
-pub fn inline_delivery_allowed(
+pub(crate) fn inline_delivery_allowed(
     target: &crate::types::ExternalTarget,
     caller_shard: ShardId,
     multi_shard: bool,
@@ -298,7 +532,7 @@ pub fn inline_delivery_allowed(
 /// Exists so callers inside the engine can take the snapshot once and pass it
 /// down by reference rather than each re-locking the global.
 #[must_use]
-pub fn global_router_snapshot() -> Option<ShardRouter> {
+pub(crate) fn global_router_snapshot() -> Option<ShardRouter> {
     crate::shard::GLOBAL_SHARD_ROUTER
         .read()
         .ok()
@@ -314,13 +548,13 @@ pub fn global_router_snapshot() -> Option<ShardRouter> {
 /// the caller's shard-local view can hold a stale terminal run of the same key
 /// while the live run sits on another shard, and inline delivery has no way to
 /// see that. Multi-shard deployments therefore defer every by-id delivery to
-/// the outbox, where the full [`resolve_placement_by_workflow_id`] fan-out
+/// the outbox, where the full [`resolve_location_by_workflow_id`] fan-out
 /// runs.
 ///
 /// Derived from the same expected-shard set the fan-out itself uses, so the
 /// two cannot disagree about what "single shard" means.
 #[must_use]
-pub fn deployment_is_multi_shard() -> bool {
+pub(crate) fn deployment_is_multi_shard() -> bool {
     let pool_shards = crate::shard::GLOBAL_SHARDED_POOL
         .read()
         .ok()
@@ -353,16 +587,16 @@ mod tests {
     #[test]
     fn a_complete_fanout_that_finds_nothing_is_not_found() {
         assert_eq!(
-            merge_placement(Vec::new(), Vec::new()),
-            TargetPlacement::NotFound
+            merge_locations(Vec::new(), Vec::new()),
+            TargetLocation::NotFound
         );
     }
 
     #[test]
     fn an_incomplete_fanout_that_finds_nothing_is_indeterminate() {
         assert_eq!(
-            merge_placement(Vec::new(), vec![uninspected(2)]),
-            TargetPlacement::Indeterminate {
+            merge_locations(Vec::new(), vec![uninspected(2)]),
+            TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(2)]
             }
         );
@@ -372,8 +606,8 @@ mod tests {
     fn a_terminal_winner_with_an_uninspected_shard_is_indeterminate() {
         let terminal = run(0, "COMPLETED", 1);
         assert_eq!(
-            merge_placement(vec![(ShardId::new(0), terminal)], vec![uninspected(1)]),
-            TargetPlacement::Indeterminate {
+            merge_locations(vec![(ShardId::new(0), terminal)], vec![uninspected(1)]),
+            TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(1)]
             }
         );
@@ -383,8 +617,8 @@ mod tests {
     fn a_live_winner_settles_the_question_despite_an_uninspected_shard() {
         let live = run(0, "RUNNING", 1);
         assert_eq!(
-            merge_placement(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]),
-            TargetPlacement::Found {
+            merge_locations(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]),
+            TargetLocation::Found {
                 shard: ShardId::new(0),
                 run: live
             }
@@ -396,14 +630,14 @@ mod tests {
         let live = run(1, "RUNNING", 1);
         let recent_terminal = run(0, "COMPLETED", 99);
         assert_eq!(
-            merge_placement(
+            merge_locations(
                 vec![
                     (ShardId::new(0), recent_terminal),
                     (ShardId::new(1), live.clone()),
                 ],
                 Vec::new()
             ),
-            TargetPlacement::Found {
+            TargetLocation::Found {
                 shard: ShardId::new(1),
                 run: live
             },
@@ -421,7 +655,7 @@ mod tests {
             started_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid"),
         };
         assert_eq!(
-            merge_placement(vec![(ShardId::new(3), unencoded)], Vec::new()).found_shard(),
+            merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new()).found_shard(),
             Some(ShardId::new(3))
         );
     }

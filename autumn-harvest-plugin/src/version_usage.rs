@@ -154,29 +154,20 @@ pub async fn build_version_usage_report(
     ))
 }
 
+/// Which shards this read must inspect, honouring an explicit `shard_id` filter.
+///
+/// Beyond the filter this is the shared cross-shard fan-out rule, and it now
+/// delegates to [`crate::shard_fanout::expected_shards`] (itself the core
+/// `external_target_location::fanout_shards`) rather than re-deriving it. This
+/// was the third independent copy of "pool keys ∪ readable ∪ default", and the
+/// engine's own by-business-key resolution now depends on that set meaning the
+/// same thing everywhere (issue #1146).
 fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BTreeSet<i32> {
     if let Some(shard_id) = shard_filter {
         return BTreeSet::from([shard_id]);
     }
-
-    let mut shards = BTreeSet::new();
-    if let Ok(pool) = api_state.storage_pool() {
-        shards.extend(pool.iter_shards().map(|(shard, _)| shard.as_i32()));
-    }
-    if let Ok(runtime) = api_state.runtime() {
-        shards.extend(
-            runtime
-                .router()
-                .readable_shards()
-                .iter()
-                .map(|shard| shard.as_i32()),
-        );
-        shards.insert(runtime.router().default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    crate::shard_fanout::expected_shards(api_state, &pools)
 }
 
 async fn observe_shard(

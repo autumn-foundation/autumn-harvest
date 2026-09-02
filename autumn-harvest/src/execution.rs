@@ -5650,12 +5650,17 @@ pub async fn rerun_workflow_execution(
             // caller before this function is even entered), so a cross-shard
             // override cannot be routed correctly here: it would insert the new
             // execution on the WRONG physical database, invisible to the
-            // override's own `RejectDuplicate` uniqueness check (which only
-            // queries the source's shard) and to by-id addressing (issue
-            // #751), which resolves a `WorkflowId` target's shard via the
-            // identical hash. Reject rather than silently corrupt the routing
-            // invariant; a same-shard override (the common case, including
-            // every single-shard deployment) is unaffected. When the
+            // override's own `RejectDuplicate` uniqueness check, which only
+            // queries the source's shard. Reject rather than silently corrupt
+            // the routing invariant; a same-shard override (the common case,
+            // including every single-shard deployment) is unaffected.
+            //
+            // Issue #1146 removed the second reason this guard used to cite —
+            // that by-id addressing (issue #751) resolved a `WorkflowId`
+            // target's shard by the identical hash, so a mis-placed run would
+            // be unreachable. By-id delivery now observes every expected shard
+            // and finds a run wherever it is, so reachability is no longer at
+            // stake; the shard-local uniqueness reason above stands on its own. When the
             // process-global router is unavailable, fall back to "assume same
             // shard as the caller" — the same documented fallback
             // `external_target_owning_shard` uses.

@@ -9102,7 +9102,8 @@ impl WorkflowContext {
     /// Which shard owns `(workflow_name, workflow_id)` is resolved by
     /// **observation**, not by prediction: delivery fans out across every
     /// shard the deployment expects to exist and merges the per-shard answers
-    /// (see [`crate::external_target_placement`]). Any placement is therefore
+    /// (see the `external_target_location` module, which is `db`-gated and so
+    /// deliberately not linked from here). Any placement is therefore
     /// addressable by business key — including a target started with an
     /// explicit shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
     /// issue #697), which can live on a shard the routing hash never computes,
@@ -9114,8 +9115,15 @@ impl WorkflowContext {
     /// or unreachable) never counts as "the target is not there": the delivery
     /// attempt is retried instead, so a shard outage cannot turn into a
     /// permanent `target_unknown` in this workflow's history. The cost is one
-    /// query per shard per delivery attempt; a single-shard deployment expects
-    /// one shard and is unchanged.
+    /// query per shard per delivery attempt (two when a shard holds no active
+    /// run of the key); a single-shard deployment expects one shard, skips the
+    /// fan-out entirely, and is unchanged.
+    ///
+    /// One user-visible consequence in a **multi-shard** deployment: a by-id
+    /// signal or cancel is never delivered inside the caller's own decision
+    /// transaction any more. It is handed to the background outbox, so delivery
+    /// completes up to one scanner poll interval later. `ExecutionId`-addressed
+    /// delivery and every single-shard deployment keep the inline path.
     ///
     /// # Errors
     ///

@@ -322,15 +322,15 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
   or a shard drained out of `writable_shards` since placement — so an
   explicitly pinned workflow could be unreachable by business-key targeting.
   Delivery now resolves by observation instead
-  (`external_target_placement::resolve_placement_by_workflow_id` fans out
+  (`external_target_location::resolve_location_by_workflow_id` fans out
   across every expected shard and merges the per-shard answers), so any
   placement is addressable.
 
   Two properties matter for posture rather than correctness. Resolution
-  **reads one row per shard** for the addressed key — an authorization-neutral
-  read the caller could already perform on its own shard, and one that returns
-  only the target's own execution id/state/start time, never another tenant's
-  data. And a shard that cannot be inspected yields a **retry**, never a
+  **reads at most two rows per shard** for the addressed key — an
+  authorization-neutral read the caller could already perform on its own shard,
+  and one that returns only the target's own execution id/state/start time,
+  never another tenant's data. And a shard that cannot be inspected yields a **retry**, never a
   `target_unknown`, so an operator watching a partial outage sees stalled
   by-id deliveries rather than silent false failures. Business-key addressing
   remains an *address, not a secret*: the caveat above about building

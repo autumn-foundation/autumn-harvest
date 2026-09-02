@@ -25,14 +25,14 @@
 //! Every test in this file uses **two genuinely separate Postgres databases**,
 //! one per logical shard — a single physical database mocked as two shards
 //! cannot distinguish "found by fanning out" from "found because both shards
-//! are the same table".
+//! are the same table". The pure merge/expected-shard rules are unit-tested in
+//! `external_target_location`'s own `#[cfg(test)]` module and deliberately not
+//! duplicated here.
 
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::execution::ResolvedRun;
-use autumn_harvest::external_target_placement::{
-    TargetPlacement, UninspectedShard, fanout_shards, merge_placement,
-    resolve_placement_by_workflow_id,
-};
+use autumn_harvest::external_target_location::{TargetLocation, resolve_location_by_workflow_id};
+use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
@@ -40,7 +40,11 @@ use autumn_harvest::store;
 use autumn_harvest::types::{
     ExecutionId, ExternalCancelId, ExternalSignalId, ExternalTarget, ShardId,
 };
-use autumn_harvest::worker::DbPool;
+use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{
+    HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
+    start_or_load_workflow_execution,
+};
 
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
@@ -48,6 +52,8 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -120,9 +126,13 @@ async fn setup_one_database() -> (String, Option<ContainerAsync<Postgres>>) {
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
+    build_pool_with_max_size(database_url, 8)
+}
+
+fn build_pool_with_max_size(database_url: &str, max_size: usize) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(8)
+        .max_size(max_size)
         .build()
         .expect("failed to build test pool")
 }
@@ -170,6 +180,35 @@ impl TwoShards {
         <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&self.urls[&shard])
             .await
             .expect("connect to shard database")
+    }
+}
+
+/// Restores the process-global router/pool to the single-shard default on drop.
+///
+/// `install_global_router` and `ShardedDbPool::from_map` both write process
+/// globals shared by every test file in the one `integration` binary, and this
+/// file installs a two-shard topology backed by databases it then drops. A
+/// sibling file that assumes the single-shard default — `cross_type_continue_as_new_tests`
+/// is one — would otherwise inherit a two-shard router pointing at dead pools.
+/// `workflow_id_targeted_tests::build_e2e_worker` defends itself by
+/// re-installing on entry; this restores on exit so neither side has to.
+struct GlobalTopologyGuard {
+    restore_pool: DbPool,
+}
+
+impl GlobalTopologyGuard {
+    /// `restore_pool` becomes the single shard's pool once the guard drops; it
+    /// must outlive the databases this test created, so pass a pool the caller
+    /// keeps alive (any live pool will do — nothing reads it after the test).
+    const fn new(restore_pool: DbPool) -> Self {
+        Self { restore_pool }
+    }
+}
+
+impl Drop for GlobalTopologyGuard {
+    fn drop(&mut self) {
+        autumn_harvest::shard::install_global_router(ShardRouter::single());
+        let _ = ShardedDbPool::single(self.restore_pool.clone());
     }
 }
 
@@ -260,6 +299,22 @@ async fn load_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> W
         .expect("load execution")
 }
 
+/// The `reason_code` of the caller's `ExternalSignalFailed`, if it has one.
+async fn failed_signal_reason(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    store::load_history(conn, exec_id)
+        .await
+        .expect("load caller history")
+        .events
+        .into_iter()
+        .find_map(|e| match e {
+            WorkflowEvent::ExternalSignalFailed { reason_code, .. } => Some(reason_code),
+            _ => None,
+        })
+}
+
 async fn history_event_types(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<String> {
     store::load_history(conn, exec_id)
         .await
@@ -281,136 +336,6 @@ fn key_hashing_to(router: &ShardRouter, workflow_name: &str, prefix: &str, to: S
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 1. Pure merge / fan-out-set rules (no DB)
-// ─────────────────────────────────────────────────────────────────────────
-
-fn run(exec_id: ExecutionId, state: &str, secs: i64) -> ResolvedRun {
-    ResolvedRun {
-        exec_id,
-        state: state.to_string(),
-        started_at: chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0)
-            .expect("valid timestamp"),
-    }
-}
-
-fn uninspected(shard: i32) -> UninspectedShard {
-    UninspectedShard {
-        shard: ShardId::new(shard),
-        reason: "no configured storage pool".to_string(),
-    }
-}
-
-#[test]
-fn merge_prefers_a_live_run_over_a_stale_terminal_on_another_shard() {
-    let live = run(ExecutionId::new_for_shard(ShardId::new(1)), "RUNNING", 10);
-    let stale = run(ExecutionId::new_for_shard(ShardId::new(0)), "COMPLETED", 99);
-    let merged = merge_placement(
-        vec![(ShardId::new(0), stale), (ShardId::new(1), live.clone())],
-        Vec::new(),
-    );
-    assert_eq!(
-        merged,
-        TargetPlacement::Found {
-            shard: ShardId::new(1),
-            run: live
-        },
-        "an active run must win over a more-recently-started terminal one, \
-         whichever shard each is on — this is what a first-hit-wins fan-out \
-         would get wrong"
-    );
-}
-
-#[test]
-fn merge_reports_not_found_only_when_every_shard_was_inspected() {
-    assert_eq!(
-        merge_placement(Vec::new(), Vec::new()),
-        TargetPlacement::NotFound
-    );
-}
-
-#[test]
-fn merge_is_indeterminate_when_no_candidate_and_a_shard_was_missed() {
-    let merged = merge_placement(Vec::new(), vec![uninspected(1)]);
-    assert_eq!(
-        merged,
-        TargetPlacement::Indeterminate {
-            uninspected: vec![uninspected(1)]
-        },
-        "an unreachable shard must never be reported as `NotFound`: that turns \
-         a transient outage into a permanent `target_unknown` in the caller's \
-         durable history"
-    );
-}
-
-#[test]
-fn merge_is_indeterminate_when_only_a_terminal_was_found_and_a_shard_was_missed() {
-    let terminal = run(ExecutionId::new_for_shard(ShardId::new(0)), "COMPLETED", 5);
-    let merged = merge_placement(vec![(ShardId::new(0), terminal)], vec![uninspected(1)]);
-    assert_eq!(
-        merged,
-        TargetPlacement::Indeterminate {
-            uninspected: vec![uninspected(1)]
-        },
-        "a terminal run on an inspected shard does not rule out a LIVE run on \
-         the shard we could not inspect — concluding `not_running` there would \
-         fail a signal whose target is alive"
-    );
-}
-
-#[test]
-fn merge_accepts_a_live_run_even_when_another_shard_was_missed() {
-    let live = run(ExecutionId::new_for_shard(ShardId::new(0)), "RUNNING", 5);
-    let merged = merge_placement(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]);
-    assert_eq!(
-        merged,
-        TargetPlacement::Found {
-            shard: ShardId::new(0),
-            run: live
-        },
-        "at most one run per business key is active, so a live run found is \
-         authoritative — refusing to deliver to it during an unrelated shard's \
-         outage would be strictly worse"
-    );
-}
-
-#[test]
-fn fanout_set_unions_local_pools_with_every_shard_the_router_knows() {
-    let router = ShardRouter::new(
-        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
-        vec![ShardId::new(0)],
-        ShardId::new(0),
-    );
-    let shards = fanout_shards(&[ShardId::new(0), ShardId::new(7)], Some(&router));
-    assert_eq!(
-        shards,
-        vec![
-            ShardId::new(0),
-            ShardId::new(1),
-            ShardId::new(2),
-            ShardId::new(7)
-        ],
-        "a shard the router knows about but this process has no pool for yet \
-         (mid a shard-add rollout) must still be named, so it is reported \
-         uninspected rather than silently skipped"
-    );
-}
-
-#[test]
-fn fanout_set_is_a_single_shard_for_a_single_shard_deployment() {
-    assert_eq!(
-        fanout_shards(&[ShardId::new(0)], Some(&ShardRouter::single())),
-        vec![ShardId::new(0)],
-        "a single-shard deployment must fan out to exactly one query — the \
-         one it already made"
-    );
-}
-
-#[test]
-fn fanout_set_falls_back_to_the_default_shard_when_nothing_is_configured() {
-    assert_eq!(fanout_shards(&[], None), vec![ShardId::new(0)]);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // 2. Fan-out resolution against two real shard databases
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -420,6 +345,7 @@ async fn fanout_finds_a_target_pinned_off_its_hash_shard() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     let sharded = shards.sharded_pool();
 
     // A key the hash places on shard 0 …
@@ -442,10 +368,10 @@ async fn fanout_finds_a_target_pinned_off_its_hash_shard() {
 
     // … and the placement-aware resolution finds where it really is.
     let placement =
-        resolve_placement_by_workflow_id(&sharded, Some(&router), "pinned_entity", &workflow_id)
+        resolve_location_by_workflow_id(&sharded, Some(&router), "pinned_entity", &workflow_id)
             .await;
     match placement {
-        TargetPlacement::Found { shard, run } => {
+        TargetLocation::Found { shard, run } => {
             assert_eq!(shard, ShardId::new(1));
             assert_eq!(run.exec_id, pinned);
         }
@@ -474,13 +400,14 @@ async fn fanout_finds_a_run_left_behind_by_a_writable_set_change() {
         ShardId::new(0),
     );
     autumn_harvest::shard::install_global_router(drained_router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     assert_eq!(
         drained_router.pick_for_new_workflow("drained_entity", &workflow_id),
         ShardId::new(0),
         "test setup: draining shard 1 must move where this key hashes"
     );
 
-    let placement = resolve_placement_by_workflow_id(
+    let placement = resolve_location_by_workflow_id(
         &shards.sharded_pool(),
         Some(&drained_router),
         "drained_entity",
@@ -488,7 +415,7 @@ async fn fanout_finds_a_run_left_behind_by_a_writable_set_change() {
     )
     .await;
     match placement {
-        TargetPlacement::Found { shard, .. } => assert_eq!(
+        TargetLocation::Found { shard, .. } => assert_eq!(
             shard,
             ShardId::new(1),
             "the run is still on the drained shard and must still be found there"
@@ -503,6 +430,7 @@ async fn fanout_prefers_the_live_run_over_a_stale_terminal_on_the_hash_shard() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
     let workflow_id = key_hashing_to(&router, "entity_wf", "stale", ShardId::new(0));
     // A completed run of the same key on the hash shard …
@@ -514,7 +442,7 @@ async fn fanout_prefers_the_live_run_over_a_stale_terminal_on_the_hash_shard() {
     let mut conn1 = shards.conn(ShardId::new(1)).await;
     insert_running_row(&mut conn1, "entity_wf", &workflow_id, live).await;
 
-    let placement = resolve_placement_by_workflow_id(
+    let placement = resolve_location_by_workflow_id(
         &shards.sharded_pool(),
         Some(&router),
         "entity_wf",
@@ -522,7 +450,7 @@ async fn fanout_prefers_the_live_run_over_a_stale_terminal_on_the_hash_shard() {
     )
     .await;
     match placement {
-        TargetPlacement::Found { shard, run } => {
+        TargetLocation::Found { shard, run } => {
             assert_eq!(shard, ShardId::new(1));
             assert_eq!(
                 run.exec_id, live,
@@ -539,8 +467,9 @@ async fn fanout_is_indeterminate_when_an_expected_shard_has_no_pool() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    let placement = resolve_placement_by_workflow_id(
+    let placement = resolve_location_by_workflow_id(
         &shards.sharded_pool_without(ShardId::new(1)),
         Some(&router),
         "absent_wf",
@@ -548,7 +477,7 @@ async fn fanout_is_indeterminate_when_an_expected_shard_has_no_pool() {
     )
     .await;
     match placement {
-        TargetPlacement::Indeterminate { uninspected } => {
+        TargetLocation::Indeterminate { uninspected } => {
             assert_eq!(uninspected.len(), 1);
             assert_eq!(uninspected[0].shard, ShardId::new(1));
         }
@@ -562,16 +491,17 @@ async fn fanout_reports_not_found_when_every_shard_answered_and_none_holds_the_k
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
     assert_eq!(
-        resolve_placement_by_workflow_id(
+        resolve_location_by_workflow_id(
             &shards.sharded_pool(),
             Some(&router),
             "absent_wf",
             "nowhere-1"
         )
         .await,
-        TargetPlacement::NotFound
+        TargetLocation::NotFound
     );
 }
 
@@ -619,6 +549,7 @@ async fn outbox_signal_by_id_reaches_a_target_pinned_off_its_hash_shard() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     let sharded = shards.sharded_pool();
 
     // Caller on shard 0. Target key hashes to shard 0 too — but the target is
@@ -691,6 +622,7 @@ async fn outbox_cancel_by_id_reaches_a_target_pinned_off_its_hash_shard() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     let sharded = shards.sharded_pool();
 
     let workflow_id = key_hashing_to(&router, "pinned_cancel_wf", "e2e-can", ShardId::new(0));
@@ -762,10 +694,21 @@ async fn outbox_never_reports_target_unknown_while_a_shard_cannot_be_inspected()
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     // The router knows shard 1; this process has no pool for it. The target
     // could be there, so the sweep must leave the request pending.
     let degraded = shards.sharded_pool_without(ShardId::new(1));
 
+    // Pin the key to the caller's own (poolful) shard. Without this the test
+    // could pass against the UNFIXED engine: a key hashing to shard 1 would hit
+    // the pre-#1146 "target shard has no pool -> leave pending" branch and
+    // record no failure either, for entirely the wrong reason.
+    let workflow_id = key_hashing_to(
+        &router,
+        "unreachable_target_wf",
+        "degraded",
+        ShardId::new(0),
+    );
     let caller = ExecutionId::new_for_shard(ShardId::new(0));
     let mut caller_conn = shards.conn(ShardId::new(0)).await;
     seed_signal_caller(
@@ -773,7 +716,7 @@ async fn outbox_never_reports_target_unknown_while_a_shard_cannot_be_inspected()
         caller,
         "degraded-caller",
         "unreachable_target_wf",
-        "maybe-over-there-1",
+        &workflow_id,
     )
     .await;
 
@@ -810,6 +753,7 @@ async fn outbox_still_reports_target_unknown_when_every_shard_answered() {
     let shards = TwoShards::start().await;
     let router = two_shard_router();
     autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
     let caller = ExecutionId::new_for_shard(ShardId::new(0));
     let mut caller_conn = shards.conn(ShardId::new(0)).await;
@@ -841,4 +785,651 @@ async fn outbox_still_reports_target_unknown_when_every_shard_answered() {
          after the grace window — #1146 must not make `target_unknown` \
          unreachable; got {types:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. The #751 outcome matrix, reached over the placement-aware route
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Issue #751 gives signal and cancel deliberately OPPOSITE semantics for a
+// target whose current run is already terminal: a signal's goal can never be
+// met by a dead target (genuine `not_running` failure), while a cancel's goal
+// — "nothing running under this key" — already is (no-op success). Both now
+// arrive through `DeliveryRoute::CrossShard` and a remote connection, which is
+// new code, so both are pinned here rather than assumed from the #751 suite.
+
+/// Seed a terminal-only run of `(name, id)` on shard 1 and a caller on shard 0.
+async fn seed_terminal_target_on_shard_one(
+    shards: &TwoShards,
+    router: &ShardRouter,
+    workflow_name: &str,
+    prefix: &str,
+) -> (String, ExecutionId, ExecutionId) {
+    let workflow_id = key_hashing_to(router, workflow_name, prefix, ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_row_in_state(&mut conn1, workflow_name, &workflow_id, target, "COMPLETED").await;
+    (
+        workflow_id,
+        target,
+        ExecutionId::new_for_shard(ShardId::new(0)),
+    )
+}
+
+#[tokio::test]
+async fn outbox_signal_by_id_fails_not_running_against_a_terminal_run_on_another_shard() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    let (workflow_id, _target, caller) =
+        seed_terminal_target_on_shard_one(&shards, &router, "terminal_sig_wf", "term-sig").await;
+
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    seed_signal_caller(
+        &mut caller_conn,
+        caller,
+        "term-sig-caller",
+        "terminal_sig_wf",
+        &workflow_id,
+    )
+    .await;
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("signal outbox sweep should succeed");
+
+    let reason = failed_signal_reason(&mut caller_conn, caller).await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("not_running"),
+        "a terminal current run found on ANOTHER shard is still a genuine \
+         `not_running` failure (issue #751 AC4) — never `target_unknown`, which \
+         would say we could not find it"
+    );
+}
+
+#[tokio::test]
+async fn outbox_cancel_by_id_is_a_no_op_success_against_a_terminal_run_on_another_shard() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    let (workflow_id, target, caller) =
+        seed_terminal_target_on_shard_one(&shards, &router, "terminal_can_wf", "term-can").await;
+
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut caller_conn, "by_id_caller", "term-can-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "terminal_can_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+
+    let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        types.contains(&"ExternalCancelDelivered".to_string()),
+        "cancel of an already-terminal run is a no-op SUCCESS (issue #751 AC5), \
+         the mirror image of the signal case above; got {types:?}"
+    );
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    assert_eq!(
+        load_execution(&mut conn1, target).await.state,
+        "COMPLETED",
+        "a no-op success must not mutate the already-terminal target"
+    );
+}
+
+#[tokio::test]
+async fn outbox_cancel_by_id_never_reports_target_unknown_while_a_shard_cannot_be_inspected() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Exercises the cancel outbox's own `DeliveryRoute::Retry` arm, which
+    // returns a six-element step tuple no other test reaches.
+    let workflow_id = key_hashing_to(&router, "degraded_cancel_wf", "deg-can", ShardId::new(0));
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut caller_conn, "by_id_caller", "deg-can-caller", caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: "degraded_cancel_wf".to_string(),
+                    workflow_id: workflow_id.clone(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool_without(ShardId::new(1))),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+
+    let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        !types.contains(&"ExternalCancelFailed".to_string())
+            && !types.contains(&"ExternalCancelDelivered".to_string()),
+        "an un-inspectable shard leaves the cancel pending — neither a durable \
+         `target_unknown` nor a no-op success claimed over a partial view; got {types:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5. Liveness, the no-short-circuit rule, and the connection budget
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_delivers_by_id_on_a_later_sweep_once_the_missing_shard_returns() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    let workflow_id = key_hashing_to(&router, "returning_shard_wf", "ret", ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "returning_shard_wf", &workflow_id, target).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    seed_signal_caller(
+        &mut caller_conn,
+        caller,
+        "ret-caller",
+        "returning_shard_wf",
+        &workflow_id,
+    )
+    .await;
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+
+    // Sweep 1: shard 1 has no pool. Nothing is resolved, nothing is recorded.
+    let processed = autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool_without(ShardId::new(1))),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("degraded sweep should succeed");
+    assert_eq!(processed, 0, "an indeterminate resolution resolves nothing");
+    assert!(
+        history_event_types(&mut caller_conn, caller)
+            .await
+            .iter()
+            .all(|t| t != "ExternalSignalFailed" && t != "ExternalSignalDelivered"),
+        "the request must still be pending after the degraded sweep"
+    );
+
+    // Sweep 2: the shard is back. The SAME pending row is delivered — proving
+    // the first sweep left it claimable rather than permanently stuck.
+    let processed = autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("recovered sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "the recovered sweep must resolve the pending row"
+    );
+    assert!(
+        history_event_types(&mut caller_conn, caller)
+            .await
+            .contains(&"ExternalSignalDelivered".to_string()),
+        "the by-id signal must be delivered once its shard is inspectable again"
+    );
+}
+
+#[tokio::test]
+async fn outbox_signal_by_id_prefers_the_live_run_over_a_stale_terminal_on_the_callers_shard() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // The end-to-end form of the "no first-hit short circuit" rule: a fan-out
+    // that stopped at the caller's own shard would find the dead run and fail
+    // the signal `not_running` while the live target waits on shard 1.
+    let workflow_id = key_hashing_to(&router, "two_run_wf", "tworun", ShardId::new(0));
+    let stale = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    insert_row_in_state(&mut conn0, "two_run_wf", &workflow_id, stale, "COMPLETED").await;
+    let live = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "two_run_wf", &workflow_id, live).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    seed_signal_caller(
+        &mut caller_conn,
+        caller,
+        "tworun-caller",
+        "two_run_wf",
+        &workflow_id,
+    )
+    .await;
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("signal outbox sweep should succeed");
+
+    let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        types.contains(&"ExternalSignalDelivered".to_string()),
+        "the live run must win over the stale terminal on the caller's own \
+         shard; got {types:?}"
+    );
+    assert_eq!(
+        autumn_harvest::signal::load_pending_signals(&mut conn1, live)
+            .await
+            .expect("load pending on shard 1")
+            .len(),
+        1,
+        "the signal must be queued against the LIVE run"
+    );
+    assert!(
+        autumn_harvest::signal::load_pending_signals(&mut conn0, stale)
+            .await
+            .expect("load pending on shard 0")
+            .is_empty(),
+        "and never against the dead one"
+    );
+}
+
+#[tokio::test]
+async fn outbox_by_id_delivery_completes_when_each_shard_pool_holds_one_connection() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // The production shape the other tests cannot model: the sweep's own
+    // connection is checked out of the caller shard's pool, which has exactly
+    // one connection. A fan-out that re-acquired from that pool would park
+    // forever (`pool.get()` is unbounded — no deadpool `Timeouts` are
+    // configured), taking the whole timeout checker with it.
+    let one_conn_pools: BTreeMap<ShardId, DbPool> = shards
+        .urls
+        .iter()
+        .map(|(shard, url)| (*shard, build_pool_with_max_size(url, 1)))
+        .collect();
+    let sharded = ShardedDbPool::from_map(one_conn_pools.clone(), ShardId::new(0));
+
+    let workflow_id = key_hashing_to(&router, "one_conn_wf", "onecon", ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "one_conn_wf", &workflow_id, target).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    {
+        let mut seed = shards.conn(ShardId::new(0)).await;
+        seed_signal_caller(
+            &mut seed,
+            caller,
+            "onecon-caller",
+            "one_conn_wf",
+            &workflow_id,
+        )
+        .await;
+    }
+
+    // The sweep runs on the pool's ONLY connection, exactly as
+    // `spawn_timeout_checker_for_shard` does.
+    let mut pooled = one_conn_pools[&ShardId::new(0)]
+        .get()
+        .await
+        .expect("the single pooled connection");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let processed = tokio::time::timeout(
+        Duration::from_secs(30),
+        autumn_harvest::timeout::enforce_external_signals_outbox(
+            &mut pooled,
+            &metrics,
+            Duration::from_millis(0),
+            &Some(sharded),
+            &[ShardId::new(0)],
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        ),
+    )
+    .await
+    .expect("the sweep must not park on its own single-connection pool")
+    .expect("signal outbox sweep should succeed");
+
+    assert_eq!(
+        processed, 1,
+        "the cross-shard by-id signal must be delivered"
+    );
+    assert_eq!(
+        autumn_harvest::signal::load_pending_signals(&mut conn1, target)
+            .await
+            .expect("load pending signals")
+            .len(),
+        1
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6. The inline gate, through a real `Worker`
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Every test above drives the outbox scanners directly. This one drives the
+// production path — `worker::persist_external_signal_inline`, gated by
+// `external_target_location::inline_delivery_allowed` — because that gate is
+// the only part of #1146 that runs inside a workflow's OWN decision
+// transaction, where a wrong answer is written to the append-only history
+// immediately and irreversibly.
+
+fn e2e_wf_info(
+    name: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+) -> WorkflowInfo {
+    WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name,
+        module: "shard_placement_by_id_tests",
+        handler,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
+fn e2e_start_params(
+    exec_id: ExecutionId,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+    input: serde_json::Value,
+) -> StartWorkflowParams<'static> {
+    StartWorkflowParams {
+        exec_id,
+        workflow_name,
+        workflow_id,
+        input,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        sla: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::default(),
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
+    }
+}
+
+/// Workflow type used by the inline-gate end-to-end test below.
+const TARGET_WF: &str = "gate_target_wf";
+
+fn gate_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let payload: serde_json::Value = ctx
+            .receive_signal("ping")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"status": "signalled", "payload": payload}))
+    })
+}
+
+fn gate_signaller_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let workflow_name = input["workflow_name"]
+            .as_str()
+            .ok_or("missing workflow_name")?
+            .to_string();
+        let workflow_id = input["workflow_id"]
+            .as_str()
+            .ok_or("missing workflow_id")?
+            .to_string();
+        match ctx
+            .signal_external_workflow_by_id(
+                &workflow_name,
+                &workflow_id,
+                "ping",
+                serde_json::json!({"hello": "world"}),
+            )
+            .await
+        {
+            Ok(()) => Ok(serde_json::json!({"result": "delivered"})),
+            Err(HarvestError::ExternalSignalFailed { reason_code, .. }) => {
+                Ok(serde_json::json!({"result": "failed", "reason_code": reason_code}))
+            }
+            Err(other) => Err(other.to_string()),
+        }
+    })
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on_the_callers_shard()
+{
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+    let sharded = shards.sharded_pool();
+
+    // The business key hashes to the CALLER's shard, and a dead run of it sits
+    // there — the exact state in which the pre-#1146 gate allowed inline
+    // delivery and recorded a permanent `not_running` against a live target.
+    // Chosen — not assumed — to hash to the CALLER's shard. If it hashed
+    // elsewhere the pre-#1146 gate would have deferred to the outbox for an
+    // unrelated reason and this test would pass against the unfixed engine.
+    // `StartWorkflowParams` takes `&'static str`, hence the leak; the test
+    // process is about to exit.
+    let target_id: &'static str = Box::leak(
+        key_hashing_to(&router, TARGET_WF, "gate-target", ShardId::new(0)).into_boxed_str(),
+    );
+
+    let stale = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    insert_row_in_state(&mut conn0, TARGET_WF, target_id, stale, "COMPLETED").await;
+
+    let live = ExecutionId::new_for_shard(ShardId::new(1));
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            e2e_wf_info(TARGET_WF, gate_target_workflow),
+            e2e_wf_info("gate_signaller_wf", gate_signaller_workflow),
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-1146-gate".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(2);
+    runtime_config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
+    runtime_config.sharded_pool = Some(sharded.clone());
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = shards.pools[&ShardId::new(0)].clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // The LIVE run of the same key, on the other shard.
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    start_or_load_workflow_execution(
+        &mut conn1,
+        e2e_start_params(live, TARGET_WF, target_id, serde_json::json!({})),
+        None,
+    )
+    .await
+    .expect("start the live target on shard 1");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    start_or_load_workflow_execution(
+        &mut conn0,
+        e2e_start_params(
+            caller,
+            "gate_signaller_wf",
+            "gate-caller-1",
+            serde_json::json!({"workflow_name": TARGET_WF, "workflow_id": target_id}),
+        ),
+        None,
+    )
+    .await
+    .expect("start the caller on shard 0");
+
+    let caller_final = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let row = load_execution(&mut conn0, caller).await;
+            if row.state != "RUNNING" && row.state != "PENDING" {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await
+    .expect("the caller must reach a terminal state");
+
+    assert_eq!(
+        caller_final.output,
+        Some(serde_json::json!({"result": "delivered"})),
+        "the signal must reach the LIVE run on shard 1. A `not_running` here is \
+         the inline gate resolving the business key against the caller's own \
+         shard and finding only the dead run — the bug #1146 closes"
+    );
+    assert_eq!(
+        autumn_harvest::signal::load_pending_signals(&mut conn1, live)
+            .await
+            .expect("load pending on the live run")
+            .len()
+            + usize::from(load_execution(&mut conn1, live).await.state == "COMPLETED"),
+        1,
+        "the signal was delivered to the live run (still queued, or already \
+         consumed and the run completed)"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
 }

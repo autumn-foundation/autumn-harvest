@@ -2255,7 +2255,7 @@ enum DeliveryRoute {
 /// * An [`ExternalTarget::ExecutionId`] is O(1) and authoritative: the shard is
 ///   encoded in the id itself. Unchanged from issue #751.
 /// * An [`ExternalTarget::WorkflowId`] is resolved by **observation** —
-///   [`crate::external_target_placement::resolve_placement_by_workflow_id`]
+///   [`crate::external_target_location::resolve_location_by_workflow_id`]
 ///   fans out across every expected shard and merges the answers — rather than
 ///   by re-deriving the rendezvous hash a fresh start would use. The hash is a
 ///   prediction of where *new* work would be placed and is wrong for a workflow
@@ -2264,21 +2264,43 @@ enum DeliveryRoute {
 ///   resolved to a shard the target does not live on and failed the request
 ///   `target_unknown` while it was running.
 ///
-/// The fan-out holds at most one extra connection at a time, sequentially, and
-/// never on the caller's own in-flight transaction — it reads the latest
-/// committed state through fresh connections, and the delivery attempt then
-/// re-resolves under the connection it actually delivers on, so a run that
-/// moves between resolution and delivery is caught there rather than here.
+/// # Connection budget
+///
+/// `conn` is the connection the sweep already holds, checked out of the
+/// caller's own shard pool, with an open transaction and a `FOR UPDATE` lock on
+/// the outbox row. Harvest configures no deadpool `Timeouts`, so a bare
+/// `pool.get()` from that same pool would be an unbounded wait and could park
+/// the whole timeout checker (the hazard `codec_rotation.rs` and
+/// `audit_export.rs` were both fixed for). Three things prevent it:
+///
+/// * A deployment expecting **one** shard short-circuits here with no fan-out
+///   at all, so the single-shard default is exactly what it was pre-#1146.
+/// * The caller's own shard is probed on `conn` itself, never re-acquired.
+/// * Every other acquisition is bounded, and a shard that fails becomes
+///   `Indeterminate` (retry), memoized in `uninspectable` so a backlog pays the
+///   bound once per shard per sweep rather than once per row.
+///
+/// The delivery attempt then re-resolves under the connection it actually
+/// delivers on, so a run that moves between resolution and delivery — a
+/// continue-as-new, say — is caught there rather than here.
 ///
 /// With no sharded pool configured at all there is one database by definition,
 /// so the route is always the caller's own connection.
 async fn resolve_delivery_route(
+    conn: &mut AsyncPgConnection,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
     target: &ExternalTarget,
     caller_exec_id: ExecutionId,
+    uninspectable: &crate::external_target_location::UninspectableShards,
 ) -> DeliveryRoute {
     let Some(pool) = sharded_pool else {
         return DeliveryRoute::Caller;
+    };
+
+    let caller_shard = if caller_exec_id.shard().is_unencoded() {
+        pool.default_shard()
+    } else {
+        caller_exec_id.shard()
     };
 
     let target_shard = match target {
@@ -2294,37 +2316,52 @@ async fn resolve_delivery_route(
             workflow_name,
             workflow_id,
         } => {
-            let router = crate::external_target_placement::global_router_snapshot();
-            match crate::external_target_placement::resolve_placement_by_workflow_id(
-                pool,
-                router.as_ref(),
-                workflow_name,
-                workflow_id,
-            )
-            .await
-            {
-                crate::external_target_placement::TargetPlacement::Found { shard, .. } => shard,
-                crate::external_target_placement::TargetPlacement::NotFound => {
-                    return DeliveryRoute::NoRunAnywhere;
-                }
-                crate::external_target_placement::TargetPlacement::Indeterminate {
-                    uninspected,
-                } => {
-                    // NEVER `NoRunAnywhere`: that is what becomes a permanent
-                    // `target_unknown` once the grace window elapses, and a
-                    // shard we could not read is not a shard the target is
-                    // absent from.
-                    let named = uninspected
-                        .iter()
-                        .map(|u| format!("{} ({})", u.shard, u.reason))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return DeliveryRoute::Retry {
-                        reason: format!(
-                            "could not inspect every shard for (workflow_name={workflow_name}, \
-                             workflow_id={workflow_id}): {named}"
-                        ),
-                    };
+            let router = crate::external_target_location::global_router_snapshot();
+            let expected =
+                crate::external_target_location::fanout_shards(&pool.shard_ids(), router.as_ref());
+            // One expected shard is the whole deployment: the target can only be
+            // there, and the delivery attempt on `conn` already reports
+            // `NoRunFound` when it is not. Fanning out would add a query on a
+            // second connection from the pool this transaction is already
+            // holding one from, for no information. Fall through to the pool
+            // comparison below with that single shard, which reproduces the
+            // pre-#1146 route exactly.
+            if let [only] = expected.as_slice() {
+                *only
+            } else {
+                match crate::external_target_location::resolve_location_by_workflow_id_with(
+                    pool,
+                    router.as_ref(),
+                    workflow_name,
+                    workflow_id,
+                    Some((caller_shard, conn)),
+                    Some(uninspectable),
+                )
+                .await
+                {
+                    crate::external_target_location::TargetLocation::Found { shard, .. } => shard,
+                    crate::external_target_location::TargetLocation::NotFound => {
+                        return DeliveryRoute::NoRunAnywhere;
+                    }
+                    crate::external_target_location::TargetLocation::Indeterminate {
+                        uninspected,
+                    } => {
+                        // NEVER `NoRunAnywhere`: that is what becomes a permanent
+                        // `target_unknown` once the grace window elapses, and a
+                        // shard we could not read is not a shard the target is
+                        // absent from.
+                        let named = uninspected
+                            .iter()
+                            .map(|u| format!("{} ({})", u.shard, u.reason))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return DeliveryRoute::Retry {
+                            reason: format!(
+                                "could not inspect every shard for (workflow_name={workflow_name}, \
+                                 workflow_id={workflow_id}): {named}"
+                            ),
+                        };
+                    }
                 }
             }
         }
@@ -2471,6 +2508,13 @@ pub async fn enforce_external_signals_outbox(
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
 
+    // Per-sweep memo of shards that could not be inspected (issue #1146). A
+    // backlog can hold hundreds of pending by-id rows; a shard that failed to
+    // hand over a connection on the first has not recovered by the last, and
+    // each re-probe costs the full acquisition bound. Shared across every step
+    // of this sweep, discarded when it returns.
+    let uninspectable = crate::external_target_location::UninspectableShards::new();
+
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
     loop {
@@ -2563,9 +2607,11 @@ pub async fn enforce_external_signals_outbox(
                     });
 
                 let route = resolve_delivery_route(
+                    conn,
                     active_sharded_pool.as_ref(),
                     &target,
                     caller_exec_id,
+                    &uninspectable,
                 )
                 .await;
 
@@ -2849,6 +2895,13 @@ pub async fn enforce_external_cancels_outbox(
             .and_then(|lock| lock.clone())
     });
 
+    // Per-sweep memo of shards that could not be inspected (issue #1146). A
+    // backlog can hold hundreds of pending by-id rows; a shard that failed to
+    // hand over a connection on the first has not recovered by the last, and
+    // each re-probe costs the full acquisition bound. Shared across every step
+    // of this sweep, discarded when it returns.
+    let uninspectable = crate::external_target_location::UninspectableShards::new();
+
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
     loop {
@@ -2940,9 +2993,11 @@ pub async fn enforce_external_cancels_outbox(
                 // (issue #1146) — an observation for a `WorkflowId` target,
                 // the encoded shard for an `ExecutionId` one.
                 let route = resolve_delivery_route(
+                    conn,
                     active_sharded_pool.as_ref(),
                     &target,
                     caller_exec_id,
+                    &uninspectable,
                 )
                 .await;
 

@@ -278,13 +278,38 @@ rules make that safe rather than merely broader:
   permanent `target_unknown`. A shard outage therefore stalls by-id deliveries
   instead of durably failing them.
 
-Operationally: expect **one row read per shard per by-id delivery attempt**, on
-the outbox scanners rather than the hot dispatch path. A single-shard deployment
-expects one shard and is unchanged, including keeping its inline (same
-transaction) fast path; multi-shard deployments route every by-id delivery
-through the outbox, which is where the hash already sent `(N-1)/N` of them.
-`ExecutionId`-addressed signal/cancel is untouched — the shard is decoded from
+Operationally: expect **one to two row reads per shard per by-id delivery
+attempt** (the per-shard resolver probes active-first, then most-recent-terminal
+only when a shard holds no active run), on the outbox scanners rather than the
+hot dispatch path. A **single-shard deployment expects one shard, skips the
+fan-out entirely, and is unchanged**, including keeping its inline
+(same-transaction) fast path. Multi-shard deployments route every by-id delivery
+through the outbox — which is where the hash already sent `(N-1)/N` of them —
+so delivery completes up to one scanner poll interval later than it used to.
+`ExecutionId`-addressed signal/cancel is untouched: the shard is decoded from
 the id and is always authoritative.
+
+Connections, not queries, are the budget here. The sweep calls the fan-out from
+inside a transaction on a connection checked out of its own shard's pool, and
+Harvest configures no deadpool timeouts, so a naive second `pool.get()` on that
+pool would park forever and wedge every scanner resident behind it. The caller's
+own shard is therefore probed on the connection already in hand, every other
+acquisition is bounded, and a sweep memoizes the shards it has already failed to
+reach so a backlog of pending rows pays that bound once per shard rather than
+once per row.
+
+**A shard you cannot reach stalls by-id delivery rather than failing it, without
+a bound.** That is the deliberate trade: `target_unknown` is written into an
+append-only history and cannot be taken back, so it is only ever recorded from a
+*complete* fan-out. The consequence is that a shard which is permanently
+uninspectable *in this process* — a router whose `readable_shards` names a shard
+no pool was ever configured for, say — leaves every affected by-id request
+pending indefinitely, and a workflow awaiting the outcome waits with it. There is
+no metric for this yet; the signal is the per-row `by-id target resolution
+inconclusive` warning, which names the shard and the reason. The plugin's
+startup `missing_router_shards` check prevents the steady-state form of this
+misconfiguration; a hand-rolled embedder whose `sharded_pool` is narrower than
+its router can still reach it.
 
 `shard::external_target_owning_shard` still exists and is still correct for the
 question it answers — *where would this key be placed?* — which is what the

@@ -3344,7 +3344,7 @@ async fn persist_external_signal_inline(
             // process-global router/pool, which cannot change inside this
             // transaction (issue #1146).
             let multi_shard_deployment =
-                crate::external_target_placement::deployment_is_multi_shard();
+                crate::external_target_location::deployment_is_multi_shard();
 
             for item in items {
                 match item {
@@ -3383,8 +3383,8 @@ async fn persist_external_signal_inline(
                         // against its authoritative encoded shard; a
                         // `WorkflowId` target is inline-eligible only in a
                         // single-shard deployment. See
-                        // `external_target_placement::inline_delivery_allowed`.
-                        if !crate::external_target_placement::inline_delivery_allowed(
+                        // `external_target_location::inline_delivery_allowed`.
+                        if !crate::external_target_location::inline_delivery_allowed(
                             &run.target,
                             exec_id.shard(),
                             multi_shard_deployment,
@@ -3530,7 +3530,7 @@ async fn persist_external_signal_inline(
                         // scanner. See the identical comment on the signal arm
                         // above for why a `WorkflowId` target is inline-eligible
                         // only in a single-shard deployment (issue #1146).
-                        if !crate::external_target_placement::inline_delivery_allowed(
+                        if !crate::external_target_location::inline_delivery_allowed(
                             &run.target,
                             exec_id.shard(),
                             multi_shard_deployment,
@@ -15838,15 +15838,21 @@ enum SuccessorSlot {
 /// Left unguarded that silently breaks two things a multi-shard deployment
 /// relies on:
 ///
-/// 1. **`workflow_id`-addressed signal/cancel/await (issue #751)** resolves its
-///    target with `shard::external_target_owning_shard`, which hashes the new
-///    pair — so it queries the wrong database and reports the live successor as
-///    `target_unknown`. That is precisely the addressing mode this feature tells
-///    callers to use for an entity that changes type.
-/// 2. **`(workflow_name, workflow_id)` uniqueness**, because
+/// 1. **`(workflow_name, workflow_id)` uniqueness**, because
 ///    [`resolve_successor_slot`] can only see the predecessor's shard: a live
 ///    run of the target type sitting on the hash-derived shard is invisible, so
 ///    the successor is created alongside it and two live runs share one key.
+///
+/// Issue #1146 removed the *second* reason this guard originally carried —
+/// that `workflow_id`-addressed signal/cancel (issue #751) resolved its target
+/// by hashing the new pair and would therefore report the relocated successor
+/// `target_unknown`. By-id delivery now finds a run wherever it lives
+/// (`external_target_location::resolve_location_by_workflow_id`), so
+/// reachability is no longer at stake. The uniqueness reason above is
+/// untouched and is on its own sufficient: two live runs under one business key
+/// is a corrupt state no addressing scheme can repair. Relaxing this guard into
+/// a real cross-shard occupancy check — which #1146's fan-out now makes
+/// possible — is a genuine follow-up, deliberately not taken here.
 ///
 /// So this fails the transition **closed**, matching what the feature already
 /// does for every other unsupported target (blank, unregistered, DAG, occupied
@@ -15923,10 +15929,9 @@ fn classify_cross_shard_continue_as_new(
         "continue_as_new into '{target}' would place the successor on shard {predecessor_shard} \
          (the predecessor's shard, since the seal and the successor insert are one transaction), \
          but the key ('{target}', '{workflow_id}') routes to shard {}. Cross-shard relocation is \
-         not supported, and proceeding would make the successor unreachable by workflow_id-\
-         addressed signal/cancel (issue #751) and could admit a second live run of the target type \
-         on the routed shard. Keep this entity on one type and branch internally, or run a \
-         single-shard deployment",
+         not supported: proceeding could admit a second live run of the target type on the routed \
+         shard, because the uniqueness check can only see the predecessor's shard. Keep this \
+         entity on one type and branch internally, or run a single-shard deployment",
         target_shard.as_i32()
     ))
 }

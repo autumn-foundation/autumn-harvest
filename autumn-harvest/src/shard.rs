@@ -725,26 +725,34 @@ impl ShardRouter {
 /// shard has been drained out of `writable_shards` since the workflow was
 /// placed, which moves where the same key re-hashes.
 ///
-/// Use it only where the *prediction* is the question — e.g.
-/// `worker::reject_cross_shard_continue_as_new`, which asks where a
-/// continue-as-new's new `(workflow_name, workflow_id)` pair would route, and
-/// `execution`'s re-run `workflow_id`-override guard, which asks the same of an
-/// overridden key. Both are about placing new work, so the hash is
-/// authoritative for them by construction.
+/// Its two remaining callers — `worker::reject_cross_shard_continue_as_new` and
+/// `execution`'s re-run `workflow_id`-override guard — use it as a proxy for a
+/// *third* question: "which shard would a shard-local uniqueness check for this
+/// key run on?" Both create the new run on an **existing** run's shard (the
+/// predecessor's, the re-run source's), never on the hashed one, and both refuse
+/// the operation when the two differ — because the uniqueness index they rely on
+/// lives on one shard and cannot see a live run of the key on another. That
+/// makes the hash the right input for them, but for a narrower reason than
+/// "placing new work", and it means both are stricter than they have to be: a
+/// residency-pinned run whose key hashes elsewhere is refused even though the
+/// new run would be residency-correct and (since this issue) perfectly
+/// reachable. Loosening either into a real cross-shard occupancy check is a
+/// follow-up that #1146's fan-out now makes possible.
 ///
 /// To find where an existing business key actually **lives** — which is what a
 /// `workflow_id`-addressed signal/cancel delivery needs — use
-/// [`crate::external_target_placement::resolve_placement_by_workflow_id`],
+/// [`crate::external_target_location::resolve_location_by_workflow_id`],
 /// which observes every expected shard instead of predicting one. Delivery
 /// stopped using this function for that in issue #1146.
 ///
 /// Returns `None` only when `target` is a `WorkflowId` and the process-global
 /// shard router has not been initialized (a boot-window / non-plugin-embedder
-/// edge case). Callers on this path already run inside an established shard
-/// connection, so the documented, accepted fallback — shared with every other
-/// `GLOBAL_SHARD_ROUTER` consumer (e.g. `completion_trigger.rs`) — is to
-/// treat this as "assume same shard as the caller", i.e. attempt inline
-/// resolution rather than deferring to the cross-shard outbox.
+/// edge case). Both remaining callers treat that as "no divergence is knowable,
+/// so do not refuse", which is also correct by construction: a deployment
+/// without a router is single-shard, and a single shard cannot diverge from
+/// itself. The delivery paths no longer consult this function at all, so the
+/// pre-#1146 "assume same shard as the caller, attempt inline" fallback this
+/// paragraph used to describe no longer exists.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn external_target_owning_shard(target: &ExternalTarget) -> Option<ShardId> {
@@ -948,13 +956,13 @@ impl ShardedDbPool {
     /// `writable_shards`, resolves here to a pool it is not in, and the caller
     /// concludes the target does not exist.
     ///
-    /// Use [`crate::external_target_placement::resolve_placement_by_workflow_id`]
+    /// Use [`crate::external_target_location::resolve_location_by_workflow_id`]
     /// and then [`Self::exact_pool_for`] on the shard it reports. Retained,
     /// rather than removed, because it is public API.
     #[deprecated(
-        since = "0.6.0",
+        since = "0.7.0",
         note = "hash-derived and wrong for explicitly-placed or drained-shard workflows; \
-                use external_target_placement::resolve_placement_by_workflow_id then exact_pool_for"
+                use external_target_location::resolve_location_by_workflow_id then exact_pool_for"
     )]
     #[must_use]
     pub fn exact_pool_for_target(
