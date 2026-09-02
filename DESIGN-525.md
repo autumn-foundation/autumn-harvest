@@ -157,10 +157,20 @@ autumn-harvest-plugin/src/dev/
 2. **BYO** (`--database-url` / `HARVEST_DEV_DATABASE_URL`): classify the DSN
    through `safety::classify`. `Unsafe` → refuse, naming the reason. Anything
    accepted still prints the not-for-production banner.
-3. **Provisioned** (default): reap stale sessions, resolve binaries, `initdb`
-   into `<tmp>/harvest-dev-<pid>-<rand>/data`, write the session record, start
-   the postmaster on 127.0.0.1:0, wait for readiness, create the database and
-   role.
+3. **Provisioned** (default): **refuse `root` first** — before the session root
+   is created or reaped, because a stale record names a `bin_dir` whose `pg_ctl`
+   the reaper runs, and at uid 0 that record could be one any unprivileged local
+   user pre-created at `harvest-dev-0`. Then reap stale sessions, resolve
+   binaries, `initdb` into `<tmp>/harvest-dev-<uid>/session-<pid>-<rand>/data`,
+   write the session record, start the postmaster on 127.0.0.1:0, wait for
+   readiness, create the database and role.
+3a. **Re-prove the HTTP port** once storage exists. The reservation in step 1
+   cannot be *held* across provisioning — autumn-web binds the same port itself
+   — so two runs that both found it free both get this far. autumn-web
+   `process::exit(1)`s on a bind failure, skipping every destructor, so the
+   loser would strand the cluster it just built. Checking again here, while
+   teardown is still ours to run, narrows that window from seconds of
+   provisioning to the microseconds before the server binds.
 4. Build the Autumn app with `HarvestPlugin`, feeding it the resolved DSN,
    port and `profile = "dev"` through Autumn's own `ConfigLoader` seam —
    **not** by mutating the process environment, which is `unsafe` and unsound
@@ -247,12 +257,18 @@ Three layers, because one is not enough:
 2. **Panic / early return** — `Drop` on `EphemeralPostgres` runs the same
    sequence, and `Drop` on `DevRuntime` reaches it.
 3. **`SIGKILL` / power loss** — the next start reaps. Each session dir holds a
-   `session.json` naming the owner pid, the postmaster pid and the postmaster's
-   **start time**, written before `initdb` so a kill at any point leaves
-   something to find. A session whose owner is dead is reclaimed — but only
-   after four checks, because reaping means signalling a pid and deleting a
-   tree: the session root is per-user and `0700` (re-verified on every use, so
-   a record cannot be planted in a world-writable `/tmp`); the record's
+   `session.json` naming the owner pid and **start time**, the postmaster pid
+   and **its** start time, written before `initdb` so a kill at any point leaves
+   something to find — and rewritten **atomically** (private sibling +
+   `rename`) once the postmaster is up, because a truncating rewrite killed
+   half-way leaves JSON the reaper cannot parse, and an unparseable record is
+   deliberately skipped: the one mechanism meant to reclaim a killed run would
+   leak it permanently instead. A session whose owner is dead is reclaimed — but
+   only after four checks, because reaping means signalling a pid and deleting a
+   tree: the session root is per-user, **owned by us** and `0700` (re-verified
+   on every use, and ownership is compared directly because `root` can `chmod`
+   a foreign directory, so a successful `chmod` proves nothing at uid 0); the
+   record's
    `data_dir` must be the one this layout puts inside its own session dir; the
    recorded start time must still match, so a *reused* pid is never mistaken
    for ours; and a cluster that could not be confirmed stopped is left running

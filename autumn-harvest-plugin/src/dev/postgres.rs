@@ -144,6 +144,13 @@ impl EphemeralPostgres {
         binaries: &PostgresBinaries,
         config: &DevRuntimeConfig,
     ) -> Result<Self, DevError> {
+        // FIRST, ahead of even touching the session root. Postgres refuses to
+        // run as `root` anyway, so this run is doomed — but `session_root`
+        // creates and hardens a directory and the caller reaps the records
+        // inside it, and at uid 0 both of those act on whatever another local
+        // user may have pre-created at `harvest-dev-0`. Refuse before any of
+        // that, not after.
+        refuse_to_run_as_root()?;
         // Never directly in the system temp directory: `session_root` creates
         // and verifies an owner-only per-user root, because a session record is
         // an instruction to stop a process and delete a tree.
@@ -207,6 +214,9 @@ impl EphemeralPostgres {
         session_dir: &Path,
         data_dir: &Path,
     ) -> Result<Self, DevError> {
+        // Already refused in `start` before the session root existed. Kept so
+        // the invariant holds for this function on its own terms: nothing
+        // below should ever run as `root`.
         refuse_to_run_as_root()?;
 
         let password = generate_password();
@@ -683,13 +693,17 @@ fn escape_conf_string(value: &str) -> String {
 }
 
 /// Write (or rewrite) the session record the reaper reads.
+///
+/// Atomically, via [`write_private_atomic`] — this file is rewritten once the
+/// postmaster is up, and a kill during that rewrite is exactly the case the
+/// reaper exists for.
 fn write_session_record(
     session_dir: &Path,
     data_dir: &Path,
     postmaster_pid: Option<u32>,
     binaries: &PostgresBinaries,
 ) -> Result<(), DevError> {
-    write_private(
+    write_private_atomic(
         &session_dir.join(SESSION_RECORD_FILE),
         &SessionRecord {
             owner_pid: std::process::id(),
@@ -717,7 +731,7 @@ fn write_session_record(
 /// reads like a bug in the dev runtime, so it is checked up front and answered
 /// with what to actually do about it. This is a real situation, not a
 /// hypothetical: plenty of container-based dev environments run as `root`.
-fn refuse_to_run_as_root() -> Result<(), DevError> {
+pub(super) fn refuse_to_run_as_root() -> Result<(), DevError> {
     if running_as_root() {
         return Err(DevError::RunningAsRoot);
     }
@@ -773,6 +787,44 @@ fn write_private(path: &Path, contents: &str) -> Result<(), DevError> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// Write a private file so a reader sees either all of it or none of it.
+///
+/// `write_private` opens with `truncate(true)`, which is fine for a file
+/// written once and never again. The session record is not that: it is
+/// rewritten in place the moment the postmaster is up. A `SIGKILL` landing
+/// inside that rewrite leaves empty or half-written JSON, and
+/// `reap_stale_sessions` deliberately skips a record it cannot parse — so the
+/// postmaster and its data directory would be leaked *permanently*, by the one
+/// mechanism meant to reclaim them.
+///
+/// So: write a private sibling and rename it over the target. `rename(2)` within
+/// a directory is atomic, and `std::fs::rename` replaces an existing
+/// destination on Windows too, so either the previous valid record or the new
+/// valid record is what any reader finds.
+///
+/// Public so the atomicity itself is testable: a truncating writer and a
+/// renaming one are indistinguishable from the finished file alone.
+///
+/// # Errors
+///
+/// [`DevError::SessionDir`] if the staging file cannot be written or the rename
+/// fails.
+pub fn write_private_atomic(path: &Path, contents: &str) -> Result<(), DevError> {
+    // A unique sibling, not a fixed `.tmp`: two writers in one session
+    // directory should never be able to land on each other's staging file.
+    let staging = path.with_extension(format!("tmp-{:08x}", std::process::id()));
+    write_private(&staging, contents)?;
+    std::fs::rename(&staging, path).map_err(|source| {
+        // Do not leave the staging file lying around to be mistaken for
+        // anything; the record itself is untouched and still valid.
+        let _ = std::fs::remove_file(&staging);
+        DevError::SessionDir {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 /// A 32-character alphanumeric password for the ephemeral superuser.

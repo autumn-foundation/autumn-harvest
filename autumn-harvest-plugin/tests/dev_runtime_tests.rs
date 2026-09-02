@@ -24,6 +24,7 @@ use autumn_harvest_plugin::dev::{
     classify_database_url, decide_reap, effective_postmaster_pid, ephemeral_dsn, http_authority,
     parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live, proc_stat_start_time,
     record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir, unix_socket_path_len,
+    write_private_atomic,
 };
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1117,176 @@ fn workspace_root() -> PathBuf {
         assert!(dir.pop(), "workspace root not found");
     }
     dir
+}
+
+// ---------------------------------------------------------------------------
+// Codex round 3
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redaction_survives_a_quoted_password_containing_a_question_mark() {
+    // Codex round 3 (P2). `?` starts a query string in a URI and is an ordinary
+    // character in a keyword/value string. Splitting on it before knowing which
+    // syntax the DSN was in cut `password='abc?hunter2'` in half: the scanner
+    // redacted the head and the tail was appended back verbatim.
+    for dsn in [
+        "host=localhost password='abc?hunter2 ghi' dbname=harvest_dev",
+        "host=localhost password=abc?hunter2 dbname=harvest_dev",
+        "password='??hunter2' host=localhost",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert!(
+            redacted.contains("host=localhost"),
+            "redaction must not eat the rest of the DSN: {dsn} -> {redacted}"
+        );
+    }
+}
+
+#[test]
+fn redaction_still_treats_a_real_uri_query_as_a_query() {
+    // The other half of the same fix: deciding syntax by prefix must not stop
+    // `?password=` in an actual URI from being redacted.
+    let dsn = "postgres://harvest@localhost:5432/harvest_dev?password=hunter2&sslmode=disable";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted}");
+    assert!(redacted.contains("password=***"), "{redacted}");
+    assert!(redacted.contains("sslmode=disable"), "{redacted}");
+}
+
+#[test]
+fn a_session_record_is_replaced_rather_than_truncated_in_place() {
+    // Codex round 3 (P2). The record is rewritten once the postmaster is up. A
+    // truncating writer killed mid-rewrite leaves empty or partial JSON, and
+    // `reap_stale_sessions` deliberately skips a record it cannot parse — so
+    // the very mechanism meant to reclaim a killed run's postmaster would leak
+    // it permanently instead.
+    //
+    // A finished file cannot tell the two writers apart, so this asks the
+    // filesystem: a hard link pinned to the original inode still holds the old
+    // bytes after a rename, and would have been truncated along with the
+    // target by an in-place rewrite.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let record = dir.path().join("session.json");
+    write_private_atomic(&record, "{\"first\":true}").expect("first write");
+
+    let witness = dir.path().join("witness.json");
+    std::fs::hard_link(&record, &witness).expect("hard link");
+
+    write_private_atomic(&record, "{\"second\":true}").expect("second write");
+
+    assert_eq!(
+        std::fs::read_to_string(&witness).expect("witness"),
+        "{\"first\":true}",
+        "the record was rewritten in place, so a kill mid-write could leave partial JSON"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record).expect("record"),
+        "{\"second\":true}"
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the staging file must not survive the rename: {leftovers:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_record_is_written_owner_only() {
+    // The staging file is created before the rename, so it — not just the
+    // final name — has to carry the private mode.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let record = dir.path().join("session.json");
+    write_private_atomic(&record, "{}").expect("write");
+    let mode = std::fs::metadata(&record)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+}
+
+#[test]
+fn root_is_refused_before_any_session_state_is_touched() {
+    // Codex round 3 (P1). As `root`, `provision_storage` used to create and
+    // harden the session root and run the reaper — which executes a recorded
+    // `bin_dir`'s `pg_ctl` — before Postgres's own "cannot run as root" refusal
+    // was reached. Any unprivileged local user can pre-create `harvest-dev-0`,
+    // so that ordering handed them a root-executed binary.
+    //
+    // Asserted on the sources with comments stripped, the same way AC6 is: the
+    // bug was an *ordering*, and the ordering is what has to stay true. A
+    // behavioural test could only ever observe it on a machine running as root.
+    let mod_rs = workspace_root().join("autumn-harvest-plugin/src/dev/mod.rs");
+    let body = strip_comment_lines(&std::fs::read_to_string(&mod_rs).expect("mod.rs"));
+    let refusal = body
+        .find("refuse_to_run_as_root()")
+        .expect("provision_storage must refuse root");
+    let root_use = body
+        .find("reaper::session_root(")
+        .expect("provision_storage must create the session root");
+    assert!(
+        refusal < root_use,
+        "the root refusal must come before the session root is created or reaped"
+    );
+
+    let postgres_rs = workspace_root().join("autumn-harvest-plugin/src/dev/postgres.rs");
+    let body = strip_comment_lines(&std::fs::read_to_string(&postgres_rs).expect("postgres.rs"));
+    let refusal = body
+        .find("refuse_to_run_as_root()")
+        .expect("EphemeralPostgres::start must refuse root");
+    let root_use = body
+        .find("session_root(")
+        .expect("EphemeralPostgres::start must create the session root");
+    assert!(
+        refusal < root_use,
+        "the root refusal must come before the session root is created"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provisioning_as_root_creates_no_session_root() {
+    // The behavioural half of the same finding, which only says anything on a
+    // machine actually running as root — which plenty of container-based dev
+    // environments, and this repo's own CI image, are.
+    if !autumn_harvest_plugin::dev::running_as_root() {
+        return;
+    }
+    let base = tempfile::tempdir().expect("temp dir");
+    let config = DevRuntimeConfig {
+        session_root: Some(base.path().to_path_buf()),
+        // Kernel-chosen, so a CI runner that happens to have something on the
+        // default 3000 fails this test for the wrong reason.
+        http_port: 0,
+        ..DevRuntimeConfig::default()
+    };
+    let error = autumn_harvest_plugin::dev::DevRuntime::start(config)
+        .await
+        .expect_err("running as root must be refused");
+    assert!(
+        matches!(error, autumn_harvest_plugin::dev::DevError::RunningAsRoot),
+        "expected a root refusal, got: {error}"
+    );
+    let entries: Vec<_> = std::fs::read_dir(base.path())
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "root must be refused before any session state exists, found: {entries:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

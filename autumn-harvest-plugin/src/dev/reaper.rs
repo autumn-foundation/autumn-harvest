@@ -14,10 +14,10 @@
 //! A session record is an instruction to `SIGKILL` a pid and `rm -rf` a
 //! directory. Four things stand between that and a planted record:
 //!
-//! 1. **The root is per-user and `0700`, and is checked on every use.** Sessions
-//!    never live directly in the world-writable system temp directory, where any
-//!    other local account could create `harvest-dev-*/session.json` naming a pid
-//!    of ours.
+//! 1. **The root is per-user, owned by us, and `0700` — checked on every use.**
+//!    Sessions never live directly in the world-writable system temp directory,
+//!    where any other local account could create `harvest-dev-*/session.json`
+//!    naming a pid of ours, or a `bin_dir` whose `pg_ctl` we would then run.
 //! 2. **The record must be self-consistent.** Its `data_dir` has to be the one
 //!    this layout puts inside the session directory; a record pointing elsewhere
 //!    is corrupt or planted and is left alone.
@@ -55,9 +55,10 @@ pub fn session_root(base: &Path) -> Result<PathBuf, DevError> {
 
 /// Make the session root owner-only, and refuse a root that is not ours.
 ///
-/// A symlink is rejected outright — another user could repoint it — and a
-/// `chmod` we are not permitted to make means the directory belongs to someone
-/// else.
+/// A symlink is rejected outright — another user could repoint it. Ownership is
+/// then checked directly: an unprivileged process cannot `chmod` a foreign
+/// directory, but `root` can, so a successful `chmod` is evidence only when we
+/// are not `root` and the uid comparison is what actually decides.
 fn harden_root(root: &Path) -> Result<(), DevError> {
     let metadata = std::fs::symlink_metadata(root).map_err(|source| DevError::SessionDir {
         path: root.to_path_buf(),
@@ -71,7 +72,21 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
+        // Ownership, not permission to chmod. For an unprivileged user those
+        // are the same question, but `root` can `chmod` a directory any local
+        // user pre-created — so a successful chmod proves nothing at uid 0,
+        // and the records inside name a `bin_dir` whose `pg_ctl` the reaper
+        // then runs. Ask who owns it instead.
+        if let Some(uid) = unix_uid()
+            && metadata.uid() != uid
+        {
+            return Err(DevError::UntrustedSessionRoot {
+                path: root.to_path_buf(),
+                reason: "it belongs to another user, so its records are not ours to act on",
+            });
+        }
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
             DevError::UntrustedSessionRoot {
                 path: root.to_path_buf(),

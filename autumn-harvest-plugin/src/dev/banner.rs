@@ -166,8 +166,21 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
 /// Conservative by construction: everything between the first `:` of the
 /// userinfo and its `@` is replaced wholesale, so a password containing `@` or
 /// `:` cannot survive by confusing the parser.
+///
+/// **Syntax is decided before anything is split.** `?` starts a query string in
+/// a URI and is an ordinary character everywhere else, so splitting on it first
+/// cut `password='abc?def ghi'` in a keyword/value string in half and printed
+/// the tail. Which syntax a DSN is in is exactly the question
+/// `tokio_postgres::Config::from_str` answers before dialling, and it answers it
+/// by prefix — so this asks the same way, and cannot disagree with the client
+/// about what the string means.
 #[must_use]
 pub fn redact_dsn(dsn: &str) -> String {
+    if !is_uri_dsn(dsn) {
+        // Keyword/value: no query string exists to separate, and the scanner
+        // has to see the whole string to consume quoted values whole.
+        return redact_keyword_value(dsn);
+    }
     let (base, query) = match dsn.split_once('?') {
         Some((base, query)) => (base, Some(query)),
         None => (dsn, None),
@@ -179,9 +192,23 @@ pub fn redact_dsn(dsn: &str) -> String {
     }
 }
 
+/// Whether libpq — and `tokio_postgres::Config::from_str` — would read this as
+/// a URI rather than a keyword/value string.
+///
+/// The test is the literal prefix, case-sensitively, and nothing else: that is
+/// the client's own rule, and matching it exactly is the point. Leading
+/// whitespace is ignored for the *decision* only; the string itself is redacted
+/// unchanged so what the developer pastes still looks like what they typed.
+fn is_uri_dsn(dsn: &str) -> bool {
+    let trimmed = dsn.trim_start();
+    trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://")
+}
+
 /// Redact `user:password@host` in the pre-query part of a URI, or `password=`
 /// in a keyword/value string.
 fn redact_userinfo(base: &str) -> String {
+    // `redact_dsn` only reaches here for a URI, so the `else` is a guard, not a
+    // path — but it fails safe rather than returning the string untouched.
     let Some(scheme_end) = base.find("://") else {
         return redact_keyword_value(base);
     };

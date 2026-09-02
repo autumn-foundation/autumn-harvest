@@ -58,9 +58,10 @@ pub use discovery::{
     DiscoveryEnv, Platform, PostgresBinaries, REQUIRED_TOOLS, candidate_bin_dirs, install_remedy,
     resolve_bin_dir,
 };
+use postgres::refuse_to_run_as_root;
 pub use postgres::{
     EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, postgres_conf_lines,
-    running_as_root, unix_socket_path_len,
+    running_as_root, unix_socket_path_len, write_private_atomic,
 };
 pub use reaper::{
     proc_stat_is_live, proc_stat_start_time, process_is_alive, process_start_token,
@@ -354,25 +355,27 @@ impl DevRuntime {
         let http_port = reserve_http_port(&config.http_host, config.http_port)?;
 
         let (database_url, storage, postgres) = provision_storage(&config).await?;
+        let postgres = Arc::new(Mutex::new(postgres));
+
+        // The reservation above could not be *held* across provisioning —
+        // autumn-web binds this same port itself — and provisioning is the long
+        // step. Two `cargo dev` runs that both found 3000 free will therefore
+        // both arrive here, and the loser would reach autumn-web's bind-failure
+        // `process::exit(1)`, which skips every destructor and strands the
+        // cluster it just built. Re-prove the port now, while teardown is still
+        // ours to run: the window narrows from seconds of provisioning to the
+        // microseconds before the server binds.
+        if let Err(error) = reserve_http_port(&config.http_host, http_port) {
+            return Err(abandon_cluster(&postgres, error).await);
+        }
 
         let base = format!("http://{}", http_authority(&config.http_host, http_port));
         let api_url = format!("{base}{}", config.api_path);
         let ui_url = format!("{api_url}/ui");
 
-        let postgres = Arc::new(Mutex::new(postgres));
         let server = match spawn_server(&config, &database_url, http_port, Arc::clone(&postgres)) {
             Ok(server) => server,
-            Err(error) => {
-                // The cluster is already up; never leak it behind a failed
-                // server. `take()` into a local first: holding the guard across
-                // the awaited shutdown is the classic deadlock shape, and the
-                // `on_shutdown` hook contends for this very lock.
-                let taken = postgres.lock().await.take();
-                if let Some(postgres) = taken {
-                    postgres.shutdown().await.ok();
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(abandon_cluster(&postgres, error).await),
         };
 
         let banner = render_banner(&BannerInputs {
@@ -602,6 +605,13 @@ async fn provision_storage(
         ));
     }
 
+    // Before the reaper, not after. A stale session record names a `bin_dir`
+    // whose `pg_ctl` `stop_orphan` executes, and as `root` this process would
+    // happily read one out of a `harvest-dev-0` some unprivileged local user
+    // pre-created. Provisioning as `root` cannot work regardless, so refuse it
+    // here — while the only thing we have done is decide to.
+    refuse_to_run_as_root()?;
+
     // Reclaim anything a killed predecessor left behind before adding to it.
     let root = reaper::session_root(
         &config
@@ -643,6 +653,24 @@ async fn resolve_binaries() -> Result<PostgresBinaries, DevError> {
         #[cfg(not(feature = "dev-runtime-managed"))]
         Err(error) => Err(error),
     }
+}
+
+/// Give up on a start that has already provisioned a cluster, taking the
+/// cluster with it.
+///
+/// The cluster is up; never leak it behind a failure that happened afterwards.
+/// `take()` into a local first: holding the guard across the awaited shutdown is
+/// the classic deadlock shape, and the `on_shutdown` hook contends for this very
+/// lock. The error is passed through so callers read as `return Err(...)`.
+async fn abandon_cluster(
+    postgres: &Arc<Mutex<Option<EphemeralPostgres>>>,
+    error: DevError,
+) -> DevError {
+    let taken = postgres.lock().await.take();
+    if let Some(postgres) = taken {
+        postgres.shutdown().await.ok();
+    }
+    error
 }
 
 /// The `host:port` authority for a URL, bracketing an IPv6 literal.

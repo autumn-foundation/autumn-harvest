@@ -248,6 +248,88 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[tokio::test]
+async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_it() {
+    // Codex round 3 (P2). The reservation above cannot be *held* across
+    // provisioning — autumn-web binds the same port itself — and provisioning
+    // is the long step. Two `cargo dev` runs that both found the port free
+    // therefore both get past the first check, and the loser would reach
+    // autumn-web's bind-failure `process::exit(1)`, which skips every
+    // destructor and strands the cluster it just built.
+    let Some(_binaries) = binaries() else { return };
+
+    let base = std::env::temp_dir().join(format!("harvest-dev-portrace-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("base");
+
+    // A free port, released immediately so the first reservation succeeds.
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        probe.local_addr().expect("addr").port()
+    };
+
+    // Event-driven, not timed: the session directory is created at the very
+    // start of provisioning and `initdb` runs for seconds afterwards, so
+    // claiming the port the moment that directory appears lands reliably in
+    // the middle of provisioning — the window the second check exists for.
+    let watched = base.clone();
+    let claimed = std::thread::spawn(move || {
+        for _ in 0..2000 {
+            if session_dir_count(&watched) > 0 {
+                return Some(std::net::TcpListener::bind(("127.0.0.1", port)).expect("claim"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    });
+
+    let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+        http_port: port,
+        session_root: Some(base.clone()),
+        ..DevRuntimeConfig::default()
+    })
+    .await
+    .expect_err("a port claimed during provisioning must be refused");
+
+    let held = claimed.join().expect("watcher");
+    assert!(
+        held.is_some(),
+        "the watcher never saw a session directory, so this proved nothing"
+    );
+    assert!(
+        matches!(
+            error,
+            autumn_harvest_plugin::dev::DevError::HttpPortUnavailable { .. }
+        ),
+        "{error}"
+    );
+
+    // And the cluster it had already built went with it.
+    assert_eq!(
+        session_dir_count(&base),
+        0,
+        "the provisioned cluster must be torn down, not stranded"
+    );
+
+    drop(held);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Session directories under a `session_root` base, across the per-user roots
+/// inside it.
+fn session_dir_count(base: &Path) -> usize {
+    std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|root| {
+            std::fs::read_dir(root.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .count()
+}
+
 /// A pid that is certain not to be running: `pid_max` is at least 2^15 on every
 /// platform we support and this exceeds the 32-bit ceiling.
 const fn dead_pid() -> u32 {
