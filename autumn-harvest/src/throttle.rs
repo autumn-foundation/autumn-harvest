@@ -1719,6 +1719,7 @@ pub async fn pending_throttle_count_for_workflow(
 ///
 /// Returns a database error if either the existence check or the grouped
 /// count query fails.
+#[cfg(feature = "db")]
 pub async fn pending_throttle_counts_for_workflows(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_names: &[&str],
