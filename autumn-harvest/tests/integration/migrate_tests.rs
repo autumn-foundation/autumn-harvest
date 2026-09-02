@@ -577,6 +577,57 @@ async fn a_role_with_only_select_and_insert_on_the_ledger_can_still_migrate() {
     );
 }
 
+#[tokio::test]
+async fn a_nontransactional_body_that_loses_the_ledger_race_is_still_reported_unserialized() {
+    // Without a transaction the body runs first and the ledger insert can lose
+    // afterwards, with nothing to roll the body back. The version is another
+    // migrator's, so the migration is `applied_concurrently` -- but this run
+    // really did execute unlocked DDL against the database, and the whole
+    // point of the unserialized list is to say so. Reporting only
+    // `applied_concurrently` would let the safety signal claim no unlocked
+    // body ran when one did.
+    let (_container, url) = empty_postgres().await;
+    migrate::apply(&url, &[]).await.expect("ledger created");
+
+    // Stand in for the migrator that wins the race: the version is already
+    // recorded when this run's insert lands.
+    let mut other = connect(&url).await;
+    diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ('29990106000000')")
+        .execute(&mut other)
+        .await
+        .expect("the winning migrator records the version");
+
+    let nontransactional = MigrationScript::with_metadata(
+        "29990106000000_harvest_migrate_probe_raced",
+        "CREATE TABLE IF NOT EXISTS harvest_migrate_raced (id INTEGER PRIMARY KEY);",
+        "run_in_transaction = false\n",
+    )
+    .expect("metadata parses");
+
+    let report = migrate::apply(&url, &[nontransactional])
+        .await
+        .expect("losing the ledger race is not a failure");
+
+    assert!(
+        report.applied.is_empty(),
+        "the version was not recorded by this run: {:?}",
+        report.applied
+    );
+    assert_eq!(
+        report.applied_concurrently,
+        vec!["29990106000000_harvest_migrate_probe_raced".to_string()]
+    );
+    assert_eq!(
+        report.applied_unserialized,
+        vec!["29990106000000_harvest_migrate_probe_raced".to_string()],
+        "the body ran here, unlocked, before losing the insert -- the report \
+         must not claim nothing ran unserialized"
+    );
+
+    // Proof the body really did run: only this run creates that table.
+    assert!(relation_exists(&url, "harvest_migrate_raced").await);
+}
+
 /// The single count the ledger-visibility migration recorded.
 async fn seen_count(url: &str) -> i64 {
     #[derive(diesel::QueryableByName)]

@@ -87,12 +87,28 @@ Two details worth naming:
   lock before any migration body ran. Refusing a migration set that
   `diesel migration run` applies for that role, mid-deploy, is the worse
   outcome, so the run probes the privilege once and proceeds unlocked —
-  Diesel's behaviour exactly. It is reported, not just logged: the report
-  carries `ledger_locked`, `harvest migrate run` prints a warning naming the
-  missing privilege and the remedy (run migrators one at a time, or grant one
-  of `UPDATE`/`DELETE`/`TRUNCATE`), and `--format json` carries the same field.
-  The `harvest` binary installs no tracing subscriber, so a warning logged
-  through `tracing` alone would reach nobody.
+  Diesel's behaviour exactly. It is reported, not just logged — the
+  `harvest` binary installs no tracing subscriber, so a warning logged through
+  `tracing` alone would reach nobody.
+
+  The report names what actually ran unserialized rather than asserting a
+  blanket state. Two fields, in the text output and under `--format json`:
+
+  | field | meaning |
+  | --- | --- |
+  | `applied_unserialized` | the migrations this run applied without the lock held |
+  | `ledger_lock_available` | whether the role could have taken the lock at all |
+
+  Two causes land in that list and they take **different** remedies, which is
+  why the second field exists and why the warning names the cause. A role
+  without the privilege can be granted it (`ledger_lock_available: false`,
+  every applied migration listed). A `run_in_transaction = false` migration has
+  no transaction for a lock to be held in, so no grant changes anything
+  (`ledger_lock_available: true`, only that migration listed). A body that ran
+  unlocked and *then* lost the ledger insert to a concurrent migrator is listed
+  too — it appears in both `applied_concurrently` and `applied_unserialized`,
+  because the DDL really did execute here. Either way: run migrators one at a
+  time.
 - **`status` never writes** — not even `CREATE TABLE IF NOT EXISTS` for the
   ledger. It probes with `to_regclass` and reports a ledger-less database as
   "never migrated", so the gate is safe to point at a database you are only

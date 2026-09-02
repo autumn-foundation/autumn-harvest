@@ -2538,8 +2538,14 @@ fn ensure_runtime_migrations_blocking(
 /// early under `Embedded`), which that command cannot reach — it applies the
 /// application database's sets and exits 0 having changed nothing (issue
 /// #1240).
-const HARVEST_MIGRATE_REMEDY: &str =
-    "Run `harvest migrate run --database-url <harvest.database.url>` to apply them.";
+const HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run` ",
+    // The DSN usually carries a password, and a command line is readable by
+    // every process on the host (`ps`, /proc) for as long as the migration
+    // runs. `--database-url` still works and is right for a passwordless DSN.
+    "to apply them. Prefer the environment variable over `--database-url`: a ",
+    "command line is visible host-wide, and this DSN usually carries a password."
+);
 
 /// The command that applies [`PLUGIN_HARVEST_MIGRATIONS`].
 ///
@@ -2551,8 +2557,10 @@ const HARVEST_MIGRATE_REMEDY: &str =
 /// added the table to prevent, since the first poison message then fails its
 /// dead-letter write and redelivers forever.
 const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
-    "Run `harvest migrate run --database-url <harvest.database.url> ",
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run ",
     "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
+    "Prefer the environment variable over `--database-url`: a command line is ",
+    "visible host-wide, and this DSN usually carries a password. ",
     // Said out loud because the process logging this is usually a container
     // with installed binaries and no checkout: unlike Harvest's own set, this
     // one is NOT embedded in the `harvest` binary, so a workspace-relative
@@ -2615,12 +2623,31 @@ mod migration_remedy_tests {
         // changed nothing (issue #1240).
         for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
             assert!(
-                remedy.contains("harvest migrate run --database-url"),
+                remedy.contains("harvest migrate run"),
                 "remedy must name the dedicated-database command: {remedy}"
             );
             assert!(
                 !remedy.contains("autumn migrate"),
                 "remedy must not name a command that cannot apply these: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_remedy_puts_the_dsn_in_a_command_line() {
+        // These strings are copied verbatim by an operator mid-incident, and
+        // the DSN they substitute usually carries a password. A command line
+        // is readable by every process on the host (`ps`, /proc) for as long
+        // as the migration runs, so the remedy must demonstrate the
+        // environment form.
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("HARVEST_DATABASE_URL="),
+                "remedy must show the environment form: {remedy}"
+            );
+            assert!(
+                !remedy.contains("--database-url <"),
+                "remedy must not demonstrate passing the DSN as an argument: {remedy}"
             );
         }
     }

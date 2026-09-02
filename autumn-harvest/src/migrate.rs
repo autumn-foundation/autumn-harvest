@@ -662,6 +662,14 @@ pub async fn apply_to_connection(
                 }
             }
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
+            Ok(Applied::ConcurrentlyAfterBody) => {
+                // Recorded by the other migrator, so it belongs in
+                // `applied_concurrently` — but this run really did execute the
+                // body without the lock, which is the whole point of the
+                // unserialized list.
+                report.applied_concurrently.push(script.name.clone());
+                report.applied_unserialized.push(script.name.clone());
+            }
             Err(error) => {
                 // Say which it was: a rolled-back migration left nothing
                 // behind, a non-transactional one may have applied part of
@@ -724,8 +732,20 @@ async fn create_ledger(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
 enum Applied {
     /// This run applied it.
     Yes,
-    /// A concurrent migrator got there first; nothing was applied here.
+    /// A concurrent migrator got there first and this run's body **never
+    /// ran** — the ledger re-check under the lock caught it before the body.
+    /// Reachable only on the transactional path.
     Concurrently,
+    /// A concurrent migrator recorded the version, but this run's body had
+    /// **already executed** by then.
+    ///
+    /// Only reachable without a transaction: there the body runs first and the
+    /// ledger insert can lose afterwards, with nothing to roll the body back.
+    /// Kept distinct from [`Concurrently`](Self::Concurrently) because the two
+    /// differ in the fact an operator needs — whether unlocked DDL ran against
+    /// this database — and collapsing them would let the report claim no
+    /// unserialized body ran when one did.
+    ConcurrentlyAfterBody,
 }
 
 /// Transaction-body failure, split so "already applied" is never inferred from
@@ -810,7 +830,9 @@ async fn apply_without_transaction(
         // rolled back. Confirm the version is there before saying so.
         Err(error @ DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
             if version_is_recorded(conn, &script.version).await? {
-                Ok(Applied::Concurrently)
+                // Not plain `Concurrently`: this run's body ran to completion,
+                // unlocked, before losing the insert.
+                Ok(Applied::ConcurrentlyAfterBody)
             } else {
                 Err(error)
             }
