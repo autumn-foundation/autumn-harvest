@@ -3,8 +3,11 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 
-use autumn_harvest_verify::Error;
+use std::path::{Path, PathBuf};
+
 use autumn_harvest_verify::allowlist::{AllowEntry, Allowlist};
+use autumn_harvest_verify::driver::BuildRequest;
+use autumn_harvest_verify::{Error, Options, Report, Verdict};
 
 fn write_temp(body: &str) -> tempfile::NamedTempFile {
     let mut f = tempfile::Builder::new()
@@ -177,5 +180,139 @@ fn unused_reports_entries_that_matched_nothing() {
         Allowlist::default()
             .unused(&used(&["seeded::wf_a"]))
             .is_empty()
+    );
+}
+
+// ── what an entry may suppress (pipeline level) ─────────────────────────────
+//
+// An allowlist entry is an escape hatch for a verdict the author has decided to
+// live with. A `proven-deterministic` workflow has no such verdict, so there is
+// nothing for the entry to suppress: it must be reported as unused, so the
+// entry — and the justification nobody has re-read since — gets deleted rather
+// than quietly outliving the problem it was written for.
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest-verify has a parent")
+        .to_path_buf()
+}
+
+fn verify_fixture(fixture: &str, root: &Path, allowlist: Option<&Path>) -> Report {
+    autumn_harvest_verify::verify(
+        &BuildRequest::default(),
+        &Options {
+            mir_paths: vec![fixtures_dir().join(fixture)],
+            source_roots: vec![root.to_path_buf()],
+            allowlist: allowlist.map(Path::to_path_buf),
+            ..Options::default()
+        },
+    )
+    .expect("the fixtures analyze without a tool error")
+}
+
+fn allowlist_for(workflow: &str, justification: &str) -> tempfile::NamedTempFile {
+    write_temp(&format!(
+        "[[allow]]\nworkflow = \"{workflow}\"\njustification = \"{justification}\"\n"
+    ))
+}
+
+#[test]
+fn a_proven_workflow_does_not_consume_its_allowlist_entry() {
+    let baseline = verify_fixture(
+        "example_deterministic_primitives.mir",
+        &workspace_root(),
+        None,
+    );
+    let proven = baseline
+        .workflows
+        .iter()
+        .find(|w| w.verdict == Verdict::ProvenDeterministic)
+        .expect("the clean fixture is proven-deterministic")
+        .workflow
+        .clone();
+
+    let file = allowlist_for(&proven, "tracked in #963; kept while the model matures");
+    let report = verify_fixture(
+        "example_deterministic_primitives.mir",
+        &workspace_root(),
+        Some(file.path()),
+    );
+
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == proven)
+        .expect("the workflow is still analyzed");
+    assert_eq!(
+        workflow.verdict,
+        Verdict::ProvenDeterministic,
+        "the entry must not change the verdict"
+    );
+    assert_eq!(
+        workflow.allowed, None,
+        "a proven workflow has nothing to allow; an entry may only suppress \
+         `nondeterminism-found` or `unknown`"
+    );
+    let summary = report.summary();
+    assert_eq!(summary.allowed, 0, "{summary:?}");
+    assert_eq!(summary.proven, 1, "{summary:?}");
+    assert_eq!(
+        report.unused_allowlist,
+        vec![proven.clone()],
+        "the entry matched nothing it could suppress, so it is unused"
+    );
+    let text = report.render_text();
+    assert!(
+        text.contains(&proven)
+            && text.contains("proven-deterministic")
+            && text.contains("can be removed"),
+        "the warning must say the workflow is now clean and the entry can go:\n{text}"
+    );
+    assert_eq!(report.exit_code(false), 0, "unused entries only warn");
+    assert_eq!(
+        report.exit_code(true),
+        1,
+        "under --strict an unused entry fails the run"
+    );
+}
+
+#[test]
+fn a_finding_still_consumes_its_allowlist_entry() {
+    let baseline = verify_fixture("format_and_outparams.mir", &fixtures_dir(), None);
+    let flagged = baseline
+        .workflows
+        .iter()
+        .find(|w| matches!(w.verdict, Verdict::NondeterminismFound { .. }))
+        .expect("the laundering matrix seeds findings")
+        .workflow
+        .clone();
+
+    let file = allowlist_for(&flagged, "seeded fixture flow, tracked in #962");
+    let report = verify_fixture(
+        "format_and_outparams.mir",
+        &fixtures_dir(),
+        Some(file.path()),
+    );
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == flagged)
+        .expect("still analyzed");
+    assert!(
+        workflow.allowed.is_some(),
+        "a finding is exactly what the hatch exists for"
+    );
+    assert_eq!(report.summary().allowed, 1);
+    assert!(
+        report.unused_allowlist.is_empty(),
+        "{:?}",
+        report.unused_allowlist
     );
 }

@@ -224,6 +224,54 @@ fn strict_flips_a_boundary_only_run_from_zero_to_one() {
     );
 }
 
+#[test]
+fn a_run_that_discovers_no_workflow_warns_and_is_strict_only_failure() {
+    // The failure this guards: a `.mir` with no readable `__autumn_workflow_info_*`
+    // marker used to print `analyzed 0` and exit 0 in every mode — a CI gate went
+    // green on a run that verified nothing at all.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mir = dir.path().join("no_markers.mir");
+    std::fs::write(
+        &mir,
+        "fn helper() -> u8 {\n    let mut _0: u8;\n\n\
+         bb0: {\n        _0 = const 0_u8;\n        return;\n    }\n}\n",
+    )
+    .expect("write .mir");
+    let mir = mir.to_string_lossy().into_owned();
+
+    let lax = run(&["--mir", &mir, "--format", "json"]);
+    assert_eq!(code(&lax), 0, "stderr:\n{}", stderr(&lax));
+    let report: autumn_harvest_verify::Report =
+        serde_json::from_str(&stdout(&lax)).expect("stdout is a Report");
+    assert_eq!(report.summary().analyzed, 0);
+    assert!(report.discovery_failed, "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no #[workflow] entry points were discovered")),
+        "the JSON warnings must carry it: {:?}",
+        report.warnings
+    );
+
+    let strict = run(&["--mir", &mir, "--format", "json", "--strict"]);
+    assert_eq!(
+        code(&strict),
+        1,
+        "`--strict` must refuse to pass a run that discovered nothing; stdout:\n{}",
+        stdout(&strict)
+    );
+
+    // The text format says it too, on the report the operator actually reads.
+    let text = run(&["--mir", &mir]);
+    assert_eq!(code(&text), 0);
+    assert!(
+        stdout(&text).contains("no #[workflow] entry points were discovered"),
+        "{}",
+        stdout(&text)
+    );
+}
+
 // ── tool errors are exit 2 ──────────────────────────────────────────────────
 
 #[test]

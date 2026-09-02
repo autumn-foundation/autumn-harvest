@@ -24,6 +24,14 @@ pub struct Report {
     pub unused_allowlist: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// True when the run discovered no `#[workflow]` entry point at all.
+    ///
+    /// `analyzed 0` is not a clean result, it is an absent one — a marker the
+    /// MIR parser could not read, a target that was never built, a `--package`
+    /// that selected the wrong crate. It warns by default and fails under
+    /// `--strict`, so a CI gate cannot go green on a run that verified nothing.
+    #[serde(default)]
+    pub discovery_failed: bool,
 }
 
 /// Counts for the success-metric triple.
@@ -61,15 +69,21 @@ impl Report {
         summary
     }
 
-    /// Exit code: 0 clean; 1 any `nondeterminism-found` (or, under `strict`, any `unknown`
-    /// or unused allowlist entry).
+    /// Exit code: 0 clean; 1 any `nondeterminism-found` (or, under `strict`, any `unknown`,
+    /// any unused allowlist entry, or a run that discovered no workflow at all).
+    ///
+    /// The last of those is [`Report::discovery_failed`]: a run that analyzed no
+    /// entry point verified nothing, and under `--strict` "nothing to report"
+    /// must not be spelled the same way as "nothing to fix".
     #[must_use]
     pub fn exit_code(&self, strict: bool) -> i32 {
         let summary = self.summary();
         if summary.found > 0 {
             return 1;
         }
-        if strict && (summary.unknown > 0 || !self.unused_allowlist.is_empty()) {
+        if strict
+            && (summary.unknown > 0 || !self.unused_allowlist.is_empty() || self.discovery_failed)
+        {
             return 1;
         }
         0
@@ -98,7 +112,8 @@ impl Report {
         for entry in &self.unused_allowlist {
             let _ = writeln!(
                 out,
-                "warning: unused allowlist entry: {entry} (no analyzed workflow has that path)"
+                "warning: unused allowlist entry: {entry} ({})",
+                self.why_unused(entry)
             );
         }
         for warning in &self.warnings {
@@ -120,6 +135,25 @@ impl Report {
             boundaries.join(", ")
         );
         out
+    }
+
+    /// Why an allowlist entry went unused — the two cases need different actions.
+    ///
+    /// An entry whose path is not in the run is a rename, a deletion or a typo.
+    /// An entry on a workflow that is *now* `proven-deterministic` is the good
+    /// case: the flow it was written for is gone, and saying "no analyzed
+    /// workflow has that path" about a workflow that is right there in the same
+    /// report would send the reader looking for a rename that never happened.
+    fn why_unused(&self, entry: &str) -> &'static str {
+        let proven = self
+            .workflows
+            .iter()
+            .any(|w| w.workflow == entry && w.verdict == Verdict::ProvenDeterministic);
+        if proven {
+            "that workflow is now proven-deterministic — the entry can be removed"
+        } else {
+            "no analyzed workflow has that path"
+        }
     }
 
     /// # Errors

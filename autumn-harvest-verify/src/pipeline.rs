@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::driver::{self, BuildRequest, EmittedMir};
-use crate::verdict::{Boundary, BoundaryKind, Site, WorkflowVerdict};
+use crate::verdict::{Boundary, BoundaryKind, Site, Verdict, WorkflowVerdict};
 use crate::{Allowlist, Model, Options, Report, analysis, entry, mir, resolve};
 
 /// The rustc releases the MIR parser has been exercised against (D1).
@@ -82,6 +82,19 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
 
     let roots = source_roots(build, opts, &emitted);
     let entries = entry::discover(&docs);
+    // Zero entries is a *reported* outcome, never a quiet clean run: with no
+    // entry there is no per-workflow verdict to carry a boundary, so the only
+    // place the failure can surface is the run itself.
+    let discovery_failed = entries.is_empty();
+    if discovery_failed {
+        let failures: usize = docs.iter().map(|d| d.parse_failures.len()).sum();
+        warnings.push(format!(
+            "no #[workflow] entry points were discovered in the analyzed MIR \
+             ({failures} parse failure{}); nothing was verified, so this run \
+             proves nothing — under `--strict` it is a failure",
+            if failures == 1 { "" } else { "s" }
+        ));
+    }
     let parse_failures = parse_failure_boundaries(&docs);
     let program = resolve::Program::build(docs, &roots)?;
     let mut workflows = analysis::analyze(&program, &model, &entries);
@@ -109,11 +122,20 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
         workflows,
         unused_allowlist,
         warnings,
+        discovery_failed,
     })
 }
 
 /// Suppress the verdicts an allowlist entry covers, and report the entries that
 /// matched nothing.
+///
+/// Only `nondeterminism-found` and `unknown` consume an entry. A
+/// `proven-deterministic` workflow has nothing to suppress, and marking it
+/// `allowed` would spend the entry on it twice over: the run's `allowed` count
+/// would claim a suppressed problem that does not exist, and the entry would
+/// never be reported as unused — so the justification for a bug that has since
+/// been fixed would sit in the file forever, silently ready to hide the *next*
+/// finding on that workflow. Leaving it unused is what makes it deletable.
 fn apply_allowlist(
     allowlist: &Allowlist,
     workflows: &mut [WorkflowVerdict],
@@ -121,6 +143,9 @@ fn apply_allowlist(
 ) {
     let mut used: BTreeSet<String> = BTreeSet::new();
     for workflow in workflows.iter_mut() {
+        if matches!(workflow.verdict, Verdict::ProvenDeterministic) {
+            continue;
+        }
         if let Some(justification) = allowlist.justification(&workflow.workflow) {
             workflow.allowed = Some(justification.to_string());
             used.insert(workflow.workflow.clone());

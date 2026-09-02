@@ -158,19 +158,26 @@ pub fn emit_mir_with_warnings(req: &BuildRequest) -> crate::Result<(Vec<EmittedM
     // gate artifact acceptance, and `--all-examples` reads the same document.
     let metadata = workspace_metadata(req)?;
 
-    let packages: Vec<Option<String>> = if req.packages.is_empty() {
+    let packages: Vec<Option<PackageSpec>> = if req.packages.is_empty() {
         vec![None]
     } else {
-        req.packages.iter().map(|p| Some(p.clone())).collect()
+        req.packages
+            .iter()
+            .map(|p| Some(parse_package_spec(p)))
+            .collect()
     };
 
     let mut emitted: Vec<EmittedMir> = Vec::new();
     for package in &packages {
-        let accept = package_ids(&metadata, package.as_deref())?;
-        let selections = targets_for(req, package.as_deref(), &metadata, &mut warnings);
+        let spec = package.as_ref();
+        let accept = package_ids(&metadata, spec, &mut warnings)?;
+        // Everything that matches metadata by name — target enumeration,
+        // fingerprint purging — uses the *resolved name*; cargo itself gets the
+        // spec verbatim, so a form this tool cannot read still reaches it.
+        let name = spec.and_then(PackageSpec::name);
+        let selections = targets_for(req, name, &metadata, &mut warnings);
         for selection in selections {
-            let mut mirs =
-                run_cargo_rustc(req, package.as_deref(), &selection, &target_dir, &accept)?;
+            let mut mirs = run_cargo_rustc(req, spec, &selection, &target_dir, &accept)?;
             emitted.append(&mut mirs);
         }
     }
@@ -209,17 +216,33 @@ fn workspace_metadata(req: &BuildRequest) -> crate::Result<serde_json::Value> {
 /// so this is the filter that keeps a dependency's `.mir` out of the analysis.
 fn package_ids(
     metadata: &serde_json::Value,
-    package: Option<&str>,
+    package: Option<&PackageSpec>,
+    warnings: &mut Vec<String>,
 ) -> crate::Result<std::collections::BTreeSet<String>> {
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    if let Some(spec) = package
+        && spec.name.is_none()
+    {
+        warnings.push(format!(
+            "cannot read `-p {}` as `name`, `name@version` or `name:version`; it is \
+             passed to cargo unchanged, and this run accepts artifacts from any \
+             workspace member for it",
+            spec.spec
+        ));
+    }
     let mut ids = std::collections::BTreeSet::new();
+    let mut known: Vec<String> = Vec::new();
     for pkg in packages {
         let name = pkg.get("name").and_then(serde_json::Value::as_str);
-        if package.is_some() && name != package {
+        let version = pkg.get("version").and_then(serde_json::Value::as_str);
+        if let Some(name) = name {
+            known.push(version.map_or_else(|| name.to_string(), |v| format!("{name}@{v}")));
+        }
+        if !package.is_none_or(|spec| spec.matches(name, version)) {
             continue;
         }
         if let Some(id) = pkg.get("id").and_then(serde_json::Value::as_str) {
@@ -229,10 +252,107 @@ fn package_ids(
     if ids.is_empty() {
         return Err(Error::Cargo(package.map_or_else(
             || "`cargo metadata` reported no workspace packages".to_string(),
-            |name| format!("`cargo metadata` knows no workspace package named `{name}`"),
+            |spec| {
+                format!(
+                    "`cargo metadata` knows no workspace package matching `{}`; it knows: {}",
+                    spec.spec,
+                    known.join(", ")
+                )
+            },
         )));
     }
     Ok(ids)
+}
+
+/// A Cargo package SPEC as `-p` accepts it.
+///
+/// Cargo's SPEC grammar is wider than a package name — `name`, `name@version`,
+/// the deprecated `name:version`, and URL forms whose fragment carries the
+/// package (`https://…#name@version`). Comparing the whole spec against
+/// `cargo metadata`'s bare `name` rejected every one of those *before cargo ran*,
+/// so `-p autumn-harvest@0.6.0` — a spec cargo itself accepts — failed with
+/// "knows no workspace package". So the spec is parsed here, and what cannot be
+/// parsed is still handed to cargo verbatim rather than refused: cargo is the
+/// authority on its own grammar, and this tool only needs the name to know
+/// whose artifacts to accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageSpec {
+    /// Verbatim, exactly as cargo will receive it.
+    spec: String,
+    /// The package name, when the spec is one this tool can read.
+    name: Option<String>,
+    /// The pinned version, when the spec carries one.
+    version: Option<String>,
+}
+
+impl PackageSpec {
+    /// The resolved name, for the metadata lookups keyed on it.
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Does this spec select the metadata package `(name, version)`?
+    ///
+    /// A spec whose name could not be read matches everything: cargo decides
+    /// which package it meant, and the run has already warned about it.
+    fn matches(&self, name: Option<&str>, version: Option<&str>) -> bool {
+        let Some(mine) = self.name.as_deref() else {
+            return true;
+        };
+        if name != Some(mine) {
+            return false;
+        }
+        // A version, when given, is matched exactly — `-p a@0.1.0` must not
+        // accept `a@0.2.0` just because the names agree.
+        self.version
+            .as_deref()
+            .is_none_or(|want| version == Some(want))
+    }
+}
+
+/// Parse a package SPEC into its name and version, as far as this tool reads them.
+fn parse_package_spec(spec: &str) -> PackageSpec {
+    let trimmed = spec.trim();
+    // A URL form names the package in its fragment: `…#name@version`, or
+    // `…#version` for the package the URL itself names (whose name we then
+    // cannot read, which is exactly the pass-through case).
+    let tail = trimmed.rsplit('#').next().unwrap_or(trimmed);
+    let (name, version) = split_name_version(tail);
+    PackageSpec {
+        spec: trimmed.to_string(),
+        name,
+        version,
+    }
+}
+
+/// `name@version` / `name:version` → the halves; anything else is a bare name.
+///
+/// The separator is only a separator when what follows it starts a version (a
+/// digit). Without that test, `https://host/x` would split at its scheme colon,
+/// and a package named `a:b` would lose half its name.
+fn split_name_version(text: &str) -> (Option<String>, Option<String>) {
+    for sep in ['@', ':'] {
+        let Some(at) = text.rfind(sep) else {
+            continue;
+        };
+        let (Some(name), Some(version)) = (text.get(..at), text.get(at.saturating_add(1)..)) else {
+            continue;
+        };
+        if version.starts_with(|c: char| c.is_ascii_digit()) {
+            return (package_name(name), Some(version.to_string()));
+        }
+    }
+    (package_name(text), None)
+}
+
+/// `Some(name)` when `text` is shaped like a Cargo package name.
+fn package_name(text: &str) -> Option<String> {
+    let name = text.trim();
+    let plausible = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plausible.then(|| name.to_string())
 }
 
 /// The workspace root for `manifest_path` (via `cargo locate-project --workspace`).
@@ -599,12 +719,13 @@ fn enabled_features(
 /// whose target dir predates `--emit=mir`); a second miss is an error.
 fn run_cargo_rustc(
     req: &BuildRequest,
-    package: Option<&str>,
+    package: Option<&PackageSpec>,
     selection: &TargetSel,
     target_dir: &Path,
     accept: &std::collections::BTreeSet<String>,
 ) -> crate::Result<Vec<EmittedMir>> {
-    let (stdout, started) = invoke_cargo_rustc(req, package, selection, target_dir)?;
+    let spec = package.map(|p| p.spec.as_str());
+    let (stdout, started) = invoke_cargo_rustc(req, spec, selection, target_dir)?;
     let artifacts = accepted_artifacts(&stdout, selection, accept);
     let mirs = mirs_of(&artifacts, selection, started)?;
     if !mirs.is_empty() {
@@ -615,8 +736,13 @@ fn run_cargo_rustc(
     // artifact at all), or it reported the unit `fresh` from a target dir that
     // was populated without `--emit=mir`. Both are fixed the same way: drop the
     // fingerprints so cargo must recompile, and run once more.
-    purge_fingerprints(&artifacts, target_dir, package, selection);
-    let (stdout, started) = invoke_cargo_rustc(req, package, selection, target_dir)?;
+    purge_fingerprints(
+        &artifacts,
+        target_dir,
+        package.and_then(PackageSpec::name),
+        selection,
+    );
+    let (stdout, started) = invoke_cargo_rustc(req, spec, selection, target_dir)?;
     let artifacts = accepted_artifacts(&stdout, selection, accept);
     let mirs = mirs_of(&artifacts, selection, started)?;
     if mirs.is_empty() {
@@ -625,9 +751,7 @@ fn run_cargo_rustc(
              none carried a `deps/<name>-<hash>` filename whose `.mir` exists, even \
              after the fingerprint was cleared. Delete {} and retry.",
             selection.describe(),
-            package
-                .map(|p| format!(" of package {p}"))
-                .unwrap_or_default(),
+            spec.map(|p| format!(" of package {p}")).unwrap_or_default(),
             artifacts.len(),
             target_dir.display()
         )));
@@ -1415,26 +1539,133 @@ mod tests {
         );
     }
 
+    /// Two members, each with the `name`/`version`/`id` triple `cargo metadata`
+    /// prints — the only three fields package resolution reads.
+    fn two_member_workspace() -> serde_json::Value {
+        serde_json::json!({
+            "packages": [
+                { "name": "a", "version": "0.1.0", "id": "path+file:///w/a#a@0.1.0" },
+                { "name": "b", "version": "0.2.0", "id": "path+file:///w/b#b@0.2.0" },
+            ]
+        })
+    }
+
+    fn ids(
+        metadata: &serde_json::Value,
+        spec: Option<&str>,
+    ) -> (
+        crate::Result<std::collections::BTreeSet<String>>,
+        Vec<String>,
+    ) {
+        let mut warnings = Vec::new();
+        let parsed = spec.map(parse_package_spec);
+        let out = package_ids(metadata, parsed.as_ref(), &mut warnings);
+        (out, warnings)
+    }
+
     #[test]
     fn package_ids_come_from_metadata_and_a_typo_is_an_error() {
-        let metadata = serde_json::json!({
-            "packages": [
-                { "name": "a", "id": "path+file:///w/a#a@0.1.0" },
-                { "name": "b", "id": "path+file:///w/b#b@0.1.0" },
-            ]
-        });
+        let metadata = two_member_workspace();
         assert_eq!(
-            package_ids(&metadata, Some("a")).expect("a is a member"),
+            ids(&metadata, Some("a")).0.expect("a is a member"),
             std::iter::once("path+file:///w/a#a@0.1.0".to_string()).collect()
         );
         assert_eq!(
-            package_ids(&metadata, None)
+            ids(&metadata, None)
+                .0
                 .expect("no -p means every workspace member")
                 .len(),
             2
         );
-        let err = package_ids(&metadata, Some("nope")).expect_err("unknown package");
+        let err = ids(&metadata, Some("nope")).0.expect_err("unknown package");
         assert!(format!("{err}").contains("nope"), "{err}");
+        assert!(
+            format!("{err}").contains("a@0.1.0") && format!("{err}").contains("b@0.2.0"),
+            "the error must name the packages the workspace does have: {err}"
+        );
+    }
+
+    // ── package SPECs ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_spec_is_parsed_into_a_name_and_an_optional_version() {
+        let bare = parse_package_spec("autumn-harvest");
+        assert_eq!(bare.name.as_deref(), Some("autumn-harvest"));
+        assert_eq!(bare.version, None);
+
+        let pinned = parse_package_spec("autumn-harvest@0.6.0");
+        assert_eq!(pinned.name.as_deref(), Some("autumn-harvest"));
+        assert_eq!(pinned.version.as_deref(), Some("0.6.0"));
+        assert_eq!(
+            pinned.spec, "autumn-harvest@0.6.0",
+            "cargo receives the spec verbatim, not the parsed halves"
+        );
+
+        // The deprecated `name:version` form cargo still accepts.
+        let colon = parse_package_spec("autumn-harvest:0.6.0");
+        assert_eq!(colon.name.as_deref(), Some("autumn-harvest"));
+        assert_eq!(colon.version.as_deref(), Some("0.6.0"));
+
+        // The URL form carries the package in the fragment.
+        let url = parse_package_spec("https://github.com/o/r#autumn-harvest@0.6.0");
+        assert_eq!(url.name.as_deref(), Some("autumn-harvest"));
+        assert_eq!(url.version.as_deref(), Some("0.6.0"));
+
+        // A separator that does not introduce a version is part of the name.
+        assert_eq!(
+            parse_package_spec("weird-name").name.as_deref(),
+            Some("weird-name")
+        );
+        // Anything else is unreadable *to this tool*: cargo still gets it.
+        let opaque = parse_package_spec("https://example.com/registry");
+        assert_eq!(opaque.name, None);
+        assert_eq!(opaque.spec, "https://example.com/registry");
+    }
+
+    #[test]
+    fn a_versioned_spec_resolves_against_the_metadata_version() {
+        let metadata = two_member_workspace();
+        // The regression: `-p a@0.1.0` is a valid SPEC that used to be compared
+        // whole against the bare name `a`, so the run died before cargo ran.
+        let (accepted, warnings) = ids(&metadata, Some("a@0.1.0"));
+        assert_eq!(
+            accepted.expect("a@0.1.0 is that member"),
+            std::iter::once("path+file:///w/a#a@0.1.0".to_string()).collect()
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            ids(&metadata, Some("a:0.1.0"))
+                .0
+                .expect("the deprecated form resolves too")
+                .len(),
+            1
+        );
+
+        let err = ids(&metadata, Some("a@9.9.9"))
+            .0
+            .expect_err("the version must match exactly");
+        assert!(
+            format!("{err}").contains("a@9.9.9") && format!("{err}").contains("a@0.1.0"),
+            "the error names the spec and the known packages: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_spec_is_passed_through_with_a_warning() {
+        let metadata = two_member_workspace();
+        let (accepted, warnings) = ids(&metadata, Some("https://example.com/registry"));
+        assert_eq!(
+            accepted
+                .expect("an unreadable spec is cargo's to judge")
+                .len(),
+            2,
+            "artifacts are then accepted from any workspace member"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("https://example.com/registry"),
+            "the warning must name the spec it could not read: {warnings:?}"
+        );
     }
 
     // ── the opt-level guard ──────────────────────────────────────────────────

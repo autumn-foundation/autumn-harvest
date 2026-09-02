@@ -100,6 +100,7 @@ fn report(workflows: Vec<WorkflowVerdict>) -> Report {
         workflows,
         unused_allowlist: Vec::new(),
         warnings: Vec::new(),
+        discovery_failed: false,
     }
 }
 
@@ -344,4 +345,50 @@ fn boundary_kind_names_are_unique_and_kebab_case() {
         );
     }
     assert_eq!(seen.len(), BoundaryKind::ALL.len());
+}
+
+#[test]
+fn an_unused_entry_on_a_proven_workflow_says_the_workflow_is_clean_now() {
+    // The two ways an entry goes unused read very differently to the person who
+    // has to act on them: a path that no longer exists is a rename or a
+    // deletion, while a path that is now `proven-deterministic` is the good
+    // news — the bug the entry was written for is fixed. The warning must not
+    // spell the second as "no analyzed workflow has that path".
+    let mut r = report(vec![proven("clean::a")]);
+    r.unused_allowlist = vec!["clean::a".to_string(), "clean::gone".to_string()];
+    let text = r.render_text();
+    assert!(
+        text.contains(
+            "warning: unused allowlist entry: clean::a (that workflow is now \
+             proven-deterministic — the entry can be removed)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "warning: unused allowlist entry: clean::gone (no analyzed workflow \
+             has that path)"
+        ),
+        "{text}"
+    );
+    assert_eq!(r.exit_code(false), 0);
+    assert_eq!(r.exit_code(true), 1, "either way, --strict fails");
+}
+
+#[test]
+fn a_run_that_discovered_no_workflow_fails_only_under_strict() {
+    let mut r = report(Vec::new());
+    r.discovery_failed = true;
+    assert_eq!(r.summary().analyzed, 0);
+    assert_eq!(r.exit_code(false), 0);
+    assert_eq!(
+        r.exit_code(true),
+        1,
+        "`analyzed 0` is an absent result, not a clean one"
+    );
+    assert_eq!(
+        report(Vec::new()).exit_code(true),
+        0,
+        "a report that never claimed to discover anything is unaffected"
+    );
 }

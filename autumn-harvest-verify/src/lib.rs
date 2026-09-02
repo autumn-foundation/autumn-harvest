@@ -118,7 +118,8 @@ pub struct Cli {
     /// Allowlist file (`harvest-verify.allow.toml`).
     #[arg(long, value_name = "FILE")]
     pub allowlist: Option<std::path::PathBuf>,
-    /// Fail on `unknown` verdicts and unused allowlist entries too.
+    /// Fail on `unknown` verdicts, unused allowlist entries and a run that
+    /// discovered no `#[workflow]` entry point at all.
     #[arg(long)]
     pub strict: bool,
     /// Output format.
@@ -259,7 +260,8 @@ pub struct Options {
     pub source_roots: Vec<std::path::PathBuf>,
     /// Pre-emitted `.mir` files/dirs to analyze instead of (or in addition to) building.
     pub mir_paths: Vec<std::path::PathBuf>,
-    /// `unknown` verdicts and unused allowlist entries fail the run.
+    /// `unknown` verdicts, unused allowlist entries and a run that discovered
+    /// no workflow at all fail the run.
     pub strict: bool,
 }
 

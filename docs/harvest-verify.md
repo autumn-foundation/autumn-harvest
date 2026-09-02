@@ -79,7 +79,7 @@ $ cargo harvest-verify --list-boundaries
 | Flag | Effect |
 |---|---|
 | `--manifest-path <PATH>` | `Cargo.toml` to work from. Default: the current directory's. |
-| `-p, --package <NAME>` | Package to analyze. Repeatable. |
+| `-p, --package <SPEC>` | Package to analyze. Repeatable. A Cargo package **SPEC**, not only a bare name: `name`, `name@version` and the deprecated `name:version` are resolved against `cargo metadata` (the version, when given, must match exactly), and a form this tool does not read — a URL spec, say — is passed to cargo unchanged with a warning rather than refused. An unmatched spec is a tool error (exit `2`) naming the spec and the packages the workspace does have. |
 | `--lib` | Analyze the package's library target. |
 | `--example <NAME>` | Analyze one example target. Repeatable. |
 | `--all-examples` | Analyze every example target of the selected packages **whose `required-features` are enabled**. Each skipped example prints a `warning: skipping example <name>: required feature(s) not enabled: <list>` line, so the analyzed set is always visible in the output. |
@@ -92,7 +92,7 @@ $ cargo harvest-verify --list-boundaries
 | `--source-root <DIR>` | Extra root for resolving `<impl at file:l:c>` headers back to source. The workspace root is always included. Repeatable. |
 | `--model <FILE>` | Overlay a model TOML on the builtin one. Repeatable, applied left to right. **Strict:** an unknown table or an unknown field is a hard error (exit `2`), not a silent no-op — a typo used to mean "the rule you thought you added never entered the model, and the tool reported `proven`". |
 | `--allowlist <FILE>` | Load an allowlist (conventionally `harvest-verify.allow.toml`). |
-| `--strict` | `unknown` verdicts and unused allowlist entries fail the run. |
+| `--strict` | `unknown` verdicts, unused allowlist entries and a run that discovered no workflow at all fail the run. |
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` emits the full report. |
 | `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
@@ -112,7 +112,7 @@ runs always ends in `-- --emit=mir -C opt-level=0`.
 | Code | Meaning |
 |---|---|
 | `0` | No findings. `unknown` verdicts warn but do not fail. |
-| `1` | Any `nondeterminism-found`. Under `--strict`, also any `unknown` or any unused allowlist entry. |
+| `1` | Any `nondeterminism-found`. Under `--strict`, also any `unknown`, any unused allowlist entry, or a run that discovered **no** `#[workflow]` entry point at all — `analyzed 0` warns by default (`warning: no #[workflow] entry points were discovered in the analyzed MIR (N parse failures)`) and fails under `--strict`, so a gate cannot go green on a run that verified nothing. |
 | `2` | Tool or build error: cargo failed, the model or allowlist is malformed, an input is unreadable. Distinct from `1` so "the tool broke" never reads as "your workflow is broken". |
 
 Findings are always printed to stdout *before* the non-zero exit, so CI logs are
@@ -263,7 +263,12 @@ Rules:
 - A duplicate `workflow` entry is an error: two justifications for one workflow
   means one of them is stale.
 - An **unused** entry (the workflow no longer exists, or no longer needs it) is
-  reported as a warning, and is an **error under `--strict`**.
+  reported as a warning, and is an **error under `--strict`**. An entry only
+  counts as *used* when it suppressed something: a workflow that is now
+  `proven-deterministic` does not consume its entry, and the warning says so —
+  `that workflow is now proven-deterministic — the entry can be removed`. An
+  entry that stayed `allowed` on a fixed workflow would sit in the file forever,
+  ready to hide the next finding on it.
 - An allowed workflow prints as `allowed (justification)` — so the justification
   appears in every run's output, not only in the file.
 
