@@ -2223,6 +2223,131 @@ pub async fn enforce_workflow_sla_breaches(
     Ok(count)
 }
 
+/// Where an outbox delivery attempt for one external target should run
+/// (issue #1146).
+///
+/// Produced by [`resolve_delivery_route`], which is the single place the
+/// engine decides which database owns an [`ExternalTarget`].
+#[derive(Debug)]
+enum DeliveryRoute {
+    /// Deliver on the caller's own connection — the target lives in the same
+    /// database the sweep is already running against.
+    Caller,
+    /// Deliver on a fresh connection from `shard`'s pool.
+    CrossShard(crate::types::ShardId),
+    /// Every expected shard was inspected and none holds a run for this
+    /// business key. The caller applies its not-found policy (leave pending
+    /// inside the grace window, `target_unknown` once it elapses).
+    NoRunAnywhere,
+    /// Nothing can be concluded this sweep: leave the row pending and retry.
+    Retry {
+        /// Operator-facing explanation for the log line.
+        reason: String,
+    },
+}
+
+/// Resolve which database an outbox delivery to `target` must run against
+/// (issue #1146).
+///
+/// Shared by the signal and cancel outbox sweeps, which previously each
+/// carried their own copy of this decision.
+///
+/// * An [`ExternalTarget::ExecutionId`] is O(1) and authoritative: the shard is
+///   encoded in the id itself. Unchanged from issue #751.
+/// * An [`ExternalTarget::WorkflowId`] is resolved by **observation** —
+///   [`crate::external_target_placement::resolve_placement_by_workflow_id`]
+///   fans out across every expected shard and merges the answers — rather than
+///   by re-deriving the rendezvous hash a fresh start would use. The hash is a
+///   prediction of where *new* work would be placed and is wrong for a workflow
+///   pinned by an explicit [`crate::shard::ShardPlacement`] (issue #697) or one
+///   left behind by a change to `writable_shards`; both cases previously
+///   resolved to a shard the target does not live on and failed the request
+///   `target_unknown` while it was running.
+///
+/// The fan-out holds at most one extra connection at a time, sequentially, and
+/// never on the caller's own in-flight transaction — it reads the latest
+/// committed state through fresh connections, and the delivery attempt then
+/// re-resolves under the connection it actually delivers on, so a run that
+/// moves between resolution and delivery is caught there rather than here.
+///
+/// With no sharded pool configured at all there is one database by definition,
+/// so the route is always the caller's own connection.
+async fn resolve_delivery_route(
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    target: &ExternalTarget,
+    caller_exec_id: ExecutionId,
+) -> DeliveryRoute {
+    let Some(pool) = sharded_pool else {
+        return DeliveryRoute::Caller;
+    };
+
+    let target_shard = match target {
+        ExternalTarget::ExecutionId(id) => {
+            let encoded = id.shard();
+            if encoded.is_unencoded() {
+                pool.default_shard()
+            } else {
+                encoded
+            }
+        }
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        } => {
+            let router = crate::external_target_placement::global_router_snapshot();
+            match crate::external_target_placement::resolve_placement_by_workflow_id(
+                pool,
+                router.as_ref(),
+                workflow_name,
+                workflow_id,
+            )
+            .await
+            {
+                crate::external_target_placement::TargetPlacement::Found { shard, .. } => shard,
+                crate::external_target_placement::TargetPlacement::NotFound => {
+                    return DeliveryRoute::NoRunAnywhere;
+                }
+                crate::external_target_placement::TargetPlacement::Indeterminate {
+                    uninspected,
+                } => {
+                    // NEVER `NoRunAnywhere`: that is what becomes a permanent
+                    // `target_unknown` once the grace window elapses, and a
+                    // shard we could not read is not a shard the target is
+                    // absent from.
+                    let named = uninspected
+                        .iter()
+                        .map(|u| format!("{} ({})", u.shard, u.reason))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return DeliveryRoute::Retry {
+                        reason: format!(
+                            "could not inspect every shard for (workflow_name={workflow_name}, \
+                             workflow_id={workflow_id}): {named}"
+                        ),
+                    };
+                }
+            }
+        }
+    };
+
+    // Pointer-equality of the two resolved pools decides inline-vs-cross-pool,
+    // exactly as it did before this change: two logical shards may be backed by
+    // the same physical pool, in which case delivering on the caller's own
+    // connection keeps the work inside its transaction.
+    match (
+        pool.exact_pool_for(target_shard),
+        pool.exact_pool_for_execution(caller_exec_id),
+    ) {
+        (Some(target_pool), Some(caller_pool)) if std::ptr::eq(target_pool, caller_pool) => {
+            DeliveryRoute::Caller
+        }
+        (Some(_), _) => DeliveryRoute::CrossShard(target_shard),
+        (None, _) => DeliveryRoute::Retry {
+            reason: format!("target shard {target_shard} has no storage pool in this process"),
+        },
+    }
+}
+
 /// Attempt one signal delivery to `target` on `conn` (issue #751).
 ///
 /// Shared by `enforce_external_signals_outbox`'s same-pool and cross-pool
@@ -2426,7 +2551,10 @@ pub async fn enforce_external_signals_outbox(
                     })
                 };
 
-                // Try to route target using the config's sharded pool if configured
+                // Route the delivery to the database that actually owns the
+                // target (issue #1146). For a `WorkflowId` target this is an
+                // observation across every expected shard, not a re-derivation
+                // of the placement hash — see `resolve_delivery_route`.
                 let active_sharded_pool = sharded_pool
                     .clone()
                     .or_else(|| {
@@ -2434,61 +2562,70 @@ pub async fn enforce_external_signals_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                let caller_shard = caller_exec_id.shard();
+                let route = resolve_delivery_route(
+                    active_sharded_pool.as_ref(),
+                    &target,
+                    caller_exec_id,
+                )
+                .await;
 
-                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_target(&target, caller_shard),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        std::ptr::eq(t_pool, c_pool)
-                    } else {
-                        false
+                let terminal_opt = match route {
+                    DeliveryRoute::Caller => {
+                        attempt_signal_delivery(
+                            conn,
+                            &target,
+                            signal_id,
+                            &signal_name,
+                            payload.clone(),
+                            idempotency_key.as_deref(),
+                            not_found_terminal,
+                        )
+                        .await
                     }
-                });
+                    DeliveryRoute::CrossShard(target_shard) => {
+                        let Some(pool) = active_sharded_pool
+                            .as_ref()
+                            .and_then(|p| p.exact_pool_for(target_shard))
+                        else {
+                            tracing::warn!(
+                                %target_shard,
+                                "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
+                            );
+                            return Ok(Some((false, Some(row.id))));
+                        };
 
-                let terminal_opt = if same_pool {
-                    attempt_signal_delivery(
-                        conn,
-                        &target,
-                        signal_id,
-                        &signal_name,
-                        payload.clone(),
-                        idempotency_key.as_deref(),
-                        not_found_terminal,
-                    )
-                    .await
-                } else {
-                    // Different pools, so we must have a target_pool resolved
-                    let Some(pool) = active_sharded_pool
-                        .as_ref()
-                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
-                    else {
+                        let mut target_conn = match pool.get().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                        };
+
+                        attempt_signal_delivery(
+                            &mut target_conn,
+                            &target,
+                            signal_id,
+                            &signal_name,
+                            payload.clone(),
+                            idempotency_key.as_deref(),
+                            not_found_terminal,
+                        )
+                        .await
+                    }
+                    // Every expected shard answered and none holds this
+                    // business key: the same not-found policy a per-shard
+                    // delivery attempt would have applied.
+                    DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // Inconclusive — leave the row pending rather than write a
+                    // wrong terminal into the caller's append-only history.
+                    DeliveryRoute::Retry { reason } => {
                         tracing::warn!(
-                            target_shard = ?crate::shard::external_target_owning_shard(&target),
-                            "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
+                            %reason,
+                            "outbox sweep: by-id target resolution inconclusive; leaving row pending"
                         );
                         return Ok(Some((false, Some(row.id))));
-                    };
-
-                    let mut target_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                    };
-
-                    attempt_signal_delivery(
-                        &mut target_conn,
-                        &target,
-                        signal_id,
-                        &signal_name,
-                        payload.clone(),
-                        idempotency_key.as_deref(),
-                        not_found_terminal,
-                    )
-                    .await
+                    }
                 };
 
                 if let Some(terminal_event) = terminal_opt {
@@ -2799,16 +2936,15 @@ pub async fn enforce_external_cancels_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_target(&target, caller_shard),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        std::ptr::eq(t_pool, c_pool)
-                    } else {
-                        false
-                    }
-                });
+                // Route to the database that actually owns the target
+                // (issue #1146) — an observation for a `WorkflowId` target,
+                // the encoded shard for an `ExecutionId` one.
+                let route = resolve_delivery_route(
+                    active_sharded_pool.as_ref(),
+                    &target,
+                    caller_exec_id,
+                )
+                .await;
 
                 // Completion-trigger / cascade follow-up starts + terminal
                 // metrics, spawned/recorded only after this step transaction
@@ -2826,7 +2962,8 @@ pub async fn enforce_external_cancels_outbox(
                 };
 
                 let mut target_conn_opt = None;
-                let terminal_opt = if same_pool {
+                let terminal_opt = match route {
+                    DeliveryRoute::Caller => {
                     attempt_cancel_delivery(
                         conn,
                         &target,
@@ -2836,13 +2973,26 @@ pub async fn enforce_external_cancels_outbox(
                         &mut acc,
                     )
                     .await
-                } else {
+                    }
+                    // Every expected shard answered and none holds this
+                    // business key.
+                    DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // Inconclusive — leave pending rather than record a wrong
+                    // terminal in the caller's append-only history.
+                    DeliveryRoute::Retry { reason } => {
+                        tracing::warn!(
+                            %reason,
+                            "cancel outbox sweep: by-id target resolution inconclusive; leaving row pending"
+                        );
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
+                    }
+                    DeliveryRoute::CrossShard(target_shard) => {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
+                        .and_then(|p| p.exact_pool_for(target_shard))
                     else {
                         tracing::warn!(
-                            target_shard = ?crate::shard::external_target_owning_shard(&target),
+                            %target_shard,
                             "cancel outbox sweep: target shard not configured locally; skipping"
                         );
                         return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
@@ -2877,6 +3027,7 @@ pub async fn enforce_external_cancels_outbox(
                     // (issue #751 review, round 3).
                     target_conn_opt = Some(target_conn);
                     terminal
+                    }
                 };
 
                 let CancelDeliveryAccumulators {

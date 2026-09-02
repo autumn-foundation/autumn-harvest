@@ -9097,25 +9097,25 @@ impl WorkflowContext {
     /// successor rather than misdelivering to — or failing against — the
     /// sealed predecessor.
     ///
-    /// # Known limitation — explicit shard placement (issue #697)
+    /// # Shard resolution (issue #1146)
     ///
-    /// Resolving which shard owns `(workflow_name, workflow_id)` is done by
-    /// re-deriving the SAME rendezvous hash a fresh start of that business
-    /// key would use ([`crate::shard::external_target_owning_shard`]). This
-    /// is correct for a target started under the default
-    /// [`crate::shard::ShardPlacement::Auto`] placement — the overwhelming
-    /// majority of workflows. It is **not** correct for a target started
-    /// with an *explicit* shard pin (`ShardPlacement::Shard`/
-    /// `ShardPlacement::ResidencyKey`, issue #697): the pin can place the
-    /// workflow on a shard the pure hash would never compute, and this
-    /// resolution has no way to discover that. A `workflow_id`-addressed
-    /// signal to such a target may resolve to the wrong shard and report
-    /// [`HarvestError::ExternalSignalFailed`] with `reason_code =
-    /// "target_unknown"` even though the target is running (just not where
-    /// the hash predicts). If a workflow is started with explicit shard
-    /// placement, address it by [`ExecutionId`](Self::signal_external_workflow)
-    /// instead of by business key. A shard-placement-aware directory lookup
-    /// is a documented follow-up, out of scope for issue #751.
+    /// Which shard owns `(workflow_name, workflow_id)` is resolved by
+    /// **observation**, not by prediction: delivery fans out across every
+    /// shard the deployment expects to exist and merges the per-shard answers
+    /// (see [`crate::external_target_placement`]). Any placement is therefore
+    /// addressable by business key — including a target started with an
+    /// explicit shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
+    /// issue #697), which can live on a shard the routing hash never computes,
+    /// and one left behind on a shard that has since been drained out of
+    /// `writable_shards`. Both previously resolved to the wrong shard and
+    /// reported `target_unknown` for a running target.
+    ///
+    /// A shard that cannot be inspected (no pool configured in this process,
+    /// or unreachable) never counts as "the target is not there": the delivery
+    /// attempt is retried instead, so a shard outage cannot turn into a
+    /// permanent `target_unknown` in this workflow's history. The cost is one
+    /// query per shard per delivery attempt; a single-shard deployment expects
+    /// one shard and is unchanged.
     ///
     /// # Errors
     ///
@@ -9410,15 +9410,15 @@ impl WorkflowContext {
     /// cancelled, rather than misdelivering to — or reporting a spurious
     /// success against — the already-sealed predecessor.
     ///
-    /// # Known limitation — explicit shard placement (issue #697)
+    /// # Shard resolution (issue #1146)
     ///
-    /// See the identical limitation documented on
+    /// Identical to
     /// [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id):
-    /// shard resolution for a `WorkflowId` target re-derives the same
-    /// rendezvous hash a fresh start would use and cannot see an explicit
-    /// shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
-    /// issue #697). Address a pinned workflow by
-    /// [`ExecutionId`](Self::request_cancel_external_workflow) instead.
+    /// the owning shard is found by fanning out across every expected shard
+    /// rather than by re-deriving the placement hash, so an explicitly pinned
+    /// target (issue #697) or one on a drained shard is addressable by business
+    /// key, and a shard that cannot be inspected leads to a retry rather than a
+    /// `target_unknown`.
     ///
     /// # Cancel semantics vs signal
     ///

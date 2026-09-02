@@ -715,18 +715,28 @@ impl ShardRouter {
 /// `WorkflowId` target's owning shard needs no directory lookup for the
 /// overwhelming majority of workflows.
 ///
-/// # Known limitation — explicit shard placement (issue #697)
+/// # This is a placement *prediction*, not a location (issue #1146)
 ///
-/// This function has **no visibility into an explicit shard pin**
-/// (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`) applied at start
-/// time. A workflow started with such a pin can live on a shard the pure
-/// hash never produces, and this function will silently return the WRONG
-/// shard for it — there is no directory of actual placements to consult, and
-/// adding one (or a cross-shard fan-out lookup) is a documented follow-up,
-/// out of scope for issue #751. Callers addressing a workflow by
-/// `(workflow_name, workflow_id)` should therefore only do so for workflows
-/// started under the default `Auto` placement; a workflow known to use
-/// explicit shard placement should be addressed by `ExecutionId` instead.
+/// For a `WorkflowId` target the returned shard answers "where would a fresh
+/// start of this business key be placed?" — **not** "where does this business
+/// key live?". The two differ whenever a workflow was started with an explicit
+/// pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`, issue #697),
+/// which can place it on a shard the pure hash never produces, and whenever a
+/// shard has been drained out of `writable_shards` since the workflow was
+/// placed, which moves where the same key re-hashes.
+///
+/// Use it only where the *prediction* is the question — e.g.
+/// `worker::reject_cross_shard_continue_as_new`, which asks where a
+/// continue-as-new's new `(workflow_name, workflow_id)` pair would route, and
+/// `execution`'s re-run `workflow_id`-override guard, which asks the same of an
+/// overridden key. Both are about placing new work, so the hash is
+/// authoritative for them by construction.
+///
+/// To find where an existing business key actually **lives** — which is what a
+/// `workflow_id`-addressed signal/cancel delivery needs — use
+/// [`crate::external_target_placement::resolve_placement_by_workflow_id`],
+/// which observes every expected shard instead of predicting one. Delivery
+/// stopped using this function for that in issue #1146.
 ///
 /// Returns `None` only when `target` is a `WorkflowId` and the process-global
 /// shard router has not been initialized (a boot-window / non-plugin-embedder
@@ -922,12 +932,30 @@ impl ShardedDbPool {
     /// (issue #751).
     ///
     /// For [`ExternalTarget::ExecutionId`] this delegates to
-    /// [`Self::exact_pool_for_execution`]. For [`ExternalTarget::WorkflowId`]
-    /// the owning shard is resolved via [`external_target_owning_shard`];
-    /// when that returns `None` (the process-global shard router isn't
-    /// initialized), `fallback_shard` is used instead — the same
-    /// "assume same shard as the caller" contract documented on
-    /// [`external_target_owning_shard`].
+    /// [`Self::exact_pool_for_execution`] and is authoritative. For
+    /// [`ExternalTarget::WorkflowId`] the owning shard is resolved via
+    /// [`external_target_owning_shard`]; when that returns `None` (the
+    /// process-global shard router isn't initialized), `fallback_shard` is used
+    /// instead.
+    ///
+    /// # Deprecated (issue #1146)
+    ///
+    /// Asking which *pool* holds a target is always a "where does this live?"
+    /// question, and for a `WorkflowId` target the rendezvous hash answers a
+    /// different one — "where would a fresh start go?" (see
+    /// [`external_target_owning_shard`]). A workflow pinned by an explicit
+    /// [`ShardPlacement`], or one left behind by a shard drained out of
+    /// `writable_shards`, resolves here to a pool it is not in, and the caller
+    /// concludes the target does not exist.
+    ///
+    /// Use [`crate::external_target_placement::resolve_placement_by_workflow_id`]
+    /// and then [`Self::exact_pool_for`] on the shard it reports. Retained,
+    /// rather than removed, because it is public API.
+    #[deprecated(
+        since = "0.6.0",
+        note = "hash-derived and wrong for explicitly-placed or drained-shard workflows; \
+                use external_target_placement::resolve_placement_by_workflow_id then exact_pool_for"
+    )]
     #[must_use]
     pub fn exact_pool_for_target(
         &self,

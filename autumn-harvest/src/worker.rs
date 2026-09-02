@@ -3340,6 +3340,11 @@ async fn persist_external_signal_inline(
             // so the terminal metric is recorded after commit.
             let mut cancel_metrics: Vec<(String, String)> = Vec::new();
             let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
+            // Resolved once per batch rather than per item: it reads the
+            // process-global router/pool, which cannot change inside this
+            // transaction (issue #1146).
+            let multi_shard_deployment =
+                crate::external_target_placement::deployment_is_multi_shard();
 
             for item in items {
                 match item {
@@ -3370,16 +3375,20 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // If cross-shard, skip inline delivery entirely and
-                        // let the background outbox handle it. An
-                        // undeterminable owning shard (`None`, only possible
-                        // for a `WorkflowId` target when the process-global
-                        // router isn't initialized) falls back to "assume
-                        // same shard as the caller" — see
-                        // `external_target_owning_shard`'s doc comment.
-                        if crate::shard::external_target_owning_shard(&run.target)
-                            .is_some_and(|owning| owning != exec_id.shard())
-                        {
+                        // If this delivery cannot be proven to land on the
+                        // caller's own shard, skip inline delivery entirely and
+                        // let the background outbox handle it — that is where
+                        // the placement-aware cross-shard resolution runs
+                        // (issue #1146). An `ExecutionId` target is compared
+                        // against its authoritative encoded shard; a
+                        // `WorkflowId` target is inline-eligible only in a
+                        // single-shard deployment. See
+                        // `external_target_placement::inline_delivery_allowed`.
+                        if !crate::external_target_placement::inline_delivery_allowed(
+                            &run.target,
+                            exec_id.shard(),
+                            multi_shard_deployment,
+                        ) {
                             continue;
                         }
 
@@ -3517,12 +3526,15 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // Cross-shard: leave for the outbox scanner. See the
-                        // identical comment on the signal arm above for the
-                        // undeterminable-owning-shard fallback.
-                        if crate::shard::external_target_owning_shard(&run.target)
-                            .is_some_and(|owning| owning != exec_id.shard())
-                        {
+                        // Not provably same-shard: leave for the outbox
+                        // scanner. See the identical comment on the signal arm
+                        // above for why a `WorkflowId` target is inline-eligible
+                        // only in a single-shard deployment (issue #1146).
+                        if !crate::external_target_placement::inline_delivery_allowed(
+                            &run.target,
+                            exec_id.shard(),
+                            multi_shard_deployment,
+                        ) {
                             continue;
                         }
 

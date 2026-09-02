@@ -244,6 +244,55 @@ So pinning the **root** of a workflow tree confines the whole tree.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
 - **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
 
+### Business-key addressing finds a pinned run wherever it is (issue #1146)
+
+`ctx.signal_external_workflow_by_id` / `ctx.request_cancel_external_workflow_by_id`
+(issue #751) address a target by `(workflow_name, workflow_id)`. Originally they
+resolved the owning shard by re-deriving `ShardRouter::pick_for_new_workflow` —
+the rendezvous hash a *fresh start* of that key would use. That answers "where
+would new work be placed?", which is not the same question as "where does this
+run live?", and for a pinned workflow it is a different answer: a signal or
+cancel addressed by business key resolved to the hash-derived shard, found
+nothing there, and failed the request `target_unknown` once the grace window
+elapsed, while the target was running the whole time.
+
+The same divergence appears without any pin at all. `pick_writable` re-hashes
+over the *current* `writable_shards` when the readable-set hash falls outside
+it, so **draining a shard moves where a key resolves after a workflow was
+already placed there** — the run stays put and the hash does not.
+
+Delivery now resolves by **observation**: it queries every expected shard for
+the addressed key and merges the answers with the same active-run-first ranking
+the management API's by-id endpoints use (`execution::select_resolved_run`). Two
+rules make that safe rather than merely broader:
+
+- **No first-hit short circuit.** `(workflow_name, workflow_id)` uniqueness is
+  shard-local, so a stale terminal run of the key can sit on one shard while the
+  live run sits on another. Every expected shard is asked before a terminal
+  answer is accepted; otherwise a signal would fail `not_running` against a dead
+  run while its live sibling waited.
+- **"Could not inspect" is never "not there."** A shard this process has no pool
+  for — mid a shard-add rollout — or one it cannot reach leaves the resolution
+  *indeterminate*, and the delivery is retried on the next outbox sweep. Only a
+  fan-out that inspected every expected shard and found nothing may become a
+  permanent `target_unknown`. A shard outage therefore stalls by-id deliveries
+  instead of durably failing them.
+
+Operationally: expect **one row read per shard per by-id delivery attempt**, on
+the outbox scanners rather than the hot dispatch path. A single-shard deployment
+expects one shard and is unchanged, including keeping its inline (same
+transaction) fast path; multi-shard deployments route every by-id delivery
+through the outbox, which is where the hash already sent `(N-1)/N` of them.
+`ExecutionId`-addressed signal/cancel is untouched — the shard is decoded from
+the id and is always authoritative.
+
+`shard::external_target_owning_shard` still exists and is still correct for the
+question it answers — *where would this key be placed?* — which is what the
+cross-type continue-as-new guard and the re-run `workflow_id`-override guard
+need. `ShardedDbPool::exact_pool_for_target` is deprecated: resolving a pool for
+a target is always a "where does it live" question, and the hash cannot answer
+it.
+
 ### Cross-shard global limits — explicit out of scope
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.
