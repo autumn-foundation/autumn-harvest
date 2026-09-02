@@ -10,6 +10,11 @@ homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "cli", "orchestration", "autumn"]
 categories = ["command-line-utilities", "asynchronous"]
+# README.md documents 50+ operator commands as plain `cargo run -p
+# autumn-harvest-cli -- ...` — no `--bin`. Without default-run, the
+# harvest-replay [[bin]] below makes every one of them ambiguous (see
+# scripts/check-default-run.sh).
+default-run = "harvest"
 
 [dependencies]
 # `db` is enabled UNCONDITIONALLY (not behind a CLI Cargo feature) so every CI
