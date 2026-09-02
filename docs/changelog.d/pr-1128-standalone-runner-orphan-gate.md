@@ -55,6 +55,15 @@ deployment and get nothing at all for it.
   a second identical scan and logging a second identical warning. It is public,
   so an embedder driving a custom boot sequence can do the same.
 
+- **The shipped standalone example can now actually be configured.** The plugin
+  loads `[harvest.startup] orphaned_workflows` from configuration;
+  `HarvestRunner::start` uses whatever `HarvestRuntimeConfig` it is handed, and
+  `examples/standalone-runner` built its config in code — so `fail` in a TOML
+  file was inert and the action silently stayed `warn`. The example now threads
+  the loaded `startup` section through (falling back to the default rather than
+  failing, in the same spirit as the gate's own crash-loop rule), which is the
+  wiring a standalone embedder needs to copy. The runbook says so explicitly.
+
 **Behaviour notes.** `off` still skips the check entirely and is still the only
 zero-cost setting; `warn` (the default) never blocks a boot, so this is not a
 breaking change for any existing standalone deployment. Crash-loop safety is
