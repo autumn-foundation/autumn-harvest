@@ -9000,7 +9000,7 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                         strong { code { (id_short) } }
                         " "
                         @if is_expired {
-                            span.badge style="background:#374151;color:#9ca3af" { "EXPIRED" }
+                            span.badge style="background:#374151;color:#e2e8f0" { "EXPIRED" }
                         } @else {
                             span.badge.FAILED { "ACTIVE" }
                         }

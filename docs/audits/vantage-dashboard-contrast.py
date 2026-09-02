@@ -13,8 +13,8 @@ below the AA thresholds (4.5:1 normal text, 3:1 large text/UI components).
 Usage:
     python3 docs/audits/vantage-dashboard-contrast.py
 
-Run from the repo root. Exits 0 always (report tool, not a CI gate) — treat
-"FAILS" lines in the output as the finding.
+Run from the repo root. Exits 1 if any real (non-exempt) failure is found,
+0 otherwise — safe to wire into CI as a gate, or run standalone as a report.
 """
 import re
 import sys
@@ -63,12 +63,20 @@ def extract_style_block(src: str) -> str:
     return m.group(1)
 
 
-def extract_inline_style_colors(src: str):
-    """Standalone `style="color: #rrggbb"` spans outside the STYLE block
-    (maud markup literals), each reported against the page background."""
+def extract_inline_style_pairs(src: str):
+    """Inline `style="..."` attributes outside the STYLE block (maud markup
+    literals). Parses the full declaration list regardless of property
+    order, so `background:X;color:Y` and `color:Y;background:X` are both
+    caught. Falls back to the page background only when the same `style`
+    attribute sets no `background` of its own."""
     out = []
-    for m in re.finditer(r'style="color:\s*(#[0-9a-fA-F]{3,6})"', src):
-        out.append(m.group(1))
+    for style_m in re.finditer(r'style="([^"]*)"', src):
+        decls = style_m.group(1)
+        fg_m = re.search(r"color:\s*(#[0-9a-fA-F]{3,6})", decls)
+        if not fg_m:
+            continue
+        bg_m = re.search(r"background:\s*(#[0-9a-fA-F]{3,6})", decls)
+        out.append((fg_m.group(1), bg_m.group(1) if bg_m else None))
     return out
 
 
@@ -93,9 +101,10 @@ def main():
         bg = bg_m.group(1) if bg_m else body_bg
         results.append((selector, fg, bg))
 
-    # Inline `style="color: #..."` spans in markup live outside STYLE.
-    for fg in extract_inline_style_colors(src):
-        results.append(("(inline style span, on #0f172a panel)", fg, body_bg))
+    # Inline `style="..."` spans in markup live outside STYLE.
+    for fg, bg in extract_inline_style_pairs(src):
+        label = "(inline style span)" if bg else "(inline style span, on #0f172a panel)"
+        results.append((label, fg, bg or body_bg))
 
     real_failures = []
     exempt = []
