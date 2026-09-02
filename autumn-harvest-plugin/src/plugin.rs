@@ -1543,6 +1543,51 @@ impl Drop for AdmissionGlobalsGuard {
     }
 }
 
+/// The application configuration this startup hook should read.
+///
+/// `state.config()` first, **not** `AutumnConfig::load()`. Re-loading reads
+/// `autumn.toml` + `AUTUMN_*` from scratch and so silently ignores any
+/// `ConfigLoader` the embedder installed via `AppBuilder::with_config_loader` —
+/// the seam autumn-web documents for exactly this. Autumn had already resolved
+/// the database URL through that loader, applied the migrations with it and
+/// built the pool from it; this function then looked at a *different* config
+/// and refused to start with "requires database.url when harvest.mode is
+/// embedded".
+///
+/// But `state.config()` is not always populated. `autumn_web::test::TestApp`
+/// starts from `AutumnConfig::default()`, and `AppState::config_arc` falls back
+/// to a default when no config extension is present — so a harness that
+/// supplies its database another way leaves `database.url` empty while the
+/// process environment still carries it. Reading only `state.config()` broke
+/// exactly those suites.
+///
+/// So: prefer the config the app is actually running on, and fall back to the
+/// ambient one **only when the app's own config names no database at all**. The
+/// fallback can add a URL where there was none; it can never override one the
+/// embedder resolved, which is what the `ConfigLoader` fix depends on.
+fn resolve_app_config(state: &AppState) -> AutumnConfig {
+    preferred_app_config(state.config(), AutumnConfig::load().ok())
+}
+
+/// The choice [`resolve_app_config`] makes, as a pure function of both configs.
+///
+/// Split out so the rule is unit-testable: the bug it fixes only reproduced
+/// inside a live `TestApp` against a Docker-backed database, which is the
+/// slowest possible place to notice a one-line policy change.
+fn preferred_app_config(from_state: AutumnConfig, ambient: Option<AutumnConfig>) -> AutumnConfig {
+    if from_state.database.url.is_some() {
+        return from_state;
+    }
+    match ambient {
+        Some(ambient) if ambient.database.url.is_some() => ambient,
+        // Neither names a database. Return the app's own config so the caller
+        // reports the invariant it actually cares about ("requires
+        // database.url when harvest.mode is embedded") rather than a difference
+        // between two empty configs.
+        _ => from_state,
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::unused_async)]
 async fn start_harvest_runtime(
     state: &AppState,
@@ -1551,8 +1596,7 @@ async fn start_harvest_runtime(
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
-    let app_config = AutumnConfig::load()
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
@@ -2888,6 +2932,60 @@ mod tests {
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
+
+    /// An `AutumnConfig` naming `url`, or naming no database when `None`.
+    fn config_naming(url: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            database: DatabaseConfig {
+                url: url.map(str::to_owned),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_app_s_own_config_wins_over_the_ambient_one() {
+        // The whole point of reading `state.config()`: a `ConfigLoader` the
+        // embedder installed must not be silently overridden by `autumn.toml`
+        // or `AUTUMN_*`. This is the dev runtime's case.
+        let chosen = preferred_app_config(
+            config_naming(Some("postgres://loader/db")),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(chosen.database.url.as_deref(), Some("postgres://loader/db"));
+    }
+
+    #[test]
+    fn the_ambient_config_fills_in_when_the_app_names_no_database() {
+        // Regression: `autumn_web::test::TestApp` starts from
+        // `AutumnConfig::default()`, and `AppState::config_arc` falls back to a
+        // default when no config extension is present — so a harness that
+        // supplies its database another way leaves `database.url` empty while
+        // the process environment still carries it. Reading only
+        // `state.config()` broke those suites with "requires database.url when
+        // harvest.mode is embedded".
+        let chosen = preferred_app_config(
+            config_naming(None),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(
+            chosen.database.url.as_deref(),
+            Some("postgres://ambient/db")
+        );
+    }
+
+    #[test]
+    fn no_database_anywhere_still_reports_the_real_invariant() {
+        // The fallback may only ever ADD a URL. With neither source naming one
+        // the caller must still fail with the embedded-mode message, not with
+        // something about configuration precedence.
+        let chosen = preferred_app_config(config_naming(None), Some(config_naming(None)));
+        assert!(chosen.database.url.is_none());
+
+        let chosen = preferred_app_config(config_naming(None), None);
+        assert!(chosen.database.url.is_none());
+    }
 
     /// Shutting a fleet of connectors down must not serialize their drains.
     ///

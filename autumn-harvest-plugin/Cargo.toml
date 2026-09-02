@@ -34,6 +34,30 @@ metrics = []
 connectors = ["dep:async-trait", "dep:sha2"]
 kafka = ["connectors", "dep:rdkafka"]
 sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
+# Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
+#
+# Off by default and never in a release build. It provisions an **ephemeral**
+# Postgres cluster, applies the ordinary embedded migration sets, runs a worker
+# and serves the management API + Vantage UI, then reclaims every byte of that
+# state on exit. Development and evaluation only; it refuses to point at
+# anything that looks like a real database.
+#
+# This tier drives a Postgres install that is already on the machine
+# (Homebrew, apt, Postgres.app, the EnterpriseDB installer). It adds one small
+# pure-Rust dependency (`url`, already in the lockfile via `autumn-harvest`).
+dev-runtime = ["dep:tokio-postgres"]
+# `dev-runtime` plus automatic acquisition of a platform-matched PostgreSQL
+# build when the machine has none — the tier that makes "a clean machine with
+# only the Rust toolchain" literally true. `postgresql_archive` only downloads
+# and extracts the archive; the cluster is still driven by our own lifecycle
+# code, so ephemerality and teardown stay under this crate's control.
+#
+# `postgresql_archive` 0.19 (not 0.21) deliberately: it is what `autumn-web`'s
+# own `managed-pg` feature resolves to, its rustls feature unifies on the
+# reqwest already in the graph rather than pulling a second copy, and its MSRV
+# (1.87) is below this workspace's 1.88 — so unlike `wasm-activities` this
+# feature raises no effective MSRV at all.
+dev-runtime-managed = ["dev-runtime", "dep:postgresql_archive"]
 
 
 [dependencies]
@@ -70,6 +94,24 @@ matchit = "0.8"
 # `queue_coverage.rs` can call it without pulling in the rest of `url`.
 percent-encoding = "2.3"
 maud = { version = "0.27", features = ["axum"] }
+# The dev runtime's production-database refusal gate parses candidate DSNs with
+# the SAME parser the connection will use (issue #525). This is the whole point:
+# a second, hand-rolled parser is a second opinion about what the client will
+# dial, and every disagreement between the two is a bypass — `hostaddr` vs
+# `host`, a `host=` query parameter that appends rather than replaces, and the
+# first-vs-last `@` split of userinfo were all real ones. Already in the
+# lockfile at this version (`autumn-harvest` depends on it under `db`, and
+# `diesel-async` connects through it), so this unifies rather than widening the
+# graph.
+tokio-postgres = { version = "0.7.18", optional = true }
+# Downloads and extracts a platform-matched PostgreSQL build for the
+# `dev-runtime-managed` tier (issue #525). Deliberately `postgresql_archive`
+# and NOT `postgresql_embedded`: we need archive acquisition only, and the
+# server-orchestration half of `postgresql_embedded` would pull `sqlx` into the
+# graph for a cluster we already drive ourselves. `default-features = false`
+# drops its native-tls default in favour of rustls, matching the rest of the
+# crate's pure-Rust TLS story (no OpenSSL on Windows).
+postgresql_archive = { version = "0.19", default-features = false, features = ["theseus", "rustls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = { workspace = true }
 
@@ -90,8 +132,19 @@ rdkafka = { version = "0.38", default-features = false, features = ["cmake-build
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"], optional = true }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "rustls"], optional = true }
 
+[[bin]]
+# Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
+# for running this with the managed tier enabled.
+name = "harvest-dev"
+path = "src/bin/harvest_dev.rs"
+required-features = ["dev-runtime"]
+
 [dev-dependencies]
 autumn-web = { version = "0.7", features = ["test-support", "mcp"] }
+# The dev-runtime lifecycle test drives the running dev runtime over real HTTP
+# (start a workflow, poll its status, fetch the Vantage page). The crate already
+# depends on reqwest for the callback deliverer; the test needs `json` on top.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 # `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain

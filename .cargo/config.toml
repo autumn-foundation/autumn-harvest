@@ -1,0 +1,30 @@
+# Workspace cargo aliases.
+[alias]
+# Zero-setup local dev runtime (issue #525).
+#
+#   git clone … && cd autumn-harvest
+#   cargo dev
+#
+# Starts an ephemeral PostgreSQL, applies the engine's migrations, runs a worker
+# and serves the management API + Vantage dashboard — no Docker, no
+# `compose.yaml`, no `DATABASE_URL`, no `diesel migration run`. Development and
+# evaluation only; see `docs/getting-started/01-project-skeleton.md`.
+#
+# Deliberately NOT `--release`: on a fresh clone the dominant term in
+# "time from `git clone` to a running workflow" is the compile, not the run, and
+# an optimised build of this workspace costs several minutes more for a sample
+# that does one activity and one timer. Debug is the faster first impression.
+# (Do not measure engine throughput with `cargo dev` — build a release binary of
+# your own app for that.)
+#
+# `dev-runtime-managed` is the tier that downloads a PostgreSQL build when the
+# machine has none, which is what makes this work on a clean machine with only
+# the Rust toolchain. On a machine that already has Postgres installed, the
+# lighter `--features dev-runtime` builds faster and never touches the network.
+dev = [
+    "run",
+    "-p", "autumn-harvest-plugin",
+    "--features", "dev-runtime-managed",
+    "--bin", "harvest-dev",
+    "--",
+]
