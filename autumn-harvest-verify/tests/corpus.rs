@@ -33,7 +33,8 @@
 //! doubles the cargo work for no benefit. (Since the driver accepts only
 //! artifacts whose `package_id` is one of the packages *this* run asked for, a
 //! shared directory would no longer poison a verdict — the split is now cache
-//! hygiene, not correctness. `tests/cli.rs` needs no emit directory at all: it
+//! hygiene, not correctness. `tests/cli.rs` builds only once, for the default
+//! target selection, and into `target/harvest-verify/cli`; the rest of it
 //! analyzes the checked-in `.mir` fixtures.)
 
 // The matrix printers are long by nature: they exist to make a failure

@@ -355,6 +355,164 @@ fn package_name(text: &str) -> Option<String> {
     plausible.then(|| name.to_string())
 }
 
+/// Target kinds `--lib` selects, as `cargo metadata` spells them.
+const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
+/// One workspace member, reduced to what the default selection needs.
+struct MemberPackage {
+    name: String,
+    manifest: PathBuf,
+    lib: bool,
+    bins: Vec<String>,
+}
+
+/// Cargo's own default selection, for a request that names no target at all.
+///
+/// `cargo build` with no `-p` and no target flag builds **the package the
+/// manifest resolves to** — the one owning the current directory, or the one
+/// `--manifest-path` names. This tool used to read that same shape as "nothing
+/// selected", skip emission entirely and report `analyzed 0` with exit 0: a
+/// gate that goes green over a run that built, parsed and verified nothing.
+///
+/// A **virtual** workspace root names no package, so there is nothing to
+/// default to (unless it has exactly one member). That is an error the operator
+/// can act on — pass `-p <member>` or `--mir` — never a silent empty run.
+///
+/// # Errors
+/// When cargo cannot be run, when the manifest is a virtual root with more than
+/// one member, or when the resolved package has no lib and no bin target.
+pub fn default_request(req: &BuildRequest) -> crate::Result<BuildRequest> {
+    let metadata = workspace_metadata(req)?;
+    let manifest = located_manifest(req.manifest_path.as_deref())?;
+    let members = member_packages(&metadata);
+    // The nearest manifest is a member ⇒ that is the package. A virtual root
+    // matches nothing, and is only unambiguous when the workspace has one member.
+    let selected = members
+        .iter()
+        .find(|m| same_path(&m.manifest, &manifest))
+        .or_else(|| members.first().filter(|_| members.len() == 1));
+    let Some(package) = selected else {
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        return Err(Error::Other(format!(
+            "no target was selected and `{}` is a virtual workspace manifest, which \
+             names no package to default to: pass `-p <member>` ({}), a target flag \
+             (`--lib`, `--example`, `--bin`, `--test`) or `--mir <path>`",
+            manifest.display(),
+            if names.is_empty() {
+                "it has no members".to_string()
+            } else {
+                names.join(", ")
+            }
+        )));
+    };
+    if !package.lib && package.bins.is_empty() {
+        return Err(Error::Other(format!(
+            "no target was selected and package `{}` has neither a lib nor a bin \
+             target to default to: pass a target flag (`--example`, `--test`), \
+             `-p <member>` or `--mir <path>`",
+            package.name
+        )));
+    }
+    Ok(BuildRequest {
+        packages: vec![package.name.clone()],
+        lib: package.lib,
+        // Only when there is no lib: a package's workflows live in its library
+        // when it has one, and building both doubles the cargo work.
+        bins: if package.lib {
+            Vec::new()
+        } else {
+            package.bins.clone()
+        },
+        ..req.clone()
+    })
+}
+
+/// The manifest a bare invocation resolves to.
+///
+/// `cargo locate-project` **without** `--workspace`: the nearest `Cargo.toml`,
+/// which is the package cargo itself would build — not the workspace root's,
+/// which is where [`workspace_root`] deliberately points instead.
+fn located_manifest(manifest_path: Option<&Path>) -> crate::Result<PathBuf> {
+    if let Some(path) = manifest_path {
+        return Ok(path.to_path_buf());
+    }
+    let out = Command::new(cargo_bin())
+        .arg("locate-project")
+        .arg("--message-format")
+        .arg("plain")
+        .output()
+        .map_err(|e| Error::Cargo(format!("cannot run `cargo locate-project`: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Cargo(format!(
+            "`cargo locate-project` failed:\n{}",
+            stderr_tail(&out.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let manifest = text.trim();
+    if manifest.is_empty() {
+        return Err(Error::Cargo(
+            "`cargo locate-project` returned no manifest path".to_string(),
+        ));
+    }
+    Ok(PathBuf::from(manifest))
+}
+
+/// The workspace members of `metadata` (`cargo metadata --no-deps`), reduced to
+/// the name, manifest path and lib/bin targets the default selection reads.
+fn member_packages(metadata: &serde_json::Value) -> Vec<MemberPackage> {
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out: Vec<MemberPackage> = Vec::new();
+    for pkg in packages {
+        let Some(name) = pkg.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let manifest = pkg
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let targets = pkg
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut lib = false;
+        let mut bins: Vec<String> = Vec::new();
+        for target in targets {
+            let kinds: Vec<&str> = target
+                .get("kind")
+                .and_then(serde_json::Value::as_array)
+                .map(|k| k.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            if kinds.iter().any(|k| LIB_KINDS.contains(k)) {
+                lib = true;
+            } else if kinds.contains(&"bin")
+                && let Some(bin) = target.get("name").and_then(serde_json::Value::as_str)
+            {
+                bins.push(bin.to_string());
+            }
+        }
+        bins.sort();
+        out.push(MemberPackage {
+            name: name.to_string(),
+            manifest: PathBuf::from(manifest),
+            lib,
+            bins,
+        });
+    }
+    out
+}
+
+/// Same file on disk? Compared literally first, then through `canonicalize`, so
+/// a symlinked checkout or a `..` segment does not read as a different package.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
 /// The workspace root for `manifest_path` (via `cargo locate-project --workspace`).
 ///
 /// # Errors
@@ -672,18 +830,51 @@ fn enumerate_examples(
     names
 }
 
+/// The feature *of `pkg`* that a feature-list entry enables, if any.
+///
+/// Cargo's feature syntax is wider than a bare name, and the difference is
+/// load-bearing here because this set decides which examples'
+/// `required-features` are satisfied:
+///
+/// * `dep:foo` activates an optional **dependency**; it is never a feature of
+///   this package.
+/// * `pkg/feat` and the weak `pkg?/feat` activate `feat` of ***`pkg`***, which
+///   is a feature of this package only when `pkg` *is* this package.
+///
+/// Recording the entry verbatim (as this used to) meant `--features a/x`
+/// enabled a "feature" literally named `a/x`, so every example of `a` whose
+/// `required-features` named `x` was reported as skipped for a feature the user
+/// had in fact asked for.
+fn own_feature(entry: &str, pkg_name: Option<&str>) -> Option<String> {
+    let entry = entry.trim();
+    if entry.is_empty() || entry.starts_with("dep:") {
+        return None;
+    }
+    let Some((owner, feature)) = entry.split_once('/') else {
+        return Some(entry.to_string());
+    };
+    let owner = owner.strip_suffix('?').unwrap_or(owner);
+    let feature = feature.trim();
+    (!feature.is_empty() && Some(owner) == pkg_name).then(|| feature.to_string())
+}
+
 /// The feature set the request enables for `pkg`, closed over feature-to-feature edges.
+///
+/// `default` is enabled unless `--no-default-features` was given, and the
+/// closure walks the package's own `features` table, so a `required-features`
+/// entry that is only *reachable* — `default = ["db"]`, or `a = ["b"]` with
+/// `--features a` — counts as enabled, exactly as it does for cargo.
 fn enabled_features(
     req: &BuildRequest,
     pkg: &serde_json::Value,
 ) -> std::collections::BTreeSet<String> {
     let table = pkg.get("features").and_then(serde_json::Value::as_object);
+    let pkg_name = pkg.get("name").and_then(serde_json::Value::as_str);
     let mut wanted: Vec<String> = Vec::new();
     for group in &req.features {
-        for name in group.split([',', ' ']) {
-            if !name.trim().is_empty() {
-                wanted.push(name.trim().to_string());
-            }
+        // Cargo accepts both `--features a,b` and `--features "a b"`.
+        for entry in group.split(|c: char| c == ',' || c.is_whitespace()) {
+            wanted.extend(own_feature(entry, pkg_name));
         }
     }
     if !req.no_default_features {
@@ -702,10 +893,7 @@ fn enabled_features(
             continue;
         };
         for child in children.iter().filter_map(serde_json::Value::as_str) {
-            // `dep:foo` / `foo/bar` edges do not enable a feature of this package.
-            if !child.contains(':') && !child.contains('/') {
-                wanted.push(child.to_string());
-            }
+            wanted.extend(own_feature(child, pkg_name));
         }
     }
     enabled
@@ -1264,6 +1452,58 @@ mod tests {
     }
 
     #[test]
+    fn a_members_default_targets_are_its_lib_or_else_its_bins() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "with-lib",
+                    "manifest_path": "/w/with-lib/Cargo.toml",
+                    "targets": [
+                        { "name": "with_lib", "kind": ["lib"] },
+                        { "name": "helper", "kind": ["bin"] },
+                        { "name": "spike", "kind": ["example"] },
+                    ],
+                },
+                {
+                    "name": "bins-only",
+                    "manifest_path": "/w/bins-only/Cargo.toml",
+                    "targets": [
+                        { "name": "b", "kind": ["bin"] },
+                        { "name": "a", "kind": ["bin"] },
+                    ],
+                },
+                {
+                    "name": "macros",
+                    "manifest_path": "/w/macros/Cargo.toml",
+                    "targets": [{ "name": "macros", "kind": ["proc-macro"] }],
+                },
+            ]
+        });
+        let members = member_packages(&metadata);
+        assert_eq!(members.len(), 3);
+        assert!(members[0].lib && members[0].bins == vec!["helper".to_string()]);
+        assert_eq!(members[0].manifest, PathBuf::from("/w/with-lib/Cargo.toml"));
+        assert!(!members[1].lib);
+        assert_eq!(
+            members[1].bins,
+            vec!["a".to_string(), "b".to_string()],
+            "bins are ordered, so the default selection is deterministic"
+        );
+        assert!(
+            members[2].lib,
+            "a proc-macro crate is a lib target for `--lib`"
+        );
+        assert!(same_path(
+            Path::new("/w/macros/Cargo.toml"),
+            &members[2].manifest
+        ));
+        assert!(!same_path(
+            Path::new("/w/other/Cargo.toml"),
+            &members[2].manifest
+        ));
+    }
+
+    #[test]
     fn a_test_target_asks_cargo_for_the_test_kind() {
         let selection = TargetSel::Test("integration".to_string());
         assert_eq!(
@@ -1310,6 +1550,171 @@ mod tests {
             !enabled.contains("dep:serde") && !enabled.contains("tokio/rt"),
             "dependency edges are not features of this package"
         );
+    }
+
+    /// One package, `a`, whose feature table exercises every shape the
+    /// normalizer has to read: a `default` set, a feature-to-feature edge and a
+    /// `dep:` edge that is not a feature at all.
+    fn qualified_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "packages": [{
+                "name": "a",
+                "version": "0.1.0",
+                "id": "path+file:///w/a#a@0.1.0",
+                "features": {
+                    "default": ["db"],
+                    "db": [],
+                    "x": ["y"],
+                    "y": [],
+                    "z": ["dep:serde"],
+                },
+                "targets": [
+                    { "name": "a", "kind": ["lib"] },
+                    { "name": "needs_x", "kind": ["example"], "required-features": ["x"] },
+                    { "name": "needs_y", "kind": ["example"], "required-features": ["y"] },
+                    { "name": "needs_db", "kind": ["example"], "required-features": ["db"] },
+                    { "name": "plain", "kind": ["example"] },
+                ],
+            }]
+        })
+    }
+
+    fn features_of(metadata: &serde_json::Value, req: &BuildRequest) -> Vec<String> {
+        let pkg = metadata
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|p| p.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        enabled_features(req, &pkg).into_iter().collect()
+    }
+
+    fn with_features(list: &[&str]) -> BuildRequest {
+        BuildRequest {
+            features: list.iter().map(|f| (*f).to_string()).collect(),
+            ..BuildRequest::default()
+        }
+    }
+
+    #[test]
+    fn a_package_qualified_feature_enables_that_packages_feature() {
+        let metadata = qualified_metadata();
+        // The regression: `--features a/x` recorded the literal `a/x`, so `x`
+        // stayed "disabled" and every example requiring it was skipped.
+        for spelling in ["a/x", "a?/x"] {
+            let enabled = features_of(&metadata, &with_features(&[spelling]));
+            assert!(
+                enabled.iter().any(|f| f == "x"),
+                "`--features {spelling}` must enable `x` of package `a`: {enabled:?}"
+            );
+            assert!(
+                enabled.iter().any(|f| f == "y"),
+                "and close over `x = [\"y\"]`: {enabled:?}"
+            );
+            assert!(
+                !enabled.iter().any(|f| f == spelling),
+                "the literal spelling is not a feature name: {enabled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_feature_of_another_package_is_not_a_feature_of_this_one() {
+        let enabled = features_of(&qualified_metadata(), &with_features(&["other/x"]));
+        assert!(
+            !enabled.iter().any(|f| f == "x" || f == "other/x"),
+            "`other/x` enables a feature of `other`, not of `a`: {enabled:?}"
+        );
+        assert!(
+            enabled.iter().any(|f| f == "db"),
+            "the default set is still enabled: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn a_feature_list_splits_on_commas_and_whitespace() {
+        let metadata = qualified_metadata();
+        for list in ["x,z", "x z", " x ,\tz "] {
+            let enabled = features_of(&metadata, &with_features(&[list]));
+            assert!(
+                enabled.iter().any(|f| f == "x") && enabled.iter().any(|f| f == "z"),
+                "`--features {list:?}` must enable both: {enabled:?}"
+            );
+        }
+        // Repeated `--features` flags accumulate, as they do for cargo.
+        let enabled = features_of(&metadata, &with_features(&["x", "a/z"]));
+        assert!(enabled.iter().any(|f| f == "x") && enabled.iter().any(|f| f == "z"));
+    }
+
+    #[test]
+    fn the_default_feature_set_is_enabled_unless_it_is_turned_off() {
+        let metadata = qualified_metadata();
+        let on = features_of(&metadata, &BuildRequest::default());
+        assert!(
+            on.iter().any(|f| f == "db"),
+            "`default = [\"db\"]` enables `db`: {on:?}"
+        );
+        let off = features_of(
+            &metadata,
+            &BuildRequest {
+                no_default_features: true,
+                ..BuildRequest::default()
+            },
+        );
+        assert!(!off.iter().any(|f| f == "db" || f == "default"), "{off:?}");
+    }
+
+    #[test]
+    fn all_examples_reads_required_features_through_the_normalizer() {
+        let metadata = qualified_metadata();
+        let names = |req: &BuildRequest, warnings: &mut Vec<String>| {
+            enumerate_examples(req, Some("a"), &metadata, warnings)
+        };
+
+        // The whole point: `--all-examples --features a/x` must build the
+        // examples that require `x`, not skip them.
+        let mut warnings = Vec::new();
+        let req = BuildRequest {
+            all_examples: true,
+            ..with_features(&["a/x"])
+        };
+        assert_eq!(
+            names(&req, &mut warnings),
+            vec![
+                "needs_db".to_string(),
+                "needs_x".to_string(),
+                "needs_y".to_string(),
+                "plain".to_string(),
+            ],
+            "warnings: {warnings:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // `other/x` is a feature of `other`; `needs_x`/`needs_y` are skipped,
+        // and `needs_db` still builds off the default set.
+        let mut warnings = Vec::new();
+        let req = BuildRequest {
+            all_examples: true,
+            ..with_features(&["other/x"])
+        };
+        assert_eq!(
+            names(&req, &mut warnings),
+            vec!["needs_db".to_string(), "plain".to_string()]
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("not enabled")),
+            "{warnings:?}"
+        );
+
+        // Without the default set, `needs_db` goes too.
+        let mut warnings = Vec::new();
+        let req = BuildRequest {
+            all_examples: true,
+            no_default_features: true,
+            ..BuildRequest::default()
+        };
+        assert_eq!(names(&req, &mut warnings), vec!["plain".to_string()]);
     }
 
     #[test]

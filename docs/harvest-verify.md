@@ -78,14 +78,14 @@ $ cargo harvest-verify --list-boundaries
 
 | Flag | Effect |
 |---|---|
-| `--manifest-path <PATH>` | `Cargo.toml` to work from. Default: the current directory's. |
+| `--manifest-path <PATH>` | `Cargo.toml` to work from. Default: the current directory's. **With no `-p`, no target flag and no `--mir`, the run defaults the way `cargo build` does** — it analyzes the package that manifest resolves to (its lib, or its bins when it has no lib); a *virtual* workspace manifest names no such package, so that combination is a tool error (exit `2`) telling you to pass `-p <member>` or `--mir`, never a silent `analyzed 0`. |
 | `-p, --package <SPEC>` | Package to analyze. Repeatable. A Cargo package **SPEC**, not only a bare name: `name`, `name@version` and the deprecated `name:version` are resolved against `cargo metadata` (the version, when given, must match exactly), and a form this tool does not read — a URL spec, say — is passed to cargo unchanged with a warning rather than refused. An unmatched spec is a tool error (exit `2`) naming the spec and the packages the workspace does have. |
 | `--lib` | Analyze the package's library target. |
 | `--example <NAME>` | Analyze one example target. Repeatable. |
 | `--all-examples` | Analyze every example target of the selected packages **whose `required-features` are enabled**. Each skipped example prints a `warning: skipping example <name>: required feature(s) not enabled: <list>` line, so the analyzed set is always visible in the output. |
 | `--bin <NAME>` | Analyze one binary target. Repeatable. |
 | `--test <NAME>` | Analyze one integration-test target (`tests/NAME.rs`). Repeatable. This is how you point the analyzer at a `#[workflow]` corpus that lives in tests rather than in `examples/` — this repo's own `harvest-verify-tests` CI job uses `--test integration`. Test targets are the most expensive shape to emit, because cargo must build the whole test binary; budget accordingly. |
-| `--features <LIST>` | Comma-separated features to enable, as for `cargo build`. |
+| `--features <LIST>` | Features to enable, as for `cargo build`: comma- or space-separated, repeatable, and package-qualified entries (`pkg/feat`, the weak `pkg?/feat`) are resolved against the package being analyzed — so `--all-examples --features mypkg/x` builds the examples whose `required-features` name `x` instead of skipping them. `default` and feature-to-feature edges are expanded transitively from `cargo metadata`, so a `required-features = ["db"]` reachable from `default` counts as enabled unless `--no-default-features` is given. |
 | `--no-default-features` | Disable default features. |
 | `--target-dir <DIR>` | Where MIR is emitted. Default: `<workspace>/target/harvest-verify`. A **relative** path resolves against the workspace root, not the current directory, so running from a subdirectory does not quietly emit into a second tree. Kept separate from `target/` on purpose — see *Stale MIR* below. Give each distinct run shape (different packages, different features) its own subdirectory: two shapes sharing one target dir invalidate each other's units on every alternation. |
 | `--mir <PATH>` | Analyze pre-emitted `.mir` files or directories instead of building. Repeatable. |

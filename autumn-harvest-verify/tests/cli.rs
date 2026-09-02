@@ -25,6 +25,16 @@ fn run(args: &[&str]) -> Output {
         .unwrap_or_else(|e| panic!("cannot run {BIN} {args:?}: {e}"))
 }
 
+/// The same, with a working directory — the input the default target selection
+/// resolves against when no `-p` and no target flag is given.
+fn run_in(dir: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {BIN} {args:?} in {}: {e}", dir.display()))
+}
+
 fn code(out: &Output) -> i32 {
     out.status.code().unwrap_or_else(|| {
         panic!(
@@ -269,6 +279,73 @@ fn a_run_that_discovers_no_workflow_warns_and_is_strict_only_failure() {
         stdout(&text).contains("no #[workflow] entry points were discovered"),
         "{}",
         stdout(&text)
+    );
+}
+
+// ── the default target selection ────────────────────────────────────────────
+
+#[test]
+fn a_bare_run_in_a_package_directory_analyzes_that_package() {
+    // The failure this guards: with no `-p`, no target flag and no `--mir`, the
+    // pipeline used to skip emission entirely and report `analyzed 0`, exit 0 —
+    // a green gate over a run that built nothing. Cargo's own default for a
+    // bare invocation is "the package the manifest resolves to"; so is ours.
+    //
+    // Slow: this is the only test in the file that actually builds. It emits
+    // into its own directory (~1 min warm, longer cold).
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("corpus")
+        .join("clean");
+    let target_dir = workspace_root()
+        .join("target")
+        .join("harvest-verify")
+        .join("cli");
+    let out = run_in(
+        &package,
+        &[
+            "--format",
+            "json",
+            "--target-dir",
+            &target_dir.to_string_lossy(),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+    let report: autumn_harvest_verify::Report = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout is not a Report: {e}\n{}", stdout(&out)));
+    assert!(
+        !report.discovery_failed,
+        "a bare run in a package directory must build it: {:?}",
+        report.warnings
+    );
+    assert_eq!(
+        report.summary().analyzed,
+        13,
+        "every `#[workflow]` in the clean corpus crate: {:?}",
+        report.summary()
+    );
+    assert_eq!(report.summary().found, 0, "{:?}", report.summary());
+}
+
+#[test]
+fn a_bare_run_at_a_virtual_workspace_root_is_a_tool_error() {
+    // A virtual manifest names no package, so there is nothing to default to.
+    // That is an error the operator can act on, never a silent `analyzed 0`.
+    let out = run_in(&workspace_root(), &["--format", "json"]);
+    assert_eq!(
+        code(&out),
+        2,
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("-p") && err.contains("--mir"),
+        "the error must say how to select something:\n{err}"
+    );
+    assert!(
+        !err.contains("panicked"),
+        "it must be a diagnostic, not a panic:\n{err}"
     );
 }
 

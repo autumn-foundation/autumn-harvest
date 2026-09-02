@@ -23,9 +23,23 @@ const VALIDATED_RUSTC: &[&str] = &["1.94", "1.95", "1.96", "1.97", "1.98"];
 
 /// Emit MIR for `build`, analyze it, and return the report.
 ///
+/// A `build` that selects no target *and* no `--mir` input is not an empty run:
+/// it is the bare `cargo harvest-verify` invocation, and it resolves to cargo's
+/// own default — the package the manifest points at
+/// ([`driver::default_request`]). Skipping emission there reported `analyzed 0`
+/// with exit 0, which is the one outcome a gate must never be able to reach by
+/// accident.
+///
 /// # Errors
 /// On cargo/build failure, a malformed model or allowlist, or unreadable inputs.
 pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
+    let defaulted = if build.is_empty() && opts.mir_paths.is_empty() {
+        Some(driver::default_request(build)?)
+    } else {
+        None
+    };
+    let build = defaulted.as_ref().unwrap_or(build);
+
     let mut warnings: Vec<String> = Vec::new();
     let mut emitted: Vec<EmittedMir> = Vec::new();
     if !build.is_empty() {
