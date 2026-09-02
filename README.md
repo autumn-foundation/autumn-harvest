@@ -29,7 +29,21 @@ map, a workflow-porting checklist, and a dual-run cutover playbook.
 
 ## Quick example
 
-Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
+Try it end-to-end with **no database, no Docker, and nothing to configure**:
+
+```bash
+cargo dev
+```
+
+That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
+serves the management API and the Vantage dashboard — then prints the dashboard
+URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
+it created. It is development-only and refuses to point at anything that is not
+a local database; see
+[Chapter 1](docs/getting-started/01-project-skeleton.md).
+
+Prefer to bring your own Postgres? `cargo run -p quickstart` (see
+[`examples/quickstart/`](examples/quickstart/)).
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
@@ -983,7 +997,8 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV)
-- Postgres 12+
+- Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
+  downloads one for you
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.

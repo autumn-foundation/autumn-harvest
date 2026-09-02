@@ -25,6 +25,14 @@ pub mod config;
 pub mod connector;
 pub mod dag_graph;
 pub mod dag_retry;
+/// Zero-setup local dev runtime (issue #525).
+///
+/// Provisions an ephemeral PostgreSQL, applies the ordinary embedded
+/// migrations, runs a worker and serves the management API + Vantage UI — with
+/// no Docker, no `compose.yaml`, no `DATABASE_URL` and no `diesel migration
+/// run`. Development and evaluation only; see the module docs.
+#[cfg(feature = "dev-runtime")]
+pub mod dev;
 pub mod lineage;
 pub mod outbox;
 pub mod plugin;

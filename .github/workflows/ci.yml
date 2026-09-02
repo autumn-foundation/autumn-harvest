@@ -121,6 +121,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-plugin (webhooks feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
+      # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
+      # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
+      - name: Clippy autumn-harvest-plugin (dev-runtime feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime -- -D warnings
+      - name: Clippy autumn-harvest-plugin (dev-runtime-managed feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime-managed -- -D warnings
       # issue #944. `connectors` alone is the broker-agnostic layer (no broker
       # client), so it lints without any system dependency. `kafka` needs the
       # libcurl headers vendored librdkafka's cmake build looks for.
@@ -461,6 +467,14 @@ jobs:
       - name: Run Linux Docker-backed manifest suites (serial)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         shell: bash
+        # Issue #525: `dev_runtime_lifecycle` skips itself when no PostgreSQL
+        # server binaries are discoverable. That skip is invisible to
+        # `ci_run_coverage.rs` (the suite uses no live-DB token), so without
+        # this the suite could silently stop testing anything and still report
+        # green. The Linux runner image ships them, so demanding them here turns
+        # "the image changed" into a red build.
+        env:
+          HARVEST_DEV_REQUIRE_POSTGRES: "1"
         run: bash .github/ci/run-suites.sh run linux
 
       # Issue #958, AC2: re-run the store/replay/retention suites against the
