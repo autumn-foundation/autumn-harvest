@@ -1,0 +1,34 @@
+[package]
+name = "autumn-harvest-verify"
+description = "Semantic (MIR-level) determinism verifier for autumn-harvest #[workflow] functions (issue #962 R&D prototype)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
+readme = "README.md"
+keywords = ["workflow", "determinism", "static-analysis", "mir"]
+categories = ["development-tools"]
+# R&D prototype: not published to crates.io in v1 (opt-in CI adoption first).
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+syn = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# The corpus proof (guardrails pass) calls the syntactic engine directly.
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+tempfile = "3"
+
+[[bin]]
+name = "cargo-harvest-verify"
+path = "src/bin/cargo_harvest_verify.rs"
+
+[lints]
+workspace = true

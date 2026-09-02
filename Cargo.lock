@@ -410,6 +410,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-harvest-verify"
+version = "0.6.0"
+dependencies = [
+ "autumn-harvest",
+ "clap",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "autumn-macros"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2832,6 +2846,53 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
+]
+
+[[package]]
+name = "harvest-verify-corpus-boundary"
+version = "0.6.0"
+dependencies = [
+ "autumn-harvest",
+ "harvest-verify-corpus-helpers",
+ "harvest-verify-corpus-helpers-deep",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harvest-verify-corpus-clean"
+version = "0.6.0"
+dependencies = [
+ "autumn-harvest",
+ "harvest-verify-corpus-helpers",
+ "harvest-verify-corpus-helpers-deep",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harvest-verify-corpus-helpers"
+version = "0.6.0"
+dependencies = [
+ "harvest-verify-corpus-helpers-deep",
+ "rand 0.8.6",
+]
+
+[[package]]
+name = "harvest-verify-corpus-helpers-deep"
+version = "0.6.0"
+
+[[package]]
+name = "harvest-verify-corpus-seeded"
+version = "0.6.0"
+dependencies = [
+ "autumn-harvest",
+ "harvest-verify-corpus-helpers",
+ "harvest-verify-corpus-helpers-deep",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

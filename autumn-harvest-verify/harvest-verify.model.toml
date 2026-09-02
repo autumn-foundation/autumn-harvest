@@ -1,0 +1,2 @@
+# harvest-verify model (issue #962). RED phase: populated by the model agent.
+version = "0.0.0-red"
