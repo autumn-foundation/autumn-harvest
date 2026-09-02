@@ -327,6 +327,41 @@ fn a_bare_run_in_a_package_directory_analyzes_that_package() {
 }
 
 #[test]
+fn a_package_with_no_target_flag_builds_its_default_targets() {
+    // `-p <package>` with no `--lib`/`--bin`/`--example`/`--test` used to force
+    // `--lib`, which fails outright on a bin-only member. It now selects the
+    // package's default targets, exactly as cargo does for `cargo build -p`.
+    //
+    // Slow only on a cold cache: it shares the emit directory with the bare-run
+    // test above, which has already built this very package's lib.
+    let target_dir = workspace_root()
+        .join("target")
+        .join("harvest-verify")
+        .join("cli");
+    let out = run_in(
+        &workspace_root(),
+        &[
+            "-p",
+            "harvest-verify-corpus-clean",
+            "--format",
+            "json",
+            "--target-dir",
+            &target_dir.to_string_lossy(),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+    let report: autumn_harvest_verify::Report = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout is not a Report: {e}\n{}", stdout(&out)));
+    assert_eq!(
+        report.summary().analyzed,
+        13,
+        "the package has a lib, so its lib is what `-p` alone builds: {:?}",
+        report.summary()
+    );
+    assert_eq!(report.summary().found, 0, "{:?}", report.summary());
+}
+
+#[test]
 fn a_bare_run_at_a_virtual_workspace_root_is_a_tool_error() {
     // A virtual manifest names no package, so there is nothing to default to.
     // That is an error the operator can act on, never a silent `analyzed 0`.

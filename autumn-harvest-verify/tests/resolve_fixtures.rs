@@ -421,7 +421,7 @@ fn an_unqualified_shadowed_impl_method_unions_its_candidates() {
     let program =
         Program::build(vec![parse_fixture("shadowed_impls.mir")], &fixture_roots()).unwrap();
     let bare = program.resolve_call("wf_calls_clean_worker::{closure#0}", "Worker::run");
-    let Resolution::Bodies(paths) = &bare else {
+    let Resolution::Bodies(paths, _) = &bare else {
         panic!("a bare `Worker::run` is ambiguous; got {bare:?}");
     };
     assert_eq!(paths.len(), 2, "got {paths:?}");
@@ -446,5 +446,126 @@ fn a_bare_static_last_segment_resolves_to_every_candidate() {
     assert!(
         program.static_named("COUNTER").is_none(),
         "an ambiguous bare name has no single answer"
+    );
+}
+
+// ── closure spans two bodies share ──────────────────────────────────────────
+
+/// A closure written in a `macro_rules!` body carries the macro *definition*'s
+/// span, so every expansion prints the same `{closure@..}`. Indexing them with
+/// "first one wins" resolves the second expansion's call site into the first
+/// expansion's body — which is how a wall-clock read comes back `proven`.
+#[test]
+fn a_closure_span_two_bodies_share_resolves_to_the_enclosing_ones() {
+    let program = Program::build(
+        vec![parse_fixture("shadowed_closures.mir")],
+        &fixture_roots(),
+    )
+    .unwrap();
+    let span = "{closure@shadowed_closures.rs:49:9: 49:17}";
+    let mut both = program.closure_bodies(span).to_vec();
+    both.sort();
+    assert_eq!(
+        both,
+        vec![
+            "wf_macro_closure_ambient::{closure#0}::{closure#0}".to_string(),
+            "wf_macro_closure_clean::{closure#0}::{closure#0}".to_string(),
+        ],
+        "both expansions must be indexed under the span they share"
+    );
+
+    let callee = format!("Option::<u64>::map::<u64, {span}>");
+    let ambient = program.resolve_call("wf_macro_closure_ambient::{closure#0}", &callee);
+    assert_eq!(
+        ambient,
+        Resolution::Body("wf_macro_closure_ambient::{closure#0}::{closure#0}".to_string()),
+        "the call site's own body disambiguates the span"
+    );
+    let clean = program.resolve_call("wf_macro_closure_clean::{closure#0}", &callee);
+    assert_eq!(
+        clean,
+        Resolution::Body("wf_macro_closure_clean::{closure#0}::{closure#0}".to_string()),
+    );
+}
+
+/// With nothing to disambiguate on, every body the span names is analyzed.
+#[test]
+fn an_undisambiguated_closure_span_unions_its_candidates() {
+    let program = Program::build(
+        vec![parse_fixture("shadowed_closures.mir")],
+        &fixture_roots(),
+    )
+    .unwrap();
+    let callee = "Option::<u64>::map::<u64, {closure@shadowed_closures.rs:49:9: 49:17}>";
+    let from_elsewhere = program.resolve_call("wall_clock_secs", callee);
+    let Resolution::Bodies(paths, _) = &from_elsewhere else {
+        panic!("an unrelated caller cannot pick one; got {from_elsewhere:?}");
+    };
+    assert_eq!(paths.len(), 2, "got {paths:?}");
+}
+
+// ── drop glue two types share ───────────────────────────────────────────────
+
+/// `clean::Guard` and `ambient::Guard` answer to the same last segment, so the
+/// glue lookup must narrow on the dropped type's module — and never come back
+/// empty, which reads as "this type has no user `Drop` impl" and drops the
+/// whole glue body on the floor.
+#[test]
+fn shadowed_drop_glue_resolves_by_the_dropped_types_module() {
+    let program =
+        Program::build(vec![parse_fixture("shadowed_drops.mir")], &fixture_roots()).unwrap();
+    let ambient = program.drop_targets("ambient::Guard<'_>");
+    assert_eq!(
+        ambient.bodies.len(),
+        1,
+        "the module qualifier picks exactly one; got {:?}",
+        ambient.bodies
+    );
+    assert!(
+        ambient.bodies[0].starts_with("ambient::<impl at"),
+        "got {:?}",
+        ambient.bodies
+    );
+    assert!(ambient.unresolved.is_none(), "{:?}", ambient.unresolved);
+
+    let clean = program.drop_targets("clean::Guard<'_>");
+    assert!(
+        clean.bodies.len() == 1 && clean.bodies[0].starts_with("clean::<impl at"),
+        "got {:?}",
+        clean.bodies
+    );
+
+    let bare = program.drop_targets("Guard");
+    assert_eq!(
+        bare.bodies.len(),
+        2,
+        "with no module to go on both glue bodies are followed; got {:?}",
+        bare.bodies
+    );
+
+    assert!(
+        program.drop_targets("std::string::String").is_inert(),
+        "a type with no user `Drop` impl in the analyzed set runs no user code"
+    );
+}
+
+/// Analyzing a pre-emitted dump with no source root leaves every `<impl at ..>`
+/// header unreadable, so nothing says these `::drop` bodies are `Drop` impls.
+/// That is a boundary, not an inert drop.
+#[test]
+fn unresolvable_drop_glue_is_a_boundary_not_an_inert_drop() {
+    let program = Program::build(
+        vec![parse_fixture("shadowed_drops.mir")],
+        &SourceRoots::default(),
+    )
+    .unwrap();
+    let targets = program.drop_targets("ambient::Guard<'_>");
+    assert!(
+        targets.unresolved.is_some(),
+        "an unreadable impl header must be named, not assumed inert"
+    );
+    assert!(
+        program.drop_targets("std::string::String").is_inert(),
+        "a std type is still inert: nothing in the analyzed set drops it"
     );
 }

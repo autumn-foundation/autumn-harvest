@@ -62,19 +62,46 @@ pub enum Resolution {
     /// A body present in the analyzed doc set, by its MIR path.
     Body(String),
     /// Several bodies any of which this call site could reach, by their MIR
-    /// paths, sorted and deduplicated (always two or more).
+    /// paths, sorted and deduplicated (always two or more), plus what made the
+    /// site ambiguous.
     ///
     /// Two analyzed modules can define the same `(self type, method)` pair
-    /// (`a::Worker::run` and `b::Worker::run`), and where the printed callee
-    /// does not say which, picking one is a coin flip that can hide a finding.
-    /// The analysis descends into **all** of them and unions the result, which
-    /// over-approximates: any candidate's finding is reported.
-    Bodies(Vec<String>),
+    /// (`a::Worker::run` and `b::Worker::run`), and two expansions of one
+    /// `macro_rules!` closure carry the same printed `{closure@..}` span. Where
+    /// the printed text does not say which body is meant, picking one is a coin
+    /// flip that can hide a finding. The analysis descends into **all** of them
+    /// and unions the result, which over-approximates: any candidate's finding
+    /// is reported.
+    Bodies(Vec<String>, Ambiguity),
     /// An honest analysis boundary (D7/D9); the `String` is the `Boundary::detail`.
     Boundary(BoundaryKind, String),
     /// A body outside the analyzed MIR (std/core/alloc or a `[trusted]` crate),
     /// by its callee path. Taint propagates through it; it never shadows a source.
     External(String),
+}
+
+/// What the printed text failed to pin down at an ambiguous call site.
+///
+/// It decides two things a reader needs: how the union may be narrowed (a
+/// receiver's declared type narrows impls and says nothing about closures) and
+/// which noun the hop and the report warning use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ambiguity {
+    /// Several `(self type, trait, method)` impl bodies answer to the callee.
+    Impl,
+    /// Several closure bodies are printed with the same `{closure@..}` span.
+    Closure,
+}
+
+impl Ambiguity {
+    /// The noun the hop note and the warning use (`ambiguous impl`, ...).
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Impl => "impl",
+            Self::Closure => "closure",
+        }
+    }
 }
 
 /// Key of an impl method: `(self type name, trait name, method)`.
@@ -90,6 +117,42 @@ struct ImplCandidate {
     module: String,
     /// The body id.
     body: String,
+}
+
+/// One `::drop` body, with what the analyzed set knows about its impl block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DropCandidate {
+    /// Module the impl block sits in, as [`module_of_impl`] reads it.
+    module: String,
+    /// The glue body id.
+    body: String,
+    /// Why the impl header could not be read, when it could not — in which case
+    /// nothing says this body is a `Drop` impl at all, only that it is a
+    /// `::drop` whose receiver type matches.
+    unresolved: Option<String>,
+}
+
+/// What a `drop(place)` terminator runs, as far as the analyzed set knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropTargets {
+    /// `Drop` impl bodies to follow: narrowed by the dropped type's module
+    /// where that selects some, unioned where it does not.
+    pub bodies: Vec<String>,
+    /// Why the glue could not be pinned down, when it could not — the
+    /// `drop-glue` boundary's detail.
+    ///
+    /// Independent of [`Self::bodies`]: a type can have one glue body the
+    /// analyzer read and another it could not, and both are reported.
+    pub unresolved: Option<String>,
+}
+
+impl DropTargets {
+    /// Nothing in the analyzed set runs user code when this type is dropped —
+    /// every std type, and any plain struct with no `Drop` impl.
+    #[must_use]
+    pub const fn is_inert(&self) -> bool {
+        self.bodies.is_empty() && self.unresolved.is_none()
+    }
 }
 
 /// The resolved program: all bodies across all docs plus the lookup tables.
@@ -114,8 +177,16 @@ pub struct Program {
     impl_methods: BTreeMap<ImplKey, Vec<ImplCandidate>>,
     /// Impl body path → its header.
     impl_headers: BTreeMap<String, ImplHeader>,
-    /// `{closure@FILE:l:c: l:c}` / `{async block@..}` → body path.
-    closures: BTreeMap<String, String>,
+    /// `{closure@FILE:l:c: l:c}` / `{async block@..}` → every body printed with
+    /// that span.
+    ///
+    /// A span is **not** a key: a closure written in a `macro_rules!` body
+    /// carries the macro *definition*'s span, so every expansion of it prints
+    /// the same `{closure@..}` for a different body — and so do the several
+    /// bodies one `#[workflow]` attribute expands to. Keeping the first one
+    /// resolved the other expansions' call sites into a body they never call,
+    /// which is a `proven-deterministic` over code that was never analyzed.
+    closures: BTreeMap<String, Vec<String>>,
     /// `f` (and the path printed inside `{async fn body of f()}`) → `f::{closure#0}`.
     async_bodies: BTreeMap<String, String>,
     /// Trait name → `(concrete type, the body that built the trait object)`.
@@ -151,6 +222,16 @@ pub struct Program {
     /// methods at all, so `Ty::m` falls through to the body-less default. The
     /// method name is the only thing left to key the boundary on.
     unresolved_impl_methods: BTreeMap<String, String>,
+    /// Dropped type name → every `::drop` body the analyzed set has for it.
+    drop_glue: BTreeMap<String, Vec<DropCandidate>>,
+    /// `::drop` bodies whose self type could not be determined at all.
+    ///
+    /// Nothing then rules out their being the glue of *any* dropped type, so
+    /// while this is non-empty every drop is a boundary. In practice it stays
+    /// empty: MIR declares a glue body's receiver (`_1: &mut clean::Guard<'_>`)
+    /// even where no source root can be read, which is exactly why the index
+    /// falls back to it.
+    drop_glue_untyped: Vec<String>,
 }
 
 impl Program {
@@ -169,6 +250,7 @@ impl Program {
         let files = program.referenced_source_files();
         program.sources = impls::SourceIndex::build(&sources.roots, &files);
         program.index_impls();
+        program.index_drop_glue();
         program.index_rta();
         Ok(program)
     }
@@ -238,7 +320,10 @@ impl Program {
                         .get(&format!("{}::{}", doc.crate_name, body.path))
                         .cloned()
                         .unwrap_or_else(|| body.path.clone());
-                    self.closures.entry(span).or_insert(id);
+                    let under = self.closures.entry(span).or_default();
+                    if !under.contains(&id) {
+                        under.push(id);
+                    }
                 }
             }
         }
@@ -377,6 +462,81 @@ impl Program {
         // all; only the ones nothing in the analyzed set defines stay boundaries.
         unresolved.retain(|method, _| !self.impl_methods.keys().any(|(_, _, name)| name == method));
         self.unresolved_impl_methods = unresolved;
+    }
+
+    /// Index every `::drop` body by the type it drops.
+    ///
+    /// Drop glue is the one call the analysis cannot see in the MIR text: a
+    /// `drop(_4)` terminator names a place, never a body. The body is found by
+    /// the dropped place's type, so every `<impl at ..>::drop` in the analyzed
+    /// set is indexed under the type it takes as `&mut self`.
+    ///
+    /// Two sources for that type, and the difference is the whole point:
+    ///
+    ///  * the impl **header**, when the source root could be read — and then the
+    ///    body counts as glue only if the header actually names `Drop`, so a
+    ///    user's inherent `fn drop(&mut self)` is not mistaken for glue;
+    ///  * the body's **receiver parameter** otherwise. Analyzing a pre-emitted
+    ///    dump has no source root, so no header can be read and nothing says
+    ///    this is a `Drop` impl — but `_1: &mut clean::Guard<'_>` still says
+    ///    which type's drop would run it. Such a body is recorded as
+    ///    *unresolved*: a drop of that type becomes a named boundary rather
+    ///    than the silent "this type has no glue" that a missing header used to
+    ///    mean.
+    fn index_drop_glue(&mut self) {
+        let mut glue: BTreeMap<String, Vec<DropCandidate>> = BTreeMap::new();
+        let mut untyped: Vec<String> = Vec::new();
+        for path in &self.order {
+            let Some((prefix, method)) = split_last(path) else {
+                continue;
+            };
+            // Glue is always an impl method; a free `fn drop` is not glue.
+            if method != "drop" || impl_span(prefix).is_none() {
+                continue;
+            }
+            let header = self.impl_headers.get(path);
+            if let Some(header) = header
+                && header
+                    .trait_
+                    .as_deref()
+                    .map(|t| TypeName::parse(t).name)
+                    .as_deref()
+                    != Some("Drop")
+            {
+                // A readable header that is not a `Drop` impl: an inherent
+                // `fn drop`, or some other trait's method of that name.
+                continue;
+            }
+            let unresolved = header.is_none().then(|| {
+                impl_span(prefix)
+                    .and_then(|(file, _, _)| self.sources.unreadable.get(&file).cloned())
+                    .unwrap_or_else(|| {
+                        "the `impl` header it is declared in could not be read".to_string()
+                    })
+            });
+            let named = header
+                .map(|h| TypeName::parse(&h.self_ty).name)
+                .filter(|name| !name.is_empty())
+                .or_else(|| self.drop_receiver_type(path));
+            let candidate = DropCandidate {
+                module: module_of_impl(prefix, self.crate_of.get(path).map(String::as_str)),
+                body: path.clone(),
+                unresolved,
+            };
+            match named {
+                Some(name) => glue.entry(name).or_default().push(candidate),
+                None => untyped.push(candidate.body),
+            }
+        }
+        self.drop_glue = glue;
+        self.drop_glue_untyped = untyped;
+    }
+
+    /// The type name a glue body's `&mut self` parameter declares.
+    fn drop_receiver_type(&self, path: &str) -> Option<String> {
+        let (_, ty) = self.body(path)?.params.first()?;
+        let name = TypeName::parse(peel_containers(peel_refs(ty))).name;
+        (!name.is_empty()).then_some(name)
     }
 
     /// RTA-lite: every concrete type unsized into a `dyn Trait` anywhere in the set.
@@ -534,10 +694,72 @@ impl Program {
         ))
     }
 
-    /// The body a `{closure@..}` / `{async block@..}` span belongs to.
+    /// Every body printed with the `{closure@..}` / `{async block@..}` span,
+    /// in the order the dumps defined them.
     #[must_use]
-    pub fn closure_body(&self, span: &str) -> Option<&str> {
-        self.closures.get(span).map(String::as_str)
+    pub fn closure_bodies(&self, span: &str) -> &[String] {
+        self.closures.get(span).map_or(&[], Vec::as_slice)
+    }
+
+    /// [`Self::closure_bodies`], narrowed to the ones a call site inside
+    /// `caller_body` can mean.
+    ///
+    /// Several bodies share a span whenever the closure was written inside a
+    /// macro, and the printed span is then the *only* thing the call site says
+    /// about which one it invokes — so the disambiguation has to come from
+    /// where the call site sits, in this order:
+    ///
+    ///  1. **Inside the caller.** `outer::{closure#0}` is a closure of `outer`,
+    ///     so a call in `outer` (or in one of `outer`'s own closures) that names
+    ///     the span means one of those, never a sibling expansion elsewhere.
+    ///  2. **The same enclosing function.** Two closures of one function are
+    ///     each other's siblings: `f::{closure#0}::{closure#1}` called from
+    ///     `f::{closure#0}::{closure#0}` is still `f`'s.
+    ///  3. **The same crate**, exactly as [`Self::real_path_near`] prefers a
+    ///     free function from the crate the call site is in.
+    ///
+    /// The closure's declared **type text** is deliberately not a fourth step:
+    /// MIR prints it as the span and nothing else, so every candidate carries
+    /// the identical text by construction — it is the map key. A future rustc
+    /// that printed more would disambiguate them at step 0, because they would
+    /// no longer share a key at all.
+    ///
+    /// What survives all three is returned whole: the union is the sound
+    /// answer, and the caller analyzes every candidate rather than guessing.
+    #[must_use]
+    pub fn closure_bodies_near(&self, caller_body: &str, span: &str) -> Vec<String> {
+        let candidates = self.closure_bodies(span);
+        if candidates.len() < 2 {
+            return candidates.to_vec();
+        }
+        let inside: Vec<String> = candidates
+            .iter()
+            .filter(|body| body.starts_with(&format!("{caller_body}::")))
+            .cloned()
+            .collect();
+        if !inside.is_empty() {
+            return inside;
+        }
+        let owner = closure_owner(caller_body);
+        let siblings: Vec<String> = candidates
+            .iter()
+            .filter(|body| closure_owner(body) == owner)
+            .cloned()
+            .collect();
+        if !siblings.is_empty() {
+            return siblings;
+        }
+        if let Some(krate) = self.crate_of.get(caller_body) {
+            let same: Vec<String> = candidates
+                .iter()
+                .filter(|body| self.crate_of.get(*body) == Some(krate))
+                .cloned()
+                .collect();
+            if !same.is_empty() {
+                return same;
+            }
+        }
+        candidates.to_vec()
     }
 
     /// Generic parameter names in scope inside `body`, in declaration order when known.
@@ -579,9 +801,12 @@ impl Program {
         }
         // 2. A closure named by its span, either as the receiver or in the turbofish.
         if let Some(span) = path.closure_span.as_deref()
-            && let Some(body) = self.closures.get(span)
+            && let Some(resolution) = bodies_resolution(
+                self.closure_bodies_near(caller_body, span),
+                Ambiguity::Closure,
+            )
         {
-            return Resolution::Body(body.clone());
+            return resolution;
         }
         // 3. A plain path (turbofish stripped) naming a body directly.
         let bare = strip_generics_everywhere(callee);
@@ -605,9 +830,11 @@ impl Program {
                         )
                     })
                 });
-                return unique.and_then(bodies_resolution).unwrap_or_else(|| {
-                    Resolution::Boundary(BoundaryKind::DynDispatch, callee.trim().into())
-                });
+                return unique
+                    .and_then(|bodies| bodies_resolution(bodies, Ambiguity::Impl))
+                    .unwrap_or_else(|| {
+                        Resolution::Boundary(BoundaryKind::DynDispatch, callee.trim().into())
+                    });
             }
             if self.is_generic_param(caller_body, receiver) && !self.is_known_type(receiver) {
                 return Resolution::Boundary(BoundaryKind::UnresolvedGeneric, receiver.to_string());
@@ -619,7 +846,7 @@ impl Program {
                 path.receiver_path.as_deref(),
                 near,
             );
-            if let Some(resolution) = bodies_resolution(bodies) {
+            if let Some(resolution) = bodies_resolution(bodies, Ambiguity::Impl) {
                 return resolution;
             }
             if let Some(detail) = self.unresolved_impl_methods.get(method) {
@@ -630,8 +857,11 @@ impl Program {
         // (`LocalKey::<T>::with::<{closure@..}, R>`): the call goes into std,
         // but the only analyzable code it runs is that closure.
         for argument in subst::turbofish(callee) {
-            if let Some(body) = self.closures.get(argument.trim()) {
-                return Resolution::Body(body.clone());
+            if let Some(resolution) = bodies_resolution(
+                self.closure_bodies_near(caller_body, argument.trim()),
+                Ambiguity::Closure,
+            ) {
+                return resolution;
             }
         }
         // 6. An item whose body the parser could not read.
@@ -826,31 +1056,72 @@ impl Program {
         self.body_or_coroutine(near, &bare).is_some()
     }
 
-    /// The user `impl Drop for Ty` body for `ty`, if the analyzed set has one.
+    /// What dropping a place of type `ty` runs.
     ///
     /// `ty` is a declared type as MIR prints it; references and the transparent
     /// containers are peeled and generic arguments stripped before the lookup,
     /// so `&mut Bomb<'_>` and `Box<Bomb>` both find `Bomb`'s glue.
+    ///
+    /// Three answers, and only the first two are ever silent:
+    ///
+    ///  * **inert** — nothing in the analyzed set implements `Drop` for this
+    ///    type name, so the drop runs no user code. Every std type is here.
+    ///  * **bodies** — one `Drop` impl, or several that the dropped type's own
+    ///    module could not tell apart. MIR prints a local's type fully
+    ///    qualified (`_4: ambient::Guard<'_>`) and prints the glue body path
+    ///    with the same trimming (`ambient::<impl at ..>::drop`), so the module
+    ///    normally picks exactly one; where it does not, all of them are
+    ///    returned and the caller unions them. Returning *none* on that tie —
+    ///    as asking for a single body did — reads as "no glue" and silently
+    ///    discards whatever the real one does.
+    ///  * **unresolved** — a `::drop` body whose receiver type matches but
+    ///    whose impl header could not be read. Nothing says whether it is glue
+    ///    for this type, so it is a `drop-glue` boundary.
     #[must_use]
-    pub fn drop_impl(&self, ty: &str) -> Option<String> {
-        let name = TypeName::parse(peel_containers(ty)).name;
+    pub fn drop_targets(&self, ty: &str) -> DropTargets {
+        let peeled = peel_containers(peel_refs(ty));
+        let name = TypeName::parse(peeled).name;
+        let mut out = DropTargets::default();
         if name.is_empty() {
-            return None;
+            return out;
         }
-        // Drop glue that two same-named types both define is followed into
-        // both: the union of their effects is the sound answer, and the caller
-        // asks for one body, so the ambiguous case yields none rather than a
-        // coin flip. `Drop` impls that collide this way are vanishingly rare
-        // and the `unresolved_impl_methods` path already reports the miss.
-        single_owned(
-            self.impl_methods
-                .get(&(name, Some("Drop".to_string()), "drop".to_string()))
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+        if let Some(body) = self.drop_glue_untyped.first() {
+            out.unresolved = Some(format!(
+                "{ty}: `{body}` may be its `Drop` glue and its self type could not be read"
+            ));
+        }
+        let candidates = self
+            .drop_glue
+            .get(&name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return out;
+        }
+        let mut chosen: Vec<&DropCandidate> = candidates.iter().collect();
+        let stripped = strip_generics_everywhere(peeled);
+        if let Some((module, _)) = split_last(stripped.trim())
+            && !module.is_empty()
+        {
+            let narrowed: Vec<&DropCandidate> = chosen
                 .iter()
-                .map(|c| c.body.clone())
-                .collect(),
-        )
+                .copied()
+                .filter(|c| modules_agree(&c.module, module))
+                .collect();
+            if !narrowed.is_empty() {
+                chosen = narrowed;
+            }
+        }
+        for candidate in chosen {
+            match &candidate.unresolved {
+                Some(reason) => {
+                    out.unresolved
+                        .get_or_insert_with(|| format!("{ty}: {reason}"));
+                }
+                None => out.bodies.push(candidate.body.clone()),
+            }
+        }
+        out
     }
 
     /// Every impl body `(self type, trait, method)` names, module-disambiguated
@@ -1078,20 +1349,31 @@ fn single<T>(mut items: Vec<T>) -> Option<T> {
     if items.len() == 1 { items.pop() } else { None }
 }
 
-fn single_owned(items: Vec<String>) -> Option<String> {
-    single(items)
-}
-
 /// One body resolves to [`Resolution::Body`], several to
 /// [`Resolution::Bodies`], none to `None`.
-fn bodies_resolution(mut bodies: Vec<String>) -> Option<Resolution> {
+fn bodies_resolution(mut bodies: Vec<String>, kind: Ambiguity) -> Option<Resolution> {
     bodies.sort();
     bodies.dedup();
     match bodies.len() {
         0 => None,
         1 => bodies.pop().map(Resolution::Body),
-        _ => Some(Resolution::Bodies(bodies)),
+        _ => Some(Resolution::Bodies(bodies, kind)),
     }
+}
+
+/// The function a closure body belongs to: its path with every trailing
+/// `::{closure#N}` (and the `::{closure#N}::{closure#M}` chains nesting builds)
+/// removed. `f::{closure#0}::{closure#1}` → `f`; a non-closure path is its own
+/// owner.
+fn closure_owner(path: &str) -> &str {
+    let mut head = path;
+    while let Some((prefix, last)) = split_last(head) {
+        if !last.starts_with("{closure#") && !last.starts_with("{coroutine#") {
+            break;
+        }
+        head = prefix;
+    }
+    head
 }
 
 struct CallSite<'a> {

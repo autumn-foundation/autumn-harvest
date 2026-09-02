@@ -419,6 +419,23 @@ only way a capture-by-`&mut` mutation can reach the caller. `side_effect`
 closures and closures passed to non-sink observability calls are exempt by model
 row.
 
+**A `{closure@FILE:L:C}` span is not a body identity.** It is the only handle a
+call site gives on which closure it invokes — the turbofish and the argument's
+declared type both print exactly that text and nothing else — but rustc gives a
+closure written inside a `macro_rules!` body the span of the *macro definition*,
+so every expansion of it prints the same one. Two different bodies then answer
+to one key (`tests/fixtures/shadowed_closures.mir` has two, and 17 bodies of the
+real `deterministic_primitives` dump share `…:57:1: 57:98`), and an index that
+kept the first resolved the other expansions' call sites into a body they never
+call — a `proven-deterministic` over code that was never analyzed. The span
+therefore indexes *every* body printed with it, and the call site is
+disambiguated by where it sits: a closure of the calling body
+(`outer::{closure#N}` called from `outer`), else one of the same enclosing
+function, else one of the same crate. What survives is analyzed **whole** — one
+candidate is followed, several are unioned with an
+`[ambiguous closure (N candidates, unioned)]` hop and a report warning — never
+narrowed to a guess.
+
 **A known imprecision, stated here rather than in a footnote: a sink *inside* a
 closure handed to a higher-order function is not recorded at the call site.**
 Only `ret` and the environment write-back are folded back, so a closure passed to
@@ -463,7 +480,7 @@ this table equal to it in both directions.
 | `recursion` | A callee already on the active call stack (direct or mutual recursion), a call chain deeper than `MAX_DEPTH = 96` bodies, or the 6000-body analysis budget running out | `unknown`, naming the body the cycle re-entered or the chain that got too deep | The cycle is **cut**, not iterated: the analyzer returns a partial pass-through summary rather than a fixpoint (§Interprocedural summaries). Honest, and weaker than it sounds. |
 | `mir-parse` | A malformed item header, an unterminated body, a dump that is not valid UTF-8, or **any statement or terminator inside a live block whose head is not on the parser's known list** | `unknown`, carrying the parse detail | **The format-drift tripwire.** Three separate paths feed it, because an earlier revision had only the first: an unparsed item is recorded and re-raised at the call that names it (`resolve_call` step 6); a non-UTF-8 dump is decoded lossily, warned about, and carries the boundary on every workflow of its crate; and an unrecognised statement/terminator head inside a reachable non-cleanup block raises it where it stands (`BENIGN_STATEMENT_HEADS` / `BENIGN_TERMINATOR_HEADS` in `analysis/summary.rs` are the allow-lists, so a *new* MIR shape is loud rather than dropped). `parse_fixtures::truncated_input_never_panics` and `::injected_junk_lines_never_panic_and_are_recorded` pin the parser half. |
 | `missing-body` | A callee resolved by name to a body absent from the analyzed dump set, **or** an `<impl at FILE:l:c>` body whose source file could not be read or parsed | `unknown` | Usually means a target was not built into the MIR set. The second half matters more than it looks: impl bodies are located by scanning the source line the MIR header names, so an unreadable file (a remapped path, a path dependency outside the source roots) used to make the body silently invisible — which meant the *same* `.mir` gave different verdicts from different working directories. It is a boundary now. |
-| `drop-glue` | A `drop(place)` terminator on a place whose type has a user `impl Drop` that the analyzer cannot resolve to a body | `unknown`, naming the dropped type | **Emitted since the audited revision.** A resolvable user `Drop` impl is now *followed* — the glue is analyzed with the dropped place as the `&mut self` argument, exactly as an explicit `Ty::drop(&mut place)` would be, so a `Drop` body that reads ambient state or emits a command is visible. The boundary is what is left: glue the analyzer cannot resolve. Its residual limit is **nested-field glue** — dropping a struct runs its fields' `Drop` impls too, and only the outermost type is looked up. |
+| `drop-glue` | A `drop(place)` terminator on a place whose type has a `::drop` body in the analyzed set that the analyzer cannot confirm is that type's `Drop` impl | `unknown`, naming the dropped type and why | **Emitted since the audited revision.** A resolvable user `Drop` impl is *followed* — the glue is analyzed with the dropped place as the `&mut self` argument, exactly as an explicit `Ty::drop(&mut place)` would be, so a `Drop` body that reads ambient state or emits a command is visible. Every `<impl at …>::drop` is indexed at `Program::build` under the type it takes as `&mut self`: from the impl **header** where a source root can be read, and from the body's own **receiver parameter** where it cannot. Two same-named types are then told apart by the dropped local's declared module, and a residual tie is unioned rather than discarded — asking for a single body and getting none on a tie reads as "this type has no glue", which is how a `Drop` that reads the wall clock came back `proven`. The boundary is what is left, and it has two shapes: glue whose body is not in the analyzed set, and — the one that used to be silent — a `::drop` body whose impl header could not be read at all, which is *every* drop in a pre-emitted dump analyzed with no source root. A type nothing in the analyzed set implements `Drop` for stays inert; that is what keeps dropping a `String` from being a boundary. Its residual limit is **nested-field glue** — dropping a struct runs its fields' `Drop` impls too, and only the outermost type is looked up. |
 
 **All twelve are reachable in the shipped code.** An earlier revision of this
 report recorded `drop-glue` as declared-but-never-emitted; the soundness review
@@ -597,10 +614,11 @@ fixed, not only the list that was.
    Two crates exporting the same bare name collapse onto one key, and
    `real_path_near` breaks the tie by proximity, falling back to the first
    indexed candidate. Deterministic, but arbitrary: a finding could name the
-   wrong file. Statics and impl methods are **not** in this class any more: they
-   are indexed by full printed path and by `(type, trait, method)` with the
-   impl's module, and a residual ambiguity is unioned rather than resolved by
-   proximity.
+   wrong file. Statics, impl methods, closure spans and `Drop` glue are **not**
+   in this class any more: they are indexed by full printed path, by
+   `(type, trait, method)` with the impl's module, by span-to-*every*-body, and
+   by the dropped self type respectively, and a residual ambiguity is unioned
+   rather than resolved by proximity.
 3. **`MAX_FACTS = 6` per place is kind-blind.** Six `Value` facts saturating a
    place before an `Order` fact arrives would hide the order flow. No probe has
    made it bite, and no slot is reserved per `TaintKind`.

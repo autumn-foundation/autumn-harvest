@@ -30,7 +30,7 @@ use std::rc::Rc;
 use crate::mir::ast::{BasicBlock, Body, Local, Operand, Place, Projection, Statement, Terminator};
 use crate::model::callee::CalleePath;
 use crate::model::{CallClass, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule};
-use crate::resolve::{Program, Resolution, Substitution};
+use crate::resolve::{Ambiguity, Program, Resolution, Substitution};
 use crate::util::{last_segment, peel_refs, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
@@ -162,6 +162,8 @@ struct InvokedArgument<'i> {
     target: &'i str,
     /// Parameter 0 is a closure environment rather than a real parameter.
     has_env: bool,
+    /// `[ambiguous closure (N candidates, unioned)]`, or empty.
+    note: &'i str,
 }
 
 /// Everything about one call site that is fixed once `(body, substitution)` is:
@@ -882,7 +884,7 @@ impl<'a> Analyzer<'a> {
         let resolution = self.program.resolve_call(frame.path, printed);
         // Only a call that lands in an analyzed body needs a substitution, and
         // computing one costs a scan of the caller's blocks.
-        let inner = if matches!(resolution, Resolution::Body(_) | Resolution::Bodies(_)) {
+        let inner = if matches!(resolution, Resolution::Body(_) | Resolution::Bodies(..)) {
             self.program
                 .call_substitution_in(frame.path, callee, frame.subst)
         } else {
@@ -976,6 +978,35 @@ impl<'a> Analyzer<'a> {
         changed
     }
 
+    /// The hop note for a call site whose candidates are all being analyzed, and
+    /// the report warning that goes with it.
+    ///
+    /// Empty when there is only one candidate: nothing was unioned, so there is
+    /// nothing for a reader to second-guess.
+    fn union_note(
+        &mut self,
+        caller: &str,
+        printed: &str,
+        kind: Ambiguity,
+        bodies: &[String],
+    ) -> String {
+        if bodies.len() < 2 {
+            return String::new();
+        }
+        let noun = kind.noun();
+        self.warnings.insert(format!(
+            "`{printed}` in `{caller}` resolves to {} {noun} bodies in the analyzed \
+             set ({}); all of them were analyzed and their findings unioned",
+            bodies.len(),
+            bodies
+                .iter()
+                .map(|b| self.program.qualified_name(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        format!(" [ambiguous {noun} ({} candidates, unioned)]", bodies.len())
+    }
+
     /// Resolve and descend into an unmodelled call.
     fn follow_call(
         &mut self,
@@ -1001,39 +1032,29 @@ impl<'a> Analyzer<'a> {
                 &site.subst,
                 "",
             ),
-            Resolution::Bodies(bodies) => {
-                // Two analyzed impls answer to this `(type, method)` and the
-                // printed callee does not say which. Narrowing on the receiver's
+            Resolution::Bodies(bodies, kind) => {
+                // Two analyzed bodies answer to this printed callee and the text
+                // does not say which. For an impl, narrowing on the receiver's
                 // declared type — which MIR prints fully qualified — usually
-                // picks one; when it does not, EVERY candidate is analyzed and
-                // the results are unioned, so a finding in any of them is
-                // reported. Picking one would be a coin flip that can hide it.
-                let narrowed = call
-                    .args
-                    .first()
-                    .and_then(operand_place)
-                    .and_then(|place| frame.body.locals.get(&place.local))
-                    .map(|declared| frame.subst.apply(declared))
-                    .map_or_else(
-                        || bodies.clone(),
-                        |declared| self.program.narrow_by_receiver(bodies, &declared),
-                    );
-                let note = if narrowed.len() > 1 {
-                    self.warnings.insert(format!(
-                        "`{printed}` in `{}` resolves to {} impl bodies in the analyzed \
-                         set ({}); all of them were analyzed and their findings unioned",
-                        frame.path,
-                        narrowed.len(),
-                        narrowed
-                            .iter()
-                            .map(|b| self.program.qualified_name(b))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                    format!(" [ambiguous impl ({} candidates, unioned)]", narrowed.len())
-                } else {
-                    String::new()
+                // picks one; a closure has no such handle, because its printed
+                // type IS the span that collided. When narrowing does not
+                // decide, EVERY candidate is analyzed and the results are
+                // unioned, so a finding in any of them is reported. Picking one
+                // would be a coin flip that can hide it.
+                let narrowed = match kind {
+                    Ambiguity::Closure => bodies.clone(),
+                    Ambiguity::Impl => call
+                        .args
+                        .first()
+                        .and_then(operand_place)
+                        .and_then(|place| frame.body.locals.get(&place.local))
+                        .map(|declared| frame.subst.apply(declared))
+                        .map_or_else(
+                            || bodies.clone(),
+                            |declared| self.program.narrow_by_receiver(bodies, &declared),
+                        ),
                 };
+                let note = self.union_note(frame.path, printed, *kind, &narrowed);
                 let mut report = report;
                 let mut changed = false;
                 for target in &narrowed {
@@ -1211,58 +1232,82 @@ impl<'a> Analyzer<'a> {
     /// an explicit `Ty::drop(&mut place)` would be.
     ///
     /// Types with no user `Drop` impl (every std type, and any plain struct) run
-    /// no user code here, so they contribute nothing.
+    /// no user code here, so they contribute nothing. A type whose glue the
+    /// analyzer *cannot* pin down is the opposite case and must never be
+    /// confused with it: it becomes a [`BoundaryKind::DropGlue`], because a
+    /// missing header says nothing about what the glue does.
+    ///
+    /// Where several same-named types' glue bodies survive the module
+    /// narrowing, every one of them is followed and the results unioned, for
+    /// the same reason an ambiguous call is.
     fn transfer_drop(
         &mut self,
         frame: Frame<'_>,
         place: &Place,
         state: &mut TaintState,
-        report: Option<&mut Report<'_>>,
+        mut report: Option<&mut Report<'_>>,
     ) -> bool {
         let Some(declared) = frame.body.locals.get(&place.local) else {
             return false;
         };
         let declared = frame.subst.apply(declared);
-        let Some(target) = self.program.drop_impl(&declared) else {
-            return false;
-        };
-        if self.program.body(&target).is_none() {
-            if report.is_some() {
-                self.push_boundary(
-                    BoundaryKind::DropGlue,
-                    &format!("{declared}: the `Drop` impl body is not in the analyzed set"),
-                    frame.path,
-                    &frame.block.label,
-                );
-            }
-            return false;
-        }
-        let hop = Hop {
-            function: frame.path.to_string(),
-            step: format!(
-                "drops {declared} -> {}",
-                self.program.qualified_name(&target)
-            ),
-        };
-        let mut inner_hops = frame.hops.to_vec();
-        inner_hops.push(hop.clone());
-        let seeded = vec![state.read(place, false).with_hop(&hop)];
-        let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, &inner_hops);
-        let mut changed = state.add(place, &outcome.ret);
-        if let Some(written) = outcome.out.get(&0) {
-            changed |= state.add(place, written);
-        }
-        if outcome.has_sink
-            && let Some(report) = report
+        let targets = self.program.drop_targets(&declared);
+        if let Some(detail) = &targets.unresolved
+            && report.is_some()
         {
-            report.sinks.push(SinkRecord {
-                block: frame.block.label.clone(),
-                site: Self::site(
-                    frame.path,
-                    &frame.block.label,
-                    &format!("commands emitted while dropping {declared}"),
+            self.push_boundary(
+                BoundaryKind::DropGlue,
+                detail,
+                frame.path,
+                &frame.block.label,
+            );
+        }
+        let note = self.union_note(
+            frame.path,
+            &format!("drop({declared})"),
+            Ambiguity::Impl,
+            &targets.bodies,
+        );
+        let mut changed = false;
+        for target in &targets.bodies {
+            if self.program.body(target).is_none() {
+                if report.is_some() {
+                    self.push_boundary(
+                        BoundaryKind::DropGlue,
+                        &format!("{declared}: the `Drop` impl body is not in the analyzed set"),
+                        frame.path,
+                        &frame.block.label,
+                    );
+                }
+                continue;
+            }
+            let hop = Hop {
+                function: frame.path.to_string(),
+                step: format!(
+                    "drops {declared} -> {}{note}",
+                    self.program.qualified_name(target)
                 ),
-            });
+            };
+            let mut inner_hops = frame.hops.to_vec();
+            inner_hops.push(hop.clone());
+            let seeded = vec![state.read(place, false).with_hop(&hop)];
+            let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
+            changed |= state.add(place, &outcome.ret);
+            if let Some(written) = outcome.out.get(&0) {
+                changed |= state.add(place, written);
+            }
+            if outcome.has_sink
+                && let Some(report) = report.as_deref_mut()
+            {
+                report.sinks.push(SinkRecord {
+                    block: frame.block.label.clone(),
+                    site: Self::site(
+                        frame.path,
+                        &frame.block.label,
+                        &format!("commands emitted while dropping {declared}"),
+                    ),
+                });
+            }
         }
         changed
     }
@@ -1313,23 +1358,30 @@ impl<'a> Analyzer<'a> {
             // A closure argument and a bare `fn` item argument are the same
             // thing to a higher-order callee: both are assumed invoked. They
             // differ only in whether parameter 0 is an environment.
-            let closure =
-                Self::closure_span_of(frame.body, operand, frame.subst).and_then(|span| {
-                    self.program
-                        .closure_body(&span)
-                        .map(|body| (span, body.to_string()))
-                });
+            let closure = Self::closure_span_of(frame.body, operand, frame.subst).map(|span| {
+                let bodies = self.program.closure_bodies_near(frame.path, &span);
+                (span, bodies)
+            });
             // A fn item that names two impl bodies (`Worker::run` where two
-            // modules define one) is followed into all of them, for the same
+            // modules define one) is followed into all of them, and so is a
+            // `{closure@..}` span two macro expansions share, for the same
             // reason `follow_call` unions an ambiguous call: skipping it, or
             // picking one, can lose the finding.
-            let targets: Vec<(String, String, bool)> = if let Some((span, target)) = closure {
-                vec![(span, target, true)]
-            } else {
-                self.fn_item_targets(frame, operand)
+            let mut note = String::new();
+            let targets: Vec<(String, String, bool)> = match closure {
+                Some((_, bodies)) if bodies.is_empty() => Vec::new(),
+                Some((span, bodies)) => {
+                    note = self.union_note(frame.path, &span, Ambiguity::Closure, &bodies);
+                    bodies
+                        .into_iter()
+                        .map(|body| (span.clone(), body, true))
+                        .collect()
+                }
+                None => self
+                    .fn_item_targets(frame, operand)
                     .into_iter()
                     .map(|path| (path.clone(), path, false))
-                    .collect()
+                    .collect(),
             };
             for (span, target, has_env) in targets {
                 self.invoke_argument_body(
@@ -1340,6 +1392,7 @@ impl<'a> Analyzer<'a> {
                         span: &span,
                         target: &target,
                         has_env,
+                        note: &note,
                     },
                     arg_taints,
                     state,
@@ -1368,13 +1421,14 @@ impl<'a> Analyzer<'a> {
                 span,
                 target,
                 has_env,
+                note,
             } = invoked;
             let hop = Hop {
                 function: frame.path.to_string(),
                 step: if has_env {
-                    format!("invokes closure {span}")
+                    format!("invokes closure {span}{note}")
                 } else {
-                    format!("invokes fn item {span}")
+                    format!("invokes fn item {span}{note}")
                 },
             };
             let mut inner_hops = frame.hops.to_vec();
@@ -1446,7 +1500,7 @@ impl<'a> Analyzer<'a> {
         let bare = strip_generics_everywhere(candidate);
         match self.program.resolve_call(frame.path, &bare) {
             Resolution::Body(target) => vec![target],
-            Resolution::Bodies(targets) => targets,
+            Resolution::Bodies(targets, _) => targets,
             Resolution::External(_) | Resolution::Boundary(..) => Vec::new(),
         }
     }

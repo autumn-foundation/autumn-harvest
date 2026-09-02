@@ -765,9 +765,49 @@ fn targets_for(
         }
     }
     if out.is_empty() {
-        out.push(TargetSel::Lib);
+        out.extend(default_targets(package, metadata, warnings));
     }
     out
+}
+
+/// The targets cargo itself would build for `-p <package>` with no target flag.
+///
+/// Forcing `--lib` here is what made `-p billing-autumn-web` (and every other
+/// bin-only member) fail with "no library targets found in package", so the
+/// operator's only way to verify one was to know its bin names. Cargo's own
+/// rule is the package's **default targets**, which is what
+/// [`default_request`] already applies to a bare invocation: the lib if there
+/// is one, otherwise all of the bins.
+///
+/// A package the metadata does not describe — a spec this tool could not read,
+/// or no `-p` at all — keeps the historical `--lib`: cargo resolves it, and its
+/// error is the honest one.
+fn default_targets(
+    package: Option<&str>,
+    metadata: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> Vec<TargetSel> {
+    let Some(name) = package else {
+        return vec![TargetSel::Lib];
+    };
+    let members = member_packages(metadata);
+    let Some(member) = members.iter().find(|m| m.name == name) else {
+        return vec![TargetSel::Lib];
+    };
+    if member.lib {
+        return vec![TargetSel::Lib];
+    }
+    if member.bins.is_empty() {
+        // Neither a lib nor a bin: nothing to default to. Selecting nothing
+        // would report `analyzed 0` with exit 0 — a green gate over a run that
+        // built nothing — so cargo is asked for the lib and its error stands.
+        warnings.push(format!(
+            "package {name} has neither a lib nor a bin target to default to: pass a \
+             target flag (`--example`, `--test`) or `--mir <path>`"
+        ));
+        return vec![TargetSel::Lib];
+    }
+    member.bins.iter().cloned().map(TargetSel::Bin).collect()
 }
 
 /// Examples of `package`, skipping those whose `required-features` are not enabled.
@@ -1448,6 +1488,97 @@ mod tests {
                 TargetSel::Bin("cli".to_string()),
                 TargetSel::Test("integration".to_string()),
             ]
+        );
+    }
+
+    /// Three shapes of member, for the `-p` default selection.
+    fn member_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "packages": [
+                {
+                    "name": "with-lib",
+                    "manifest_path": "/w/with-lib/Cargo.toml",
+                    "targets": [
+                        { "name": "with_lib", "kind": ["lib"] },
+                        { "name": "helper", "kind": ["bin"] },
+                    ],
+                },
+                {
+                    "name": "bins-only",
+                    "manifest_path": "/w/bins-only/Cargo.toml",
+                    "targets": [
+                        { "name": "b", "kind": ["bin"] },
+                        { "name": "a", "kind": ["bin"] },
+                    ],
+                },
+                {
+                    "name": "tests-only",
+                    "manifest_path": "/w/tests-only/Cargo.toml",
+                    "targets": [{ "name": "it", "kind": ["test"] }],
+                },
+            ]
+        })
+    }
+
+    #[test]
+    fn a_package_with_no_target_flag_gets_its_default_targets() {
+        // `-p <bin-only member>` used to force `--lib` and fail with "no library
+        // targets found in package", so a bin-only member could only be verified
+        // by naming its bins. Cargo's own default is the package's default
+        // targets, and so is this.
+        let req = BuildRequest {
+            packages: vec!["bins-only".to_string()],
+            ..BuildRequest::default()
+        };
+        let metadata = member_metadata();
+        let mut warnings = Vec::new();
+        assert_eq!(
+            targets_for(&req, Some("bins-only"), &metadata, &mut warnings),
+            vec![
+                TargetSel::Bin("a".to_string()),
+                TargetSel::Bin("b".to_string())
+            ],
+            "a bin-only package builds all of its bins, in a stable order"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        assert_eq!(
+            targets_for(&req, Some("with-lib"), &metadata, &mut warnings),
+            vec![TargetSel::Lib],
+            "a package with a lib builds only that: its workflows live there"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        assert_eq!(
+            targets_for(&req, Some("tests-only"), &metadata, &mut warnings),
+            vec![TargetSel::Lib],
+            "nothing to default to: cargo is asked for the lib and its error stands"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "and the operator is told why: {warnings:?}"
+        );
+
+        let mut warnings = Vec::new();
+        assert_eq!(
+            targets_for(&req, Some("not-a-member"), &metadata, &mut warnings),
+            vec![TargetSel::Lib],
+            "a package the metadata does not describe keeps the historical --lib"
+        );
+    }
+
+    #[test]
+    fn an_explicit_target_flag_still_wins_over_the_default_selection() {
+        let req = BuildRequest {
+            packages: vec!["bins-only".to_string()],
+            bins: vec!["a".to_string()],
+            ..BuildRequest::default()
+        };
+        let mut warnings = Vec::new();
+        assert_eq!(
+            targets_for(&req, Some("bins-only"), &member_metadata(), &mut warnings),
+            vec![TargetSel::Bin("a".to_string())]
         );
     }
 

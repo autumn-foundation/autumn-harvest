@@ -1054,3 +1054,84 @@ fn an_ambiguous_static_read_is_ambient_if_any_candidate_is() {
         "the trace must name the candidate that made it ambient; got:\n{trace}"
     );
 }
+
+// ── one printed `{closure@..}` span, two bodies ─────────────────────────────
+
+fn shadowed_closures() -> Vec<WorkflowVerdict> {
+    run(
+        "shadowed_closures.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1
+}
+
+#[test]
+fn a_macro_expanded_closure_is_resolved_per_expansion_not_per_span() {
+    // Both expansions of `mk_add!` print the same `{closure@..}` span, and only
+    // one of them reads the wall clock. Keeping the first body indexed under
+    // that span reports the ambient workflow as `proven-deterministic`.
+    let v = shadowed_closures();
+    assert_flagged(pick(&v, "wf_macro_closure_ambient"), "SystemTime::now");
+}
+
+#[test]
+fn the_clean_expansion_of_a_shared_closure_span_stays_proven() {
+    let v = shadowed_closures();
+    let clean = pick(&v, "wf_macro_closure_clean");
+    assert_clean(
+        clean,
+        "the call site sits inside its own expansion's body, which is what tells \
+         the two closures that share a span apart",
+    );
+    assert_eq!(
+        clean.verdict.name(),
+        "proven-deterministic",
+        "boundaries = {:?}",
+        boundary_kinds(clean)
+    );
+}
+
+// ── one `Drop` glue key, two types ──────────────────────────────────────────
+
+#[test]
+fn shadowed_drop_glue_is_followed_into_the_dropped_types_own_impl() {
+    // `clean::Guard` and `ambient::Guard` share a last segment. A glue lookup
+    // that insists on a single answer finds none and treats the drop as inert,
+    // which loses the wall-clock read inside `ambient::Guard::drop` entirely.
+    let v = run(
+        "shadowed_drops.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    assert_flagged(pick(&v, "wf_drop_ambient_guard"), "SystemTime::now");
+    assert_clean(
+        pick(&v, "wf_drop_clean_guard"),
+        "the other module's glue emits a command built from clean data",
+    );
+}
+
+#[test]
+fn drop_glue_with_no_readable_impl_header_is_unknown_never_proven() {
+    // How a pre-emitted `.mir` file is analyzed: no source root, so no
+    // `<impl at FILE:L:C>` header can be read back and nothing says these
+    // `::drop` bodies are `Drop` impls at all.
+    let v = run("shadowed_drops.mir", &SourceRoots::default()).1;
+    for workflow in ["wf_drop_ambient_guard", "wf_drop_clean_guard"] {
+        let picked = pick(&v, workflow);
+        assert_ne!(
+            picked.verdict.name(),
+            "proven-deterministic",
+            "{workflow}: unreadable drop glue must never be assumed inert"
+        );
+        assert!(
+            boundary_kinds(picked).contains(&BoundaryKind::DropGlue),
+            "{workflow}: the glue the analyzer could not resolve must be named; \
+             got {:?}",
+            boundary_kinds(picked)
+        );
+    }
+}

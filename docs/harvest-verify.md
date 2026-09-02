@@ -79,7 +79,7 @@ $ cargo harvest-verify --list-boundaries
 | Flag | Effect |
 |---|---|
 | `--manifest-path <PATH>` | `Cargo.toml` to work from. Default: the current directory's. **With no `-p`, no target flag and no `--mir`, the run defaults the way `cargo build` does** — it analyzes the package that manifest resolves to (its lib, or its bins when it has no lib); a *virtual* workspace manifest names no such package, so that combination is a tool error (exit `2`) telling you to pass `-p <member>` or `--mir`, never a silent `analyzed 0`. |
-| `-p, --package <SPEC>` | Package to analyze. Repeatable. A Cargo package **SPEC**, not only a bare name: `name`, `name@version` and the deprecated `name:version` are resolved against `cargo metadata` (the version, when given, must match exactly), and a form this tool does not read — a URL spec, say — is passed to cargo unchanged with a warning rather than refused. An unmatched spec is a tool error (exit `2`) naming the spec and the packages the workspace does have. |
+| `-p, --package <SPEC>` | Package to analyze. Repeatable. A Cargo package **SPEC**, not only a bare name: `name`, `name@version` and the deprecated `name:version` are resolved against `cargo metadata` (the version, when given, must match exactly), and a form this tool does not read — a URL spec, say — is passed to cargo unchanged with a warning rather than refused. An unmatched spec is a tool error (exit `2`) naming the spec and the packages the workspace does have. **With no target flag, `-p` builds the package's default targets, as `cargo build -p` does** — its lib, or all of its bins when it has none — so a bin-only member (`-p standalone-runner`) verifies without your having to name its binaries. |
 | `--lib` | Analyze the package's library target. |
 | `--example <NAME>` | Analyze one example target. Repeatable. |
 | `--all-examples` | Analyze every example target of the selected packages **whose `required-features` are enabled**. Each skipped example prints a `warning: skipping example <name>: required feature(s) not enabled: <list>` line, so the analyzed set is always visible in the output. |
@@ -511,7 +511,12 @@ The ones you are most likely to meet:
   a tainted branch is not re-analyzed under it.
 - **Drop glue is followed one level.** A user `impl Drop` on the dropped type is
   analyzed; the `Drop` impls of its *fields* are not, and glue the analyzer
-  cannot resolve raises a `drop-glue` boundary.
+  cannot resolve raises a `drop-glue` boundary. Two same-named types
+  (`a::Guard`, `b::Guard`) are told apart by the dropped local's declared
+  module, and where they cannot be, **both** impls are analyzed and their
+  findings unioned. Analyzing a pre-emitted dump with no source root cannot read
+  any `impl` header, so nothing there says a `::drop` body is a `Drop` impl at
+  all: every such drop is a `drop-glue` boundary rather than an inert one.
 - **The allowlist file is not strict about unknown keys** (the model files are).
   A misspelt key in `harvest-verify.allow.toml` is ignored rather than rejected.
 - **Not analyzed at all:** activity bodies (activities are allowed to be

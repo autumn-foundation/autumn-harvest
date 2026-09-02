@@ -34,6 +34,24 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_statics.mir shadowed_statics.rs
 #   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_impls.mir   shadowed_impls.rs
 #
+# The two fixtures added for review round 4 were produced on rustc 1.98.0
+# (88d9e12ae 2026-08-18) as well, from this directory:
+#
+#   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_closures.mir shadowed_closures.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_drops.mir    shadowed_drops.rs
+#
+# `shadowed_closures.mir` is checked for the property it exists to pin: two
+# DIFFERENT bodies must print the SAME `{closure@shadowed_closures.rs:L:C}`,
+# because the closure is written inside a `macro_rules!` body and so carries the
+# macro definition's span. If a future rustc ever gives each expansion its own
+# span, re-emit it and update the span string in
+# `resolve_fixtures::a_closure_span_two_bodies_share_resolves_to_the_enclosing_ones`
+# — and if the collision is gone entirely, say so there rather than deleting the
+# test, since the resolver still has to handle dumps from the toolchains that do
+# collide. Check with
+#
+#   grep -o '{closure@[^}]*}' shadowed_closures.mir | sort | uniq -c
+#
 # `bodyless_dependency.mir` needs TWO steps, because its point is a callee whose
 # body the analysis never sees. The stub crate is compiled to an rlib WITHOUT
 # `--emit=mir`, exactly as a dependency outside a `--package` scope is:
