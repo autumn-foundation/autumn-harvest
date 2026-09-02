@@ -22,7 +22,7 @@
 
 use crate::util::{
     generic_args_of, is_segment_suffix, is_type_shaped, matching_angle, peel_refs, split_top,
-    split_top_trim, strip_generics,
+    split_top_trim, strip_generics, strip_generics_everywhere,
 };
 
 /// A callee path as printed at a MIR call site, decomposed for rule matching.
@@ -46,6 +46,14 @@ pub struct CalleePath {
     /// `Ty::method` path it is the penultimate segment, and only when that
     /// segment is type-shaped (see [`Self::parse`]).
     pub receiver: Option<String>,
+    /// The receiver type as the call site spelled it, generics stripped and
+    /// references peeled: `b::Worker` for `b::Worker::run`, `HashMap` for
+    /// `<HashMap<K, V> as IntoIterator>::into_iter`.
+    ///
+    /// [`Self::receiver`] is only its last segment, which is what the model
+    /// matches on; the module qualifier is what tells two same-named impls in
+    /// the analyzed set apart, so it is kept here rather than thrown away.
+    pub receiver_path: Option<String>,
     /// Trait of a qualified `<T as Trait>::m` call (last segment, generics stripped).
     pub trait_: Option<String>,
     /// Turbofish arguments of the called item, in order, verbatim.
@@ -126,6 +134,11 @@ fn parse_qualified(text: &str, out: &mut CalleePath) {
         let self_ty = halves.first().copied().unwrap_or(inner).trim();
         let self_ty = strip_impl_header(self_ty);
         let ty = TypeName::parse(self_ty);
+        out.receiver_path = Some(
+            strip_generics_everywhere(peel_refs(self_ty))
+                .trim()
+                .to_string(),
+        );
         out.receiver = Some(ty.name);
         out.receiver_generic_args = ty.generic_args;
         out.is_dyn = ty.is_dyn;
@@ -183,6 +196,7 @@ fn parse_unqualified(text: &str, out: &mut CalleePath) {
 
     out.generic_args = generics.last().cloned().unwrap_or_default();
     if let Some(ty) = impl_receiver {
+        out.receiver_path = Some(ty.name.clone());
         out.receiver = Some(ty.name);
         out.receiver_generic_args = ty.generic_args;
         out.is_dyn = ty.is_dyn;
@@ -192,6 +206,7 @@ fn parse_unqualified(text: &str, out: &mut CalleePath) {
         if let Some(candidate) = names.get(idx).filter(|name| is_type_shaped(name)) {
             {
                 let ty = TypeName::parse(candidate);
+                out.receiver_path = Some(names.get(..=idx).unwrap_or_default().join("::"));
                 out.receiver = Some(if ty.name.is_empty() {
                     candidate.clone()
                 } else {

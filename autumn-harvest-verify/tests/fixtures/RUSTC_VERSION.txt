@@ -28,6 +28,27 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #         -o implicit_and_higher_order.mir implicit_and_higher_order.rs
 #   rustc --crate-type lib --edition 2024 --emit=mir -o parse_drift.mir parse_drift.rs
 #
+# The three fixtures added for review round 2 were produced on rustc 1.98.0
+# (88d9e12ae 2026-08-18) as well, from this directory:
+#
+#   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_statics.mir shadowed_statics.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir -o shadowed_impls.mir   shadowed_impls.rs
+#
+# `bodyless_dependency.mir` needs TWO steps, because its point is a callee whose
+# body the analysis never sees. The stub crate is compiled to an rlib WITHOUT
+# `--emit=mir`, exactly as a dependency outside a `--package` scope is:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name bodyless_dep_stub \
+#         -o libbodyless_dep_stub.rlib bodyless_dep_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern bodyless_dep_stub=libbodyless_dep_stub.rlib \
+#         -o bodyless_dependency.mir bodyless_dependency.rs
+#   rm libbodyless_dep_stub.rlib
+#
+# The rlib is a build artifact and is deliberately NOT checked in; only
+# `bodyless_dep_stub.rs` and the emitted `.mir` are. rustc trims the callee to a
+# bare `now_ish()` in the dump, which is the whole point of the fixture.
+#
 # `parse_drift_garbled.mir` is NOT compiled: it is a byte-for-byte copy of
 # `parse_drift.mir` with exactly one call terminator rewritten from
 # `_4 = wall_clock_secs() -> [..]` to `_4 <== wall_clock_secs() -> [..]`,

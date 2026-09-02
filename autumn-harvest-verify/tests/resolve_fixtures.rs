@@ -359,3 +359,92 @@ fn the_real_example_workflow_body_is_reachable_by_path() {
             .contains(&"__autumn_workflow_info_notify_decision")
     );
 }
+
+// ── Review round 2: shadowed statics and shadowed impl methods ──────────────
+
+#[test]
+fn statics_are_indexed_by_their_full_printed_path() {
+    let program = Program::build(
+        vec![parse_fixture("shadowed_statics.mir")],
+        &fixture_roots(),
+    )
+    .unwrap();
+    let a = program.static_named("a::COUNTER").expect("a::COUNTER");
+    assert_eq!(a.path, "a::COUNTER");
+    assert_eq!(a.ty, "u64");
+    let b = program.static_named("b::COUNTER").expect("b::COUNTER");
+    assert_eq!(b.path, "b::COUNTER");
+    assert!(
+        b.ty.contains("Atomic"),
+        "the atomic must not be shadowed by the plain one; got {}",
+        b.ty
+    );
+}
+
+#[test]
+fn an_alloc_footer_resolves_to_the_static_it_names() {
+    let doc = parse_fixture("shadowed_statics.mir");
+    let alloc = doc
+        .alloc_statics
+        .iter()
+        .find(|(_, name)| name.as_str() == "b::COUNTER")
+        .map(|(alloc, _)| alloc.clone())
+        .expect("an alloc for b::COUNTER");
+    let program = Program::build(vec![doc], &fixture_roots()).unwrap();
+    let doc = program.docs.first();
+    let item = program
+        .static_of_alloc(doc, &alloc)
+        .expect("the alloc resolves");
+    assert_eq!(item.path, "b::COUNTER");
+}
+
+#[test]
+fn shadowed_impl_methods_resolve_by_their_module_path() {
+    let program =
+        Program::build(vec![parse_fixture("shadowed_impls.mir")], &fixture_roots()).unwrap();
+    let ambient = program.resolve_call("wf_calls_ambient_worker::{closure#0}", "b::Worker::run");
+    assert!(
+        matches!(&ambient, Resolution::Body(path) if path.starts_with("b::<impl at")),
+        "`b::Worker::run` must reach b's body; got {ambient:?}"
+    );
+    let clean = program.resolve_call("wf_calls_clean_worker::{closure#0}", "a::Worker::run");
+    assert!(
+        matches!(&clean, Resolution::Body(path) if path.starts_with("a::<impl at")),
+        "`a::Worker::run` must reach a's body; got {clean:?}"
+    );
+}
+
+/// With no module qualifier to go on, the answer must cover BOTH candidates
+/// rather than silently pick the first.
+#[test]
+fn an_unqualified_shadowed_impl_method_unions_its_candidates() {
+    let program =
+        Program::build(vec![parse_fixture("shadowed_impls.mir")], &fixture_roots()).unwrap();
+    let bare = program.resolve_call("wf_calls_clean_worker::{closure#0}", "Worker::run");
+    let Resolution::Bodies(paths) = &bare else {
+        panic!("a bare `Worker::run` is ambiguous; got {bare:?}");
+    };
+    assert_eq!(paths.len(), 2, "got {paths:?}");
+}
+
+/// A name that is only a last segment stays ambiguous, and the resolver hands
+/// back BOTH candidates rather than the first one it indexed.
+#[test]
+fn a_bare_static_last_segment_resolves_to_every_candidate() {
+    let program = Program::build(
+        vec![parse_fixture("shadowed_statics.mir")],
+        &fixture_roots(),
+    )
+    .unwrap();
+    let mut paths: Vec<&str> = program
+        .statics_named_all("COUNTER")
+        .into_iter()
+        .map(|item| item.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["a::COUNTER", "b::COUNTER"]);
+    assert!(
+        program.static_named("COUNTER").is_none(),
+        "an ambiguous bare name has no single answer"
+    );
+}

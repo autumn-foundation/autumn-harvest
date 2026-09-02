@@ -36,7 +36,9 @@ everything it calls.
   **160** public `WorkflowContext` methods across eleven tables — 128 sources, 85
   sinks, 18 sanctioned primitives, 105 non-sinks, 8 handler registrations, 38
   forbidden effects, 16 sanitizers, 22 reductions, 24 trusted crates, 25 ambient
-  types and an empty `[[std_free_fn]]` escape hatch — each row carrying a
+  types and 7 `[[std_free_fn]]` rows (the body-less **free** functions of std and
+  of trusted crates that rustc trims to one segment, which is the residue the
+  receiver-based trust rule cannot reach) — each row carrying a
   `context.rs` line citation. `ctx.system_now`,
   `ctx.new_uuid`, `ctx.random_*`, `ctx.side_effect` (#384), `ctx.version` and
   `UserMetrics` emission (#532) are modelled as determinism-preserving, and

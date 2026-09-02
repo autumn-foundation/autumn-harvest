@@ -848,3 +848,209 @@ fn a_body_less_std_callee_is_not_a_boundary() {
         boundary_kinds(v)
     );
 }
+
+// ── Review round 2: three false-`proven` shadowing / trust holes ────────────
+
+/// Finding 1: `a::COUNTER: u64` must not decide the verdict for `b::COUNTER:
+/// AtomicU64`. Both print with their FULL path in the `static` header and in
+/// the `allocN (static: ..)` footer on rustc 1.98, so nothing is ambiguous
+/// here — the index just has to keep them apart.
+#[test]
+fn a_shadowed_atomic_static_is_still_an_ambient_read() {
+    let verdicts = run(
+        "shadowed_statics.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_reads_shadowed_atomic");
+    assert_eq!(
+        v.verdict.name(),
+        "nondeterminism-found",
+        "reading `b::COUNTER: AtomicU64` is ambient however `a::COUNTER: u64` is \
+         spelled; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+    let finding = assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+    let trace = trace_text(finding);
+    assert!(
+        trace.contains("b::COUNTER"),
+        "the trace must name the static that was actually read; got:\n{trace}"
+    );
+}
+
+/// The other half of finding 1: the immutable static keeps its clean verdict.
+#[test]
+fn the_shadowing_immutable_static_stays_clean() {
+    let verdicts = run(
+        "shadowed_statics.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_reads_shadowing_plain");
+    assert_eq!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "`a::COUNTER: u64` is plain immutable data; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+}
+
+/// Finding 3: `b::Worker::run` reads the wall clock; `a::Worker::run` is a
+/// constant. Keying the impl index on the bare `Worker` collapsed them.
+#[test]
+fn a_shadowed_impl_method_is_resolved_by_its_module() {
+    let verdicts = run(
+        "shadowed_impls.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_calls_ambient_worker");
+    assert_eq!(
+        v.verdict.name(),
+        "nondeterminism-found",
+        "`b::Worker::run` reads `SystemTime::now`; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+    assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+}
+
+/// The other half of finding 3: disambiguation by module path is precise
+/// enough to keep the clean `a::Worker::run` caller proven.
+#[test]
+fn the_shadowing_clean_impl_method_stays_proven() {
+    let verdicts = run(
+        "shadowed_impls.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_calls_clean_worker");
+    assert_eq!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "`a::Worker::run` returns a constant; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+}
+
+/// Finding 2: a body-less callee from a dependency compiled without
+/// `--emit=mir`. Its `std::string::String` destination is not evidence about
+/// the CALLEE, so the call is an honest `external-crate-body` boundary.
+#[test]
+fn a_body_less_dependency_fn_is_not_trusted_by_its_result_type() {
+    let verdicts = run(
+        "bodyless_dependency.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_calls_bodyless_dependency");
+    assert_eq!(
+        v.verdict.name(),
+        "unknown",
+        "`now_ish` has no body here; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+    assert!(
+        boundary_kinds(v).contains(&BoundaryKind::ExternalCrateBody),
+        "got {:?}",
+        boundary_kinds(v)
+    );
+}
+
+/// The other half of finding 2: `format`, `must_use`, `String::len`,
+/// `Vec::new`, `Vec::push` and `Vec::len` are all body-less here and must stay
+/// trusted, or every workflow in the workspace goes `unknown`.
+#[test]
+fn body_less_std_receivers_and_free_fns_stay_trusted() {
+    let verdicts = run(
+        "bodyless_dependency.mir",
+        &SourceRoots {
+            roots: vec![fixtures_dir()],
+        },
+    )
+    .1;
+    let v = pick(&verdicts, "wf_std_receivers_stay_trusted");
+    assert_eq!(
+        v.verdict.name(),
+        "proven-deterministic",
+        "boundaries = {:?}",
+        boundaries(v)
+            .iter()
+            .map(|b| (b.kind, b.detail.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The conservative half of finding 1: when an `allocN` footer names only a
+/// bare last segment that two modules both define, and the pointee type does
+/// not pick one — both are `u64` here, and only their MUTABILITY differs — the
+/// read is ambient because ONE of the candidates is.
+#[test]
+fn an_ambiguous_static_read_is_ambient_if_any_candidate_is() {
+    let text = "static a::COUNTER: u64 = {\n\
+                \x20   let mut _0: u64;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _0 = const 7_u64;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                static mut b::COUNTER: u64 = {\n\
+                \x20   let mut _0: u64;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _0 = const 0_u64;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                fn __autumn_workflow_info_wf_bare_static() -> u8 {\n\
+                \x20   let mut _0: u8;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _0 = const 0_u8;\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                fn wf_bare_static(_1: &WorkflowContext) -> u64 {\n\
+                \x20   let mut _0: u64;\n\
+                \x20   let mut _2: &u64;\n\
+                \x20   let mut _3: std::string::String;\n\
+                \n\
+                \x20   bb0: {\n\
+                \x20       _2 = const {alloc9: &u64};\n\
+                \x20       _3 = const \"charge\";\n\
+                \x20       _0 = autumn_harvest::WorkflowContext::execute_activity_raw(copy _1, move _3, copy _2) -> [return: bb1, unwind continue];\n\
+                \x20   }\n\
+                \n\
+                \x20   bb1: {\n\
+                \x20       return;\n\
+                \x20   }\n\
+                }\n\
+                alloc9 (static: COUNTER, size: 8, align: 8) {\n\
+                \x20   00 00 00 00 00 00 00 00\n\
+                }\n";
+    let verdicts = analyze_text(text);
+    let v = pick(&verdicts, "wf_bare_static");
+    assert_eq!(
+        v.verdict.name(),
+        "nondeterminism-found",
+        "`COUNTER` could be `static mut b::COUNTER`, and the conservative answer \
+         over the candidates is the ambient one; boundaries = {:?}",
+        boundary_kinds(v)
+    );
+    let finding = assert_found(v, FindingKind::TaintedSinkArgument, TaintKind::Value);
+    let trace = trace_text(finding);
+    assert!(
+        trace.contains("b::COUNTER"),
+        "the trace must name the candidate that made it ambient; got:\n{trace}"
+    );
+}

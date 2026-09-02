@@ -31,7 +31,7 @@ use crate::mir::ast::{BasicBlock, Body, Local, Operand, Place, Projection, State
 use crate::model::callee::CalleePath;
 use crate::model::{CallClass, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule};
 use crate::resolve::{Program, Resolution, Substitution};
-use crate::util::{last_segment, strip_generics_everywhere};
+use crate::util::{last_segment, peel_refs, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
 use super::control::ControlGraph;
@@ -150,6 +150,20 @@ struct CallOperands<'c> {
     args: &'c [Operand],
 }
 
+/// One higher-order argument being invoked: which argument it is, the operand
+/// that carries it, and the body it names.
+#[derive(Clone, Copy)]
+struct InvokedArgument<'i> {
+    index: usize,
+    operand: &'i Operand,
+    /// The closure span or fn-item path, for the hop text.
+    span: &'i str,
+    /// The body to analyze.
+    target: &'i str,
+    /// Parameter 0 is a closure environment rather than a real parameter.
+    has_env: bool,
+}
+
 /// Everything about one call site that is fixed once `(body, substitution)` is:
 /// the substituted callee text, its decomposition, and the model rows it matches.
 ///
@@ -264,6 +278,9 @@ pub struct Analyzer<'a> {
     pub findings: Vec<Finding>,
     /// Boundaries collected across every body reached from this entry.
     pub boundaries: Vec<Boundary>,
+    /// Report warnings: name collisions the analysis had to resolve
+    /// conservatively. Deduplicated, because the fixpoint revisits a block.
+    pub warnings: BTreeSet<String>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -279,6 +296,7 @@ impl<'a> Analyzer<'a> {
             budget: BUDGET,
             findings: Vec::new(),
             boundaries: Vec::new(),
+            warnings: BTreeSet::new(),
         }
     }
 
@@ -497,7 +515,9 @@ impl<'a> Analyzer<'a> {
                 // and the `unsafe-raw-pointer` boundary below is the honest
                 // answer rather than an ambient-source verdict (U04).
                 if !rvalue.text.contains(": *mut ") && !rvalue.text.contains(": *const ") {
-                    set.absorb(&self.static_taint_of_alloc(frame, alloc));
+                    let alloc = alloc.clone();
+                    let text = rvalue.text.clone();
+                    set.absorb(&self.static_taint_of_alloc(frame, &alloc, &text));
                 }
             }
             set.absorb(&self.const_taint(frame, &rvalue.text));
@@ -862,7 +882,7 @@ impl<'a> Analyzer<'a> {
         let resolution = self.program.resolve_call(frame.path, printed);
         // Only a call that lands in an analyzed body needs a substitution, and
         // computing one costs a scan of the caller's blocks.
-        let inner = if matches!(resolution, Resolution::Body(_)) {
+        let inner = if matches!(resolution, Resolution::Body(_) | Resolution::Bodies(_)) {
             self.program
                 .call_substitution_in(frame.path, callee, frame.subst)
         } else {
@@ -894,6 +914,68 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Analyze one resolved callee body and fold its outcome into the caller.
+    ///
+    /// `note` is appended to the hop text and is non-empty only when the call
+    /// site was ambiguous and every candidate is being unioned.
+    #[allow(clippy::too_many_arguments)]
+    fn descend_into(
+        &mut self,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
+        printed: &str,
+        arg_taints: &[TaintSet],
+        state: &mut TaintState,
+        report: Option<&mut Report<'_>>,
+        target: &str,
+        subst: &Substitution,
+        note: &str,
+    ) -> bool {
+        let qualified = self.program.qualified_name(target);
+        let resolved = if qualified == printed {
+            String::new()
+        } else {
+            format!(" -> {qualified}")
+        };
+        let hop = Hop {
+            function: frame.path.to_string(),
+            step: format!(
+                "calls {printed}{resolved}{}{}{note}",
+                self.devirtualized(&CalleePath::parse(printed)),
+                subst_note(subst)
+            ),
+        };
+        let mut inner_hops = frame.hops.to_vec();
+        inner_hops.push(hop.clone());
+        let seeded: Vec<TaintSet> = arg_taints.iter().map(|set| set.with_hop(&hop)).collect();
+        let outcome = self.analyze_body(target, subst, &seeded, &inner_hops);
+        let mut changed = state.add(call.dest, &outcome.ret);
+        changed |= Self::write_back_refs(
+            frame.body,
+            call.args,
+            &TaintSet::new(),
+            state,
+            Some(&outcome),
+        );
+        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+        if outcome.has_sink
+            && let Some(report) = report
+        {
+            // A helper that emits commands makes *this call site* a sink
+            // for control dependence: `if tainted { dispatch(ctx) }` is
+            // the same finding as an inline `ctx.execute_activity_raw`.
+            report.sinks.push(SinkRecord {
+                block: frame.block.label.clone(),
+                site: Self::site(
+                    frame.path,
+                    &frame.block.label,
+                    &format!("commands emitted by {qualified}"),
+                ),
+            });
+        }
+        changed
+    }
+
     /// Resolve and descend into an unmodelled call.
     fn follow_call(
         &mut self,
@@ -908,49 +990,64 @@ impl<'a> Analyzer<'a> {
         let union = union_of(arg_taints);
         let site = self.call_target(frame, printed, call.callee.unwrap_or_default());
         match &site.resolution {
-            Resolution::Body(target) => {
-                let qualified = self.program.qualified_name(target);
-                let resolved = if qualified == printed {
-                    String::new()
+            Resolution::Body(target) => self.descend_into(
+                frame,
+                call,
+                printed,
+                arg_taints,
+                state,
+                report,
+                target,
+                &site.subst,
+                "",
+            ),
+            Resolution::Bodies(bodies) => {
+                // Two analyzed impls answer to this `(type, method)` and the
+                // printed callee does not say which. Narrowing on the receiver's
+                // declared type — which MIR prints fully qualified — usually
+                // picks one; when it does not, EVERY candidate is analyzed and
+                // the results are unioned, so a finding in any of them is
+                // reported. Picking one would be a coin flip that can hide it.
+                let narrowed = call
+                    .args
+                    .first()
+                    .and_then(operand_place)
+                    .and_then(|place| frame.body.locals.get(&place.local))
+                    .map(|declared| frame.subst.apply(declared))
+                    .map_or_else(
+                        || bodies.clone(),
+                        |declared| self.program.narrow_by_receiver(bodies, &declared),
+                    );
+                let note = if narrowed.len() > 1 {
+                    self.warnings.insert(format!(
+                        "`{printed}` in `{}` resolves to {} impl bodies in the analyzed \
+                         set ({}); all of them were analyzed and their findings unioned",
+                        frame.path,
+                        narrowed.len(),
+                        narrowed
+                            .iter()
+                            .map(|b| self.program.qualified_name(b))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    format!(" [ambiguous impl ({} candidates, unioned)]", narrowed.len())
                 } else {
-                    format!(" -> {qualified}")
+                    String::new()
                 };
-                let hop = Hop {
-                    function: frame.path.to_string(),
-                    step: format!(
-                        "calls {printed}{resolved}{}{}",
-                        self.devirtualized(&CalleePath::parse(printed)),
-                        subst_note(&site.subst)
-                    ),
-                };
-                let mut inner_hops = frame.hops.to_vec();
-                inner_hops.push(hop.clone());
-                let seeded: Vec<TaintSet> =
-                    arg_taints.iter().map(|set| set.with_hop(&hop)).collect();
-                let outcome = self.analyze_body(target, &site.subst, &seeded, &inner_hops);
-                let mut changed = state.add(call.dest, &outcome.ret);
-                changed |= Self::write_back_refs(
-                    frame.body,
-                    call.args,
-                    &TaintSet::new(),
-                    state,
-                    Some(&outcome),
-                );
-                self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
-                if outcome.has_sink
-                    && let Some(report) = report
-                {
-                    // A helper that emits commands makes *this call site* a sink
-                    // for control dependence: `if tainted { dispatch(ctx) }` is
-                    // the same finding as an inline `ctx.execute_activity_raw`.
-                    report.sinks.push(SinkRecord {
-                        block: frame.block.label.clone(),
-                        site: Self::site(
-                            frame.path,
-                            &frame.block.label,
-                            &format!("commands emitted by {qualified}"),
-                        ),
-                    });
+                let mut report = report;
+                let mut changed = false;
+                for target in &narrowed {
+                    changed |= self.descend_into(
+                        frame,
+                        call,
+                        printed,
+                        arg_taints,
+                        state,
+                        report.as_deref_mut(),
+                        target,
+                        &site.subst,
+                        &note,
+                    );
                 }
                 changed
             }
@@ -989,49 +1086,89 @@ impl<'a> Analyzer<'a> {
     /// and so does `now_ish` from a dependency that was never asked for MIR.
     /// Treating every trimmed path as a boundary would make every workflow
     /// `unknown`; treating every trimmed path as an opaque propagator is the
-    /// silent `proven` the soundness review found. The discriminator is the
-    /// *declared types* at the call site, which MIR always prints fully
-    /// qualified: a call into std has a `std::`/`core::`/`alloc::` type on its
-    /// receiver, one of its arguments or its destination.
+    /// silent `proven` the soundness review found.
     ///
-    /// Three things count as std:
-    ///  1. the callee path itself is explicitly rooted at std/core/alloc, or at
-    ///     a `[[trusted]]` crate;
-    ///  2. a declared type at the call site is rooted there;
-    ///  3. the callee matches a `[[std_free_fn]]` row — the residue of (2),
-    ///     free functions whose whole signature is primitives.
+    /// The discriminator has to be evidence about the **callee**. A declared
+    /// type at the call site is not: `now_ish() -> std::string::String` names
+    /// std in its result and is still a dependency's body. Three things count:
+    ///
+    ///  1. the callee path text itself is rooted at std/core/alloc or at a
+    ///     `[[trusted]]` crate — including the qualifying trait of a
+    ///     `<T as std::future::IntoFuture>::into_future`;
+    ///  2. the call is a **method**, and its receiver type is std — either a
+    ///     primitive (the language reserves inherent impls on those, and rustc
+    ///     prints them trimmed: `<u64 as From<u32>>::from`), or the declared type
+    ///     of its *receiver argument* is rooted entirely in trusted crates
+    ///     (`Vec::<u32>::push(move _12, ..)` with `_12: &mut std::vec::Vec<u32>`),
+    ///     or — for an associated function, which has no receiver argument —
+    ///     some declared type at the site spells the receiver type itself with a
+    ///     trusted root (`DateTime::<Utc>::from_timestamp_millis` returns a
+    ///     `std::option::Option<chrono::DateTime<chrono::Utc>>`);
+    ///  3. the callee matches a `[[std_free_fn]]` row — the residue of (2), free
+    ///     functions with no receiver to reason about.
+    ///
+    /// (2) is refused when the call goes through a trait some impl in the
+    /// analyzed set implements: a user `impl MyTrait for Vec<u32>` is user code,
+    /// and `Vec`'s std-ness says nothing about it. In practice `resolve_call`
+    /// finds that impl's body first and never gets here, so this is a belt on
+    /// top of braces.
     fn is_trusted_bodyless(&self, frame: Frame<'_>, call: CallOperands<'_>, printed: &str) -> bool {
         let parsed = CalleePath::parse(printed);
         if self.model.is_std_free_fn(&parsed) {
             return true;
         }
-        // A method whose self type is a primitive is a `core` impl: the language
-        // reserves inherent impls on primitives, and rustc prints them trimmed
-        // (`<u64 as From<u32>>::from`) with no std-rooted type anywhere in sight.
-        if parsed
-            .receiver
-            .as_deref()
-            .is_some_and(|receiver| PRIMITIVE_TYPES.contains(&receiver))
+        // (1) A crate root spelled in the callee PATH itself.
+        if path_roots(&callee_path_text(printed)).any(|root| self.is_trusted_root(root)) {
+            return true;
+        }
+        let Some(receiver) = parsed.receiver.as_deref() else {
+            return false;
+        };
+        if let Some(trait_name) = parsed.trait_.as_deref()
+            && self
+                .program
+                .has_impl_method(receiver, Some(trait_name), parsed.last_segment())
         {
+            return false;
+        }
+        // (2) A primitive self type, or a receiver the call site declares with
+        // a std-rooted path.
+        if PRIMITIVE_TYPES.contains(&receiver) {
             return true;
         }
-        // Any crate root spelled anywhere in the callee text: the qualifying
-        // trait of `<T as std::future::IntoFuture>::into_future` is as good an
-        // answer as the head of the path would be.
-        if path_roots(printed).any(|root| self.is_trusted_root(root)) {
-            return true;
+        // The receiver ARGUMENT: `_1` of a method call is the self value, and
+        // MIR declares it fully qualified even where the callee path is trimmed
+        // (`<DefaultCallsite as Callsite>::metadata(move _17)` with
+        // `_17: &tracing::__macro_support::MacroCallsite`). It is evidence about
+        // the callee precisely because it *is* the callee's self type; every
+        // root in it must be trusted, so a `&dep::Worker` receiver never is.
+        if let Some(ty) = call
+            .args
+            .first()
+            .and_then(operand_place)
+            .and_then(|place| frame.body.locals.get(&place.local))
+        {
+            let ty = frame.subst.apply(ty);
+            let ty = peel_refs(&ty);
+            let mut roots = path_roots(ty).peekable();
+            if roots.peek().is_some() && roots.all(|root| self.is_trusted_root(root)) {
+                return true;
+            }
         }
+        // An ASSOCIATED function has no self argument (`Vec::<u32>::new()`,
+        // `DateTime::<Utc>::from_timestamp_millis(0_i64)`), so the receiver has
+        // to be found by name among the declared types instead.
         let declared = call
             .args
             .iter()
             .filter_map(operand_place)
-            .chain(std::iter::once(call.dest))
             .filter_map(|place| frame.body.locals.get(&place.local))
             .map(String::as_str)
+            .chain(frame.body.locals.get(&call.dest.local).map(String::as_str))
             .chain(call.dest_ty);
         for ty in declared {
             let ty = frame.subst.apply(ty);
-            if path_roots(&ty).any(|root| self.is_trusted_root(root)) {
+            if receiver_roots(&ty, receiver).any(|root| self.is_trusted_root(root)) {
                 return true;
             }
         }
@@ -1182,13 +1319,56 @@ impl<'a> Analyzer<'a> {
                         .closure_body(&span)
                         .map(|body| (span, body.to_string()))
                 });
-            let (span, target, has_env) = if let Some((span, target)) = closure {
-                (span, target, true)
-            } else if let Some(path) = self.fn_item_target(frame, operand) {
-                (path.clone(), path, false)
+            // A fn item that names two impl bodies (`Worker::run` where two
+            // modules define one) is followed into all of them, for the same
+            // reason `follow_call` unions an ambiguous call: skipping it, or
+            // picking one, can lose the finding.
+            let targets: Vec<(String, String, bool)> = if let Some((span, target)) = closure {
+                vec![(span, target, true)]
             } else {
-                continue;
+                self.fn_item_targets(frame, operand)
+                    .into_iter()
+                    .map(|path| (path.clone(), path, false))
+                    .collect()
             };
+            for (span, target, has_env) in targets {
+                self.invoke_argument_body(
+                    frame,
+                    InvokedArgument {
+                        index,
+                        operand,
+                        span: &span,
+                        target: &target,
+                        has_env,
+                    },
+                    arg_taints,
+                    state,
+                    &mut out,
+                );
+            }
+        }
+        out
+    }
+
+    /// One `(argument, body)` pair from [`Self::closure_argument_taint_inner`]:
+    /// analyze the body as if the higher-order callee invoked it, and fold its
+    /// return taint into `out`.
+    fn invoke_argument_body(
+        &mut self,
+        frame: Frame<'_>,
+        invoked: InvokedArgument<'_>,
+        arg_taints: &[TaintSet],
+        state: &mut TaintState,
+        out: &mut TaintSet,
+    ) {
+        {
+            let InvokedArgument {
+                index,
+                operand,
+                span,
+                target,
+                has_env,
+            } = invoked;
             let hop = Hop {
                 function: frame.path.to_string(),
                 step: if has_env {
@@ -1208,8 +1388,8 @@ impl<'a> Analyzer<'a> {
                     others.absorb(set);
                 }
             }
-            let Some(callee_body) = self.program.body(&target) else {
-                continue;
+            let Some(callee_body) = self.program.body(target) else {
+                return;
             };
             let mut seeded = Vec::with_capacity(callee_body.params.len());
             if has_env {
@@ -1224,7 +1404,7 @@ impl<'a> Analyzer<'a> {
             while seeded.len() < callee_body.params.len() {
                 seeded.push(others.with_hop(&hop));
             }
-            let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, &inner_hops);
+            let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
             // What the closure wrote through its environment is written back
             // onto the locals it captured, which is the only way a capture-by-
@@ -1233,35 +1413,41 @@ impl<'a> Analyzer<'a> {
                 Self::write_back_closure_captures(frame.body, operand, written, state);
             }
         }
-        out
     }
 
-    /// The body a bare `fn` item argument names, if the analyzed set has it.
+    /// Every body a bare `fn` item argument names, if the analyzed set has it.
     ///
     /// A fn item is a ZST: MIR passes it as the constant `add_clock`, and its
     /// type is spelled `fn(u64) -> u64 {add_clock}`. Neither carries a
     /// `{closure@..}` span, so the closure path never sees it — yet
     /// `.map(Uuid::new_v4)`, `.unwrap_or_else(Instant::now)` and
     /// `.or_insert_with(SystemTime::now)` are all this shape.
-    fn fn_item_target(&self, frame: Frame<'_>, operand: &Operand) -> Option<String> {
+    fn fn_item_targets(&self, frame: Frame<'_>, operand: &Operand) -> Vec<String> {
         let candidate = match operand {
             Operand::Const { text, .. } => {
                 let text = frame.subst.apply(text);
                 fn_item_path(&text).unwrap_or(text)
             }
             Operand::Copy(place) | Operand::Move(place) => {
-                let declared = frame.subst.apply(frame.body.locals.get(&place.local)?);
-                fn_item_path(&declared)?
+                let Some(declared) = frame.body.locals.get(&place.local) else {
+                    return Vec::new();
+                };
+                let declared = frame.subst.apply(declared);
+                let Some(path) = fn_item_path(&declared) else {
+                    return Vec::new();
+                };
+                path
             }
         };
         let candidate = candidate.trim();
         if candidate.is_empty() || !candidate.starts_with(is_path_start) {
-            return None;
+            return Vec::new();
         }
         let bare = strip_generics_everywhere(candidate);
         match self.program.resolve_call(frame.path, &bare) {
-            Resolution::Body(target) => Some(target),
-            _ => None,
+            Resolution::Body(target) => vec![target],
+            Resolution::Bodies(targets) => targets,
+            Resolution::External(_) | Resolution::Boundary(..) => Vec::new(),
         }
     }
 
@@ -1499,17 +1685,62 @@ impl<'a> Analyzer<'a> {
     // ── reads ───────────────────────────────────────────────────────────────
 
     /// Taint of a `const {allocN: &T}` read: ambient statics only.
-    fn static_taint_of_alloc(&self, frame: Frame<'_>, alloc: &str) -> TaintSet {
+    ///
+    /// `text` is the whole operand, whose pointee type (`&Atomic<u64>`) is the
+    /// tie-breaker when the footer's name is ambiguous.
+    fn static_taint_of_alloc(&mut self, frame: Frame<'_>, alloc: &str, text: &str) -> TaintSet {
         let doc = self.program.doc_of(frame.path);
-        let Some(item) = self.program.static_of_alloc(doc, alloc) else {
+        let candidates = self.program.statics_of_alloc(doc, alloc);
+        self.ambient_of_candidates(frame, &candidates, alloc_pointee(text))
+    }
+
+    /// Classify the `static` items one printed name could denote.
+    ///
+    /// One candidate is the ordinary case. Several mean the name was a bare
+    /// last segment two modules both define: the pointee type printed at the
+    /// read disambiguates when it picks exactly one, and otherwise the answer
+    /// must cover every candidate — ambient if **any** of them is — because
+    /// choosing one is exactly the coin flip that made a read of an
+    /// `AtomicU64` look like a read of a `u64` that shared its name.
+    fn ambient_of_candidates(
+        &mut self,
+        frame: Frame<'_>,
+        candidates: &[&crate::mir::ast::StaticItem],
+        pointee: Option<&str>,
+    ) -> TaintSet {
+        let narrowed: Vec<&crate::mir::ast::StaticItem> = match pointee {
+            Some(pointee) if candidates.len() > 1 => {
+                let by_type: Vec<&crate::mir::ast::StaticItem> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|item| same_type_name(&item.ty, pointee))
+                    .collect();
+                if by_type.len() == 1 {
+                    by_type
+                } else {
+                    candidates.to_vec()
+                }
+            }
+            _ => candidates.to_vec(),
+        };
+        let ambient: Vec<&crate::mir::ast::StaticItem> = narrowed
+            .iter()
+            .copied()
+            .filter(|item| item.is_mut || self.model.is_ambient_type(&item.ty))
+            .collect();
+        if narrowed.len() > 1 {
+            let names: Vec<&str> = narrowed.iter().map(|item| item.path.as_str()).collect();
+            self.warnings.insert(format!(
+                "the static read in `{}` could be any of {}; it is classified as {}                  because that is the conservative answer over all of them",
+                frame.path,
+                names.join(", "),
+                if ambient.is_empty() { "deterministic" } else { "ambient" }
+            ));
+        }
+        let Some(item) = ambient.first() else {
             return TaintSet::new();
         };
-        let ambient = item.is_mut || self.model.is_ambient_type(&item.ty);
-        if !ambient {
-            return TaintSet::new();
-        }
-        let name = last_segment(&item.path).to_string();
-        Self::ambient_fact(frame, &name, &item.ty)
+        Self::ambient_fact(frame, &item.path.clone(), &item.ty.clone())
     }
 
     /// Taint of a `const NAME` / `const f::promoted[0]` / `&/*tls*/ NAME` rvalue.
@@ -1545,15 +1776,8 @@ impl<'a> Analyzer<'a> {
             }
             return TaintSet::new();
         }
-        let Some(item) = self.program.static_named(&bare) else {
-            return TaintSet::new();
-        };
-        if !(item.is_mut || self.model.is_ambient_type(&item.ty)) {
-            return TaintSet::new();
-        }
-        let name = last_segment(&bare).to_string();
-        let ty = item.ty.clone();
-        Self::ambient_fact(frame, &name, &ty)
+        let candidates = self.program.statics_named_all(&bare);
+        self.ambient_of_candidates(frame, &candidates, None)
     }
 
     fn ambient_fact(frame: Frame<'_>, name: &str, ty: &str) -> TaintSet {
@@ -1877,6 +2101,66 @@ fn is_benign_terminator(text: &str) -> bool {
 struct Report<'r> {
     sinks: &'r mut Vec<SinkRecord>,
     branches: &'r mut Vec<BranchRecord>,
+}
+
+/// Crate roots of every fully-qualified spelling of `receiver` inside a
+/// declared type.
+///
+/// MIR prints `let` declarations fully qualified even where it trims the callee
+/// path, so a declared type that *contains* the receiver type says which crate
+/// the receiver is from — and a receiver is the one thing at a call site that
+/// is genuinely about the callee. The receiver is often not the whole type:
+/// `DateTime::<Utc>::from_timestamp_millis` takes an `i64` and returns
+/// `std::option::Option<chrono::DateTime<chrono::Utc>>`, whose `chrono::DateTime`
+/// is the spelling wanted here.
+///
+/// Only paths whose LAST segment is exactly the receiver count, so the
+/// `std::option::Option` wrapper and the `chrono::Utc` parameter contribute
+/// nothing: a std-rooted type that is not the receiver is not evidence about
+/// the callee, which is the whole point of the rule.
+fn receiver_roots<'t>(ty: &'t str, receiver: &'t str) -> impl Iterator<Item = &'t str> {
+    ty.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .filter(move |token| last_segment(token) == receiver)
+        .filter_map(crate::util::crate_root)
+}
+
+/// The part of a callee path that names the callee, for a crate-root scan.
+///
+/// A qualified header is kept whole, because its self type and its trait are
+/// both statements about the callee (`<T as std::future::IntoFuture>::into_future`
+/// is std's). Turbofish arguments are dropped, because they are statements
+/// about the *caller's* type arguments: `helper::<std::string::String>` from a
+/// dependency compiled without `--emit=mir` names std without being std.
+fn callee_path_text(printed: &str) -> String {
+    let text = printed.trim();
+    if text.starts_with('<')
+        && let Some(close) = crate::util::matching_angle(text)
+        && let (Some(header), Some(rest)) =
+            (text.get(..=close), text.get(close.saturating_add(1)..))
+    {
+        return format!("{header}{}", strip_generics_everywhere(rest));
+    }
+    strip_generics_everywhere(text)
+}
+
+/// `const {alloc2: &Atomic<u64>}` → `&Atomic<u64>`.
+///
+/// The pointee is the one piece of type information printed at a static read,
+/// and it is what tells `a::COUNTER: u64` from `b::COUNTER: AtomicU64` when the
+/// footer's name was too short to.
+fn alloc_pointee(text: &str) -> Option<&str> {
+    let at = text.find("{alloc")?;
+    let rest = text.get(at..)?;
+    let colon = rest.find(':')?;
+    let close = rest.rfind('}')?;
+    let inner = rest.get(colon.saturating_add(1)..close)?.trim();
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// Do a static's declared type and a printed pointee name the same type?
+fn same_type_name(declared: &str, pointee: &str) -> bool {
+    let want = crate::model::callee::TypeName::parse(pointee).name;
+    !want.is_empty() && crate::model::callee::TypeName::parse(declared).name == want
 }
 
 fn memo_key(path: &str, subst: &Substitution, args: &[TaintSet]) -> String {

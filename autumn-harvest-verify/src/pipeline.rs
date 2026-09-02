@@ -97,7 +97,9 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
     }
     let parse_failures = parse_failure_boundaries(&docs);
     let program = resolve::Program::build(docs, &roots)?;
-    let mut workflows = analysis::analyze(&program, &model, &entries);
+    let (mut workflows, analysis_warnings) =
+        analysis::analyze_with_warnings(&program, &model, &entries);
+    warnings.extend(analysis_warnings);
 
     for (verdict, entry) in workflows.iter_mut().zip(&entries) {
         verdict.workflow = qualified_workflow(&program, entry);

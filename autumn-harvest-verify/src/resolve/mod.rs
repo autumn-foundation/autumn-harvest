@@ -41,8 +41,8 @@ use std::path::PathBuf;
 use crate::mir::ast::{Body, Local, MirDoc, Operand, Statement, StaticItem, Terminator};
 use crate::model::callee::{CalleePath, TypeName};
 use crate::util::{
-    crate_root, last_segment, looks_like_type_param, peel_containers, peel_refs, split_last,
-    split_top_trim, strip_generics_everywhere,
+    crate_root, is_segment_suffix, last_segment, looks_like_type_param, peel_containers, peel_refs,
+    segments, split_last, split_top_trim, strip_generics_everywhere,
 };
 use crate::verdict::BoundaryKind;
 
@@ -61,6 +61,15 @@ pub struct SourceRoots {
 pub enum Resolution {
     /// A body present in the analyzed doc set, by its MIR path.
     Body(String),
+    /// Several bodies any of which this call site could reach, by their MIR
+    /// paths, sorted and deduplicated (always two or more).
+    ///
+    /// Two analyzed modules can define the same `(self type, method)` pair
+    /// (`a::Worker::run` and `b::Worker::run`), and where the printed callee
+    /// does not say which, picking one is a coin flip that can hide a finding.
+    /// The analysis descends into **all** of them and unions the result, which
+    /// over-approximates: any candidate's finding is reported.
+    Bodies(Vec<String>),
     /// An honest analysis boundary (D7/D9); the `String` is the `Boundary::detail`.
     Boundary(BoundaryKind, String),
     /// A body outside the analyzed MIR (std/core/alloc or a `[trusted]` crate),
@@ -70,6 +79,18 @@ pub enum Resolution {
 
 /// Key of an impl method: `(self type name, trait name, method)`.
 type ImplKey = (String, Option<String>, String);
+
+/// One impl method a key can denote, with the module path that tells it apart
+/// from a same-named impl elsewhere in the analyzed set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ImplCandidate {
+    /// Module path the impl block sits in, exactly as rustc trimmed it in the
+    /// body path (`a` for `a::<impl at f.rs:30:5: 30:16>::run`), or `""` at the
+    /// crate root.
+    module: String,
+    /// The body id.
+    body: String,
+}
 
 /// The resolved program: all bodies across all docs plus the lookup tables.
 #[derive(Debug, Default)]
@@ -89,8 +110,8 @@ pub struct Program {
     /// site is the very same body the helpers crate's own dump printed as
     /// `origin_tag`, lengthened only because `helpers_deep` exports the name too.
     qualified: BTreeMap<String, String>,
-    /// `(self type, trait, method)` → body path.
-    impl_methods: BTreeMap<ImplKey, String>,
+    /// `(self type, trait, method)` → every impl body that answers to it.
+    impl_methods: BTreeMap<ImplKey, Vec<ImplCandidate>>,
     /// Impl body path → its header.
     impl_headers: BTreeMap<String, ImplHeader>,
     /// `{closure@FILE:l:c: l:c}` / `{async block@..}` → body path.
@@ -99,10 +120,21 @@ pub struct Program {
     async_bodies: BTreeMap<String, String>,
     /// Trait name → `(concrete type, the body that built the trait object)`.
     unsized_to: BTreeMap<String, BTreeSet<(String, String)>>,
-    /// Static / thread-local name (last segment) → item.
+    /// Static / thread-local FULL printed path → item.
+    ///
+    /// rustc 1.94-1.98 print both the `static PATH: Ty` item header and the
+    /// `allocN (static: PATH, ..)` footer with the same trimmed-but-qualified
+    /// path, so `a::COUNTER: u64` and `b::COUNTER: AtomicU64` are two distinct
+    /// keys here. Keying on the last segment collapsed them, and whichever the
+    /// index happened to keep decided whether reading the *other* was ambient.
     statics: BTreeMap<String, StaticItem>,
-    /// `allocN` → static name, merged across docs.
-    alloc_statics: BTreeMap<String, String>,
+    /// Last path segment → every full path indexed under it, in insertion order.
+    statics_by_last: BTreeMap<String, Vec<String>>,
+    /// `allocN` → every static name any doc gave it.
+    ///
+    /// Alloc ids are numbered per dump, so two docs routinely disagree about
+    /// what `alloc1` is; the set keeps both rather than letting the first win.
+    alloc_statics: BTreeMap<String, BTreeSet<String>>,
     /// Body id → the crate whose dump defined it.
     crate_of: BTreeMap<String, String>,
     /// Crate names present in the analyzed set.
@@ -165,11 +197,11 @@ impl Program {
             for (name, value) in &doc.alloc_statics {
                 self.alloc_statics
                     .entry(name.clone())
-                    .or_insert_with(|| value.clone());
+                    .or_default()
+                    .insert(value.clone());
             }
             for item in &doc.statics {
-                let name = last_segment(&item.path).to_string();
-                self.statics.entry(name).or_insert_with(|| item.clone());
+                index_static(&mut self.statics, &mut self.statics_by_last, item.clone());
             }
             for (body_at, body) in doc.bodies.iter().enumerate() {
                 let id = if collides.contains(&body.path) {
@@ -190,13 +222,15 @@ impl Program {
                 if body.is_const {
                     // A `const NAME: Ty = {..}` body is how a `thread_local!` key
                     // and a promoted constant reach the analysis.
-                    self.statics
-                        .entry(last_segment(&body.path).to_string())
-                        .or_insert_with(|| StaticItem {
+                    index_static(
+                        &mut self.statics,
+                        &mut self.statics_by_last,
+                        StaticItem {
                             path: body.path.clone(),
                             ty: body.return_ty.clone(),
                             is_mut: false,
-                        });
+                        },
+                    );
                 }
                 if let Some(span) = closure_param_span(body) {
                     let id = self
@@ -280,7 +314,7 @@ impl Program {
     }
 
     fn index_impls(&mut self) {
-        let mut methods: BTreeMap<ImplKey, String> = BTreeMap::new();
+        let mut methods: BTreeMap<ImplKey, Vec<ImplCandidate>> = BTreeMap::new();
         let mut headers: BTreeMap<String, ImplHeader> = BTreeMap::new();
         let mut unresolved: BTreeMap<String, String> = BTreeMap::new();
         for path in &self.order {
@@ -314,13 +348,27 @@ impl Program {
                 .as_deref()
                 .map(|t| TypeName::parse(t).name)
                 .filter(|t| !t.is_empty());
-            methods
-                .entry((self_name.clone(), trait_name, method.to_string()))
-                .or_insert_with(|| path.clone());
+            // rustc prints the impl body path with the module it sits in
+            // (`a::<impl at f.rs:30:5: 30:16>::run`), trimmed exactly the way
+            // the call site's `a::Worker::run` is trimmed — so the two agree
+            // and the module is all that tells two same-named impls apart.
+            let candidate = ImplCandidate {
+                module: module_of_impl(prefix, self.crate_of.get(path).map(String::as_str)),
+                body: path.clone(),
+            };
+            push_candidate(
+                methods
+                    .entry((self_name.clone(), trait_name, method.to_string()))
+                    .or_default(),
+                candidate.clone(),
+            );
             // The inherent spelling `Ty::m` must resolve too, even for a trait impl.
-            methods
-                .entry((self_name, None, method.to_string()))
-                .or_insert_with(|| path.clone());
+            push_candidate(
+                methods
+                    .entry((self_name, None, method.to_string()))
+                    .or_default(),
+                candidate,
+            );
             headers.insert(path.clone(), header);
         }
         self.impl_methods = methods;
@@ -404,19 +452,86 @@ impl Program {
         body.locals.get(&local).map(String::as_str)
     }
 
-    /// The static (or `thread_local!` key) an `allocN` footer entry names.
+    /// Every `static` (or `thread_local!` key) an `allocN` footer entry could name.
+    ///
+    /// The alloc footer sits in the same dump as the body that reads it, so the
+    /// doc's own map is authoritative; the merged map is a fallback for a body
+    /// whose doc is not in hand, and it keeps every doc's answer because alloc
+    /// ids are numbered per dump and collide freely across them.
     #[must_use]
-    pub fn static_of_alloc(&self, doc: Option<&MirDoc>, alloc: &str) -> Option<&StaticItem> {
-        let name = doc
-            .and_then(|d| d.alloc_statics.get(alloc))
-            .or_else(|| self.alloc_statics.get(alloc))?;
-        self.statics.get(last_segment(name))
+    pub fn statics_of_alloc(&self, doc: Option<&MirDoc>, alloc: &str) -> Vec<&StaticItem> {
+        if let Some(name) = doc.and_then(|d| d.alloc_statics.get(alloc)) {
+            return self.statics_named_all(name);
+        }
+        let Some(names) = self.alloc_statics.get(alloc) else {
+            return Vec::new();
+        };
+        let mut out: Vec<&StaticItem> = Vec::new();
+        for name in names {
+            for item in self.statics_named_all(name) {
+                if !out.iter().any(|have| have.path == item.path) {
+                    out.push(item);
+                }
+            }
+        }
+        out
     }
 
-    /// A `static`/`const` item by its printed name.
+    /// The single static an `allocN` footer names, when exactly one answers.
+    #[must_use]
+    pub fn static_of_alloc(&self, doc: Option<&MirDoc>, alloc: &str) -> Option<&StaticItem> {
+        single(self.statics_of_alloc(doc, alloc))
+    }
+
+    /// Every `static`/`const` item a printed name could denote.
+    ///
+    /// The printed name is normally a full path (`b::COUNTER`) and matches one
+    /// item exactly. It can also be *more* qualified than the item's own dump
+    /// printed it (`mycrate::b::COUNTER`) or — for a name recovered from a
+    /// `const NAME` rvalue in a dump that trimmed harder — *less*. Both are
+    /// resolved by segment-suffix in the appropriate direction, and only a bare
+    /// last segment that two modules both define comes back with two answers.
+    #[must_use]
+    pub fn statics_named_all(&self, name: &str) -> Vec<&StaticItem> {
+        let name = name.trim();
+        if let Some(item) = self.statics.get(name) {
+            return vec![item];
+        }
+        let Some(paths) = self.statics_by_last.get(last_segment(name)) else {
+            return Vec::new();
+        };
+        let want = segments(name);
+        let mut matched: Vec<&StaticItem> = Vec::new();
+        for path in paths {
+            let have = segments(path);
+            if (is_segment_suffix(name, &have) || is_segment_suffix(path, &want))
+                && let Some(item) = self.statics.get(path)
+            {
+                matched.push(item);
+            }
+        }
+        matched
+    }
+
+    /// A `static`/`const` item by its printed name, when exactly one answers.
     #[must_use]
     pub fn static_named(&self, name: &str) -> Option<&StaticItem> {
-        self.statics.get(last_segment(name))
+        single(self.statics_named_all(name))
+    }
+
+    /// True when the analyzed set defines `(self type, trait, method)`.
+    ///
+    /// A user trait implemented on a std type (`impl MyTrait for Vec<u32>`) is
+    /// user code, so a body-less `<Vec<u32> as MyTrait>::m` must not inherit
+    /// `Vec`'s std-ness. In practice [`Self::resolve_call`] finds that impl's
+    /// body first and the question never arises; this is the belt on top.
+    #[must_use]
+    pub fn has_impl_method(&self, self_ty: &str, trait_: Option<&str>, method: &str) -> bool {
+        self.impl_methods.contains_key(&(
+            self_ty.to_string(),
+            trait_.map(str::to_string),
+            method.to_string(),
+        ))
     }
 
     /// The body a `{closure@..}` / `{async block@..}` span belongs to.
@@ -480,20 +595,32 @@ impl Program {
                 let trait_name = path.trait_.as_deref().unwrap_or(receiver);
                 let candidates = self.unsized_to.get(trait_name);
                 let unique = candidates.filter(|set| set.len() == 1).and_then(|set| {
-                    set.iter().next().and_then(|(concrete, _)| {
-                        self.impl_method(concrete, path.trait_.as_deref(), method)
+                    set.iter().next().map(|(concrete, _)| {
+                        self.impl_method_candidates(
+                            concrete,
+                            path.trait_.as_deref(),
+                            method,
+                            None,
+                            near,
+                        )
                     })
                 });
-                return unique.map_or_else(
-                    || Resolution::Boundary(BoundaryKind::DynDispatch, callee.trim().into()),
-                    Resolution::Body,
-                );
+                return unique.and_then(bodies_resolution).unwrap_or_else(|| {
+                    Resolution::Boundary(BoundaryKind::DynDispatch, callee.trim().into())
+                });
             }
             if self.is_generic_param(caller_body, receiver) && !self.is_known_type(receiver) {
                 return Resolution::Boundary(BoundaryKind::UnresolvedGeneric, receiver.to_string());
             }
-            if let Some(body) = self.impl_method(receiver, path.trait_.as_deref(), method) {
-                return Resolution::Body(body);
+            let bodies = self.impl_method_candidates(
+                receiver,
+                path.trait_.as_deref(),
+                method,
+                path.receiver_path.as_deref(),
+                near,
+            );
+            if let Some(resolution) = bodies_resolution(bodies) {
+                return resolution;
             }
             if let Some(detail) = self.unresolved_impl_methods.get(method) {
                 return Resolution::Boundary(BoundaryKind::MissingBody, detail.clone());
@@ -710,23 +837,115 @@ impl Program {
         if name.is_empty() {
             return None;
         }
-        self.impl_methods
-            .get(&(name, Some("Drop".to_string()), "drop".to_string()))
-            .cloned()
+        // Drop glue that two same-named types both define is followed into
+        // both: the union of their effects is the sound answer, and the caller
+        // asks for one body, so the ambiguous case yields none rather than a
+        // coin flip. `Drop` impls that collide this way are vanishingly rare
+        // and the `unresolved_impl_methods` path already reports the miss.
+        single_owned(
+            self.impl_methods
+                .get(&(name, Some("Drop".to_string()), "drop".to_string()))
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.body.clone())
+                .collect(),
+        )
     }
 
-    fn impl_method(&self, self_ty: &str, trait_: Option<&str>, method: &str) -> Option<String> {
+    /// Every impl body `(self type, trait, method)` names, module-disambiguated
+    /// by `receiver_path` (the receiver as the call site spelled it) when that
+    /// selects exactly one.
+    fn impl_method_candidates(
+        &self,
+        self_ty: &str,
+        trait_: Option<&str>,
+        method: &str,
+        receiver_path: Option<&str>,
+        near: Option<&str>,
+    ) -> Vec<String> {
         let key = (
             self_ty.to_string(),
             trait_.map(str::to_string),
             method.to_string(),
         );
-        if let Some(path) = self.impl_methods.get(&key) {
-            return Some(path.clone());
+        let found = self
+            .impl_methods
+            .get(&key)
+            .or_else(|| {
+                self.impl_methods
+                    .get(&(self_ty.to_string(), None, method.to_string()))
+            })
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if found.len() < 2 {
+            return found.iter().map(|c| c.body.clone()).collect();
         }
-        self.impl_methods
-            .get(&(self_ty.to_string(), None, method.to_string()))
+        // Analyzing several targets at once (`--all-examples`) puts one
+        // `impl Serialize for Receipt` per example in the same program. A call
+        // inside one example means *its own* crate's impl, exactly as
+        // `real_path_near` decides for a free function.
+        let mut found: Vec<&ImplCandidate> = found.iter().collect();
+        if let Some(krate) = near {
+            let same: Vec<&ImplCandidate> = found
+                .iter()
+                .copied()
+                .filter(|c| self.crate_of.get(&c.body).map(String::as_str) == Some(krate))
+                .collect();
+            if !same.is_empty() {
+                found = same;
+            }
+        }
+        if let [only] = found.as_slice() {
+            return vec![only.body.clone()];
+        }
+        // `b::Worker::run` at the call site and `b::<impl at ..>::run` in the
+        // body path carry the same trimmed module, so the qualifier the caller
+        // wrote is enough — and it is the only evidence in the printed text.
+        let wanted = receiver_path.and_then(split_last).map(|(module, _)| module);
+        if let Some(module) = wanted.filter(|m| !m.is_empty()) {
+            let narrowed: Vec<&ImplCandidate> = found
+                .iter()
+                .copied()
+                .filter(|c| modules_agree(&c.module, module))
+                .collect();
+            if let [only] = narrowed.as_slice() {
+                return vec![only.body.clone()];
+            }
+        }
+        found.iter().map(|c| c.body.clone()).collect()
+    }
+
+    /// Narrow an ambiguous [`Resolution::Bodies`] with a receiver's declared
+    /// type, which MIR prints fully qualified (`_1: &a::Worker`).
+    ///
+    /// Returns the bodies unchanged when the type picks none or several: the
+    /// union is the sound answer, never a guess.
+    #[must_use]
+    pub fn narrow_by_receiver(&self, bodies: &[String], declared: &str) -> Vec<String> {
+        let stripped = strip_generics_everywhere(peel_containers(declared));
+        let Some((module, _)) = split_last(stripped.trim()) else {
+            return bodies.to_vec();
+        };
+        if module.is_empty() {
+            return bodies.to_vec();
+        }
+        let narrowed: Vec<String> = bodies
+            .iter()
+            .filter(|body| {
+                split_last(body)
+                    .map(|(prefix, _)| {
+                        module_of_impl(prefix, self.crate_of.get(*body).map(String::as_str))
+                    })
+                    .is_some_and(|have| modules_agree(&have, module))
+            })
             .cloned()
+            .collect();
+        if narrowed.len() == 1 {
+            narrowed
+        } else {
+            bodies.to_vec()
+        }
     }
 
     /// A body by exact path, redirected to its coroutine body when it is an async shim.
@@ -798,6 +1017,80 @@ impl Program {
         self.impl_methods
             .keys()
             .any(|(self_ty, _, _)| self_ty == name)
+    }
+}
+
+/// Index one `static`/`const` item under its full path and its last segment.
+fn index_static(
+    statics: &mut BTreeMap<String, StaticItem>,
+    by_last: &mut BTreeMap<String, Vec<String>>,
+    item: StaticItem,
+) {
+    let by = by_last
+        .entry(last_segment(&item.path).to_string())
+        .or_default();
+    if !by.iter().any(|have| have == &item.path) {
+        by.push(item.path.clone());
+    }
+    statics.entry(item.path.clone()).or_insert(item);
+}
+
+/// Append a candidate unless the same body is already recorded.
+fn push_candidate(into: &mut Vec<ImplCandidate>, candidate: ImplCandidate) {
+    if !into.iter().any(|have| have.body == candidate.body) {
+        into.push(candidate);
+    }
+}
+
+/// The module an impl body path sits in: everything before `<impl at`, with the
+/// body id's crate prefix (added only when two dumps print the same path)
+/// removed, because a call site never spells it.
+fn module_of_impl(prefix: &str, crate_name: Option<&str>) -> String {
+    let head = prefix
+        .find("<impl at")
+        .map_or(prefix, |at| prefix.get(..at).unwrap_or(prefix));
+    let head = head.trim().trim_end_matches("::").trim();
+    let head = crate_name
+        .and_then(|krate| head.strip_prefix(&format!("{krate}::")))
+        .unwrap_or(head);
+    if head == crate_name.unwrap_or_default() {
+        return String::new();
+    }
+    head.to_string()
+}
+
+/// Do two printed module paths denote the same module?
+///
+/// One side can be trimmed harder than the other (`deep::inner` vs `inner`),
+/// so a `::`-segment suffix in either direction counts — but never the empty
+/// path, which would match everything.
+fn modules_agree(have: &str, want: &str) -> bool {
+    if have.is_empty() || want.is_empty() {
+        return have == want;
+    }
+    have == want
+        || is_segment_suffix(want, &segments(have))
+        || is_segment_suffix(have, &segments(want))
+}
+
+/// The only element of a candidate list, or `None` when there is not exactly one.
+fn single<T>(mut items: Vec<T>) -> Option<T> {
+    if items.len() == 1 { items.pop() } else { None }
+}
+
+fn single_owned(items: Vec<String>) -> Option<String> {
+    single(items)
+}
+
+/// One body resolves to [`Resolution::Body`], several to
+/// [`Resolution::Bodies`], none to `None`.
+fn bodies_resolution(mut bodies: Vec<String>) -> Option<Resolution> {
+    bodies.sort();
+    bodies.dedup();
+    match bodies.len() {
+        0 => None,
+        1 => bodies.pop().map(Resolution::Body),
+        _ => Some(Resolution::Bodies(bodies)),
     }
 }
 

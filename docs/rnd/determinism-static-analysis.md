@@ -202,7 +202,7 @@ hash-ordered iterator.
 | `[[reduction]]` | 22 | Order-killing reductions and keyed lookups. |
 | `[[trusted]]` | 24 | Crates with no MIR available, modelled as pure taint-**propagators** rather than as `unknown`. |
 | `[[ambient_type]]` | 25 | Interior-mutable / lazily-initialised types whose `static` instances are ambient roots. |
-| `[[std_free_fn]]` | 0 | Escape hatch for a body-less free function whose whole signature is primitives, so no `std::`-rooted type at the call site identifies it as std. The table exists and is honoured; **no row is needed empirically** on this repo's corpus and examples. |
+| `[[std_free_fn]]` | 7 | Body-less **free** functions of std or of a `[[trusted]]` crate that rustc trims to one segment. A free function has no receiver, and the receiver is the only thing at a call site that is evidence about the callee, so this table is what the trust rule leaves over: `format`, `must_use`, `to_value`, `from_value`, `display`, `debug`, `task_duration`, each verified against the real callee text and declared types in a dump. |
 
 All **160** public methods of `impl WorkflowContext` are classified, not merely
 the **70** distinct ones this repo's examples happen to call
@@ -509,18 +509,41 @@ approximate, and a reader who quotes a verdict needs them.
   emitted. Treating every trimmed path as a boundary makes essentially **every**
   workflow `unknown`; treating every trimmed path as an opaque propagator is a
   silent `proven` on a dependency that reads the wall clock, which is what the
-  soundness review of this PR demonstrated. The discriminator shipped is the
-  **declared types at the call site**, which MIR always prints fully qualified. A
-  body-less callee is trusted as a pure taint-propagator iff one of four things
-  holds: a `std`/`core`/`alloc` or `[[trusted]]` crate root appears anywhere in
-  the callee text; the same appears in any declared type at the call site
-  (receiver, an argument, or the destination); the receiver is a primitive type
-  (the language reserves inherent impls on primitives, and rustc prints them
-  trimmed); or a `[[std_free_fn]]` row names it. Otherwise it is an
+  soundness review of this PR demonstrated. The discriminator shipped requires
+  evidence about the **callee**, never about the values flowing through it: an
+  argument or result type that is std-rooted says nothing, because
+  `now_ish() -> std::string::String` from a dependency compiled without
+  `--emit=mir` has exactly that shape. A body-less callee is trusted as a pure
+  taint-propagator iff one of four things holds: a `std`/`core`/`alloc` or
+  `[[trusted]]` crate root appears in the callee path text itself (the qualifying
+  trait of a `<T as std::future::IntoFuture>::into_future` included, turbofish
+  arguments excluded); the call is a **method** and the declared type of its
+  receiver argument — which MIR prints fully qualified even where the callee path
+  is trimmed, as `_17: &tracing::__macro_support::MacroCallsite` — is rooted
+  entirely in trusted crates, or, for an associated function with no receiver
+  argument, some declared type at the site spells the receiver type itself with
+  a trusted root (`DateTime::<Utc>::from_timestamp_millis` returns a
+  `std::option::Option<chrono::DateTime<chrono::Utc>>`); the receiver is a
+  primitive type (the language reserves inherent impls on primitives, and rustc
+  prints them trimmed); or a `[[std_free_fn]]` row names it. Otherwise it is an
   `external-crate-body` boundary. `[[std_free_fn]]` is the escape hatch for the
-  residue — a free function whose whole signature is primitives — and **no row is
-  needed empirically** on this repo. The reasoning is recorded at
+  residue the receiver rule cannot reach — **free** functions of std or of a
+  `[[trusted]]` crate, which have no receiver to reason about; measured on this
+  repo that residue is seven rows (`format`, `must_use`, `to_value`,
+  `from_value`, `display`, `debug`, `task_duration`), each verified against the
+  real callee text and declared types in a dump. The reasoning is recorded at
   `Analyzer::is_trusted_bodyless` in `autumn-harvest-verify/src/analysis/summary.rs`.
+- **Two names that print the same are kept apart, and unified when they cannot
+  be.** rustc 1.94-1.98 print a `static` item header, its `allocN (static: ..)`
+  footer and an impl body path with the module they sit in (`static b::COUNTER`,
+  `a::<impl at f.rs:30:5: 30:16>::run`), trimmed exactly the way a call site is,
+  so `a::COUNTER: u64` and `b::COUNTER: AtomicU64` — and `a::Worker::run` and
+  `b::Worker::run` — are told apart by their full printed path rather than by
+  their last segment. Where a printed name genuinely is ambiguous, the answer
+  covers every candidate instead of picking one: an ambiguous static read is
+  ambient if **any** candidate is, and an ambiguous impl method is analyzed in
+  all of its candidate bodies with the findings unioned (the trace carries
+  `[ambiguous impl (N candidates, unioned)]`). Both cases add a report warning.
 - **Sanitizer kills are per-place and monotone, not flow-sensitive.** Taint is a
   per-body fixpoint over places and the kill set only ever grows, so a `sort()`
   anywhere in a body kills `Order` taint on that place for the whole body,
@@ -563,14 +586,21 @@ reader who has to decide whether to trust a verdict needs the list that was not
 fixed, not only the list that was.
 
 1. **`<T as std::Trait>::m` on an unemitted dependency's type is trusted.** The
-   std-root test scans the whole callee text, so the qualifying trait name alone
-   is enough — a third-party type's `impl std::fmt::Display` body is treated as
-   std and never becomes a boundary.
+   trusted-root test scans the callee path text, so the qualifying trait name
+   alone is enough — a third-party type's `impl std::fmt::Display` body is
+   treated as std and never becomes a boundary. The narrower relative, a
+   dependency's *extension trait* on a std type (`impl DepExt for String`),
+   survives the receiver rule for the same reason: rustc trims both the self type
+   and the trait, so the receiver argument's `&std::string::String` is the only
+   thing printed and it is genuinely std.
 2. **Single-fn-name aliasing.** Bodies are indexed by their trimmed printed path.
    Two crates exporting the same bare name collapse onto one key, and
    `real_path_near` breaks the tie by proximity, falling back to the first
    indexed candidate. Deterministic, but arbitrary: a finding could name the
-   wrong file.
+   wrong file. Statics and impl methods are **not** in this class any more: they
+   are indexed by full printed path and by `(type, trait, method)` with the
+   impl's module, and a residual ambiguity is unioned rather than resolved by
+   proximity.
 3. **`MAX_FACTS = 6` per place is kind-blind.** Six `Value` facts saturating a
    place before an `Order` fact arrives would hide the order flow. No probe has
    made it bite, and no slot is reserved per `TaintKind`.

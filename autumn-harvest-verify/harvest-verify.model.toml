@@ -2228,27 +2228,62 @@ reason = "See `len`."
 # really is code the analysis never saw, and calling it "clean" is the silent
 # `proven` this table exists to prevent.
 #
-# std is the exception, because it is modelled by the tables above instead. The
-# analyzer recognises it from the *declared types* at the call site, which MIR
-# always prints fully qualified even where it trims the callee path
-# (`String::clone` has a `std::string::String` receiver; `format` has a
-# `std::string::String` destination), and from a primitive self type
-# (`<u64 as From<u32>>::from`). Those two rules cover every std call the corpus
-# and all 43 workspace examples make, which is why this table is currently
-# empty.
+# A trusted crate is the exception, because it is modelled by the tables above
+# instead. The analyzer recognises one from evidence about the CALLEE: either
+# the callee path names a trusted crate root itself (including the qualifying
+# trait of a `<T as std::future::IntoFuture>::into_future`), or the call is a
+# METHOD whose receiver type is a primitive (`<u64 as From<u32>>::from`) or is
+# declared at the call site with a trusted root — MIR prints `let` declarations
+# fully qualified even where it trims the callee path, so `String::clone`'s
+# `_9: &std::string::String` receiver says what `String` is.
 #
-# Add a row here when a run reports `unknown: external-crate-body: <path>` for a
-# std/core/alloc function whose whole signature is primitives, so no type at the
-# call site names its crate:
+# Declared ARGUMENT and RESULT types are deliberately not evidence. `now_ish()
+# -> std::string::String` from a dependency compiled without `--emit=mir` names
+# std in its result and is still a body the analysis never saw; treating that as
+# std was the silent `proven` this rule was tightened to prevent.
+#
+# What that leaves is FREE functions: with no receiver there is nothing at the
+# call site that names the callee's crate. Add a row here when a run reports
+# `unknown: external-crate-body: <path>` for a free function of std/core/alloc
+# or of a `[[trusted]]` crate, after checking the callee text and the declared
+# types in the dump to confirm which item it really is:
 #
 #   [[std_free_fn]]
 #   path = "some_free_fn"
-#   reason = "core::…::some_free_fn; takes and returns primitives, so no
-#             declared type at the call site is std-rooted."
+#   reason = "core::…::some_free_fn; a free function, so no receiver at the
+#             call site names its crate."
 #
 # `path` matches exactly as `[[source]] path` does: a `::`-segment suffix of the
 # callee path with generic arguments stripped. A row here says "this body is
-# std, propagate taint through it", never "this call is clean".
+# trusted, propagate taint through it", never "this call is clean".
+
+[[std_free_fn]]
+path = "format"
+reason = "alloc::fmt::format. `format!` lowers to `format(Arguments)`, printed with no crate root and no receiver; its `std::fmt::Arguments` argument and `std::string::String` result are the caller's types, not evidence about the callee. Verified in the dumps: `_5 = format(move _6)` with `_6: std::fmt::Arguments<'_>`. Without this row every workflow that formats a string is `unknown`."
+
+[[std_free_fn]]
+path = "must_use"
+reason = "core::hint::must_use — the identity function the `#[must_use]` lint desugars `format!` and friends through. Verified in the dumps: `_4 = must_use::<String>(move _5)` with `_5: std::string::String`, immediately after the `format` call whose result it forwards."
+
+[[std_free_fn]]
+path = "to_value"
+reason = "serde_json::to_value, a `[[trusted]]` crate's free function that rustc trims to one segment at every `#[workflow]` command-encoding site. Verified in the corpus dumps: `_35 = to_value::<&u64>(move _36)` with `_36: &u64` and `_35: std::result::Result<serde_json::Value, serde_json::Error>` — the crate is named only in the RESULT, which is not evidence about the callee. A structural walk over the value; the derived `Serialize` impls it calls are in the analyzed set when they are first-party."
+
+[[std_free_fn]]
+path = "from_value"
+reason = "serde_json::from_value, the decoding half of `to_value` and trimmed the same way. Verified in the dumps: `from_value::<bool>(move _N)` with a `serde_json::Value` argument and a `std::result::Result<bool, serde_json::Error>` destination — again the crate is named only in types that are the CALLER's, not the callee's."
+
+[[std_free_fn]]
+path = "display"
+reason = "tracing::field::display — what `tracing`'s `%field` sigil lowers to, printed as a bare `display::<&T>` with the *caller's* `T` as its only type. Verified in the dumps: `_36 = display::<&autumn_harvest::ExecutionId>(move _37)` with `_36: tracing::field::DisplayValue<..>`. The name is generic, but a user's own `fn display` with a body in the analyzed set is resolved to that body and never reaches this table."
+
+[[std_free_fn]]
+path = "debug"
+reason = "tracing::field::debug — the `?field` sigil's half of the pair above, and trimmed identically. Verified in the dumps: `_51 = debug::<&std::option::Option<autumn_harvest::ExecutionId>>(move _52)` with `_51: tracing::field::DebugValue<..>`."
+
+[[std_free_fn]]
+path = "task_duration"
+reason = "autumn_harvest::task_duration (`autumn-harvest/src/lib.rs`), a `[[trusted]]` crate's free function that parses a `&str` into an `Option<Duration>`. rustc trims it to one segment in every `#[activity]` info body. Verified in the dumps: `_4 = task_duration(move _5)` with `_5: &str` and `_4: std::option::Option<std::time::Duration>`. Pure string parsing: no clock, no ambient state."
 
 [[trusted]]
 name = "core"

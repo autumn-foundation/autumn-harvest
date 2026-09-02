@@ -460,16 +460,32 @@ The ones you are most likely to meet:
   own output would have told you. **Re-run the corpus after any toolchain
   change**; see
   [the R&D report](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot).
-- **A body-less callee is trusted only when the call site looks like std.**
+- **A body-less callee is trusted only on evidence about the callee itself.**
   rustc's trimmed paths make `format` or `String::clone` indistinguishable *by
-  name* from a first-party function whose MIR was not emitted, so the
-  discriminator is the declared types at the call site, which MIR prints fully
-  qualified. A body-less callee propagates taint silently when a
-  `std`/`core`/`alloc` or `[[trusted]]` root appears in the callee text or in any
-  declared type there, when the receiver is a primitive, or when a
-  `[[std_free_fn]]` row names it; otherwise it is an `external-crate-body`
-  boundary and you get `unknown`. The residual cost: `<T as std::Trait>::m` on a
-  third-party type is trusted on the strength of the trait name alone.
+  name* from a first-party function whose MIR was not emitted. The discriminator
+  is deliberately narrow, because a std-rooted argument or result type is not
+  evidence — `now_ish() -> std::string::String` from an unemitted dependency has
+  exactly that shape. A body-less callee propagates taint silently only when a
+  `std`/`core`/`alloc` or `[[trusted]]` root appears in the **callee path text**
+  (turbofish excluded), when it is a **method** whose receiver argument's declared
+  type is rooted entirely in trusted crates (or, for an associated function,
+  whose receiver type is spelled with a trusted root in some declared type at the
+  site), when the receiver is a primitive, or when a `[[std_free_fn]]` row names
+  it; otherwise it is an `external-crate-body` boundary and you get `unknown`.
+  `[[std_free_fn]]` therefore holds the **free** functions of std and of trusted
+  crates that rustc trims to one segment — seven rows here (`format`,
+  `must_use`, `to_value`, `from_value`, `display`, `debug`, `task_duration`). The
+  residual cost: `<T as std::Trait>::m` on a third-party type is trusted on the
+  strength of the trait name alone.
+- **Two names that print the same are kept apart, and unified when they cannot
+  be.** Statics are indexed by their full printed path (`a::COUNTER: u64` and
+  `b::COUNTER: AtomicU64` are two entries, not one) and impl methods by
+  `(type, trait, method)` plus the impl's module, disambiguated at a call site by
+  the module the caller wrote and by the receiver's declared type. When a printed
+  name is genuinely ambiguous the tool does not pick: an ambiguous static read is
+  ambient if **any** candidate is, an ambiguous impl method is analyzed in every
+  candidate body with the findings unioned, and either way the run prints a
+  `warning:` naming the collision.
 - **`tokio::select!` is invisible to it.** The macro leaves no residual token in
   MIR. HVG010/DET011 remain the gate for select-style racing.
 - **Sanitizer kills are per-place and monotone.** A `sort()` anywhere in a body

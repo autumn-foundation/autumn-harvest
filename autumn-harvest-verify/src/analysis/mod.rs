@@ -20,7 +20,23 @@ use taint::TaintSet;
 /// Analyze every entry and produce one verdict per workflow.
 #[must_use]
 pub fn analyze(program: &Program, model: &Model, entries: &[Entry]) -> Vec<WorkflowVerdict> {
+    analyze_with_warnings(program, model, entries).0
+}
+
+/// [`analyze`], plus the report warnings the run accumulated.
+///
+/// A warning here is always about an ambiguity the analysis resolved
+/// conservatively — two statics or two impl methods that share a printed name —
+/// so it never changes a verdict, but a run whose answer turned on a name
+/// collision should say which one.
+#[must_use]
+pub fn analyze_with_warnings(
+    program: &Program,
+    model: &Model,
+    entries: &[Entry],
+) -> (Vec<WorkflowVerdict>, Vec<String>) {
     let mut out = Vec::with_capacity(entries.len());
+    let mut warnings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in entries {
         let mut analyzer = Analyzer::new(program, model);
         let args: Vec<TaintSet> = Vec::new();
@@ -35,6 +51,7 @@ pub fn analyze(program: &Program, model: &Model, entries: &[Entry]) -> Vec<Workf
             std::mem::take(&mut analyzer.findings),
             std::mem::take(&mut analyzer.boundaries),
         ));
+        warnings.append(&mut analyzer.warnings);
     }
-    out
+    (out, warnings.into_iter().collect())
 }
