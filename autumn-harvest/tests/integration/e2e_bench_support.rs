@@ -581,6 +581,28 @@ pub fn pacing_verdict(target_per_sec: f64, achieved_per_sec: f64) -> Pacing {
     }
 }
 
+/// Whether a paced scenario held its target rate on **every** shard.
+///
+/// An aggregate rate cannot answer this. A sender that drives shard 0 at four
+/// times the per-shard target while shards 1-3 idle, then moves on, achieves
+/// exactly the aggregate target and is nowhere near the intended load shape —
+/// so the percentiles it produces describe a saturated single shard rather than
+/// the unsaturated sweep the page claims. The weakest shard decides.
+#[must_use]
+pub fn per_shard_pacing_verdict(target_per_shard: f64, achieved_per_shard: &[f64]) -> Pacing {
+    if achieved_per_shard.is_empty() {
+        return Pacing::Saturated;
+    }
+    if achieved_per_shard
+        .iter()
+        .all(|achieved| pacing_verdict(target_per_shard, *achieved) == Pacing::Held)
+    {
+        Pacing::Held
+    } else {
+        Pacing::Saturated
+    }
+}
+
 /// Outcome of comparing a fresh run against a published baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReproVerdict {
@@ -1562,6 +1584,29 @@ mod tests {
     }
 
     #[test]
+    fn pacing_must_hold_on_every_shard_not_merely_in_aggregate() {
+        assert_eq!(
+            per_shard_pacing_verdict(8.0, &[8.0, 8.0, 8.0, 8.0]),
+            Pacing::Held
+        );
+        // The regression this exists to catch (Codex review, PR #1282): a sender
+        // that drives one shard at 4x the per-shard target while the rest idle
+        // hits the aggregate target exactly, and would have passed an aggregate
+        // check while publishing a saturated single shard's percentiles.
+        assert_eq!(
+            per_shard_pacing_verdict(8.0, &[32.0, 0.0, 0.0, 0.0]),
+            Pacing::Saturated,
+            "one shard carrying the whole aggregate is not the documented load shape"
+        );
+        assert_eq!(
+            per_shard_pacing_verdict(8.0, &[8.0, 8.0, 8.0, 6.0]),
+            Pacing::Saturated,
+            "the weakest shard decides"
+        );
+        assert_eq!(per_shard_pacing_verdict(8.0, &[]), Pacing::Saturated);
+    }
+
+    #[test]
     fn reproduction_verdict_uses_the_published_tolerance() {
         assert_eq!(
             repro_verdict(100.0, 100.0, REPRO_TOLERANCE_PCT),
@@ -2095,8 +2140,9 @@ pub mod db {
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
         SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
         dispatch_population_soundness, inflight_soundness, latency_soundness, mean_inflight,
-        measured_samples, pacing_verdict, steady_state_slice, steady_state_throughput,
-        steady_state_window, throughput_soundness, warmup_batch_for, warmup_soundness,
+        measured_samples, pacing_verdict, per_shard_pacing_verdict, steady_state_slice,
+        steady_state_throughput, steady_state_window, throughput_soundness, warmup_batch_for,
+        warmup_soundness,
     };
 
     // ── Skip / provisioning ───────────────────────────────────────────────
@@ -3566,7 +3612,7 @@ pub mod db {
                 }
             }
         }
-        samples.sort_by(|a, b| a.0.cmp(&b.0));
+        samples.sort_by_key(|a| a.0);
         let ordered: Vec<f64> = samples.iter().map(|(_, ms)| *ms).collect();
         let kept = measured_samples(&ordered);
         let dispatch = LatencyStats::from_samples(kept);
@@ -3654,6 +3700,73 @@ pub mod db {
         })
     }
 
+    /// Signal every execution, **one paced sender per shard**, concurrently.
+    ///
+    /// Returns the per-execution send instants, the achieved rate for each
+    /// shard, and how many requests did not return 200.
+    ///
+    /// One sender per shard rather than one over a flattened list is the whole
+    /// point (Codex review, PR #1282). A single sender walking a
+    /// shard-by-shard list at the aggregate rate drives shard 0 at
+    /// `8 * shards` signals/sec while its peers sit idle, then moves on to
+    /// shard 1. The aggregate pacing check still passes, and the multi-shard
+    /// percentiles it publishes are those of one *saturated* shard rather than
+    /// of the unsaturated sweep the page describes. The per-shard rates
+    /// returned here are what [`per_shard_pacing_verdict`] checks, so that
+    /// failure mode is caught rather than averaged away.
+    async fn paced_signals(
+        addr: std::net::SocketAddr,
+        by_shard: &[Vec<ExecutionId>],
+        deadline: Instant,
+    ) -> (Vec<(ExecutionId, Instant)>, Vec<f64>, usize) {
+        let period = std::time::Duration::from_secs_f64(1.0 / PACED_STARTS_PER_SEC_PER_SHARD);
+        let mut tasks = Vec::with_capacity(by_shard.len());
+        for ids in by_shard {
+            let ids = ids.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(period);
+                // `Delay`, not `Burst`: a catch-up burst after a slow send
+                // would hide the saturation the verdict exists to detect.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let started = Instant::now();
+                let mut sent = Vec::with_capacity(ids.len());
+                let mut failures = 0_usize;
+                for exec_id in ids {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    ticker.tick().await;
+                    let (sent_at, status) =
+                        send_signal_over_http(addr, exec_id, BENCH_SIGNAL).await;
+                    if status != Some(200) {
+                        failures += 1;
+                    }
+                    sent.push((exec_id, sent_at));
+                }
+                // `interval`'s first tick fires immediately, so n sends span
+                // n-1 periods; dividing by n would overstate the achieved rate
+                // and bias this gate in the optimistic direction.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "signal counts here are far below 2^53"
+                )]
+                let achieved = (sent.len().saturating_sub(1)) as f64
+                    / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+                (sent, achieved, failures)
+            }));
+        }
+        let mut all_sent = Vec::new();
+        let mut achieved_per_shard = Vec::with_capacity(by_shard.len());
+        let mut failures = 0_usize;
+        for task in tasks {
+            let (sent, achieved, shard_failures) = task.await.expect("paced signal task");
+            all_sent.extend(sent);
+            achieved_per_shard.push(achieved);
+            failures += shard_failures;
+        }
+        (all_sent, achieved_per_shard, failures)
+    }
+
     /// **Scenario (c).** Signal round-trip: HTTP request sent -> the workflow's
     /// own code resumes past `wait_for_signal`.
     ///
@@ -3694,10 +3807,15 @@ pub mod db {
         };
 
         let warm_per_shard = warmup_batch_for(SIGNAL_WORKFLOWS_PER_SHARD);
-        let mut warm_ids = Vec::new();
-        let mut measured_ids = Vec::new();
+        // Kept GROUPED BY SHARD, not flattened. Signalling a flat list from one
+        // paced sender drives shard 0 at the whole aggregate rate while its
+        // peers idle, then moves on to shard 1 -- the aggregate pace looks
+        // right and the load shape is nothing like the documented one, so the
+        // percentiles describe a saturated single shard. See `paced_signals`.
+        let mut warm_by_shard: Vec<Vec<ExecutionId>> = Vec::new();
+        let mut measured_by_shard: Vec<Vec<ExecutionId>> = Vec::new();
         for shard in &shards {
-            warm_ids.extend(
+            warm_by_shard.push(
                 seed_workflows(
                     &cluster,
                     *shard,
@@ -3707,7 +3825,7 @@ pub mod db {
                 )
                 .await,
             );
-            measured_ids.extend(
+            measured_by_shard.push(
                 seed_workflows(
                     &cluster,
                     *shard,
@@ -3718,7 +3836,9 @@ pub mod db {
                 .await,
             );
         }
-        let total = warm_ids.len() + measured_ids.len();
+        let warm_count: usize = warm_by_shard.iter().map(Vec::len).sum();
+        let measured_count: usize = measured_by_shard.iter().map(Vec::len).sum();
+        let total = warm_count + measured_count;
 
         // Every run must be genuinely parked before its signal, or the sample
         // includes the workflow's own first dispatch instead of the round trip.
@@ -3740,49 +3860,18 @@ pub mod db {
         // is closed.
         tokio::time::sleep(SIGNAL_PARK_SETTLE).await;
 
-        let target = PACED_STARTS_PER_SEC_PER_SHARD * f64::from(shard_count);
-        let period = std::time::Duration::from_secs_f64(1.0 / target);
-
         // Warmup cohort: signalled through the identical path, and every sample
         // discarded. Keeping the two cohorts separate — rather than signalling
         // one list and trimming a fraction off the front — is what makes "the
         // published percentiles contain no warmup sample" true by construction.
-        let mut warm_ticker = tokio::time::interval(period);
-        warm_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        for exec_id in &warm_ids {
-            if Instant::now() >= deadline {
-                break;
-            }
-            warm_ticker.tick().await;
-            let _ = send_signal_over_http(server.addr, *exec_id, BENCH_SIGNAL).await;
-        }
-        let warm_drained = wait_for_completions(&cluster, "warm", warm_ids.len(), deadline).await;
+        paced_signals(server.addr, &warm_by_shard, deadline).await;
+        let warm_drained = wait_for_completions(&cluster, "warm", warm_count, deadline).await;
 
-        let mut ticker = tokio::time::interval(period);
-        // `Delay`, not `Burst`: see `paced_seed`.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let signalling_started = Instant::now();
-        let mut sent: Vec<(ExecutionId, Instant)> = Vec::with_capacity(measured_ids.len());
-        let mut failures = 0_usize;
-        for exec_id in &measured_ids {
-            if Instant::now() >= deadline {
-                break;
-            }
-            ticker.tick().await;
-            let (sent_at, status) =
-                send_signal_over_http(server.addr, *exec_id, BENCH_SIGNAL).await;
-            if status != Some(200) {
-                failures += 1;
-            }
-            sent.push((*exec_id, sent_at));
-        }
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "signal counts here are far below 2^53"
-        )]
-        let achieved = sent.len() as f64 / signalling_started.elapsed().as_secs_f64();
+        let (sent, achieved_per_shard, failures) =
+            paced_signals(server.addr, &measured_by_shard, deadline).await;
+        let achieved: f64 = achieved_per_shard.iter().sum();
 
-        let per_shard = wait_for_completions(&cluster, "meas", measured_ids.len(), deadline).await;
+        let per_shard = wait_for_completions(&cluster, "meas", measured_count, deadline).await;
 
         let mut samples: Vec<(Instant, f64)> = Vec::new();
         let mut unobserved = 0_usize;
@@ -3800,7 +3889,7 @@ pub mod db {
         let roundtrip = LatencyStats::from_samples(&ordered);
 
         let mut unsound = latency_soundness(roundtrip.count, 0, 0);
-        unsound.extend(warmup_soundness("signal", warm_ids.len(), &warm_drained));
+        unsound.extend(warmup_soundness("signal", warm_count, &warm_drained));
         if parked < total {
             unsound.push(format!(
                 "only {parked} of {total} workflows had parked on the signal before signalling \
@@ -3815,18 +3904,26 @@ pub mod db {
                 "{unobserved} signalled workflow(s) never recorded an observation"
             ));
         }
-        if sent.len() < measured_ids.len() {
+        if sent.len() < measured_count {
             unsound.push(format!(
-                "the scenario budget ran out after {} of {} signals",
+                "the scenario budget ran out after {} of {measured_count} signals",
                 sent.len(),
-                measured_ids.len()
             ));
         }
         let completed = usize::try_from(per_shard.iter().sum::<u64>()).unwrap_or(0);
         unsound.extend(throughput_soundness(sent.len(), completed, &per_shard));
-        if pacing_verdict(target, achieved) == Pacing::Saturated {
+        if per_shard_pacing_verdict(PACED_STARTS_PER_SEC_PER_SHARD, &achieved_per_shard)
+            == Pacing::Saturated
+        {
             unsound.push(format!(
-                "paced at {target:.1} signals/s but only achieved {achieved:.1}/s"
+                "paced at {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard but achieved \
+                 {}/s — every shard must hold the pace, or these percentiles describe a \
+                 saturated shard rather than the sweep",
+                achieved_per_shard
+                    .iter()
+                    .map(|a| format!("{a:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ));
         }
 
@@ -3856,11 +3953,18 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
-                    format!("target pace: {target:.1} signals/s"),
                     format!(
-                        "{} measured signals after a discarded warmup cohort of {}",
-                        measured_ids.len(),
-                        warm_ids.len()
+                        "target pace: {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard, \
+                         one paced sender per shard running concurrently; achieved {}/s",
+                        achieved_per_shard
+                            .iter()
+                            .map(|a| format!("{a:.1}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    format!(
+                        "{measured_count} measured signals after a discarded warmup cohort of \
+                         {warm_count}"
                     ),
                     wall_clock_note,
                 ],
