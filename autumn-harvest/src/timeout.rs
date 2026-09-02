@@ -2232,9 +2232,39 @@ pub async fn enforce_workflow_sla_breaches(
 enum DeliveryRoute {
     /// Deliver on the caller's own connection — the target lives in the same
     /// database the sweep is already running against.
-    Caller,
+    Caller {
+        /// See [`DeliveryRoute::CrossShard::expected_live`].
+        expected_live: bool,
+    },
     /// Deliver on a fresh connection from `shard`'s pool.
-    CrossShard(crate::types::ShardId),
+    CrossShard {
+        /// The shard whose database holds the resolved run.
+        shard: crate::types::ShardId,
+        /// The cross-shard resolution found a **live** run on `shard`
+        /// (issue #1146, Codex round 1 P2).
+        ///
+        /// The delivery attempt re-resolves shard-locally on `shard` — which it
+        /// must, to catch a continue-as-new that lands between resolution and
+        /// delivery (issue #751). But a *shard-local* re-read cannot see the
+        /// key move shards: if the live run on `shard` terminates and a new run
+        /// of the same key starts on another shard in that window — reachable
+        /// after writable-set drift or a placement change — the re-read sees
+        /// only the old terminal run. Recording its verdict would durably fail
+        /// the signal `not_running`, or report a cancel as a no-op success,
+        /// against a run that is alive elsewhere.
+        ///
+        /// So when this is `true` and the shard-local read comes back
+        /// terminal-or-absent, the two views disagree and the delivery is left
+        /// **pending** instead: the next sweep re-resolves globally and finds
+        /// wherever the key went. This terminates — once the key really is
+        /// terminal everywhere, the global winner is terminal, this is `false`,
+        /// and the shard-local verdict is recorded as before.
+        ///
+        /// `false` whenever no global resolution ran: `ExecutionId` targets,
+        /// and the single-shard short-circuit (where "another shard" does not
+        /// exist). Both then behave exactly as they did pre-#1146.
+        expected_live: bool,
+    },
     /// Every expected shard was inspected and none holds a run for this
     /// business key. The caller applies its not-found policy (leave pending
     /// inside the grace window, `target_unknown` once it elapses).
@@ -2294,7 +2324,9 @@ async fn resolve_delivery_route(
     uninspectable: &crate::external_target_location::UninspectableShards,
 ) -> DeliveryRoute {
     let Some(pool) = sharded_pool else {
-        return DeliveryRoute::Caller;
+        return DeliveryRoute::Caller {
+            expected_live: false,
+        };
     };
 
     let caller_shard = if caller_exec_id.shard().is_unencoded() {
@@ -2303,14 +2335,16 @@ async fn resolve_delivery_route(
         caller_exec_id.shard()
     };
 
-    let target_shard = match target {
+    let (target_shard, expected_live) = match target {
         ExternalTarget::ExecutionId(id) => {
             let encoded = id.shard();
-            if encoded.is_unencoded() {
+            let shard = if encoded.is_unencoded() {
                 pool.default_shard()
             } else {
                 encoded
-            }
+            };
+            // Authoritative by construction; nothing was resolved by observation.
+            (shard, false)
         }
         ExternalTarget::WorkflowId {
             workflow_name,
@@ -2327,7 +2361,10 @@ async fn resolve_delivery_route(
             // comparison below with that single shard, which reproduces the
             // pre-#1146 route exactly.
             if let [only] = expected.as_slice() {
-                *only
+                // No global resolution ran, so there is no live-run expectation
+                // to compare a shard-local read against — and with one shard
+                // there is nowhere else for the key to be.
+                (*only, false)
             } else {
                 match crate::external_target_location::resolve_location_by_workflow_id_with(
                     pool,
@@ -2339,7 +2376,9 @@ async fn resolve_delivery_route(
                 )
                 .await
                 {
-                    crate::external_target_location::TargetLocation::Found { shard, .. } => shard,
+                    crate::external_target_location::TargetLocation::Found { shard, run } => {
+                        (shard, !crate::erase::is_terminal_state(&run.state))
+                    }
                     crate::external_target_location::TargetLocation::NotFound => {
                         return DeliveryRoute::NoRunAnywhere;
                     }
@@ -2376,13 +2415,64 @@ async fn resolve_delivery_route(
         pool.exact_pool_for_execution(caller_exec_id),
     ) {
         (Some(target_pool), Some(caller_pool)) if std::ptr::eq(target_pool, caller_pool) => {
-            DeliveryRoute::Caller
+            DeliveryRoute::Caller { expected_live }
         }
-        (Some(_), _) => DeliveryRoute::CrossShard(target_shard),
+        (Some(_), _) => DeliveryRoute::CrossShard {
+            shard: target_shard,
+            expected_live,
+        },
         (None, _) => DeliveryRoute::Retry {
             reason: format!("target shard {target_shard} has no storage pool in this process"),
         },
     }
+}
+
+/// What to do with a shard-local by-id delivery outcome, once the cross-shard
+/// resolution's view is taken into account (issue #1146, Codex round 1 P2).
+///
+/// Split out as a pure function for the same reason
+/// `worker::classify_cross_shard_continue_as_new` and `classify_successor_slot`
+/// are: the interesting cases are a matrix over two inputs, and the window that
+/// produces the interesting ones — the key moving shards between the global
+/// resolution and the shard-local delivery read — is microseconds wide and has
+/// no test seam. Classifying here makes the matrix exhaustively testable
+/// without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByIdVerdict {
+    /// Record the outcome the shard-local read reported.
+    Record,
+    /// The two views disagree, or the target is momentarily unresolvable.
+    /// Leave the row pending so a later sweep re-resolves globally.
+    LeavePending,
+    /// No run found anywhere: apply the caller's grace-window policy.
+    NotFoundPolicy,
+}
+
+/// The by-id verdict for one shard-local outcome.
+///
+/// `resolved_terminal`/`resolved_absent` describe what the *shard-local* read
+/// found; `expected_live` is whether the cross-shard resolution had just seen a
+/// **live** run on this same shard.
+///
+/// The one non-obvious row is `expected_live && (terminal || absent)`. The two
+/// reads disagree, and only one of them can see across shards — so the
+/// shard-local verdict is not evidence the key is dead, it is evidence the key
+/// moved. Recording it would durably fail a signal `not_running`, or report a
+/// cancel as a no-op success, against a run alive on another shard. Retrying
+/// terminates: once the key really is terminal everywhere, the global winner is
+/// terminal too, `expected_live` is `false`, and the verdict is recorded.
+const fn classify_by_id_outcome(
+    expected_live: bool,
+    resolved_terminal: bool,
+    resolved_absent: bool,
+) -> ByIdVerdict {
+    if expected_live && (resolved_terminal || resolved_absent) {
+        return ByIdVerdict::LeavePending;
+    }
+    if resolved_absent {
+        return ByIdVerdict::NotFoundPolicy;
+    }
+    ByIdVerdict::Record
 }
 
 /// Attempt one signal delivery to `target` on `conn` (issue #751).
@@ -2393,15 +2483,36 @@ async fn resolve_delivery_route(
 /// ("leave pending, retry on the next sweep") rather than propagated — a
 /// transient failure delivering to ONE row must not abort the scan of every
 /// other pending row.
+/// One pending outbox signal, bundled so [`attempt_signal_delivery`] stays under
+/// clippy's argument-count ceiling — the same shape
+/// [`CancelDeliveryAccumulators`] took for the cancel side (issue #751).
+struct SignalDeliveryRequest<'a> {
+    /// Who to deliver to.
+    target: &'a ExternalTarget,
+    /// The caller's correlation id, echoed into the terminal event.
+    signal_id: crate::types::ExternalSignalId,
+    /// Signal name and payload as recorded on the `ExternalSignalRequested`.
+    signal_name: &'a str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&'a str>,
+    /// Whether the cross-shard resolution saw a **live** run on the shard this
+    /// attempt is running against — see [`DeliveryRoute::CrossShard`].
+    expected_live: bool,
+}
+
 async fn attempt_signal_delivery(
     conn: &mut AsyncPgConnection,
-    target: &ExternalTarget,
-    signal_id: crate::types::ExternalSignalId,
-    signal_name: &str,
-    payload: serde_json::Value,
-    idempotency_key: Option<&str>,
+    request: SignalDeliveryRequest<'_>,
     not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
 ) -> Option<WorkflowEvent> {
+    let SignalDeliveryRequest {
+        target,
+        signal_id,
+        signal_name,
+        payload,
+        idempotency_key,
+        expected_live,
+    } = request;
     match target {
         ExternalTarget::ExecutionId(target_id) => {
             match crate::signal::send_signal_idempotent(
@@ -2445,18 +2556,45 @@ async fn attempt_signal_delivery(
             Ok(crate::signal::ByIdSignalOutcome::Delivered) => {
                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
             }
-            // No run has ever existed for this business key — subject to
-            // the same grace window as an `ExecutionId`'s `NotFound`.
-            Ok(crate::signal::ByIdSignalOutcome::NoRunFound) => not_found_terminal(),
+            // No run has ever existed for this business key — subject to the
+            // same grace window as an `ExecutionId`'s `NotFound`, unless the
+            // resolution just saw a live run here (see
+            // `classify_by_id_outcome`).
+            Ok(crate::signal::ByIdSignalOutcome::NoRunFound) => {
+                match classify_by_id_outcome(expected_live, false, true) {
+                    ByIdVerdict::NotFoundPolicy => not_found_terminal(),
+                    ByIdVerdict::LeavePending | ByIdVerdict::Record => None,
+                }
+            }
             // The current run for this business key is already terminal — a
             // genuine, immediate failure (unlike cancel, a signal's goal is
             // never already met by a terminal target), never gated by the
             // grace window (issue #751 AC4).
+            //
+            // UNLESS the cross-shard resolution just saw a LIVE run here
+            // (issue #1146, Codex round 1 P2): the two views disagree, which
+            // means the key moved shards between the two reads, and this
+            // shard-local read cannot see where it went. Leave the row pending
+            // so the next sweep re-resolves globally rather than durably
+            // failing a signal whose target is alive elsewhere.
             Ok(crate::signal::ByIdSignalOutcome::NotRunning) => {
-                Some(WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code: "not_running".to_string(),
-                })
+                match classify_by_id_outcome(expected_live, true, false) {
+                    ByIdVerdict::LeavePending => {
+                        tracing::warn!(
+                            workflow_name,
+                            workflow_id,
+                            "by-id signal: resolution saw a live run but the shard-local read \
+                             found it terminal; re-resolving on the next sweep"
+                        );
+                        None
+                    }
+                    ByIdVerdict::Record | ByIdVerdict::NotFoundPolicy => {
+                        Some(WorkflowEvent::ExternalSignalFailed {
+                            signal_id,
+                            reason_code: "not_running".to_string(),
+                        })
+                    }
+                }
             }
             Err(HarvestError::Database(e)) => {
                 tracing::error!(error = %e, "outbox sweep: db error during by-id signal delivery");
@@ -2616,19 +2754,25 @@ pub async fn enforce_external_signals_outbox(
                 .await;
 
                 let terminal_opt = match route {
-                    DeliveryRoute::Caller => {
+                    DeliveryRoute::Caller { expected_live } => {
                         attempt_signal_delivery(
                             conn,
-                            &target,
-                            signal_id,
-                            &signal_name,
-                            payload.clone(),
-                            idempotency_key.as_deref(),
+                            SignalDeliveryRequest {
+                                target: &target,
+                                signal_id,
+                                signal_name: &signal_name,
+                                payload: payload.clone(),
+                                idempotency_key: idempotency_key.as_deref(),
+                                expected_live,
+                            },
                             not_found_terminal,
                         )
                         .await
                     }
-                    DeliveryRoute::CrossShard(target_shard) => {
+                    DeliveryRoute::CrossShard {
+                        shard: target_shard,
+                        expected_live,
+                    } => {
                         let Some(pool) = active_sharded_pool
                             .as_ref()
                             .and_then(|p| p.exact_pool_for(target_shard))
@@ -2640,21 +2784,45 @@ pub async fn enforce_external_signals_outbox(
                             return Ok(Some((false, Some(row.id))));
                         };
 
-                        let mut target_conn = match pool.get().await {
-                            Ok(c) => c,
-                            Err(e) => {
+                        // Bounded for the same reason the fan-out is (issue
+                        // #1146, Codex round 1 P1): this is a peer pool reached
+                        // while holding a connection from another pool in the
+                        // same process, and one timeout checker runs per
+                        // assigned shard. An unbounded wait here lets two
+                        // checkers hold each other's only connection. This
+                        // acquisition predates #1146 — it has always served
+                        // cross-shard `ExecutionId` delivery — and was
+                        // unbounded until now.
+                        let mut target_conn = match tokio::time::timeout(
+                            crate::external_target_location::FANOUT_ACQUIRE_BOUND,
+                            pool.get(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
                                 tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %target_shard,
+                                    "outbox sweep: no connection available for the target shard; leaving row pending"
+                                );
                                 return Ok(Some((false, Some(row.id))));
                             }
                         };
 
                         attempt_signal_delivery(
                             &mut target_conn,
-                            &target,
-                            signal_id,
-                            &signal_name,
-                            payload.clone(),
-                            idempotency_key.as_deref(),
+                            SignalDeliveryRequest {
+                                target: &target,
+                                signal_id,
+                                signal_name: &signal_name,
+                                payload: payload.clone(),
+                                idempotency_key: idempotency_key.as_deref(),
+                                expected_live,
+                            },
                             not_found_terminal,
                         )
                         .await
@@ -2763,6 +2931,7 @@ async fn attempt_cancel_delivery(
     reason: &str,
     not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
     acc: &mut CancelDeliveryAccumulators,
+    expected_live: bool,
 ) -> Option<WorkflowEvent> {
     match target {
         ExternalTarget::ExecutionId(target_id) => {
@@ -2809,11 +2978,36 @@ async fn attempt_cancel_delivery(
                     }
                     Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
-                // Already terminal = no-op success (goal already met).
+                // Already terminal = no-op success (goal already met) —
+                // UNLESS the cross-shard resolution just saw a LIVE run on this
+                // shard (issue #1146, Codex round 1 P2). The two views disagree,
+                // so the key moved shards between the reads and this
+                // shard-local read cannot see where. Reporting success here
+                // would durably record a cancellation that never reached the
+                // run that is actually alive. Leave it pending; the next sweep
+                // re-resolves globally.
                 Ok(crate::execution::ByIdCancelOutcome::AlreadyTerminal) => {
-                    Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                    match classify_by_id_outcome(expected_live, true, false) {
+                        ByIdVerdict::LeavePending => {
+                            tracing::warn!(
+                                workflow_name,
+                                workflow_id,
+                                "by-id cancel: resolution saw a live run but the shard-local \
+                                 read found it terminal; re-resolving on the next sweep"
+                            );
+                            None
+                        }
+                        ByIdVerdict::Record | ByIdVerdict::NotFoundPolicy => {
+                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                        }
+                    }
                 }
-                Ok(crate::execution::ByIdCancelOutcome::NoRunFound) => not_found_terminal(),
+                Ok(crate::execution::ByIdCancelOutcome::NoRunFound) => {
+                    match classify_by_id_outcome(expected_live, false, true) {
+                        ByIdVerdict::NotFoundPolicy => not_found_terminal(),
+                        ByIdVerdict::LeavePending | ByIdVerdict::Record => None,
+                    }
+                }
                 Err(HarvestError::Database(e)) => {
                     tracing::error!(
                         error = %e,
@@ -3018,7 +3212,7 @@ pub async fn enforce_external_cancels_outbox(
 
                 let mut target_conn_opt = None;
                 let terminal_opt = match route {
-                    DeliveryRoute::Caller => {
+                    DeliveryRoute::Caller { expected_live } => {
                     attempt_cancel_delivery(
                         conn,
                         &target,
@@ -3026,6 +3220,7 @@ pub async fn enforce_external_cancels_outbox(
                         "cancelled by external request",
                         not_found_terminal,
                         &mut acc,
+                        expected_live,
                     )
                     .await
                     }
@@ -3041,7 +3236,10 @@ pub async fn enforce_external_cancels_outbox(
                         );
                         return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     }
-                    DeliveryRoute::CrossShard(target_shard) => {
+                    DeliveryRoute::CrossShard {
+                        shard: target_shard,
+                        expected_live,
+                    } => {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
                         .and_then(|p| p.exact_pool_for(target_shard))
@@ -3053,10 +3251,24 @@ pub async fn enforce_external_cancels_outbox(
                         return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     };
 
-                    let mut target_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
+                    // Bounded for the same reason as the signal outbox above
+                    // (issue #1146, Codex round 1 P1).
+                    let mut target_conn = match tokio::time::timeout(
+                        crate::external_target_location::FANOUT_ACQUIRE_BOUND,
+                        pool.get(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
                             tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                %target_shard,
+                                "cancel outbox sweep: no connection available for the target shard; leaving row pending"
+                            );
                             return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                         }
                     };
@@ -3068,6 +3280,7 @@ pub async fn enforce_external_cancels_outbox(
                         "cancelled by external request",
                         not_found_terminal,
                         &mut acc,
+                        expected_live,
                     )
                     .await;
                     // Keep the target connection open past this branch: for
@@ -4224,6 +4437,76 @@ pub async fn enforce_workflow_history_ceiling(
 
 #[cfg(test)]
 mod tests {
+    // ── by-id shard-local vs. cross-shard disagreement (issue #1146) ──────
+
+    #[test]
+    fn an_agreeing_shard_local_read_is_recorded() {
+        // Resolution saw a terminal winner; the shard-local read agrees. This
+        // is issue #751's ordinary `not_running` / no-op-success case and must
+        // stay exactly as it was.
+        assert_eq!(
+            classify_by_id_outcome(false, true, false),
+            ByIdVerdict::Record
+        );
+    }
+
+    #[test]
+    fn an_absent_key_with_no_live_expectation_follows_the_grace_window() {
+        assert_eq!(
+            classify_by_id_outcome(false, false, true),
+            ByIdVerdict::NotFoundPolicy
+        );
+    }
+
+    #[test]
+    fn a_terminal_read_against_a_live_expectation_is_left_pending() {
+        // THE regression. The cross-shard resolution saw a live run on this
+        // shard; the shard-local re-read says terminal. Only the resolution can
+        // see across shards, so this is evidence the key MOVED, not that it
+        // died. Recording it would durably fail a signal `not_running` — or
+        // report a cancel as a no-op success — against a run alive elsewhere.
+        assert_eq!(
+            classify_by_id_outcome(true, true, false),
+            ByIdVerdict::LeavePending
+        );
+    }
+
+    #[test]
+    fn an_absent_read_against_a_live_expectation_is_left_pending() {
+        // Same disagreement, and in particular NOT the grace-window path: a
+        // shard that just held a live run reporting the key absent must never
+        // start the clock toward a permanent `target_unknown`.
+        assert_eq!(
+            classify_by_id_outcome(true, false, true),
+            ByIdVerdict::LeavePending
+        );
+    }
+
+    #[test]
+    fn a_live_expectation_met_by_a_live_read_is_recorded() {
+        assert_eq!(
+            classify_by_id_outcome(true, false, false),
+            ByIdVerdict::Record
+        );
+    }
+
+    #[test]
+    fn the_disagreement_rule_terminates() {
+        // `LeavePending` retries, so the rule must not be able to retry
+        // forever. It cannot: a retry re-resolves globally, and once the key is
+        // terminal everywhere the global winner is terminal too, which is
+        // `expected_live == false` — the recorded row above.
+        assert_eq!(
+            classify_by_id_outcome(true, true, false),
+            ByIdVerdict::LeavePending
+        );
+        assert_eq!(
+            classify_by_id_outcome(false, true, false),
+            ByIdVerdict::Record,
+            "the very next sweep's classification, once the global view agrees"
+        );
+    }
+
     use super::*;
 
     // ── force_fail_activity classification truth table (issue #765) ────────

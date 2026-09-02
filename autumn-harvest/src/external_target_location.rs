@@ -264,6 +264,38 @@ pub fn merge_locations(
     TargetLocation::Found { shard, run: winner }
 }
 
+/// How long a fan-out will wait for a **peer** shard's connection before giving
+/// up on that shard for this attempt (issue #1146, Codex round 1 P1).
+///
+/// Deliberately far shorter than [`crate::audit_export::SHARD_ACQUIRE_BOUND`],
+/// and for a different reason. That bound exists to stop an *indefinite* park
+/// and is generous on purpose, so a merely-busy shard is not starved. This one
+/// exists to stop a **circular wait between per-shard scanners in one process**,
+/// where being generous is the problem rather than the cure.
+///
+/// The cycle: `Worker` spawns one timeout checker per assigned shard, and each
+/// holds its own shard pool's connection for the whole `enforce_timeouts_once`
+/// pass. With `shard_assignments = [0, 1]` and one connection per pool, checker
+/// 0 can sit waiting for pool 1 while checker 1 waits for pool 0. Nothing is
+/// deadlocked — both bounds expire — but with a generous bound both scanners
+/// stall for it on every tick, delaying every other scanner resident, and by-id
+/// delivery makes no progress. Failing fast means neither ever *waits* on the
+/// other, so the cycle cannot form: a peer whose only connection is busy right
+/// now is simply uninspected, the row is retried, and the next tick — whose
+/// phase has drifted — finds the pool free.
+///
+/// **The deterministic answer is capacity, not timing.** A process that runs
+/// checkers for more than one shard should size each shard pool at **2 or
+/// more**: one connection for that shard's own scanner, one for a peer's
+/// cross-shard read. `docs/sharding.md` says so. This bound is what keeps a
+/// deployment that has not done so degraded rather than stalled.
+///
+/// Note the same circular shape applies to the *delivery* acquisition in the
+/// outbox scanners, which predates this issue (it existed for cross-shard
+/// `ExecutionId` targets) and was unbounded; `timeout.rs` now bounds it with
+/// this constant too.
+pub const FANOUT_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Shards a sweep has already found uninspectable, memoized for the length of
 /// that sweep (issue #1146).
 ///
@@ -401,11 +433,11 @@ pub async fn resolve_location_by_workflow_id_with(
             continue;
         };
 
-        // 3. Bounded acquisition. An unbounded `pool.get()` here would convert
-        //    an unreachable or saturated shard into an indefinite park inside
-        //    the caller's open transaction.
-        let acquired =
-            tokio::time::timeout(crate::audit_export::SHARD_ACQUIRE_BOUND, shard_pool.get()).await;
+        // 3. Tightly bounded acquisition — see `FANOUT_ACQUIRE_BOUND`. This is a
+        //    peer pool, reached while holding a connection from another pool in
+        //    the same process, so it must fail fast rather than wait out
+        //    contention.
+        let acquired = tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await;
         let mut conn = match acquired {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
@@ -418,8 +450,8 @@ pub async fn resolve_location_by_workflow_id_with(
             }
             Err(_elapsed) => {
                 let reason = format!(
-                    "connection acquisition exceeded {:?}",
-                    crate::audit_export::SHARD_ACQUIRE_BOUND
+                    "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy or \
+                     unreachable)"
                 );
                 if let Some(memo) = memo {
                     memo.record(shard, reason.clone());

@@ -114,6 +114,40 @@ clone per management-API request. The new type is `TargetLocation`, not
 an observation of where existing work is, and confusing the two is what issue
 #1146 *is*.
 
+**Codex round 1 (one P1, one P2, both real).** The P1 is the second act of the
+connection story above. Bounding the fan-out's acquisitions stopped an
+*indefinite* park but left a circular one: `Worker` runs one timeout checker per
+assigned shard, each holding its own pool's connection for the whole pass, so a
+process assigned two shards with one connection per pool has checker 0 waiting
+on pool 1 while checker 1 waits on pool 0. Both bounds expire, both memoize the
+peer, nothing delivers — and with the generous 5s scanner bound both scanners
+stall for it every tick. Peer acquisitions now use a tight
+`FANOUT_ACQUIRE_BOUND` instead, so neither scanner ever *waits* on the other and
+the cycle cannot form; the row is retried on the next tick, whose phase has
+drifted. The same circular shape applies to the cross-shard *delivery*
+acquisition, which predates this issue entirely (it has always served
+`ExecutionId` targets) and was unbounded — now bounded with the same constant.
+`docs/sharding.md` states the deterministic answer: a process polling several
+shards should size each shard pool at 2 or more.
+
+The P2 is a correctness bug of exactly the class this issue exists to remove.
+`resolve_delivery_route` kept only the resolved *shard* and let the delivery
+attempt re-resolve shard-locally — which it must, to catch a continue-as-new.
+But a shard-local re-read cannot see the key move shards: if the live run
+terminates and a new run of the same key starts elsewhere in that window, the
+re-read sees only the old terminal run, and its verdict is a permanent
+`not_running` for a signal, or a no-op success for a cancel, against a run that
+is alive. The route now carries whether the resolution saw a **live** run, and a
+shard-local read that disagrees leaves the row pending for a global re-resolve
+instead of recording anything. It terminates by construction: once the key is
+terminal everywhere the global winner is terminal, the expectation is `false`,
+and the verdict is recorded as before. The rule is a pure `classify_by_id_outcome`
+with an exhaustive unit matrix — the window it guards is microseconds wide and
+has no test seam, so the classifier is split out for the same reason
+`worker::classify_cross_shard_continue_as_new` is. (A randomized end-to-end race
+test was written first and **discarded**: it passed with the fix disabled, because
+the seal never landed inside the window. It would have been evidence of nothing.)
+
 **Deliberate non-fix: an unreachable shard stalls by-id delivery without a
 bound.** `target_unknown` goes into an append-only history and cannot be taken
 back, so it is recorded only from a *complete* fan-out. The consequence is that a

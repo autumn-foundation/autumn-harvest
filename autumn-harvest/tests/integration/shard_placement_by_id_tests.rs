@@ -1433,3 +1433,87 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
     worker.shutdown();
     let _ = handle.await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 7. Codex round 1 regressions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // Codex round 1 P1: `Worker` spawns one timeout checker per assigned shard,
+    // and each holds its own shard pool's connection for the whole
+    // `enforce_timeouts_once` pass. With one connection per pool, checker 0
+    // waiting on pool 1 while checker 1 waits on pool 0 is a circular wait.
+    // Bounding it at `SHARD_ACQUIRE_BOUND` (5s) made it survivable but still
+    // cost both scanners that stall on every tick; `FANOUT_ACQUIRE_BOUND` makes
+    // the fan-out decline to wait at all, so the cycle cannot form.
+    //
+    // Modelled here by holding shard 1's only connection for the whole sweep —
+    // standing in for the peer checker that would be holding it.
+    let one_conn_pools: BTreeMap<ShardId, DbPool> = shards
+        .urls
+        .iter()
+        .map(|(shard, url)| (*shard, build_pool_with_max_size(url, 1)))
+        .collect();
+    let sharded = ShardedDbPool::from_map(one_conn_pools.clone(), ShardId::new(0));
+
+    let workflow_id = key_hashing_to(&router, "busy_peer_wf", "busy", ShardId::new(0));
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    {
+        let mut seed = shards.conn(ShardId::new(0)).await;
+        seed_signal_caller(
+            &mut seed,
+            caller,
+            "busy-caller",
+            "busy_peer_wf",
+            &workflow_id,
+        )
+        .await;
+    }
+
+    // Shard 1's sole connection is checked out and held.
+    let _peer_hog = one_conn_pools[&ShardId::new(1)]
+        .get()
+        .await
+        .expect("hold the peer shard's only connection");
+
+    let mut pooled = one_conn_pools[&ShardId::new(0)]
+        .get()
+        .await
+        .expect("the caller shard's only connection");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let started = std::time::Instant::now();
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut pooled,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(sharded),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("signal outbox sweep should succeed");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND,
+        "the sweep must decline to wait on a busy peer pool rather than stall \
+         for the generous scanner bound — took {elapsed:?}"
+    );
+
+    // And it must leave the row pending, not conclude anything from the shard
+    // it could not read.
+    let types = history_event_types(&mut pooled, caller).await;
+    assert!(
+        !types.contains(&"ExternalSignalFailed".to_string())
+            && !types.contains(&"ExternalSignalDelivered".to_string()),
+        "an uninspectable peer leaves the request pending; got {types:?}"
+    );
+}
