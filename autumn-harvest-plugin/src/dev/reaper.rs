@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use super::discovery::PostgresBinaries;
 use super::session::{
     ReapDecision, SESSION_RECORD_FILE, SESSION_ROOT_PREFIX, SessionRecord, decide_reap,
-    effective_postmaster_pid, is_session_dir, record_is_self_consistent,
+    effective_postmaster_pid, is_session_dir, parse_postmaster_pid, record_is_self_consistent,
 };
 use super::{DevError, postgres};
 
@@ -117,11 +117,17 @@ fn current_user_token() -> String {
         )
 }
 
-/// The effective uid, via `id -u`.
+/// The **effective** uid, via `/proc/self/status` or `id -u`.
+///
+/// Effective, not real, and the distinction is the whole point: this answer
+/// gates the root refusal *and* the session-root ownership check, and a process
+/// with a non-zero real uid but euid 0 — a setuid-root launcher — has every
+/// privilege the refusal exists to keep away from a planted session record.
+/// `id -u` reports the effective id (`id -ru` is the real one), so both sources
+/// must agree on that or the answer depends on which one happened to work.
 ///
 /// `/usr/bin/id` by absolute path: resolving it through `PATH` would let a
-/// planted `id` on a developer's `PATH` silently answer whatever it liked, and
-/// this same answer gates the root-refusal check.
+/// planted `id` on a developer's `PATH` silently answer whatever it liked.
 #[cfg(unix)]
 pub(super) fn unix_uid() -> Option<u32> {
     // `/proc/self/status` first where it exists: no process spawn, and — more
@@ -147,18 +153,62 @@ pub(super) fn unix_uid() -> Option<u32> {
     None
 }
 
-/// The real uid from a `/proc/self/status` body.
+/// The **effective** uid from a `/proc/self/status` body.
 ///
-/// The `Uid:` line is `real  effective  saved  filesystem`; the first is what
-/// `id -u` reports.
+/// The `Uid:` line is `real  effective  saved  filesystem`, and the second
+/// column is what `id -u` reports — reading the first made the two sources
+/// disagree for any process whose real and effective ids differ, which is
+/// exactly the setuid-root case the root refusal must not fail open on.
+///
+/// The filesystem uid (fourth column) is what the kernel actually attributes
+/// new files to, and it equals the effective uid unless something calls
+/// `setfsuid`, which nothing here does; the ownership check is written against
+/// the effective uid on that basis.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn parse_proc_status_uid(status: &str) -> Option<u32> {
     status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().nth(1))
         .and_then(|uid| uid.parse().ok())
+}
+
+/// What Postgres's own `postmaster.pid` file says about a session.
+///
+/// Three states, not two: "there is no pid file" and "I could not read the pid
+/// file" mean opposite things to a reaper that deletes data directories.
+enum PidFile {
+    /// Confirmed absent. `pg_ctl` removes it on a clean stop, so this is real
+    /// evidence that no server is running.
+    Absent,
+    /// Present and readable.
+    Present(String),
+    /// Present but unreadable, or read but unparseable — a truncated,
+    /// half-written file is exactly what a crash leaves. Evidence of nothing.
+    Unreadable,
+}
+
+impl PidFile {
+    /// The contents to hand [`effective_postmaster_pid`], if any.
+    fn contents(&self) -> Option<&str> {
+        match self {
+            Self::Present(contents) => Some(contents),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Read a session's `postmaster.pid`, distinguishing absent from unreadable.
+fn read_postmaster_pid_file(data_dir: &Path) -> PidFile {
+    match std::fs::read_to_string(data_dir.join("postmaster.pid")) {
+        Ok(contents) if parse_postmaster_pid(&contents).is_some() => PidFile::Present(contents),
+        // `NotFound` is the one answer that is evidence. Everything else —
+        // readable but with no pid on the first line (a half-written file), a
+        // permission error, an I/O error — is uncertainty.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PidFile::Absent,
+        Ok(_) | Err(_) => PidFile::Unreadable,
+    }
 }
 
 /// Reclaim every abandoned session directory under `root`, returning how many
@@ -213,12 +263,21 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
 
         // Close the start window: a record written before `pg_ctl start`
         // carries no pid, but the cluster it belongs to may well be running.
-        record.postmaster_pid = effective_postmaster_pid(
-            &record,
-            std::fs::read_to_string(record.data_dir.join("postmaster.pid"))
-                .ok()
-                .as_deref(),
-        );
+        let pid_file = read_postmaster_pid_file(&record.data_dir);
+        if record.postmaster_pid.is_none() && matches!(pid_file, PidFile::Unreadable) {
+            // Absence of a pid is only evidence when it is *confirmed* absence.
+            // A transient read error, or the truncated file a crash mid-write
+            // leaves, would otherwise read as "no server" — and `decide_reap`
+            // would answer `Remove`, deleting the data directory out from under
+            // a postmaster that may well still be running, along with the only
+            // record that could ever stop it. Leave it for a run that can tell.
+            tracing::warn!(
+                path = %dir.display(),
+                "dev runtime: leaving a session whose postmaster.pid could not be read"
+            );
+            continue;
+        }
+        record.postmaster_pid = effective_postmaster_pid(&record, pid_file.contents());
 
         let decision = decide_reap(
             &record,

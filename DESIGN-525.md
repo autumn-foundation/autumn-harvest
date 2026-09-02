@@ -279,7 +279,17 @@ Three layers, because one is not enough:
    `data_dir` must be the one this layout puts inside its own session dir; the
    recorded start time must still match, so a *reused* pid is never mistaken
    for ours; and a cluster that could not be confirmed stopped is left running
-   **with its directory intact** rather than deleted underneath it.
+   **with its directory intact** rather than deleted underneath it. During the
+   start window the record carries no postmaster pid, so Postgres's own
+   `postmaster.pid` is the only evidence — and *absence* of a pid counts only
+   when it is confirmed absence. A file that exists but cannot be read or
+   parsed, which is what a crash mid-write leaves, is uncertainty, and the
+   session is left for a run that can tell.
+
+The identity the whole thing hangs on is the **effective** uid, not the real
+one: `id -u` reports the effective id, and a process with real uid 1000 and euid
+0 has every privilege the root refusal exists to keep away from a planted
+record.
 
 The reaper's decision is a **pure function** over `(session record, is_alive)`
 so it is exhaustively unit-testable without spawning anything.

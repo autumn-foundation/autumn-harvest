@@ -63,6 +63,8 @@ pub use postgres::{
     EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, postgres_conf_lines,
     running_as_root, unix_socket_path_len, write_private_atomic,
 };
+#[cfg(target_os = "linux")]
+pub use reaper::parse_proc_status_uid;
 pub use reaper::{
     proc_stat_is_live, proc_stat_start_time, process_is_alive, process_start_token,
     reap_stale_sessions, rewrite_owner_pid_for_test, session_root,

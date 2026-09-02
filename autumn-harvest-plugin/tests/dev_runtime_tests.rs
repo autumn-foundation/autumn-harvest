@@ -1384,6 +1384,76 @@ async fn a_non_loopback_http_host_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// Codex round 5
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_uid_parser_reads_the_effective_id_not_the_real_one() {
+    // Codex round 5 (P2). The `Uid:` line is `real effective saved filesystem`,
+    // and `id -u` reports the *effective* id (`id -ru` is the real one). Reading
+    // the first column made the two sources disagree for exactly the process the
+    // root refusal must not fail open on: a setuid-root launcher, real uid 1000,
+    // effective uid 0 — which would have read as "not root" and then reaped a
+    // real user's session root, executing its recorded `pg_ctl` as root.
+    use autumn_harvest_plugin::dev::parse_proc_status_uid;
+
+    let setuid_root = "Name:\tharvest-dev\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+    assert_eq!(parse_proc_status_uid(setuid_root), Some(0));
+
+    let ordinary = "Name:\tharvest-dev\nUid:\t1000\t1000\t1000\t1000\n";
+    assert_eq!(parse_proc_status_uid(ordinary), Some(1000));
+
+    assert_eq!(parse_proc_status_uid("Name:\tx\n"), None);
+    assert_eq!(parse_proc_status_uid("Uid:\t1000\n"), None);
+}
+
+#[test]
+fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
+    // Codex round 5 (P2). During the start window the record carries no
+    // postmaster pid, so `postmaster.pid` is the only evidence a cluster is
+    // running. A truncated file — exactly what a crash mid-write leaves —
+    // parsed to `None`, which reads as "no server": `decide_reap` answered
+    // `Remove`, deleting the data directory out from under a postmaster that
+    // may well still be running, along with the only record that could stop it.
+    //
+    // Absence of a pid is evidence only when it is *confirmed* absence.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000a");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let mut stale = record(u32::MAX - 1, None);
+    stale.owner_start_token = None;
+    stale.data_dir = data_dir.clone();
+    std::fs::write(
+        session_dir.join("session.json"),
+        stale.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    // Half-written: the file exists, but there is no pid on its first line.
+    std::fs::write(data_dir.join("postmaster.pid"), "\n/tmp/data\n").expect("pid file");
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "an unreadable postmaster.pid is uncertainty, not proof that nothing is running"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+
+    // Confirmed absent — `pg_ctl` removes it on a clean stop — so the session
+    // really is a corpse and is reclaimed.
+    std::fs::remove_file(data_dir.join("postmaster.pid")).expect("remove pid file");
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        1,
+        "with no pid file at all the session is a corpse and must be reclaimed"
+    );
+    assert!(!session_dir.exists(), "{}", session_dir.display());
+}
+
+// ---------------------------------------------------------------------------
 // AC7 — the docs present the zero-setup path as the default
 // ---------------------------------------------------------------------------
 
