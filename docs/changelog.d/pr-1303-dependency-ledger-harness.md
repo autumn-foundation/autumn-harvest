@@ -1,19 +1,27 @@
-## Dependency ledger harness + wasmtime/metrics security fix (PR #1303)
+## Dependency ledger harness + wasmtime/h2/metrics security fix (PR #1303)
 
 No lockfile-verified dependency audit previously existed in this repo — no
 `cargo-audit`/`cargo-deny`, no advisory scan, no license gate in CI. This PR
 adds one (`deny.toml` + a new `dependency-audit` CI job running
 `cargo deny check` via `EmbarkStudios/cargo-deny-action@v2`) and, using it,
-fixes the one reachable finding it turned up: four wasmtime advisories
-(RUSTSEC-2026-0222/0223/0268/0269 — VM-state/type-index corruption, guest-
-controlled host heap allocation, a filesystem sandbox escape) against
-`wasmtime` 46.0.1, the direct dependency behind the `wasm-activities`
-sandbox feature. All four are fixed within the already-declared
-`wasmtime = "46"` range (→ 46.0.3): a lockfile-only `cargo update`, no
-manifest change, no new MSRV. `metrics` 0.24.5, independently yanked
-upstream, moves to 0.24.6 the same way.
+fixes the reachable findings it turned up:
 
-Eleven other advisory-adjacent findings (crossbeam-epoch, lru, h2, rsa,
+- Four wasmtime advisories (RUSTSEC-2026-0222/0223/0268/0269 — VM-state/
+  type-index corruption, guest-controlled host heap allocation, a
+  filesystem sandbox escape) against `wasmtime` 46.0.1, the direct
+  dependency behind the `wasm-activities` sandbox feature. Fixed within the
+  already-declared `wasmtime = "46"` range (→ 46.0.3): a lockfile-only
+  `cargo update`, no manifest change, no new MSRV.
+- RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) against `h2` 0.4.13,
+  reached via hyper 1.x → axum → autumn-web, our production HTTP server
+  path. Fixed the same way: `cargo update -p h2@0.4.13` → 0.4.19, no
+  manifest change. A second h2 instance (0.3.27, on the old hyper-0.14 line
+  behind the optional `sqs`/AWS-SDK feature) has no patched 0.3.x release to
+  move to and stays deferred.
+- `metrics` 0.24.5, independently yanked upstream, moves to 0.24.6 the same
+  way.
+
+Ten other advisory-adjacent findings (crossbeam-epoch, lru, h2@0.3.27, rsa,
 proc-macro-error2, instant, rustls-webpki x3, two yanked crates) are none of
 them fixable from this repo's own manifest today — each carries a
 reachability verdict and a revisit trigger in `deny.toml` rather than being
