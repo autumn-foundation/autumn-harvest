@@ -226,7 +226,7 @@ harvest backup verify \
   --shard 0=postgres://harvest@standby-b/harvest_shard0 \
   --shard 1=postgres://harvest@standby-b/harvest_shard1 \
   --i-know-this-is-scratch \
-  -o json
+  --format json
 ```
 
 Exit codes: `0` clean or resumable-with-reclaim, `1` incoherent (**do not start
@@ -249,7 +249,7 @@ Only now. Point the fleet's DSNs at the promoted region and start it with
 `dr_fencing` still enabled — each worker pins the **new** epoch at startup.
 
 ```bash
-harvest worker health -o json
+harvest worker health --output json
 harvest dr status --shard 0=... --shard 1=...
 ```
 
