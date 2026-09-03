@@ -557,16 +557,20 @@ shows the sort-elision candidate isn't rejected on a cost comparison at all
 what any selectivity estimate says.
 
 **A separate, narrower diagnostic goes further, for the sticky-routing
-predicate specifically.** With the competing `idx_harvest_tq_coverage_sample`
-index hidden and `enable_seqscan=off; enable_bitmapscan=off` set
-(session-local, inside a rolled-back transaction) to bias the planner away
-from those plan types — these are cost penalties, not a hard directive, which
-is exactly why the natural, unhinted ten-predicate results above still show
-`Seq Scan`/`Bitmap Heap Scan` for most rows rather than being universally
-overridden — Postgres does walk `idx_harvest_tq_poll` for the sticky
-predicate, already producing rows in the required order. But it still
-inserts a redundant `Sort` node on top and materialises every matching row
-before applying `LIMIT 1`, rather than eliding the sort.
+predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
+`idx_harvest_tq_coverage_sample` index hidden and `enable_seqscan=off;
+enable_bitmapscan=off` set (session-local, inside a rolled-back transaction)
+to bias the planner away from those plan types — these are cost penalties,
+not a hard directive, which is exactly why the natural, unhinted
+ten-predicate results above still show `Seq Scan`/`Bitmap Heap Scan` for most
+rows rather than being universally overridden — Postgres does walk a
+**serial** `Index Scan` on `idx_harvest_tq_poll` for the sticky predicate
+(not a parallel one here, so there is no `Gather`/`Gather Merge` question to
+resolve for this specific plan), already producing rows in the required
+order. But it still inserts a `Sort` node on top and materialises every
+matching row before applying `LIMIT 1` — genuinely redundant, since a serial
+scan over an index whose key already matches the `ORDER BY` needs no further
+sorting.
 
 Two separate, compounding effects are at work, not one:
 
@@ -590,22 +594,28 @@ Two separate, compounding effects are at work, not one:
    queue except a pathological one. Whatever distinguishes
    `claim_task_query()`'s tested predicates from that case — `SubPlan`-bearing
    filters (`EXISTS`, `jsonb_array_elements`) versus a plain scalar NULL
-   check, the forced-index diagnostic choosing a *parallel* index scan
-   (`Gather`/`Gather Merge` semantics differ from a serial scan), or
-   something else — is not established here. What issue #1177 establishes is
-   narrower and still load-bearing: for the specific query and predicates
-   tested, sort-elision does not survive adding any one of them; that is
-   demonstrably not a `CASE`-key-specific problem, but it is not shown to be
-   a universal one either. With or without the `CASE` key, this alone makes
-   every claim O(backlog) in this fixture.
+   check, or something else — is not established here. What issue #1177
+   establishes is narrower and still load-bearing: for the specific query and
+   predicates tested, sort-elision does not survive adding any one of them;
+   that is demonstrably not a `CASE`-key-specific problem, but it is not
+   shown to be a universal one either. With or without the `CASE` key, this
+   alone makes every claim O(backlog) in this fixture.
 2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
-   once (1) has already forced a `Sort` node to exist. Without `FOR UPDATE`,
-   the same forced-index plan (again, the sticky-predicate diagnostic)
-   restores a bounded Top-N heapsort (in-memory, no disk spill) — it still
-   scans the full eligible set to get there, but stays in memory. With `FOR
-   UPDATE SKIP LOCKED`, the sort is unbounded and spills to disk past a few
-   hundred thousand rows (`Sort Method: external merge Disk: 5640-7057kB` in
-   the #1177 fixture).
+   once (1) has already forced a `Sort` node to exist for the locked variant.
+   Without `FOR UPDATE`, the same sticky-predicate diagnostic restores a
+   bounded Top-N heapsort (in-memory, no disk spill) — it still scans the
+   full eligible set to get there, but stays in memory, whereas the locked
+   variant's sort is unbounded and spills to disk past a few hundred
+   thousand rows (`Sort Method: external merge Disk: 5640-7057kB` in the
+   #1177 fixture). This unlocked comparison uses a **parallel**
+   `Parallel Index Scan using idx_harvest_tq_poll`, per the issue's own
+   excerpt, rather than the serial scan in (1); the excerpt doesn't show
+   whether a `Gather` or `Gather Merge` sits above it, so — unlike the locked
+   case — this page does not claim that unlocked sort is redundant, only that
+   it stays bounded and in-memory rather than spilling to disk. The
+   bounded-versus-unbounded/disk-spill contrast holds regardless of that
+   ambiguity, since both figures come from the same measured `EXPLAIN`
+   output.
 
 A semantically-identical rewrite — the ordered scan wrapped in a subquery,
 with the residual filter applied as an outer `WHERE` — does not help either,
@@ -628,16 +638,26 @@ contribution to the collapse has not been independently re-tested against
 the current query; the other nine are unaffected by that fix and remain as
 implemented today.
 
-**Untested scope: multiple queues.** The base query binds
-`queue_name = ANY($1)`; issue #1177's own text does not say how many queue
-names `$1` held during its reproduction (its fixture describes rows seeded
-into a single `default` queue). This page's own attribution-table scenarios
-default `Scenario.queues` to 4 (see
-[known limitations](#known-limitations)). A btree index scan *can*, in
-principle, still produce output in the index's overall order across a
-multi-value leading-column match without an extra `Sort` — whether that
-holds for `idx_harvest_tq_poll` specifically, and whether it changes
-anything about the ten-predicate finding above, has not been checked here.
+**Multiple queues: partially controlled for, not fully.**
+`idx_harvest_tq_poll` leads with `queue_name`; for `queue_name = ANY($1)`
+over several values, its output is grouped by queue rather than necessarily
+a single global `priority`/`scheduled_at` order, and merging those groups
+can itself require a `Sort` — independent of any residual predicate. Issue
+#1177's own baseline (the identical `queue_name = ANY($1)` binding, no added
+predicate — "each added alone to the base query") already functions as a
+same-array no-residual control: it shows `Index Scan using
+idx_harvest_tq_poll`, **no `Sort` node at all**, whatever `$1` held in that
+reproduction. That rules out multi-queue ordering as the explanation for the
+ten-predicate collapse *in that fixture specifically* — the `Sort` those ten
+scenarios needed is absent from the zero-predicate baseline run against the
+identical binding. What remains unconfirmed: issue #1177's own text does not
+say how many queue names `$1` actually held (its fixture description
+mentions rows seeded into a single `default` queue, which would make this a
+non-issue for that reproduction specifically), and this page's own
+attribution-table scenarios default `Scenario.queues` to 4 (see
+[known limitations](#known-limitations)) — a separate harness this
+reproduction was not run against. Whether the ten-predicate finding
+transfers to a genuinely multi-queue bind has not been checked here.
 
 **What this means for the query as it stands today:** there is no realistic
 deployment shape that gets the cheap index-ordered plan back, because
