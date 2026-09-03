@@ -672,6 +672,38 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
+    /// A workflow's `execution_timeout`, `chain_execution_timeout`, or `sla`
+    /// (issue #1163) is a `std::time::Duration` that cannot convert to a
+    /// `chrono::Duration`.
+    ///
+    /// Every start path resolves these fields via
+    /// `chrono::Duration::from_std(d).ok()`; on overflow that silently
+    /// discards the declared value rather than erroring, so the hard
+    /// runaway cap (or chain cap, or SLA budget) simply never applies —
+    /// with no error and no log line. `task_duration` accepts up to 20
+    /// digits with checked `u64` arithmetic, so a value past what
+    /// `chrono::Duration` can represent is reachable through the macro, e.g.
+    /// `#[workflow(execution_timeout = "999999999999d")]`. Caught once
+    /// here, at build time, so every start path (including the #617 chain
+    /// cap and the #743 DAG shadow `WorkflowInfo`) benefits uniformly
+    /// instead of each silently accepting a declaration it can never honor.
+    #[error(
+        "workflow '{workflow}' field '{field}' is {actual:?}, which cannot be represented as a \
+         chrono::Duration (ceiling: {ceiling:?}); lower the declared value"
+    )]
+    UnrepresentableWorkflowDuration {
+        /// The workflow name.
+        workflow: String,
+        /// Which field was unrepresentable: `"execution_timeout"`,
+        /// `"chain_execution_timeout"`, or `"sla"`.
+        field: &'static str,
+        /// The declared value that failed to convert.
+        actual: Duration,
+        /// The largest `std::time::Duration` representable as a
+        /// `chrono::Duration` (derived from `chrono::Duration::MAX`).
+        ceiling: Duration,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
@@ -2365,6 +2397,7 @@ impl HarvestBuilder {
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
         validate_workflow_throttle_policies(&self.workflows)?;
+        validate_workflow_duration_fields(&self.workflows)?;
         validate_dag_workflow_name_collisions(
             &self.workflows,
             &self.auto_registered_dag_workflows,
@@ -3250,6 +3283,51 @@ fn validate_workflow_throttle_policies(
                     policy.refill_per_sec
                 ),
             });
+        }
+    }
+    Ok(())
+}
+
+/// Reject a workflow whose `execution_timeout`, `chain_execution_timeout`,
+/// or `sla` cannot convert to `chrono::Duration` (issue #1163).
+///
+/// Every start path resolves these fields via
+/// `chrono::Duration::from_std(d).ok()`, which silently maps an
+/// out-of-range `Duration` to `None` — indistinguishable from "no timeout
+/// declared". `task_duration` accepts up to 20 digits with checked `u64`
+/// arithmetic, so a declaration like
+/// `#[workflow(execution_timeout = "999999999999d")]` parses fine but is
+/// well past chrono's representable range, silently dropping the intended
+/// hard runaway cap. Validated once here, at build time, against every
+/// registered [`WorkflowInfo`] — including the #743 DAG shadow
+/// `WorkflowInfo` produced by `DagInfo::as_workflow_info` and pushed into
+/// `self.workflows` by [`HarvestBuilder::dags`] before `try_build` runs —
+/// so every start path benefits uniformly rather than each accepting a
+/// declaration it can never honor.
+fn validate_workflow_duration_fields(
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    // chrono::Duration::MAX is positive, so `to_std()` cannot fail; the
+    // `unwrap_or` fallback only guards against a future chrono change we
+    // cannot foresee, never observed in practice.
+    let ceiling = chrono::Duration::MAX.to_std().unwrap_or(Duration::MAX);
+    for wf in workflows {
+        let fields: [(&'static str, Option<Duration>); 3] = [
+            ("execution_timeout", wf.execution_timeout),
+            ("chain_execution_timeout", wf.chain_execution_timeout),
+            ("sla", wf.sla),
+        ];
+        for (field, value) in fields {
+            if let Some(actual) = value
+                && chrono::Duration::from_std(actual).is_err()
+            {
+                return Err(HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    workflow: wf.name.to_string(),
+                    field,
+                    actual,
+                    ceiling,
+                });
+            }
         }
     }
     Ok(())
@@ -5730,6 +5808,201 @@ mod tests {
             })])
             .try_build();
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    /// Minimal `WorkflowInfo` carrying only the three duration fields
+    /// `validate_workflow_duration_fields` (issue #1163) checks, for the
+    /// tests below.
+    fn wf_info_with_durations(
+        execution_timeout: Option<Duration>,
+        chain_execution_timeout: Option<Duration>,
+        sla: Option<Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: "report_wf",
+            module: "test",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout,
+            sla,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    /// The largest `std::time::Duration` `chrono::Duration::from_std` can
+    /// still convert. One nanosecond past this must be rejected.
+    fn chrono_duration_ceiling() -> Duration {
+        chrono::Duration::MAX
+            .to_std()
+            .expect("chrono::Duration::MAX is positive and must convert to std::time::Duration")
+    }
+
+    #[test]
+    fn validate_workflow_duration_fields_accepts_none_and_the_exact_ceiling() {
+        let ceiling = chrono_duration_ceiling();
+        let workflows = vec![wf_info_with_durations(
+            Some(ceiling),
+            Some(ceiling),
+            Some(ceiling),
+        )];
+        assert!(
+            validate_workflow_duration_fields(&workflows).is_ok(),
+            "expected the exact chrono::Duration ceiling to be accepted"
+        );
+        assert!(
+            validate_workflow_duration_fields(&[wf_info_with_durations(None, None, None)]).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_workflow_duration_fields_rejects_execution_timeout_past_the_ceiling() {
+        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
+        let err =
+            validate_workflow_duration_fields(&[wf_info_with_durations(Some(over), None, None)])
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    ref workflow,
+                    field: "execution_timeout",
+                    actual,
+                    ..
+                } if workflow == "report_wf" && actual == over
+            ),
+            "expected UnrepresentableWorkflowDuration naming execution_timeout, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workflow_duration_fields_rejects_chain_execution_timeout_past_the_ceiling() {
+        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
+        let err =
+            validate_workflow_duration_fields(&[wf_info_with_durations(None, Some(over), None)])
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    ref workflow,
+                    field: "chain_execution_timeout",
+                    ..
+                } if workflow == "report_wf"
+            ),
+            "expected UnrepresentableWorkflowDuration naming chain_execution_timeout, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_workflow_duration_fields_rejects_sla_past_the_ceiling() {
+        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
+        let err =
+            validate_workflow_duration_fields(&[wf_info_with_durations(None, None, Some(over))])
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    ref workflow,
+                    field: "sla",
+                    ..
+                } if workflow == "report_wf"
+            ),
+            "expected UnrepresentableWorkflowDuration naming sla, got: {err}"
+        );
+    }
+
+    /// The `999999999999d` repro from the issue: expressible through
+    /// `task_duration`'s checked `u64` arithmetic (well under `u64::MAX`
+    /// seconds) but far past chrono's ceiling.
+    #[test]
+    fn validate_workflow_duration_fields_rejects_the_issue_repro_value() {
+        let almost_2_7_billion_years = Duration::from_secs(999_999_999_999 * 86_400);
+        let err = validate_workflow_duration_fields(&[wf_info_with_durations(
+            Some(almost_2_7_billion_years),
+            None,
+            None,
+        )])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::UnrepresentableWorkflowDuration { .. }
+        ));
+    }
+
+    #[test]
+    fn harvest_builder_rejects_workflow_with_unrepresentable_execution_timeout() {
+        let over = chrono_duration_ceiling() + Duration::from_secs(1);
+        let result = HarvestBuilder::new()
+            .workflows(vec![wf_info_with_durations(Some(over), None, None)])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    ref workflow,
+                    field: "execution_timeout",
+                    ..
+                } if workflow == "report_wf"
+            ),
+            "expected UnrepresentableWorkflowDuration, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("report_wf"),
+            "message should name the workflow: {msg}"
+        );
+        assert!(
+            msg.contains("execution_timeout"),
+            "message should name the field: {msg}"
+        );
+        assert!(
+            msg.contains("ceiling"),
+            "message should name the representable ceiling: {msg}"
+        );
+    }
+
+    /// The #743 DAG shadow `WorkflowInfo` (`DagInfo::as_workflow_info`, pushed
+    /// into `self.workflows` by `HarvestBuilder::dags` before `try_build` runs)
+    /// must be covered by the same validation as a `#[workflow]`-declared one —
+    /// otherwise a DAG's `#[dag(execution_timeout = "...")]` could silently
+    /// vanish exactly like the bug this issue fixes for plain workflows.
+    #[cfg(feature = "unified-dag-execution")]
+    #[test]
+    fn harvest_builder_rejects_dag_with_unrepresentable_execution_timeout() {
+        let over = chrono_duration_ceiling() + Duration::from_secs(1);
+        let mut dag = fake_unified_dag_info();
+        dag.execution_timeout = Some(over);
+        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::UnrepresentableWorkflowDuration {
+                    ref workflow,
+                    field: "execution_timeout",
+                    ..
+                } if workflow == "daily_etl"
+            ),
+            "expected UnrepresentableWorkflowDuration for the DAG's shadow WorkflowInfo, got: {err}"
+        );
     }
 
     #[test]
