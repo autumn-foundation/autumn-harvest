@@ -311,11 +311,20 @@ hash-derived shard and missed a second live run unconditionally rather than only
 under a race. Closing it properly means cross-shard key uniqueness, which is an
 architectural addition rather than a fix — see issue #1313 for the options.
 
-**Size each shard pool at 2 or more in a process that polls several shards.**
-`Worker` spawns one timeout checker per assigned shard, and each holds its own
-shard pool's connection for the whole scanner pass. So a process with
+**Size each shard pool at one connection per local scanner sharing it, plus
+one.** `Worker` spawns one timeout checker per assigned shard, and each holds
+its own shard pool's connection for the whole scanner pass. So a process with
 `shard_assignments = [0, 1]` and one connection per pool has checker 0 wanting
-pool 1 exactly while checker 1 is holding it, and vice versa. Peer acquisitions
+pool 1 exactly while checker 1 is holding it, and vice versa.
+
+For the usual topology — one database per logical shard — that rule is just
+"2 or more". It is stated per *physical pool* because of the colocated case:
+`ShardedDbPool::pool_for` returns the same pool for several logical shards
+aliased onto one database, while checkers are spawned per logical *assignment*.
+Shards 0 and 1 aliased onto a pool at `max_size = 2` therefore run two scanners
+against two connections and leave nothing for shard 2's cross-shard read —
+under-provisioned, though every individual shard looks like it meets a flat
+threshold of two. Such a pool needs 3. Peer acquisitions
 in the fan-out and in cross-shard delivery are bounded tightly
 (`external_target_location::FANOUT_ACQUIRE_BOUND`) precisely so neither scanner
 ever *waits* on the other and the circular wait cannot form — a peer whose only
@@ -326,9 +335,12 @@ nothing to spare while its own scanner is mid-pass, so a peer read succeeds only
 if it lands during that scanner's sleep window; likely, since passes are short
 relative to the poll interval and two independent tasks do not stay in phase, but
 a probability rather than a guarantee. The guarantee is capacity: one connection
-for that shard's own scanner, one for a peer's cross-shard read. A multi-shard
-worker configured below that now logs a warning naming the shard at startup, so
-the degradation is visible rather than silent. A deployment that runs one process
+per local scanner running against that pool, one for a peer's cross-shard read.
+A multi-shard worker configured below that now logs a warning at startup naming
+the pool's shards, its `max_size` and what it needs, so the degradation is
+visible rather than silent. The warning groups by physical pool, so an aliased
+pool is reported once, for all the shards sharing it, against the total they
+require between them. A deployment that runs one process
 per shard is unaffected either way, since each process holds only its own shard's
 connection.
 

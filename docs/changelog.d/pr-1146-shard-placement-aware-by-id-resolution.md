@@ -379,6 +379,33 @@ precedence will select, then asserts that after resolution the global carries
 the resolved topology and that the gate reports multi-shard. Verified red on
 revert.
 
+**Codex round 9 (one P1, on the round-8 fix's neighbourhood).** The capacity
+warning added earlier in this PR counted per *logical* shard: it flagged any
+shard whose pool had `max_size < 2`. `ShardedDbPool::pool_for` returns the same
+`DbPool` for every logical shard aliased onto one database, and
+`spawn_monitoring_tasks` spawns one timeout checker per logical *assignment* —
+so a colocated topology puts N scanners on one pool, each holding a connection
+for its whole pass. Shards 0 and 1 aliased onto a pool at `max_size = 2` passed
+the check twice while between them holding both connections, leaving shard 2's
+checker unable to probe that database at all. The under-provisioning the warning
+exists to surface was invisible in exactly the topology this PR added support
+for and tests (`outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool`).
+
+The requirement for one physical pool is `local scanners + 1`, not a flat 2.
+`under_provisioned_shard_pools` now groups `shard_targets` by physical pool
+identity — via the same `same_underlying_pool` the delivery paths use, so the
+warning and the routing cannot disagree about what "one pool" means — and
+reports each pool once, naming every shard sharing it, its `max_size` and the
+total they need between them. Five unit tests: the plain sufficient and
+insufficient cases, the two-alias case, three aliases reported as one warning
+rather than three, and an aliased pool sized correctly *not* being flagged (so
+the check does not simply fire whenever aliasing is present). The two alias
+tests are verified red against the old flat rule.
+
+`docs/sharding.md` states the rule per physical pool and works the colocated
+example, while noting that for one-database-per-shard it is still just "2 or
+more".
+
 **Documented in** `docs/sharding.md` (new *Business-key addressing finds a
 pinned run wherever it is* section under issue #697), `docs/security-posture.md`
 (the #697/#751 interaction bullet, rewritten from a limitation to the resolved
