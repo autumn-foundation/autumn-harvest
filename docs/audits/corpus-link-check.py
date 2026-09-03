@@ -53,6 +53,18 @@ KNOWN LIMITATIONS:
   heading anywhere in the corpus is currently written as a link (checked),
   so this is left unfixed rather than half-implemented.
 
+- A fenced code block nested inside a blockquote (each line prefixed with
+  `>`, e.g. `> \`\`\`bash`) is not recognized as a fence, because
+  FENCE_OPEN_RE looks for the delimiter after up to 3 spaces, not after a
+  blockquote marker. This corpus does this at least once
+  (docs/runbooks/triage-pending-tasks-idle-workers.md's `harvest workflow
+  diagnose` example), but correctly: nothing inside that specific block
+  looks like a link or heading, so it causes no current false result. A
+  correct fix needs to track the active blockquote-prefix depth alongside
+  fence state (open/body/close must share the same `>` nesting) — real
+  scope, not a regex tweak, for a gap this corpus doesn't currently trip
+  over. Left unfixed for the same reason as the two limitations above.
+
 Usage:
     python3 docs/audits/corpus-link-check.py [--json]
 
@@ -135,11 +147,17 @@ _TITLE = r'(?:"[^"]*"|\'[^\']*\'|\([^)]*\))'
 # Stopping at the first `)` (the obvious-looking `[^)\s]+`) truncates that
 # to `guide(v2` and reports a real file as missing.
 _DEST = r"(<[^<>]*>|(?:[^()\s]|\([^()]*\))+)"
-LINK_RE = re.compile(rf"\[{_LABEL}\]\({_DEST}(?:\s+{_TITLE})?\)")
+# `(?<!\\)` before the opening `[`: CommonMark renders `\[not a link](x)` as
+# literal text (the backslash escapes the bracket), not a link — relevant
+# for prose that demonstrates Markdown syntax rather than using it. Doesn't
+# attempt full odd/even backslash-run accounting (`\\[real link]`, an
+# escaped backslash followed by a real link, would be misread) — that's a
+# corpus that doesn't exist here; this handles the actual pattern in play.
+LINK_RE = re.compile(rf"(?<!\\)\[{_LABEL}\]\({_DEST}(?:\s+{_TITLE})?\)")
 # Bare image `![alt](src)`, checked independently so a *local* image's `src`
 # still gets a missing-file check even when the image is ALSO wrapped in an
 # outer link (and so consumed into LINK_RE's label, per above).
-IMAGE_RE = re.compile(rf"!\[[^\]]*\]\({_DEST}(?:\s+{_TITLE})?\)")
+IMAGE_RE = re.compile(rf"(?<!\\)!\[[^\]]*\]\({_DEST}(?:\s+{_TITLE})?\)")
 
 
 def unwrap_angle_dest(target: str) -> str:
@@ -157,14 +175,16 @@ def normalize_ref_label(label: str) -> str:
     # as "undefined".
     return re.sub(r"\s+", " ", label.strip()).lower()
 # Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
-REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
+# `(?<!\\)` guards the opener the same way LINK_RE does — `\[literal](x)`
+# style escaping applies here too.
+REF_USE_RE = re.compile(r"(?<!\\)\[([^\]]*)\]\[([^\]]*)\]")
 # Bare shortcut reference `[ref]` — only counts if `ref` matches a real
 # definition (checked against REF_DEF_RE's output below); otherwise a
 # `[bracketed]` phrase is just prose (e.g. `[FAILED]` in a log excerpt),
 # per CommonMark. The lookahead excludes the label half of `[text](url)`
 # and `[text][ref]`/`[text][]`, which are always immediately followed by
 # `(` or `[` — so this never double-matches those.
-SHORTCUT_RE = re.compile(r"\[([^\]]+)\](?!\(|\[)")
+SHORTCUT_RE = re.compile(r"(?<!\\)\[([^\]]+)\](?!\(|\[)")
 # Reference definition line: `[ref]: target "optional title"`, optionally
 # indented up to 3 spaces. Target is either bare (no whitespace) or
 # angle-bracketed — the latter is CommonMark's only way to put a space in a
@@ -279,7 +299,18 @@ def headings_of(path: Path) -> set:
     return slugs
 
 
-CODE_SPAN_RE = re.compile(r"(`+).*?\1")
+# A code span's closer must be a run of EXACTLY as many backticks as the
+# opener — not merely contain that many. `` `[x](y)`` `` (one backtick,
+# then later a two-backtick run) is not a code span at all under
+# CommonMark, because no run of exactly one backtick closes it; the naive
+# `(`+).*?\1` backreference happily matches `\1` (one backtick) as a
+# substring of the LONGER two-backtick run, incorrectly turning a real
+# link into "code" that never gets checked — a link could go broken with
+# this gate reporting green. The `(?!`)` after the opening capture locks it
+# to its maximal length (blocks backtracking to a shorter opener); the
+# `(?<!`)`/`(?!`)` around the closer's `\1` require it to be its own
+# maximal run, not a prefix or suffix of a longer one.
+CODE_SPAN_RE = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)")
 
 
 def strip_code_spans_and_fences(text: str) -> str:
