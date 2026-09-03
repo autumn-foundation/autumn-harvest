@@ -1856,3 +1856,185 @@ async fn eris_require_auth_blocks_audit_export_redrive() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── Dev-profile unauthenticated management API (issue #1284) ─────────────────
+//
+// The quickstart's documented Step 3 —
+//
+//   cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
+//
+// — is a bare `reqwest` GET with no cookie, no bearer token and no session. In
+// the `dev` profile it must reach `GET /admin/preflight` rather than 401, which
+// is what `set_deployment_profile`'s own contract has always promised ("`dev`
+// allows an unauthenticated local management API").
+//
+// Two request shapes both have to work, and they are NOT the same shape:
+//
+//   1. NO `Session` extension at all. This is what a standalone integration
+//      that mounts `harvest_api_router` directly (with no autumn-web session
+//      layer) produces — and what these tests produce by default.
+//   2. A FRESH, NON-COOKIE-BACKED `Session`. This is what the real quickstart
+//      app produces. autumn-web installs its session layer unconditionally, and
+//      that layer mints an empty session for a request that carries no valid
+//      cookie and inserts it into the extensions — so the quickstart's CLI call
+//      arrives as `Some(session)`, not `None`. A fix that only handles shape 1
+//      passes here and still 401s in the quickstart.
+//
+// The widening is bounded on three sides, each pinned below: `dev` only,
+// no-established-session only, and an embedder-declared boundary still wins.
+
+fn get_with_cookieless_session(uri: &str) -> Request<Body> {
+    let mut request = get(uri);
+    request
+        .extensions_mut()
+        .insert(Session::new_for_test_without_cookie(
+            "harvest-cookieless-session".to_string(),
+            HashMap::new(),
+        ));
+    request
+}
+
+fn get_with_session(uri: &str, session_key: &str) -> Request<Body> {
+    let mut request = get(uri);
+    let mut data = HashMap::new();
+    data.insert(session_key.to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-established-session".to_string(),
+        data,
+    ));
+    request
+}
+
+fn dev_profile_app() -> impl tower::Service<
+    Request<Body>,
+    Response = autumn_web::reexports::axum::response::Response,
+    Error = std::convert::Infallible,
+    Future = impl std::future::Future,
+> + Clone {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
+    app_with_api_state(api_state)
+}
+
+/// AC1, shape 1: the documented preflight command with no session extension.
+#[tokio::test]
+async fn hermes_dev_profile_admits_preflight_with_no_session_extension() {
+    let res = dev_profile_app()
+        .oneshot(get("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// AC1, shape 2: the quickstart's ACTUAL shape — autumn-web's session layer has
+/// already minted an empty, non-cookie-backed session for the cookieless CLI
+/// request. This is the assertion the issue's own stated mechanism
+/// (`session = None`) would have missed.
+#[tokio::test]
+async fn hermes_dev_profile_admits_preflight_with_fresh_cookieless_session() {
+    let res = dev_profile_app()
+        .oneshot(get_with_cookieless_session("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// AC1: the fix is the shared admin gate, not a `/admin/preflight` special
+/// case — a second admin-gated read route admits the same caller.
+#[tokio::test]
+async fn hermes_dev_profile_admits_second_admin_route_when_unauthenticated() {
+    let res = dev_profile_app()
+        .oneshot(get_with_cookieless_session("/admin/shards/health"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// AC3: an ESTABLISHED (cookie-backed) session is still judged by the
+/// configured session key in `dev`. The widening is for callers who presented
+/// no credential at all — it does not delete `set_admin_auth_session_key`'s
+/// meaning for an embedder running its own auth middleware.
+#[tokio::test]
+async fn hermes_dev_profile_still_requires_configured_key_for_established_session() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
+    api_state.set_admin_auth_session_key("operator_id");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(get_with_session("/admin/preflight", "admin_id"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// AC3: and the established-session path still ADMITS the configured key.
+#[tokio::test]
+async fn hermes_dev_profile_admits_established_session_with_configured_key() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
+    api_state.set_admin_auth_session_key("operator_id");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(get_with_session("/admin/preflight", "operator_id"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// AC2: the bypass does not escape `dev`. A named non-dev profile stays
+/// fail-closed for both unauthenticated shapes.
+#[tokio::test]
+async fn hermes_non_dev_profile_rejects_unauthenticated_admin_route() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .clone()
+        .oneshot(get("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let res = app
+        .oneshot(get_with_cookieless_session("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// AC2: the default (`unknown`) profile is non-dev and stays fail-closed. This
+/// is the profile a standalone integration gets when it never calls
+/// `set_deployment_profile`, so it is the one that must not drift open.
+#[tokio::test]
+async fn hermes_unknown_profile_rejects_unauthenticated_admin_route() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get_with_cookieless_session("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// AC4: an embedder-declared auth boundary still short-circuits ahead of the
+/// profile branch — precedence is unchanged.
+#[tokio::test]
+async fn hermes_declared_auth_boundary_still_short_circuits_in_dev() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
+    api_state.set_admin_auth_boundary(true);
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(get("/admin/preflight"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
