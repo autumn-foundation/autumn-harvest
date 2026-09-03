@@ -951,6 +951,25 @@ residuals is worse than one that has more of them:
    activity unless configured otherwise".
 6. **HMAC is the wrong primitive for the stated threat model** (§6): every
    verifier can forge. Ed25519 with CI-held private keys is the answer.
+7. **A build has no sealed manifest, so a sync detects the race rather than
+   preventing it.** Publishing a *new* `(build_id, workflow_name)` under an
+   existing build is allowed by design — the primary key makes an existing
+   name's bytes immutable, not the build's membership — so the set of modules a
+   build contains can legitimately change while a worker is syncing it.
+   `sync_build_into_registry` re-reads the manifest before committing and fails
+   with a retry instruction if it moved, which keeps the postcondition honest
+   ("a successful sync means the whole build as of a consistent moment") but
+   leaves a publish racing a fleet-wide sync able to make several workers retry.
+
+   The GA-shaped answer is a **sealed build**: publishing appends to a build
+   until it is sealed, after which membership is fixed and a sync reads a
+   manifest that cannot move. That is deliberately *not* done here, because it
+   is the one thing this registry design has so far avoided — build-level
+   state. There is no `active` flag precisely so the ramp is the only switch and
+   rollback touches no registry row (§6); a `sealed` column reintroduces a
+   lifecycle, and with it the question of what a half-sealed build means to a
+   worker mid-sync. Worth paying for if module publishing becomes a multi-step
+   operation; not worth paying for a retryable race at spike scope.
 
 ### Open questions for a T2 decision
 
