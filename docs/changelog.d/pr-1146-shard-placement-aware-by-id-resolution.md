@@ -131,12 +131,20 @@ on pool 1 while checker 1 waits on pool 0. Both bounds expire, both memoize the
 peer, nothing delivers — and with the generous 5s scanner bound both scanners
 stall for it every tick. Peer acquisitions now use a tight
 `FANOUT_ACQUIRE_BOUND` instead, so neither scanner ever *waits* on the other and
-the cycle cannot form; the row is retried on the next tick, whose phase has
-drifted. The same circular shape applies to the cross-shard *delivery*
-acquisition, which predates this issue entirely (it has always served
-`ExecutionId` targets) and was unbounded — now bounded with the same constant.
-`docs/sharding.md` states the deterministic answer: a process polling several
-shards should size each shard pool at 2 or more.
+the cycle cannot form; the row is retried on a later tick. What that buys is
+**bounded return, not progress** — round 4 below is where that distinction was
+forced, and this paragraph originally claimed the bound left the next tick's
+phase "drifted", which it does not: two checkers that time out together then
+sleep the same poll interval, so nothing in the bound alters their relative
+phase. A peer read succeeds only if it lands during that peer scanner's sleep
+window, which is likely but is a probability the code does nothing to create.
+The same circular shape applies to the cross-shard *delivery* acquisition, which
+predates this issue entirely (it has always served `ExecutionId` targets) and
+was unbounded — now bounded too, by the same status-derived rule the fan-out
+uses. `docs/sharding.md` states the deterministic answer, and it is the only
+one: a process polling several shards should size each shard pool at 2 or more.
+Retries keep such a deployment degraded rather than stalled; only capacity makes
+progress a guarantee.
 
 The P2 is a correctness bug of exactly the class this issue exists to remove.
 `resolve_delivery_route` kept only the resolved *shard* and let the delivery
