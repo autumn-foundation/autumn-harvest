@@ -24,10 +24,21 @@ A PR into `trunk-dev` waits on the `test` matrix (`ubuntu-latest`,
 superseded runs on a new push — that is cost control, not a trust-lowering
 retry, since a cancelled run never reports a conclusion the wrong way.
 Draft-PR and docs-only skips are already implemented (see the comment block
-at the top of `ci.yml`) so an intermediate draft push or a docs-only change
-doesn't pay for the compile/test matrix. **When this pipeline says green, it
-means the full matrix ran once, on that exact commit, and passed once — that
-part of the verdict is honest.**
+at the top of `ci.yml`): the `changes` job's `needs.changes.outputs.code`
+output gates every expensive step behind `if:`, so a docs-only commit still
+reports every `test` leg green while running none of the compile/test work —
+by design (a skipped step reports success so branch-protection-required
+checks aren't left permanently pending on a docs-only PR; see the `ci.yml`
+header comment), not by accident, but it means **green is honest only for the
+commits that actually exercised it**: a code-touching commit's green means
+the full matrix ran once, on that exact commit, and passed once; a docs-only
+commit's green (this PR's own CI run included) means the matrix legs
+completed with the code-dependent steps skipped, and asserts nothing about
+the test suite. The distinction is visible in the run itself (every
+code-dependent step shows `skipped`, not `success`), so nothing is hidden —
+but it does mean "green" is not a single verdict shape across this pipeline's
+runs, and a reader diffing runs needs to check which case they're looking
+at.
 
 What it does not mean is "fast": the `ubuntu-latest` leg of `test` is
 consistently the slowest of the three, at ~150–155 minutes end to end across
@@ -146,9 +157,20 @@ already named.
 
 ## 📊 Escape analysis & rerun-click trend
 
-- **Reverts:** one in project history (`08b1207`, a `Bolt` micro-optimization
-  reverted for a negative benchmark result — not a CI escape, not a
-  production bug).
+- **Reverts:** one in `trunk-dev`'s actual history (`git log --all --oneline
+  | grep -i revert` against the fetched branch refs): `08b1207`, a `Bolt`
+  micro-optimization reverted for a negative benchmark result — not a CI
+  escape, not a production bug. This is the "reverted before merge, caught by
+  review/benchmark rather than by an escaped bug" pattern, and it is the only
+  instance of that pattern reachable from `trunk-dev`: a same-shaped commit,
+  `d4b149a` ("DLQ aggregate grouping — extract + profile (negative result,
+  reverted after review)"), exists as a loose object in this checkout but
+  `git merge-base --is-ancestor d4b149a origin/trunk-dev` is false and no ref
+  contains it — it is unreachable pre-squash history from a PR that squashed
+  to a different, reverted-before-merge commit, not part of the branch this
+  census covers, and not a second data point beyond `08b1207`'s pattern.
+  No commit resembling a shipped-then-reverted **production** escape was
+  found.
 - **Rerun-button usage:** 0 runs with `run_attempt > 1` across ~150 sampled
   `pull_request`-event runs and 30 `push`-event runs. No reflexive-rerun
   culture; consistent with a pipeline whose red is currently trusted enough
@@ -169,7 +191,8 @@ Timing decomposition (per-suite, from a `push`-event run's logs):
 ```sh
 # Given a run id for the `CI` workflow on trunk-dev:
 gh api repos/autumn-foundation/autumn-harvest/actions/runs/<run_id>/logs \
-  -o logs.zip   # or actions_get/get_workflow_run_logs_url via the GitHub API
+  > logs.zip   # `gh api` has no -o/--output flag; redirect stdout instead.
+              # (or actions_get/get_workflow_run_logs_url via the GitHub API)
 unzip logs.zip -d ci_logs
 # Isolate the "run linux" step's ##[group]cargo ... timestamps and diff
 # consecutive ones -- see this memo's PR description for the ~40-line parser.
