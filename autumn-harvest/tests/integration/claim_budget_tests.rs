@@ -2675,7 +2675,7 @@ async fn zz_capture_capability_labels_claim_evidence() {
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_schedule_to_close_claim_evidence() {
     use diesel::QueryableByName;
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
     #[derive(QueryableByName)]
     struct ExplainRow {
@@ -2875,7 +2875,6 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         let headline = headline_scenario();
         let seeded = db::seed(&mut stats_conn, headline).await;
         let queues = db::queue_names(headline);
-        let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
 
         if label == "schedule-to-close" {
             diesel::sql_query("TRUNCATE harvest_task_queue")
@@ -2906,6 +2905,43 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                 .await
                 .expect("re-analyze before the stat-snapshot drain");
         }
+
+        // Heap-growth snapshot immediately before the drain starts: isolates
+        // how much of the aggregate pg_stat_statements buffer delta (below)
+        // is attributable to MVCC bloat accumulating over the drain itself
+        // (10,000 individual claim UPDATEs with no VACUUM in between, the
+        // real production shape) rather than to the wider row alone -- a
+        // single-call EXPLAIN snapshot, seeded fresh and rolled back inside a
+        // transaction, can never see this: it never accumulates dead tuples.
+        #[derive(QueryableByName, Debug, Clone, Copy)]
+        struct HeapStatRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            heap_pages: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n_live_tup: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n_dead_tup: i64,
+        }
+        async fn heap_stats(label: &str, when: &str, conn: &mut AsyncPgConnection) -> HeapStatRow {
+            let rows: Vec<HeapStatRow> = diesel::sql_query(
+                "SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages, \
+                        n_live_tup, n_dead_tup \
+                 FROM pg_stat_user_tables WHERE relname = 'harvest_task_queue'",
+            )
+            .load(conn)
+            .await
+            .expect("pg_relation_size/pg_stat_user_tables query failed");
+            let row = rows.into_iter().next().expect(
+                "no pg_stat_user_tables row for harvest_task_queue -- \
+                 autovacuum stats not yet populated for this fresh table",
+            );
+            eprintln!(
+                "label={label} when={when} heap_pages={} n_live_tup={} n_dead_tup={}",
+                row.heap_pages, row.n_live_tup, row.n_dead_tup
+            );
+            row
+        }
+        let heap_before = heap_stats(label, "before-drain", &mut stats_conn).await;
 
         // Drive the real claim path repeatedly so pg_stat_statements
         // accumulates real, attributed `calls`/buffer counters for the
@@ -2950,6 +2986,33 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
             seeded.claimable_rows,
         );
         claimed_by_label.insert(label, claimed);
+
+        // `ANALYZE` refreshes the planner's row-count estimate, not the
+        // autovacuum-collector's n_live_tup/n_dead_tup counters -- those come
+        // from `pg_stat_user_tables`, updated by each UPDATE's own stats
+        // message, so no extra call is needed here to make the "after"
+        // snapshot accurate.
+        let heap_after = heap_stats(label, "after-drain", &mut stats_conn).await;
+        std::fs::write(
+            out_dir.join(format!("{label}-heap-growth.txt")),
+            format!(
+                "-- {label}: harvest_task_queue heap growth over the real \
+                 {} full-drain claim loop ({claimed} claims) --\n\
+                 before: heap_pages={} n_live_tup={} n_dead_tup={}\n\
+                 after:  heap_pages={} n_live_tup={} n_dead_tup={}\n\
+                 delta:  heap_pages={} n_dead_tup={}\n",
+                headline.backlog,
+                heap_before.heap_pages,
+                heap_before.n_live_tup,
+                heap_before.n_dead_tup,
+                heap_after.heap_pages,
+                heap_after.n_live_tup,
+                heap_after.n_dead_tup,
+                heap_after.heap_pages - heap_before.heap_pages,
+                heap_after.n_dead_tup - heap_before.n_dead_tup,
+            ),
+        )
+        .expect("write heap-growth artifact");
 
         let stats_rows: Vec<StatRow> = diesel::sql_query(
             "SELECT query, calls, shared_blks_hit, shared_blks_read, \
