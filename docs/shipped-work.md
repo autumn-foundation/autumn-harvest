@@ -5958,7 +5958,7 @@ folds fragments in here.
   (`broker_coordinate_dedupe_survives_a_mapper_whose_workflow_id_drifts`) is
   single-shard, which is why it passes. Fixed by narrowing the documented scope
   rather than the mechanism: the rustdoc and a new
-  ["The dedupe guarantee is shard-local"](../getting-started/13-broker-connectors.md)
+  ["The dedupe guarantee is shard-local"](getting-started/13-broker-connectors.md#the-dedupe-guarantee-is-shard-local)
   docs section state the exact boundary and the (cheap, already-recommended)
   remedy — a deterministic mapper id — and `ConnectorRuntime::run` now logs a
   warning at startup naming the binding and the shard count when it detects the
