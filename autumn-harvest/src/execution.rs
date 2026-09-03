@@ -1237,6 +1237,40 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
+                    // A rebalanced prior (issue #964) cannot be terminated
+                    // FROM HERE, and replacing it would be actively unsafe.
+                    //
+                    // `MIGRATED`/`MIGRATING` are active conflicts because the
+                    // run is still live — just on another shard. But this
+                    // branch's `inline_cancel` only matches `RUNNING`/`PAUSED`,
+                    // so it would no-op against the seal, and `replace_execution`
+                    // would then seal that row `CONTINUED_AS_NEW` and insert a
+                    // fresh run here. `CONTINUED_AS_NEW` is excluded from the
+                    // active-uniqueness index, so the business key would be
+                    // released while the real run keeps executing on its target
+                    // shard: TWO live runs for one key, the exact outcome
+                    // widening `is_active_conflict_state` exists to prevent.
+                    //
+                    // Terminating the live copy is not this function's to do —
+                    // it holds one connection to one shard and the live copy is
+                    // on another database. So refuse, retryably, naming where
+                    // the run actually is. The caller cancels it there and
+                    // starts again, or waits for the migration to settle.
+                    if matches!(existing.state.as_str(), "MIGRATED" | "MIGRATING") {
+                        return Err(HarvestError::ShardUnavailable {
+                            shard_id: existing.migrated_to_shard.unwrap_or(existing.shard_id),
+                            reason: format!(
+                                "workflow_id '{}' is held by execution {} which has been \
+                                 rebalanced onto another shard (state {}); its live copy \
+                                 cannot be terminated from this shard, so the start is \
+                                 refused rather than creating a second live run. Cancel or \
+                                 terminate the execution by id, then retry.",
+                                request.workflow_id,
+                                ExecutionId::from_uuid(existing.id),
+                                existing.state,
+                            ),
+                        });
+                    }
                     let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),
@@ -1708,7 +1742,13 @@ pub enum ActiveConflictBehavior {
 /// treats them. SUSPENDED is not a persisted state.
 #[must_use]
 pub fn is_active_conflict_state(state: &str) -> bool {
-    matches!(state, "RUNNING" | "PAUSED")
+    // `MIGRATED` and `MIGRATING` (issue #964) are active conflicts even though
+    // neither row will ever run again where it sits. A `MIGRATED` row is the
+    // seal left behind when the run was rebalanced onto another shard: the run
+    // is still live, just elsewhere, so treating it as "terminal prior" would
+    // let a start of the same business key create a SECOND live run. A
+    // `MIGRATING` row is a staged copy holding the identity mid-migration.
+    matches!(state, "RUNNING" | "PAUSED" | "MIGRATED" | "MIGRATING")
 }
 
 /// Resolve the effective active-prior behavior from the two orthogonal axes
@@ -1953,9 +1993,15 @@ mod active_conflict_tests {
     use crate::types::WorkflowIdReusePolicy as R;
 
     #[test]
-    fn active_states_are_running_and_paused_only() {
+    fn active_states_are_the_live_and_the_migrated() {
         assert!(is_active_conflict_state("RUNNING"));
         assert!(is_active_conflict_state("PAUSED"));
+        // Issue #964: a sealed source is a live run that lives on another
+        // shard, and a staged copy holds the identity mid-migration. Treating
+        // either as a terminal prior would let a start of the same business key
+        // create a second live run.
+        assert!(is_active_conflict_state("MIGRATED"));
+        assert!(is_active_conflict_state("MIGRATING"));
         for other in [
             "SUSPENDED",
             "COMPLETED",
@@ -2527,6 +2573,29 @@ pub async fn cancel_workflow_execution_collect(
                         Vec::new(),
                         Vec::new(),
                     ));
+                }
+                // A rebalanced seal is NOT a terminal prior (issue #964). The
+                // run is alive on another shard, so answering `Config("already
+                // terminal")` here would be a lie with teeth: the cancel
+                // outbox maps that error to `ExternalCancelDelivered` and
+                // records a delivered cancellation in the sender's history for
+                // a workflow that goes on running, never retrying.
+                //
+                // Every caller is supposed to have resolved the residence
+                // before reaching this shard, so landing here means the
+                // resolution failed or was skipped. A retryable
+                // `ShardUnavailable` leaves the delivery pending, which is the
+                // only safe answer for a cancel that has not happened.
+                state @ ("MIGRATED" | "MIGRATING") => {
+                    return Err(HarvestError::ShardUnavailable {
+                        shard_id: execution.migrated_to_shard.unwrap_or(execution.shard_id),
+                        reason: format!(
+                            "workflow execution {exec_id} was rebalanced onto another \
+                             shard (state {state}); this row is a forwarding seal, not \
+                             the live run, so the cancellation is left pending rather \
+                             than reported as delivered"
+                        ),
+                    });
                 }
                 state => {
                     return Err(HarvestError::Config(format!(

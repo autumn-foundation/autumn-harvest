@@ -397,5 +397,16 @@ harness = false
 name = "codec_rotation_reencrypt_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `awaitables::project_awaitables` -- the pure, read-only "what is this
+# execution parked on right now?" projection behind the `/awaitables`
+# management endpoint and the awaitables sub-report folded into `/diagnose`
+# and `/replay-diagnosis` (issue #615). No feature requirement:
+# `project_awaitables` is pure and unconditional (no DB access). See
+# `benches/awaitables_profile.rs`.
+[[bench]]
+name = "awaitables_profile"
+harness = false
+
 [lints]
 workspace = true

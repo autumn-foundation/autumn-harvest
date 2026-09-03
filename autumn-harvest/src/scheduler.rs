@@ -1458,13 +1458,11 @@ pub async fn trigger_unified_dag(
             });
         }
 
-        let running: i64 = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
-            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-            .count()
-            .get_result(&mut db)
-            .await
-            .map_err(crate::error::database_error)?;
+        // Tick-exact basis (issue #1160): counts a cross-type continue-as-new
+        // successor of this schedule too, not just same-named runs -- a manual
+        // trigger must not double-dispatch a schedule whose active run has
+        // already changed type mid-chain.
+        let running: i64 = schedule_running_basis(&mut db, dag_name, schedule.id).await?;
         if running >= i64::from(schedule.max_active_runs) {
             return Err(HarvestError::UpdateRejected {
                 reason: format!(
@@ -3414,18 +3412,51 @@ pub async fn claim_and_fire_workflow_schedule(
     Ok(())
 }
 
-/// Cancel the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
-/// up to `max_to_cancel`.
+/// Load up to `limit` of the oldest scheduled RUNNING/PAUSED execution ids
+/// under `schedule_id`, shared by `cancel_in_flight_runs` and
+/// `terminate_in_flight_runs`.
 ///
-/// Filters by `schedule_id` rather than the `sched:` workflow-id prefix so that workflow-retry
-/// executions (which carry a UUID `workflow_id` but still link back to the originating schedule via
-/// the `schedule_id` FK) are included, while operator-triggered manual runs (which have
-/// `schedule_id = NULL`) are not inadvertently cancelled.
-/// Orders by `started_at ASC` so the oldest executions are cancelled first.
+/// Filters by `schedule_id` alone -- NOT also by `workflow_name` -- rather than the
+/// `sched:` workflow-id prefix, so that workflow-retry executions (which carry a UUID
+/// `workflow_id` but still link back to the originating schedule via the `schedule_id`
+/// FK) are included, while operator-triggered manual runs (which have `schedule_id =
+/// NULL`) are not inadvertently targeted. `schedule_id` is unique to one schedule, so
+/// it alone is already the correct, sufficient scope: a workflow-name filter on top of
+/// it is redundant for a same-type schedule and actively wrong for one whose
+/// `ctx.continue_as_new_as(...)` (#803) successor carries this `schedule_id` under a
+/// DIFFERENT `workflow_name` -- exactly the case a `workflow_name` filter would silently
+/// exclude from overlap cleanup (issue #1160).
+/// Orders by `started_at ASC` (oldest first) and pushes `limit` into the query
+/// itself rather than loading every match and truncating in Rust.
+#[cfg(feature = "db")]
+async fn load_overlap_cleanup_targets(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    limit: u32,
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
+        // must not make them targets for automatic overlap-cleanup. Scheduled and
+        // backfill runs remain eligible; NULL origin (pre-migration) is included for
+        // backward compatibility.
+        .filter(harvest_workflow_executions::origin.is_null().or(
+            harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+        ))
+        .order(harvest_workflow_executions::started_at.asc())
+        .limit(i64::from(limit))
+        .select(harvest_workflow_executions::id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Cancel up to `max_to_cancel` of the oldest in-flight runs under `schedule_id`
+/// (see [`load_overlap_cleanup_targets`] for selection).
 #[cfg(feature = "db")]
 async fn cancel_in_flight_runs(
     conn: &mut AsyncPgConnection,
-    workflow_name: &str,
     schedule_id: uuid::Uuid,
     reason: &str,
     max_to_cancel: u32,
@@ -3433,29 +3464,10 @@ async fn cancel_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
-    let running_ids: Vec<uuid::Uuid> =
-        harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-            // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
-            // must not make them targets for automatic overlap-cleanup. Scheduled and
-            // backfill runs remain eligible; NULL origin (pre-migration) is included for
-            // backward compatibility.
-            .filter(harvest_workflow_executions::origin.is_null().or(
-                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
-            ))
-            .order(harvest_workflow_executions::started_at.asc())
-            .select(harvest_workflow_executions::id)
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+    let running_ids = load_overlap_cleanup_targets(conn, schedule_id, max_to_cancel).await?;
 
     let mut count: u32 = 0;
-    for raw_id in running_ids
-        .into_iter()
-        .take(usize::try_from(max_to_cancel).unwrap_or(usize::MAX))
-    {
+    for raw_id in running_ids {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match cancel_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
@@ -3471,16 +3483,11 @@ async fn cancel_in_flight_runs(
     Ok(count)
 }
 
-/// Terminate the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
-/// up to `max_to_terminate`.
-///
-/// Filters by `schedule_id` (same rationale as `cancel_in_flight_runs`) so workflow-retry
-/// executions are included and manual-trigger runs (`schedule_id` = NULL) are excluded.
-/// Orders by `started_at ASC` so the oldest executions are terminated first.
+/// Terminate up to `max_to_terminate` of the oldest in-flight runs under
+/// `schedule_id` (see [`load_overlap_cleanup_targets`] for selection).
 #[cfg(feature = "db")]
 async fn terminate_in_flight_runs(
     conn: &mut AsyncPgConnection,
-    workflow_name: &str,
     schedule_id: uuid::Uuid,
     reason: &str,
     max_to_terminate: u32,
@@ -3488,25 +3495,10 @@ async fn terminate_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
-    let active_ids: Vec<uuid::Uuid> =
-        harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-            .filter(harvest_workflow_executions::origin.is_null().or(
-                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
-            ))
-            .order(harvest_workflow_executions::started_at.asc())
-            .select(harvest_workflow_executions::id)
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+    let active_ids = load_overlap_cleanup_targets(conn, schedule_id, max_to_terminate).await?;
 
     let mut count: u32 = 0;
-    for raw_id in active_ids
-        .into_iter()
-        .take(usize::try_from(max_to_terminate).unwrap_or(usize::MAX))
-    {
+    for raw_id in active_ids {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match terminate_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
@@ -4091,18 +4083,10 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
-    let mut running: i64 = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .count()
-        .get_result(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    // A throttled fire (issue #607) durably defers before any execution row
-    // exists -- count it toward max_active_runs/overlap so a schedule can't
-    // dispatch past its own concurrency limit while an earlier fire is still
-    // sitting in the throttle queue (code review, issue #607).
-    running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
+    // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
+    // cross-type successors included per issue #1160, plus the #607 pending-
+    // throttle backlog) -- see `schedule_running_basis`.
+    let mut running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
 
     if running >= i64::from(schedule.max_active_runs) {
         let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
@@ -4258,7 +4242,6 @@ async fn tick_one_workflow_schedule(
                         .unwrap_or(1);
                 let cancelled = cancel_in_flight_runs(
                     conn,
-                    wf_name,
                     schedule.id,
                     "overlap policy CancelOther: new firing",
                     needed,
@@ -4274,7 +4257,6 @@ async fn tick_one_workflow_schedule(
                         .unwrap_or(1);
                 let terminated = terminate_in_flight_runs(
                     conn,
-                    wf_name,
                     schedule.id,
                     "overlap policy TerminateOther: new firing",
                     needed,
@@ -5250,8 +5232,8 @@ pub struct OverdueSample {
 /// workflow (or DAG) name on **one shard** connection (issue #696).
 ///
 /// Replicates `tick_one_workflow_schedule`'s own count byte-for-byte: the
-/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name)`
-/// **plus** the #607 pending-throttle backlog
+/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name OR
+/// schedule_id = schedule_id)` **plus** the #607 pending-throttle backlog
 /// (`throttle::pending_throttle_count_for_workflow`) that the tick adds before
 /// comparing against `max_active_runs`. A DAG schedule's executions carry
 /// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis,
@@ -5262,15 +5244,27 @@ pub struct OverdueSample {
 /// `overdue` *exactly* when the tick would deliberately hold `next_run_at` in
 /// the past.
 ///
+/// The `schedule_id` disjunct (issue #1160) additively counts a
+/// `ctx.continue_as_new_as(...)` (#803) successor, which carries this schedule's
+/// `schedule_id` under a DIFFERENT `workflow_name` a name-only count would miss --
+/// one `COUNT(*)`, so a same-type row matching both clauses is still counted once.
+/// See `docs/getting-started/08-dags-and-schedules.md`'s overlap-policy section for
+/// the full rationale and the rejected alternative.
+///
 /// # Errors
 ///
 /// Returns a database error if either count query fails.
 pub async fn schedule_running_basis(
     conn: &mut AsyncPgConnection,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> HarvestResult<i64> {
     let running: i64 = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(name))
+        .filter(
+            harvest_workflow_executions::workflow_name
+                .eq(name)
+                .or(harvest_workflow_executions::schedule_id.eq(Some(schedule_id))),
+        )
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .count()
         .get_result(conn)
@@ -5280,45 +5274,101 @@ pub async fn schedule_running_basis(
     Ok(running.saturating_add(pending))
 }
 
-/// Batched form of [`schedule_running_basis`] for many schedule names at once.
+/// Batched form of [`schedule_running_basis`] for many schedules at once.
 ///
 /// One grouped `RUNNING`/`PAUSED` count query plus one grouped
 /// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`])
-/// covering every name in `names`, all on **one shard** connection, instead
-/// of the two queries *per name* `schedule_running_basis` issues when called
-/// in a loop over many schedules (Ledger perf pass on `GET /admin/schedules`).
+/// covering every schedule in `schedules`, all on **one shard** connection,
+/// instead of the two queries *per schedule* `schedule_running_basis` issues
+/// when called in a loop over many schedules (Ledger perf pass on
+/// `GET /admin/schedules`).
 ///
-/// A name with zero `RUNNING`/`PAUSED` executions and zero pending-throttle
-/// rows is absent from the returned map; callers should treat a missing key
-/// as `0`, matching what a per-name call to `schedule_running_basis` would
-/// have returned.
+/// Returns a map keyed by `schedule_id` rather than by name (issue #1160):
+/// `schedule_running_basis`'s `schedule_id` disjunct means two schedules can
+/// no longer be assumed to have independent, name-only bases, so the caller
+/// must look results up by the schedule it actually asked about. A schedule
+/// with zero total (same-type + cross-type) running/pending executions is
+/// absent from the returned map; callers should treat a missing key as `0`,
+/// matching what a per-schedule call to `schedule_running_basis` would have
+/// returned.
 ///
 /// # Errors
 ///
 /// Returns a database error if either grouped count query fails.
 pub async fn schedule_running_basis_batch(
     conn: &mut AsyncPgConnection,
-    names: &[&str],
-) -> HarvestResult<HashMap<String, i64>> {
-    if names.is_empty() {
+    schedules: &[(uuid::Uuid, &str)],
+) -> HarvestResult<HashMap<uuid::Uuid, i64>> {
+    if schedules.is_empty() {
         return Ok(HashMap::new());
     }
-    let running: Vec<(String, i64)> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq_any(names))
+    // Dedupe by schedule id defensively: a duplicate `(id, name)` pair would
+    // otherwise double-add the pending-throttle term for that id below (each
+    // id's basis is looked up once from `by_name`/`cross_type_by_schedule`,
+    // which are already idempotent under a repeat, but the throttle map is
+    // merged with `+=`). No caller passes duplicates today, but the contract
+    // is cheap to hold unconditionally rather than document as a caller
+    // obligation.
+    let owner_name: HashMap<uuid::Uuid, &str> =
+        schedules.iter().map(|(id, name)| (*id, *name)).collect();
+    let ids: Vec<uuid::Uuid> = owner_name.keys().copied().collect();
+    let name_set: std::collections::HashSet<&str> = owner_name.values().copied().collect();
+    let names: Vec<&str> = name_set.iter().copied().collect();
+
+    // Grouped by (workflow_name, schedule_id): every RUNNING/PAUSED row that
+    // matches EITHER this batch's names or its schedule ids, bucketed by its
+    // own exact pair. A row can only ever land in one bucket, so summing
+    // buckets below never double-counts it even when a bucket's name AND
+    // schedule_id both belong to the same schedule in the batch.
+    let grouped: Vec<(String, Option<uuid::Uuid>, i64)> = harvest_workflow_executions::table
+        .filter(
+            harvest_workflow_executions::workflow_name
+                .eq_any(&names)
+                .or(harvest_workflow_executions::schedule_id.eq_any(&ids)),
+        )
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .group_by(harvest_workflow_executions::workflow_name)
+        .group_by((
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::schedule_id,
+        ))
         .select((
             harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::schedule_id,
             diesel::dsl::count_star(),
         ))
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
-    let mut basis: HashMap<String, i64> = running.into_iter().collect();
-    let pending = crate::throttle::pending_throttle_counts_for_workflows(conn, names).await?;
-    for (name, count) in pending {
-        *basis.entry(name).or_insert(0) += count;
+    // Same-type count per name (identical semantics to the pre-#1160 batch:
+    // every RUNNING/PAUSED execution of that workflow type, manual runs
+    // included, regardless of which schedule_id -- if any -- it carries).
+    let mut by_name: HashMap<String, i64> = HashMap::new();
+    // Cross-type successor count per schedule id (issue #1160): rows carrying
+    // that schedule's `schedule_id` under a DIFFERENT `workflow_name`. Kept
+    // separate from `by_name` so the same row is never added to both.
+    let mut cross_type_by_schedule: HashMap<uuid::Uuid, i64> = HashMap::new();
+    for (row_name, row_schedule_id, count) in &grouped {
+        if name_set.contains(row_name.as_str()) {
+            *by_name.entry(row_name.clone()).or_insert(0) += count;
+        }
+        if let Some(sched_id) = row_schedule_id
+            && let Some(own_name) = owner_name.get(sched_id)
+            && *own_name != row_name.as_str()
+        {
+            *cross_type_by_schedule.entry(*sched_id).or_insert(0) += count;
+        }
+    }
+
+    let pending = crate::throttle::pending_throttle_counts_for_workflows(conn, &names).await?;
+    let mut basis: HashMap<uuid::Uuid, i64> = HashMap::new();
+    for (sched_id, name) in owner_name {
+        let total = by_name.get(name).copied().unwrap_or(0)
+            + cross_type_by_schedule.get(&sched_id).copied().unwrap_or(0)
+            + pending.get(name).copied().unwrap_or(0);
+        if total > 0 {
+            basis.insert(sched_id, total);
+        }
     }
     Ok(basis)
 }
@@ -5506,7 +5556,7 @@ pub async fn overdue_schedule_pass(
         let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
         // Shard-local + throttle-aware basis (matches the tick exactly).
         let at_capacity =
-            schedule_running_basis(conn, &name).await? >= i64::from(s.max_active_runs);
+            schedule_running_basis(conn, &name, s.id).await? >= i64::from(s.max_active_runs);
         // Resolve overlap/catchup exactly as the tick does, so the gated
         // at-capacity suppression (Codex P2-B) matches when the tick retains.
         let overlap_policy = OverlapPolicy::from_db(&s.overlap_policy);
@@ -6058,19 +6108,10 @@ async fn drain_buffered_schedule_runs(
             continue;
         }
 
-        let mut running: i64 = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-            .count()
-            .get_result(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        // A throttled fire durably defers before any execution row exists --
-        // count it toward max_active_runs so this loop can't drain more
-        // buffered slots than the schedule's true remaining capacity allows
-        // while an earlier fire is still sitting in the throttle queue
-        // (code review, issue #607).
-        running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
+        // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
+        // cross-type successors included per issue #1160, plus the #607
+        // pending-throttle backlog) -- see `schedule_running_basis`.
+        let running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
 
         let available = i64::from(schedule.max_active_runs).saturating_sub(running);
         if available <= 0 {

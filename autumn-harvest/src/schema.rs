@@ -154,6 +154,27 @@ diesel::table! {
         /// be resolved from the input. Never read on replay -- purely an
         /// admission-time bookkeeping column backing the quota usage counts.
         quota_key -> Nullable<Text>,
+        /// Forwarding pointer for a shard-rebalanced execution (issue #964).
+        /// Non-NULL exactly when `state = 'MIGRATED'`: the shard the run now
+        /// physically lives on, after an operator migrated it off this one. The
+        /// `ExecutionId` is never re-minted by a migration, so an id captured
+        /// before the move still routes here and resolves through this column.
+        /// NULL for every execution that never moved.
+        migrated_to_shard -> Nullable<Int4>,
+        /// Wall-clock of the cutover commit that sealed this row (issue #964).
+        /// Non-NULL exactly when `state = 'MIGRATED'`.
+        migrated_at -> Nullable<Timestamptz>,
+        /// Every shard that PREVIOUSLY hosted this execution (issue #964), as a
+        /// JSONB array of shard ids, oldest first. Appended to at each
+        /// activation; NULL for an execution that never moved.
+        ///
+        /// Distinct from `migrated_to_shard` on purpose. The pointer is
+        /// collapsed so routing hops do not accumulate, which destroys the
+        /// evidence of intermediate residences; this array does not, so the
+        /// live row's array plus the live row's own shard is the COMPLETE set
+        /// of shards still holding a copy of this run's bytes. That is what a
+        /// cross-residence payload erasure has to traverse.
+        migrated_from_shards -> Nullable<Jsonb>,
     }
 }
 
@@ -983,6 +1004,11 @@ diesel::table! {
         /// parent's execution rows are gone.
         parent_id     -> Nullable<Uuid>,
         summarized_at -> Timestamptz,
+        /// The demoted execution's residence history (issue #964), carried over
+        /// verbatim so a cross-residence payload erasure can still reach the
+        /// sealed source copies after the execution row itself is collected.
+        /// NULL for a run that never moved.
+        migrated_from_shards -> Nullable<Jsonb>,
     }
 }
 
@@ -1077,6 +1103,48 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable per-execution shard-migration record (issue #964).
+    ///
+    /// Lives on the **source** shard -- the one that stays authoritative right
+    /// up to the cutover commit -- so a crash at any point leaves a record on
+    /// the database that still owns the run. `resume_incomplete_migrations`
+    /// drives it forward; the phase machine that decides what to do with a row
+    /// found mid-flight is pure and lives in `shard_rebalance`.
+    harvest_shard_migrations (execution_id) {
+        execution_id -> Uuid,
+        source_shard -> Int4,
+        target_shard -> Int4,
+        /// PENDING | COPIED | VERIFIED | COMMITTED | DONE | ABORTED. Only the
+        /// VERIFIED -> COMMITTED transition changes who is authoritative.
+        phase -> Text,
+        /// The replay-verification fingerprint the target copy produced, kept
+        /// so an operator can see WHAT was verified, not only that it passed.
+        verified_fingerprint -> Nullable<Text>,
+        /// The source history's high-water mark at the instant verification
+        /// passed. The cutover seals only while the source's live counts still
+        /// equal these, so a run that woke, ran a decision cycle and re-parked
+        /// between verification and cutover is refused rather than cut over to
+        /// a copy that no longer contains its latest events.
+        verified_event_count -> Nullable<Int8>,
+        verified_max_event_id -> Nullable<Int4>,
+        abort_reason -> Nullable<Text>,
+        /// The source's parked workflow task row, captured verbatim at stage
+        /// time and re-inserted on the target at activation. Held here rather
+        /// than staged on the target because the claim query does not filter on
+        /// execution state, so a task row next to a staged `MIGRATING`
+        /// execution would be claimable -- live on two shards at once.
+        staged_task -> Nullable<Jsonb>,
+        attempts -> Int4,
+        last_error -> Nullable<Text>,
+        last_attempt_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -1104,6 +1172,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
     harvest_cross_shard_children,
+    harvest_shard_migrations,
     harvest_debounce,
     harvest_start_throttle,
     harvest_start_idempotency,

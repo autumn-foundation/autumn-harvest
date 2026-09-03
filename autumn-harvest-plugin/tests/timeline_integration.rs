@@ -66,6 +66,16 @@ const INIT_SQL: &str = concat!(
     // issue #704: history-bloat early-warning guard column (read back by
     // WorkflowExecution::as_select()).
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
+    // issue #964: shard-rebalancing forwarding columns (read back by
+    // WorkflowExecution::as_select()). Added inline rather than by including
+    // the migration, which also alters `harvest_execution_summaries` -- a table
+    // this bundle never creates. Without them every seed in this suite fails
+    // with `column harvest_workflow_executions.migrated_to_shard does not
+    // exist`, and the not-found routes answer 503 instead of 404 because the
+    // lookup errors before it can miss.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"

@@ -3179,6 +3179,11 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
+    // Issue #964. Both are returned by `GET /workflows`, so both must be
+    // filterable: a state the API emits but rejects as a filter value is a
+    // listing an operator can see and cannot narrow.
+    "MIGRATING",
+    "MIGRATED",
 ];
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
@@ -4327,10 +4332,23 @@ async fn get_workflow_by_id(
 async fn get_workflow_result_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    // Issue #1151 review: reject a malformed query string up front, before
+    // the business-id resolution DB lookup below -- otherwise an unknown
+    // workflow_id or an unreachable shard would mask the malformed query
+    // behind a 404/503 instead of the documented 400, and the lookup would
+    // run for a request that was always going to be rejected. The delegate
+    // (`get_workflow_result`) decodes `raw_query` again once resolution
+    // succeeds; this is a cheap, side-effect-free re-parse, not a
+    // functional duplication.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4339,7 +4357,7 @@ async fn get_workflow_result_by_id(
     let mut resp = get_workflow_result(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
         headers,
         maybe_session,
     )
@@ -4374,8 +4392,15 @@ async fn get_workflow_stack_by_id(
 async fn list_workflow_children_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
+    // Issue #1151 review: same early-reject rationale as
+    // `get_workflow_result_by_id` above.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4384,7 +4409,7 @@ async fn list_workflow_children_by_id(
     let out = list_workflow_children(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
     )
     .await;
     finalize_by_id(out, exec_id)
@@ -7108,6 +7133,8 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+                "prior_residences",
+                "retired_residences",
             ]),
         ),
         (
@@ -8291,32 +8318,21 @@ async fn shards_health(
 ///
 /// The one thing this endpoint *does* reject outright is a malformed query
 /// string: the raw query is parsed via
-/// [`crate::queue_coverage::parse_raw_query_pairs_strict`] rather than
-/// axum's built-in `Query<Vec<(String, String)>>` extractor, so an invalid
+/// [`crate::strict_query::parse_raw_query_pairs_strict`] rather than axum's
+/// built-in `Query<Vec<(String, String)>>` extractor, so an invalid
 /// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
 /// documented `400` JSON error instead of silently substituting `U+FFFD`
 /// and reporting a false-clean result for a scoped deploy gate (issue #774
-/// review).
+/// review; swept to every other raw-pairs route by issue #1151).
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
-    let pairs = match raw_query
-        .as_deref()
-        .map(crate::queue_coverage::parse_raw_query_pairs_strict)
-    {
-        None => Vec::new(),
-        Some(Ok(pairs)) => pairs,
-        Some(Err(crate::queue_coverage::InvalidQueryEncoding)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "malformed query string: invalid percent-encoded UTF-8"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let pairs =
+        match crate::strict_query::decode_or_queue_coverage_bad_request(raw_query.as_deref()) {
+            Ok(pairs) => pairs,
+            Err(response) => return response,
+        };
     let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
         .into_response()
@@ -9189,9 +9205,10 @@ mod stack_state_tests {
 
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
     use axum::response::IntoResponse as _;
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_workflow_filters(&pairs)?;
     // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
     // issue #486) and `history_bloat_min_events` (history-bloat discovery,
@@ -9455,8 +9472,9 @@ pub struct SummaryListPage {
 /// false` so a summary is never mistaken for a live execution.
 async fn list_workflow_summaries(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<SummaryListPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_summary_filters(&pairs)?;
     let (summaries, next_cursor) = load_summaries_from_shards(&api_state, &filters).await?;
     let items: Vec<SummaryListItem> = summaries
@@ -9553,8 +9571,9 @@ async fn load_summaries_from_shards(
 /// is named in `unavailable_shards` rather than failing the call wholesale.
 async fn count_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowCountResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = WorkflowCountParams::from_query_pairs(&pairs, KNOWN_WORKFLOW_STATES)
         .map_err(AutumnError::bad_request_msg)?;
     Ok(Json(
@@ -9572,8 +9591,9 @@ async fn count_workflows(
 /// `unavailable_shards` rather than failing the call wholesale.
 async fn usage_report(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<UsageResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let ceiling = api_state.usage_window_ceiling();
     let params = UsageParams::from_query_pairs(&pairs, chrono::Utc::now(), ceiling)
         .map_err(AutumnError::bad_request_msg)?;
@@ -10338,10 +10358,14 @@ fn terminal_workflow_states() -> Vec<String> {
 async fn export_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -10416,10 +10440,14 @@ async fn export_workflow_history(
 
 async fn export_workflow_histories(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_batch_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10470,10 +10498,14 @@ async fn export_workflow_histories(
 /// no state transition, no event appended, no task claimed.
 async fn export_workflow_history_sample(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_sample_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10719,10 +10751,11 @@ fn parse_workflow_history_query(
 async fn get_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowHistoryPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
@@ -10817,10 +10850,14 @@ async fn get_workflow_history(
 async fn get_workflow_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -11099,8 +11136,9 @@ fn workflow_result_pending_response() -> axum::response::Response {
 async fn list_workflow_children(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowChildrenResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let filters = parse_workflow_children_filters(&pairs)?;
 
@@ -11350,8 +11388,9 @@ async fn load_workflow_children_tree_from_shards(
 async fn get_workflow_tree(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let params = parse_lineage_query(&pairs)?;
 
@@ -11945,8 +11984,9 @@ impl From<external_task::ExternalHandoffRow> for ExternalHandoffResponse {
 
 async fn list_external_handoffs(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<ExternalHandoffListResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_external_handoff_filters(&pairs)?;
     let limit = filters.limit;
     let (mut rows, coverage) = load_external_handoffs_from_shards(&api_state, &filters).await?;
@@ -12392,8 +12432,9 @@ fn parse_workflow_logs_query(
 async fn get_workflow_logs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowLogsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, cursor, levels, since) = parse_workflow_logs_query(&pairs)?;
 
@@ -20372,6 +20413,7 @@ pub(crate) async fn signal_with_start_workflow(
     // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
     // where start_input is never written (mirrors the payload-cap deferral from issue #252).
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
+    let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -20399,6 +20441,21 @@ pub(crate) async fn signal_with_start_workflow(
             }
         };
         if let Some((existing_uuid, existing_state)) = hit {
+            // A rebalanced SEAL is not the run (issue #964). It matches this
+            // query — `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED —
+            // and shards iterate in id order, so the seal on the origin shard is
+            // found before the live copy on the target. Selecting it sends the
+            // whole operation to a row that will never run again: the resolver
+            // sees a non-RUNNING prior, upgrades to `TerminateIfRunning`, and
+            // the start path refuses a rebalanced prior, so the request 503s
+            // forever while the live run sits available on the next shard.
+            //
+            // Keep scanning instead, remembering the seal only so a live copy
+            // this node cannot see is refused rather than silently duplicated.
+            if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                seal_only = Some(candidate_shard);
+                continue;
+            }
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
@@ -20420,6 +20477,22 @@ pub(crate) async fn signal_with_start_workflow(
             found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
             break;
         }
+    }
+
+    // A seal but no live copy anywhere this node can reach: the run is alive on
+    // a shard with no pool here. Falling through would start a FRESH run for a
+    // business key that is already held, which is the duplicate the seal exists
+    // to prevent — so refuse retryably instead.
+    if found_shard.is_none()
+        && let Some(seal_shard) = seal_only
+    {
+        return AutumnError::service_unavailable_msg(format!(
+            "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+             off shard {}; its live copy is not reachable from this node, so the \
+             signal-with-start is refused rather than starting a duplicate run",
+            seal_shard.as_i32()
+        ))
+        .into_response();
     }
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
@@ -21030,6 +21103,7 @@ async fn update_with_start_workflow(
         (hit_exec_id.shard(), conn, hit_exec_id)
     } else {
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
@@ -21059,6 +21133,13 @@ async fn update_with_start_workflow(
                 }
             };
             if let Some((existing_uuid, existing_state)) = hit {
+                // A rebalanced seal is not the run (issue #964) — see the
+                // matching scan in the signal-with-start handler. Skip it and
+                // keep looking for the live copy.
+                if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                    seal_only = Some(candidate_shard);
+                    continue;
+                }
                 // Reuse the execution UUID only when attaching to a live RUNNING or
                 // SUSPENDED run under a non-rejecting policy. All other paths
                 // (terminal prior, PAUSED, TerminateIfRunning) go through
@@ -21082,6 +21163,16 @@ async fn update_with_start_workflow(
 
         if let Some(tuple) = found_shard {
             tuple
+        } else if let Some(seal_shard) = seal_only {
+            // Held by a run rebalanced onto a shard this node cannot reach.
+            // Starting fresh would duplicate the business key.
+            return AutumnError::service_unavailable_msg(format!(
+                "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+                 off shard {}; its live copy is not reachable from this node, so the \
+                 update-with-start is refused rather than starting a duplicate run",
+                seal_shard.as_i32()
+            ))
+            .into_response();
         } else {
             let shard = runtime
                 .router
@@ -22909,10 +23000,34 @@ async fn erase_workflow_payloads_handler(
         .unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
-    let result = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, &reason).await;
+    // Cross-residence (issue #964): a rebalanced execution's payloads exist on
+    // the sealed source shard as well as the live target, and an erasure that
+    // scrubbed only the shard the id routes to would leave a complete readable
+    // copy of the subject's data behind on another database.
+    //
+    // NOTE the deliberate absence of a held connection around this call. The
+    // helper checks out its own connection PER RESIDENCE, starting with the
+    // live one — so holding the audit connection across it would have this
+    // request waiting on a pool slot it is itself holding whenever the live
+    // shard's pool is the supported minimum size of one. That would wedge every
+    // erasure, migrated or not, until checkout timed out. The audit connection
+    // is therefore acquired AFTER the erase returns, which is the same
+    // one-connection-at-a-time discipline the cross-shard cancel path keeps for
+    // issue #688's precedent.
+    let result = match api_state.storage_pool() {
+        Ok(pool) => {
+            autumn_harvest::erase::erase_workflow_payloads_all_residences(
+                pool.sharded_pool(),
+                exec_id,
+                &reason,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -25409,10 +25524,12 @@ async fn get_schedule(
                 .as_deref()
                 .or(sched.workflow_name.as_deref())
                 .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            at_capacity = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
-                .await
-                .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
+            at_capacity =
+                autumn_harvest::scheduler::schedule_running_basis(&mut conn, name, sched.id)
+                    .await
+                    .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
             effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
                 &mut conn,
                 sched.calendar_name.as_deref(),
@@ -25727,8 +25844,9 @@ async fn observe_schedule_runs_shard(
 async fn list_schedule_runs_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let schedule_id = parse_uuid(&id_str, "schedule id")?;
     let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
@@ -26026,14 +26144,15 @@ async fn upsert_workflow_schedule_and_read_back(
     // the `harvest.schedule.overdue` gauge correctly suppress it to `false` —
     // breaking the read == gauge == tick invariant (issue #696, Codex round 2).
     // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
-    // `RUNNING`/`PAUSED` count + #607 pending-throttle backlog) that list/get use;
-    // a count failure falls back to `false` (don't suppress the wedge signal).
+    // `RUNNING`/`PAUSED` count, cross-type #1160 successors of this schedule_id
+    // included, + #607 pending-throttle backlog) that list/get use; a count
+    // failure falls back to `false` (don't suppress the wedge signal).
     let name = row
         .dag_name
         .as_deref()
         .or(row.workflow_name.as_deref())
         .unwrap_or("");
-    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name)
+    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name, row.id)
         .await
         .is_ok_and(|basis| basis >= i64::from(row.max_active_runs));
     // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
@@ -26544,25 +26663,35 @@ async fn load_schedule_overdue_aux_by_shard(
         // queries plus `resolve_effective_fire_at`'s calendar-exclusions
         // load) with exactly two grouped queries covering every schedule on
         // the shard at once (issue #786-class N+1; Ledger perf pass). A
-        // failed running-basis batch degrades to "0 running" for every name
-        // via `unwrap_or_default()`, the same as the old per-row
+        // failed running-basis batch degrades to "0 running" for every
+        // schedule via `unwrap_or_default()`, the same as the old per-row
         // `Err(_) => false` arm: it never *suppresses* an overdue wedge
         // signal, only fails to hide one. The exclusions batch below is
         // handled differently -- see the comment at its call site.
-        let names: Vec<&str> = schedules
+        //
+        // Keyed by (schedule_id, name) rather than name alone (issue #1160):
+        // `schedule_running_basis_batch`'s cross-type disjunct means the
+        // result is looked up per schedule, not per name. No BTreeSet dedup
+        // needed here (unlike the pre-#1160 name-only batch): a dag_name and
+        // a different row's workflow_name can collide on the same string,
+        // but keying by `s.id` (unique) rather than by name means a
+        // collision no longer risks two schedules sharing one basis lookup.
+        let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
             .iter()
             .map(|s| {
-                s.dag_name
-                    .as_deref()
-                    .or(s.workflow_name.as_deref())
-                    .unwrap_or("")
+                (
+                    s.id,
+                    s.dag_name
+                        .as_deref()
+                        .or(s.workflow_name.as_deref())
+                        .unwrap_or(""),
+                )
             })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
-        let basis = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &names)
-            .await
-            .unwrap_or_default();
+        let basis =
+            autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &schedule_names)
+                .await
+                .unwrap_or_default();
 
         let calendar_names: Vec<&str> = schedules
             .iter()
@@ -26587,13 +26716,10 @@ async fn load_schedule_overdue_aux_by_shard(
                 .ok();
 
         for s in schedules {
-            let name = s
-                .dag_name
-                .as_deref()
-                .or(s.workflow_name.as_deref())
-                .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            let at_capacity = basis.get(name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
+            let at_capacity =
+                basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
             // Calendar-adjusted fire time (Codex round 3), computed in-memory
             // against this shard's preloaded exclusions map -- or the raw
             // anchor (`None`) if that load failed, never a silent "no
@@ -27971,7 +28097,9 @@ async fn trigger_schedule_now(
     // treat it as saturated rather than silently firing through.
     if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
         let is_saturated =
-            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name).await {
+            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name, schedule.id)
+                .await
+            {
                 Ok(running) => running >= i64::from(schedule.max_active_runs),
                 Err(_) => true,
             };
@@ -29096,7 +29224,7 @@ pub(crate) async fn schedule_backfill_inner(
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
-        let running = query_running_count_best_effort(&pool, &kind, &name).await;
+        let running = query_running_count_best_effort(&pool, &kind, &name, schedule_id).await;
         // Workflow IDs are derived from original_slot (not fire_time), so duplicate
         // detection must use the same set of timestamps that dispatch will use.
         let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
@@ -29219,7 +29347,7 @@ pub(crate) async fn schedule_backfill_inner(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name).await {
+    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
         Ok(count) => count,
         Err(count_failures) => {
             let status = "partial";
@@ -30356,12 +30484,16 @@ pub(crate) async fn schedule_backfill_inner(
 /// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the
 /// named entity. A PAUSED run still occupies an active slot for
 /// `max_active_runs`/overlap enforcement (issue #383), matching the scheduler.
+/// The `schedule_id` disjunct (issue #1160) also counts a cross-type
+/// continue-as-new successor of this schedule, matching
+/// `scheduler::schedule_running_basis`.
 /// Returns the total count across all shards, or all shard failures that made
 /// the count unsafe to use for `max_active_runs` enforcement.
 async fn query_running_count(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> Result<i64, Vec<BackfillShardFailure>> {
     let mut total = 0i64;
     let mut failures = Vec::new();
@@ -30377,7 +30509,11 @@ async fn query_running_count(
         // Both DAG and Workflow kinds query harvest_workflow_executions since
         // DAGs are now unified as workflows (issue #256 step 5).
         let count_result = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(name))
+            .filter(
+                harvest_workflow_executions::workflow_name
+                    .eq(name)
+                    .or(harvest_workflow_executions::schedule_id.eq(Some(schedule_id))),
+            )
             .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result::<i64>(&mut conn)
@@ -30406,8 +30542,11 @@ async fn query_running_count_best_effort(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> i64 {
-    query_running_count(pool, kind, name).await.unwrap_or(0)
+    query_running_count(pool, kind, name, schedule_id)
+        .await
+        .unwrap_or(0)
 }
 
 /// Fan out across shards summing pending (not-yet-fired) start-throttle rows
@@ -30812,8 +30951,9 @@ async fn list_dead_letters(
 /// on the happy path).
 async fn aggregate_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
@@ -38127,12 +38267,28 @@ pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError>
     pool.get().await.map_err(|error| map_pool_error(&error))
 }
 
+/// Resolve a connection to the shard that currently hosts `exec_id`.
+///
+/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964)
+/// so an execution an operator has rebalanced onto another shard is still found
+/// by the `ExecutionId` a caller captured before the move — the identity
+/// contract that makes shard rebalancing safe is *"any id captured before the
+/// migration continues to resolve after it"*, and this is the chokepoint the
+/// ~40 single-execution management routes reach it through.
+///
+/// A single-shard deployment pays nothing: with one pool there is nowhere to
+/// migrate to, so the forwarding probe is skipped and this is byte-for-byte the
+/// pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
+/// primary-key lookup against a partial index that is empty until an operator
+/// rebalances.
 pub(crate) async fn db_conn_for_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    acquire_conn(pool.pool_for_execution(exec_id)).await
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(pool.sharded_pool(), exec_id)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default
@@ -38165,7 +38321,19 @@ pub(crate) async fn db_conn_for_execution_exact(
 ) -> Result<Option<PoolConn>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
-        return acquire_conn(shard_pool).await.map(Some);
+        // Issue #964: the origin shard is reachable, but the run may have been
+        // rebalanced off it. Follow the durable forwarding pointer, preserving
+        // this helper's exact/no-default contract — without it `/tree`, `/logs`
+        // and `PATCH /triage` read (and, for triage, WRITE) the sealed source
+        // instead of the live copy, and report success for doing so.
+        let _ = shard_pool;
+        return ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| map_pool_error(&error));
     }
     let shard = exec_id.shard().as_i32();
     let pools = crate::shard_fanout::pools_by_shard(api_state);
@@ -38496,7 +38664,24 @@ pub(crate) async fn load_workflows(
         };
     }
 
-    if !filters.states.is_empty() {
+    if filters.states.is_empty() {
+        // Issue #964: a completed migration leaves TWO rows carrying the same
+        // `id` and the same copied `created_at` — `MIGRATED` on the source and
+        // the live `RUNNING` copy on the target — and this listing fans out
+        // across every shard. Returning both would show one logical execution
+        // twice, and worse: the keyset cursor is derived from `(created_at, id)`,
+        // which is byte-identical for the two copies, so a page boundary landing
+        // between them makes the strict next-page predicate skip the other one
+        // permanently — possibly leaving only the stale `MIGRATED` state visible.
+        //
+        // The sealed source is a forwarding tombstone, not a workflow, so the
+        // DEFAULT listing collapses residences to the live row by excluding it.
+        // An explicit `state=MIGRATED` filter still returns it: the diagnostic
+        // view an operator needs mid-decommission is deliberately preserved,
+        // and that branch cannot double-count because it excludes the live copy
+        // by the same predicate.
+        query = query.filter(harvest_workflow_executions::state.ne("MIGRATED"));
+    } else {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
     if let Some(name) = &filters.workflow_name {
@@ -43131,8 +43316,9 @@ pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> 
 
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
@@ -43636,8 +43822,9 @@ async fn request_drain_handler(
 
 async fn drain_preview_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Vec<DrainPreviewItem>>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -43973,11 +44160,18 @@ pub async fn poll_update_result(
         loop {
             let result = {
                 // Scope the connection so it is returned to the pool before sleeping.
-                let mut c = pool
-                    .pool_for_execution(exec_id)
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                // Forwarding-aware (issue #964): the admit-and-wake half of an
+                // update routes through `db_conn_for_execution`, which follows
+                // the durable pointer to the live copy. If the poll did not, a
+                // rebalanced workflow would have its update run on the target
+                // while this loop read the sealed source's frozen history —
+                // never observing `UpdateCompleted`/`UpdateFailed`, and
+                // answering 504 for an update that in fact completed.
+                let mut c = autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await?;
                 let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
@@ -49568,7 +49762,7 @@ mod tests {
         let response = get_workflow_result(
             Extension(state),
             Path(exec_id.to_string()),
-            Query(Vec::new()),
+            axum::extract::RawQuery(None),
             axum::http::HeaderMap::new(),
             None,
         )
@@ -53539,6 +53733,9 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
+            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),

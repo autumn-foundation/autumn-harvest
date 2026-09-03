@@ -610,10 +610,22 @@ fn erase_outcome_serialized_fields_are_all_declared() {
             execution_id: "c".to_string(),
             reason: "boom".to_string(),
         }],
+        // Also `skip_serializing_if` -- populated for the same reason: this
+        // test asserts over the widest response the endpoint can produce, and
+        // a cross-residence erase (#964) emits one entry per sealed source it
+        // scrubbed.
+        prior_residences: vec![],
+        // Also `skip_serializing_if` — a retired shard on the residence chain
+        // that the erasure could not visit because its pool is gone fleet-wide.
+        retired_residences: vec![9],
     };
     // `children` is skipped when empty; give it one entry so it serializes.
     let outcome = autumn_harvest::erase::EraseOutcome {
         children: vec![outcome.clone()],
+        prior_residences: vec![autumn_harvest::erase::ErasedResidence {
+            shard_id: 0,
+            outcome: outcome.clone(),
+        }],
         ..outcome
     };
 

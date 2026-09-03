@@ -395,6 +395,9 @@ pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
+/// Shard rebalancing: migrating quiescent workflow executions across shards
+/// (issue #964).
+pub mod shard_rebalance;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
