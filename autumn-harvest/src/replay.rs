@@ -12515,13 +12515,7 @@ mod tests {
     fn timer_scan_cross_or_stop_stashes_interleaved_external_cancel_triplet() {
         let timer_id = TimerId::new("idle");
         let (_, target, requested, delivered) = external_cancel_triplet();
-        let events = vec![
-            requested,
-            delivered,
-            WorkflowEvent::TimerCancelled {
-                timer_id: timer_id.clone(),
-            },
-        ];
+        let events = vec![requested, delivered, WorkflowEvent::TimerCancelled { timer_id }];
         let mut matcher = HistoryMatcher::new(events);
         assert_eq!(
             matcher.match_timer_cancel("idle"),
