@@ -607,8 +607,20 @@ jobs:
           # other nonzero exit (wrong default-run binary, a crash, a changed
           # error shape) fails the step rather than being swallowed by a
           # blanket `|| true`.
-          cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)"
-          cli_status=$?
+          #
+          # GitHub Actions' default `shell: bash` runs steps as `bash -eo
+          # pipefail {0}` — errexit is already on before this script's own
+          # `set -uo pipefail` ever runs. A plain `cli_out="$(cmd)"` where
+          # `cmd` is expected to exit nonzero (the known 401 case) would abort
+          # the whole step right there, before `cli_status=$?` is even
+          # reached. Wrapping the assignment as an `if` condition is the
+          # standard way to capture a command's real exit status without
+          # tripping errexit — `if`/`elif` conditions are explicitly exempt.
+          if cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
+            cli_status=0
+          else
+            cli_status=$?
+          fi
           if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
             echo "${cli_out}"
             echo "::error::cargo run -p autumn-harvest-cli -- ... is ambiguous (missing default-run)"; exit 1
