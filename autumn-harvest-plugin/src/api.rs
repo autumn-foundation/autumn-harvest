@@ -8301,10 +8301,11 @@ async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
-    let pairs = match crate::strict_query::decode_or_bad_request(raw_query.as_deref()) {
-        Ok(pairs) => pairs,
-        Err(response) => return response,
-    };
+    let pairs =
+        match crate::strict_query::decode_or_queue_coverage_bad_request(raw_query.as_deref()) {
+            Ok(pairs) => pairs,
+            Err(response) => return response,
+        };
     let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
         .into_response()

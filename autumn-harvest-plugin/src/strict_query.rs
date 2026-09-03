@@ -116,7 +116,9 @@ pub fn decode_or_autumn_error(
 /// propagating it further, so boxing would only add an allocation with no
 /// benefit here.
 #[allow(clippy::result_large_err)]
-pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, String)>, Response> {
+pub fn decode_or_queue_coverage_bad_request(
+    raw_query: Option<&str>,
+) -> Result<Vec<(String, String)>, Response> {
     match raw_query.map(parse_raw_query_pairs_strict) {
         None => Ok(Vec::new()),
         Some(Ok(pairs)) => Ok(pairs),
@@ -131,7 +133,7 @@ pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, Str
 /// via `.into_response()`) whose *other* invalid-param `400`s are
 /// [`AutumnError`]-shaped (the `Err(error) => return error.into_response()`
 /// idiom used throughout [`crate::api`]). Using this instead of
-/// [`decode_or_bad_request`] keeps a route's malformed-query `400` in the
+/// [`decode_or_queue_coverage_bad_request`] keeps a route's malformed-query `400` in the
 /// SAME body shape as its own other `400`s, rather than introducing a
 /// second, inconsistent error shape on the same route (issue #1151 review).
 ///
@@ -141,7 +143,7 @@ pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, Str
 /// [`AutumnError::bad_request_msg`] on [`InvalidQueryEncoding`], for the
 /// caller to `return` directly.
 ///
-/// See [`decode_or_bad_request`]'s doc comment for why the large `Err`
+/// See [`decode_or_queue_coverage_bad_request`]'s doc comment for why the large `Err`
 /// variant is allowed rather than boxed.
 #[allow(clippy::result_large_err)]
 pub fn decode_or_autumn_error_response(
@@ -417,16 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_or_bad_request_treats_absent_query_as_empty_pairs() {
+    fn decode_or_queue_coverage_bad_request_treats_absent_query_as_empty_pairs() {
         assert_eq!(
-            decode_or_bad_request(None).expect("absent query must decode"),
+            decode_or_queue_coverage_bad_request(None).expect("absent query must decode"),
             Vec::new()
         );
     }
 
     #[test]
-    fn decode_or_bad_request_returns_400_response_on_malformed_encoding() {
-        let response = decode_or_bad_request(Some("queue_name=%FF"))
+    fn decode_or_queue_coverage_bad_request_returns_400_response_on_malformed_encoding() {
+        let response = decode_or_queue_coverage_bad_request(Some("queue_name=%FF"))
             .expect_err("malformed encoding must be rejected");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }

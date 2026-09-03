@@ -82,10 +82,14 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 // Strict raw-query percent-decoding was extracted to `crate::strict_query`
 // (issue #1151) so every other management API route with the same
 // `Query<Vec<(String, String)>>` gap could share it rather than
-// reimplementing it. Re-exported here so `crate::queue_coverage::{
-// parse_raw_query_pairs_strict, InvalidQueryEncoding}` (this module's
-// original, still-referenced-elsewhere path) keeps working.
-pub use crate::strict_query::{InvalidQueryEncoding, parse_raw_query_pairs_strict};
+// reimplementing it. The `queue_coverage` handler itself now calls
+// `crate::strict_query::decode_or_queue_coverage_bad_request` directly, and
+// this module's own doc comments reference the strict decoder by its full
+// path -- the only remaining user of a bare `parse_raw_query_pairs_strict`
+// name in this module is the integration test below, so it's imported
+// test-only rather than as a module-wide (let alone `pub`) re-export.
+#[cfg(test)]
+use crate::strict_query::parse_raw_query_pairs_strict;
 
 /// Query string accepted by `GET /admin/queue-coverage`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -94,7 +98,7 @@ pub struct QueueCoverageQuery {
     /// valid value — an unknown/never-scheduled queue simply yields
     /// `uncovered: false` (there is nothing pending on it), never an error.
     /// A malformed *encoding* (invalid percent-decoded UTF-8) is rejected
-    /// earlier, by [`parse_raw_query_pairs_strict`], before it ever reaches
+    /// earlier, by [`crate::strict_query::parse_raw_query_pairs_strict`], before it ever reaches
     /// this type — see that function's doc comment.
     pub queue_name: Option<String>,
 }
@@ -106,7 +110,7 @@ impl QueueCoverageQuery {
     /// Infallible by construction (issue #774 AC8, matching the
     /// `dlq::DlqAggregateParams`/`workflow_count::WorkflowCountParams`/
     /// `usage::UsageParams` convention) **once the pairs are already valid
-    /// decoded strings** — see [`parse_raw_query_pairs_strict`] for the
+    /// decoded strings** — see [`crate::strict_query::parse_raw_query_pairs_strict`] for the
     /// upstream check that actually can reject a request. `queue_name` is a
     /// free-text filter with no invalid *decoded value* — any string is a
     /// legitimate (if possibly never-scheduled) queue name — so unlike a
