@@ -26,17 +26,32 @@ External links (http/https/mailto) are intentionally NOT checked — that
 needs network access and is a different audit; this script is pure
 filesystem, so it can run in CI on every PR.
 
-KNOWN LIMITATION: a 4-space-indented, non-fenced CommonMark code block is
-not excluded from link/heading extraction — only fenced (``` or ~~~) blocks
-and inline code spans are. A correct fix needs container-relative
-indentation tracking (4 spaces means "code block" only when it is NOT a
-list-item continuation, which this corpus uses constantly — e.g.
-docs/performance.md:1164 is a real, working link at 4-space indent inside a
-`*` list item). A naive "blank every 4-space-indented line" fix would
-silently stop checking links like that one. Left unfixed because no genuine
-top-level indented code block containing link- or heading-looking text
-currently exists in the corpus (checked) — the risk of the naive fix
-outweighs a gap with zero current impact.
+KNOWN LIMITATIONS:
+
+- A 4-space-indented, non-fenced CommonMark code block is not excluded from
+  link/heading extraction — only fenced (``` or ~~~) blocks and inline code
+  spans are. A correct fix needs container-relative indentation tracking (4
+  spaces means "code block" only when it is NOT a list-item continuation,
+  which this corpus uses constantly — e.g. docs/performance.md:1164 is a
+  real, working link at 4-space indent inside a `*` list item). A naive
+  "blank every 4-space-indented line" fix would silently stop checking
+  links like that one. Left unfixed because no genuine top-level indented
+  code block containing link- or heading-looking text currently exists in
+  the corpus (checked) — the risk of the naive fix outweighs a gap with
+  zero current impact.
+
+- `slugify()` operates on a heading's raw Markdown source, not its
+  GitHub-RENDERED text. This is invisible for the markup this corpus
+  actually puts in headings (`**bold**`, `` `code` ``, emoji — all pass
+  through unchanged or get correctly stripped as punctuation either way),
+  but a heading that is itself a link — `## [Guide](guide.md)`, which
+  GitHub renders and slugs as just "Guide" — would slug from the raw
+  `[Guide](guide.md)` text instead, producing garbage. Properly rendering
+  arbitrary inline Markdown (links, images, entities) to plain text before
+  slugging is a materially bigger piece of work than the regex-level fixes
+  above — effectively a small inline-Markdown-to-text renderer — and no
+  heading anywhere in the corpus is currently written as a link (checked),
+  so this is left unfixed rather than half-implemented.
 
 Usage:
     python3 docs/audits/corpus-link-check.py [--json]
@@ -107,13 +122,19 @@ _LABEL = r"(?:[^\[\]]|\[[^\[\]]*\])*"
 _TITLE = r'(?:"[^"]*"|\'[^\']*\'|\([^)]*\))'
 # CommonMark also allows an angle-bracketed destination — `[x](<a b.md>)` —
 # specifically so a path containing a space can be written at all (the bare
-# form `[^)\s]+` stops at the first space). Captured as one alternative
+# form otherwise stops at the first space). Captured as one alternative
 # inside the same group; `unwrap_angle_dest` strips the brackets afterward.
 # Without this, `<management-api.md>` (brackets included) is what gets
 # resolved against the filesystem, which never exists — a real file falsely
 # reported missing — and a bracketed destination containing a space isn't
 # matched by the bare form at all, so it's silently skipped.
-_DEST = r"(<[^<>]*>|[^)\s]+)"
+#
+# The bare form itself allows one level of BALANCED parens (same nested-once
+# shape as `_LABEL`'s bracket handling above) — CommonMark permits a literal
+# `(`/`)` pair inside an unbracketed destination, e.g. `[x](guide(v2).md)`.
+# Stopping at the first `)` (the obvious-looking `[^)\s]+`) truncates that
+# to `guide(v2` and reports a real file as missing.
+_DEST = r"(<[^<>]*>|(?:[^()\s]|\([^()]*\))+)"
 LINK_RE = re.compile(rf"\[{_LABEL}\]\({_DEST}(?:\s+{_TITLE})?\)")
 # Bare image `![alt](src)`, checked independently so a *local* image's `src`
 # still gets a missing-file check even when the image is ALSO wrapped in an
@@ -125,6 +146,16 @@ def unwrap_angle_dest(target: str) -> str:
     if target.startswith("<") and target.endswith(">"):
         return target[1:-1]
     return target
+
+
+def normalize_ref_label(label: str) -> str:
+    # CommonMark reference-label matching case-folds AND collapses runs of
+    # internal whitespace to one space, not just leading/trailing — so
+    # `[x][foo bar]` matches a definition written `[foo  bar]: ...` (or
+    # split across a line wrap). Comparing with only `.strip().lower()`
+    # treats those as different keys and reports a real, defined reference
+    # as "undefined".
+    return re.sub(r"\s+", " ", label.strip()).lower()
 # Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
 REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # Bare shortcut reference `[ref]` — only counts if `ref` matches a real
@@ -285,7 +316,7 @@ def extract_link_targets(text: str):
     defs = {}
 
     def collect_def(m):
-        defs[m.group(1).strip().lower()] = unwrap_angle_dest(m.group(2))
+        defs[normalize_ref_label(m.group(1))] = unwrap_angle_dest(m.group(2))
         return ""  # remove the definition line so it can't also match as prose
 
     text = REF_DEF_RE.sub(collect_def, text)
@@ -309,7 +340,7 @@ def extract_link_targets(text: str):
 
     for m in REF_USE_RE.finditer(text):
         label, ref = m.group(1), m.group(2)
-        key = (ref if ref else label).strip().lower()
+        key = normalize_ref_label(ref if ref else label)
         consumed.append(m.span())
         if key in defs:
             targets.append(defs[key])
@@ -323,7 +354,7 @@ def extract_link_targets(text: str):
     for m in SHORTCUT_RE.finditer(text):
         if overlaps(m.span()):
             continue
-        key = m.group(1).strip().lower()
+        key = normalize_ref_label(m.group(1))
         if key in defs:
             targets.append(defs[key])
             consumed.append(m.span())
