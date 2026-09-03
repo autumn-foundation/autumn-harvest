@@ -89,7 +89,13 @@ REF_DEF_RE = re.compile(
     r'(?m)^[ \t]{0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?'
     r'(?:[ \t]+(?:"[^"]*"|\'[^\']*\'|\([^)]*\)))?[ \t]*$'
 )
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$", re.MULTILINE)
+# CommonMark allows up to 3 leading spaces on an ATX heading (4+ makes it an
+# indented code block instead) — including headings nested inside a list
+# item, which is exactly how this corpus uses them (docs/shipped-work.md has
+# 167 of them, e.g. "  ### What shipped" under a `- **Phase N**` bullet).
+# Requiring column 0 misses all of those and reports every link into one as
+# a "missing anchor" false positive.
+HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})\s+(.+?)\s*#*$", re.MULTILINE)
 FENCE_RE = re.compile(r"^```")
 
 
@@ -269,6 +275,16 @@ def main():
                 if not resolved.exists():
                     broken.append((src, target, "missing file"))
                     continue
+                if resolved.is_dir():
+                    # A link to a directory (e.g. `dashboards/`) renders on
+                    # GitHub as that directory's README — credit the README
+                    # for inbound-link purposes, or a page reachable only
+                    # by a directory link false-reports as an orphan (found
+                    # in review: docs/dashboards/README.md, linked from
+                    # docs/migrating-from-temporal.md as `dashboards/`).
+                    readme = resolved / "README.md"
+                    if readme in file_set:
+                        resolved = readme
                 if resolved in file_set:
                     inbound[resolved] = inbound.get(resolved, 0) + 1
 
