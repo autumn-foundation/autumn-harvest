@@ -15,6 +15,7 @@
 // this apparatus was built to answer.
 
 use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -110,10 +111,26 @@ struct ClaimerOutcome {
 /// One claimer: `per_claimer` claim-only attempts against all `QUEUES` queue
 /// names, no enqueue and no complete/ack during the measured phase (matches
 /// what `docs/performance.md`'s table itself measures: `claim_task` alone).
+///
+/// **Post-review correction.** `RedisTaskQueue::claim_inner` checks the given
+/// queue list *in order* and returns as soon as the first queue yields an
+/// entry (`autumn-harvest-redis/src/redis_queue.rs:416-464`); it does not
+/// select globally across queues the way Postgres's `queue_name = ANY($2)`
+/// does. Passing the same fixed `[q0, q1, q2, q3]` order to every call would
+/// mean every claim in the registered cell comes from `q0` alone (it holds
+/// far more than the 800-op measured budget), leaving `q1..q3` completely
+/// unread — a single-queue run in a four-stream costume, not a match for the
+/// scenario it claims to reproduce. `next_rotation` hands each call a
+/// distinct rotation of the queue list (a shared, call-ordered counter
+/// across every claimer, so the rotation is fair across the whole
+/// concurrent run, not just within one claimer's own calls), so claims
+/// actually distribute across all four queues. See the Assay section for
+/// the post-fix per-queue drain counts that verify this.
 async fn run_claimer(
     queue: RedisTaskQueue,
     worker_id: String,
     queues: Arc<Vec<String>>,
+    rotation: Arc<AtomicUsize>,
     start_gate: Arc<Barrier>,
     per_claimer: usize,
     deadline: Instant,
@@ -122,20 +139,31 @@ async fn run_claimer(
     let my_start = Instant::now();
     let mut observed = Vec::with_capacity(per_claimer);
     for _ in 0..per_claimer {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
+        let start_at = rotation.fetch_add(1, Ordering::Relaxed) % queues.len();
+        let rotated: Vec<String> =
+            queues.iter().cycle().skip(start_at).take(queues.len()).cloned().collect();
         let call_start = Instant::now();
-        match queue.claim(&queues, &worker_id).await {
-            Ok(Some(_claimed)) => {
+        // Post-review correction: bound the call itself, not just the loop
+        // head, mirroring `claim_bench_support.rs`'s
+        // `tokio::time::timeout(deadline - now, queue::claim_task(...))` — an
+        // unbounded await on a stalled Redis would otherwise sit past the
+        // advertised scenario ceiling with the loop-top check never running
+        // again.
+        match tokio::time::timeout(deadline - now, queue.claim(&rotated, &worker_id)).await {
+            Ok(Ok(Some(_claimed))) => {
                 let ms = call_start.elapsed().as_secs_f64() * 1000.0;
                 observed.push((ms, true));
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 let ms = call_start.elapsed().as_secs_f64() * 1000.0;
                 observed.push((ms, false));
             }
-            Err(_) => break,
+            Ok(Err(_)) => break,
+            Err(_) => break, // timed out at the scenario deadline
         }
     }
     ClaimerOutcome { observed, span: (my_start, Instant::now()) }
@@ -175,6 +203,10 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
 
     let total_ops = measured_claims_for(backlog);
     let queues = Arc::new(queue_names(&prefix));
+    // Shared across every claimer so the queue-list rotation each call uses
+    // is fair over the whole concurrent run, not just within one claimer's
+    // own calls. See `run_claimer`'s doc comment (post-review correction).
+    let rotation = Arc::new(AtomicUsize::new(0));
     let start_gate = Arc::new(Barrier::new(CLAIMERS + 1));
     let deadline = Instant::now() + scenario_budget;
 
@@ -190,9 +222,11 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
             .expect("connect to local redis");
         let worker_id = format!("matchbench-worker-{c}");
         let queues = Arc::clone(&queues);
+        let rotation = Arc::clone(&rotation);
         let start_gate = Arc::clone(&start_gate);
         handles.push(tokio::spawn(async move {
-            run_claimer(queue, worker_id, queues, start_gate, per_claimer, deadline).await
+            run_claimer(queue, worker_id, queues, rotation, start_gate, per_claimer, deadline)
+                .await
         }));
     }
 

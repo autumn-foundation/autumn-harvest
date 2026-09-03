@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does Redis clear a decisive matched-workload margin over Postgres at the 10k-backlog headline cell? (pursue: 17,562 vs 290 claims/sec line, ledger #2)
+# ⛏️ Prospect: does Redis clear a decisive matched-workload margin over Postgres at the 10k-backlog headline cell? (pursue: 18,933 vs 290 claims/sec line, ledger #2)
 
 > Status: **measured.** The Pre-registration section above was committed
 > (`883fd7a`) before the apparatus was built or run; nothing in it has been
@@ -182,6 +182,56 @@ successful claim across the *whole* observed sequence, warmup included,
 because the wall-clock denominator (`measured_window`) starts at the first
 warmup call too. `claims_per_sec = total_claimed / wall_secs`.
 
+> **Post-review correction (Codex, two findings on the first pushed
+> commit).** **P1 — the four queues were not actually being sampled.**
+> `RedisTaskQueue::claim_inner` checks the queue list it's given *in order*
+> and returns as soon as the first queue yields an entry
+> (`autumn-harvest-redis/src/redis_queue.rs:416-464`). The apparatus's first
+> version passed the same fixed `[q0, q1, q2, q3]` order to every claimer on
+> every call; since `q0` alone holds 2,500 entries at the registered cell —
+> far more than the 800-op measured budget — **every measured claim came
+> from `q0`**, and `q1..q3` were never read at all. That silently reduced
+> the "4 queues" scenario back to the single-queue shape ledger #1's own
+> apparatus already tried and found unmatched, while still *reporting* a
+> matching `n` (an `n` match is a function of `measured_claims_for` and
+> warmup trimming, not of which queue a claim came from, so the earlier
+> `n`-matches-published-`n` check did not — and could not — catch this).
+> Fixed by rotating the queue order per call from a shared, call-ordered
+> counter across every claimer (`run_claimer`'s `rotation: Arc<AtomicUsize>`
+> in the apparatus source), so claims distribute across all four queues
+> instead of draining one. Verified directly, not just by argument: after a
+> post-fix run of the registered cell, `XPENDING <stream> harvest_workers`
+> on each of the four queue streams reported **exactly 200 pending entries
+> per queue** (800 total, matching `total_claimed`), each roughly evenly
+> spread across the 8 consumer identities (individual worker counts ranged
+> 12-35 per queue — real, not perfectly uniform, contention, not a
+> single-queue skew).
+>
+> **P2 — each claim call was not individually bounded by the remaining
+> scenario deadline.** The pre-registration and this section both describe
+> "wall-clock-bounded sampling" ported from `claim_bench_support.rs`, but
+> the first version only checked the deadline at the *top* of each
+> claimer's loop, leaving the `claim` call itself an unbounded await — a
+> stalled Redis would have sat past the advertised ceiling with the
+> loop-top check never running again, exactly the failure mode
+> `claim_bench_support.rs`'s own `tokio::time::timeout(deadline - now,
+> queue::claim_task(...))` (`claim_bench_support.rs:4107-4119`) exists to
+> prevent. Fixed by wrapping each call in
+> `tokio::time::timeout(deadline - now, queue.claim(...))`, mirroring that
+> pattern; a timeout now behaves the same as a hard error (break, and the
+> claimer's `truncated` state is implied by having collected fewer than its
+> planned `per_claimer` observations).
+>
+> Both fixes changed the *mechanism*, not the *conclusion*: the corrected
+> registered-cell mean (18,933.43 claims/s across four runs, see Assay) is
+> within the pre-fix runs' range (15,319.64-19,140.83) and clears the same
+> 290 claims/s line by the same roughly-two-orders-of-magnitude margin. The
+> numbers in Assay and Verdict below are all from the corrected apparatus;
+> the pre-fix numbers are not reported as a separate result, since the fix
+> is what makes this apparatus actually answer the registered question
+> (both P1's queue-4 fidelity and P2's timeout-bounding property that the
+> Apparatus section above already claimed as ported).
+
 **Stubs list (what was faked/skipped, and why it matters for reading the
 number):**
 
@@ -219,24 +269,26 @@ number):**
 
 ## 📊 Assay
 
-Registered cell (10,000-row backlog) run four times total (the sweep run
-below, plus three independent repeats), fresh `FLUSHALL` and a fresh
-process-derived key prefix each time:
+All numbers below are from the **corrected** apparatus (post-review fixes
+P1/P2, see Apparatus). Registered cell (10,000-row backlog) run four times
+total (the sweep run below, plus three independent repeats), fresh
+`FLUSHALL` and a fresh process-derived key prefix each time:
 
 | run | n | claimed | empty | total_claimed | wall_secs | claims/s | p50 ms | p99 ms |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 1 (sweep) | 720 | 720 | 0 | 800 | 0.042 | 19,140.83 | 0.376 | 0.855 |
-| 2 | 720 | 720 | 0 | 800 | 0.047 | 17,029.08 | 0.439 | 0.714 |
-| 3 | 720 | 720 | 0 | 800 | 0.043 | 18,758.27 | 0.382 | 0.856 |
-| 4 | 720 | 720 | 0 | 800 | 0.052 | 15,319.64 | 0.505 | 1.097 |
+| 1 (sweep) | 720 | 720 | 0 | 800 | 0.044 | 18,334.91 | 0.412 | 0.744 |
+| 2 | 720 | 720 | 0 | 800 | 0.043 | 18,631.97 | 0.392 | 0.794 |
+| 3 | 720 | 720 | 0 | 800 | 0.042 | 18,921.21 | 0.381 | 0.846 |
+| 4 | 720 | 720 | 0 | 800 | 0.040 | 19,845.62 | 0.382 | 0.685 |
 
-Mean **17,561.96 claims/s** across the four runs (range 15,319.64-19,140.83,
-spread 21.8% of the mean — comparable run-to-run variance to ledger #1's
-contended-shared-queue numbers, expected given sub-50ms measured windows are
-sensitive to scheduler noise). Every run: `n = 720` (exactly matching
-`docs/performance.md`'s published `n` for the same 10,000-row cell — direct
-evidence the bounded-fraction/warmup-trim porting is correct, not just
-plausible), `empty = 0`, `truncated = false`.
+Mean **18,933.43 claims/s** across the four runs (range 18,334.91-19,845.62,
+spread 7.98% of the mean — tighter than the pre-fix runs, consistent with
+claims no longer piling contention onto a single queue). Every run: `n =
+720` (exactly matching `docs/performance.md`'s published `n` for the same
+10,000-row cell), `empty = 0`, `truncated = false`, and (directly verified
+via `XPENDING` on the registered-cell run, not merely inferred) **200
+claimed entries per queue across all four queues** — the fidelity check P1
+required.
 
 Control (`docs/performance.md`, "Claim latency vs backlog depth", published,
 same reference machine shape, not re-measured here): **29 claims/s** at the
@@ -248,9 +300,9 @@ Supplementary cells, same sweep run, not gated by a pre-set line:
 
 | backlog | n (this run) | claims/s (this run) | Postgres control | ratio |
 |--:|--:|--:|--:|--:|
-| 1,000 | 184 (Postgres: 184) | 20,441.32 | 640 | ~32x |
-| 10,000 (registered) | 720 (Postgres: 720) | 19,140.83 | 29 | ~660x |
-| 100,000 | 720 (Postgres: 583, ⚠ truncated) | 19,627.62 | 3 | ~6,542x (not apples-to-apples — see below) |
+| 1,000 | 184 (Postgres: 184) | 17,895.95 | 640 | ~28.0x |
+| 10,000 (registered) | 720 (Postgres: 720) | 18,334.91 | 29 | ~632.2x |
+| 100,000 | 720 (Postgres: 583, ⚠ truncated) | 18,587.22 | 3 | ~6,196x (not apples-to-apples — see below) |
 
 The 1,000-row `n` (184) also matches the Postgres control's published `n`
 exactly. The 100,000-row row does **not**: Postgres's own published cell hit
@@ -271,14 +323,16 @@ ledger #1 treated an unmatched comparison.
 **PURSUE, decisively, on the registered cell.** At the 10,000-row backlog,
 8-claimer, 4-queue, bounded-fraction, claim-only scenario —
 `docs/performance.md`'s own headline shape, reproduced with the harness's
-own scenario-defining functions ported by value rather than approximated —
-`RedisTaskQueue::claim` sustained a mean **17,561.96 claims/s** across four
-independent runs (range 15,319.64-19,140.83), against a **≥290 claims/s**
-(10x the published 29 claims/s) pre-registered success line. Every run
-clears the line by roughly two orders of magnitude (~528x-660x the Postgres
-control on the individual runs, ~605x on the mean). This is not a borderline
-call decided by which run you pick — the *lowest* of the four runs
-(15,319.64) still clears the line by ~53x.
+own scenario-defining functions ported by value rather than approximated,
+and (after the P1 fix) verified via `XPENDING` to actually be reading all
+four queues rather than draining one — `RedisTaskQueue::claim` sustained a
+mean **18,933.43 claims/s** across four independent runs (range
+18,334.91-19,845.62), against a **≥290 claims/s** (10x the published 29
+claims/s) pre-registered success line. Every run clears the line by roughly
+two orders of magnitude (~632x-684x the Postgres control on the individual
+runs, ~653x on the mean). This is not a borderline call decided by which run
+you pick — the *lowest* of the four runs (18,334.91) still clears the line
+by ~63x.
 
 This closes the gap ledger #1 flagged and could not close: the earlier
 assay's two unmatched attempts (near-empty steady-state loop, then a
