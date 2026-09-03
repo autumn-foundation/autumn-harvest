@@ -630,17 +630,19 @@ async fn schedule_running_basis_counts_a_cross_type_successor_additively() {
     .await
     .expect("seed cross-type fixture");
 
-    let basis_a = autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_a, schedule_a_id)
-        .await
-        .expect("schedule A basis query");
+    let basis_a =
+        autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_a, schedule_a_id)
+            .await
+            .expect("schedule A basis query");
     assert_eq!(
         basis_a, 2,
         "schedule A's basis must be 2: its own manual-trigger run PLUS the cross-type successor"
     );
 
-    let basis_b = autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_b, schedule_b_id)
-        .await
-        .expect("schedule B basis query");
+    let basis_b =
+        autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_b, schedule_b_id)
+            .await
+            .expect("schedule B basis query");
     assert_eq!(
         basis_b, 1,
         "schedule B's basis counts the same execution once (it IS schedule B's own type), \

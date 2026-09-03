@@ -27980,17 +27980,13 @@ async fn trigger_schedule_now(
     // For Skip policy, fail closed: if the running-count query fails on any shard,
     // treat it as saturated rather than silently firing through.
     if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
-        let is_saturated = match query_running_count(
-            &pool,
-            &ScheduleKind::Workflow,
-            &workflow_name,
-            schedule.id,
-        )
-        .await
-        {
-            Ok(running) => running >= i64::from(schedule.max_active_runs),
-            Err(_) => true,
-        };
+        let is_saturated =
+            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name, schedule.id)
+                .await
+            {
+                Ok(running) => running >= i64::from(schedule.max_active_runs),
+                Err(_) => true,
+            };
         if is_saturated {
             let ar = NewAuditRecord {
                 actor: &actor,

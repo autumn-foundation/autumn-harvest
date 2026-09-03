@@ -10565,7 +10565,9 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
         }
     })
     .await
-    .expect("issue #1160: CancelOther timed out waiting to reach the cross-type successor within 12 s");
+    .expect(
+        "issue #1160: CancelOther timed out waiting to reach the cross-type successor within 12 s",
+    );
 
     // Shut the scheduler down before taking any further counts: with
     // OverlapPolicy::CancelOther and this cron cadence, every subsequent tick
