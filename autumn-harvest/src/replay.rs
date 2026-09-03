@@ -1259,6 +1259,182 @@ impl HistoryMatcher {
         self.consumed_signal_events.insert(cursor);
     }
 
+    fn stash_external_cancel_request(
+        &mut self,
+        cursor: usize,
+        cancel_id: ExternalCancelId,
+        target: crate::types::ExternalTarget,
+    ) {
+        self.pending_external_cancels.push(StashedExternalCancel {
+            cancel_id,
+            target,
+            terminal: None,
+        });
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_cancel_terminal(
+        &mut self,
+        cursor: usize,
+        cancel_id: ExternalCancelId,
+        terminal: StashedCancelTerminal,
+    ) {
+        if let Some(pending) = self
+            .pending_external_cancels
+            .iter_mut()
+            .find(|pending| pending.cancel_id == cancel_id)
+        {
+            pending.terminal = Some(terminal);
+        }
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_await_request(
+        &mut self,
+        cursor: usize,
+        await_id: ExternalAwaitId,
+        target: ExecutionId,
+    ) {
+        self.pending_external_awaits.push(StashedExternalAwait {
+            await_id,
+            target,
+            terminal: None,
+        });
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_await_terminal(
+        &mut self,
+        cursor: usize,
+        await_id: ExternalAwaitId,
+        terminal: StashedAwaitTerminal,
+    ) {
+        if let Some(pending) = self
+            .pending_external_awaits
+            .iter_mut()
+            .find(|pending| pending.await_id == await_id)
+        {
+            pending.terminal = Some(terminal);
+        }
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    /// Stashes a "transparent" external-primitive event at `cursor` — a plain
+    /// signal, or an `ExternalSignal`/`ExternalCancel`/`ExternalAwait` triplet
+    /// member — so the owning primitive's own matcher can find it later, and
+    /// marks the event consumed so the calling scan does not treat it as its
+    /// own terminal or as an unconsumed ordering point (issue #492, issue
+    /// #757).
+    ///
+    /// This only mutates stash/consumed-event state; it does not touch a
+    /// cursor or return a value. Callers keep full control of their own
+    /// control flow (loop-continue, an early `return`, or a `TimerScanStep`)
+    /// and call this only for the subset of the 10 variants below that their
+    /// own scan treats as transparent — e.g. `match_external_signal` excludes
+    /// `ExternalSignalRequested`/`Delivered`/`Failed`, since those are its own
+    /// subject rather than a transparent sibling event there. Panics (via the
+    /// final `unreachable!`) if called for the event at `cursor` when that
+    /// event is not one of the 10 handled variants — every call site's own
+    /// match arm pattern is what guarantees that never happens.
+    fn stash_transparent_external_event(&mut self, cursor: usize) {
+        match &self.events[cursor] {
+            WorkflowEvent::SignalReceived {
+                signal_name,
+                payload,
+            } => {
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(cursor, signal_name, payload);
+            }
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                idempotency_key,
+            } => {
+                self.stash_external_signal_request(
+                    cursor,
+                    *signal_id,
+                    target.clone(),
+                    signal_name.clone(),
+                    payload.clone(),
+                    idempotency_key.clone(),
+                );
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                self.stash_external_signal_terminal(
+                    cursor,
+                    *signal_id,
+                    StashedSignalTerminal::Delivered,
+                );
+            }
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => {
+                self.stash_external_signal_terminal(
+                    cursor,
+                    *signal_id,
+                    StashedSignalTerminal::Failed(reason_code.clone()),
+                );
+            }
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                self.stash_external_cancel_request(cursor, *cancel_id, target.clone());
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                self.stash_external_cancel_terminal(
+                    cursor,
+                    *cancel_id,
+                    StashedCancelTerminal::Delivered,
+                );
+            }
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => {
+                self.stash_external_cancel_terminal(
+                    cursor,
+                    *cancel_id,
+                    StashedCancelTerminal::Failed(reason_code.clone()),
+                );
+            }
+            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                self.stash_external_await_request(cursor, *await_id, *target);
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                self.stash_external_await_terminal(
+                    cursor,
+                    *await_id,
+                    StashedAwaitTerminal::Resolved(output.clone()),
+                );
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                self.stash_external_await_terminal(
+                    cursor,
+                    *await_id,
+                    StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    },
+                );
+            }
+            other => unreachable!(
+                "stash_transparent_external_event called for a non-transparent event: {other:?}"
+            ),
+        }
+    }
+
     /// Returns `true` for events transparent to main workflow command replay.
     ///
     /// Update events are transparent to the main workflow replay sequence —
@@ -1409,151 +1585,21 @@ impl HistoryMatcher {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // Signals can arrive at any time; stash them for later
-                // wait_for_signal calls and continue scanning.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                // ExternalSignal event triplets can be interleaved with an
-                // in-flight activity (e.g. tokio::join!(signal, activity)).
-                // Stash them so match_external_signal can find them later.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel event triplets are transparent to activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // Signals, and ExternalSignal/ExternalCancel/ExternalAwait event
+                // triplets, can be interleaved with an in-flight activity (e.g.
+                // tokio::join!(signal, activity)). Stash them so their own
+                // matchers can find them later (issue #492, issue #757).
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Update events are transparent to the activity scan.
@@ -1671,152 +1717,24 @@ impl HistoryMatcher {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // Signals can be ingested while a local activity is retrying
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
+                // Signals can be ingested while a local activity is retrying.
                 // ExternalSignal events can be interleaved before the local
                 // activity's terminal event when a crash recovery case writes
                 // signal events first (the RunLocalActivity + SignalExternalWorkflow
-                // mixed batch).  Stash them so match_external_signal can find them
-                // after the local activity resolves.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are also transparent to local activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // mixed batch). ExternalCancel/ExternalAwait triplets are
+                // likewise transparent here (issue #492, issue #757). Stash
+                // them all so their own matchers can find them later.
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
@@ -2104,159 +2022,22 @@ impl HistoryMatcher {
     fn drain_early_signals(&mut self) {
         while self.cursor < self.events.len() {
             match &self.events[self.cursor] {
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(self.cursor, signal_name, payload);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // Drain ExternalSignal event pairs so they can be matched by
-                // match_external_signal regardless of where they fall in history
-                // relative to ActivityScheduled / TimerStarted events (mixed batches).
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        self.cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // Drain ExternalCancel event pairs (issue #492) symmetrically.
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // External await event triplets are drained early too (issue #757).
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
+                // Drain signals, and ExternalSignal/ExternalCancel/ExternalAwait
+                // event pairs (issue #492, issue #757), so they can be matched
+                // by their own primitives regardless of where they fall in
+                // history relative to ActivityScheduled / TimerStarted events
+                // (mixed batches).
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(self.cursor);
                     self.cursor += 1;
                     self.advance_to_next_unconsumed_event();
                 }
@@ -2597,13 +2378,8 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // Signals can arrive while an external activity is pending.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // A second ActivityAwaitingExternal for the same activity can
@@ -2627,140 +2403,21 @@ impl HistoryMatcher {
                 // ExternalSignal event triplets can be interleaved when the
                 // workflow sends a concurrent external signal while awaiting
                 // external activity completion (e.g. tokio::join! with
-                // signal_external_workflow).  Stash them so
-                // match_external_signal can find them after the activity
-                // resolves, rather than breaking the scan prematurely.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to external activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // signal_external_workflow), and ExternalCancel/ExternalAwait
+                // triplets are likewise transparent here (issue #492, issue
+                // #757). Stash them so their own matchers can find them after
+                // the activity resolves, rather than breaking the scan
+                // prematurely.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
@@ -2946,14 +2603,19 @@ impl HistoryMatcher {
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
-                // Signals can arrive while the external signal delivery is in-flight.
-                WorkflowEvent::SignalReceived {
-                    signal_name: sn,
-                    payload,
-                } => {
-                    let sn = sn.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, sn, payload);
+                // Signals can arrive while the external signal delivery is
+                // in-flight, and ExternalCancel/ExternalAwait triplets are
+                // likewise transparent to the signal forward scan (issue #492,
+                // issue #757). ExternalSignal* itself is this function's own
+                // subject, matched above — not part of this transparent set.
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Update events are transparent to the external signal scan.
@@ -2962,94 +2624,6 @@ impl HistoryMatcher {
                 }
                 WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to the signal forward scan (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
@@ -3832,161 +3406,28 @@ impl HistoryMatcher {
 
             // Signals can arrive while a timer is pending; stash them for
             // later wait_for_signal calls and continue scanning.
-            if let WorkflowEvent::SignalReceived {
-                signal_name,
-                payload,
-            } = &self.events[scan_cursor]
-            {
-                let signal_name = signal_name.clone();
-                let payload = payload.clone();
-                self.stash_signal(scan_cursor, signal_name, payload);
+            if let WorkflowEvent::SignalReceived { .. } = &self.events[scan_cursor] {
+                self.stash_transparent_external_event(scan_cursor);
                 scan_cursor += 1;
                 continue;
             }
 
             // ExternalSignal event triplets can be interleaved with an in-flight
-            // timer (e.g. tokio::join!(signal_external, sleep)). Stash them so
-            // match_external_signal can find them after the timer resolves.
+            // timer (e.g. tokio::join!(signal_external, sleep)), and
+            // ExternalCancel/ExternalAwait triplets are likewise transparent to
+            // timer scans (issue #492, issue #757). Stash them so their own
+            // matchers can find them after the timer resolves.
             match &self.events[scan_cursor] {
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                // ExternalCancel events are transparent to timer scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                     continue;
                 }
@@ -4311,150 +3752,21 @@ impl HistoryMatcher {
             {
                 TimerScanStep::Cross
             }
-            // Signals can arrive while a timer is armed; stash them for a later
-            // wait_for_signal and cross.
-            WorkflowEvent::SignalReceived {
-                signal_name,
-                payload,
-            } => {
-                let signal_name = signal_name.clone();
-                let payload = payload.clone();
-                self.stash_signal(scan, signal_name, payload);
-                TimerScanStep::Cross
-            }
-            // External-signal / external-cancel triplets can interleave with an
-            // in-flight timer; stash so their own matchers find them afterwards.
-            WorkflowEvent::ExternalSignalRequested {
-                signal_id,
-                target,
-                signal_name,
-                payload,
-                idempotency_key,
-            } => {
-                self.stash_external_signal_request(
-                    scan,
-                    *signal_id,
-                    target.clone(),
-                    signal_name.clone(),
-                    payload.clone(),
-                    idempotency_key.clone(),
-                );
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                let id = *signal_id;
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| p.signal_id == id)
-                {
-                    p.terminal = Some(StashedSignalTerminal::Delivered);
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalSignalFailed {
-                signal_id,
-                reason_code,
-            } => {
-                let id = *signal_id;
-                let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| p.signal_id == id)
-                {
-                    p.terminal = Some(StashedSignalTerminal::Failed(code));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                let stashed = StashedExternalCancel {
-                    cancel_id: *cancel_id,
-                    target: target.clone(),
-                    terminal: None,
-                };
-                self.pending_external_cancels.push(stashed);
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                let id = *cancel_id;
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| p.cancel_id == id)
-                {
-                    p.terminal = Some(StashedCancelTerminal::Delivered);
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelFailed {
-                cancel_id,
-                reason_code,
-            } => {
-                let id = *cancel_id;
-                let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| p.cancel_id == id)
-                {
-                    p.terminal = Some(StashedCancelTerminal::Failed(code));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            // External await event triplets are transparent to the timer scan (issue #757).
-            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                let stashed = StashedExternalAwait {
-                    await_id: *await_id,
-                    target: *target,
-                    terminal: None,
-                };
-                self.pending_external_awaits.push(stashed);
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                let id = *await_id;
-                let out = output.clone();
-                if let Some(p) = self
-                    .pending_external_awaits
-                    .iter_mut()
-                    .find(|p| p.await_id == id)
-                {
-                    p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalAwaitFailed {
-                await_id,
-                reason_code,
-                message,
-                error_type,
-                details,
-                non_retryable,
-            } => {
-                let id = *await_id;
-                let term = StashedAwaitTerminal::Failed {
-                    reason_code: reason_code.clone(),
-                    message: message.clone(),
-                    error_type: error_type.clone(),
-                    details: details.clone(),
-                    non_retryable: *non_retryable,
-                };
-                if let Some(p) = self
-                    .pending_external_awaits
-                    .iter_mut()
-                    .find(|p| p.await_id == id)
-                {
-                    p.terminal = Some(term);
-                }
-                self.consumed_signal_events.insert(scan);
+            // Signals can arrive while a timer is armed, and ExternalSignal /
+            // ExternalCancel / ExternalAwait triplets can interleave with an
+            // in-flight timer too (issue #492, issue #757); stash them for
+            // their own matchers and cross.
+            WorkflowEvent::SignalReceived { .. }
+            | WorkflowEvent::ExternalSignalRequested { .. }
+            | WorkflowEvent::ExternalSignalDelivered { .. }
+            | WorkflowEvent::ExternalSignalFailed { .. }
+            | WorkflowEvent::ExternalCancelRequested { .. }
+            | WorkflowEvent::ExternalCancelDelivered { .. }
+            | WorkflowEvent::ExternalCancelFailed { .. }
+            | WorkflowEvent::ExternalAwaitRequested { .. }
+            | WorkflowEvent::ExternalAwaitResolved { .. }
+            | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                self.stash_transparent_external_event(scan);
                 TimerScanStep::Cross
             }
             // Update events are transparent to the timer scan.
@@ -4654,13 +3966,8 @@ impl HistoryMatcher {
 
                     return HistoryMatch::Matched { output };
                 }
-                WorkflowEvent::SignalReceived {
-                    signal_name: recorded_name,
-                    payload,
-                } => {
-                    let recorded_name = recorded_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, recorded_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
@@ -4799,129 +4106,19 @@ impl HistoryMatcher {
                 }
                 // ExternalSignal event triplets can appear before SignalReceived
                 // when a mixed batch (e.g. tokio::join!(wait_for_signal, signal_external))
-                // wrote signal events first.  Stash them for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to signal wait scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // wrote signal events first, and ExternalCancel/ExternalAwait
+                // triplets are likewise transparent here (issue #492, issue
+                // #757). Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 other => {
@@ -5265,13 +4462,8 @@ impl HistoryMatcher {
 
                 // Other signals can arrive while the race is pending; stash
                 // them for later signal waits and continue scanning.
-                WorkflowEvent::SignalReceived {
-                    signal_name: recorded_name,
-                    payload,
-                } => {
-                    let recorded_name = recorded_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, recorded_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -5316,122 +4508,19 @@ impl HistoryMatcher {
                 }
 
                 // ExternalSignal event triplets can be interleaved with the
-                // pending race; stash them for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-
-                // ExternalCancel events are transparent to signal-or-timer race
-                // scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    self.pending_external_cancels.push(StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    self.pending_external_awaits.push(StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Failed {
-                            reason_code: reason_code.clone(),
-                            message: message.clone(),
-                            error_type: error_type.clone(),
-                            details: details.clone(),
-                            non_retryable: *non_retryable,
-                        });
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // pending race, and ExternalCancel/ExternalAwait triplets are
+                // likewise transparent to signal-or-timer race scans (issue
+                // #492, issue #757). Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -6030,13 +5119,8 @@ impl HistoryMatcher {
 
                 // Signals arriving while the race is pending are stashed for
                 // later signal waits.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -6060,122 +5144,20 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
 
-                // ExternalSignal event triplets can be interleaved; stash them
-                // for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-
-                // ExternalCancel events are transparent to the race scan (#492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    self.pending_external_cancels.push(StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    self.pending_external_awaits.push(StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Failed {
-                            reason_code: reason_code.clone(),
-                            message: message.clone(),
-                            error_type: error_type.clone(),
-                            details: details.clone(),
-                            non_retryable: *non_retryable,
-                        });
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // ExternalSignal event triplets can be interleaved, and
+                // ExternalCancel/ExternalAwait triplets are likewise
+                // transparent to the race scan (issue #492, issue #757).
+                // Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -13148,5 +12130,688 @@ mod tests {
             matcher2.match_external_await(target),
             HistoryMatch::ExternalAwaitInProgress { .. }
         ));
+    }
+
+    // ── Issue #1338: characterization tests for the 10 sites consolidated onto
+    // `stash_transparent_external_event`. Before this suite, `ExternalCancel`
+    // triplet transparency (issue #492) had zero direct test coverage at any
+    // of the 10 sites, and `ExternalAwait` triplet transparency (issue #757)
+    // was covered only at `scan_activity_terminal` (the test above). These
+    // pin per-site behavior so a future event-family addition that misses a
+    // site is caught here instead of only in production (the exact failure
+    // class issue #1338 documents from `33595ff5`). ──────────────────────
+
+    #[test]
+    fn scan_activity_terminal_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "compute".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!(7),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_activity("compute"),
+            HistoryMatch::Matched {
+                output: serde_json::json!(7)
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn scan_local_activity_terminal_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "format_data".into(),
+                input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_local_activity("format_data"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn scan_local_activity_terminal_stashes_interleaved_external_await_triplet() {
+        let activity_id = ActivityExecId::new();
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "format_data".into(),
+                input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_local_activity("format_data"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn drain_early_signals_stashes_interleaved_external_cancel_triplet() {
+        // Direct unit test of `drain_early_signals` (Site 3, issue #1338) —
+        // this call site mutates `self.cursor` in place (rather than a local
+        // scan_cursor) and does an extra `advance_to_next_unconsumed_event()`
+        // per arm, so it is pinned directly rather than only through a public
+        // wrapper that might resolve the pair via a different site first.
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.drain_early_signals();
+        assert_eq!(matcher.cursor, 2);
+        assert_eq!(matcher.pending_external_cancels.len(), 1);
+        assert_eq!(matcher.pending_external_cancels[0].cancel_id, cancel_id);
+        assert!(matches!(
+            matcher.pending_external_cancels[0].terminal,
+            Some(StashedCancelTerminal::Delivered)
+        ));
+    }
+
+    #[test]
+    fn drain_early_signals_stashes_interleaved_external_await_triplet() {
+        // Direct unit test of `drain_early_signals` (Site 3, issue #1338) for
+        // the `ExternalAwait` family (issue #757), mirroring the cancel test
+        // above.
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.drain_early_signals();
+        assert_eq!(matcher.cursor, 2);
+        assert_eq!(matcher.pending_external_awaits.len(), 1);
+        assert_eq!(matcher.pending_external_awaits[0].await_id, await_id);
+        assert!(matches!(
+            matcher.pending_external_awaits[0].terminal,
+            Some(StashedAwaitTerminal::Resolved(_))
+        ));
+    }
+
+    #[test]
+    fn match_external_activity_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let token = ExternalActivityToken::new();
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let output = serde_json::json!({"accepted": true});
+        let events = vec![
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "ship_order".into(),
+                input: Value::Null,
+                queue: "fulfillment".into(),
+                schedule_to_close_secs: 60,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_activity("ship_order"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_activity_stashes_interleaved_external_await_triplet() {
+        let activity_id = ActivityExecId::new();
+        let token = ExternalActivityToken::new();
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let output = serde_json::json!({"accepted": true});
+        let events = vec![
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "ship_order".into(),
+                input: Value::Null,
+                queue: "fulfillment".into(),
+                schedule_to_close_secs: 60,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_activity("ship_order"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_signal_stashes_interleaved_external_cancel_triplet() {
+        let signal_id = ExternalSignalId::new();
+        let signal_target = ExecutionId::new();
+        let cancel_id = ExternalCancelId::new();
+        let cancel_target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::ExecutionId(signal_target),
+                signal_name: "poke".into(),
+                payload: serde_json::json!({"n": 1}),
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: cancel_target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_signal(
+                &crate::types::ExternalTarget::ExecutionId(signal_target),
+                "poke"
+            ),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&cancel_target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_signal_stashes_interleaved_external_await_triplet() {
+        let signal_id = ExternalSignalId::new();
+        let signal_target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let await_target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::ExecutionId(signal_target),
+                signal_name: "poke".into(),
+                payload: serde_json::json!({"n": 1}),
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id,
+                target: await_target,
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_signal(
+                &crate::types::ExternalTarget::ExecutionId(signal_target),
+                "poke"
+            ),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(await_target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_timer_strict_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("cooldown");
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer("cooldown"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_timer_strict_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("cooldown");
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer("cooldown"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn timer_scan_cross_or_stop_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("idle");
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::TimerCancelled {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer_cancel("idle"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn timer_scan_cross_or_stop_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("idle");
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::TimerCancelled { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer_cancel("idle"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_inner_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("distractor");
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            // A non-transparent event first, so drain_early_signals halts here
+            // and match_signal_inner's own scan is what crosses the pair below.
+            WorkflowEvent::TimerCancelled {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_inner_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("distractor");
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::TimerCancelled {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_stashes_interleaved_external_await_triplet() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"done": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
     }
 }
