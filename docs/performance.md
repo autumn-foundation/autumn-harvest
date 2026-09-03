@@ -1164,16 +1164,21 @@ from the benchmark are directly comparable.
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **`schedule_to_close` (#378)** — measured directly:
     `docs/performance-schedule-to-close.md` seeds `schedule_to_close_at`
-    (rather than leaving it null) and **confirms this page's own suspicion**:
-    a small, real buffer cost (+2.5% to +6% across four independent
-    measurement methods — single-call `EXPLAIN` at two backlog depths, a real
-    10,001-call `pg_stat_statements` drain, and two standalone MVCC-bloat
-    corroboration scripts), nowhere near the 20% impact floor. No fix is
-    proposed or needed. One caveat the page reports rather than hides: at the
-    100,000-row depth the planner occasionally (once in two capture runs)
-    chose a markedly more expensive plan specifically for the
-    `schedule_to_close_at`-populated table — see that page's "100k-depth plan
-    instability" section, which does not claim a confirmed mechanism for it.
+    (rather than leaving it null) and **confirms this page's own suspicion at
+    the row level**: a small, real buffer cost (+3.6% to +5.7%, reproduced to
+    the exact buffer count across three independent capture runs at the
+    1,000- and 10,000-row depths), corroborated by two standalone MVCC-bloat
+    scripts (+4.7%, +5.2%) — nowhere near the 20% impact floor. No fix is
+    proposed or needed for that row-level cost. Two things did **not**
+    reproduce cleanly and are reported as open rather than smoothed into one
+    number: at the 100,000-row depth the planner chose a markedly more
+    expensive plan specifically for the `schedule_to_close_at`-populated
+    table in **two of three** capture runs — the more common outcome here,
+    not a rare fluke — and the real 10,001-call `pg_stat_statements` drain's
+    aggregate delta ranged +2.5% to +22.5% across three runs of the identical
+    test. See that page's "100k-depth plan instability" and "Corroboration"
+    sections, neither of which claims a confirmed mechanism for the
+    variance.
   * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
     column tests, against columns the seed leaves null; not yet measured.
 

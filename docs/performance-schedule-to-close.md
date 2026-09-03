@@ -1,4 +1,4 @@
-# `schedule_to_close_at` claim predicate: measured, confirmed cheap
+# `schedule_to_close_at` claim predicate: measured, confirmed cheap at the row level; a scale-dependent plan risk found alongside
 
 `docs/performance.md`'s "Known limitations" section flagged
 `schedule_to_close_at` (issue #378), alongside worker sessions (#606) and
@@ -8,19 +8,30 @@ but never measured because `claim_bench_support::db::seed_backlog` never
 populates the column. This page is that measurement, for `schedule_to_close_at`
 only.
 
-The result **confirms the doc's own suspicion**: at the two backlog depths
-where this environment's measurements reproduce consistently (1,000 and
-10,000 rows), populating `schedule_to_close_at` adds a small, real buffer
-cost to the claim query -- **+5.7% and +3.6%** respectively -- corroborated by
-a real 10,001-call production-code drain (**+2.5%** aggregate) and two
-standalone MVCC-bloat scripts (**+4.7%** and **+5.2%**). All four independent
-measurements land in the same 2.5-6% band, none within shouting distance of
-the 20% impact floor. This is a **negative result**: no fix is proposed, and
-none is needed. The one caveat, reported rather than papered over: at the
-100,000-row depth, the planner occasionally (once in two runs) chose a
-markedly more expensive plan for the `schedule_to_close_at`-populated table
--- see [The 100k-depth plan instability](#the-100k-depth-plan-instability)
-below.
+The result **confirms the doc's own suspicion at the row level**: at the two
+backlog depths where this environment's measurements reproduced identically
+across three independent capture runs (1,000 and 10,000 rows), populating
+`schedule_to_close_at` adds a small, real, stable buffer cost to the claim
+query -- **+5.7% and +3.6%** respectively -- corroborated by two standalone
+MVCC-bloat scripts (**+4.7%** and **+5.2%**). None of this comes close to the
+20% impact floor; no fix is proposed or needed for the row-level cost.
+
+**Two things this page found alongside that are not as clean, and are
+reported as such rather than smoothed into a single headline number:**
+
+1. At the 100,000-row depth, the planner chose a markedly more expensive
+   plan for the `schedule_to_close_at`-populated table in **two of three**
+   capture runs -- not a rare fluke, the more common outcome in this
+   environment. See [The 100k-depth plan
+   instability](#the-100k-depth-plan-instability).
+2. The real-drain `pg_stat_statements` aggregate and the
+   `pg_stat_user_tables` dead-tuple counts varied far more between runs than
+   the 1,000-/10,000-row `EXPLAIN` numbers did -- including a 6x swing in
+   dead-tuple count for the *same* `no-schedule-to-close` label across two
+   runs. See [Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+   and [Write-side cost](#write-side-cost). This page does not have a
+   reliable pinned percentage for either measurement and says so rather than
+   reporting whichever run's number looked cleanest.
 
 ## Workload
 
@@ -70,94 +81,119 @@ rather than by row width alone (a single-call EXPLAIN, seeded fresh and
 rolled back inside a transaction, can never observe that: it never
 accumulates dead tuples).
 
+This capture was run **three times** end to end during this pass (the first
+before a clippy fix that only hoisted item declarations with no functional
+change, the second and third after it). The committed artifacts are the
+**third** run's. Where a number reproduced across all three runs, this page
+says so and treats it as reliable; where it didn't, all the observed values
+are reported rather than one being silently picked as canonical.
+
 ## Measurement
 
 ### Buffer deltas across backlog depth
 
 `EXPLAIN (ANALYZE, BUFFERS, ...)` total buffers for `claim_task_query()`,
 `no-schedule-to-close` vs `schedule-to-close` (artifacts:
-`docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-claim-backlog-{depth}.explain.txt`):
+`docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-claim-backlog-{depth}.explain.txt`,
+third run):
 
 | backlog | no-schedule-to-close buffers | schedule-to-close buffers | delta | delta % |
 |---:|---:|---:|---:|---:|
 | 1,000 | 53 | 56 | +3 | +5.7% |
 | 10,000 | 274 | 284 | +10 | +3.6% |
-| 100,000 | 2,476 | 10,128 | +7,652 | +309.0% |
+| 100,000 | 2,473 | 10,125 | +7,652 | +309.4% |
 
-The 1,000- and 10,000-row rows are the reliable evidence here: they
-reproduced within a point of these values across two independent full runs
-of this capture (the first run measured 53/56 and 274/284 identically). The
-100,000-row row did **not** reproduce -- see the next section.
+The 1,000- and 10,000-row rows reproduced to the exact buffer count across
+**all three** independent runs of this capture (53/56 and 274/284, every
+time) -- this is the reliable evidence on this page. The 100,000-row row did
+**not** reproduce consistently -- see the next section, which is where its
+real finding lives.
 
 ### The 100k-depth plan instability
 
-The first capture run measured 100,000-row buffers as 2,473 (no-schedule-to-close)
-vs 2,537 (schedule-to-close), a +2.6% delta consistent with the two smaller
-depths. The second run -- the one whose numbers are tabulated above, and the
-one this page's aggregate/heap-growth sections use throughout, for
-internal consistency -- measured 2,476 vs **10,128**, a +309% delta. Comparing
-the plans directly (`grep`-ed from the committed artifacts) shows why: the
-`schedule-to-close` side's main candidate-row source flipped from `Seq Scan
-on harvest_task_queue` (both runs' `no-schedule-to-close` side, and the first
-run's `schedule-to-close` side) to `Index Scan using idx_harvest_tq_poll` in
-the second run's `schedule-to-close` capture only. That index cannot serve
-the query's `ORDER BY` (the non-indexable leading `CASE` expression --
-see `docs/performance.md`'s TL;DR), so the plan still pays for a full
-external-merge sort afterward (`Sort Method: external merge Disk: 15280kB`,
-identical in both plans) *in addition to* a more expensive random-access
-scan to source the rows -- strictly worse than the `Seq Scan` alternative
-here, not a genuine optimization the planner found.
+The 100,000-row depth's `no-schedule-to-close` buffer count was stable
+across all three runs (2,473, 2,476, 2,473). The `schedule-to-close` side was
+not:
+
+| run | no-schedule-to-close | schedule-to-close | delta % | plan for `schedule-to-close` |
+|---:|---:|---:|---:|---|
+| 1 | 2,473 | 2,537 | +2.6% | `Seq Scan` |
+| 2 | 2,476 | 10,128 | +309.0% | `Index Scan using idx_harvest_tq_poll` |
+| 3 (committed) | 2,473 | 10,125 | +309.4% | `Index Scan using idx_harvest_tq_poll` |
+
+**Two of three runs, not one, show the expensive plan** -- this is the more
+common outcome in this environment, not a rare fluke, and this page's
+earlier draft undersold it by calling it a single occurrence. Comparing the
+plans directly (`grep`-ed from the committed artifacts) shows the mechanism:
+in runs 2 and 3, the `schedule-to-close` side's main candidate-row source
+used `Index Scan using idx_harvest_tq_poll` instead of `Seq Scan on
+harvest_task_queue` (the plan every `no-schedule-to-close` capture used, in
+all three runs, and the plan run 1's `schedule-to-close` capture also used).
+That index cannot serve the query's `ORDER BY` (the non-indexable leading
+`CASE` expression -- see `docs/performance.md`'s TL;DR), so the plan still
+pays for a full external-merge sort afterward (`Sort Method: external merge
+Disk: 15280kB`, identical across all captures at this depth) *in addition
+to* a more expensive random-access scan to source the rows -- strictly worse
+than the `Seq Scan` alternative here, not a genuine optimization the planner
+found.
 
 This is the same class of run-to-run plan instability at this exact backlog
 depth that `docs/performance-capability-labels.md`'s "Review note" section
 documents (there, a `Seq Scan` vs `Index Scan` flip on `harvest_workers`
 between two runs of *that* capture, attributed to `ANALYZE`-statistics
-sampling variance rather than to the change under test). It was **not**
-independently reproduced a third time here, and no targeted test isolating
-the mechanism was run -- so, per this repo's "reasoning about what the
-planner will probably do" prohibition, this page reports the observation
-(a real, once-observed plan flip, specifically on the schedule-to-close-populated
-table, nowhere else) without asserting a confirmed causal mechanism. It is
-flagged as a risk to be aware of at large backlog depths, not as a proposed
-fix target: there is no schema or query change on offer that would pin the
-planner's choice without the "planner-disabling flags... outside a
-diagnostic session" this repo's rules ban.
+sampling variance rather than to the change under test). Here, though, the
+flip correlates with which *label* is captured (2 of 2 times it appeared, it
+was on the `schedule-to-close` side, never on `no-schedule-to-close`), which
+is suggestive of a real interaction between the wider row and the planner's
+cost/selectivity estimate at this row count rather than pure chance -- but no
+targeted test isolating that mechanism was run, and a 2-vs-3 sample cannot
+distinguish "the wider row measurably raises the odds of this plan" from "an
+unrelated shared factor across this environment's runs happened to
+correlate." Per this repo's "reasoning about what the planner will probably
+do" prohibition, this page reports the observation and its correlation
+honestly without asserting a confirmed causal mechanism. It is flagged as a
+**risk to be aware of at large backlog depths for deployments that populate
+`schedule_to_close_at`**, not as a proposed fix target: there is no schema or
+query change on offer that would pin the planner's choice without the
+"planner-disabling flags... outside a diagnostic session" this repo's rules
+ban, and extended statistics or a planner hint would be a schema/config
+change outside this pass's scope (this repo's "ask before" list).
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
-To confirm the small-depth EXPLAIN deltas hold under the actual claim
-workload -- repeated `claim_task()` calls draining the backlog one row at a
-time, as production does -- the harness drives the real async
+To check whether the small-depth `EXPLAIN` deltas hold under the actual
+claim workload -- repeated `claim_task()` calls draining the backlog one row
+at a time, as production does -- the harness drives the real async
 `queue::claim_task(...)` function 10,001 times (10,000 successful claims plus
 one final empty poll) against the 10,000-row/4-queue headline scenario at
-each data state and snapshots `pg_stat_statements` afterward (artifacts:
+each data state and snapshots `pg_stat_statements` afterward (artifacts,
+third/committed run:
 `docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-pg_stat_statements.txt`):
 
-| state | calls | `shared_blks_hit` | avg per call |
-|---|---:|---:|---:|
-| no-schedule-to-close | 10,001 | 5,124,396 | 512.39 |
-| schedule-to-close | 10,001 | 5,250,159 | 524.96 |
+| run | no-schedule-to-close avg/call | schedule-to-close avg/call | delta % |
+|---:|---:|---:|---:|
+| 1 | 458.85 | 562.11 | +22.5% |
+| 2 | 512.39 | 524.96 | +2.5% |
+| 3 (committed) | 532.91 | 560.18 | +5.1% |
 
-Aggregate delta: **+2.45%** -- in the same 2.5-6% band as the 1,000- and
-10,000-row single-call EXPLAIN deltas above, and well clear of the 100k
-depth's plan-instability outlier.
-
-**This page's first capture run measured this same aggregate at +22.5%**
-(458.85 -> 562.11 avg buffers/call), a result this rewrite does not carry
-forward as the headline number. Investigating the gap (see [Write-side
-cost](#write-side-cost) below) found real, reproducible dead-tuple growth
-from the wider row, but only enough to explain roughly 5 percentage points
-of it -- not 22. The most likely explanation, consistent with [the 100k-depth
-plan instability](#the-100k-depth-plan-instability) above, is that the first
-run's drain caught the same kind of plan flip at some point along its
-10,000-claim descent through shrinking backlog depths (a full sweep passes
-through depths from 10,000 down to 1, including the neighborhood where the
-100k-row instability was directly observed) -- but this was not confirmed by
-re-instrumenting that specific run, so it is reported as the more likely
-explanation, not a proven one. The second run's numbers are used throughout
-this page because they are the ones the heap-growth instrumentation was
-captured alongside, in the same run, making the aggregate-vs-heap-growth
-comparison in the next section internally consistent.
+**This did not reproduce to a stable number the way the 1,000-/10,000-row
+`EXPLAIN` deltas did.** All three runs are positive (`schedule-to-close`
+never came out cheaper), but the magnitude ranges over a factor of ~9x
+(2.5% to 22.5%) across otherwise-identical runs of the same test against a
+fresh, identically-shaped fixture each time. Given the 100k-depth finding
+above -- a plan flip that specifically favors `schedule-to-close` and adds a
+large buffer cost when it fires -- the most likely explanation is that a
+10,000-claim drain, which walks the backlog down from 10,000 to 1 one claim
+at a time, occasionally crosses a similar planner tipping point at some
+depth along the way on the `schedule-to-close` side, and run 1 (the highest
+delta) caught more or larger such moments than runs 2 and 3. This is
+**not confirmed** -- the drain loop does not capture a plan for every one of
+its 10,001 calls, only the aggregate `pg_stat_statements` counters, so there
+is no per-call plan trace to check this against directly. Read the aggregate
+delta as "positive and real, roughly mid-single-digit to low-double-digit
+percent, with the exact number apparently sensitive to how many planner
+tipping points a given drain happens to cross" rather than as a single
+citable percentage.
 
 ## Write-side cost
 
@@ -166,61 +202,65 @@ Every `UPDATE` to a claimed row -- including the claim `UPDATE` itself in
 `schedule_to_close_at` -- still creates a brand-new MVCC tuple version that
 carries the column's value forward, exactly the mechanism
 `docs/performance-capability-labels.md`'s "Write-side cost" section
-documents for `required_capabilities`. Two independent, standalone
-corroborations (artifacts:
-`docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`):
+documents for `required_capabilities`. Two independent, standalone,
+single-statement-or-single-transaction corroborations (which is what makes
+these two reproduce cleanly where the live 10,001-call drain below does
+not -- neither leaves a ~15-minute window for autovacuum to run partway
+through): artifacts
+`docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`:
 
 | seeding + update shape | no-schedule-to-close heap-page growth | schedule-to-close heap-page growth | extra growth |
 |---|---:|---:|---:|
 | one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 | 263 | +5.2% |
-| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop | 233 | 244 | +4.7% |
+| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (single transaction) | 233 | 244 | +4.7% |
 
-Both land close to the EXPLAIN/aggregate band above (2.5-6%), not near the
-first run's +22.5% outlier -- consistent with that outlier being a plan-shape
-event rather than a row-width effect.
+Both land close to the `EXPLAIN` band above (2.5-6%).
 
-The instrumented rerun also snapshotted `pg_stat_user_tables` immediately
-before and after the real 10,000-claim headline drain (artifacts:
-`docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-heap-growth.txt`):
+The instrumented captures also snapshotted `pg_stat_user_tables` immediately
+before and after the real 10,000-claim headline drain -- a ~15-minute window
+in this environment, long enough for autovacuum to run unpredictably partway
+through (artifacts, all three runs' final state committed for the third):
 
-| state | heap pages before | heap pages after | page growth | `n_dead_tup` after |
-|---|---:|---:|---:|---:|
-| no-schedule-to-close | 244 | 288 | +44 | 802 |
-| schedule-to-close | 250 | 302 | +52 | 4,779 |
+| run | no-schedule-to-close `n_dead_tup` | schedule-to-close `n_dead_tup` | ratio | heap-page growth (no-stc / stc) |
+|---:|---:|---:|---:|---|
+| 2 | 802 | 4,779 | 5.96x | +44 / +52 (+18.2%) |
+| 3 (committed) | 4,855 | 5,131 | 1.06x | +49 / +52 (+6.1%) |
 
-Heap-*page* growth is close between the two states (+44 vs +52, 18.2% more
-for schedule-to-close) -- consistent with the small buffer deltas measured
-throughout this page. **Dead-tuple count is not close: 4,779 vs 802, a 5.96x
-difference.** The wider row leaves less free space per heap page to begin
-with, so more of the claim UPDATE's 10,000 new tuple versions cannot fit a
-HOT (Heap-Only Tuple) update in place on the same page and instead leave a
-larger share of old versions dead without triggering a proportional increase
-in *page count* (Postgres reuses free space within existing pages via HOT
-before allocating new ones). This dead-tuple growth is real and reproducible
-in this one capture, but this page does not have a second independent
-measurement of it the way the buffer/heap-page numbers above do -- read it as
-a directional finding, not a pinned percentage. It recurs in production
-exactly as it does here: the window between a claim and whenever autovacuum
-next runs.
+**This does not support a pinned dead-tuple ratio.** The `no-schedule-to-close`
+label alone swung from 802 to 4,855 dead tuples (6.05x) between two runs of
+the *identical* seed/drain shape -- larger than the swing between labels
+within either single run. The `schedule-to-close` side was comparatively more
+stable across runs (4,779 vs 5,131, +7.4%). The most plausible explanation is
+that autovacuum's exact timing relative to the ~15-minute drain -- entirely
+outside this harness's control, since nothing in the test triggers or waits
+for it -- dominates the dead-tuple count observed at the end, and happened to
+catch `no-schedule-to-close` mid-cleanup in run 3 but not run 2. **Heap-page
+growth**, unlike the dead-tuple count, was consistently modest and in the
+same direction both times (+18.2% and +6.1% more growth for
+`schedule-to-close`), which is more consistent with the small, stable
+row-width effect measured elsewhere on this page than the dead-tuple counts
+are.
 
-No schema or index change is proposed by this pass. The dead-tuple
-observation is a candidate input to `autovacuum_vacuum_scale_factor` tuning
-on `harvest_task_queue` for a deployment that both uses
-`schedule_to_close_at` heavily and runs a very hot claim path, but that is an
-operational/config decision for a deployment to make with its own workload
-shape, not a code change this measurement pass makes unilaterally (per this
-repo's "ask before... changing `postgresql.conf` / parameter group"
-convention).
+No schema, index, or autovacuum-configuration change is proposed by this
+pass. The variance itself is the finding worth recording: a live queue's
+dead-tuple count at any given moment is not something this measurement
+approach can pin down without controlling for autovacuum, and a future pass
+that wants a reliable dead-tuple number for this table should disable
+autovacuum for the duration of its own measurement window explicitly (not
+done here, since disabling autovacuum is itself something this repo's rules
+require flagging findings about rather than doing silently inside a
+benchmark) or take many more than three samples.
 
 ## Equivalence
 
-Both drains claim exactly 10,000 of 10,000 seeded rows
+All drains claim exactly 10,000 of 10,000 seeded rows
 (`claimed == claimed_by_label` asserted equal between the two labels inside
 the test), and `claim_row.calls == claimed + 1` is asserted for the final
 empty poll in each state (this assertion is inherited from the shared
 pattern; see the test source). The schedule-to-close claim path returns the
-same claim behavior as the unpopulated path -- the cost measured here is
-overhead on an otherwise identical result set, not a correctness difference.
+same claim behavior as the unpopulated path in every run -- the cost (and its
+variance) measured here is overhead on an otherwise identical result set, not
+a correctness difference.
 
 ## What shipped
 
@@ -233,9 +273,9 @@ overhead on an otherwise identical result set, not a correctness difference.
   both states while also snapshotting `pg_stat_statements`, and asserts
   claim-count equivalence between the two states as a correctness check.
 - `docs/perf-artifacts/schedule-to-close-claim-predicate/` -- the committed
-  `EXPLAIN` captures, `pg_stat_statements` snapshots, heap-growth snapshots,
-  the standalone bulk-UPDATE bloat-corroboration script and its output, and
-  a `fixture-summary.txt`.
+  (third-run) `EXPLAIN` captures, `pg_stat_statements` snapshots,
+  heap-growth snapshots, the standalone bulk-UPDATE bloat-corroboration
+  script and its output, and a `fixture-summary.txt`.
 - `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` -- a
   reproduction script that re-runs the capture test.
 - This doc.
@@ -257,10 +297,16 @@ or, with only a reachable Docker daemon and no external Postgres:
 
 Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots,
 heap-growth snapshots, and `fixture-summary.txt` under
-`docs/perf-artifacts/schedule-to-close-claim-predicate/` from scratch. **They
-do NOT regenerate `claim_update_bloat_corroboration.txt`** -- that script is
-independent of the Rust harness and is never invoked by the repro command
-above. After any schema, index, or storage-layout change to
+`docs/perf-artifacts/schedule-to-close-claim-predicate/` from scratch.
+**Expect the 100,000-row depth and the aggregate/heap-growth numbers to vary
+between runs** -- see [The 100k-depth plan
+instability](#the-100k-depth-plan-instability) and [Write-side
+cost](#write-side-cost) above; this is expected, not a reproduction failure.
+The 1,000- and 10,000-row `EXPLAIN` buffer counts should reproduce exactly.
+
+**They do NOT regenerate `claim_update_bloat_corroboration.txt`** -- that
+script is independent of the Rust harness and is never invoked by the repro
+command above. After any schema, index, or storage-layout change to
 `harvest_task_queue`, re-run it explicitly, or the committed corroboration
 output will silently go stale even though the primary `EXPLAIN`/
 `pg_stat_statements` captures are fresh:
