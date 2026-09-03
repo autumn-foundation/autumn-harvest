@@ -26,6 +26,18 @@ External links (http/https/mailto) are intentionally NOT checked — that
 needs network access and is a different audit; this script is pure
 filesystem, so it can run in CI on every PR.
 
+KNOWN LIMITATION: a 4-space-indented, non-fenced CommonMark code block is
+not excluded from link/heading extraction — only fenced (``` or ~~~) blocks
+and inline code spans are. A correct fix needs container-relative
+indentation tracking (4 spaces means "code block" only when it is NOT a
+list-item continuation, which this corpus uses constantly — e.g.
+docs/performance.md:1164 is a real, working link at 4-space indent inside a
+`*` list item). A naive "blank every 4-space-indented line" fix would
+silently stop checking links like that one. Left unfixed because no genuine
+top-level indented code block containing link- or heading-looking text
+currently exists in the corpus (checked) — the risk of the naive fix
+outweighs a gap with zero current impact.
+
 Usage:
     python3 docs/audits/corpus-link-check.py [--json]
 
