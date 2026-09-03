@@ -513,13 +513,18 @@ async fn load_all_schedules(conn: &mut AsyncPgConnection) -> Vec<HarvestSchedule
 }
 
 /// Proves `schedule_running_basis_batch` is exactly equivalent to calling the
-/// original, unmodified `schedule_running_basis` once per distinct name: same
+/// original, unmodified `schedule_running_basis` once per schedule: same
 /// fixture, same connection, same run. A moderate-scale fixture (60
 /// schedules -- enough distinct names, running populations and throttle rows
 /// to be non-trivial) so this runs fast enough to stay in the default suite,
 /// unlike the 500-row evidence capture above.
+///
+/// Keyed by schedule id rather than name (issue #1160): `schedule_running_basis`
+/// gained a `schedule_id`-scoped disjunct so a cross-type continue-as-new
+/// successor counts toward its schedule's `max_active_runs` too, so the batch
+/// form's result is no longer just a function of `name` alone.
 #[tokio::test]
-async fn schedule_running_basis_batch_matches_per_name_loop() {
+async fn schedule_running_basis_batch_matches_per_schedule_loop() {
     const N: i64 = 60;
 
     let (admin, _guard) = setup_server().await;
@@ -531,38 +536,133 @@ async fn schedule_running_basis_batch_matches_per_name_loop() {
     let schedules = load_all_schedules(&mut conn).await;
     assert_eq!(schedules.len(), usize::try_from(N).unwrap());
 
-    let names: Vec<&str> = schedules
+    let owned_pairs: Vec<(uuid::Uuid, String)> = schedules
         .iter()
         .map(|s| {
-            s.dag_name
-                .as_deref()
-                .or(s.workflow_name.as_deref())
-                .unwrap_or("")
+            (
+                s.id,
+                s.dag_name
+                    .as_deref()
+                    .or(s.workflow_name.as_deref())
+                    .unwrap_or("")
+                    .to_string(),
+            )
         })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
+        .collect();
+    let pairs: Vec<(uuid::Uuid, &str)> = owned_pairs
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
         .collect();
 
-    let batched = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &names)
+    let batched = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &pairs)
         .await
         .expect("batched basis query");
 
-    let mut per_name: HashMap<String, i64> = HashMap::new();
-    for name in &names {
-        let basis = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
+    let mut per_schedule: HashMap<uuid::Uuid, i64> = HashMap::new();
+    for (id, name) in &pairs {
+        let basis = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name, *id)
             .await
-            .expect("per-name basis query");
-        per_name.insert((*name).to_string(), basis);
+            .expect("per-schedule basis query");
+        per_schedule.insert(*id, basis);
     }
 
-    for name in &names {
-        let expected = per_name.get(*name).copied().unwrap_or(0);
-        let actual = batched.get(*name).copied().unwrap_or(0);
+    for (id, name) in &pairs {
+        let expected = per_schedule.get(id).copied().unwrap_or(0);
+        let actual = batched.get(id).copied().unwrap_or(0);
         assert_eq!(
             actual, expected,
-            "batched running-basis for {name:?} must equal the per-name loop's result"
+            "batched running-basis for schedule {id} ({name:?}) must equal the per-schedule loop's result"
         );
     }
+}
+
+/// (issue #1160) A cross-type continue-as-new successor -- a RUNNING execution
+/// carrying schedule A's `schedule_id` but schedule B's `workflow_name` -- must
+/// count toward BOTH the batched and per-schedule running basis for schedule
+/// A, additively on top of A's own same-type count (which still includes a
+/// manual-trigger run of A's own type, proving the disjunct doesn't regress
+/// existing same-type counting).
+#[tokio::test]
+async fn schedule_running_basis_counts_a_cross_type_successor_additively() {
+    let (admin, _guard) = setup_server().await;
+    let url = create_fresh_db(&admin, &unique("schedule_basis_cross_type")).await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    let schedule_a = "cross_type_basis_schedule_a";
+    let schedule_b = "cross_type_basis_schedule_b";
+    let schedule_a_id = uuid::Uuid::new_v4();
+    let schedule_b_id = uuid::Uuid::new_v4();
+
+    conn.batch_execute(&format!(
+        "INSERT INTO harvest_schedules (
+             id, dag_name, schedule_expr, timezone, catchup, max_active_runs, is_paused,
+             next_run_at, created_at, updated_at, workflow_name, queue_name, jitter_secs,
+             overlap_policy, buffered_runs, buffer_all_max, calendar_name, skip_policy
+         ) VALUES
+         ('{schedule_a_id}', NULL, '*/30 * * * * *', 'UTC', false, 1, false,
+          NOW() + interval '1 hour', NOW(), NOW(), '{schedule_a}', 'default', 0,
+          'skip', '[]'::jsonb, 1, NULL, 'skip'),
+         ('{schedule_b_id}', NULL, '*/30 * * * * *', 'UTC', false, 1, false,
+          NOW() + interval '1 hour', NOW(), NOW(), '{schedule_b}', 'default', 0,
+          'skip', '[]'::jsonb, 1, NULL, 'skip');
+
+         -- A manual-trigger run of schedule A's OWN type: schedule_id NULL,
+         -- origin = manual_trigger. Must still count toward A (regression guard).
+         INSERT INTO harvest_workflow_executions (
+             id, workflow_name, workflow_id, run_id, shard_id, state, input,
+             queue_name, started_at, created_at, schedule_id, origin
+         ) VALUES (
+             gen_random_uuid(), '{schedule_a}', 'manual-a', gen_random_uuid(), 0, 'RUNNING',
+             'null'::jsonb, 'default', NOW(), NOW(), NULL, 'manual_trigger'
+         );
+
+         -- The cross-type successor: schedule A's schedule_id, schedule B's
+         -- workflow_name -- exactly what ctx.continue_as_new_as(...) (#803)
+         -- leaves behind mid-chain.
+         INSERT INTO harvest_workflow_executions (
+             id, workflow_name, workflow_id, run_id, shard_id, state, input,
+             queue_name, started_at, created_at, schedule_id, origin
+         ) VALUES (
+             gen_random_uuid(), '{schedule_b}', 'sched:{schedule_a_id}:successor', gen_random_uuid(), 0,
+             'RUNNING', 'null'::jsonb, 'default', NOW(), NOW(), '{schedule_a_id}', 'scheduled'
+         );"
+    ))
+    .await
+    .expect("seed cross-type fixture");
+
+    let basis_a =
+        autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_a, schedule_a_id)
+            .await
+            .expect("schedule A basis query");
+    assert_eq!(
+        basis_a, 2,
+        "schedule A's basis must be 2: its own manual-trigger run PLUS the cross-type successor"
+    );
+
+    let basis_b =
+        autumn_harvest::scheduler::schedule_running_basis(&mut conn, schedule_b, schedule_b_id)
+            .await
+            .expect("schedule B basis query");
+    assert_eq!(
+        basis_b, 1,
+        "schedule B's basis counts the same execution once (it IS schedule B's own type), \
+         not twice just because it also happens to carry schedule A's schedule_id"
+    );
+
+    let pairs = [(schedule_a_id, schedule_a), (schedule_b_id, schedule_b)];
+    let batched = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &pairs)
+        .await
+        .expect("batched basis query");
+    assert_eq!(
+        batched.get(&schedule_a_id).copied().unwrap_or(0),
+        2,
+        "batched form must agree with the per-schedule form for A"
+    );
+    assert_eq!(
+        batched.get(&schedule_b_id).copied().unwrap_or(0),
+        1,
+        "batched form must agree with the per-schedule form for B"
+    );
 }
 
 /// Proves `resolve_effective_fire_at_pure`, fed the batched

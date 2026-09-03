@@ -952,6 +952,24 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
 - **continue-as-new**: a continuation inherits the predecessor's frozen
   carryover (the continuation is the same logical scheduled run), so cursors and
   recovery state survive the fork.
+- **Cross-type continue-as-new and overlap controls** (issue #1160): `ctx.continue_as_new_as(...)`
+  (#803) continues the same logical scheduled run as a *different* registered
+  workflow type — `schedule_id`/`scheduled_for` carry over unchanged (as above),
+  but the successor's `workflow_name` is now the target type. Both overlap
+  controls account for this:
+  - `OverlapPolicy::CancelOther` / `TerminateOther` select purely on `schedule_id`
+    (no `workflow_name` filter), so they can reach and clean up a cross-type
+    successor of the schedule that fired again.
+  - `max_active_runs` counting (`scheduler::schedule_running_basis`) counts
+    `workflow_name = <this schedule's type>` **OR** `schedule_id = <this schedule>`
+    — one `COUNT(*)`, so a same-type row matching both clauses is never
+    double-counted. This is additive by design: the name clause alone already
+    covers every same-type run (including manual, non-scheduled triggers of that
+    type), and the `schedule_id` clause adds only the cross-type successor rows
+    the name clause would otherwise miss. The alternative of re-scoping the count
+    to `schedule_id` alone was rejected because it would stop counting manual
+    runs of an existing single-type schedule — a behaviour change out of scope
+    for #1160.
 - **Slot ordering**: carryover selects the *previous logical fire* by the
   schedule slot (`scheduled_for`), not by completion time. Overlapping,
   catch-up, or backfilled fires that finish out of order therefore can't hand a
