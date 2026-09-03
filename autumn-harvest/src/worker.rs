@@ -15292,7 +15292,8 @@ async fn handle_suspended_workflow(
     .await
 }
 
-async fn fail_execution_on_error<T>(
+#[doc(hidden)]
+pub async fn fail_execution_on_error<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
@@ -15319,6 +15320,19 @@ async fn fail_execution_on_error<T>(
     // back the enclosing transaction and perform the standalone claim
     // release afterward, rather than terminally failing the run here.
     if error.suspended_claim_ambiguous().is_some() {
+        return Err(error);
+    }
+    // Issue #1184 (Codex review round 1, P1): the identical blameless,
+    // no-decision-made shape as the #1182 case just above -- a guard inside
+    // `persist_workflow_continue_as_new`'s seal transaction (or any other
+    // #1184-guarded write reachable from here) can raise this instead. It
+    // must pass through un-failed for the same reason: if the transient
+    // contention that caused it clears before a second, unguarded
+    // `fail_task_and_execution` call below ran, that second call's OWN
+    // guard would find the claim genuinely still held and actually commit a
+    // `WorkflowFailed` -- turning a blameless "no decision, release and let
+    // the same owner retry" into a real terminal failure.
+    if error.terminal_write_claim_ambiguous().is_some() {
         return Err(error);
     }
     fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
@@ -20193,13 +20207,19 @@ async fn process_task(
                 session_slots_in_use,
             )
             .await;
-            // Acquire only if we actually need to act on a capability miss:
-            // the happy path must not pay for a checkout at all.
-            if result
-                .as_ref()
-                .err()
-                .is_some_and(|e| e.handler_not_registered().is_some())
-            {
+            // Acquire only if we actually need to act on a capability miss or
+            // an ambiguous terminal-write claim (issue #1184, Codex review
+            // round 1, P2): this shared activity dispatch path can reach
+            // `fail_task_and_execution_with_history`'s #1184 guard too (e.g.
+            // via a session-acquire/session-release failure, or
+            // `finalize_activity_failure`), and without this check its
+            // `TerminalWriteClaimAmbiguous` would return immediately below,
+            // never reaching the common interception code that releases the
+            // claim -- wedging the task `RUNNING` under a worker that no
+            // longer owns it instead of releasing it for redispatch.
+            if result.as_ref().err().is_some_and(|e| {
+                e.handler_not_registered().is_some() || e.terminal_write_claim_ambiguous().is_some()
+            }) {
                 let conn = pool.get().await.map_err(crate::error::database_error)?;
                 (conn, result)
             } else {

@@ -27,9 +27,9 @@ use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
     HandlerRegistry, PreloadedFailureHistory, WorkflowTaskPersistence, check_paused_and_park,
-    fail_task_and_execution_with_history, persist_child_workflow_completion,
-    persist_child_workflow_failure, persist_workflow_completion, persist_workflow_continue_as_new,
-    persist_workflow_failure,
+    fail_execution_on_error, fail_task_and_execution_with_history,
+    persist_child_workflow_completion, persist_child_workflow_failure, persist_workflow_completion,
+    persist_workflow_continue_as_new, persist_workflow_failure,
 };
 
 use chrono::Utc;
@@ -785,4 +785,62 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
         reloaded.worker_id, None,
         "the release must clear ownership so any capable worker can re-claim it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// fail_execution_on_error -- Codex review round 1, P1: this shared
+// error-handling glue passed `SuspendedClaimAmbiguous` through un-failed but
+// not `TerminalWriteClaimAmbiguous`, so a #1184-guarded write's ambiguity
+// (e.g. from `persist_workflow_continue_as_new`'s seal transaction) fell
+// through to an ordinary `fail_task_and_execution` call here -- which, if the
+// transient contention that caused the ambiguity had cleared by then, would
+// actually find the claim still held and commit a real `WorkflowFailed`,
+// turning a blameless "no decision" into a genuine terminal failure.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fail_execution_on_error_passes_terminal_write_claim_ambiguous_through_unfailed() {
+    let (url, _container) = setup_db().await;
+    let (exec_id, task) = seed_claimed_task(&url, "q1184-error-passthrough", "dispatcher-a").await;
+
+    let mut conn = connect(&url).await;
+    let result: Result<(), _> = fail_execution_on_error(
+        &mut conn,
+        &task,
+        "dispatcher-a",
+        Err(autumn_harvest::HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id }),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("the ambiguous sentinel must pass through, not be swallowed")
+            .terminal_write_claim_ambiguous(),
+        Some(task.id),
+        "must be the same sentinel, not converted into a terminal failure"
+    );
+
+    // Passing through unfailed means this function must attempt NO write at
+    // all -- unlike the guarded functions elsewhere in this file, there is no
+    // claim to have "moved": the task is still validly claimed the whole
+    // time, and the bug this guards against is precisely that an unguarded
+    // passthrough would still try (and, if the contention had cleared,
+    // succeed at) failing it anyway.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "must append no terminal event; got {history:?}"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(execution.state, "RUNNING");
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row is untouched");
+    assert_eq!(reloaded.state, "RUNNING");
+    assert_eq!(reloaded.worker_id.as_deref(), Some("dispatcher-a"));
 }
