@@ -181,6 +181,13 @@ change to the replay surface**.
   through the optimisation instead. Each entry now records what its decision
   cost, a hit charges that, and both paths report through one error constructor,
   since even a differing message is a differing observable outcome.
+  Charging the hit was necessary but not sufficient: the first cut left the
+  *check* on each branch separately, so a fresh decision that pushed the run
+  over budget was accepted while the same total served from cache was rejected —
+  the residency dependence surviving inside its own fix. Cost is charged and the
+  budget checked in exactly one place, on the path both branches join, and
+  before the response is acted on, since an over-budget `Await` acted on
+  optimistically schedules a real activity the run then fails immediately after.
 - **Signing can be introduced or rotated on a build that already exists.** The
   identical-bytes republish path cleared `retired_at` and left the row's old (or
   NULL) signature, so a republish carrying a signature valid under a new key
@@ -189,7 +196,14 @@ change to the replay surface**.
   a deploy, the exact coupling this design exists to remove. The signature is
   written too; safe because it is verified against the caller's key before any
   write, and the bytes are unchanged, so it rebinds the same content to a fresh
-  attestation of the same tuple rather than smuggling in different code.
+  attestation of the same tuple rather than smuggling in different code. A
+  republish supplying *no* signature leaves the stored one alone (`COALESCE`)
+  rather than erasing it: mid-rollout, an older or unsigned publisher re-seeding
+  the same build would otherwise NULL a valid attestation and make every worker
+  syncing with the key reject a row that was correctly signed a moment earlier.
+  Withdrawing a signature is deliberately not expressible — it would be
+  indistinguishable from that accident, and retirement already exists for
+  withdrawing a module.
 - **The guest-facing failure shape is documented as the host actually sends
   it.** The example showed `{"kind":"err","error":"..."}`; the real outcome
   always carries `error_type` and may carry `details`. A guest with a strict

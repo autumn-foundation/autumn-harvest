@@ -309,6 +309,9 @@ const CITED_TESTS: &[&str] = &[
     // Codex review round 4.
     "a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation",
     "signing_can_be_introduced_and_rotated_on_an_existing_build",
+    // Codex review round 5.
+    "the_run_budget_is_charged_and_checked_once_for_both_cache_paths",
+    "an_unsigned_republish_does_not_erase_an_existing_signature",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",

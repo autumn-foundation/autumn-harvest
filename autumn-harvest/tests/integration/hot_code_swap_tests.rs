@@ -1596,6 +1596,58 @@ async fn signing_can_be_introduced_and_rotated_on_an_existing_build() {
         .expect_err("the superseded key must no longer verify");
 }
 
+#[tokio::test]
+async fn an_unsigned_republish_does_not_erase_an_existing_signature() {
+    // Codex review round 5, correcting round 4. Writing the signature
+    // unconditionally meant a publisher supplying none would NULL a valid one —
+    // so mid-rollout, an older or unsigned publisher re-seeding the same build
+    // would turn a harmless duplicate publish into a fleet-wide refusal, every
+    // worker syncing with the key rejecting a row that was correctly signed a
+    // moment earlier. An explicit (verified) signature replaces; `None` leaves
+    // the stored attestation alone.
+    let (mut conn, _c) = db().await;
+    let bytes = pipeline_v1_bytes();
+    let signature = sign_module_binding(
+        OPERATOR_KEY,
+        "wf-v1",
+        "pipeline",
+        &compute_module_hash(&bytes),
+    )
+    .expect("sign");
+
+    publish_workflow_module(
+        &mut conn,
+        "wf-v1",
+        "pipeline",
+        &bytes,
+        Some(&signature),
+        Some(OPERATOR_KEY),
+    )
+    .await
+    .expect("signed publish");
+
+    // The unsigned re-seed: identical bytes, no signature, no key.
+    publish_workflow_module(&mut conn, "wf-v1", "pipeline", &bytes, None, None)
+        .await
+        .expect("an idempotent re-seed must still succeed");
+
+    assert_eq!(
+        fetch_workflow_module(&mut conn, "wf-v1", "pipeline")
+            .await
+            .expect("fetch")
+            .expect("row")
+            .signature
+            .as_deref(),
+        Some(signature.as_str()),
+        "the stored signature must survive a republish that supplies none"
+    );
+
+    let registry = Arc::new(ModuleRegistry::new());
+    sync_build_into_registry(&mut conn, &registry, "wf-v1", Some(OPERATOR_KEY))
+        .await
+        .expect("a key-configured sync must still accept the build");
+}
+
 // ── the AC3 end-to-end demonstration ──────────────────────────────────────────
 
 /// Publish v2 under a new build id while the process is running, ramp new
@@ -2401,6 +2453,70 @@ async fn decisions_are_reused_across_separate_workflow_tasks() {
     assert!(
         misses > 0,
         "the first drive must have populated the cache ({misses} misses expected)"
+    );
+}
+
+#[test]
+fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
+    // Codex review round 5, correcting round 4. Charging cache hits was the
+    // right fix; keeping a *separate* check on each path was not. The miss path
+    // checked before computing and never re-checked after adding the cost, so a
+    // fresh decision that pushed the run over budget was accepted while the same
+    // total served from cache was rejected — the residency dependence surviving
+    // inside its own fix.
+    //
+    // Guarded structurally rather than functionally: reproducing it needs a
+    // guest slow enough to exhaust a ten-second budget, which is not a test
+    // anyone should wait for. The invariant is that the cost is charged and the
+    // budget checked in exactly ONE place, on the path both branches join, and
+    // *before* the response is acted on — an over-budget `Await` acted on
+    // optimistically schedules a real activity the run then fails immediately
+    // after.
+    let src = include_str!("../../src/hot_swap.rs");
+    let start = src
+        .find("pub fn module_workflow_handler(")
+        .expect("the trampoline is where the guard expects it");
+    let body = &src[start..];
+    let live: Vec<&str> = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    let checks: Vec<usize> = live
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("run_budget_exceeded"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "the run budget must be checked in exactly one place, or the cached and          recomputed paths can disagree; found {} checks",
+        checks.len()
+    );
+
+    let charges: Vec<usize> = live
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("guest_time = guest_time.saturating_add"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        charges.len(),
+        1,
+        "the budget must be charged in exactly one place, so a hit and a miss          cost the same accounting; found {} charge sites",
+        charges.len()
+    );
+
+    let acted_on = live
+        .iter()
+        .position(|line| line.trim_start().starts_with("match response"))
+        .expect("the trampoline acts on the response with `match response`");
+    assert!(
+        charges[0] < checks[0] && checks[0] < acted_on,
+        "order must be charge -> check -> act (charge at {}, check at {}, act at          {acted_on}); checking after acting lets an over-budget `Await` schedule          a real activity the run then fails",
+        charges[0],
+        checks[0]
     );
 }
 

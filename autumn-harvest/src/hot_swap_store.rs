@@ -221,8 +221,21 @@ pub async fn publish_workflow_module(
         // so this rebinds the same content to a fresh attestation of the same
         // `(build_id, workflow_name, module_hash)` tuple — it cannot smuggle in
         // different code.
+        //
+        // `COALESCE`, not a bare assignment (issue #967, Codex review round 5,
+        // correcting round 4). A publisher that supplies no signature must not
+        // *erase* one: mid-rollout, an older or unsigned publisher re-seeding
+        // the same build would otherwise NULL a valid attestation, and every
+        // worker syncing with the signing key would then reject the row as
+        // unsigned — turning a harmless duplicate publish into a fleet-wide
+        // refusal of a build that was correctly signed a moment earlier. So an
+        // explicitly supplied (and therefore verified) signature replaces the
+        // stored one, and `None` leaves it alone. Removing a signature is
+        // deliberately not expressible here: it would be indistinguishable from
+        // this accident, and retirement already exists for withdrawing a module.
         diesel::sql_query(
-            "UPDATE harvest_workflow_modules SET retired_at = NULL, signature = $3 \
+            "UPDATE harvest_workflow_modules \
+             SET retired_at = NULL, signature = COALESCE($3, signature) \
              WHERE build_id = $1 AND workflow_name = $2",
         )
         .bind::<diesel::sql_types::Text, _>(build_id)

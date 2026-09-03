@@ -1830,20 +1830,30 @@ pub fn module_workflow_handler(
             // is a compile-time constant to avoid, arriving through the
             // optimisation instead. The cache is allowed to make a run
             // *cheaper*; it is not allowed to change what the run *decides*.
-            let response = if let Some((cached, recorded)) = cached {
-                guest_time = guest_time.saturating_add(recorded);
-                if guest_time >= DECIDE_RUN_WALL_CLOCK {
-                    return Err(run_budget_exceeded(&build_id));
-                }
-                cached
+            // ONE order for both paths: charge the cost, check the budget, then
+            // act on the response (issue #967, Codex review round 5, correcting
+            // round 4). The first cut of this charged cache hits — which was the
+            // point — but kept the miss path's check *before* the decision and
+            // never re-checked after adding its cost. So a fresh decision that
+            // pushed the run over budget was accepted while the same total
+            // served from cache was rejected: the residency dependence survived
+            // its own fix, in the asymmetry of the fix.
+            //
+            // The post-charge check also has to come before the response is
+            // *used*, not merely before the next iteration. An over-budget
+            // `Await` acted on optimistically schedules a real activity — a side
+            // effect the run then fails immediately after, which is the worst of
+            // both outcomes.
+            //
+            // The pre-check is gone rather than duplicated: since every
+            // iteration now returns as soon as the budget is reached, the loop
+            // cannot re-enter with `guest_time` already over it.
+            let (response, cost) = if let Some((cached, recorded)) = cached {
+                (cached, recorded)
             } else {
-                if guest_time >= DECIDE_RUN_WALL_CLOCK {
-                    return Err(run_budget_exceeded(&build_id));
-                }
                 let started = Instant::now();
                 let response = decide_encoded(&host, &limits, &module, &encoded, step_index)?;
                 let elapsed = started.elapsed();
-                guest_time = guest_time.saturating_add(elapsed);
                 host.registry
                     .decisions()
                     .ok_or_else(|| "the decision cache is poisoned".to_string())?
@@ -1868,8 +1878,13 @@ pub fn module_workflow_handler(
                 // slow guest blocks the poll instead of yielding — bounded by
                 // fuel (the operative, deterministic budget) and by the wall
                 // clock backstop.
-                response
+                (response, elapsed)
             };
+
+            guest_time = guest_time.saturating_add(cost);
+            if guest_time >= DECIDE_RUN_WALL_CLOCK {
+                return Err(run_budget_exceeded(&build_id));
+            }
 
             match response {
                 DecideResponse::Complete { output } => return Ok(output),

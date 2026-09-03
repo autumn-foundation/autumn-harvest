@@ -395,6 +395,18 @@ it should be named rather than discovered later:
     decides**
     (`a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation`).
 
+    Charging the hit is necessary but not sufficient, and the first cut of that
+    fix showed why: it left the *check* on each branch separately, so a fresh
+    decision that pushed the run over budget was accepted while the same total
+    served from cache was rejected — the residency dependence surviving inside
+    its own fix. The cost is charged and the budget checked in exactly one
+    place, on the path both branches join, and **before the response is acted
+    on**: an over-budget `Await` acted on optimistically schedules a real
+    activity the run then fails immediately afterwards, which is the worst of
+    both outcomes. Guarded structurally, since reproducing it needs a guest slow
+    enough to exhaust a ten-second budget
+    (`the_run_budget_is_charged_and_checked_once_for_both_cache_paths`).
+
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
 no command. `DECIDE_RUN_WALL_CLOCK` (10 s) is therefore the worst case for how
@@ -968,7 +980,14 @@ residuals is worse than one that has more of them:
    that *rotating* a key does not require a new build id: republishing identical
    bytes with a signature valid under the new key rebinds the attestation in
    place, which is what makes introducing signing to an existing build possible
-   at all (`signing_can_be_introduced_and_rotated_on_an_existing_build`).
+   at all (`signing_can_be_introduced_and_rotated_on_an_existing_build`). A
+   republish that supplies *no* signature leaves the stored one alone rather
+   than erasing it — mid-rollout, an unsigned publisher re-seeding the same
+   build would otherwise turn a harmless duplicate publish into a fleet-wide
+   refusal (`an_unsigned_republish_does_not_erase_an_existing_signature`).
+   Withdrawing a signature is deliberately not expressible: it would be
+   indistinguishable from that accident, and retirement already exists for
+   withdrawing a module.
 7. **A build has no sealed manifest, so a sync detects the race rather than
    preventing it.** Publishing a *new* `(build_id, workflow_name)` under an
    existing build is allowed by design — the primary key makes an existing
